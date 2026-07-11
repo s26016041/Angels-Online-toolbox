@@ -3,9 +3,10 @@
 即時監控每個天使之戀分身正在練的技能經驗球：
   1. 按「開始監控」→ 自動找出所有分身，用 AOB 特徵碼定位技能經驗球。
   2. 鎖定「正在增加」的那顆（在練的技能），顯示即時值與每小時經驗。
-  3. 若某台的值「持續 5 分鐘沒有變動」（經驗球滿了、或遊戲停止/斷線）→
-     自動停止該台監控、循環發出警報聲、並跳出警告視窗標明是哪個帳號；
-     警報聲持續到按「停止警報」為止。
+  3. 若某台的值「持續 5 分鐘沒有變動」→ 先重新定位確認（結構可能被搬走了，
+     不是真的停）：若還有球在動就改鎖到它、繼續監控；連新定位都找不到在動的
+     球，才判定經驗球滿了 / 遊戲停止/斷線 → 自動停該台、循環發警報聲、跳警告
+     視窗標明帳號；警報聲持續到按「停止警報」為止。
 
 全程只讀取記憶體、不搶焦點、不掛除錯器（安全）。
 """
@@ -37,6 +38,8 @@ SIG = aob.SKILL_EXP_BALL
 SCAN_LIMIT = 4096
 # 數值持續這麼多秒沒變動 → 判定經驗球滿了 / 遊戲停止 → 警報。
 NO_CHANGE_SECS = 300
+# 疑似卡住時，重新定位並讀兩次之間的間隔（秒），用來判斷球是否「當下正在增加」。
+REVERIFY_GAP_SECS = 0.4
 
 
 class LocateWorker(QThread):
@@ -256,7 +259,12 @@ class MonitorTab(BaseTab):
                     curvals[a] = v
                     if v is None:
                         continue
-                    d = v - (m["v0"].get(a) or v)
+                    base = m["v0"].get(a)
+                    if base is None:  # 定位當下讀不到基準 → 無法比較，跳過
+                        continue
+                    # 注意：base 可能是 0（空的經驗球），不能寫成 `base or v`，
+                    # 否則 0 會被當假值 → 差值變 0 → 剛升級/剛開練的技能永遠鎖不到。
+                    d = v - base
                     if d > best_d:
                         best_d, best_a = d, a
                 if best_a is not None and best_d > 0:
@@ -280,8 +288,14 @@ class MonitorTab(BaseTab):
                 m["last_change"] = now
             dur = now - m["last_change"]
             if dur >= NO_CHANGE_SECS:
-                stalled.append(self._acct(m["title"]))
-                self._set_row(r, m["value"], 0.0, "⚠ 已滿/停止")
+                # 疑似卡住 → 先重新定位確認：只要這台還有任何一顆球在動，
+                # 就代表結構被搬走了（或本來就鎖錯顆），改鎖到在動的那顆、
+                # 計時歸零，不誤報。連重新定位都找不到在動的球，才是真的停了。
+                if self._reverify_active(m, now):
+                    self._set_row(r, m["value"], 0.0, "監控中（已重新定位）")
+                else:
+                    stalled.append(self._acct(m["title"]))
+                    self._set_row(r, m["value"], 0.0, "⚠ 已滿/停止")
             else:
                 rate = 0.0
                 dt = now - m["t_lock"]
@@ -292,6 +306,47 @@ class MonitorTab(BaseTab):
         if stalled:
             # 任何一台觸發 → 響警報 + 整個監控停掉（等同按停止），要自己重按「開始監控」。
             self._alarm_and_stop(stalled)
+
+    def _reverify_active(self, m: dict, now: float) -> bool:
+        """疑似卡住 → 對這一台重新定位，確認是否還有球正在增加。
+
+        天使之戀的技能結構是動態配置的，升級 / 換角 / 換地圖 / 重連都可能把它搬到
+        別的位址；一旦搬走，原本鎖定的固定位址會凍住或讀不到，就會被誤判成「已滿」。
+        這裡重新用 AOB 掃一次、讀兩次找出「當下正在增加」的球：
+          - 找到 → 結構搬家了（或原本鎖錯顆），改鎖到新位址、計時歸零，回傳 True（別響警報）。
+          - 找不到 → 連新定位都沒有球在動 → 真的滿了 / 停了 / 斷線，回傳 False（該響警報）。
+
+        注意：只在倒數達標（每台最多一次）時才呼叫，屬罕見事件；為求邏輯單純採同步執行，
+        會有約 1 秒的短暫停頓，不影響平常每秒輪詢。
+        """
+        sc = m["sc"]
+        try:
+            cands = aob.scan(sc, SIG, limit=SCAN_LIMIT)
+        except Exception:
+            cands = []
+        if not cands:
+            return False
+        first = {a: sc.read_value(a, SIG.vt) for a in cands}
+        time.sleep(REVERIFY_GAP_SECS)
+        best_a, best_d = None, 0
+        for a in cands:
+            v1, v2 = first.get(a), sc.read_value(a, SIG.vt)
+            if v1 is None or v2 is None:
+                continue
+            d = v2 - v1
+            if d > best_d:
+                best_d, best_a = d, a
+        if best_a is None or best_d <= 0:
+            return False  # 沒有任何球在動 → 真的停了
+        # 找到仍在增加的球 → 改鎖到它，等同「偵測到一次新的變動」，5 分鐘計時重新起算。
+        cur = sc.read_value(best_a, SIG.vt)
+        m["cands"] = cands
+        m["v0"] = first
+        m["active"] = best_a
+        m["value"] = cur
+        m["last_change"] = now
+        m["v_lock"], m["t_lock"] = cur, now
+        return True
 
     def _set_row(self, r: int, value, rate, status: str) -> None:
         self.table.setItem(r, 2, QTableWidgetItem(

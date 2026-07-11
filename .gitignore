@@ -19,6 +19,9 @@ captures/
 build/
 dist/
 *.spec
+# 例外：這支是手維護的建置設定（release.py / build_local.py 都靠它，
+# 內含白屏修復 collect_submodules('app')），必須納入版控。
+!AngelsOnlineToolbox.spec
 
 # 編輯器 / 系統
 .vscode/
