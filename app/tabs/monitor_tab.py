@@ -258,6 +258,7 @@ class MonitorTab(BaseTab):
         )
         row = QHBoxLayout()
         self.start_btn = QPushButton("開始監控")
+        self.start_btn.setProperty("primary", True)  # 主要動作 → 主色（見 app/theme.py）
         self.start_btn.clicked.connect(self.start)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
@@ -277,12 +278,17 @@ class MonitorTab(BaseTab):
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr = self.table.horizontalHeader()
+        # 前三欄貼齊內容寬度，「狀態」欄吃掉剩餘空間 → 長狀態字不用手動拉就完整顯示。
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 帳號
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # PID
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 技能經驗球
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)           # 狀態
         self.table.verticalHeader().setDefaultSectionSize(30)
         root.addWidget(self.table)
 
         self.status = QLabel("就緒")
-        self.status.setStyleSheet("color: gray;")
+        self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
 
     # ------------------------------------------------------------------

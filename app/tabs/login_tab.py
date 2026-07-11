@@ -148,13 +148,14 @@ class LoginTab(BaseTab):
         self.launch_btn = QPushButton("啟動遊戲")
         self.launch_btn.clicked.connect(self._launch_game)
         self.login_btn = QPushButton("啟動並自動登入（用上方帳密）")
+        self.login_btn.setProperty("primary", True)  # 主要動作 → 主色（見 app/theme.py）
         self.login_btn.clicked.connect(self._launch_and_login)
         btn_row.addWidget(self.launch_btn)
         btn_row.addWidget(self.login_btn)
         root.addLayout(btn_row)
 
         self.status_label = QLabel("就緒")
-        self.status_label.setStyleSheet("color: gray;")
+        self.status_label.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status_label)
         root.addStretch(1)
 

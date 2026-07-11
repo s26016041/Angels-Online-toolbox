@@ -116,7 +116,7 @@ class DiagnosticsTab(BaseTab):
 
         self.status = QLabel("就緒")
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: gray;")
+        self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
 
         self._windows: list[win.WindowInfo] = []

@@ -72,6 +72,10 @@ def _build_main_window():
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(__app_name__)
+
+    from app.theme import apply_theme
+    apply_theme(app)
+
     return app, MainWindow()
 
 
