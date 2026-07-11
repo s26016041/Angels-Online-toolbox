@@ -1,12 +1,16 @@
 """監控技能經驗球分頁（產品主畫面）。
 
 即時監控每個天使之戀分身正在練的技能經驗球：
-  1. 按「開始監控」→ 自動找出所有分身，用 AOB 特徵碼定位技能經驗球。
-  2. 鎖定「正在增加」的那顆（在練的技能），顯示即時值與每小時經驗。
-  3. 若某台的值「持續 5 分鐘沒有變動」→ 先重新定位確認（結構可能被搬走了，
-     不是真的停）：若還有球在動就改鎖到它、繼續監控；連新定位都找不到在動的
-     球，才判定經驗球滿了 / 遊戲停止/斷線 → 自動停該台、循環發警報聲、跳警告
-     視窗標明帳號；警報聲持續到按「停止警報」為止。
+  1. 按「開始監控」→ 自動找出所有分身。
+  2. 背景執行緒「每一輪都重新用 AOB 特徵掃描」每台分身，讀出所有技能經驗球候選，
+     比對前後兩輪、挑出「正在增加」的那顆來跟隨，顯示即時值。
+     ★ 不快取位址 ★——換地圖 / 重連 / 升級會讓遊戲把技能結構搬到別的位址（舊位址
+     的值會「跑掉」或凍住），因為每輪都重掃特徵，新位址下一輪就會出現、自動跟上，
+     效果等同「手動按停止再開始」，但是自動且持續的。
+  3. 若跟隨的球「持續 5 分鐘沒有再增加」（期間重掃也沒有任何在動的球），或「突然
+     掃不到特徵」（很可能是斷線 / 遊戲關了，也照樣併入這 5 分鐘倒數）→ 判定經驗球
+     滿了 / 遊戲停止/斷線 → 自動停該台、循環發警報聲、跳警告視窗標明帳號；警報聲
+     持續到按「停止警報」為止。一定要先偵測到一次增加，才會開始算這 5 分鐘。
 
 全程只讀取記憶體、不搶焦點、不掛除錯器（安全）。
 """
@@ -14,7 +18,7 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -36,30 +40,81 @@ from app.tabs.base_tab import BaseTab
 SIG = aob.SKILL_EXP_BALL
 # AOB 特徵較鬆（會命中所有技能結構），上限開大以免漏掉目標；靠「正在增加」選出在練技能。
 SCAN_LIMIT = 4096
-# 數值持續這麼多秒沒變動 → 判定經驗球滿了 / 遊戲停止 → 警報。
+# 數值持續這麼多秒沒再增加 → 判定經驗球滿了 / 遊戲停止 → 警報。
 NO_CHANGE_SECS = 300
-# 疑似卡住時，重新定位並讀兩次之間的間隔（秒），用來判斷球是否「當下正在增加」。
-REVERIFY_GAP_SECS = 0.4
+# 快速讀值的間隔（毫秒）：決定畫面值多快更新一次。
+READ_INTERVAL_MS = 700
+# 慢速重掃特徵的間隔（秒）：決定換地圖/搬家後多久補上新位址（越小越快跟上、越吃 CPU）。
+RESCAN_SECS = 3
 
 
-class LocateWorker(QThread):
-    """背景掃描每個分身、用 AOB 特徵定位經驗球候選位址。"""
+class ScanWorker(QThread):
+    """慢速執行緒：定期全記憶體重掃 AOB 特徵，更新每台的候選位址清單。
 
-    done = Signal(object)  # [(pid, title, scanner, [candidate_addrs]), ...]
+    「全掃」很慢（要讀整塊記憶體），所以放這條慢執行緒、不擋畫面更新；它只負責讓
+    候選位址保持最新——換地圖 / 重連把技能結構搬走後，下一次全掃就會拿到新位址。
+    候選清單 self._cands 是與 ReadWorker 共享的 dict（本執行緒寫、對方讀）。
+    """
 
-    def __init__(self, insts) -> None:
+    def __init__(self, insts, cands: dict) -> None:
         super().__init__()
-        self._insts = insts
+        self._insts = insts  # [(pid, title, sc), ...]
+        self._cands = cands
+        self._running = True
 
     def run(self) -> None:
-        out = []
-        for pid, title, sc in self._insts:
-            try:
-                cands = aob.scan(sc, SIG, limit=SCAN_LIMIT)
-            except Exception:
-                cands = []
-            out.append((pid, title, sc, cands))
-        self.done.emit(out)
+        while self._running:
+            for pid, _title, sc in self._insts:
+                if not self._running:
+                    return
+                try:
+                    self._cands[pid] = aob.scan(sc, SIG, limit=SCAN_LIMIT)
+                except Exception:
+                    pass
+            # 掃完一輪後歇 RESCAN_SECS 再掃；分段睡以便能盡快響應停止。
+            for _ in range(max(1, int(RESCAN_SECS * 10))):
+                if not self._running:
+                    return
+                self.msleep(100)
+
+    def stop(self) -> None:
+        self._running = False
+
+
+class ReadWorker(QThread):
+    """快速執行緒：每 ~0.7 秒讀一次候選位址的現值，回傳 {pid: {位址: 值}} 快照。
+
+    只讀「已知候選位址」的值（很快），所以畫面更新回到即時；不做全掃。搭配 ScanWorker
+    保持候選位址最新即可。與 ScanWorker 共用 scanner——兩者都只讀取、不改動 scanner
+    內部掃描狀態，ReadProcessMemory 本身可並行，安全。
+    """
+
+    snapshot = Signal(object)  # {pid: {addr: value}}
+
+    def __init__(self, insts, cands: dict) -> None:
+        super().__init__()
+        self._insts = insts
+        self._cands = cands
+        self._running = True
+
+    def run(self) -> None:
+        while self._running:
+            snap: dict[int, dict[int, int]] = {}
+            for pid, _title, sc in self._insts:
+                if not self._running:
+                    return
+                addrs = self._cands.get(pid, [])
+                try:
+                    snap[pid] = {a: sc.read_value(a, SIG.vt) for a in addrs}
+                except Exception:
+                    snap[pid] = {}
+            if not self._running:
+                return
+            self.snapshot.emit(snap)
+            self.msleep(READ_INTERVAL_MS)
+
+    def stop(self) -> None:
+        self._running = False
 
 
 class AlarmThread(QThread):
@@ -110,7 +165,7 @@ class AlarmDialog(QDialog):
         body = "\n".join(f"　• {a}" for a in accounts)
         self.label.setText(
             "以下分身的技能經驗球滿了、或遊戲停止/斷線了\n"
-            f"（數值持續 {dur} 沒有變動）：\n\n" + body
+            f"（數值持續 {dur} 沒有再增加）：\n\n" + body
         )
 
 
@@ -120,7 +175,9 @@ class MonitorTab(BaseTab):
 
     def build_ui(self) -> None:
         self._mons: dict[int, dict] = {}
-        self._worker: LocateWorker | None = None
+        self._cands: dict[int, list] = {}   # {pid: [addr,...]}，ScanWorker 寫、ReadWorker 讀
+        self._scan_worker: ScanWorker | None = None
+        self._read_worker: ReadWorker | None = None
         self._alarm_thread: AlarmThread | None = None
         self._alarm_dialog: AlarmDialog | None = None
         self._alarm_accts: list[str] = []
@@ -128,8 +185,9 @@ class MonitorTab(BaseTab):
         root = QVBoxLayout(self)
         root.addWidget(
             QLabel(
-                "即時監控每個分身正在練的技能經驗球（AOB 特徵定位，重開/多開都能自動定位）。\n"
-                "某台值「持續 5 分鐘沒變動」（經驗球滿了或遊戲停止）→ 自動停該台 + 警報聲 + 跳視窗提示。"
+                "即時監控每個分身正在練的技能經驗球。每輪都重新掃特徵、自動追最新位址，\n"
+                "換地圖 / 重連 / 升級都不會跑掉。某台「持續 5 分鐘沒再增加」（滿了或停止）→ "
+                "自動停該台 + 警報聲 + 跳視窗提示。"
             )
         )
         row = QHBoxLayout()
@@ -138,7 +196,7 @@ class MonitorTab(BaseTab):
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop)
-        self.rescan_btn = QPushButton("重新定位")
+        self.rescan_btn = QPushButton("重新探索分身")
         self.rescan_btn.setEnabled(False)
         self.rescan_btn.clicked.connect(self.rescan)
         row.addWidget(self.start_btn)
@@ -147,9 +205,9 @@ class MonitorTab(BaseTab):
         row.addStretch(1)
         root.addLayout(row)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
-            ["帳號", "PID", "技能經驗球", "每小時經驗", "狀態"]
+            ["帳號", "PID", "技能經驗球", "狀態"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -160,10 +218,6 @@ class MonitorTab(BaseTab):
         self.status = QLabel("就緒")
         self.status.setStyleSheet("color: gray;")
         root.addWidget(self.status)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._poll)
 
     # ------------------------------------------------------------------
     def _find_instances(self):
@@ -184,6 +238,9 @@ class MonitorTab(BaseTab):
     def _acct(title: str) -> str:
         return title.split(" - ", 1)[1] if " - " in title else title
 
+    # ------------------------------------------------------------------
+    # 開始 / 停止 / 重新探索
+    # ------------------------------------------------------------------
     def start(self) -> None:
         self._stop_alarm()  # 重新開始前先關掉還在響的警報
         insts = self._find_instances()
@@ -194,39 +251,43 @@ class MonitorTab(BaseTab):
                 "若遊戲以系統管理員身分執行，請同樣以系統管理員身分執行本工具。",
             )
             return
-        self._begin_locate(insts, f"定位中…掃描 {len(insts)} 台的經驗球特徵")
+        self._begin(insts)
 
     def rescan(self) -> None:
-        if not self._mons:
+        """重新探索分身（納入新開的視窗 / 移除已關的），並重啟監控。"""
+        self._stop_worker()
+        self._close_scanners()
+        self._stop_alarm()
+        insts = self._find_instances()
+        if not insts:
+            self._reset_ui("找不到分身")
             return
-        self._timer.stop()
-        insts = [(pid, m["title"], m["sc"]) for pid, m in self._mons.items()]
-        self._begin_locate(insts, "重新定位中…")
+        self._begin(insts)
 
-    def _begin_locate(self, insts, msg: str) -> None:
-        self.start_btn.setEnabled(False)
-        self.rescan_btn.setEnabled(False)
-        self.status.setText(msg)
-        self._worker = LocateWorker(insts)
-        self._worker.done.connect(self._on_located)
-        self._worker.start()
-
-    def _on_located(self, results) -> None:
-        now = time.monotonic()
-        self._mons = {}
-        for pid, title, sc, cands in results:
-            v0 = {a: sc.read_value(a, SIG.vt) for a in cands}
-            self._mons[pid] = {
-                "title": title, "sc": sc, "cands": cands, "v0": v0,
-                "active": None, "value": None, "last_change": now,
-                "v_lock": None, "t_lock": now, "alerted": False,
+    def _begin(self, insts) -> None:
+        self._mons = {
+            pid: {
+                "title": title, "sc": sc,
+                "prev": {},          # 上一輪快照 {addr: value}
+                "tracked": None,     # 目前跟隨（在練）的位址
+                "value": None,       # 顯示值
+                "last_inc": None,    # 上次偵測到「增加」的時間；None = 還沒動過 → 不倒數
             }
+            for pid, title, sc in insts
+        }
         self._rebuild_table()
-        self._timer.start()
+        insts = [(pid, m["title"], m["sc"]) for pid, m in self._mons.items()]
+        self._cands = {pid: [] for pid, _t, _s in insts}
+        # 慢執行緒定期重掃特徵更新候選位址；快執行緒每 ~0.7s 讀值更新畫面。
+        self._scan_worker = ScanWorker(insts, self._cands)
+        self._read_worker = ReadWorker(insts, self._cands)
+        self._read_worker.snapshot.connect(self._on_snapshot)
+        self._scan_worker.start()
+        self._read_worker.start()
+        self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.rescan_btn.setEnabled(True)
-        located = sum(1 for m in self._mons.values() if m["cands"])
-        self.status.setText(f"監控中：{len(self._mons)} 台（成功定位 {located} 台）")
+        self.status.setText(f"監控中：{len(self._mons)} 台（背景持續重掃特徵，自動追最新位址）")
 
     def _rebuild_table(self) -> None:
         self.table.setRowCount(len(self._mons))
@@ -234,126 +295,66 @@ class MonitorTab(BaseTab):
             self.table.setItem(r, 0, QTableWidgetItem(self._acct(m["title"])))
             self.table.setItem(r, 1, QTableWidgetItem(str(pid)))
             self.table.setItem(r, 2, QTableWidgetItem("…"))
-            self.table.setItem(r, 3, QTableWidgetItem("—"))
-            self.table.setItem(r, 4, QTableWidgetItem(
-                "定位失敗" if not m["cands"] else "準備中"))
-        self._poll()
+            self.table.setItem(r, 3, QTableWidgetItem("定位中…"))
 
     # ------------------------------------------------------------------
-    def _poll(self) -> None:
+    # 每輪快照處理（在 UI 執行緒，由背景 worker 的訊號觸發）
+    # ------------------------------------------------------------------
+    def _on_snapshot(self, snap: dict) -> None:
         now = time.monotonic()
         stalled = []
         for r, (pid, m) in enumerate(self._mons.items()):
             if r >= self.table.rowCount():
                 break
-            if not m["cands"]:
-                self._set_row(r, None, None, "定位失敗（可按重新定位）")
-                continue
-            sc = m["sc"]
+            cur = snap.get(pid)
+            if cur is None:
+                continue  # 這輪沒有這台的資料
 
-            if m["active"] is None:
-                # 找「正在增加」的那顆來鎖定
-                best_a, best_d, curvals = None, 0, {}
-                for a in m["cands"]:
-                    v = sc.read_value(a, SIG.vt)
-                    curvals[a] = v
-                    if v is None:
-                        continue
-                    base = m["v0"].get(a)
-                    if base is None:  # 定位當下讀不到基準 → 無法比較，跳過
-                        continue
-                    # 注意：base 可能是 0（空的經驗球），不能寫成 `base or v`，
-                    # 否則 0 會被當假值 → 差值變 0 → 剛升級/剛開練的技能永遠鎖不到。
-                    d = v - base
-                    if d > best_d:
-                        best_d, best_a = d, a
-                if best_a is not None and best_d > 0:
-                    m["active"] = best_a
-                    m["value"] = curvals[best_a]
-                    m["last_change"] = now
-                    m["v_lock"], m["t_lock"] = curvals[best_a], now
-                    self._set_row(r, m["value"], 0.0, "監控中（已鎖定在練技能）")
-                else:
-                    valid = {a: v for a, v in curvals.items() if v is not None}
-                    tentative = max(valid, key=valid.get) if valid else None
-                    self._set_row(r, valid.get(tentative), None, "等待變動以鎖定技能…")
-                continue
+            prev = m["prev"]
+            # 這輪相對上一輪「有增加」的位址們（cur 為空→掃不到特徵→自然沒有任何增加）
+            increased = {
+                a: v - prev[a]
+                for a, v in cur.items()
+                if v is not None and prev.get(a) is not None and v > prev[a]
+            }
+            if increased:
+                tracked = m["tracked"]
+                if tracked not in increased:
+                    # 換一顆在動的（首次鎖定 / 換地圖搬家 / 切技能）→ 改跟增加最多的那顆
+                    m["tracked"] = max(increased, key=increased.get)
+                m["last_inc"] = now
 
-            # 已鎖定 → 監控該位址
-            v = sc.read_value(m["active"], SIG.vt)
-            if v is None:
-                v = m["value"]  # 讀不到（遊戲可能關了）→ 視為未變動，讓計時繼續
-            if v != m["value"]:
-                m["value"] = v
-                m["last_change"] = now
-            dur = now - m["last_change"]
-            if dur >= NO_CHANGE_SECS:
-                # 疑似卡住 → 先重新定位確認：只要這台還有任何一顆球在動，
-                # 就代表結構被搬走了（或本來就鎖錯顆），改鎖到在動的那顆、
-                # 計時歸零，不誤報。連重新定位都找不到在動的球，才是真的停了。
-                if self._reverify_active(m, now):
-                    self._set_row(r, m["value"], 0.0, "監控中（已重新定位）")
-                else:
-                    stalled.append(self._acct(m["title"]))
-                    self._set_row(r, m["value"], 0.0, "⚠ 已滿/停止")
+            # 更新顯示值 = 跟隨那顆的現值
+            tr = m["tracked"]
+            if tr is not None and cur.get(tr) is not None:
+                m["value"] = cur[tr]
+
+            # 「突然掃不到特徵」通常代表斷線／遊戲關了，等同「沒有球在動」，照樣倒數。
+            lost = not cur
+            if m["last_inc"] is None:
+                # 還沒鎖定過 → 不倒數（先有變動才算 5 分鐘）。
+                self._set_row(r, m["value"],
+                              "定位中…（掃不到特徵）" if lost else "等待變動以鎖定技能…")
             else:
-                rate = 0.0
-                dt = now - m["t_lock"]
-                if m["v_lock"] is not None and m["value"] is not None and dt > 3:
-                    rate = (m["value"] - m["v_lock"]) / dt * 3600
-                self._set_row(r, m["value"], rate, f"監控中（{int(dur)}s 未變）")
+                quiet = now - m["last_inc"]
+                if quiet >= NO_CHANGE_SECS:
+                    stalled.append(self._acct(m["title"]))
+                    self._set_row(r, m["value"],
+                                  "⚠ 掃不到特徵（可能斷線）" if lost else "⚠ 已滿/停止")
+                elif lost:
+                    self._set_row(r, m["value"], f"掃不到特徵…（{int(quiet)}s，可能斷線）")
+                else:
+                    self._set_row(r, m["value"], f"監控中（{int(quiet)}s 未增加）")
+            m["prev"] = cur
 
         if stalled:
             # 任何一台觸發 → 響警報 + 整個監控停掉（等同按停止），要自己重按「開始監控」。
             self._alarm_and_stop(stalled)
 
-    def _reverify_active(self, m: dict, now: float) -> bool:
-        """疑似卡住 → 對這一台重新定位，確認是否還有球正在增加。
-
-        天使之戀的技能結構是動態配置的，升級 / 換角 / 換地圖 / 重連都可能把它搬到
-        別的位址；一旦搬走，原本鎖定的固定位址會凍住或讀不到，就會被誤判成「已滿」。
-        這裡重新用 AOB 掃一次、讀兩次找出「當下正在增加」的球：
-          - 找到 → 結構搬家了（或原本鎖錯顆），改鎖到新位址、計時歸零，回傳 True（別響警報）。
-          - 找不到 → 連新定位都沒有球在動 → 真的滿了 / 停了 / 斷線，回傳 False（該響警報）。
-
-        注意：只在倒數達標（每台最多一次）時才呼叫，屬罕見事件；為求邏輯單純採同步執行，
-        會有約 1 秒的短暫停頓，不影響平常每秒輪詢。
-        """
-        sc = m["sc"]
-        try:
-            cands = aob.scan(sc, SIG, limit=SCAN_LIMIT)
-        except Exception:
-            cands = []
-        if not cands:
-            return False
-        first = {a: sc.read_value(a, SIG.vt) for a in cands}
-        time.sleep(REVERIFY_GAP_SECS)
-        best_a, best_d = None, 0
-        for a in cands:
-            v1, v2 = first.get(a), sc.read_value(a, SIG.vt)
-            if v1 is None or v2 is None:
-                continue
-            d = v2 - v1
-            if d > best_d:
-                best_d, best_a = d, a
-        if best_a is None or best_d <= 0:
-            return False  # 沒有任何球在動 → 真的停了
-        # 找到仍在增加的球 → 改鎖到它，等同「偵測到一次新的變動」，5 分鐘計時重新起算。
-        cur = sc.read_value(best_a, SIG.vt)
-        m["cands"] = cands
-        m["v0"] = first
-        m["active"] = best_a
-        m["value"] = cur
-        m["last_change"] = now
-        m["v_lock"], m["t_lock"] = cur, now
-        return True
-
-    def _set_row(self, r: int, value, rate, status: str) -> None:
+    def _set_row(self, r: int, value, status: str) -> None:
         self.table.setItem(r, 2, QTableWidgetItem(
             "—" if value is None else str(value)))
-        self.table.setItem(r, 3, QTableWidgetItem(
-            "—" if rate is None else f"+{rate:,.0f}/時"))
-        self.table.setItem(r, 4, QTableWidgetItem(status))
+        self.table.setItem(r, 3, QTableWidgetItem(status))
 
     # ------------------------------------------------------------------
     # 警報
@@ -372,15 +373,38 @@ class MonitorTab(BaseTab):
         self._alarm_dialog.raise_()
         self._alarm_dialog.activateWindow()
         # 整個監控停掉（等同按停止），但警報聲繼續響到按「停止警報」
-        self._stop_monitoring("已停止（觸發警報）— 請按『開始監控』重新開始")
+        self._stop_worker()
+        self._close_scanners()
+        self._reset_ui("已停止（觸發警報）— 請按『開始監控』重新開始")
 
-    def _stop_monitoring(self, status: str = "已停止") -> None:
-        self._timer.stop()
+    # ------------------------------------------------------------------
+    # 生命週期
+    # ------------------------------------------------------------------
+    def _stop_worker(self) -> None:
+        """停掉兩條背景執行緒並等它們結束（一定要在關閉 scanner 前呼叫）。"""
+        if self._read_worker:
+            try:
+                self._read_worker.snapshot.disconnect(self._on_snapshot)
+            except Exception:
+                pass
+            self._read_worker.stop()
+        if self._scan_worker:
+            self._scan_worker.stop()
+        if self._read_worker:
+            self._read_worker.wait(5000)
+            self._read_worker = None
+        if self._scan_worker:
+            self._scan_worker.wait(8000)  # 可能正卡在一次全掃，等久一點
+            self._scan_worker = None
+
+    def _close_scanners(self) -> None:
         for m in self._mons.values():
             try:
                 m["sc"].close()
             except Exception:
                 pass
+
+    def _reset_ui(self, status: str) -> None:
         self._mons = {}
         self.table.setRowCount(0)
         self.start_btn.setEnabled(True)
@@ -397,18 +421,13 @@ class MonitorTab(BaseTab):
             self._alarm_dialog.hide()
         self._alarm_accts = []
 
-    # ------------------------------------------------------------------
     def stop(self) -> None:
         self._stop_alarm()
-        self._stop_monitoring("已停止")
+        self._stop_worker()
+        self._close_scanners()
+        self._reset_ui("已停止")
 
     def on_close(self) -> None:
-        self._timer.stop()
         self._stop_alarm()
-        if self._worker and self._worker.isRunning():
-            self._worker.wait(5000)
-        for m in self._mons.values():
-            try:
-                m["sc"].close()
-            except Exception:
-                pass
+        self._stop_worker()
+        self._close_scanners()
