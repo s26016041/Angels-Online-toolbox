@@ -99,21 +99,24 @@ def main() -> None:
     for d in ("build", "dist"):
         shutil.rmtree(ROOT / d, ignore_errors=True)
 
-    # 編譯單一 .exe（GUI 程式 → --windowed；lazy import 的套件要 --collect-all）
+    # 一律用 AngelsOnlineToolbox.spec 編（單一設定來源，發布版＝本地版）。
+    # spec 裡已用 collect_submodules('app') 收動態載入的分頁，不能用裸 CLI flag
+    # 編，否則會漏收分頁 → 打包後一片白。
     print("\n開始編譯 .exe（第一次可能要幾分鐘）…")
     rc = sh([
         sys.executable, "-m", "PyInstaller",
-        "--onefile", "--windowed", "--clean", "--noconfirm",
-        "--name", EXE_NAME,
-        "--add-data", "VERSION;.",  # 把版本檔收進 exe，app 才讀得到版本
-        "--collect-all", "keystone",
-        "--collect-all", "pymem",
-        "--collect-all", "pefile",
-        "main.py",
+        "--clean", "--noconfirm",
+        "AngelsOnlineToolbox.spec",
     ])
     exe = ROOT / "dist" / f"{EXE_NAME}.exe"
     if rc != 0 or not exe.exists():
         die("編譯失敗，請看上面 PyInstaller 的訊息。")
+
+    # 冒煙測試：實際跑打包好的 exe，確認分頁真的載入（避免又是白屏才發現）。
+    print("\n冒煙測試：執行打包後的 exe --selftest …")
+    if sh([str(exe), "--selftest"]) != 0:
+        die("冒煙測試失敗：打包後的 exe 沒有載入任何分頁，發布中止。請用 build_local.py --debug 追查。")
+    print("✓ 冒煙測試通過。")
     size_mb = exe.stat().st_size // (1024 * 1024)
     print(f"\n✓ 編譯完成：{exe}（約 {size_mb} MB）")
 

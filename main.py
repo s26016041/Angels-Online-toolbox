@@ -1,25 +1,104 @@
 """天使之戀工具箱 — 程式進入點。
 
 執行方式：
-    py main.py
+    py main.py              正常啟動 GUI
+    py main.py --selftest   自我測試：不開視窗，離線建立主視窗並檢查分頁有無載入，
+                            成功回傳 0、失敗回傳非 0（本地打包後的冒煙測試會用它）。
 """
 from __future__ import annotations
 
+import os
 import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
 
-from app import __app_name__
-from app.main_window import MainWindow
+def _log_dir() -> Path:
+    """崩潰記錄放使用者 AppData，打包成 exe 後也寫得進去。"""
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    path = Path(base) / "AngelsOnlineToolbox"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return Path(".")
+    return path
+
+
+def _install_excepthook() -> None:
+    """全域例外攔截：把 traceback 寫進 log，並盡量跳訊息框。
+
+    打包成 --windowed 的 exe 沒有主控台，未攔截的例外會靜默死掉（就是這次
+    白屏 / 閃退看不到原因的根源）。裝了這個之後，未來任何未捕捉例外都會留下
+    紀錄檔，也會彈出可讀的錯誤視窗。
+    """
+
+    def handler(exc_type, exc_value, exc_tb) -> None:
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            log_path = _log_dir() / "crash.log"
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+                f.write(text)
+        except OSError:
+            log_path = None
+
+        # 先印到主控台（除錯版看得到），再嘗試跳訊息框（正式版看得到）。
+        sys.stderr.write(text)
+        try:
+            from PySide6.QtWidgets import QApplication, QMessageBox
+
+            if QApplication.instance() is not None:
+                box = QMessageBox()
+                box.setIcon(QMessageBox.Critical)
+                box.setWindowTitle("程式發生未預期的錯誤")
+                box.setText("程式遇到未處理的例外，即將關閉。")
+                detail = text
+                if log_path is not None:
+                    detail = f"紀錄檔：{log_path}\n\n{text}"
+                box.setDetailedText(detail)
+                box.exec()
+        except Exception:
+            pass
+
+    sys.excepthook = handler
+
+
+def _build_main_window():
+    """建立並回傳主視窗（供正常啟動與自我測試共用）。"""
+    from app import __app_name__
+    from app.main_window import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName(__app_name__)
+    return app, MainWindow()
+
+
+def _selftest() -> int:
+    """離線建立主視窗，檢查分頁確實有載入。回傳 0=成功、1=失敗。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from app import __version__
+
+    _app, window = _build_main_window()
+    count = len(getattr(window, "_loaded_tabs", []))
+    print(f"[selftest] 版本 = {__version__}")
+    print(f"[selftest] 已載入分頁數 = {count}")
+    if count <= 0:
+        print("[selftest] 失敗：沒有任何分頁被載入（打包遺漏了 app.* 子模組？）")
+        return 1
+    print("[selftest] 成功：分頁載入正常。")
+    return 0
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
-    app.setApplicationName(__app_name__)
+    _install_excepthook()
 
-    window = MainWindow()
+    if "--selftest" in sys.argv:
+        return _selftest()
+
+    app, window = _build_main_window()
     window.show()
-
     return app.exec()
 
 

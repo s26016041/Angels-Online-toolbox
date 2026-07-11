@@ -87,6 +87,15 @@ class MainWindow(QMainWindow):
 
         if not self._loaded_tabs:
             self.statusBar().showMessage("尚未載入任何分頁")
+            # 空視窗（一片白）通常代表打包時漏收了 app.tabs.* 子模組，
+            # 或分頁在 import 階段就全部失敗。明確跳出訊息，不要靜默白屏。
+            QMessageBox.critical(
+                self,
+                "沒有可用的分頁",
+                "找不到任何分頁，視窗會是空的。\n\n"
+                "若這是打包後的 .exe，通常是漏收了 app 底下的分頁模組；\n"
+                "請確認 spec 有 collect_submodules('app')，或改用 build_local.py 重新編譯。",
+            )
         else:
             self.statusBar().showMessage(
                 f"已載入 {len(self._loaded_tabs)} 個分頁"
