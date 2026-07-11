@@ -10,6 +10,11 @@ env/
 captures/
 *.log
 
+# 封包擷取 / 記憶體除錯產物（大檔、非原始碼）
+*.etl
+*.pcapng
+*.dmp
+
 # 打包輸出
 build/
 dist/
