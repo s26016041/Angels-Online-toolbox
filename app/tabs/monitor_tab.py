@@ -16,7 +16,9 @@
 """
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -117,8 +119,18 @@ class ReadWorker(QThread):
         self._running = False
 
 
-class AlarmThread(QThread):
-    """循環發出警報嗶聲，直到 stop()。"""
+ALARM_MP3 = "music/Alarm_music.mp3"
+
+
+def _resource(rel: str) -> Path:
+    """資源檔路徑：開發時相對專案根目錄；打包成 exe 後在 PyInstaller 解壓目錄。"""
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / rel
+    return Path(__file__).resolve().parents[2] / rel
+
+
+class BeepThread(QThread):
+    """後備方案：mp3 播不出來時，用循環嗶聲，直到 stop()。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -138,6 +150,60 @@ class AlarmThread(QThread):
 
     def stop(self) -> None:
         self._on = False
+
+
+class Alarm:
+    """警報聲：優先『循環播放 music/Alarm_music.mp3』；播不出來則退回嗶聲。
+
+    QMediaPlayer 必須在有事件迴圈的執行緒建立/使用，因此本類別由 UI 主執行緒持有
+    與操作（警報是在 UI 執行緒觸發的）。
+    """
+
+    def __init__(self, parent=None) -> None:
+        self._parent = parent
+        self._player = None
+        self._audio = None
+        self._beep: BeepThread | None = None
+
+    def start(self) -> None:
+        if self._player is not None or (self._beep and self._beep.isRunning()):
+            return  # 已經在響
+        if not self._start_mp3():
+            self._beep = BeepThread()
+            self._beep.start()
+
+    def _start_mp3(self) -> bool:
+        path = _resource(ALARM_MP3)
+        if not path.exists():
+            return False
+        try:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+            self._audio = QAudioOutput()
+            self._player = QMediaPlayer(self._parent)
+            self._player.setAudioOutput(self._audio)
+            self._player.setLoops(QMediaPlayer.Loops.Infinite)  # 循環播放到 stop()
+            self._player.setSource(QUrl.fromLocalFile(str(path)))
+            self._player.play()
+            return True
+        except Exception:
+            self._player = None
+            self._audio = None
+            return False
+
+    def stop(self) -> None:
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            self._player = None
+            self._audio = None
+        if self._beep is not None:
+            self._beep.stop()
+            self._beep.wait(2000)
+            self._beep = None
 
 
 class AlarmDialog(QDialog):
@@ -178,7 +244,7 @@ class MonitorTab(BaseTab):
         self._cands: dict[int, list] = {}   # {pid: [addr,...]}，ScanWorker 寫、ReadWorker 讀
         self._scan_worker: ScanWorker | None = None
         self._read_worker: ReadWorker | None = None
-        self._alarm_thread: AlarmThread | None = None
+        self._alarm = Alarm(self)
         self._alarm_dialog: AlarmDialog | None = None
         self._alarm_accts: list[str] = []
 
@@ -363,9 +429,7 @@ class MonitorTab(BaseTab):
         for a in accounts:
             if a not in self._alarm_accts:
                 self._alarm_accts.append(a)
-        if self._alarm_thread is None or not self._alarm_thread.isRunning():
-            self._alarm_thread = AlarmThread()
-            self._alarm_thread.start()
+        self._alarm.start()
         if self._alarm_dialog is None:
             self._alarm_dialog = AlarmDialog(self, self._stop_alarm)
         self._alarm_dialog.set_accounts(self._alarm_accts)
@@ -413,10 +477,7 @@ class MonitorTab(BaseTab):
         self.status.setText(status)
 
     def _stop_alarm(self) -> None:
-        if self._alarm_thread:
-            self._alarm_thread.stop()
-            self._alarm_thread.wait(2000)
-            self._alarm_thread = None
+        self._alarm.stop()
         if self._alarm_dialog:
             self._alarm_dialog.hide()
         self._alarm_accts = []

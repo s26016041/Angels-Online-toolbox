@@ -13,12 +13,14 @@ import os
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-datas = [('VERSION', '.')]
+datas = [('VERSION', '.'), ('music', 'music')]  # music/：警報聲 mp3
 binaries = []
 hiddenimports = []
 
 # 動態載入的分頁 / 核心模組（連同它們的相依）都要明確收進來。
 hiddenimports += collect_submodules('app')
+# 警報聲用 QtMultimedia 播 mp3（在函式內 lazy import，明確列入以確保連同音訊後端一起收）。
+hiddenimports += ['PySide6.QtMultimedia']
 
 # 這幾個套件是 lazy import / 有原生 DLL，需要 collect_all 才收得齊。
 for pkg in ('keystone', 'pymem', 'pefile'):
