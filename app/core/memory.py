@@ -543,6 +543,34 @@ class MemoryScanner:
         hits.sort(key=lambda h: h[0])
         return hits
 
+    def filter_string_hits(
+        self, hits, text: str, progress=None
+    ) -> list[tuple[int, str, int]]:
+        """字串「再次搜尋」：在既有命中位址中，只保留『現在的內容仍等於 text』的。
+
+        每個命中沿用它當初的編碼，把 text 用該編碼編碼後、讀相同長度的位元組比對。
+        典型用法：先搜一個字串得到很多命中 → 在遊戲裡把該欄位改成新文字 → 輸入新
+        文字再次搜尋 → 只有你真正在改的那個位址會留下來（等同數值搜尋的逐步縮小）。
+
+        hits 與回傳皆為 [(位址, 編碼 codec 名, 位元組長度), ...]，依位址排序。
+        """
+        self._require_handle()
+        out: list[tuple[int, str, int]] = []
+        total = len(hits) or 1
+        for i, (addr, enc, _blen) in enumerate(hits):
+            try:
+                pat = text.encode(enc, errors="strict")
+            except Exception:
+                pat = b""
+            if pat:
+                raw = self._read_bytes(addr, len(pat))
+                if raw is not None and raw == pat:
+                    out.append((addr, enc, len(pat)))
+            if progress:
+                progress((i + 1) / total)
+        out.sort(key=lambda h: h[0])
+        return out
+
     def read_string(self, addr: int, byte_len: int, enc_key: str) -> str | None:
         """從位址讀出指定位元組數並依編碼解碼；失敗回傳 None。
 

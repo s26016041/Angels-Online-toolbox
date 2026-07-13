@@ -17,23 +17,29 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
 
+from app.config import config
+from app.core import charname, notify
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import aob
@@ -58,17 +64,25 @@ class ScanWorker(QThread):
     候選清單 self._cands 是與 ReadWorker 共享的 dict（本執行緒寫、對方讀）。
     """
 
-    def __init__(self, insts, cands: dict) -> None:
+    def __init__(self, insts, cands: dict, names: dict) -> None:
         super().__init__()
         self._insts = insts  # [(pid, title, sc), ...]
         self._cands = cands
+        self._names = names   # {pid: 角色名}，本執行緒解一次、UI 讀
         self._running = True
 
     def run(self) -> None:
         while self._running:
-            for pid, _title, sc in self._insts:
+            for pid, title, sc in self._insts:
                 if not self._running:
                     return
+                # 角色名解一次就好（存檔路徑不會變）；失敗記 "?" 不重試。
+                if pid not in self._names:
+                    try:
+                        self._names[pid] = charname.read_character_name(
+                            sc, charname.account_from_title(title)) or "?"
+                    except Exception:
+                        self._names[pid] = "?"
                 try:
                     self._cands[pid] = aob.scan(sc, SIG, limit=SCAN_LIMIT)
                 except Exception:
@@ -232,6 +246,7 @@ class AlarmDialog(QDialog):
         self.label.setText(
             "以下分身的技能經驗球滿了、或遊戲停止/斷線了\n"
             f"（數值持續 {dur} 沒有再增加）：\n\n" + body
+            + "\n\n畫面已凍結保留最後資料。處理完記得按『開始監控』重新偵測。"
         )
 
 
@@ -242,6 +257,7 @@ class MonitorTab(BaseTab):
     def build_ui(self) -> None:
         self._mons: dict[int, dict] = {}
         self._cands: dict[int, list] = {}   # {pid: [addr,...]}，ScanWorker 寫、ReadWorker 讀
+        self._names: dict[int, str] = {}    # {pid: 角色名}，ScanWorker 解、UI 讀
         self._scan_worker: ScanWorker | None = None
         self._read_worker: ReadWorker | None = None
         self._alarm = Alarm(self)
@@ -251,9 +267,11 @@ class MonitorTab(BaseTab):
         root = QVBoxLayout(self)
         root.addWidget(
             QLabel(
-                "即時監控每個分身正在練的技能經驗球。每輪都重新掃特徵、自動追最新位址，\n"
-                "換地圖 / 重連 / 升級都不會跑掉。某台「持續 5 分鐘沒再增加」（滿了或停止）→ "
-                "自動停該台 + 警報聲 + 跳視窗提示。"
+                "即時監控每個分身正在練的技能經驗球。每輪都重新掃特徵、自動追最新位址，"
+                "換地圖 / 重連 / 升級都不會跑掉。\n"
+                "某台「持續 5 分鐘沒再增加」（滿了或停止）→ 警報聲 + 跳視窗提示，並『凍結』"
+                "畫面（像暫停）保留最後資料。\n"
+                "⚠ 處理完記得按「開始監控」重新偵測，畫面才會繼續更新。"
             )
         )
         row = QHBoxLayout()
@@ -272,18 +290,46 @@ class MonitorTab(BaseTab):
         row.addStretch(1)
         root.addLayout(row)
 
-        self.table = QTableWidget(0, 4)
+        # 通知方式：音效 or Telegram（選擇與房間 ID 都存進設定，下次自動帶回）
+        notify_row = QHBoxLayout()
+        notify_row.addWidget(QLabel("通知方式："))
+        self.notify_sound_rb = QRadioButton("音效警報")
+        self.notify_tg_rb = QRadioButton("Telegram 通知")
+        self._notify_grp = QButtonGroup(self)
+        self._notify_grp.addButton(self.notify_sound_rb)
+        self._notify_grp.addButton(self.notify_tg_rb)
+        notify_row.addWidget(self.notify_sound_rb)
+        notify_row.addWidget(self.notify_tg_rb)
+        notify_row.addWidget(QLabel("群組/房間 ID："))
+        self.tg_id_edit = QLineEdit()
+        self.tg_id_edit.setPlaceholderText("Telegram 群組/房間 ID")
+        self.tg_id_edit.setMaximumWidth(220)
+        notify_row.addWidget(self.tg_id_edit)
+        notify_row.addStretch(1)
+        root.addLayout(notify_row)
+        # 從設定載入（先設好再接訊號，避免載入時誤觸存檔）
+        self.tg_id_edit.setText(str(config.get("monitor.telegram_id", "")))
+        if config.get("monitor.notify_method", "sound") == "telegram":
+            self.notify_tg_rb.setChecked(True)
+        else:
+            self.notify_sound_rb.setChecked(True)
+        self.tg_id_edit.setEnabled(self.notify_tg_rb.isChecked())
+        self.notify_tg_rb.toggled.connect(self._on_notify_changed)
+        self.tg_id_edit.editingFinished.connect(self._save_tg_id)
+
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["帳號", "PID", "技能經驗球", "狀態"]
+            ["角色", "帳號", "PID", "技能經驗球", "狀態"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         hdr = self.table.horizontalHeader()
-        # 前三欄貼齊內容寬度，「狀態」欄吃掉剩餘空間 → 長狀態字不用手動拉就完整顯示。
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 帳號
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # PID
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 技能經驗球
-        hdr.setSectionResizeMode(3, QHeaderView.Stretch)           # 狀態
+        # 前四欄貼齊內容寬度，「狀態」欄吃掉剩餘空間 → 長狀態字不用手動拉就完整顯示。
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 角色
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 帳號
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # PID
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 技能經驗球
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)           # 狀態
         self.table.verticalHeader().setDefaultSectionSize(30)
         root.addWidget(self.table)
 
@@ -309,6 +355,24 @@ class MonitorTab(BaseTab):
     @staticmethod
     def _acct(title: str) -> str:
         return title.split(" - ", 1)[1] if " - " in title else title
+
+    def _stalled_entry(self, pid: int, m: dict) -> dict:
+        """一台觸發警報時的顯示名 = 帳號 + 角色名（警告視窗與 Telegram 通知都用它）。"""
+        acc = charname.account_from_title(m["title"])
+        ch = self._names.get(pid)
+        name = f"{acc}（{ch}）" if ch and ch != "?" else acc
+        return {"name": name}
+
+    # --- 通知方式設定（存進 config，下次自動帶回）------------------------------
+    def _on_notify_changed(self) -> None:
+        tg = self.notify_tg_rb.isChecked()
+        config.set("monitor.notify_method", "telegram" if tg else "sound")
+        config.save()
+        self.tg_id_edit.setEnabled(tg)
+
+    def _save_tg_id(self) -> None:
+        config.set("monitor.telegram_id", self.tg_id_edit.text().strip())
+        config.save()
 
     # ------------------------------------------------------------------
     # 開始 / 停止 / 重新探索
@@ -337,6 +401,7 @@ class MonitorTab(BaseTab):
         self._begin(insts)
 
     def _begin(self, insts) -> None:
+        self._names = {}   # 重新探索 → 重新解角色名（換角色也能更新）
         self._mons = {
             pid: {
                 "title": title, "sc": sc,
@@ -350,8 +415,8 @@ class MonitorTab(BaseTab):
         self._rebuild_table()
         insts = [(pid, m["title"], m["sc"]) for pid, m in self._mons.items()]
         self._cands = {pid: [] for pid, _t, _s in insts}
-        # 慢執行緒定期重掃特徵更新候選位址；快執行緒每 ~0.7s 讀值更新畫面。
-        self._scan_worker = ScanWorker(insts, self._cands)
+        # 慢執行緒定期重掃特徵 + 解角色名；快執行緒每 ~0.7s 讀值更新畫面。
+        self._scan_worker = ScanWorker(insts, self._cands, self._names)
         self._read_worker = ReadWorker(insts, self._cands)
         self._read_worker.snapshot.connect(self._on_snapshot)
         self._scan_worker.start()
@@ -364,10 +429,11 @@ class MonitorTab(BaseTab):
     def _rebuild_table(self) -> None:
         self.table.setRowCount(len(self._mons))
         for r, (pid, m) in enumerate(self._mons.items()):
-            self.table.setItem(r, 0, QTableWidgetItem(self._acct(m["title"])))
-            self.table.setItem(r, 1, QTableWidgetItem(str(pid)))
-            self.table.setItem(r, 2, QTableWidgetItem("…"))
-            self.table.setItem(r, 3, QTableWidgetItem("定位中…"))
+            self.table.setItem(r, 0, QTableWidgetItem(self._names.get(pid) or "…"))
+            self.table.setItem(r, 1, QTableWidgetItem(self._acct(m["title"])))
+            self.table.setItem(r, 2, QTableWidgetItem(str(pid)))
+            self.table.setItem(r, 3, QTableWidgetItem("…"))
+            self.table.setItem(r, 4, QTableWidgetItem("定位中…"))
 
     # ------------------------------------------------------------------
     # 每輪快照處理（在 UI 執行緒，由背景 worker 的訊號觸發）
@@ -381,6 +447,13 @@ class MonitorTab(BaseTab):
             cur = snap.get(pid)
             if cur is None:
                 continue  # 這輪沒有這台的資料
+
+            # 角色名由 ScanWorker 背景解出，解到後補上「角色」欄
+            nm = self._names.get(pid)
+            if nm and nm != "?":
+                item0 = self.table.item(r, 0)
+                if item0 is None or item0.text() != nm:
+                    self.table.setItem(r, 0, QTableWidgetItem(nm))
 
             prev = m["prev"]
             # 這輪相對上一輪「有增加」的位址們（cur 為空→掃不到特徵→自然沒有任何增加）
@@ -410,7 +483,7 @@ class MonitorTab(BaseTab):
             else:
                 quiet = now - m["last_inc"]
                 if quiet >= NO_CHANGE_SECS:
-                    stalled.append(self._acct(m["title"]))
+                    stalled.append(self._stalled_entry(pid, m))
                     self._set_row(r, m["value"],
                                   "⚠ 掃不到特徵（可能斷線）" if lost else "⚠ 已滿/停止")
                 elif lost:
@@ -424,28 +497,53 @@ class MonitorTab(BaseTab):
             self._alarm_and_stop(stalled)
 
     def _set_row(self, r: int, value, status: str) -> None:
-        self.table.setItem(r, 2, QTableWidgetItem(
+        self.table.setItem(r, 3, QTableWidgetItem(
             "—" if value is None else str(value)))
-        self.table.setItem(r, 3, QTableWidgetItem(status))
+        self.table.setItem(r, 4, QTableWidgetItem(status))
 
     # ------------------------------------------------------------------
     # 警報
     # ------------------------------------------------------------------
-    def _alarm_and_stop(self, accounts) -> None:
-        for a in accounts:
-            if a not in self._alarm_accts:
-                self._alarm_accts.append(a)
-        self._alarm.start()
+    def _alarm_and_stop(self, stalled) -> None:
+        for s in stalled:
+            if s["name"] not in self._alarm_accts:
+                self._alarm_accts.append(s["name"])
+        # 依使用者選的通知方式：Telegram → 送通知、不放音樂；否則 → 音效警報。
+        if self.notify_tg_rb.isChecked():
+            note = self._send_telegram(stalled)
+        else:
+            self._alarm.start()
+            note = ""
+        # 兩種方式都還是跳警告視窗
         if self._alarm_dialog is None:
             self._alarm_dialog = AlarmDialog(self, self._stop_alarm)
         self._alarm_dialog.set_accounts(self._alarm_accts)
         self._alarm_dialog.show()
         self._alarm_dialog.raise_()
         self._alarm_dialog.activateWindow()
-        # 整個監控停掉（等同按停止），但警報聲繼續響到按「停止警報」
+        # 停止背景更新，但『凍結』畫面（保留最後資料，像按暫停）；警報聲繼續響到按「停止警報」。
         self._stop_worker()
         self._close_scanners()
-        self._reset_ui("已停止（觸發警報）— 請按『開始監控』重新開始")
+        msg = "⚠ 已凍結（觸發警報）— 處理完記得按『開始監控』重新偵測，畫面才會繼續更新"
+        self._reset_ui(msg + (f"　｜　{note}" if note else ""), clear_table=False)
+
+    def _send_telegram(self, stalled) -> str:
+        """背景送 Telegram 通知（每台一則，name=帳號+角色名）。回傳給狀態列的短訊。"""
+        room_id = self.tg_id_edit.text().strip()
+        if not room_id:
+            return "⚠ 未填 Telegram 群組/房間 ID，通知未送出"
+        dur = f"{NO_CHANGE_SECS // 60} 分鐘" if NO_CHANGE_SECS >= 60 else f"{NO_CHANGE_SECS} 秒"
+        content = f"⚠ 技能經驗球已滿或停止（連續 {dur} 沒再增加），請處理。"
+        names = [s["name"] for s in stalled]
+
+        def worker():
+            for nm in names:
+                ok, info = notify.send_telegram(room_id, nm, content)
+                if not ok:
+                    sys.stderr.write(f"[telegram] 送出失敗 {nm}: {info}\n")
+
+        threading.Thread(target=worker, daemon=True).start()
+        return f"已送出 Telegram 通知（{len(names)} 則）"
 
     # ------------------------------------------------------------------
     # 生命週期
@@ -474,9 +572,11 @@ class MonitorTab(BaseTab):
             except Exception:
                 pass
 
-    def _reset_ui(self, status: str) -> None:
+    def _reset_ui(self, status: str, clear_table: bool = True) -> None:
         self._mons = {}
-        self.table.setRowCount(0)
+        if clear_table:
+            self.table.setRowCount(0)
+        # clear_table=False → 保留表格最後資料（凍結/暫停顯示），內部狀態仍重置。
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.rescan_btn.setEnabled(False)

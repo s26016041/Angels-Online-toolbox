@@ -214,13 +214,6 @@ class MemoryTab(BaseTab):
         row.addWidget(self.value_edit, stretch=1)
         lay.addLayout(row)
 
-        opt_row = QHBoxLayout()
-        self.writable_chk = QCheckBox("只搜尋可寫入區段（較快、較省記憶體，建議勾選）")
-        self.writable_chk.setChecked(True)
-        opt_row.addWidget(self.writable_chk)
-        opt_row.addStretch(1)
-        lay.addLayout(opt_row)
-
         btn_row = QHBoxLayout()
         self.first_btn = QPushButton("首次搜尋")
         self.first_btn.clicked.connect(self.do_first_scan)
@@ -265,12 +258,18 @@ class MemoryTab(BaseTab):
             opt.addWidget(chk)
         self.str_btn = QPushButton("搜尋字串")
         self.str_btn.clicked.connect(self.do_string_scan)
+        self.str_next_btn = QPushButton("再次搜尋")
+        self.str_next_btn.setEnabled(False)
+        self.str_next_btn.clicked.connect(self.do_string_next_scan)
         opt.addStretch(1)
         opt.addWidget(self.str_btn)
+        opt.addWidget(self.str_next_btn)
         lay.addLayout(opt)
         lay.addWidget(
             QLabel(
-                "結果會出現在下方「③ 搜尋結果」，可直接『找指標路徑』或『加入觀察』。"
+                "結果會出現在下方「③ 搜尋結果」，可『加入觀察』。\n"
+                "要縮小範圍：在遊戲裡把該文字改成新的 → 輸入新文字按「再次搜尋」，"
+                "只會留下真正在改的那個位址。"
             )
         )
         return box
@@ -421,10 +420,9 @@ class MemoryTab(BaseTab):
                 "「增加 / 減少 / 改變」要先有一輪結果才能比較。",
             )
             return
-        writable_only = self.writable_chk.isChecked()
         self._run_scan(
             lambda progress: self._scanner.first_scan(
-                vt, scan_type, value, writable_only, progress
+                vt, scan_type, value, False, progress  # 一律搜尋全部記憶體（不分可否寫入）
             ),
             f"首次搜尋（{SCAN_TYPE_LABEL.get(scan_type, scan_type)}）…",
         )
@@ -494,16 +492,46 @@ class MemoryTab(BaseTab):
         if not encs:
             QMessageBox.warning(self, "缺少編碼", "請至少勾選一種編碼。")
             return
-        writable = self.writable_chk.isChecked()
         self._scanner.reset()  # 字串搜尋獨立於數值搜尋，先清掉數值狀態
         self._clear_results()
 
         def job(progress):
-            self._str_hits = self._scanner.search_string(text, encs, writable, progress)
+            # 一律搜尋全部記憶體（不分可否寫入）
+            self._str_hits = self._scanner.search_string(text, encs, False, progress)
             return len(self._str_hits)
 
         self._set_scanning(True)
         self.scan_status.setText(f"搜尋字串「{text}」…")
+        self.progress.setValue(0)
+        self._worker = ScanWorker(job)
+        self._worker.progress.connect(self.progress.setValue)
+        self._worker.done.connect(self._on_string_done)
+        self._worker.failed.connect(self._on_scan_failed)
+        self._worker.start()
+
+    def do_string_next_scan(self) -> None:
+        """字串再次搜尋：在既有命中中，只保留現在內容仍等於輸入文字的位址。"""
+        if not self._scanner.attached:
+            QMessageBox.information(self, "提示", "請先選定程序。")
+            return
+        if not self._str_hits:
+            QMessageBox.information(self, "提示", "請先做一次字串搜尋。")
+            return
+        text = self.str_edit.text()
+        if not text:
+            QMessageBox.warning(
+                self, "缺少文字",
+                "請輸入要比對的新文字（可先在遊戲裡把該欄位改成新文字）。",
+            )
+            return
+        prev = list(self._str_hits)
+
+        def job(progress):
+            self._str_hits = self._scanner.filter_string_hits(prev, text, progress)
+            return len(self._str_hits)
+
+        self._set_scanning(True)
+        self.scan_status.setText(f"再次搜尋字串「{text}」…（在 {len(prev)} 筆中縮小）")
         self.progress.setValue(0)
         self._worker = ScanWorker(job)
         self._worker.progress.connect(self.progress.setValue)
@@ -538,6 +566,7 @@ class MemoryTab(BaseTab):
     # ------------------------------------------------------------------
     def _populate_results(self, count: int) -> None:
         self._str_result_meta = {}  # 這是數值結果，非字串
+        self._str_hits = []  # 數值結果 → 字串命中作廢，停用字串『再次搜尋』
         rows = self._scanner.results(limit=RESULT_DISPLAY_LIMIT)
         self.result_table.setRowCount(len(rows))
         for i, (addr, value) in enumerate(rows):
@@ -554,6 +583,7 @@ class MemoryTab(BaseTab):
 
     def _clear_results(self) -> None:
         self.result_table.setRowCount(0)
+        self._str_hits = []  # 清結果同時作廢字串命中，避免『再次搜尋』誤用舊資料
 
     # ------------------------------------------------------------------
     # 觀察清單
@@ -735,12 +765,14 @@ class MemoryTab(BaseTab):
         self.reset_btn.setEnabled(not scanning)
         self.type_combo.setEnabled(not scanning)
         self.str_btn.setEnabled(not scanning and attached)
+        self.str_next_btn.setEnabled(not scanning and attached and bool(self._str_hits))
 
     def _update_enabled(self) -> None:
         attached = self._scanner.attached
         self.first_btn.setEnabled(attached)
         self.next_btn.setEnabled(attached and self._scanner.has_results)
         self.str_btn.setEnabled(attached)
+        self.str_next_btn.setEnabled(attached and bool(self._str_hits))
 
     # ------------------------------------------------------------------
     def on_close(self) -> None:
