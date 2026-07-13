@@ -48,10 +48,15 @@ class AOBSignature:
         return bytes(sig), bytes(mask)
 
 
-def scan(scanner, aob: AOBSignature, writable_only: bool = True, limit: int = 64) -> list[int]:
+def scan(scanner, aob: AOBSignature, writable_only: bool = True, limit: int = 64,
+         should_stop=None) -> list[int]:
     """在程序記憶體找 AOB 樣式，回傳 [目標值位址, ...]。
 
     以「最長連續固定位元組」當搜尋錨點快速定位候選，再逐一驗證整段 masked 樣式。
+
+    should_stop: 可選的 callable，每掃一個記憶體區塊前呼叫一次；回傳 True 就中止並
+    回傳目前找到的（不完整）結果。全掃一個分身要 1～2.5 秒，沒有這個中止點的話，
+    要求它停止的人（例如關閉程式、觸發警報）就得整整等它掃完。
     """
     sig, mask = aob.parse()
     n = len(sig)
@@ -70,6 +75,8 @@ def scan(scanner, aob: AOBSignature, writable_only: bool = True, limit: int = 64
 
     hits: list[int] = []
     for base, size in scanner._iter_regions(writable_only=writable_only):
+        if should_stop is not None and should_stop():
+            return hits
         raw = scanner._read_region(base, size)
         if not raw:
             continue
