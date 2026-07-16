@@ -78,6 +78,17 @@ def enumerate_windows(
     return results
 
 
+def get_window_title(hwnd: int) -> str:
+    """即時讀取指定視窗的目前標題；失敗 / 視窗已關回傳空字串。
+
+    標題會隨遊戲狀態改變（例如切換頻道），所以要拿最新頻道就得重讀，
+    不能只用開始監控當下抓到的舊標題。"""
+    try:
+        return win32gui.GetWindowText(hwnd)
+    except Exception:
+        return ""
+
+
 def enumerate_child_windows(parent_hwnd: int) -> list[WindowInfo]:
     """列舉指定視窗底下的所有子孫視窗。
 

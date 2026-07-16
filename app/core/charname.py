@@ -22,6 +22,19 @@ def account_from_title(title: str) -> str:
     return tail.split("(", 1)[0].strip()
 
 
+def channel_from_title(title: str) -> str:
+    """'Angels Online Global - fred26016041(雅典娜-3)' → '雅典娜-3'；無括號回傳 ''。
+
+    頻道（伺服器名＋頻道號）就在標題最後的括號裡；玩家切頻道時遊戲會改這串，
+    所以只要即時重讀標題就能反映最新頻道。取最後一組括號，避免帳號/角色名裡的括號干擾。
+    """
+    l = title.rfind("(")
+    r = title.rfind(")")
+    if 0 <= l < r:
+        return title[l + 1:r].strip()
+    return ""
+
+
 def _iter_raw(sc):
     for base, size in sc._iter_regions(writable_only=False):
         raw = sc._read_region(base, size)

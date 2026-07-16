@@ -29,6 +29,7 @@ from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QHeaderView,
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from app.config import config
@@ -340,6 +342,10 @@ class MonitorTab(BaseTab):
         self._alarm = Alarm(self)
         self._alarm_dialog: AlarmDialog | None = None
         self._alarm_accts: list[str] = []
+        # 使用者手動關閉警報的帳號名（用帳號名而非 PID：PID 每次開遊戲會變、帳號名不會）。
+        # 存進 config，重開工具 / 重新探索都自動保持關閉。停用只是「不警報」，仍照掃照顯示。
+        self._disabled_accounts: set[str] = set(
+            config.get("monitor.disabled_accounts", []) or [])
 
         root = QVBoxLayout(self)
         self.desc = QLabel()
@@ -412,19 +418,21 @@ class MonitorTab(BaseTab):
         self.notify_tg_rb.toggled.connect(self._on_notify_changed)
         self.tg_id_edit.editingFinished.connect(self._save_tg_id)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["角色", "帳號", "PID", "技能經驗球", "狀態"]
+            ["監控", "角色", "帳號", "頻道", "PID", "技能經驗球", "狀態"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         hdr = self.table.horizontalHeader()
-        # 前四欄貼齊內容寬度，「狀態」欄吃掉剩餘空間 → 長狀態字不用手動拉就完整顯示。
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 角色
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 帳號
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # PID
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 技能經驗球
-        hdr.setSectionResizeMode(4, QHeaderView.Stretch)           # 狀態
+        # 前六欄貼齊內容寬度，「狀態」欄吃掉剩餘空間 → 長狀態字不用手動拉就完整顯示。
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 監控（勾選 = 會警報）
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 角色
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 帳號
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 頻道
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # PID
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # 技能經驗球
+        hdr.setSectionResizeMode(6, QHeaderView.Stretch)           # 狀態
         self.table.verticalHeader().setDefaultSectionSize(30)
         root.addWidget(self.table)
 
@@ -444,12 +452,8 @@ class MonitorTab(BaseTab):
                 sc.open(w.pid)
             except Exception:
                 continue
-            insts.append((w.pid, w.title, sc))
+            insts.append((w.pid, w.hwnd, w.title, sc))
         return insts
-
-    @staticmethod
-    def _acct(title: str) -> str:
-        return title.split(" - ", 1)[1] if " - " in title else title
 
     def _stalled_entry(self, pid: int, m: dict) -> dict:
         """一台觸發警報時的顯示名 = 帳號 + 角色名（警告視窗與 Telegram 通知都用它）。"""
@@ -499,6 +503,7 @@ class MonitorTab(BaseTab):
             "換地圖 / 重連 / 升級都不會追丟。\n"
             f"某台「持續 {dur}沒再增加」（滿了或停止）→ 警報聲 + 跳視窗提示，並『凍結』"
             "畫面（像暫停）保留最後資料。\n"
+            "「監控」欄取消勾選 → 該帳號只顯示數值、不倒數也不警報（設定會記住，下次自動帶回）。\n"
             "⚠ 處理完記得按「開始監控」重新偵測，畫面才會繼續更新。"
         )
 
@@ -543,13 +548,14 @@ class MonitorTab(BaseTab):
         self._health = {}  # 重新探索 → 重新判斷誰需要重掃
         self._mons = {
             pid: {
+                "hwnd": hwnd,        # 用來即時重讀標題 → 換頻道立刻反映
                 "title": title, "sc": sc,
                 "prev": {},          # 上一輪快照 {addr: value}
                 "tracked": None,     # 目前跟隨（在練）的位址
                 "value": None,       # 顯示值
                 "last_inc": None,    # 上次偵測到「增加」的時間；None = 還沒動過 → 不倒數
             }
-            for pid, title, sc in insts
+            for pid, hwnd, title, sc in insts
         }
         self._rebuild_table()
         insts = [(pid, m["title"], m["sc"]) for pid, m in self._mons.items()]
@@ -569,11 +575,41 @@ class MonitorTab(BaseTab):
     def _rebuild_table(self) -> None:
         self.table.setRowCount(len(self._mons))
         for r, (pid, m) in enumerate(self._mons.items()):
-            self.table.setItem(r, 0, QTableWidgetItem(self._names.get(pid) or "…"))
-            self.table.setItem(r, 1, QTableWidgetItem(self._acct(m["title"])))
-            self.table.setItem(r, 2, QTableWidgetItem(str(pid)))
-            self.table.setItem(r, 3, QTableWidgetItem("…"))
-            self.table.setItem(r, 4, QTableWidgetItem("定位中…"))
+            title = m["title"]
+            account = charname.account_from_title(title)
+            self.table.setCellWidget(r, 0, self._make_monitor_check(account))
+            self.table.setItem(r, 1, QTableWidgetItem(self._names.get(pid) or "…"))
+            self.table.setItem(r, 2, QTableWidgetItem(account))
+            self.table.setItem(r, 3, QTableWidgetItem(charname.channel_from_title(title) or "—"))
+            self.table.setItem(r, 4, QTableWidgetItem(str(pid)))
+            self.table.setItem(r, 5, QTableWidgetItem("…"))
+            self.table.setItem(r, 6, QTableWidgetItem("定位中…"))
+
+    def _make_monitor_check(self, account: str) -> QWidget:
+        """建一列的「監控」勾選框：勾 = 會警報；取消 = 只顯示不警報。置中放進儲存格。
+
+        用 cell widget（而非 checkable item），讓勾選訊號跟每輪的數值/狀態更新完全隔離，
+        不會被 _on_snapshot 大量 setItem 誤觸。"""
+        cb = QCheckBox()
+        cb.setChecked(account not in self._disabled_accounts)
+        cb.setToolTip("取消勾選：此帳號不倒數、不警報（仍即時顯示數值）")
+        cb.toggled.connect(lambda on, acc=account: self._on_monitor_toggle(acc, on))
+        wrap = QWidget()
+        lay = QHBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setAlignment(Qt.AlignCenter)
+        lay.addWidget(cb)
+        return wrap
+
+    def _on_monitor_toggle(self, account: str, monitored: bool) -> None:
+        """勾選 = 監控（會警報）；取消 = 加入停用清單。即時生效（_on_snapshot 每輪讀清單），
+        並存進 config 讓下次自動帶回。"""
+        if monitored:
+            self._disabled_accounts.discard(account)
+        else:
+            self._disabled_accounts.add(account)
+        config.set("monitor.disabled_accounts", sorted(self._disabled_accounts))
+        config.save()
 
     # ------------------------------------------------------------------
     # 每輪快照處理（在 UI 執行緒，由背景 worker 的訊號觸發）
@@ -585,16 +621,24 @@ class MonitorTab(BaseTab):
         for r, (pid, m) in enumerate(self._mons.items()):
             if r >= self.table.rowCount():
                 break
-            cur = snap.get(pid)
-            if cur is None:
-                continue  # 這輪沒有這台的資料
+
+            # 即時重讀視窗標題 → 換頻道 / 換帳號畫面立刻反映（切頻道時遊戲會改標題）。
+            # GetWindowText 很便宜，每輪讀一次不影響效能；空字串代表視窗剛關掉，保留舊值。
+            fresh = win.get_window_title(m["hwnd"])
+            if fresh:
+                m["title"] = fresh
+            account = charname.account_from_title(m["title"])
+            self._update_text(r, 2, account)
+            self._update_text(r, 3, charname.channel_from_title(m["title"]) or "—")
 
             # 角色名由 ScanWorker 背景解出，解到後補上「角色」欄
             nm = self._names.get(pid)
             if nm and nm != "?":
-                item0 = self.table.item(r, 0)
-                if item0 is None or item0.text() != nm:
-                    self.table.setItem(r, 0, QTableWidgetItem(nm))
+                self._update_text(r, 1, nm)
+
+            cur = snap.get(pid)
+            if cur is None:
+                continue  # 這輪沒有這台的資料
 
             prev = m["prev"]
             # 這輪相對上一輪「有增加」的位址們（cur 為空→掃不到特徵→自然沒有任何增加）
@@ -616,6 +660,13 @@ class MonitorTab(BaseTab):
             tr = m["tracked"]
             if tr is not None and cur.get(tr) is not None:
                 m["value"] = cur[tr]
+
+            # 已關閉警報的帳號：仍照掃、照顯示數值，但完全跳過倒數 / 警報判定，
+            # 也不會被算進「任一台滿了就整體停掉」，不會拖累還在監控的其他分身。
+            if account in self._disabled_accounts:
+                self._set_row(r, m["value"], "🔕 已關閉警報（僅顯示數值）")
+                m["prev"] = cur
+                continue
 
             # 「突然掃不到特徵」通常代表斷線／遊戲關了，等同「沒有球在動」，照樣倒數。
             lost = not cur
@@ -640,9 +691,15 @@ class MonitorTab(BaseTab):
             self._alarm_and_stop(stalled)
 
     def _set_row(self, r: int, value, status: str) -> None:
-        self.table.setItem(r, 3, QTableWidgetItem(
+        self.table.setItem(r, 5, QTableWidgetItem(
             "—" if value is None else str(value)))
-        self.table.setItem(r, 4, QTableWidgetItem(status))
+        self.table.setItem(r, 6, QTableWidgetItem(status))
+
+    def _update_text(self, r: int, c: int, text: str) -> None:
+        """僅在文字有變動時才換 item，避免每輪都重建（減少閃爍 / 無謂 CPU）。"""
+        item = self.table.item(r, c)
+        if item is None or item.text() != text:
+            self.table.setItem(r, c, QTableWidgetItem(text))
 
     # ------------------------------------------------------------------
     # 警報
