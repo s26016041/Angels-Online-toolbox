@@ -342,8 +342,10 @@ class CharCard(QFrame):
                 self.locate_lbl.setText("● 已定位")
                 self.locate_lbl.setStyleSheet(f"color: {SUCCESS};")
             self.level_lbl.setText(f"Lv{stats.level}")
+            # 當前經驗 / 升到下一級所需的經驗（都是絕對值，跟遊戲畫面同一套數字）
             self.exp_lbl.setText(
-                f"經驗 {stats.exp:,}（{stats.exp_pct:.2f}%）")
+                f"經驗 {stats.exp:,} / {stats.exp_hi:,}"
+                f"（{stats.exp_pct:.2f}%）")
             self.gold_lbl.setText(f"金幣 {stats.gold:,}")
             low = stats.max_hp > 0 and stats.hp / stats.max_hp < 0.3
             self.hp_lbl.setText(f"HP {stats.hp:,}/{stats.max_hp:,}")
