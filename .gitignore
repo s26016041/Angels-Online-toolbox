@@ -23,6 +23,9 @@ dist/
 # 內含白屏修復 collect_submodules('app')），必須納入版控。
 !AngelsOnlineToolbox.spec
 
+# 逆向 / 分析用的臨時腳本，不進版控
+scratchpad/
+
 # 編輯器 / 系統
 .vscode/
 .idea/
