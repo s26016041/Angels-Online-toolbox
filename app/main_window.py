@@ -27,7 +27,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{__app_name__} v{__version__}")
-        self.resize(880, 620)
+        # 固定視窗大小：各分頁的內容（收益監控的角色卡、封包分頁的兩張表）都放在
+        # 可捲動區裡，視窗本身不需要、也不該跟著內容一起長高。固定尺寸讓多開時
+        # 每次打開的位置與大小都一致。寬度要放得下封包分頁的欄位。
+        self.setFixedSize(940, 700)
 
         self.tabs = QTabWidget()
         self.tabs.setMovable(True)

@@ -9,8 +9,16 @@
 """
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication
+
+from app.paths import resource
+
+# 介面字體：打包在 fonts/ 裡，不依賴使用者電腦有沒有裝。
+# 載入失敗（檔案缺了 / 打包漏收）就退回系統內建的微軟正黑體，不讓程式開不起來。
+UI_FONT_FILE = "fonts/Iansui-Regular.ttf"
+UI_FONT_FALLBACK = "Microsoft JhengHei UI"
+UI_FONT_SIZE = 10
 
 # --- 調色盤（深邃夜藍）------------------------------------------------------
 # 這些常數與下方 QSS 內的色碼一致；改色時兩邊一起改。
@@ -230,9 +238,20 @@ def _palette() -> QPalette:
     return p
 
 
+def _ui_font() -> QFont:
+    """載入內附字體；載不到就退回系統字體（不讓程式因為缺字體而開不起來）。"""
+    path = resource(UI_FONT_FILE)
+    if path.exists():
+        fid = QFontDatabase.addApplicationFont(str(path))
+        families = QFontDatabase.applicationFontFamilies(fid)
+        if families:
+            return QFont(families[0], UI_FONT_SIZE)
+    return QFont(UI_FONT_FALLBACK, UI_FONT_SIZE)
+
+
 def apply_theme(app: QApplication) -> None:
     """在 QApplication 套用深邃夜藍主題（字體 + 調色盤 + QSS）。"""
     app.setStyle("Fusion")  # 統一底層繪製，QSS 才會在各元件一致生效
-    app.setFont(QFont("Microsoft JhengHei UI", 10))
+    app.setFont(_ui_font())
     app.setPalette(_palette())
     app.setStyleSheet(_QSS)

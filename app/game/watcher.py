@@ -1,0 +1,353 @@
+"""背景監看執行緒：把每個分身的角色屬性與技能經驗球讀成一份份快照。
+
+分頁只負責畫，掃描與判斷都在這裡，所以換版面不會動到這段邏輯。
+
+兩種資料、兩套定位方式
+----------------------
+* 角色屬性（等級 / HP / MP / 經驗 / 金幣）——玩家物件，用結構條件定位一次（約 1 秒），
+  之後每輪用固定偏移一次讀齊，一次只花 0.1 毫秒。位址因換地圖 / 重連而失效時，
+  `player.read()` 會回 None，這裡自動重新定位（帶冷卻，免得定位不到就連環全掃）。
+* 技能經驗球——AOB 特徵（見 app/game/aob.py）。特徵會命中該角色所有的球、一些不再
+  更新的舊副本、還有一堆根本不是球的物品，所以：
+    1. 用種類 ID（球值位址 -0x98，見 app/game/items.py）辨識每個命中是什麼東西。
+    2. 靠「誰在增加」挑出**裝備中**的那幾顆——飾品欄可同時裝多顆、階級還可以不同，
+       練功時它們會一起漲；舊副本不會動，自然被排除。
+
+貴的動作都是按需執行：玩家物件位址還有效就不重掃，球還在跳就證明位址是對的、也不重掃。
+正常運作時這條執行緒幾乎都在睡，只是每 0.7 秒讀幾十個位址而已。
+
+全程只讀取記憶體、不寫入、不注入、不掛除錯器（安全）。
+"""
+from __future__ import annotations
+
+import time
+
+from PySide6.QtCore import QThread, Signal
+
+from app.core import charname
+from app.game import aob, inventory, items, player
+
+# 讀值間隔（毫秒）：決定畫面多快更新。讀一次只要 0.1ms，這個頻率完全不佔資源。
+READ_INTERVAL_MS = 700
+# 定位失敗（還在登入/選角畫面、或遊戲剛關）後，隔多久才重試全掃。
+# 全掃約 1 秒，失敗時若不設冷卻就會變成無限全掃、把 CPU 燒滿。
+RELOCATE_GAP_SECS = 5.0
+
+BALL_SIG = aob.SKILL_EXP_BALL
+# 特徵較鬆，上限開大以免漏掉正在練的那顆。
+BALL_SCAN_LIMIT = 4096
+# 完全沒有候選位址時的重掃間隔（例如還在讀取畫面）。
+BALL_NO_CANDS_GAP = 5.0
+# 有候選、但從沒看過任何一顆增加（沒在練功）→ 隔這麼久才重掃一次。
+BALL_IDLE_GAP = 30.0
+# 球「安靜」超過這麼久才考慮重掃（練功順利時每幾秒就跳，這條幾乎不會成立）。
+BALL_QUIET_SECS = 10.0
+# 安靜越久重掃越稀疏，但不超過這個間隔。
+BALL_MAX_GAP = 60.0
+# 一顆球多久沒動就不再算「裝備中」。
+BALL_LIVE_SECS = 60.0
+
+
+class StatsWorker(QThread):
+    """每輪對每台分身發出一份 (pid, PlayerStats|None, ball dict|None) 快照。
+
+    ball dict 的內容：
+        balls  [{addr, value, name, cap, pct, is_ball, type_id}, ...]
+               有在增加就是裝備中的那幾顆；都沒在增加就給數值最大的那顆當參考。
+        live   True = 上面那些正在增加
+        count  候選位址數
+        raw    特徵原始命中數（含非球物品）
+        idle   沒在動的球，依「種類+值」去重後的 [(type_id, value), ...]
+        quiet  距離上次有球增加過了幾秒；從沒動過是 None
+
+    共享 dict（本執行緒寫、UI 執行緒讀）：self._names {pid: 角色名}
+    """
+
+    snapshot = Signal(int, object, object)
+
+    def __init__(self, insts, names: dict) -> None:
+        super().__init__()
+        self._insts = insts            # [(pid, hwnd, title, sc), ...]
+        self._names = names
+        self._bases: dict[int, int] = {}
+        self._last_try: dict[int, float] = {}
+        # 技能球狀態
+        self._cands: dict[int, list[int]] = {}        # {pid: [候選位址]}
+        self._types: dict[int, dict[int, int]] = {}   # {pid: {位址: 種類 ID}}
+        self._raw_hits: dict[int, int] = {}           # {pid: 特徵原始命中數}
+        self._prev: dict[int, dict[int, int]] = {}    # {pid: {位址: 上一輪的值}}
+        self._live: dict[int, dict[int, float]] = {}  # {pid: {位址: 上次增加的時間}}
+        self._ever: dict[int, set[int]] = {}          # {pid: 曾經增加過的位址}
+        self._force: set[int] = set()                 # 偵測到換裝 → 下一輪立刻重掃
+        self._inv: dict[int, int] = {}                # {pid: 物品陣列表頭}
+        self._last_inc: dict[int, float] = {}         # {pid: 任一顆上次增加的時間}
+        self._last_scan: dict[int, float] = {}        # {pid: 上次全掃特徵的時間}
+        # 未知種類 ID 的探測結果：{(pid, type_id): BallType | None}，None = 探過但找不到
+        self._probed: dict[tuple[int, int], object] = {}
+        self._running = True
+
+    # -- 玩家物件 ------------------------------------------------------
+    def _stats(self, pid: int, sc):
+        try:
+            st = player.read(sc, self._bases.get(pid, 0))
+        except Exception:
+            st = None
+        if st is not None:
+            return st
+        now = time.monotonic()
+        if now - self._last_try.get(pid, 0.0) < RELOCATE_GAP_SECS:
+            return None
+        self._last_try[pid] = now
+        try:
+            base = player.locate(sc, should_stop=lambda: not self._running) or 0
+        except Exception:
+            base = 0
+        self._bases[pid] = base
+        try:
+            return player.read(sc, base) if base else None
+        except Exception:
+            return None
+
+    # -- 技能球 --------------------------------------------------------
+    def _needs_ball_scan(self, pid: int, now: float) -> bool:
+        if pid in self._force:
+            # 偵測到換裝 → 不等冷卻，立刻重掃，不然畫面會卡著已經拔掉的球
+            self._force.discard(pid)
+            return True
+        since = now - self._last_scan.get(pid, 0.0)
+        if not self._cands.get(pid):
+            return since >= BALL_NO_CANDS_GAP   # 沒候選 → 沒東西可讀，積極找
+        last_inc = self._last_inc.get(pid)
+        if last_inc is None:
+            # 有候選但從沒看過它動：可能沒在練功，也可能掃到的是舊副本 → 久久重掃當保險
+            return since >= BALL_IDLE_GAP
+        quiet = now - last_inc
+        if quiet < BALL_QUIET_SECS:
+            return False    # 球還在跳 → 位址是對的 → 完全不用掃（穩態走這條）
+        # 安靜了。分不出是搬家（重掃救得回來）還是練完了（重掃也沒用），所以照掃，
+        # 但間隔隨安靜時間拉長，避免練完的那台被連續全掃燒 CPU。
+        return since >= max(BALL_QUIET_SECS, min(BALL_MAX_GAP, quiet / 2))
+
+    def _describe(self, pid: int, sc, addr: int, type_id, value: int) -> dict:
+        """把一個候選位址講成畫面要的樣子。
+
+        種類 ID 在對照表裡 → 直接拿名稱與上限。
+        不在表裡 → 探一次遊戲自己組出來的道具提示，能問出名稱／上限就用（見
+        items.probe_ball）；問不出來就標成「非技能球」，畫面不會畫進度條或百分比。
+        """
+        bt = items.ball_type(type_id)
+        if bt is None and type_id is not None:
+            key = (pid, type_id)
+            if key not in self._probed:
+                try:
+                    self._probed[key] = items.probe_ball(sc, value)
+                except Exception:
+                    self._probed[key] = None
+            bt = self._probed[key]
+        pct = bt.pct(value) if bt else None
+        return {"addr": addr, "value": value, "type_id": type_id,
+                "name": bt.name if bt else items.UNKNOWN_LABEL,
+                "cap": bt.cap if bt else 0,
+                "pct": pct,
+                "is_ball": bt is not None}
+
+    def _inventory_ball(self, pid: int, sc) -> dict | None:
+        """精確版：直接讀物品陣列的飾品欄兩格，不做任何行為推論。
+
+        表頭要先靠 AOB 找到的球結構反查一次（見 app/game/inventory.py），之後每輪
+        只讀幾個指標。換飾品當下就會反映，球滿了也不會從清單消失。
+        """
+        head = self._inv.get(pid)
+        if head and not inventory.is_valid(sc, head):
+            head = None                 # 換地圖 / 重連 → 表搬家了
+        if not head:
+            structs = [a - inventory.ITEM_BALL_OFF
+                       for a in (self._cands.get(pid) or [])
+                       if items.is_ball(self._types.get(pid, {}).get(a))]
+            if not structs:
+                return None             # 還沒有任何球可以當錨點 → 交給舊路徑先找
+            try:
+                head = inventory.locate(sc, structs)
+            except Exception:
+                head = None
+            if not head:
+                return None
+            self._inv[pid] = head
+
+        try:
+            slots = inventory.scan_slots(sc, head)
+        except Exception:
+            return None
+
+        equipped, bag = [], []
+        for idx, tid, ptr, val in slots:
+            if not items.is_ball(tid):
+                continue
+            entry = {"addr": ptr + inventory.ITEM_BALL_OFF, "value": val,
+                     "type_id": tid, "slot": idx}
+            (equipped if idx in inventory.SLOT_ACCESSORY else bag).append(entry)
+
+        def described(e):
+            bt = items.ball_type(e["type_id"])
+            return {**e,
+                    "name": bt.name if bt else items.UNKNOWN_LABEL,
+                    "cap": bt.cap if bt else 0,
+                    "pct": bt.pct(e["value"]) if bt else None,
+                    "is_ball": bt is not None}
+
+        # 有沒有在增加只拿來決定顯示顏色，不再影響「哪幾顆是裝備中」
+        prev = self._prev.get(pid, {})
+        cur = {e["addr"]: e["value"] for e in equipped}
+        now = time.monotonic()
+        if any(v > prev.get(a, v) for a, v in cur.items()):
+            self._last_inc[pid] = now
+        self._prev[pid] = {**prev, **cur}
+        last_inc = self._last_inc.get(pid)
+        live = last_inc is not None and now - last_inc <= BALL_LIVE_SECS
+
+        return {
+            "balls": [described(e) for e in equipped],
+            "live": live,
+            "count": len(equipped) + len(bag),
+            "raw": self._raw_hits.get(pid, 0),
+            "idle": sorted((e["type_id"], e["value"]) for e in bag),
+            "quiet": None if live else (
+                (now - last_inc) if last_inc else None),
+            "exact": True,
+        }
+
+    def _ball(self, pid: int, sc) -> dict | None:
+        now = time.monotonic()
+        if self._needs_ball_scan(pid, now):
+            try:
+                hits = aob.scan(sc, BALL_SIG, limit=BALL_SCAN_LIMIT,
+                                should_stop=lambda: not self._running)
+            except Exception:
+                hits = None
+            if not self._running:
+                return None     # 中途被喊停 → hits 不完整，別拿去覆蓋候選清單
+            if hits is not None:
+                # 全部留著（不預先篩掉非球）—— 玩家可能裝了對照表裡沒有的東西，
+                # 那也要看得到，只是畫面上會標成「非技能球」。
+                self._cands[pid] = list(hits)
+                self._types[pid] = {a: items.read_type_id(sc, a) for a in hits}
+                self._raw_hits[pid] = len(hits)
+            self._last_scan[pid] = time.monotonic()
+
+        addrs = self._cands.get(pid) or []
+        if not addrs:
+            return None
+        try:
+            cur = {a: sc.read_value(a, BALL_SIG.vt) for a in addrs}
+            # ★ 種類 ID 每輪都要重讀，不能只在掃描時讀一次。
+            # 玩家換飾品時遊戲會把那塊記憶體挪去放別的物品，位址還在、值也還讀得到，
+            # 但已經是另一顆球了。快取舊 ID 的話就會出現「35000 的球配到 120000 上限」
+            # 這種張冠李戴。一顆球才多讀 4 bytes，成本可以忽略。
+            types = {a: items.read_type_id(sc, a) for a in addrs}
+        except Exception:
+            return None
+
+        prev = self._prev.get(pid, {})
+        old_types = self._types.get(pid, {})
+        self._types[pid] = types
+
+        now = time.monotonic()
+        live = self._live.setdefault(pid, {})
+        ever = self._ever.setdefault(pid, set())
+
+        # 換裝偵測：種類 ID 變了，或值變小（球只會往上加，變小代表這個位置
+        # 已經換成別的東西了）。這些位址的歷史立刻作廢，並要求馬上重掃特徵，
+        # 免得畫面卡著舊球、或多出根本已經拔掉的那幾顆。
+        swapped = {
+            a for a in addrs
+            if (a in old_types and types.get(a) != old_types[a])
+            or (prev.get(a) is not None and cur.get(a) is not None
+                and cur[a] < prev[a])
+        }
+        if swapped:
+            # 整台的「裝備中」記錄全部作廢重認，不是只丟掉變動的那幾個位址：
+            # 換裝時被拔掉的那顆常常會以「值沒變的舊副本」留在記憶體裡，光看它自己
+            # 看不出有變化，只有整組重認才不會在畫面上留下已經拔掉的殘影。
+            live.clear()
+            ever.clear()
+            for a in swapped:
+                prev.pop(a, None)
+            self._force.add(pid)
+
+        increased = [a for a, v in cur.items()
+                     if a not in swapped and v is not None
+                     and prev.get(a) is not None and v > prev[a]]
+        self._prev[pid] = cur
+
+        for a in list(live):
+            if a not in cur:
+                live.pop(a)     # 重掃後不見了的位址（搬家）→ 丟掉
+        ever &= set(cur)
+        for a in increased:
+            live[a] = now
+            ever.add(a)
+        if increased:
+            self._last_inc[pid] = now
+
+        known = [a for a in cur
+                 if cur[a] is not None and items.is_ball(types.get(a))]
+
+        def payload(shown: list[int], is_live: bool) -> dict:
+            sh = set(shown)
+            return {
+                "balls": [self._describe(pid, sc, a, types.get(a), cur[a])
+                          for a in shown],
+                "live": is_live,
+                "count": len(addrs),
+                "raw": self._raw_hits.get(pid, 0),
+                # 「其他球」只算確定是球的，不然會混進一堆別的物品
+                "idle": sorted({(types.get(a), cur[a])
+                                for a in known if a not in sh}),
+                "quiet": None if is_live else (
+                    (now - self._last_inc[pid]) if pid in self._last_inc else None),
+            }
+
+        # 顯示「這輪期間曾經增加過」的所有球 —— 那就是裝備中的那幾顆。
+        # 不能只留「最近 N 秒有增加」的：**球一滿就不會再動**，那樣它會從清單裡消失，
+        # 害呼叫端的「球滿」判定忽有忽無、重複發通知。
+        shown = [a for a in ever if cur.get(a) is not None]
+        if shown:
+            shown.sort(key=lambda a: cur[a], reverse=True)
+            recent = any(now - live.get(a, 0.0) <= BALL_LIVE_SECS for a in shown)
+            return payload(shown, recent)
+
+        # 從沒看過任何一顆增加（沒在練功 / 剛接上）→ 給最大的那顆當參考。
+        # 優先從「確定是球」的裡面挑，免得拿一個不相干的物品來充數。
+        pool = known or [a for a in cur if cur[a] is not None]
+        if not pool:
+            return None
+        return payload([max(pool, key=lambda a: cur[a])], False)
+
+    # -- 主迴圈 --------------------------------------------------------
+    def run(self) -> None:
+        while self._running:
+            for pid, _hwnd, title, sc in self._insts:
+                if not self._running:
+                    return
+                # 角色名解一次就好（存檔路徑不會變），失敗記 "?" 不重試。
+                if pid not in self._names:
+                    try:
+                        self._names[pid] = charname.read_character_name(
+                            sc, charname.account_from_title(title)) or "?"
+                    except Exception:
+                        self._names[pid] = "?"
+                st = self._stats(pid, sc)
+                # 先走精確路徑（直接讀飾品欄兩格）。定位到物品陣列之後就完全不必再
+                # 掃 AOB 特徵了 —— 那是每台 1～2.5 秒的全記憶體掃，能省則省。
+                # 還沒定位到（剛啟動、換地圖搬家）才退回舊的「靠增加推論」，
+                # 那條同時負責用 AOB 找出定位所需的錨點。
+                ball = self._inventory_ball(pid, sc)
+                if ball is None:
+                    ball = self._ball(pid, sc)
+                if not self._running:
+                    return
+                self.snapshot.emit(pid, st, ball)
+            self.msleep(READ_INTERVAL_MS)
+
+    def stop(self) -> None:
+        self._running = False

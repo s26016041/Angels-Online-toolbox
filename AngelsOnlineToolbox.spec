@@ -13,7 +13,8 @@ import os
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-datas = [('VERSION', '.'), ('music', 'music')]  # music/：警報聲 mp3
+# music/：警報聲 mp3　　fonts/：介面字體（見 app/theme.py，漏收會退回系統字體）
+datas = [('VERSION', '.'), ('music', 'music'), ('fonts', 'fonts')]
 binaries = []
 hiddenimports = []
 
