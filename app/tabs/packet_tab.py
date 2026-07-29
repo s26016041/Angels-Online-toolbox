@@ -18,6 +18,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -46,6 +48,8 @@ class PacketTab(BaseTab):
         self._cap: injector.SendCapture | None = None
         self._packets: list[injector.Packet] = []
         self._windows: list[win.WindowInfo] = []
+        self._group_mode = False
+        self._baseline_sigs: set[tuple[int, ...]] = set()
 
         root = QVBoxLayout(self)
 
@@ -99,7 +103,10 @@ class PacketTab(BaseTab):
         self.proc_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.proc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.proc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.proc_table.setMaximumHeight(160)
+        # 保底高度：至少看得到約 5~7 個程序。原本只設 maximum，視窗一變矮就會被
+        # 下方（封包表 stretch=2、內容 stretch=1）擠到只剩一列。列高約 30px。
+        self.proc_table.setMinimumHeight(200)
+        self.proc_table.setMaximumHeight(280)
         lay.addWidget(self.proc_table)
 
         btn_row = QHBoxLayout()
@@ -120,15 +127,51 @@ class PacketTab(BaseTab):
     def _build_packet_group(self) -> QGroupBox:
         box = QGroupBox("② 送出的封包（即時）")
         lay = QVBoxLayout(box)
-        self.pkt_table = QTableWidget(0, 5)
-        self.pkt_table.setHorizontalHeaderLabels(
-            ["#", "長度", "亂度/8", "呼叫鏈（登入函式候選）", "內容預覽"]
+
+        # 分組控制列：內容是加密的分不出來，能區分「攻擊/移動/放技能」的是呼叫鏈
+        # （從哪段程式送出）。把相同呼叫鏈的封包摺成一列，幾百包就變幾種來源。
+        ctrl = QHBoxLayout()
+        self.group_chk = QCheckBox("依呼叫鏈分組（找動作函式用）")
+        self.group_chk.setToolTip(
+            "內容加密、分不出來；能區分動作的是『從哪段程式送出』= 呼叫鏈。\n"
+            "勾選後把相同呼叫鏈的封包併成一列，幾百包就變成幾種來源。"
         )
+        self.group_chk.toggled.connect(self._on_group_toggled)
+        ctrl.addWidget(self.group_chk)
+        ctrl.addWidget(QLabel("比對深度"))
+        self.depth_spin = QSpinBox()
+        self.depth_spin.setRange(1, 12)
+        self.depth_spin.setValue(4)
+        self.depth_spin.setEnabled(False)
+        self.depth_spin.setToolTip(
+            "拿呼叫鏈前幾層當分組依據。太小會全部併成一組，太大會被堆疊雜訊拆碎。"
+        )
+        self.depth_spin.valueChanged.connect(self._on_depth_changed)
+        ctrl.addWidget(self.depth_spin)
+        self.baseline_btn = QPushButton("設為基線")
+        self.baseline_btn.setEnabled(False)
+        self.baseline_btn.setToolTip(
+            "把目前所有來源當成背景雜訊；之後新冒出來的來源會標紅置頂。\n"
+            "用法：先站著不動→按這顆→回遊戲只做一個動作（如攻擊）→看標紅那列。"
+        )
+        self.baseline_btn.clicked.connect(self.set_baseline)
+        self.clearbase_btn = QPushButton("清除基線")
+        self.clearbase_btn.setEnabled(False)
+        self.clearbase_btn.clicked.connect(self.clear_baseline)
+        ctrl.addWidget(self.baseline_btn)
+        ctrl.addWidget(self.clearbase_btn)
+        ctrl.addStretch(1)
+        lay.addLayout(ctrl)
+
+        self.pkt_table = QTableWidget(0, 5)
         self.pkt_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.pkt_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.pkt_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.pkt_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        # 保底高度：即使視窗偏矮，也至少看得到約 5 個封包。
+        self.pkt_table.setMinimumHeight(200)
         self.pkt_table.itemSelectionChanged.connect(self._show_detail)
+        self._apply_headers()
         lay.addWidget(self.pkt_table)
         return box
 
@@ -224,20 +267,112 @@ class PacketTab(BaseTab):
             self._timer.stop()
             self.status.setText(f"讀取失敗，已停止：{exc}")
             return
-        for pkt in new:
-            self._append_packet(pkt)
-
-    def _append_packet(self, pkt: injector.Packet) -> None:
-        self._packets.append(pkt)
-        # 超過上限時裁掉最舊的（同步表格）
-        if len(self._packets) > MAX_ROWS:
-            self._packets = self._packets[-MAX_ROWS:]
-            self._rebuild_table()
+        if not new:
             return
-        r = self.pkt_table.rowCount()
-        self.pkt_table.insertRow(r)
-        self._fill_row(r, pkt)
-        self.pkt_table.scrollToBottom()
+        self._packets.extend(new)
+        trimmed = False
+        if len(self._packets) > MAX_ROWS:  # 超過上限裁掉最舊的
+            self._packets = self._packets[-MAX_ROWS:]
+            trimmed = True
+        if self._group_mode:
+            self._rebuild_grouped()
+        elif trimmed:
+            self._rebuild_table()
+        else:
+            for pkt in new:
+                r = self.pkt_table.rowCount()
+                self.pkt_table.insertRow(r)
+                self._fill_row(r, pkt)
+            self.pkt_table.scrollToBottom()
+
+    # ---- 分組 / 基線（把幾百包摺成幾種來源，標出新來源 = 動作函式）--------
+    def _apply_headers(self) -> None:
+        """依目前模式設定表頭；逐包與分組共用同一張 5 欄表。"""
+        if self._group_mode:
+            self.pkt_table.setHorizontalHeaderLabels(
+                ["狀態", "封包數", "長度", "呼叫鏈（動作函式候選）", "內容範例"]
+            )
+        else:
+            self.pkt_table.setHorizontalHeaderLabels(
+                ["#", "長度", "亂度/8", "呼叫鏈（登入函式候選）", "內容預覽"]
+            )
+
+    def _on_group_toggled(self, checked: bool) -> None:
+        self._group_mode = checked
+        self.depth_spin.setEnabled(checked)
+        self.baseline_btn.setEnabled(checked)
+        self.clearbase_btn.setEnabled(checked)
+        self._apply_headers()
+        if checked:
+            self._rebuild_grouped()
+            self.status.setText(
+                "分組模式：相同呼叫鏈併成一列。做法→先站著不動幾秒，按「設為基線」，"
+                "再回遊戲只做一個動作（如攻擊同一隻怪），標紅置頂那列就是它的來源。"
+            )
+        else:
+            self._rebuild_table()
+
+    def _on_depth_changed(self, _value: int) -> None:
+        if self._baseline_sigs:  # 深度變了，舊基線的簽章對不上，得清掉
+            self._baseline_sigs.clear()
+            self.status.setText("比對深度已變更，基線已清除，請重新按「設為基線」。")
+        if self._group_mode:
+            self._rebuild_grouped()
+
+    def set_baseline(self) -> None:
+        """把目前所有來源記為基線；之後不在基線內的來源會標紅置頂。"""
+        self._baseline_sigs = {self._signature(p) for p in self._packets}
+        self._rebuild_grouped()
+        self.status.setText(
+            f"已把目前 {len(self._baseline_sigs)} 種來源設為基線。"
+            "現在回遊戲只做一個動作（例如攻擊同一隻怪），新來源會標紅置頂。"
+        )
+
+    def clear_baseline(self) -> None:
+        self._baseline_sigs.clear()
+        if self._group_mode:
+            self._rebuild_grouped()
+        self.status.setText("已清除基線。")
+
+    def _signature(self, pkt: injector.Packet) -> tuple[int, ...]:
+        """分組依據：呼叫鏈的前 N 層（N = 比對深度）。"""
+        return tuple(pkt.call_chain[: self.depth_spin.value()])
+
+    def _rebuild_grouped(self) -> None:
+        groups: dict[tuple[int, ...], dict] = {}
+        for pkt in self._packets:
+            sig = self._signature(pkt)
+            g = groups.get(sig)
+            if g is None:
+                groups[sig] = g = {"count": 0, "lengths": set(), "rep": pkt}
+            g["count"] += 1
+            g["lengths"].add(pkt.length)
+            g["rep"] = pkt  # 以最新一包當代表
+        has_base = bool(self._baseline_sigs)
+        rows = [
+            (has_base and sig not in self._baseline_sigs, g["count"], sig, g)
+            for sig, g in groups.items()
+        ]
+        rows.sort(key=lambda x: (not x[0], -x[1]))  # 有基線時新來源置頂，其餘依數量
+
+        self.pkt_table.setRowCount(len(rows))
+        for r, (is_new, count, sig, g) in enumerate(rows):
+            rep = g["rep"]
+            status = "● 新" if is_new else ("基線" if has_base else "—")
+            st_item = QTableWidgetItem(status)
+            st_item.setData(Qt.UserRole, rep.seq)
+            self.pkt_table.setItem(r, 0, st_item)
+            self.pkt_table.setItem(r, 1, QTableWidgetItem(str(count)))
+            lengths = ",".join(str(x) for x in sorted(g["lengths"]))
+            self.pkt_table.setItem(r, 2, QTableWidgetItem(lengths))
+            chain = " ← ".join(f"0x{a:X}" for a in sig) or "—"
+            self.pkt_table.setItem(r, 3, QTableWidgetItem(chain))
+            self.pkt_table.setItem(r, 4, QTableWidgetItem(rep.data[:24].hex(" ")))
+            if is_new:
+                for c in range(5):
+                    it = self.pkt_table.item(r, c)
+                    if it:
+                        it.setForeground(Qt.red)
 
     def _rebuild_table(self) -> None:
         self.pkt_table.setRowCount(len(self._packets))
@@ -263,16 +398,25 @@ class PacketTab(BaseTab):
         rows = self.pkt_table.selectionModel().selectedRows()
         if not rows:
             return
-        seq = self.pkt_table.item(rows[0].row(), 0).data(Qt.UserRole)
+        item0 = self.pkt_table.item(rows[0].row(), 0)
+        if item0 is None:
+            return
+        seq = item0.data(Qt.UserRole)
         pkt = next((p for p in self._packets if p.seq == seq), None)
         if not pkt:
             return
         chain = "\n".join(f"    0x{a:X}" for a in pkt.call_chain) or "    （無）"
         verdict = "疑似加密/壓縮" if pkt.entropy > 7.5 else "疑似明文/輕度混淆"
+        note = ""
+        if self._group_mode:
+            sig = self._signature(pkt)
+            n = sum(1 for p in self._packets if self._signature(p) == sig)
+            note = f"（分組模式：此來源在目前緩衝共 {n} 包，以下顯示其中一包代表）\n"
         self.detail.setPlainText(
-            f"封包 #{pkt.seq}　長度 {pkt.length}　亂度 {pkt.entropy:.2f}/8 → {verdict}\n"
+            note
+            + f"封包 #{pkt.seq}　長度 {pkt.length}　亂度 {pkt.entropy:.2f}/8 → {verdict}\n"
             f"直接呼叫者(send wrapper)：0x{pkt.caller:X}\n"
-            f"呼叫鏈（遊戲內位址，登入函式候選在較上層）：\n{chain}\n"
+            f"呼叫鏈（遊戲內位址，動作/登入函式候選在較上層）：\n{chain}\n"
             f"\n內容：\n{pkt.hexdump()}"
         )
 
