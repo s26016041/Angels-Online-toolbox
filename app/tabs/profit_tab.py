@@ -280,6 +280,14 @@ class CharCard(QFrame):
         rate_row.addWidget(self.death_lbl)
         rate_row.addStretch(1)
         root.addLayout(rate_row)
+
+        # 累計：從按下「開始計算」到現在總共賺了多少
+        self.total_lbl = QLabel("")
+        self.total_lbl.setStyleSheet(f"color: {TEXT};")
+        self.total_lbl.setToolTip(
+            "從按下「開始計算」到現在的累計。\n"
+            "經驗後面的百分比 = 這段時間賺到的經驗相當於本級所需經驗的幾成。")
+        root.addWidget(self.total_lbl)
         self.eta_lbl = QLabel("")
         self.eta_lbl.setStyleSheet(f"color: {TEXT_MUT};")
         root.addWidget(self.eta_lbl)
@@ -304,6 +312,7 @@ class CharCard(QFrame):
             self.rate_lbl.setText("尚未開始計算")
             self.eta_lbl.setText("")
             self.death_lbl.setText("")
+            self.total_lbl.setText("")
         else:
             self.session.start()
             self.start_btn.setText("停止計算")
@@ -371,6 +380,14 @@ class CharCard(QFrame):
         else:
             self.death_lbl.setText("死亡 0 次")
             self.death_lbl.setStyleSheet(f"color: {TEXT_MUT};")
+
+        # 累計：總共賺了多少。經驗的百分比用「本級所需經驗」當分母 —— 講「賺了
+        # 半級」比講「賺了 300 萬」直觀得多。升級會讓分母換成新一級的，屬正常。
+        span = (stats.exp_hi - stats.exp_lo) if stats is not None else 0
+        exp_txt = f"經驗 +{s.exp_gain:,}"
+        if span > 0:
+            exp_txt += f"（+{s.exp_gain / span * 100:.1f}%）"
+        self.total_lbl.setText(f"累計　{exp_txt}　金幣 +{s.gold_gain:,}")
 
         if stats is None or not exp_h:
             self.eta_lbl.setText("")
