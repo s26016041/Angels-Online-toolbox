@@ -43,6 +43,12 @@ class MainWindow(QMainWindow):
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
+        # 自動更新：背景查有沒有新版，有才跳提示。開發模式與關掉自動檢查時完全不動作。
+        from app.update_ui import UpdateManager
+
+        self._updater = UpdateManager(self)
+        self._updater.start()
+
     # ------------------------------------------------------------------
     # 分頁自動載入
     # ------------------------------------------------------------------
