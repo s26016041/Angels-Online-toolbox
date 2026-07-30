@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from app import __version__
@@ -55,12 +55,17 @@ class DownloadThread(QThread):
 class UpdateManager:
     """掛在主視窗上：開場檢查一次，有新版就問要不要更新。"""
 
+    # 多久重查一次。這是掛機監控工具，使用者會開著好幾個小時不關 —— 只在啟動時
+    # 檢查的話，那些人永遠不會更新，「強制更新」等於形同虛設。
+    RECHECK_MS = 30 * 60 * 1000
+
     def __init__(self, parent) -> None:
         self._parent = parent
         self._check: CheckThread | None = None
         self._dl: DownloadThread | None = None
         self._dlg: QProgressDialog | None = None
         self._info: dict | None = None
+        self._timer: QTimer | None = None
 
     def start(self) -> None:
         """開場呼叫。只有開發模式與無頭模式不做，其餘一律檢查並強制更新。"""
@@ -72,12 +77,24 @@ class UpdateManager:
         # 並中止行程，害冒煙測試誤判成「分頁載入失敗」。實際踩過。
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return
+        self._run_check()
+        self._timer = QTimer(self._parent)
+        self._timer.timeout.connect(self._run_check)
+        self._timer.start(self.RECHECK_MS)
+
+    def _run_check(self) -> None:
+        """查一次。上一輪還沒收完、或正在下載時就跳過這輪。"""
+        if self._check is not None or self._dl is not None:
+            return
         self._check = CheckThread()
         self._check.done.connect(self._on_checked)
         self._check.start()
 
     def stop(self) -> None:
         """關閉程式前呼叫：等背景執行緒收完，別讓 Qt 在解構時抱怨。"""
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
         for t in (self._check, self._dl):
             if t is not None and t.isRunning():
                 t.wait(3000)
@@ -89,9 +106,23 @@ class UpdateManager:
         """查到新版就直接更新，不問使用者。"""
         self._check = None
         if not info:
+            # 查不到有兩種：已是最新（正常）、或連線/憑證出問題（要讓人看得到）。
+            # 以前兩種都靜靜略過，結果使用者更新不了時完全沒有線索。
+            err = updater.last_error()
+            if err:
+                self._show_status(f"⚠ 檢查更新失敗（{err}）—— 目前使用 {__version__}")
             return
         self._info = info
         self._start_download()
+
+    def _show_status(self, text: str) -> None:
+        """把訊息寫到主視窗狀態列（沒有狀態列就算了，不能因此壞掉）。"""
+        try:
+            bar = self._parent.statusBar()
+        except Exception:
+            return
+        if bar is not None:
+            bar.showMessage(text, 30000)
 
     def _start_download(self) -> None:
         cur = updater.exe_path()

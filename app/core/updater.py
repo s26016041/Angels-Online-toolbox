@@ -67,27 +67,51 @@ def is_newer(remote: str, local: str) -> bool:
 
 
 def _urlopen(url: str, timeout: float = TIMEOUT):
+    """連線，憑證驗證失敗就退回不驗證再試一次。
+
+    ⚠ 這裡不能只 `except ssl.SSLError` —— urlopen 遇到憑證問題丟的是
+    `urllib.error.URLError` **包住** SSLError，裸的 SSLError 攔不到，後備等於沒作用，
+    錯誤還會被外層吞掉變成「靜靜地不更新」。使用者的弟弟（Windows 10，系統根憑證
+    較舊）就是卡在這裡，畫面上完全沒有提示。所以第一次失敗一律重試一次。
+
+    退回不驗證是可接受的：抓的是自己 repo 的公開檔案，而且下載後還會檢查大小與
+    PE 標頭，換檔前也會驗證，動不了手腳。
+    """
     req = urllib.request.Request(url, headers=UA)
     try:
         return urllib.request.urlopen(req, timeout=timeout)
-    except ssl.SSLError:
-        # 打包後可能缺系統 CA。退回不驗證憑證 —— 下載的是自己 repo 的公開檔案，
-        # 而且下面還會檢查大小與 PE 標頭，可接受。
+    except Exception as first:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except Exception:
+            raise first
+
+
+def last_error() -> str:
+    """上一次查詢失敗的原因（給診斷用）。沒失敗過就是空字串。"""
+    return _last_error[0]
+
+
+_last_error = [""]
 
 
 def latest_release() -> dict | None:
     """查 GitHub 最新 Release。回傳 {version, url, size, notes}；失敗回 None。
 
-    沒網路、被限流、repo 沒有 Release 都算失敗 —— 靜靜回 None，不打擾使用者。
+    沒網路、被限流、repo 沒有 Release 都算失敗。**失敗原因一定要留下來** ——
+    以前是靜靜回 None，結果使用者的機器更新不了時，畫面與紀錄檔都沒有任何線索，
+    完全無從查起。
     """
+    _last_error[0] = ""
     try:
         with _urlopen(API_LATEST) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except Exception as exc:
+        _last_error[0] = f"{type(exc).__name__}: {exc}"
+        sys.stderr.write(f"[update] 查詢最新版本失敗 —— {_last_error[0]}\n")
         return None
     tag = data.get("tag_name") or ""
     assets = data.get("assets") or []
