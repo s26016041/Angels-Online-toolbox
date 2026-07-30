@@ -1,17 +1,21 @@
-"""自動更新的介面：背景檢查、詢問、下載進度、重新啟動。
+"""自動更新的介面：背景檢查、強制更新、下載進度、重新啟動。
+
+**強制更新，不詢問** —— 查到新版就直接下載、換檔、重啟。只顯示進度，沒有選項。
+理由是記憶體位址與物品對照表會隨遊戲改版而失效，舊版留在使用者手上只會顯示錯的
+資料或完全抓不到，讓人以為程式壞了。
 
 檢查在背景執行緒做（連 GitHub 可能要幾秒），不擋住視窗開啟。
-沒網路 / 查不到 / 已是最新 → 完全安靜，不打擾使用者。
+沒網路 / 查不到 / 已是最新 → 完全安靜。
+更新失敗 → 提示一下就繼續用舊版，不能因為更新不成功就讓人沒得用。
 """
 from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from app import __version__
-from app.config import config
 from app.core import updater
 
 
@@ -59,7 +63,7 @@ class UpdateManager:
         self._info: dict | None = None
 
     def start(self) -> None:
-        """開場呼叫。開發模式、無頭模式、或使用者關掉自動檢查時什麼都不做。"""
+        """開場呼叫。只有開發模式與無頭模式不做，其餘一律檢查並強制更新。"""
         updater.clean_leftovers()
         if not updater.is_frozen():
             return
@@ -67,8 +71,6 @@ class UpdateManager:
         # 這條執行緒還連著網路沒收完，Qt 會丟「QThread: Destroyed while running」
         # 並中止行程，害冒煙測試誤判成「分頁載入失敗」。實際踩過。
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
-            return
-        if not config.get("update.auto_check", True):
             return
         self._check = CheckThread()
         self._check.done.connect(self._on_checked)
@@ -84,39 +86,30 @@ class UpdateManager:
 
     # ------------------------------------------------------------------
     def _on_checked(self, info) -> None:
+        """查到新版就直接更新，不問使用者。"""
         self._check = None
         if not info:
             return
         self._info = info
-        notes = info.get("notes") or ""
-        if len(notes) > 400:
-            notes = notes[:400] + "…"
-        box = QMessageBox(self._parent)
-        box.setWindowTitle("有新版本")
-        box.setText(f"目前版本 {__version__}，最新版本 {info['version']}。\n"
-                    "要現在更新嗎？更新後程式會自動重新啟動。")
-        if notes:
-            box.setInformativeText(notes)
-        yes = box.addButton("立即更新", QMessageBox.AcceptRole)
-        box.addButton("稍後再說", QMessageBox.RejectRole)
-        never = box.addButton("不再自動檢查", QMessageBox.DestructiveRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is never:
-            config.set("update.auto_check", False)
-            config.save()
-            return
-        if clicked is not yes:
-            return
         self._start_download()
 
     def _start_download(self) -> None:
         cur = updater.exe_path()
         dest = cur.with_suffix(cur.suffix + ".new")
-        self._dlg = QProgressDialog("下載新版本…", "取消", 0, 100, self._parent)
+        # 強制更新：沒有取消鈕（傳 None）、應用程式層級 modal，避免使用者在換檔
+        # 途中去操作視窗。下載完會自己重啟。
+        self._dlg = QProgressDialog(
+            f"正在更新到 {self._info['version']}…\n完成後會自動重新啟動。",
+            None, 0, 100, self._parent)
         self._dlg.setWindowTitle("更新中")
+        self._dlg.setWindowModality(Qt.ApplicationModal)
         self._dlg.setMinimumDuration(0)
         self._dlg.setAutoClose(False)
+        self._dlg.setAutoReset(False)
+        # 關掉標題列的關閉鈕，避免關掉對話框以為取消了、其實還在下載
+        self._dlg.setWindowFlags(
+            (self._dlg.windowFlags() | Qt.CustomizeWindowHint)
+            & ~Qt.WindowCloseButtonHint)
         self._dlg.setValue(0)
         self._dl = DownloadThread(self._info, dest)
         self._dl.progress.connect(self._on_progress)
@@ -126,29 +119,34 @@ class UpdateManager:
     def _on_progress(self, got: int, total: int) -> None:
         if not self._dlg:
             return
+        ver = self._info["version"] if self._info else ""
         if total:
             self._dlg.setValue(int(got / total * 100))
             self._dlg.setLabelText(
-                f"下載新版本…　{got / 1e6:.1f} / {total / 1e6:.1f} MB")
+                f"正在更新到 {ver}…　{got / 1e6:.1f} / {total / 1e6:.1f} MB\n"
+                "完成後會自動重新啟動。")
         else:
-            self._dlg.setLabelText(f"下載新版本…　{got / 1e6:.1f} MB")
+            self._dlg.setLabelText(
+                f"正在更新到 {ver}…　{got / 1e6:.1f} MB\n完成後會自動重新啟動。")
 
     def _on_downloaded(self, ok: bool, dest) -> None:
         self._dl = None
         if self._dlg:
             self._dlg.close()
             self._dlg = None
+        # 更新失敗不能讓人沒得用 —— 講清楚原因就讓他繼續用舊版
         if not ok:
             QMessageBox.warning(
                 self._parent, "更新失敗",
-                "下載沒有完成或檔案不完整，這次先跳過。\n"
-                "可以稍後再試，或到 GitHub Releases 手動下載。")
+                f"下載 {self._info['version']} 沒有完成或檔案不完整，"
+                "這次先用目前的版本。\n下次開啟會再試一次，"
+                "也可以到 GitHub Releases 手動下載。")
             return
         if not updater.apply_and_restart(dest):
             QMessageBox.warning(
                 self._parent, "更新失敗",
                 "換檔時失敗，已保留原本的版本。\n"
-                "若程式安裝在唯讀資料夾（例如 Program Files），"
+                "若程式放在唯讀資料夾（例如 Program Files），"
                 "請改用系統管理員身分執行，或手動下載。")
             return
         QApplication.quit()

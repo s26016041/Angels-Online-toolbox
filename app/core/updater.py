@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import sys
@@ -165,14 +166,42 @@ def apply_and_restart(new_file: Path) -> bool:
             pass
         return False
     try:
-        subprocess.Popen([str(cur)], cwd=str(cur.parent), close_fds=True)
+        subprocess.Popen([str(cur)], cwd=str(cur.parent), close_fds=True,
+                         env=_child_env())
     except OSError:
         return False
     return True
 
 
+def _child_env() -> dict:
+    """啟動新版時要用的環境變數：把 PyInstaller 的解壓目錄指標清掉。
+
+    onefile 的 exe 啟動時會把自己解壓到 %TEMP%\\_MEIxxxxxx，並用 `_PYI_*` /
+    `_MEIPASS2` 這些環境變數記住位置。如果直接把環境整份傳給新行程，**新版會沿用
+    舊版的解壓目錄**；舊版接著結束、要刪掉那個目錄時，發現裡面的檔案還被新版開著，
+    就會跳「Failed to remove temporary directory: ...\\_MEIxxxxxx」的警告。
+    實際踩過（使用者更新後就看到這個視窗）。清掉之後新版會自己開一個新目錄。
+    """
+    return {k: v for k, v in os.environ.items()
+            if not (k.startswith("_MEI") or k.startswith("_PYI"))}
+
+
 def clean_leftovers() -> None:
-    """刪掉上次更新留下的 .old。刪不掉就算了（可能還被佔用），下次再試。"""
+    """開場清理：刪掉上次更新留下的 .old，並移除舊版的「不再自動檢查」設定。
+
+    刪不掉 .old 就算了（可能還被佔用），下次再試。
+    """
+    # 0.2.4 之前的版本有「不再自動檢查」選項。改成強制更新後那個設定必須清掉，
+    # 否則當初按過的人會永遠停在舊版、拿到錯的記憶體位址還以為程式壞了。
+    try:
+        from app.config import config
+
+        if config.get("update.auto_check", None) is not None:
+            config.set("update.auto_check", None)
+            config.save()
+    except Exception:
+        pass
+
     if not is_frozen():
         return
     old = exe_path()
@@ -181,3 +210,30 @@ def clean_leftovers() -> None:
         old.unlink(missing_ok=True)
     except OSError:
         pass
+    _clean_stale_mei()
+
+
+def _clean_stale_mei() -> None:
+    """清掉 %TEMP% 裡別人留下的 _MEIxxxxxx 解壓目錄。
+
+    onefile 的 exe 若沒能正常收尾（更新換檔、當掉、被工作管理員砍掉）就會留下
+    這種目錄，一個約 80MB，累積起來很可觀 —— 使用者電腦上實際存過 9 個 / 86MB。
+    正在使用中的那些會刪失敗，直接跳過；自己這次的解壓目錄也不能刪。
+    """
+    mine = os.environ.get("_PYI_APPLICATION_HOME_DIR") or getattr(
+        sys, "_MEIPASS", "")
+    tmp = os.environ.get("TEMP") or os.environ.get("TMP")
+    if not tmp:
+        return
+    try:
+        entries = list(Path(tmp).glob("_MEI*"))
+    except OSError:
+        return
+    for d in entries:
+        if not d.is_dir() or (mine and os.path.normcase(str(d))
+                              == os.path.normcase(str(mine))):
+            continue
+        try:
+            shutil.rmtree(d)
+        except OSError:
+            pass          # 還被別的行程開著 → 那個行程結束後自己會清
