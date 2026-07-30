@@ -24,7 +24,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-EXE_NAME = "AngelsOnlineToolbox"
+EXE_NAME = "天使之戀AO工具箱"
+# 0.2.5 以前的檔名。那些版本的自動更新是「寫死比對這個資產名稱」，所以每次發布都要
+# 一併上傳一份同內容、舊檔名的副本，否則他們永遠找不到更新、靜靜卡在舊版。
+# 0.2.6 之後的版本改成「找不到正式檔名就取任何 .exe」，等舊版都汰換完就能移除這段。
+LEGACY_EXE_NAME = "AngelsOnlineToolbox"
 
 
 def sh(cmd: list[str]) -> int:
@@ -120,18 +124,27 @@ def main() -> None:
     size_mb = exe.stat().st_size // (1024 * 1024)
     print(f"\n✓ 編譯完成：{exe}（約 {size_mb} MB）")
 
-    # 建立 Release（gh 會順便建 tag）並上傳 .exe
+    # 舊檔名的副本：給 0.2.5 以前的版本抓（它們寫死比對舊資產名稱）
+    legacy = ROOT / "dist" / f"{LEGACY_EXE_NAME}.exe"
+    shutil.copy2(exe, legacy)
+    print(f"✓ 另存舊檔名副本供舊版自動更新使用：{legacy.name}")
+
+    # 建立 Release（gh 會順便建 tag）並上傳兩份 .exe
     print("\n建立 GitHub Release 並上傳 .exe…")
     rc = sh([
         "gh", "release", "create", tag,
         "--target", target,
         "--title", tag,
-        "--notes", f"天使之戀工具箱 {tag}\n\n由 release.py 自動編譯發布。",
-        str(exe),
+        "--notes", f"天使之戀工具箱 {tag}\n\n由 release.py 自動編譯發布。\n\n"
+                   f"下載 `{EXE_NAME}.exe` 即可。"
+                   f"（`{LEGACY_EXE_NAME}.exe` 是同一個檔案，"
+                   f"只是為了讓 0.2.5 以前的版本能自動更新而保留的舊檔名。）",
+        str(exe), str(legacy),
     ])
     if rc != 0:
         die("建立 Release 失敗，請看上面 gh 的訊息。")
-    print(f"\n✅ 已發布 {tag} 到 GitHub Releases，並上傳 {EXE_NAME}.exe")
+    print(f"\n✅ 已發布 {tag} 到 GitHub Releases，"
+          f"並上傳 {EXE_NAME}.exe 與 {LEGACY_EXE_NAME}.exe")
 
 
 if __name__ == "__main__":

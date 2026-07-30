@@ -31,7 +31,10 @@ from pathlib import Path
 
 REPO = "s26016041/Angels-Online-toolbox"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
-ASSET_NAME = "AngelsOnlineToolbox.exe"
+ASSET_NAME = "天使之戀AO工具箱.exe"
+# 0.2.5 以前的檔名。那些版本的更新程式是寫死找這個名字的，所以發布時要一併上傳
+# 一份同內容、舊檔名的資產，否則他們會永遠找不到更新、靜靜卡在舊版。
+LEGACY_ASSET_NAME = "AngelsOnlineToolbox.exe"
 TIMEOUT = 15.0
 UA = {"User-Agent": "AngelsOnlineToolbox-Updater"}
 
@@ -87,15 +90,22 @@ def latest_release() -> dict | None:
     except Exception:
         return None
     tag = data.get("tag_name") or ""
-    for asset in data.get("assets") or []:
-        if asset.get("name") == ASSET_NAME:
-            return {
-                "version": tag,
-                "url": asset.get("browser_download_url"),
-                "size": int(asset.get("size") or 0),
-                "notes": (data.get("body") or "").strip(),
-            }
-    return None
+    assets = data.get("assets") or []
+    # 先找正式檔名，找不到就退而取任何 .exe —— 這樣以後再改名也不會讓舊版失聯
+    # （0.2.5 之前是寫死比對檔名的，改名時就得靠 LEGACY_ASSET_NAME 補一份）。
+    picked = next((a for a in assets if a.get("name") == ASSET_NAME), None)
+    if picked is None:
+        picked = next(
+            (a for a in assets
+             if str(a.get("name", "")).lower().endswith(".exe")), None)
+    if picked is None:
+        return None
+    return {
+        "version": tag,
+        "url": picked.get("browser_download_url"),
+        "size": int(picked.get("size") or 0),
+        "notes": (data.get("body") or "").strip(),
+    }
 
 
 def check() -> dict | None:

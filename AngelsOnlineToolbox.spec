@@ -33,7 +33,10 @@ for pkg in ('keystone', 'pymem', 'pefile'):
 
 
 DEBUG_CONSOLE = os.environ.get('AOT_CONSOLE', '0') == '1'
-APP_NAME = 'AngelsOnlineToolbox' + ('-debug' if DEBUG_CONSOLE else '')
+# exe 的檔名（使用者在桌面/工作列看到的名字）。0.2.6 從 AngelsOnlineToolbox
+# 改成中文名；更新程式已改成「找不到正式檔名就取任何 .exe」，所以以後再改不會
+# 讓舊版失聯，但 0.2.5 以前是寫死比對的，發布時要一併傳一份舊檔名（見 release.py）。
+APP_NAME = '天使之戀AO工具箱' + ('-debug' if DEBUG_CONSOLE else '')
 
 
 a = Analysis(

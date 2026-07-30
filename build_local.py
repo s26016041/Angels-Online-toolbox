@@ -55,11 +55,11 @@ def main() -> int:
     env = dict(os.environ)
     if debug:
         env["AOT_CONSOLE"] = "1"
-        exe_name = "AngelsOnlineToolbox-debug.exe"
+        exe_name = "天使之戀AO工具箱-debug.exe"
         print("\n=== 編譯除錯版（帶主控台，看得到 traceback）===")
     else:
         env.pop("AOT_CONSOLE", None)
-        exe_name = "AngelsOnlineToolbox.exe"
+        exe_name = "天使之戀AO工具箱.exe"
         print("\n=== 編譯正式版（無主控台，GUI）===")
 
     if sh([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", SPEC], env=env) != 0:
