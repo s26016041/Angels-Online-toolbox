@@ -13,8 +13,9 @@ import os
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-# music/：警報聲 mp3　　fonts/：介面字體（見 app/theme.py，漏收會退回系統字體）
-datas = [('VERSION', '.'), ('music', 'music'), ('fonts', 'fonts')]
+# assets/ 整包收進去：icon.ico（程式圖示）、fonts/（介面字體）、music/（警報聲）。
+# 路徑對應 app/paths.py 的 resource()，漏收的話字體會退回系統字體、警報退回嗶聲。
+datas = [('VERSION', '.'), ('assets', 'assets')]
 binaries = []
 hiddenimports = []
 
@@ -63,6 +64,9 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
+    # exe 檔本身在檔案總管 / 桌面 / 工作列捷徑上顯示的圖示（嵌進 exe）。
+    # 執行中的視窗左上角與工作列圖示是另一條路，由 app/theme.py 的 setWindowIcon 設定。
+    icon='assets/icon.ico',
     # 除錯版帶主控台（看得到 traceback）；正式版無主控台（GUI）。
     console=DEBUG_CONSOLE,
     disable_windowed_traceback=False,

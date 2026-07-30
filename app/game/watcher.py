@@ -47,9 +47,6 @@ BALL_QUIET_SECS = 10.0
 BALL_MAX_GAP = 60.0
 # 一顆球多久沒動就不再算「裝備中」。
 BALL_LIVE_SECS = 60.0
-# 多久掃一次商店列表學新的球種類 ID。商店只在玩家打開時才在記憶體裡，所以要重試；
-# 掃一次約一秒，而且目錄全部認得之後就完全不掃了。
-SHOP_LEARN_GAP = 90.0
 
 
 class StatsWorker(QThread):
@@ -84,12 +81,8 @@ class StatsWorker(QThread):
         self._ever: dict[int, set[int]] = {}          # {pid: 曾經增加過的位址}
         self._force: set[int] = set()                 # 偵測到換裝 → 下一輪立刻重掃
         self._inv: dict[int, int] = {}                # {pid: 物品陣列表頭}
-        self._catalog_done = False                    # 遊戲物品說明表只解析一次
-        self._last_shop_learn = 0.0                   # 上次掃商店列表學 ID 的時間
         self._last_inc: dict[int, float] = {}         # {pid: 任一顆上次增加的時間}
         self._last_scan: dict[int, float] = {}        # {pid: 上次全掃特徵的時間}
-        # 未知種類 ID 的探測結果：{(pid, type_id): BallType | None}，None = 探過但找不到
-        self._probed: dict[tuple[int, int], object] = {}
         self._running = True
 
     # -- 玩家物件 ------------------------------------------------------
@@ -137,30 +130,16 @@ class StatsWorker(QThread):
     def _describe(self, pid: int, sc, addr: int, type_id, value: int) -> dict:
         """把一個候選位址講成畫面要的樣子。
 
-        種類 ID 在對照表裡 → 直接拿名稱與上限。
-        不在表裡 → 探一次遊戲自己組出來的道具提示，能問出名稱／上限就用（見
-        items.probe_ball）；問不出來就標成「非技能球」，畫面不會畫進度條或百分比。
+        只查 app/game/items.py 那張寫死的表 —— 不做任何執行時推測（原因見該檔開頭）。
+        不在表裡就標成「非經驗球」，畫面不畫進度條也不顯示百分比。
         """
         bt = items.ball_type(type_id)
-        if bt is None and type_id is not None:
-            key = (pid, type_id)
-            if key not in self._probed:
-                try:
-                    got = items.probe_ball(sc, value)
-                except Exception:
-                    got = None
-                if got is not None:
-                    # 學到就存進設定檔 —— 玩家把滑鼠移過去一次，之後永久認得
-                    items.remember(type_id, got)
-                self._probed[key] = got
-            bt = self._probed[key] or items.ball_type(type_id)
-        # 保險：球的累積值不可能超過自己的上限。真的超過就代表這個 ID 對錯球種了
-        # （表裡有些項目是靠「同組連號」推的，沒實測過）。這時寧可只顯示數值、
-        # 不顯示上限與百分比，也不要畫一條騙人的滿格進度條。
+        # 保險：球的累積值不可能超過自己的上限。真的超過就代表表裡那筆對照有誤，
+        # 這時只顯示數值、不顯示上限與百分比，也不要畫一條騙人的滿格進度條。
         if bt is not None and bt.cap and value > bt.cap:
             sys.stderr.write(
                 f"[items] ⚠ ID {type_id} 的值 {value:,} 超過表中「{bt.name}」的"
-                f"上限 {bt.cap:,} → 對照可能有誤，暫不顯示上限\n")
+                f"上限 {bt.cap:,} → 對照表有誤，暫不顯示上限\n")
             return {"addr": addr, "value": value, "type_id": type_id,
                     "name": bt.name, "cap": 0, "pct": None, "is_ball": True}
         return {"addr": addr, "value": value, "type_id": type_id,
@@ -168,27 +147,6 @@ class StatsWorker(QThread):
                 "cap": bt.cap if bt else 0,
                 "pct": bt.pct(value) if bt else None,
                 "is_ball": bt is not None}
-
-    def _try_learn_shop(self, sc) -> None:
-        """定期掃商店列表，把還不認識的球的種類 ID 學起來。
-
-        商店/商城列表只在玩家打開時才在記憶體裡，所以要重試而不是掃一次；
-        學到的會永久存進設定檔。目錄全部認得之後就完全不掃（missing 為空）。
-        """
-        now = time.monotonic()
-        if now - self._last_shop_learn < SHOP_LEARN_GAP:
-            return
-        self._last_shop_learn = now
-        try:
-            if not items.missing_ids():
-                return          # 全都認得了 → 不必再掃
-            got = items.learn_from_shop(sc)
-        except Exception:
-            return
-        if got:
-            left = len(items.missing_ids())
-            sys.stderr.write(
-                f"[items] 從商店列表學到 {got} 種經驗球的 ID，還有 {left} 種未知\n")
 
     def _inventory_ball(self, pid: int, sc) -> dict | None:
         """精確版：直接讀物品陣列的飾品欄兩格，不做任何行為推論。
@@ -212,19 +170,6 @@ class StatsWorker(QThread):
             if not head:
                 return None
             self._inv[pid] = head
-            # 定位到物品欄的同時，順手把遊戲自己的物品說明表解析一次：
-            # 名稱／加成／上限現場讀，寫死的那份只當後備（遊戲改版才不會失效）。
-            # 要走一遍所有可讀區塊（約一秒），所以整個工具只做一次。
-            if not self._catalog_done:
-                self._catalog_done = True
-                try:
-                    n = items.refresh_from_game(sc)
-                    if n:
-                        sys.stderr.write(
-                            f"[items] 從遊戲讀到 {n} 種經驗球的容量\n")
-                except Exception:
-                    pass
-        self._try_learn_shop(sc)
 
         try:
             slots = inventory.scan_slots(sc, head)
@@ -233,19 +178,21 @@ class StatsWorker(QThread):
 
         equipped, bag = [], []
         for idx, tid, ptr, val in slots:
-            if not items.is_ball(tid):
+            is_acc = idx in inventory.SLOT_ACCESSORY
+            # 飾品欄那兩格「一定顯示」，就算對照表裡沒有那個種類 ID ——
+            # 使用者要看到「飾品欄右裝了個我不認識的東西」，而不是那一格憑空消失。
+            # 背包則只算確定是球的，否則會把所有雜物都數進去。
+            if not is_acc and not items.is_ball(tid):
                 continue
             entry = {"addr": ptr + inventory.ITEM_BALL_OFF, "value": val,
-                     "type_id": tid, "slot": idx}
-            (equipped if idx in inventory.SLOT_ACCESSORY else bag).append(entry)
+                     "type_id": tid, "slot": idx,
+                     "side": inventory.slot_side(idx)}
+            (equipped if is_acc else bag).append(entry)
 
         def described(e):
-            bt = items.ball_type(e["type_id"])
-            return {**e,
-                    "name": bt.name if bt else items.UNKNOWN_LABEL,
-                    "cap": bt.cap if bt else 0,
-                    "pct": bt.pct(e["value"]) if bt else None,
-                    "is_ball": bt is not None}
+            # 走 _describe 才會套上「值超過上限就不顯示上限」那道保險
+            d = self._describe(pid, sc, e["addr"], e["type_id"], e["value"])
+            return {**d, "slot": e["slot"], "side": e["side"]}
 
         # 有沒有在增加只拿來決定顯示顏色，不再影響「哪幾顆是裝備中」
         prev = self._prev.get(pid, {})

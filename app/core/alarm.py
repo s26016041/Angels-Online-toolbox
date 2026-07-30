@@ -3,7 +3,7 @@
 原本寫在「監控技能經驗球」分頁裡，因為「收益監控」也要用，抽出來共用。
 兩邊都是同一顆警報聲、同一種視窗行為，沒必要維護兩份。
 
-音效優先播 music/Alarm_music.mp3（循環到 stop()）；播不出來就退回 winsound 嗶聲。
+音效優先播 assets/music/Alarm_music.mp3（循環到 stop()）；播不出來就退回 winsound 嗶聲。
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QDialog, QLabel, QPushButton, QVBoxLayout
 
 from app.paths import resource
 
-ALARM_MP3 = "music/Alarm_music.mp3"
+ALARM_MP3 = "assets/music/Alarm_music.mp3"
 
 
 class BeepThread(QThread):

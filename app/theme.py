@@ -9,16 +9,20 @@
 """
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPalette
 from PySide6.QtWidgets import QApplication
 
 from app.paths import resource
 
-# 介面字體：打包在 fonts/ 裡，不依賴使用者電腦有沒有裝。
+# 介面字體：打包在 assets/fonts/ 裡，不依賴使用者電腦有沒有裝。
 # 載入失敗（檔案缺了 / 打包漏收）就退回系統內建的微軟正黑體，不讓程式開不起來。
-UI_FONT_FILE = "fonts/Iansui-Regular.ttf"
+UI_FONT_FILE = "assets/fonts/Iansui-Regular.ttf"
 UI_FONT_FALLBACK = "Microsoft JhengHei UI"
 UI_FONT_SIZE = 10
+
+# 程式圖示：同一顆 .ico 供「視窗左上角」與「工作列」使用（Qt 這兩個是同一個設定）。
+# exe 檔本身在檔案總管/桌面顯示的圖示是另一條路 —— 由 spec 的 icon= 嵌進去。
+APP_ICON_FILE = "assets/icon.ico"
 
 # --- 調色盤（深邃夜藍）------------------------------------------------------
 # 這些常數與下方 QSS 內的色碼一致；改色時兩邊一起改。
@@ -250,8 +254,11 @@ def _ui_font() -> QFont:
 
 
 def apply_theme(app: QApplication) -> None:
-    """在 QApplication 套用深邃夜藍主題（字體 + 調色盤 + QSS）。"""
+    """在 QApplication 套用深邃夜藍主題（圖示 + 字體 + 調色盤 + QSS）。"""
     app.setStyle("Fusion")  # 統一底層繪製，QSS 才會在各元件一致生效
+    icon = resource(APP_ICON_FILE)
+    if icon.exists():
+        app.setWindowIcon(QIcon(str(icon)))
     app.setFont(_ui_font())
     app.setPalette(_palette())
     app.setStyleSheet(_QSS)

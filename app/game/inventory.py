@@ -38,6 +38,15 @@ import numpy as np
 SLOT_ACCESSORY = (8, 9)      # 飾品欄兩格
 EQUIP_SLOTS = 12             # 前 12 格是裝備欄，之後是空格與背包
 
+# 飾品欄的左右對應。實測：使用者把「右邊」那顆卸到背包後，正好是第 9 格變空，
+# 第 8 格的球還在；使用者也確認遊戲的飾品欄就是兩格、一左一右。
+SLOT_SIDE = {8: "左", 9: "右"}
+
+
+def slot_side(index: int) -> str:
+    """格號 → 「左」/「右」；不是飾品欄就回空字串。"""
+    return SLOT_SIDE.get(index, "")
+
 # 物品結構內的偏移
 ITEM_TYPE_OFF = 0x08         # 種類 ID
 ITEM_BALL_OFF = 0xA0         # 技能經驗球的值

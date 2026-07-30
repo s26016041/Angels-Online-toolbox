@@ -1,9 +1,11 @@
 """資源檔路徑：開發時相對專案根目錄，打包成 exe 後在 PyInstaller 的解壓目錄。
 
-專案根目錄下的資源資料夾（都要在 AngelsOnlineToolbox.spec 的 datas 裡列出來，
-否則打包後會找不到）：
-    music/  警報聲 mp3
-    fonts/  介面字體
+所有資源集中在專案根目錄的 assets/（整包在 AngelsOnlineToolbox.spec 的 datas 裡
+列出來，否則打包後會找不到）：
+    assets/icon.ico          程式圖示（exe、工作列、視窗左上）
+    assets/icon.png          圖示的來源圖，改圖時重新產生 .ico 用
+    assets/fonts/*.ttf       介面字體
+    assets/music/*.mp3       警報聲
 """
 from __future__ import annotations
 

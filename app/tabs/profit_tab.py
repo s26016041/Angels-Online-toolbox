@@ -429,13 +429,16 @@ class CharCard(QFrame):
             if not show:
                 continue
             b = balls[i]
-            name.setText(b["name"])
+            # 飾品欄有左右兩格，標出來才知道要動哪一顆（只有精確路徑拿得到格號）
+            side = b.get("side") or ""
+            name.setText(f"［{side}］{b['name']}" if side else b["name"])
             if not b["is_ball"]:
                 # 對照表沒有、也問不出名字的飾品：只標「非經驗球」，
                 # 進度條與百分比都不畫（畫了只會是騙人的數字）。
                 bar.setVisible(False)
                 info.setText("")
-                tip = (f"這個位置裝的東西不在對照表裡（種類 ID {b['type_id']}，"
+                where = f"飾品欄{side}" if side else "這個位置"
+                tip = (f"{where}裝的東西不在對照表裡（種類 ID {b['type_id']}，"
                        f"目前值 {b['value']:,}）。\n"
                        "把這個 ID 補進 app/game/items.py 就能正常顯示名稱與上限。")
                 name.setToolTip(tip)
