@@ -828,9 +828,11 @@ class ProfitTab(BaseTab):
         m["alive"] = bool(fresh)
         if fresh:
             m["title"] = fresh
+        # 名字解不出來時（新角色還沒產生存檔檔案）先用帳號頂著，別讓那一格一直空白。
+        # 背景會定期重試，存檔一出現就會自動換成真的角色名。
         nm = self._names.get(pid)
-        if nm and nm != "?":
-            card.set_name(nm)
+        card.set_name(nm if nm and nm != "?"
+                      else charname.account_from_title(m["title"]))
         card.update_data(m["title"], stats, ball)
         self._check_alarms(pid, m, stats, ball)
 

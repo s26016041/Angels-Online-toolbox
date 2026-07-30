@@ -47,6 +47,8 @@ BALL_QUIET_SECS = 10.0
 BALL_MAX_GAP = 60.0
 # 一顆球多久沒動就不再算「裝備中」。
 BALL_LIVE_SECS = 60.0
+# 角色名解不到時，多久重試一次（要掃全記憶體，所以別太頻繁）。
+NAME_RETRY_SECS = 120.0
 
 
 class StatsWorker(QThread):
@@ -72,6 +74,7 @@ class StatsWorker(QThread):
         self._names = names
         self._bases: dict[int, int] = {}
         self._last_try: dict[int, float] = {}
+        self._name_try: dict[int, float] = {}    # {pid: 上次嘗試解角色名的時間}
         # 技能球狀態
         self._cands: dict[int, list[int]] = {}        # {pid: [候選位址]}
         self._types: dict[int, dict[int, int]] = {}   # {pid: {位址: 種類 ID}}
@@ -84,6 +87,30 @@ class StatsWorker(QThread):
         self._last_inc: dict[int, float] = {}         # {pid: 任一顆上次增加的時間}
         self._last_scan: dict[int, float] = {}        # {pid: 上次全掃特徵的時間}
         self._running = True
+
+    # -- 角色名 --------------------------------------------------------
+    def _resolve_name(self, pid: int, sc, title: str) -> None:
+        """解角色名。解不到就過一陣子再試，不要記成永久失敗。
+
+        名字是從記憶體裡的存檔路徑「RobotData_1_{帳號}_{角色名}.data」解出來的
+        （見 app/core/charname.py）。**新角色還沒產生存檔檔案時就抓不到** ——
+        使用者的弟弟那隻低等角色就是一直空白。存檔之後路徑就會出現，所以要重試；
+        以前解不到會記成 "?" 而且永遠不再嘗試，等於卡死。
+
+        這個查詢要掃全部記憶體，所以只在「還沒解到」時每隔一段時間重試一次。
+        """
+        if self._names.get(pid) not in (None, "?"):
+            return
+        now = time.monotonic()
+        if now - self._name_try.get(pid, 0.0) < NAME_RETRY_SECS:
+            return
+        self._name_try[pid] = now
+        try:
+            got = charname.read_character_name(
+                sc, charname.account_from_title(title))
+        except Exception:
+            got = None
+        self._names[pid] = got or "?"
 
     # -- 玩家物件 ------------------------------------------------------
     def _stats(self, pid: int, sc):
@@ -328,13 +355,7 @@ class StatsWorker(QThread):
             for pid, _hwnd, title, sc in self._insts:
                 if not self._running:
                     return
-                # 角色名解一次就好（存檔路徑不會變），失敗記 "?" 不重試。
-                if pid not in self._names:
-                    try:
-                        self._names[pid] = charname.read_character_name(
-                            sc, charname.account_from_title(title)) or "?"
-                    except Exception:
-                        self._names[pid] = "?"
+                self._resolve_name(pid, sc, title)
                 st = self._stats(pid, sc)
                 # 先走精確路徑（直接讀飾品欄兩格）。定位到物品陣列之後就完全不必再
                 # 掃 AOB 特徵了 —— 那是每台 1～2.5 秒的全記憶體掃，能省則省。
