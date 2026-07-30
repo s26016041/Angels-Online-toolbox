@@ -457,25 +457,16 @@ class CharCard(QFrame):
                 txt += f"　滿約 {eta((b['cap'] - b['value']) / rate * 3600)}"
             info.setText(txt)
 
-        exact = bool(ball and ball.get("exact"))
-        # 標題直接講清楚現在的資料可不可信 —— 剛啟動那幾秒還沒定位到物品欄，
-        # 顯示的是「數值最大的那顆」當參考，很可能是背包裡早就滿了的球。
-        self.ball_title.setText(
-            "● 經驗球（飾品欄）" if exact else "● 經驗球（定位中，僅供參考）")
-        self.ball_title.setStyleSheet(
-            f"color: {ACCENT if exact else TEXT_MUT};")
+        # 球的資料只有一個來源：直接讀物品陣列的飾品欄兩格。沒有「僅供參考」的模式。
+        self.ball_title.setText("● 經驗球（飾品欄）")
+        self.ball_title.setStyleSheet(f"color: {ACCENT};")
 
         idle = ball.get("idle") if ball else None
         if idle:
             unfull = sum(1 for tid, v in idle
                          if (bt := items.ball_type(tid)) and v < bt.cap)
-            label = "背包經驗球" if exact else "其他偵測到的球"
-            self.bag_lbl.setText(f"{label} {len(idle)} 顆　未滿 {unfull} 顆")
-            self.bag_lbl.setToolTip(
-                "飾品欄以外、物品欄裡的球（精確值）。"
-                if exact else
-                "沒在增加的球：背包裡的、以及記憶體殘留的舊副本都算在內，\n"
-                "已依「種類 + 數值」去重，但仍可能高估，僅供參考。")
+            self.bag_lbl.setText(f"背包經驗球 {len(idle)} 顆　未滿 {unfull} 顆")
+            self.bag_lbl.setToolTip("飾品欄以外、物品欄裡的球。")
         else:
             self.bag_lbl.setText("")
 
@@ -684,10 +675,9 @@ class ProfitTab(BaseTab):
                 f"角色死亡：HP 歸零（Lv{stats.level}，HP 0/{stats.max_hp:,}）。")
 
         # -- 技能球滿：直接比對數值，不用計時猜 --
-        # ★ 一定要等 exact（真的讀到飾品欄那兩格）才判定。剛啟動的頭幾秒還沒定位到
-        #   物品陣列，那時走的是舊的推論路徑，它會拿「數值最大的球」當參考顯示——
-        #   而那顆很可能是**背包裡早就滿了的球**，照著判就會一開分頁就誤報。
-        if self.cb_ball.isChecked() and ball and ball.get("exact"):
+        # ball 只會是「飾品欄兩格的實際內容」，所以不必再擔心誤把背包裡早就滿了的
+        # 球當成裝備中的（那是舊推論路徑才有的問題）。
+        if self.cb_ball.isChecked() and ball:
             full = [b for b in ball["balls"]
                     if b["is_ball"] and b["cap"] and b["value"] >= b["cap"]]
             if full:
