@@ -120,6 +120,10 @@ class MainWindow(QMainWindow):
                 widget.on_show()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名慣例)
+        try:
+            self._updater.stop()
+        except Exception:
+            traceback.print_exc()
         for tab in self._loaded_tabs:
             try:
                 tab.on_close()

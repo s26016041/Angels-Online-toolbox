@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
@@ -57,15 +59,28 @@ class UpdateManager:
         self._info: dict | None = None
 
     def start(self) -> None:
-        """開場呼叫。開發模式或使用者關掉自動檢查就什麼都不做。"""
+        """開場呼叫。開發模式、無頭模式、或使用者關掉自動檢查時什麼都不做。"""
         updater.clean_leftovers()
         if not updater.is_frozen():
+            return
+        # 無頭模式（--selftest 會設 offscreen）不要查：冒煙測試建好視窗就馬上結束，
+        # 這條執行緒還連著網路沒收完，Qt 會丟「QThread: Destroyed while running」
+        # 並中止行程，害冒煙測試誤判成「分頁載入失敗」。實際踩過。
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return
         if not config.get("update.auto_check", True):
             return
         self._check = CheckThread()
         self._check.done.connect(self._on_checked)
         self._check.start()
+
+    def stop(self) -> None:
+        """關閉程式前呼叫：等背景執行緒收完，別讓 Qt 在解構時抱怨。"""
+        for t in (self._check, self._dl):
+            if t is not None and t.isRunning():
+                t.wait(3000)
+        self._check = None
+        self._dl = None
 
     # ------------------------------------------------------------------
     def _on_checked(self, info) -> None:
