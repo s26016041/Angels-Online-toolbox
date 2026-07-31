@@ -20,6 +20,25 @@
 **現在飾品欄那兩格是直接讀出來的，裝什麼就是什麼**，所以那套機制整個移除了。
 「有沒有在增加」只剩一個用途：決定畫面顏色（綠＝正在練功），不影響任何判定。
 
+★ 為什麼分成兩條執行緒 ★
+------------------------
+定位要掃全記憶體：解角色名 1.1 秒、AOB 0.85 秒、物品陣列反查 0.9 秒。以前這些跟
+「每輪讀值」在同一條迴圈裡，於是開場那二十秒會出現：
+
+    5.9s 解角色名 1161ms ┐
+    6.8s AOB      830ms ├─ 同一輪，整整卡住 2.7 秒
+    7.5s 反查      708ms ┘
+
+期間**所有**分身的畫面都停著不動，實測更新間隔平均 1.06 秒、最久 4.3 秒（設計值
+0.7 秒），而且還沒定位好的分身球區是空的——看起來就是「每隔幾秒閃一下、卡卡的」。
+
+現在拆成：
+* **讀值執行緒**（StatsWorker 本身）只做便宜的讀取，穩定每 0.7 秒發一次快照，
+  永遠不會被掃描卡住。
+* **定位執行緒**（_Locator）專門跑那些全掃，找到什麼就更新共用的位址表。
+  順序是「先玩家物件（數值最有感）→ 再物品陣列 → 最後角色名」，
+  因為名字沒解出來時畫面本來就會先用帳號頂著。
+
 全程只讀取記憶體、不寫入、不注入、不掛除錯器（安全）。
 """
 from __future__ import annotations
@@ -40,9 +59,8 @@ RELOCATE_GAP_SECS = 5.0
 INV_RELOCATE_GAP_SECS = 8.0
 # 多久內有增加就算「正在練功」（只影響顏色，不影響任何判定）。
 BALL_ACTIVE_SECS = 60.0
-# 背包裡的球多久重新盤點一次。飾品欄那兩格每輪都讀（那才是會即時變的），
-# 背包要一格一格查種類，成本高一個量級，而且內容不會秒秒在變。
-BAG_REFRESH_SECS = 5.0
+# 定位執行緒沒事做時的休息間隔（全部定位完就進入這個狀態）。
+LOCATE_IDLE_MS = 500
 
 BALL_SIG = aob.SKILL_EXP_BALL
 BALL_SCAN_LIMIT = 4096
@@ -76,34 +94,24 @@ class StatsWorker(QThread):
         self._inv_try: dict[int, float] = {}     # {pid: 上次重新定位物品陣列的時間}
         self._prev: dict[int, dict[int, int]] = {}   # {pid: {球位址: 上輪的值}}
         self._last_inc: dict[int, float] = {}    # {pid: 上次有球增加的時間}
-        self._bag: dict[int, list] = {}          # {pid: 上次盤點到的背包球}
-        self._bag_at: dict[int, float] = {}      # {pid: 上次盤點背包的時間}
-        # 「這一輪已經做過的全記憶體掃描」。開場五台一起要掃，排隊做完要二十幾秒，
-        # 期間畫面一直空著。每輪各給一個名額，資料就會一台一台冒出來而不是全部乾等。
-        self._located = False                    # 本輪是否已定位過物品陣列
-        self._named = False                      # 本輪是否已解過角色名
         self._running = True
 
-    # -- 角色名 --------------------------------------------------------
-    def _resolve_name(self, pid: int, sc, title: str) -> None:
+    # ==================================================================
+    # 以下三個 _ensure_* 只在「定位執行緒」裡跑（每個都要掃全記憶體）。
+    # 回傳 True = 這次真的花力氣掃了，定位執行緒用它判斷還要不要繼續忙。
+    # ==================================================================
+    def _ensure_name(self, pid: int, sc, title: str) -> bool:
         """解角色名。解不到就過一陣子再試，不要記成永久失敗。
 
         名字是從記憶體裡的存檔路徑「RobotData_1_{帳號}_{角色名}.data」解出來的
         （見 app/core/charname.py）。**新角色還沒產生存檔檔案時就抓不到**，
         存檔之後路徑才會出現，所以要重試；記成永久失敗會讓那一格一直空白。
-
-        這個查詢要掃全部記憶體（一台 1～2.5 秒），所以只在「還沒解到」時每隔一段
-        時間重試一次，而且一輪最多解一個 —— 名字解不到時畫面本來就會先用帳號頂著，
-        不值得為了它把其他分身的等級 / 經驗 / 金幣一起卡住。
         """
         if self._names.get(pid) not in (None, "?"):
-            return
+            return False
         now = time.monotonic()
         if now - self._name_try.get(pid, 0.0) < NAME_RETRY_SECS:
-            return
-        if self._named:
-            return
-        self._named = True
+            return False
         self._name_try[pid] = now
         try:
             got = charname.read_character_name(
@@ -111,18 +119,15 @@ class StatsWorker(QThread):
         except Exception:
             got = None
         self._names[pid] = got or "?"
+        return True
 
-    # -- 玩家物件 ------------------------------------------------------
-    def _stats(self, pid: int, sc):
-        try:
-            st = player.read(sc, self._bases.get(pid, 0))
-        except Exception:
-            st = None
-        if st is not None:
-            return st
+    def _ensure_base(self, pid: int, sc) -> bool:
+        """玩家物件還沒定位（或剛失效）就重新找。"""
+        if self._bases.get(pid):
+            return False
         now = time.monotonic()
         if now - self._last_try.get(pid, 0.0) < RELOCATE_GAP_SECS:
-            return None
+            return False
         self._last_try[pid] = now
         try:
             base = player.locate(sc, should_stop=lambda: not self._running) or 0
@@ -133,45 +138,49 @@ class StatsWorker(QThread):
         # 讀得到的殘影（讀起來像有效的表），所以這裡主動作廢、重新定位。
         if base:
             self._inv.pop(pid, None)
-            self._bag.pop(pid, None)
             self._prev.pop(pid, None)
-        try:
-            return player.read(sc, base) if base else None
-        except Exception:
-            return None
+        return True
 
-    # -- 經驗球 --------------------------------------------------------
-    def _locate_inventory(self, pid: int, sc) -> int | None:
-        """定位物品陣列表頭。AOB 特徵在這裡的唯一用途就是提供一個錨點物品。
-
-        帶冷卻：AOB 是全記憶體掃（一台 1～2.5 秒），定位不到時不能每輪都掃。
-        """
+    def _ensure_inventory(self, pid: int, sc) -> bool:
+        """定位物品陣列表頭。AOB 特徵在這裡的唯一用途就是提供一個錨點物品。"""
+        if self._inv.get(pid):
+            return False
         now = time.monotonic()
         if now - self._inv_try.get(pid, 0.0) < INV_RELOCATE_GAP_SECS:
-            return None
-        # 一輪最多定位一台：五台一起開的話，全部排隊掃完要二十幾秒，中間畫面
-        # 空著很難看。改成每輪只掃一台，其他分身的等級 / 經驗 / 金幣照樣先出來，
-        # 球再一台一台補上；總時間一樣，但畫面是持續在動的。
-        if self._located:
-            return None
-        self._located = True
+            return False
         self._inv_try[pid] = now
         try:
             hits = aob.scan(sc, BALL_SIG, limit=BALL_SCAN_LIMIT,
                             should_stop=lambda: not self._running)
         except Exception:
-            return None
+            return True
         if not self._running or not hits:
-            return None
+            return True
         # 不篩種類 ID —— 只是要一個「在陣列裡的物品」當錨點，是不是已知的球無所謂
         structs = {a - inventory.ITEM_BALL_OFF for a in hits}
         try:
             head = inventory.locate(sc, structs)
         except Exception:
-            return None
+            head = None
         if head:
             self._inv[pid] = head
-        return head
+        return True
+
+    # ==================================================================
+    # 以下是「讀值執行緒」的工作：只讀已知位址，不做任何全掃，成本 ~2ms/輪。
+    # ==================================================================
+    def _stats(self, pid: int, sc):
+        """讀角色屬性。位址失效就作廢，交給定位執行緒重找（本輪先回 None）。"""
+        base = self._bases.get(pid, 0)
+        if not base:
+            return None
+        try:
+            st = player.read(sc, base)
+        except Exception:
+            st = None
+        if st is None:
+            self._bases[pid] = 0        # 換地圖 / 重連 → 請定位執行緒重找
+        return st
 
     def _describe(self, type_id, value: int) -> dict:
         """種類 ID + 數值 → 畫面要的樣子。只查寫死的表，不做任何推測。"""
@@ -191,13 +200,11 @@ class StatsWorker(QThread):
                 "is_ball": bt is not None}
 
     def _ball(self, pid: int, sc) -> dict | None:
-        """讀飾品欄兩格。定位不到物品陣列就回 None（不顯示，也不猜）。"""
+        """讀飾品欄兩格與背包。還沒定位到物品陣列就回 None（不顯示，也不猜）。"""
         head = self._inv.get(pid)
         if head and not inventory.is_valid(sc, head):
-            head = None                 # 換地圖 / 重連 → 陣列搬家了
-            self._inv.pop(pid, None)
-        if not head:
-            head = self._locate_inventory(pid, sc)
+            self._inv.pop(pid, None)    # 換地圖 / 重連 → 陣列搬家了
+            head = None
         if not head:
             return None
 
@@ -218,19 +225,16 @@ class StatsWorker(QThread):
         except Exception:
             return None
 
-        # 背包盤點 —— 128 格每格都要查種類，降頻做，中間沿用上次結果。
+        # 背包盤點 —— 每輪都做。實測整張表掃完只要 0.4～0.5ms，沒有降頻的必要；
+        # 一降頻反而是背包顆數每隔幾秒才跳一次，看起來像畫面在閃。
         # 只算確定是球的，否則會把所有雜物都數進去。
-        bag = self._bag.get(pid, [])
-        if now - self._bag_at.get(pid, 0.0) >= BAG_REFRESH_SECS:
-            self._bag_at[pid] = now
-            try:
-                bag = sorted((tid, val)
-                             for idx, tid, _p, val in inventory.scan_slots(sc, head)
-                             if idx not in inventory.SLOT_ACCESSORY
-                             and items.is_ball(tid))
-            except Exception:
-                bag = []
-            self._bag[pid] = bag
+        try:
+            bag = sorted((tid, val)
+                         for idx, tid, _p, val in inventory.scan_slots(sc, head)
+                         if idx not in inventory.SLOT_ACCESSORY
+                         and items.is_ball(tid))
+        except Exception:
+            bag = []
 
         # 「有沒有在增加」只拿來決定顏色（綠＝正在練功），不影響任何判定
         cur = {e["addr"]: e["value"] for e in equipped}
@@ -249,20 +253,64 @@ class StatsWorker(QThread):
                 (now - last_inc) if last_inc else None),
         }
 
-    # -- 主迴圈 --------------------------------------------------------
+    # -- 讀值主迴圈（永遠不做全掃，所以節奏是穩的）----------------------
     def run(self) -> None:
-        while self._running:
-            self._located = self._named = False      # 每輪重發全掃名額
-            for pid, _hwnd, title, sc in self._insts:
-                if not self._running:
-                    return
-                self._resolve_name(pid, sc, title)
-                st = self._stats(pid, sc)
-                ball = self._ball(pid, sc)
-                if not self._running:
-                    return
-                self.snapshot.emit(pid, st, ball)
-            self.msleep(READ_INTERVAL_MS)
+        locator = _Locator(self)
+        locator.start()
+        try:
+            while self._running:
+                for pid, _hwnd, _title, sc in self._insts:
+                    if not self._running:
+                        return
+                    st = self._stats(pid, sc)
+                    ball = self._ball(pid, sc)
+                    if not self._running:
+                        return
+                    self.snapshot.emit(pid, st, ball)
+                self.msleep(READ_INTERVAL_MS)
+        finally:
+            # 定位執行緒掃到一半時，should_stop 會讓它提早收手；
+            # 一定要等它真的結束，否則它還在用即將被關掉的 handle。
+            self._running = False
+            locator.wait(15000)
 
     def stop(self) -> None:
         self._running = False
+
+
+class _Locator(QThread):
+    """專跑全記憶體掃描的執行緒：找位址，不碰畫面。
+
+    跟讀值執行緒共用 StatsWorker 上那幾個 dict（一邊寫、一邊讀）。dict 的單筆
+    存取在 CPython 裡是不可分割的，而且兩邊都只認「有值 / 沒值」，不會讀到寫一半
+    的狀態，所以不需要鎖。
+
+    順序刻意排成「玩家物件 → 物品陣列 → 角色名」：等級 / 經驗 / 金幣最有感，
+    名字最不急（畫面在解出來之前會先用帳號頂著）。
+    """
+
+    def __init__(self, worker: "StatsWorker") -> None:
+        super().__init__()
+        self._w = worker
+
+    def run(self) -> None:
+        w = self._w
+        while w._running:
+            worked = False
+            for step in (w._ensure_base, w._ensure_inventory):
+                for pid, _hwnd, _title, sc in w._insts:
+                    if not w._running:
+                        return
+                    try:
+                        worked |= step(pid, sc)
+                    except Exception:
+                        pass
+            for pid, _hwnd, title, sc in w._insts:
+                if not w._running:
+                    return
+                try:
+                    worked |= w._ensure_name(pid, sc, title)
+                except Exception:
+                    pass
+            if not worked:          # 全部定位完了就別空轉燒 CPU
+                self.msleep(LOCATE_IDLE_MS)
