@@ -43,7 +43,7 @@ import numpy as np
 
 # 陣列裡的格子索引
 SLOT_ACCESSORY = (8, 9)      # 飾品欄兩格
-EQUIP_SLOTS = 12             # 前 12 格是裝備欄，之後是空格與背包
+EQUIP_SLOTS = 12             # 前 12 格是裝備欄，之後是空格與背包（版面說明用）
 
 # 飾品欄的左右對應。實測：使用者把「右邊」那顆卸到背包後，正好是第 9 格變空，
 # 第 8 格的球還在；使用者也確認遊戲的飾品欄就是兩格、一左一右。
@@ -262,12 +262,14 @@ def scan_slots(scanner, head: int, count: int = 128):
 
 
 def is_valid(scanner, head: int) -> bool:
-    """表頭還有效嗎？（換地圖 / 重連會讓它搬家）
+    """表頭還有效嗎？（陣列會搬家：換地圖、重連、物品增減都可能重新配置）
 
-    只看前 12 格（裝備欄那段）裡還有沒有物品 —— 夠判斷「這塊還是不是那張表」，
-    又不必像以前那樣每輪掃 64 格 × 每格兩次讀取。
+    ⚠ 這裡**必須用完整的門檻**（64 格裡要有 12 個有效物品），不能為了省讀取改成
+    「前幾格有東西就算數」。實測過的反例：黑狐的陣列從 0x365A31D0 搬到 0x37EC6BA8
+    之後，舊位址那塊記憶體還讀得到，而且**還殘留兩個像物品的指標**（第 2 格、第 9 格）
+    —— 寬鬆的檢查會通過，程式就一直讀那份死掉的副本，畫面變成
+    「左邊整格不見、右邊非經驗球」。嚴格門檻對同一塊記憶體回傳 False，正確。
+
+    成本本來就不高：整條指標一次讀進來，數到 12 個就提早收工。
     """
-    if not head:
-        return False
-    return any(p and item_type(scanner, p) is not None
-               for p in read_pointers(scanner, head, EQUIP_SLOTS))
+    return bool(head) and _looks_like_inventory(scanner, head)
