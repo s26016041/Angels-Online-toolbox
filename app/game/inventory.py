@@ -22,8 +22,15 @@
 怎麼定位這張表
 --------------
 用 AOB 找到任一顆球的結構位址後，反向搜「誰精確指著它」——那個位置就是它所在的
-格子，再往前掃過空格就到表頭。表頭確認方式：前 64 格裡要有夠多有效的物品指標
-（實測真表有 90 幾個，巧合命中的只有零星一兩個）。
+格子，再往前掃就到表頭。
+
+⚠ 往前掃很容易多退幾格：空格的內容是 0，而陣列前面的空白也是 0，兩者長得一樣。
+多退一格，之後所有格號就整排位移，飾品欄（第 8、9 格）會對到裝備欄的別的東西
+——使用者實際遇過「兩顆一樣的球，右邊正常、左邊卻顯示非經驗球」。
+所以表頭是這樣定案的：
+  1. 刷掉不是物品的候選（走過頭會停在空白上）
+  2. 看**誰被別的結構指著**：實測真表頭被指 1～9 次，往前每一格都是 0 次
+  3. 最後再確認前 64 格裡有夠多有效物品指標（真表有 90 幾個，巧合命中只有一兩個）
 
 定位一次之後每輪只要讀兩個指標，成本趨近於零，而且換裝當下就會反映。
 純讀記憶體。
@@ -75,24 +82,88 @@ def item_type(scanner, ptr: int) -> int | None:
     return tid if 0 < tid < MAX_ITEM_ID else None
 
 
-def _head_from(scanner, slot: int) -> int:
-    """從某一格往前掃到表頭。空格（0）算陣列的一部分，垃圾值代表已經越界。"""
+def _head_candidates(scanner, slot: int) -> list[int]:
+    """從某一格往前掃，把沿路每個「可能是表頭」的位址都收集起來。
+
+    ⚠ 不能只取最前面那個：**空格（0）也算陣列的一部分**，所以往前掃會一路走過
+    陣列前面的零，多退幾格。多退一格就會讓所有格號位移，飾品欄（第 8、9 格）
+    就對到裝備欄的別的東西 —— 使用者實際遇過「左邊顯示非經驗球、右邊正常」。
+    所以收集候選之後要再用「表頭本身必須放著一個物品」＋「有指標指著它」挑。
+    """
+    out = []
     at = slot
     while at > 0x10000 and slot - at < 0x1000:
         p = _dword(scanner, at - 4)
         if p is None or (p != 0 and item_type(scanner, p) is None):
             break
         at -= 4
-    return at
+        out.append(at)
+    return out
+
+
+def _solid(scanner, cands: list[int]) -> list[int]:
+    """候選裡「那一格真的放著物品」的那些。
+
+    走過頭時會停在陣列前面的空白上，那些格子是 0（不是物品），先刷掉。
+    """
+    return [a for a in cands
+            if item_type(scanner, _dword(scanner, a) or 0) is not None]
+
+
+def _vote_for_head(scanner, cands: list[int], near: int) -> dict[int, int]:
+    """數每個候選各被幾個指標指著 —— 真正的表頭會被別的結構持有，陣列中間不會。
+
+    實測五個分身：真表頭被指 1～9 次，往前每一格都是 **0 次**，判別力乾淨。
+
+    成本控制：候選全擠在 4KB 內，所以先用範圍比較刷掉 99.99%，再逐一比對；
+    而且先掃「陣列自己所在的那塊」，那裡通常就找得到持有者，找到就收工，
+    找不到才把整個程序讀完。
+    """
+    lo, hi = min(cands), max(cands)
+    votes = {a: 0 for a in cands}
+    regions = list(scanner._iter_regions(writable_only=True))
+    # 把陣列所在的那塊排到最前面
+    regions.sort(key=lambda r: not (r[0] <= near < r[0] + r[1]))
+    for base, size in regions:
+        raw = scanner._read_region(base, size)
+        if not raw:
+            continue
+        arr = np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<u4")
+        idx = np.flatnonzero((arr >= lo) & (arr <= hi))
+        for v in arr[idx] if idx.size else ():
+            if int(v) in votes:
+                votes[int(v)] += 1
+        if any(votes.values()):
+            break                       # 已經有人被指名，不必再讀下去
+    return votes
+
+
+def _pick_head(scanner, slot: int) -> int | None:
+    """從某一格回推真正的表頭；這一格不在物品陣列裡就回 None。
+
+    順序是刻意的：
+      1. 刷掉不是物品的候選（走過頭會停在陣列前面的空白上）
+      2. 先用最前面那個當草稿，確認「這裡真的是物品陣列」——不是的話直接放棄，
+         省下第 3 步的掃描（反查會找到不少指向同一件物品、但不在陣列裡的指標）
+      3. 再用「誰被指著」把表頭釘到正確那一格
+    """
+    solid = _solid(scanner, _head_candidates(scanner, slot))
+    if not solid:
+        return None
+    rough = min(solid)
+    if not _looks_like_inventory(scanner, rough):
+        return None
+    if len(solid) == 1:
+        return rough
+    votes = _vote_for_head(scanner, solid, near=slot)
+    best = max(votes, key=lambda a: (votes[a], -a))
+    return best if votes[best] else rough
 
 
 def _looks_like_inventory(scanner, head: int) -> bool:
     """真的物品陣列前 64 格會塞滿有效指標；巧合命中的只有零星一兩個。"""
     n = 0
-    for i in range(HEAD_WINDOW):
-        p = _dword(scanner, head + i * 4)
-        if p is None:
-            break
+    for p in read_pointers(scanner, head, HEAD_WINDOW):
         if p and item_type(scanner, p) is not None:
             n += 1
             if n >= HEAD_MIN_ITEMS:
@@ -110,23 +181,41 @@ def locate(scanner, item_structs) -> int | None:
     targets = np.array(sorted(set(item_structs)), dtype="<u4")
     if targets.size == 0:
         return None
+    lo, hi = targets[0], targets[-1]
     slots: list[int] = []
     for base, size in scanner._iter_regions(writable_only=True):
         raw = scanner._read_region(base, size)
         if not raw:
             continue
         arr = np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<u4")
-        for i in np.flatnonzero(np.isin(arr, targets)):
-            slots.append(base + int(i) * 4)
-    seen = set()
+        # 先用範圍刷掉絕大多數，再比對；等價於 np.isin，但不隨目標數變慢
+        idx = np.flatnonzero((arr >= lo) & (arr <= hi))
+        if idx.size:
+            slots.extend(base + int(i) * 4 for i in idx[np.isin(arr[idx], targets)])
     for at in sorted(slots):
-        head = _head_from(scanner, at)
-        if head in seen:
-            continue
-        seen.add(head)
-        if _looks_like_inventory(scanner, head):
+        head = _pick_head(scanner, at)
+        if head is not None:
             return head
     return None
+
+
+def read_pointers(scanner, head: int, count: int = 128) -> list[int]:
+    """一次把整條指標陣列讀進來。
+
+    以前是「每格各發一次 ReadProcessMemory」，128 格 × 5 台 × 每 0.7 秒 —— 光這裡
+    每輪就上千次系統呼叫。整條一次讀只要 1 次，其餘工作完全一樣。
+
+    要求的範圍只要有一段沒對應到記憶體，ReadProcessMemory 就是整批失敗（不是讀一半），
+    所以讀不到時逐次減半重試 —— 表尾剛好貼著區塊邊界時，至少前半段照樣讀得到，
+    行為跟以前「逐格讀、讀不到就停」一致。
+    """
+    n = count
+    while n:
+        raw = scanner._read_bytes(head, n * 4)
+        if raw:
+            return list(struct.unpack(f"<{n}I", raw))
+        n //= 2
+    return []
 
 
 def read_slot(scanner, head: int, index: int) -> tuple[int, int, int] | None:
@@ -158,13 +247,10 @@ def accessories(scanner, head: int) -> list[tuple[int, int, int]]:
 def scan_slots(scanner, head: int, count: int = 128):
     """走一遍整張表，回傳 [(格號, 種類 ID, 結構位址, 球值), ...]。
 
-    用來數背包裡還有幾顆球。128 格是保守上限，讀不到就提早停。
+    用來數背包裡還有幾顆球。128 格是保守上限。
     """
     out = []
-    for i in range(count):
-        p = _dword(scanner, head + i * 4)
-        if p is None:
-            break
+    for i, p in enumerate(read_pointers(scanner, head, count)):
         if not p:
             continue
         tid = item_type(scanner, p)
@@ -176,5 +262,12 @@ def scan_slots(scanner, head: int, count: int = 128):
 
 
 def is_valid(scanner, head: int) -> bool:
-    """表頭還有效嗎？（換地圖 / 重連會讓它搬家）"""
-    return bool(head) and _looks_like_inventory(scanner, head)
+    """表頭還有效嗎？（換地圖 / 重連會讓它搬家）
+
+    只看前 12 格（裝備欄那段）裡還有沒有物品 —— 夠判斷「這塊還是不是那張表」，
+    又不必像以前那樣每輪掃 64 格 × 每格兩次讀取。
+    """
+    if not head:
+        return False
+    return any(p and item_type(scanner, p) is not None
+               for p in read_pointers(scanner, head, EQUIP_SLOTS))

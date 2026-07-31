@@ -40,6 +40,9 @@ RELOCATE_GAP_SECS = 5.0
 INV_RELOCATE_GAP_SECS = 8.0
 # 多久內有增加就算「正在練功」（只影響顏色，不影響任何判定）。
 BALL_ACTIVE_SECS = 60.0
+# 背包裡的球多久重新盤點一次。飾品欄那兩格每輪都讀（那才是會即時變的），
+# 背包要一格一格查種類，成本高一個量級，而且內容不會秒秒在變。
+BAG_REFRESH_SECS = 5.0
 
 BALL_SIG = aob.SKILL_EXP_BALL
 BALL_SCAN_LIMIT = 4096
@@ -73,6 +76,12 @@ class StatsWorker(QThread):
         self._inv_try: dict[int, float] = {}     # {pid: 上次重新定位物品陣列的時間}
         self._prev: dict[int, dict[int, int]] = {}   # {pid: {球位址: 上輪的值}}
         self._last_inc: dict[int, float] = {}    # {pid: 上次有球增加的時間}
+        self._bag: dict[int, list] = {}          # {pid: 上次盤點到的背包球}
+        self._bag_at: dict[int, float] = {}      # {pid: 上次盤點背包的時間}
+        # 「這一輪已經做過的全記憶體掃描」。開場五台一起要掃，排隊做完要二十幾秒，
+        # 期間畫面一直空著。每輪各給一個名額，資料就會一台一台冒出來而不是全部乾等。
+        self._located = False                    # 本輪是否已定位過物品陣列
+        self._named = False                      # 本輪是否已解過角色名
         self._running = True
 
     # -- 角色名 --------------------------------------------------------
@@ -83,13 +92,18 @@ class StatsWorker(QThread):
         （見 app/core/charname.py）。**新角色還沒產生存檔檔案時就抓不到**，
         存檔之後路徑才會出現，所以要重試；記成永久失敗會讓那一格一直空白。
 
-        這個查詢要掃全部記憶體，所以只在「還沒解到」時每隔一段時間重試一次。
+        這個查詢要掃全部記憶體（一台 1～2.5 秒），所以只在「還沒解到」時每隔一段
+        時間重試一次，而且一輪最多解一個 —— 名字解不到時畫面本來就會先用帳號頂著，
+        不值得為了它把其他分身的等級 / 經驗 / 金幣一起卡住。
         """
         if self._names.get(pid) not in (None, "?"):
             return
         now = time.monotonic()
         if now - self._name_try.get(pid, 0.0) < NAME_RETRY_SECS:
             return
+        if self._named:
+            return
+        self._named = True
         self._name_try[pid] = now
         try:
             got = charname.read_character_name(
@@ -115,6 +129,12 @@ class StatsWorker(QThread):
         except Exception:
             base = 0
         self._bases[pid] = base
+        # 玩家物件搬家 = 換地圖 / 重登，物品陣列一定也跟著搬。舊位址上可能還留著
+        # 讀得到的殘影（讀起來像有效的表），所以這裡主動作廢、重新定位。
+        if base:
+            self._inv.pop(pid, None)
+            self._bag.pop(pid, None)
+            self._prev.pop(pid, None)
         try:
             return player.read(sc, base) if base else None
         except Exception:
@@ -129,6 +149,12 @@ class StatsWorker(QThread):
         now = time.monotonic()
         if now - self._inv_try.get(pid, 0.0) < INV_RELOCATE_GAP_SECS:
             return None
+        # 一輪最多定位一台：五台一起開的話，全部排隊掃完要二十幾秒，中間畫面
+        # 空著很難看。改成每輪只掃一台，其他分身的等級 / 經驗 / 金幣照樣先出來，
+        # 球再一台一台補上；總時間一樣，但畫面是持續在動的。
+        if self._located:
+            return None
+        self._located = True
         self._inv_try[pid] = now
         try:
             hits = aob.scan(sc, BALL_SIG, limit=BALL_SCAN_LIMIT,
@@ -175,26 +201,38 @@ class StatsWorker(QThread):
         if not head:
             return None
 
+        now = time.monotonic()
+        # 飾品欄兩格 —— 每輪都讀，總共只要幾次讀取。
+        # 這兩格「一定顯示」，就算對照表裡沒有那個種類 ID：使用者要看到
+        # 「飾品欄左裝了個我不認識的東西」，而不是那一格憑空消失。
+        equipped = []
         try:
-            slots = inventory.scan_slots(sc, head)
+            for idx in inventory.SLOT_ACCESSORY:
+                got = inventory.read_slot(sc, head, idx)
+                if not got:
+                    continue
+                tid, ptr, val = got
+                equipped.append({**self._describe(tid, val),
+                                 "addr": ptr + inventory.ITEM_BALL_OFF,
+                                 "slot": idx, "side": inventory.slot_side(idx)})
         except Exception:
             return None
 
-        equipped, bag = [], []
-        for idx, tid, ptr, val in slots:
-            is_acc = idx in inventory.SLOT_ACCESSORY
-            # 飾品欄那兩格「一定顯示」，就算對照表裡沒有那個種類 ID ——
-            # 使用者要看到「飾品欄右裝了個我不認識的東西」，而不是那一格憑空消失。
-            # 背包則只算確定是球的，否則會把所有雜物都數進去。
-            if not is_acc and not items.is_ball(tid):
-                continue
-            entry = {**self._describe(tid, val),
-                     "addr": ptr + inventory.ITEM_BALL_OFF,
-                     "slot": idx, "side": inventory.slot_side(idx)}
-            (equipped if is_acc else bag).append(entry)
+        # 背包盤點 —— 128 格每格都要查種類，降頻做，中間沿用上次結果。
+        # 只算確定是球的，否則會把所有雜物都數進去。
+        bag = self._bag.get(pid, [])
+        if now - self._bag_at.get(pid, 0.0) >= BAG_REFRESH_SECS:
+            self._bag_at[pid] = now
+            try:
+                bag = sorted((tid, val)
+                             for idx, tid, _p, val in inventory.scan_slots(sc, head)
+                             if idx not in inventory.SLOT_ACCESSORY
+                             and items.is_ball(tid))
+            except Exception:
+                bag = []
+            self._bag[pid] = bag
 
         # 「有沒有在增加」只拿來決定顏色（綠＝正在練功），不影響任何判定
-        now = time.monotonic()
         cur = {e["addr"]: e["value"] for e in equipped}
         prev = self._prev.get(pid, {})
         if any(v > prev.get(a, v) for a, v in cur.items()):
@@ -206,7 +244,7 @@ class StatsWorker(QThread):
         return {
             "balls": equipped,
             "live": live,
-            "idle": sorted((e["type_id"], e["value"]) for e in bag),
+            "idle": bag,
             "quiet": None if live else (
                 (now - last_inc) if last_inc else None),
         }
@@ -214,6 +252,7 @@ class StatsWorker(QThread):
     # -- 主迴圈 --------------------------------------------------------
     def run(self) -> None:
         while self._running:
+            self._located = self._named = False      # 每輪重發全掃名額
             for pid, _hwnd, title, sc in self._insts:
                 if not self._running:
                     return
