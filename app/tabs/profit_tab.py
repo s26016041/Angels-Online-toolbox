@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -489,6 +489,10 @@ class ProfitTab(BaseTab):
     TAB_TITLE = "收益監控"
     ORDER = 4   # 產品主畫面，排最前面
 
+    # Telegram 是在背景執行緒送的，不能直接碰 UI；用訊號把結果帶回主執行緒。
+    # 選了 Telegram 就不會跳視窗也不會出聲，送失敗如果悄悄吞掉，等於完全沒通知。
+    tg_failed = Signal(str)
+
     def build_ui(self) -> None:
         self._mons: dict[int, dict] = {}
         self._cards: dict[int, CharCard] = {}
@@ -554,6 +558,8 @@ class ProfitTab(BaseTab):
         self.status = QLabel("就緒")
         self.status.setStyleSheet(f"color: {TEXT_MUT};")
         root.addWidget(self.status)
+        # 背景執行緒送 Telegram 失敗時，把原因顯示在這一行（跨執行緒要走訊號）
+        self.tg_failed.connect(self.status.setText)
 
     # ------------------------------------------------------------------
     # 通知設定（原本在「監控技能經驗球」分頁，搬過來並加上死亡／斷線監控）
@@ -587,7 +593,14 @@ class ProfitTab(BaseTab):
         row = QHBoxLayout()
         row.addWidget(QLabel("通知方式："))
         self.rb_sound = QRadioButton("音效警報")
+        self.rb_sound.setToolTip(
+            "在這台電腦上循環播放警報聲，並跳出視窗列出是哪幾台出事，\n"
+            "按「停止警報」才會停。適合人就在電腦前的時候。")
         self.rb_tg = QRadioButton("Telegram 通知")
+        self.rb_tg.setToolTip(
+            "只送 Telegram，**不出聲、也不跳視窗**。\n"
+            "適合人不在電腦前：不會擋住畫面，也不會留一個視窗等別人幫你按掉。\n"
+            "（沒填群組/房間 ID 就送不出去，那時仍會跳視窗，但不會出聲。）")
         grp = QButtonGroup(self)
         grp.addButton(self.rb_sound)
         grp.addButton(self.rb_tg)
@@ -716,10 +729,23 @@ class ProfitTab(BaseTab):
             return
         who = f"{card.account}（{card.name_lbl.text()}）"
         events = [(who, cur[r]) for r in fresh]
-        self._pending += events
-        if self.rb_tg.isChecked():
+
+        tg = self.rb_tg.isChecked()
+        room = self.tg_id.text().strip()
+
+        # 通知真的送得出去就到此為止：不出聲、也不跳視窗。
+        # 選 Telegram 的情境是「人不在電腦前」，跳一個要人按掉的視窗只會擋住畫面，
+        # 而且電腦前如果是別人（或掛著練功），他根本不知道那是什麼、也不該幫忙按。
+        if tg and room:
             self._send_telegram_async(events)
             self.status.setText(f"已送出 Telegram 通知（{len(events)} 則）")
+            return
+
+        self._pending += events
+        if tg:
+            # 選了 Telegram 卻沒填 ID：送不出去，維持原本行為（跳視窗但不出聲），
+            # 至少畫面上還看得到是哪幾台出事。
+            self.status.setText("⚠ 未填 Telegram 群組/房間 ID，通知未送出")
         else:
             self._alarm.start()
         self._show_dialog(self._pending)
@@ -753,6 +779,7 @@ class ProfitTab(BaseTab):
                 ok, info = notify.send_telegram(room, who, "⚠ " + msg)
                 if not ok:
                     sys.stderr.write(f"[telegram] 送出失敗 {who}: {info}\n")
+                    self.tg_failed.emit(f"⚠ Telegram 送出失敗（{who}）：{info}")
 
         threading.Thread(target=worker, daemon=True).start()
 
