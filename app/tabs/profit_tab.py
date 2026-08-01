@@ -84,6 +84,9 @@ R_DISCONNECT = "disconnect"
 # 不一樣，理論上會先關舊連線再開新的），以及查詢本身的抖動。
 # ⚠ 「切頻道會不會真的短暫斷線」尚未實測，這個值是保守估計。
 DISCONNECT_GRACE_SECS = 15.0
+# 多久檢查一次「有沒有分身的視窗換成新的行程」（遊戲關掉重開 → PID 會變）。
+# 只是讀幾個視窗標題，成本可以忽略。
+REATTACH_CHECK_MS = 3000
 # TCP 連線表的快取秒數：一輪要問五台，沒必要每台都去掃一次整張表。
 CONN_CACHE_SECS = 1.5
 
@@ -188,6 +191,7 @@ class CharCard(QFrame):
     def __init__(self, index: int, pid: int, title: str,
                  monitored: bool, on_monitor_toggle) -> None:
         super().__init__()
+        self.index = index
         self.pid = pid
         self.account = charname.account_from_title(title)
         self.session = Session()
@@ -324,6 +328,15 @@ class CharCard(QFrame):
         self.eta_lbl.setText("")
 
     # -- 每輪更新 ------------------------------------------------------
+    def rebind(self, pid: int) -> None:
+        """遊戲客戶端重開後 PID 會變，把卡片接到新的行程上。
+
+        刻意**不動 session**：累計的經驗 / 金幣 / 時薪是同一個帳號一路打下來的，
+        重開一次遊戲不該把它歸零。
+        """
+        self.pid = pid
+        self.head_lbl.setText(f"角色 {self.index} · PID {pid} · {self.account}")
+
     def update_data(self, title: str, stats, ball) -> None:
         self.chan_lbl.setText(charname.channel_from_title(title) or "")
         balls = ball["balls"] if ball else []
@@ -483,6 +496,8 @@ class ProfitTab(BaseTab):
         self._worker: StatsWorker | None = None
         self._dying: list[QThread] = []
         self._dying_scanners: list = []
+        self._reattach_timer = QTimer(self)
+        self._reattach_timer.timeout.connect(self._try_reattach)
         # 警報狀態
         self._alarm = Alarm(self)
         self._dialog: AlarmDialog | None = None
@@ -789,15 +804,86 @@ class ProfitTab(BaseTab):
             self._cards[pid] = card
             self.cards_box.insertWidget(self.cards_box.count() - 1, card)
 
+        self._start_worker()
+        # 遊戲關掉重開時 PID 會變成新的一個，舊 handle 永遠讀不到東西
+        # → 卡片會一直停在「定位中…」。定期檢查、自動接上去。
+        self._reattach_timer.start(REATTACH_CHECK_MS)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.rescan_btn.setEnabled(True)
+        self.found_lbl.setText(f"偵測到 {len(self._mons)} 個遊戲視窗")
+        self.status.setText(f"監控中：{len(self._mons)} 台")
+
+    def _start_worker(self) -> None:
         self._worker = StatsWorker(
             [(pid, m["hwnd"], m["title"], m["sc"]) for pid, m in self._mons.items()],
             self._names)
         self._worker.snapshot.connect(self._on_snapshot)
         self._worker.start()
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.rescan_btn.setEnabled(True)
-        self.found_lbl.setText(f"偵測到 {len(self._mons)} 個遊戲視窗")
+
+    # ------------------------------------------------------------------
+    def _try_reattach(self) -> None:
+        """分身的遊戲被關掉重開時，自動接到新的行程上。
+
+        為什麼需要：分身清單是「開始監控」當下列舉一次就固定的，PID 也是那時記下的。
+        玩家把某一台遊戲關掉重開，那個 PID 就永遠死了，程式卻還抱著舊 handle 讀
+        —— 畫面上那張卡片會一直卡在「定位中…」，其他台都正常，看起來莫名其妙。
+        （實測：黑狐的客戶端重開後 PID 從 4952 變成 49424。）
+
+        用**帳號名**配對，因為帳號不會變、PID 每次都會變。只換掉真的死掉的那幾台，
+        其他分身與所有已累計的數據都不動。
+        """
+        if self._worker is None or not self._mons:
+            return
+        dead = [pid for pid, m in self._mons.items()
+                if not win.get_window_title(m["hwnd"])]
+        if not dead:
+            return
+        # 目前還沒被監控的遊戲視窗，用帳號索引起來當作替身候選
+        spare: dict[str, object] = {}
+        for w in win.enumerate_windows(title_contains="Angels Online"):
+            if "_MIDAGEONL_" not in w.class_name or w.pid in self._mons:
+                continue
+            spare.setdefault(charname.account_from_title(w.title), w)
+        pairs = []
+        for pid in dead:
+            w = spare.pop(charname.account_from_title(self._mons[pid]["title"]), None)
+            if w is not None:
+                pairs.append((pid, w))
+        if not pairs:
+            return          # 遊戲只是被關掉、還沒開回來 → 什麼都不動，下次再看
+
+        # 只停舊的 worker，不要用 _teardown（那會把所有分身的 handle 都收掉，
+        # 但沒被換掉的那幾台還要繼續用）。
+        try:
+            self._worker.snapshot.disconnect(self._on_snapshot)
+        except Exception:
+            pass
+        self._worker.stop()
+        self._dying.append(self._worker)
+        self._worker = None
+
+        for old_pid, w in pairs:
+            sc = MemoryScanner()
+            try:
+                sc.open(w.pid)
+            except Exception:
+                continue    # 開不起來（例如權限不足）→ 保持原狀，下一輪再試
+            m = self._mons.pop(old_pid)
+            self._dying_scanners.append(m["sc"])    # 等舊 worker 停了才關
+            self._mons[w.pid] = {"hwnd": w.hwnd, "title": w.title, "sc": sc}
+            card = self._cards.pop(old_pid)
+            card.rebind(w.pid)
+            self._cards[w.pid] = card
+            # 這些都是綁 PID 的暫態，換行程後要清掉；角色名也要重解
+            # （同一個帳號可能登入了不同角色）。
+            for d in (self._fired, self._lost_since, self._names):
+                d.pop(old_pid, None)
+            sys.stderr.write(f"[profit] 分身重開，PID {old_pid} → {w.pid}"
+                             f"（{charname.account_from_title(w.title)}）\n")
+
+        self._start_worker()
+        self._retire_later()
         self.status.setText(f"監控中：{len(self._mons)} 台")
 
     def _clear_cards(self) -> None:
@@ -810,9 +896,10 @@ class ProfitTab(BaseTab):
     # ------------------------------------------------------------------
     def _on_snapshot(self, pid: int, stats, ball) -> None:
         card = self._cards.get(pid)
-        if card is None:
+        m = self._mons.get(pid)
+        # 舊 worker 停下來之前還會再吐幾份快照，那時 pid 可能已經被換成新的了
+        if card is None or m is None:
             return
-        m = self._mons[pid]
         # 標題讀不到 = 視窗沒了（遊戲被關掉／崩潰）→ 斷線監控要用這個訊號
         fresh = win.get_window_title(m["hwnd"])
         m["alive"] = bool(fresh)
@@ -830,6 +917,7 @@ class ProfitTab(BaseTab):
     # 生命週期（與角色總覽相同的收尾流程：先停執行緒，確認停好才關 handle）
     # ------------------------------------------------------------------
     def _teardown(self, wait: bool) -> None:
+        self._reattach_timer.stop()
         threads = [t for t in (self._worker,) if t is not None]
         if self._worker is not None:
             try:
@@ -847,7 +935,14 @@ class ProfitTab(BaseTab):
                 t.wait(5000)
             self._finish_teardown()
             return
+        self._retire_later()
 
+    def _retire_later(self) -> None:
+        """等所有要收掉的執行緒真的停了，再關它們用過的 handle。
+
+        順序不能反：執行緒還在跑的時候關 handle，它下一次讀取就會踩到已關閉的
+        handle。所以用輪詢等到 isRunning() 全部是 False 才收。
+        """
         def check() -> None:
             if any(t.isRunning() for t in self._dying):
                 QTimer.singleShot(100, check)
