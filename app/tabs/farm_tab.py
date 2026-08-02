@@ -100,6 +100,13 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → �
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_TRIES = 6
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
+# ★ 封包攻擊時仍要每隔這麼久補按一次技能鍵。
+# 原因：**會走過去打是客戶端的行為，不是伺服器的**。按下技能鍵時客戶端會判斷
+# 「目標超出這招的射程 → 先走過去再放」；我們直接送施放封包等於跳過那段判斷，
+# 伺服器收到「對太遠的怪施放」就當作沒發生 —— 症狀就是角色不走也不打
+# （使用者回報「不會走路了」「旁邊有怪也不打」）。
+# 補按鍵讓遊戲自己處理接近，就不必知道每個角色的射程是多少。
+DRIVE_GAP = 0.25
 ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
@@ -197,9 +204,9 @@ class KeyWorker(_Paced):
         self.skill = None           # 學到的技能 ID
         self._on = False
         self._learning = False
-        self._v0 = None             # 開始學之前那個欄位的值
         self._tries = 0
         self._next_learn = 0.0
+        self._next_drive = 0.0      # 下次補按技能鍵的時間（見 DRIVE_GAP）
 
     def set_on(self, on: bool) -> None:
         self._on = on
@@ -254,6 +261,12 @@ class KeyWorker(_Paced):
                     if attack.send_trio(self.mover, self.pf,
                                         self.skill, self.eid):
                         self.sent += 1
+                        # ★ 還是要偶爾按一下技能鍵：走過去打是**客戶端**的行為，
+                        #   純送封包的話角色不會自己接近（見 DRIVE_GAP）。
+                        now = time.perf_counter()
+                        if now >= self._next_drive:
+                            self._next_drive = now + DRIVE_GAP
+                            _send_scan(self.hwnd, self.vk)
                         return
                     # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
                     # 別讓角色空等。
