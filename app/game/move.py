@@ -126,6 +126,27 @@ class Mover:
         self._block = block
         self._active = True
 
+    def call(self, fn: int, a1: int = 0, a2: int = 0,
+             a3: int = 0, a4: int = 0) -> bool:
+        """請遊戲主執行緒呼叫 fn(a1, a2, a3, a4)。回傳是否排得進去。
+
+        ★ 一律推四個參數。目標函式是 cdecl（呼叫端清堆疊），
+          參數比它需要的多不會有事 —— 它只是不看後面那幾個。
+
+        只有一個指令槽：上一個還沒被執行完就回 False，呼叫端自己決定要不要重試。
+        訊息迴圈每秒跑 60 次以上，我們的用量（每秒個位數）綽綽有餘。
+        """
+        if not self._active:
+            return False
+        pm = self._pm
+        if pm.read_uint(self._block + _FLAG):
+            return False                       # 上一個還沒執行
+        for off, val in ((_FN, fn), (_A1, a1), (_A2, a2),
+                         (_CNT, a3), (_A4, a4)):
+            pm.write_uint(self._block + off, val & 0xFFFFFFFF)
+        pm.write_uint(self._block + _FLAG, 1)
+        return True
+
     def walk_to(self, scanner, player_obj: int,
                 tile_x: float, tile_y: float) -> bool:
         """走到指定的格子座標。回傳是否成功送出請求。
@@ -149,14 +170,8 @@ class Mover:
                         int(x * entity.TILE_UNITS) & 0xFFFF,
                         int(y * entity.TILE_UNITS) & 0xFFFF)
             for x, y in pts)
-        pm = self._pm
-        pm.write_bytes(WAYPOINTS, buf, len(buf))
-        pm.write_uint(self._block + _A1, wx)
-        pm.write_uint(self._block + _A2, wy)
-        pm.write_uint(self._block + _CNT, len(pts))
-        pm.write_uint(self._block + _A4, random.randint(1, 0xFFFF))
-        pm.write_uint(self._block + _FLAG, 1)      # 舉旗，下一幀就會執行
-        return True
+        self._pm.write_bytes(WAYPOINTS, buf, len(buf))
+        return self.call(MOVE_FN, wx, wy, len(pts), random.randint(1, 0xFFFF))
 
     def calls_done(self) -> int:
         """stub 總共替我們呼叫了幾次（診斷用）。"""
