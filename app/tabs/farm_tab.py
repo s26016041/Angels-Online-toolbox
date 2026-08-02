@@ -80,19 +80,22 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，�
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
 # 的 MAX_HOP），長距離是靠這裡定期重下、一段一段接力走完的，所以不能太久。
 WALK_GAP = 0.8
-# 導航時停在「攻擊半徑 - 這個」的位置：只走到剛好打得到，不走到怪旁邊。
-# 留餘裕是因為怪自己也會動，剛好卡在射程邊緣會一走一停。
-WALK_MARGIN = 3.0
 HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
 
-# 攻擊半徑（格）。使用者實測：人站在 (154,40) 時打得到 (130,49) 的怪，
-# 再遠就打不到 —— √(24²+9²) ≈ 25.6，也就是以角色為圓心的一個圓。
-# 半徑內的怪優先打；半徑內沒有時仍會挑最近的（遊戲的攻擊指令會自己走過去），
-# 免得站在原地發呆。可在介面上調整。
-ATTACK_RADIUS = 26.0
+# ★ 不設「攻擊半徑」——**每個角色的射程不一樣，寫死任何數字都是錯的**。
+# 改成用「目標有沒有在掉血」自己判斷：
+#     掉血 = 打得到 → 站著打，別再移動（移動會打斷節奏）
+#     沒掉血超過 NO_DMG_WAIT 秒 → 打不到，繼續走過去
+# 這樣不管是近戰還是遠程、換武器換技能，都不必重設。
+#
+# 為什麼不用固定半徑：實測黑狐的射程約 14 格（125 次攻擊的距離分佈上緣），
+# 但先前預設 26 —— 怪在 16~26 格時程式以為打得到就不走，只能等遊戲自己慢慢
+# 接近；真的走時又停在 26-3=23 格、還在射程外。實測 36% 的時間耗在空檔上。
+NO_DMG_WAIT = 1.2               # 沒掉血這麼久就判定打不到，繼續走過去
+CLOSE_ENOUGH = 2.0              # 走到離怪這麼近就別再走了（不要疊在牠身上）
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -434,6 +437,7 @@ class CharFarmPage(QWidget):
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
+        self._no_dmg = 0.0         # 目標多久沒掉血（用來判斷打不打得到）
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -505,20 +509,6 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._keys.set_interval)
         self._keys.set_interval(DEFAULT_INTERVAL)
         bar.addWidget(self.interval)
-        bar.addSpacing(12)
-        bar.addWidget(QLabel("攻擊半徑"))
-        self.radius = QDoubleSpinBox()
-        self.radius.setRange(1.0, 200.0)
-        self.radius.setSingleStep(1.0)
-        self.radius.setDecimals(1)
-        self.radius.setValue(ATTACK_RADIUS)
-        self.radius.setSuffix(" 格")
-        self.radius.setFixedWidth(90)
-        self.radius.setToolTip(
-            "以角色為圓心、這個半徑內的怪優先打（實測約 25.6 格）。\n"
-            "半徑內沒有選中的怪時，仍會挑最近的一隻 —— 遊戲的攻擊指令\n"
-            "會讓角色自己走過去，只是要多花點時間。")
-        bar.addWidget(self.radius)
         bar.addSpacing(12)
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setToolTip(
@@ -742,19 +732,16 @@ class CharFarmPage(QWidget):
         pool.sort(key=lambda t: t[0])
         if not pool:
             return False
-        # 半徑內的優先；半徑內沒有就挑最近的（遊戲會自己走過去，不要站在原地）
-        r = self.radius.value()
-        inside = [t for t in pool if t[0] <= r]
-        d, self._cur = (inside or pool)[0]
+        d, self._cur = pool[0]                    # 就打最近的
         self._stuck = 0.0
+        self._no_dmg = 0.0
         self._last_hp = -1
         self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
         self._keys.set_on(True)                   # 送鍵執行緒：開始狂按
         self.status.setText(
             f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
-            + ("" if inside else "（半徑外，會自己走過去）")
-            + f"　累計擊殺 {self._kills}")
+            f"　累計擊殺 {self._kills}")
         return True
 
     def _on_died(self, eid: int) -> None:
@@ -874,14 +861,17 @@ class CharFarmPage(QWidget):
         m = self._cur
         hp = self._atk.hp
 
-        # ★ 打不到的距離就用移動封包導航過去，但**只走到剛好打得到**就停 ——
-        # 不必走到牠旁邊（使用者要求）。停在 攻擊半徑 - WALK_MARGIN 格，
-        # 留一點餘裕是因為怪自己也會動，剛好卡在射程邊緣容易一走一停。
-        if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP):
+        # ★ 打得到就別動，打不到就走過去 —— 用「目標有沒有掉血」判斷，
+        # 不設固定射程（每個角色不一樣）。掉血就把計時歸零、停止移動。
+        if 0 < hp < self._last_hp:
+            self._no_dmg = 0.0
+        else:
+            self._no_dmg += dt
+        if (self.move_cb.isChecked() and me
+                and self._no_dmg >= NO_DMG_WAIT and self._walk_t >= WALK_GAP):
             mp = entity.read_pos(self.sc, m.addr)
-            reach = max(1.0, self.radius.value() - WALK_MARGIN)
-            if mp and math.hypot(mp[0] - me[0], mp[1] - me[1]) > reach:
-                self._walk_toward(mp[0], mp[1], me, reach)
+            if mp and math.hypot(mp[0] - me[0], mp[1] - me[1]) > CLOSE_ENOUGH:
+                self._walk_toward(mp[0], mp[1], me, CLOSE_ENOUGH)
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
@@ -942,7 +932,6 @@ class CharFarmPage(QWidget):
         if i is not None:
             self.key_box.setCurrentIndex(i)
         self.interval.setValue(float(g(self._key("interval"), DEFAULT_INTERVAL)))
-        self.radius.setValue(float(g(self._key("radius"), ATTACK_RADIUS)))
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.back_cb.setChecked(bool(g(self._key("back"), False)))
         home = g(self._key("home"), None)
@@ -961,7 +950,6 @@ class CharFarmPage(QWidget):
         s(self._key("monsters"), self.wanted())
         s(self._key("vk"), self.key_box.currentData())
         s(self._key("interval"), self.interval.value())
-        s(self._key("radius"), self.radius.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("back"), self.back_cb.isChecked())
         s(self._key("home"), list(self._home) if self._home else None)
@@ -975,7 +963,6 @@ class CharFarmPage(QWidget):
         self.picked.model().rowsRemoved.connect(self._save_settings)
         self.key_box.currentIndexChanged.connect(self._save_settings)
         self.interval.valueChanged.connect(self._save_settings)
-        self.radius.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.back_cb.toggled.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
