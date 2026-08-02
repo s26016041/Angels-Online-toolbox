@@ -719,12 +719,12 @@ class CharFarmPage(QWidget):
         self.type_box.addItem("近戰", True)
         self.type_box.setFixedWidth(80)
         self.type_box.setToolTip(
-            f"遠程：距離 {ATTACK_PACKET_RANGE:.0f} 格內就送攻擊封包"
-            f"（走到 {WALK_KEEP:.0f} 格內就停）。\n"
-            "近戰：直接用怪物座標 —— 攻擊封包帶牠的位置，走路也直接走到\n"
-            "　　　牠身上，不停在幾格外等。\n"
+            f"遠程：送攻擊封包（距離 {ATTACK_PACKET_RANGE:.0f} 格內就送，"
+            f"走到 {WALK_KEEP:.0f} 格內就停）。\n"
+            "近戰：用封包選定怪物，然後**狂按你選的那個 F 鍵**出手，\n"
+            "　　　射程與走位交給遊戲客戶端判斷；我們只負責走到怪身上。\n"
             "⚠ 射程每個角色不一樣，近戰角色站太遠送攻擊封包伺服器不會理，\n"
-            "　 症狀是站著不動、怪完全不掉血。")
+            "　 症狀是站著不動、怪完全不掉血 —— 所以近戰交給客戶端比較穩。")
         mbar.addWidget(self.type_box)
         mbar.addSpacing(12)
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
@@ -1191,11 +1191,13 @@ class CharFarmPage(QWidget):
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
         #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
         # ★ 近戰／遠程（使用者在頁面上選）：
-        #   近戰 —— **直接用怪物座標**：攻擊封包帶牠的座標，走路也直接走到
-        #           牠身上（不停在幾格外等）。施放封包的第 3、4 個參數就是
-        #           座標，所以近戰不必自己算「要站多近」。
-        #   遠程 —— 維持原本：ATTACK_PACKET_RANGE 內就送，走到 WALK_KEEP 內
+        #   近戰 —— **選怪用封包、出手用按鍵**（狂按使用者選的那個 Fx）。
+        #           射程與走位交給遊戲客戶端判斷，它知道每招要站多近；
+        #           我們只負責走到怪身上，不自己算「要站多遠」。
+        #   遠程 —— 維持原本：送施放封包，ATTACK_PACKET_RANGE 內就送、
+        #           走到 WALK_KEEP 內就停。
         melee = bool(self.type_box.currentData())
+        self._keys.mode = MODE_KEY if melee else self.mode
         blocked = self._path_pts > 1
         reach = MELEE_RANGE if blocked else ATTACK_PACKET_RANGE
         in_range = dist is not None and dist <= reach
@@ -1221,7 +1223,7 @@ class CharFarmPage(QWidget):
         # 寫目標那條要據此決定「寫不寫血量」——
         #   封包攻擊：**不寫**，血量交給遊戲，讀到 0 就是死亡訊號
         #   按鍵攻擊：**要寫**，遊戲出手前會檢查 +0x2DC > 0，不餵就不打
-        self._atk.packets = bool(self.mode == MODE_PACKET
+        self._atk.packets = bool(self._keys.mode == MODE_PACKET
                                  and self._keys.packets and self._keys.skill
                                  and self._keys.mover is not None)
         self._keys.set_on(in_range)
@@ -1291,7 +1293,7 @@ class CharFarmPage(QWidget):
             + (f"　{self._why}" if self._why else "")
             + f"　目標血量 {hp}%"
             + ("　📦 封包攻擊" if self._atk.packets else
-               "　⌨ 按鍵攻擊" if self.mode == MODE_KEY else "")
+               "　⌨ 按鍵攻擊" if self._keys.mode == MODE_KEY else "")
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
             + (f"　武器耐久 {self._dura[0]}"
                + (f"/{self._dura[1]}" if self._dura[1] > 0 else "")
