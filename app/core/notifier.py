@@ -3,8 +3,9 @@
 原本這套只在收益監控分頁裡。自動掛機也需要（例如武器壞掉要停下來通知），
 與其複製一份，不如抽出來共用 —— 兩邊的行為才不會慢慢走鐘。
 
-★ 設定沿用收益監控那一份（`profit.notify_method` / `profit.telegram_id`），
-  使用者只要在監控分頁設定一次，掛機這邊自動跟著走。
+★ 設定來源可換：預設沿用收益監控那一份（`profit.notify_method` /
+  `profit.telegram_id`），但呼叫端可以傳 `get_settings` 進來，
+  改成「每個分身各自一份」—— 自動掛機就是這樣用的（使用者要求各自獨立）。
 
 ★ 通知真的送得出去就到此為止：**不出聲、也不跳視窗**。
   選 Telegram 的情境是「人不在電腦前」，跳一個要人按掉的視窗只會擋住畫面，
@@ -38,23 +39,33 @@ class Notifier(QObject):
 
     failed = Signal(str)                 # Telegram 送失敗（在 UI 執行緒顯示）
 
-    def __init__(self, parent, title: str = "⚠ 警報") -> None:
+    def __init__(self, parent, title: str = "⚠ 警報", get_settings=None) -> None:
+        """get_settings: 可選 callable，回傳 (method, room)。
+        不傳就沿用收益監控那一份全域設定。"""
         super().__init__(parent)
         self._parent = parent
         self._title = title
+        self._get = get_settings
         self._alarm = Alarm(parent)
         self._dialog: AlarmDialog | None = None
         self._pending: list[tuple[str, str]] = []
 
+    def _settings(self) -> tuple[str, str]:
+        if self._get is not None:
+            method, room = self._get()
+            return method, (room or "").strip()
+        return (config.get(KEY_METHOD, "sound"),
+                str(config.get(KEY_ROOM, "") or "").strip())
+
     def fire(self, who: str, msg: str) -> str:
         """送一則通知。回傳一句可以放進狀態列的說明。"""
-        room = telegram_room()
-        if room:
+        method, room = self._settings()
+        if method == "telegram" and room:
             self._send_async(room, [(who, msg)])
             return "已送出 Telegram 通知"
 
         self._pending.append((who, msg))
-        if config.get(KEY_METHOD, "sound") == "telegram":
+        if method == "telegram":
             # 選了 Telegram 卻沒填 ID：送不出去，維持原本行為（跳視窗但不出聲）
             note = "⚠ 未填 Telegram 群組/房間 ID，改用視窗提示"
         else:

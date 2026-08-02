@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -46,11 +47,13 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from app.config import config
 from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
@@ -266,23 +269,21 @@ class ScanWorker(QThread):
         self._hot: dict[int, list] = {}          # pid → 上次命中的區塊
         self._full_at: dict[int, float] = {}     # pid → 上次全掃的時間
         self._inv: dict[int, int] = {}           # pid → 物品陣列表頭
-        self._inv_at: dict[int, float] = {}      # pid → 上次找表頭的時間
         self._running = True
 
     def _inventory_head(self, pid: int, sc: MemoryScanner, now: float):
-        """物品陣列表頭。有效就直接用 —— 重找要跑 AOB 全掃，很貴。"""
+        """物品陣列表頭。★ 只讀快取，**絕不在這裡重找**。
+
+        重找要跑 AOB 全掃，實測 1.7～2.1 秒／台。這條執行緒是怪物清單的關鍵路徑，
+        五台排隊就是十秒的空窗（使用者回報的「搜尋會卡住」）。
+        重找交給 InvWorker 那條獨立執行緒，找到再放進這個快取。
+        """
         head = self._inv.get(pid)
-        if head and inventory.is_valid(sc, head):
-            return head
-        if now - self._inv_at.get(pid, -99.0) < INV_RELOCATE_GAP:
-            return None                          # 剛找過還是失敗，先別一直重試
-        self._inv_at[pid] = now
-        hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096,
-                        should_stop=lambda: not self._running)
-        head = inventory.locate(sc, {a - inventory.ITEM_BALL_OFF for a in hits})
-        if head:
-            self._inv[pid] = head
-        return head
+        return head if head and inventory.is_valid(sc, head) else None
+
+    def set_inventory_head(self, pid: int, head: int) -> None:
+        """InvWorker 找到表頭後放進來，之後每輪掃描就直接帶出去。"""
+        self._inv[pid] = head
 
     def request(self, pid: int, sc: MemoryScanner) -> None:
         if not any(p == pid for p, _ in self._queue):
@@ -340,6 +341,55 @@ class ScanWorker(QThread):
         self._running = False
 
 
+class InvWorker(QThread):
+    """專門找「物品指標陣列表頭」的執行緒（讀武器耐久要用）。
+
+    ★ 為什麼要獨立一條：找表頭要跑 AOB 全記憶體掃描，實測 **1.7～2.1 秒／台**。
+      放在怪物清單那條執行緒上，五台排隊就是十秒的空窗 —— 使用者回報的
+      「殺怪殺一殺有時候搜尋會卡住」就是這個。
+      （跟 watcher.py 把定位拆成 _Locator 是同一個道理，那次也是最有效的一招。）
+
+    表頭本身很穩：實測 40 秒、五台，0 次失效。所以這條執行緒平時幾乎沒事做，
+    只有開場各找一次，之後失效才重找。
+    """
+
+    found = Signal(int, object)                  # pid, head
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._want: dict[int, MemoryScanner] = {}
+        self._at: dict[int, float] = {}
+        self._running = True
+
+    def request(self, pid: int, sc: MemoryScanner) -> None:
+        """請它找（或重找）某台的表頭。有冷卻，不會一直重跑全掃。"""
+        if time.monotonic() - self._at.get(pid, -99.0) >= INV_RELOCATE_GAP:
+            self._want[pid] = sc
+
+    def run(self) -> None:
+        while self._running:
+            if not self._want:
+                self.msleep(200)
+                continue
+            pid, sc = next(iter(self._want.items()))
+            del self._want[pid]
+            self._at[pid] = time.monotonic()
+            head = None
+            try:
+                hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096,
+                                should_stop=lambda: not self._running)
+                head = inventory.locate(
+                    sc, {a - inventory.ITEM_BALL_OFF for a in hits})
+            except Exception:                    # noqa: BLE001
+                head = None
+            if self._running and head:
+                self.found.emit(pid, head)
+
+    def stop(self) -> None:
+        self._running = False
+        self._want.clear()
+
+
 class CharFarmPage(QWidget):
     """單一分身的掛機介面。"""
 
@@ -354,7 +404,12 @@ class CharFarmPage(QWidget):
         self.sc = sc
         self.account = account
         self.char_name = char_name
-        self._notifier = notifier
+        self._loading = True          # 載入設定期間不要反過來又存一次
+        # 通知器每個分身一個，設定讀自己頁面上的那一列（使用者要求各自獨立）
+        self._notifier = notifier or Notifier(
+            self, "⚠ 自動掛機警報",
+            lambda: ("telegram" if self.rb_tg.isChecked() else "sound",
+                     self.tg_id.text()))
         # 三件事各自跑自己的執行緒，互不干擾：
         #   掃描更新清單（ScanWorker，全分身共用）
         #   寫入目標＋偵測死亡（TargetWorker，50 Hz）
@@ -393,6 +448,30 @@ class CharFarmPage(QWidget):
         self._killed: dict[int, float] = {}
 
         root = QVBoxLayout(self)
+
+        # 通知列（最上面）。★ 每個分身各自一份設定，不共用
+        # —— 使用者要求：不同分身可能要通知到不同的地方。
+        nbar = QHBoxLayout()
+        nbar.addWidget(QLabel("通知方式"))
+        self.rb_sound = QRadioButton("音效警報")
+        self.rb_tg = QRadioButton("Telegram")
+        grp = QButtonGroup(self)
+        grp.addButton(self.rb_sound)
+        grp.addButton(self.rb_tg)
+        self.rb_sound.setChecked(True)
+        nbar.addWidget(self.rb_sound)
+        nbar.addWidget(self.rb_tg)
+        self.tg_id = QLineEdit()
+        self.tg_id.setPlaceholderText("Telegram 群組/房間 ID")
+        self.tg_id.setFixedWidth(220)
+        nbar.addWidget(self.tg_id)
+        self.test_btn = QPushButton("測試通知")
+        self.test_btn.setToolTip("立刻送一則測試通知，確認設定會不會通。")
+        self.test_btn.clicked.connect(
+            lambda: self.notify("這是一則測試通知。"))
+        nbar.addWidget(self.test_btn)
+        nbar.addStretch(1)
+        root.addLayout(nbar)
 
         bar = QHBoxLayout()
         self.scan_btn = QPushButton("掃描周圍怪物")
@@ -518,6 +597,10 @@ class CharFarmPage(QWidget):
         root.addWidget(self.status)
         root.addStretch(1)
 
+        self._load_settings()
+        self._loading = False
+        self._wire_saving()
+
     # ------------------------------------------------------------------
     # -- 選中怪物清單 --------------------------------------------------
     def wanted(self) -> list[str]:
@@ -544,6 +627,7 @@ class CharFarmPage(QWidget):
             return
         self._home = p
         self.home_lbl.setText(f"原點：({p[0]:.0f}, {p[1]:.0f})")
+        self._save_settings()
 
     def _ensure_mover(self) -> bool:
         """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。"""
@@ -822,8 +906,67 @@ class CharFarmPage(QWidget):
                if self._dura[0] >= 0 else "")
             + f"　累計擊殺 {self._kills}")
 
+    # ------------------------------------------------------------------
+    # -- 設定的保存與載入（每個帳號各自一份）----------------------------
+    #
+    # ★ 用**帳號名**當 key，不能用 PID —— 玩家關掉重開遊戲 PID 就變了
+    #   （見 [[memory-re-pitfalls]] 第 10 條）。
+    # ★ 「開始掛機」刻意**不存**：使用者明講「那個每次都要是關閉的，
+    #   因為我不能幫他打開」—— 程式一開就自己開打太危險。
+    def _key(self, field: str) -> str:
+        return f"farm.{self.account}.{field}"
+
+    def _load_settings(self) -> None:
+        g = config.get
+        for name in g(self._key("monsters"), []) or []:
+            self._add_name(str(name))
+        vk = g(self._key("vk"), DEFAULT_KEY)
+        i = next((n for n, (_, v) in enumerate(SKILL_KEYS) if v == vk), None)
+        if i is not None:
+            self.key_box.setCurrentIndex(i)
+        self.interval.setValue(float(g(self._key("interval"), DEFAULT_INTERVAL)))
+        self.radius.setValue(float(g(self._key("radius"), ATTACK_RADIUS)))
+        self.move_cb.setChecked(bool(g(self._key("move"), True)))
+        self.back_cb.setChecked(bool(g(self._key("back"), False)))
+        home = g(self._key("home"), None)
+        if isinstance(home, (list, tuple)) and len(home) == 2:
+            self._home = (float(home[0]), float(home[1]))
+            self.home_lbl.setText(f"原點：({self._home[0]:.0f},"
+                                  f" {self._home[1]:.0f})")
+        if g(self._key("notify"), "sound") == "telegram":
+            self.rb_tg.setChecked(True)
+        self.tg_id.setText(str(g(self._key("tg_id"), "") or ""))
+
+    def _save_settings(self) -> None:
+        if self._loading:
+            return
+        s = config.set
+        s(self._key("monsters"), self.wanted())
+        s(self._key("vk"), self.key_box.currentData())
+        s(self._key("interval"), self.interval.value())
+        s(self._key("radius"), self.radius.value())
+        s(self._key("move"), self.move_cb.isChecked())
+        s(self._key("back"), self.back_cb.isChecked())
+        s(self._key("home"), list(self._home) if self._home else None)
+        s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
+        s(self._key("tg_id"), self.tg_id.text().strip())
+        config.save()
+
+    def _wire_saving(self) -> None:
+        """所有設定一改就存 —— 不要讓使用者每次都重設一遍。"""
+        self.picked.model().rowsInserted.connect(self._save_settings)
+        self.picked.model().rowsRemoved.connect(self._save_settings)
+        self.key_box.currentIndexChanged.connect(self._save_settings)
+        self.interval.valueChanged.connect(self._save_settings)
+        self.radius.valueChanged.connect(self._save_settings)
+        self.move_cb.toggled.connect(self._save_settings)
+        self.back_cb.toggled.connect(self._save_settings)
+        self.rb_tg.toggled.connect(self._save_settings)
+        self.tg_id.editingFinished.connect(self._save_settings)
+
+    # ------------------------------------------------------------------
     def notify(self, msg: str) -> None:
-        """送警報通知。設定沿用收益監控那一份（使用者只要設定一次）。"""
+        """送警報通知。設定是這個分身自己的（通知列在頁面最上面）。"""
         if self._notifier is None:
             return
         who = f"{self.account}（{self.char_name}）"
@@ -843,11 +986,8 @@ class FarmTab(BaseTab):
         self._pages: dict[int, CharFarmPage] = {}
         self._scanners: list[MemoryScanner] = []
         self._worker: ScanWorker | None = None
+        self._inv: InvWorker | None = None    # 找物品陣列表頭（AOB 全掃，很慢）
         self._keys: list[_Paced] = []         # 每個分身：寫入執行緒 + 送鍵執行緒
-        # 通知設定沿用收益監控那一份，使用者只要在那邊設定一次
-        self._notifier = Notifier(self, "⚠ 自動掛機警報")
-        self._notifier.failed.connect(
-            lambda msg: self.found.setText(msg))
 
         root = QVBoxLayout(self)
 
@@ -905,6 +1045,9 @@ class FarmTab(BaseTab):
         self._worker.done.connect(self._on_scan_done)
         # 掃描讓路給攻擊：掃描是大量記憶體讀取，攻擊只要準時。
         self._worker.start(QThread.LowPriority)
+        self._inv = InvWorker()
+        self._inv.found.connect(self._on_inv_found)
+        self._inv.start(QThread.LowestPriority)
         for pid, hwnd, title, sc in insts:
             tgt, keys = TargetWorker(sc), KeyWorker(hwnd)
             tgt.start(QThread.HighPriority)
@@ -912,8 +1055,10 @@ class FarmTab(BaseTab):
             self._keys += [tgt, keys]
             acct = charname.account_from_title(title)
             nm = charname.read_character_name(sc, acct) or acct
+            # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
             page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
-                                tgt, keys, self._notifier, acct, nm)
+                                tgt, keys, None, acct, nm)
+            page._notifier.failed.connect(self.found.setText)
             self._pages[pid] = page
             self.tabs.addTab(page, nm)
         self.found.setText(f"偵測到 {len(insts)} 個分身")
@@ -930,8 +1075,20 @@ class FarmTab(BaseTab):
 
     def _on_scan_done(self, s: Scan) -> None:
         page = self._pages.get(s.pid)
+        if page is None:
+            return
+        page.apply_scan(s)
+        # 表頭還沒找到（或失效）就請 InvWorker 去找 —— 那是 AOB 全掃，
+        # 絕不能放在怪物清單那條執行緒上。
+        if s.inv is None and self._inv is not None:
+            self._inv.request(s.pid, page.sc)
+
+    def _on_inv_found(self, pid: int, head: int) -> None:
+        if self._worker is not None:
+            self._worker.set_inventory_head(pid, head)
+        page = self._pages.get(pid)
         if page is not None:
-            page.apply_scan(s)
+            page.inv = head
 
     def _tick(self) -> None:
         dt = TICK_MS / 1000.0
@@ -945,10 +1102,11 @@ class FarmTab(BaseTab):
             # ⚠ 一定要拆掉移動 hook —— 不還原 IAT 就等於在遊戲裡留了一段跳板
             if page._mover is not None:
                 page._mover.stop()
-        for th in ([self._worker] if self._worker else []) + self._keys:
+        for th in [t for t in (self._worker, self._inv) if t] + self._keys:
             th.stop()
             th.wait(5000)
         self._worker = None
+        self._inv = None
         self._keys = []
         self.tabs.clear()
         self._pages = {}
