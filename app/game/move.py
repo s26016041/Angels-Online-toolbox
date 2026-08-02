@@ -60,6 +60,14 @@ PATHFIND_FN = 0x00549B81
 PATH_MAX_TILES = 28.0       # 尋路的有效範圍實測約 30~40 格，超過就回 0
 # 這段算不出來就縮短再試（由遠到近）
 PATH_TRY = (28.0, 18.0, 10.0, 5.0)
+# ★ 直線方向被牆擋住時，換角度找繞路。
+# 為什麼需要：中繼點全部取在「往目標的直線」上，那個方向有牆的話會全部算不出來，
+# 角色就停在牆邊不動 —— 使用者回報「沒怪物回原點怎麼沒有計算路徑」。
+# 實測（黑狐，原點在 195 格外）：直線 28/18 格算不出，但 −40°/−60° 的 20 格
+# 都算得出 3 點路徑，也就是繞得過去，只是我們沒去試。
+# 角度控制在 ±70° 以內，這樣繞路仍然會朝目標前進（cos70° ≈ 0.34）。
+DETOUR_TRY = ((20.0, -40), (20.0, 40), (20.0, -70), (20.0, 70),
+              (12.0, -40), (12.0, 40))
 
 # --- 尋路要的 this ----------------------------------------------------------
 # ⚠⚠ **不是**我們用 VT_PLAYER 掃到的那個位址，而是**它 −8**。
@@ -321,16 +329,38 @@ class Mover:
         #   呼叫端過一下會再試一次，總之不要凍住畫面（見 path_to 的說明）。
         if not self._lock.acquire(timeout=wait):
             return 0
+        def try_point(px: float, py: float) -> int:
+            tx = int(px * entity.TILE_UNITS) & 0xFFFF
+            ty = int(py * entity.TILE_UNITS) & 0xFFFF
+            n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
+                               ecx=this, timeout=0.15)
+            if n and 0 < n <= MAX_POINTS:
+                self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
+                return n
+            return 0
+
         try:
             for hop in (full,) + PATH_TRY:
                 if hop > full:
                     continue
-                tx = int((cx + dx / full * hop) * entity.TILE_UNITS) & 0xFFFF
-                ty = int((cy + dy / full * hop) * entity.TILE_UNITS) & 0xFFFF
-                n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
-                                   ecx=this, timeout=0.15)
-                if n and 0 < n <= MAX_POINTS:
-                    self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
+                n = try_point(cx + dx / full * hop, cy + dy / full * hop)
+                if n:
+                    return n
+            # 直線方向整條都算不出來 = 那個方向有牆。換角度繞（見 DETOUR_TRY）。
+            # ⚠ 只有在直線全失敗時才做，平常不會多花這些呼叫。
+            # ⚠⚠ **繞路的落點一定要比現在更靠近目標**，否則就是原地打轉：
+            #    實測（黑狐回 195 格外的原點）沒有這條規則時，走到某一格之後
+            #    繞路又把它帶回原處，然後無限來回，看起來一直在動卻永遠到不了。
+            ang = math.atan2(dy, dx)
+            for hop, deg in DETOUR_TRY:
+                if hop > full:
+                    continue
+                a = ang + math.radians(deg)
+                px, py = cx + math.cos(a) * hop, cy + math.sin(a) * hop
+                if math.hypot(tile_x - px, tile_y - py) >= full:
+                    continue                   # 繞過去反而更遠，不要
+                n = try_point(px, py)
+                if n:
                     return n
         finally:
             self._lock.release()

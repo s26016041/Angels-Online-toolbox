@@ -79,7 +79,17 @@ HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就�
 GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，不必常看）
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
 # 的 MAX_HOP），長距離是靠這裡定期重下、一段一段接力走完的，所以不能太久。
-WALK_GAP = 0.8
+# ★ 下一次移動指令最少隔多久。**而且角色還在走時一律不下**（見 tick）。
+# ⚠⚠ 這是「走不回原點」的真正原因：以前每 0.8 秒就重下一次指令，
+#   把還沒走完的**多點路徑砍掉**。那條路徑常常是「先繞開再往前」，
+#   我們正好在繞開那一段打斷它 → 回到原處又重算 → 無限來回，
+#   看起來就像根本沒在算路徑。實測不打斷之後，176 格外的原點 42 秒就走回去了。
+WALK_GAP = 0.4
+# 判斷「有沒有在移動」要隔一段時間再比位置。
+# ⚠ 心跳是 10ms，而角色約 9 格/秒 = 每拍才 0.09 格 —— 拿相鄰兩拍比
+#   幾乎永遠判定「沒在動」（卡住偵測也一起誤判，走路中照樣累積秒數）。
+MOVE_SAMPLE = 0.3
+MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
 HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
@@ -577,6 +587,9 @@ class CharFarmPage(QWidget):
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._home_pts = 1         # 上次「走回原點」算出的路徑點數
+        self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
+        self._move_ref: tuple[float, float] | None = None
+        self._move_t = 0.0
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
         # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
@@ -1054,6 +1067,16 @@ class CharFarmPage(QWidget):
         self._walk_t += dt
         me = self.my_pos()
 
+        # ★ 「角色正在走路嗎」—— 隔 MOVE_SAMPLE 秒比一次位置（見常數說明）。
+        #   移動中一律不重下移動指令，否則會把多點路徑砍掉、原地來回。
+        self._move_t += dt
+        if self._move_t >= MOVE_SAMPLE:
+            self._move_t = 0.0
+            if me is not None and self._move_ref is not None:
+                self._moving = math.hypot(me[0] - self._move_ref[0],
+                                          me[1] - self._move_ref[1]) > MOVE_EPS
+            self._move_ref = me
+
         if self._cur is None:
             # ★ 追怪不限距離，只有「周圍完全沒有選中的怪」才回原點（使用者要求）
             if self.back_cb.isChecked() and self._home and me:
@@ -1062,7 +1085,7 @@ class CharFarmPage(QWidget):
                     # ⚠ 回傳值不能丟掉：走不了（尋路算不出路徑、或指令槽被佔）
                     #   時什麼都不會發生，狀態列卻還寫著「走回原點」——
                     #   看起來就像沒在算路徑、站在原地發呆。
-                    if self._walk_t >= WALK_GAP:
+                    if not self._moving and self._walk_t >= WALK_GAP:
                         self._home_pts = self._walk_toward(
                             self._home[0], self._home[1], me, 0.0)
                     self.status.setText(
@@ -1116,7 +1139,8 @@ class CharFarmPage(QWidget):
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
         #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
-        if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
+        if (self.move_cb.isChecked() and me and not self._moving
+                and self._walk_t >= WALK_GAP
                 and dist is not None and dist > keep):
             n = self._walk_toward(mp[0], mp[1], me, keep)
             # ⚠ 走不了（尋路算不出路徑，或指令槽被佔）**不要把它記成「沒有障礙物」**。
@@ -1162,9 +1186,10 @@ class CharFarmPage(QWidget):
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
         # 代表這隻走不過去（隔著地形之類），換一隻。
-        moving = (me is not None and self._last_pos is not None
-                  and (abs(me[0] - self._last_pos[0]) > 0.2
-                       or abs(me[1] - self._last_pos[1]) > 0.2))
+        # ⚠ 用上面那個「隔 0.3 秒取樣」的結果，不要拿相鄰兩拍比 ——
+        #   心跳 10ms，角色每拍才走 0.09 格，那樣比永遠都是「沒在動」，
+        #   於是走路途中也會一直累積卡住秒數，走到一半就被判定走不過去換怪。
+        moving = self._moving
         # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp and dist is not None:
