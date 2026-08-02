@@ -250,6 +250,24 @@ class Mover:
                 time.sleep(0.005)
         return None
 
+    def path_to(self, scanner, tile_x: float, tile_y: float) -> int:
+        """**只算路徑、不移動**，回傳路徑點數。
+
+        這是「中間有沒有障礙物」最直接的答案，不必先走一步再看：
+            1 個點  = 直線過得去
+            多個點  = 要繞，代表中間有地形
+            0       = 算不出路徑（那個方向不通，或超出尋路範圍）
+        一次呼叫約一幀（十幾毫秒），挑到新目標時算一次就夠。
+        """
+        this = pathfinder_this(scanner)
+        if not this:
+            return 0
+        tx = int(tile_x * entity.TILE_UNITS) & 0xFFFF
+        ty = int(tile_y * entity.TILE_UNITS) & 0xFFFF
+        n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
+                           ecx=this, timeout=0.15)
+        return n if (n and 0 < n <= MAX_POINTS) else 0
+
     def walk_to(self, scanner, player_obj: int,
                 tile_x: float, tile_y: float) -> int:
         """走到指定的格子座標。**回傳尋路算出的路徑點數**（0 = 走不了）。

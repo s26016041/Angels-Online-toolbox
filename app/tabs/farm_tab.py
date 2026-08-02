@@ -84,6 +84,11 @@ HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
+# ⛔ 不要做「打不到就一步一步走近」那種自動收斂 —— 使用者明講看起來卡卡的，
+#    而且根本不需要：實測（黑狐，目標有寫進記憶體）12.2 / 11.6 / 8.9 格
+#    都打得死（血量 100 → 47 → 0）。曾經以為 13 格打不到，那是診斷時
+#    **忘了寫目標**、讀到的血量根本不是那隻怪，量錯了。
+#    另外目標血量欄位會被遊戲清成 0，拿它當「沒打到」的訊號一定誤判。
 
 # ★ 攻擊封包的最遠距離。**這是遊戲的固定值，不是角色屬性，所以不量測**
 #   （使用者指出的：每個角色都一樣）。
@@ -100,13 +105,9 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → �
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_TRIES = 6
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
-# ★ 封包攻擊時仍要每隔這麼久補按一次技能鍵。
-# 原因：**會走過去打是客戶端的行為，不是伺服器的**。按下技能鍵時客戶端會判斷
-# 「目標超出這招的射程 → 先走過去再放」；我們直接送施放封包等於跳過那段判斷，
-# 伺服器收到「對太遠的怪施放」就當作沒發生 —— 症狀就是角色不走也不打
-# （使用者回報「不會走路了」「旁邊有怪也不打」）。
-# 補按鍵讓遊戲自己處理接近，就不必知道每個角色的射程是多少。
-DRIVE_GAP = 0.25
+# ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
+#    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
+#    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
 ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
@@ -206,7 +207,6 @@ class KeyWorker(_Paced):
         self._learning = False
         self._tries = 0
         self._next_learn = 0.0
-        self._next_drive = 0.0      # 下次補按技能鍵的時間（見 DRIVE_GAP）
 
     def set_on(self, on: bool) -> None:
         self._on = on
@@ -261,12 +261,6 @@ class KeyWorker(_Paced):
                     if attack.send_trio(self.mover, self.pf,
                                         self.skill, self.eid):
                         self.sent += 1
-                        # ★ 還是要偶爾按一下技能鍵：走過去打是**客戶端**的行為，
-                        #   純送封包的話角色不會自己接近（見 DRIVE_GAP）。
-                        now = time.perf_counter()
-                        if now >= self._next_drive:
-                            self._next_drive = now + DRIVE_GAP
-                            _send_scan(self.hwnd, self.vk)
                         return
                     # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
                     # 別讓角色空等。
@@ -538,7 +532,7 @@ class CharFarmPage(QWidget):
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
-        self._path_pts = 1         # 上次尋路的路徑點數（>1 = 中間有地形）
+        self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -873,7 +867,7 @@ class CharFarmPage(QWidget):
             return False
         d, self._cur = pool[0]                    # 就打最近的
         self._stuck = 0.0
-        self._path_pts = 1                        # 還沒算過，先當作直線通
+        self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._last_hp = -1
         self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
@@ -1027,12 +1021,28 @@ class CharFarmPage(QWidget):
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
 
-        # 規則只有一條（使用者定的）：
-        #   **在攻擊範圍外就走進來，進到範圍內才送攻擊封包組。**
-        # 不再為「中間有障礙物」特別走到怪臉上 —— 攻擊改用封包之後，
-        # 剩下的接近動作交給遊戲自己處理就好；真的過不去會由卡住偵測換一隻。
-        in_range = dist is None or dist <= ATTACK_PACKET_RANGE
-        keep = ATTACK_PACKET_RANGE * RANGE_KEEP    # 走到範圍的九成，留點餘裕
+        # 接近規則（改用封包攻擊後，接近**完全由我們自己走**，不靠按鍵）：
+        #   ① 中間有障礙物（尋路點數 > 1）→ 走到怪臉上
+        #      隔著牆時「直線距離近」是假的，站在原地打不到。
+        #   ② 沒障礙物、超出攻擊範圍 → 走到範圍的九成
+        #   ③ 進到範圍內才送三連包
+        # ⚠ 讀不到座標（dist is None）算「不在範圍內」—— 位置不明就別亂送封包，
+        #   那多半是怪的物件已經被回收了。
+        #
+        # ★ 有沒有障礙物**直接問遊戲的尋路函式**（只算不走，約一幀）：
+        #   回 1 點就是直線通、多點就是要繞。挑到新目標時算一次即可，
+        #   不必先走一步再看 —— 否則近距離隔著牆的怪會被當成「在範圍內」空打。
+        if (self._path_pts < 0 and mp is not None and me
+                and self._mover is not None and self._mover.active):
+            self._path_pts = self._mover.path_to(self.sc, mp[0], mp[1])
+        # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
+        #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
+        #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
+        #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
+        blocked = self._path_pts > 1
+        reach = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE
+        in_range = dist is not None and dist <= reach
+        keep = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE * RANGE_KEEP
         if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
                 and not in_range and dist is not None and dist > keep):
             self._path_pts = self._walk_toward(mp[0], mp[1], me, keep)
@@ -1071,7 +1081,8 @@ class CharFarmPage(QWidget):
         d = dist if dist is not None else float("nan")
         self.status.setText(
             f"掛機中：{m.name}　距離 {d:.1f} 格"
-            + ("" if in_range else "　→ 走進攻擊範圍")
+            + ("　⛰ 隔著地形，走到臉上" if blocked
+               else "" if in_range else "　→ 走進攻擊範圍")
             + f"　目標血量 {hp}%"
             + ("　📦 封包攻擊" if (self._keys.packets and self._keys.skill
                                  and self._keys.mover) else "")
