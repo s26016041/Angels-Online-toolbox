@@ -132,8 +132,14 @@ def set_target(scanner, state: int, eid: int) -> None:
     """把目標寫進客戶端狀態。之後送出攻擊按鍵，角色就會打這隻。
 
     只寫這 4 bytes —— 這是遊戲自己每次選目標都會寫的欄位。
+
+    ⚠ 實體 ID 是**無號** 32 位元（實測有 0x8E8D04DA = 23 億這種值），
+    但 MemoryScanner 只提供有號的 int32。直接傳會炸：
+        'i' format requires -2147483648 <= number <= 2147483647
+    所以先轉成等價的有號值 —— 寫進記憶體的 4 個位元組完全相同。
     """
-    scanner.write_value(state + OFF_TARGET, VALUE_TYPES["int32"], eid)
+    signed = struct.unpack("<i", struct.pack("<I", eid & 0xFFFFFFFF))[0]
+    scanner.write_value(state + OFF_TARGET, VALUE_TYPES["int32"], signed)
 
 
 def is_alive(scanner, ent: Entity) -> bool:

@@ -20,18 +20,20 @@ from __future__ import annotations
 
 import ctypes
 
+from collections import Counter
+
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QDoubleSpinBox,
+    QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -48,6 +50,7 @@ WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 DEFAULT_INTERVAL = 0.1          # 秒；使用者指定預設每 0.1 秒按一次
 TICK_MS = 20                    # 迴圈計時器解析度
 RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻（掃一次約 0.4 秒）
+NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 
 
 def send_key(hwnd: int, vk: int = VK_F2) -> None:
@@ -114,7 +117,6 @@ class CharFarmPage(QWidget):
         self._acc = 0.0
         self._wrote = False        # 這一輪掛機有沒有寫過目標（判斷死亡用）
         self._cur: entity.Entity | None = None   # 正在打的那隻
-        self._farm_type: int | None = None       # 只打這個種類
         self._kills = 0
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
@@ -138,35 +140,51 @@ class CharFarmPage(QWidget):
         bar.addSpacing(12)
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setToolTip(
-            "勾選後開始迴圈：把選中的怪寫進遊戲的『目前目標』，並持續送 F2。\n"
-            "取消勾選立刻停止。")
+            "勾選後開始迴圈：把「選中怪物」那一種寫進遊戲的目前目標，並持續送 F2。\n"
+            "打死會自動接同名的下一隻。取消勾選立刻停止。")
         self.run_cb.toggled.connect(self._on_toggle)
         bar.addWidget(self.run_cb)
         bar.addStretch(1)
         root.addLayout(bar)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["名稱", "種類 ID", "實體 ID"])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch)
-        root.addWidget(self.table, 1)
+        # 兩個小區塊：左邊是要打的目標（可手動輸入），右邊是附近有什麼
+        # 一律只顯示中文名字 —— 比對也是用名字，所以手動打字才會通。
+        panes = QHBoxLayout()
+
+        left = QGroupBox("選中怪物")
+        lv = QVBoxLayout(left)
+        self.pick = QLineEdit()
+        self.pick.setPlaceholderText("點右邊挑一個，或直接打字")
+        lv.addWidget(self.pick)
+        lv.addStretch(1)
+        left.setFixedWidth(200)
+        panes.addWidget(left)
+
+        right = QGroupBox("周圍怪物")
+        rv = QVBoxLayout(right)
+        self.near = QListWidget()
+        self.near.setFixedHeight(NEAR_HEIGHT)
+        self.near.itemClicked.connect(
+            lambda it: self.pick.setText(it.data(Qt.UserRole)))
+        rv.addWidget(self.near)
+        panes.addWidget(right, 1)
+        root.addLayout(panes)
 
         self.status = QLabel("尚未掃描")
         self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
+        root.addStretch(1)
 
     # ------------------------------------------------------------------
     def apply_scan(self, state, mons, err: str) -> None:
         self.state = state
         self.mons = mons or []
-        self.table.setRowCount(len(self.mons))
-        for r, m in enumerate(self.mons):
-            self.table.setItem(r, 0, QTableWidgetItem(m.name))
-            self.table.setItem(r, 1, QTableWidgetItem(str(m.type_id)))
-            self.table.setItem(r, 2, QTableWidgetItem(f"{m.eid:#010x}"))
+        # 只列中文名字 + 數量，不顯示任何 ID
+        self.near.clear()
+        for name, n in Counter(m.name for m in self.mons).most_common():
+            it = QListWidgetItem(f"{name}　×{n}")
+            it.setData(Qt.UserRole, name)
+            self.near.addItem(it)
         self.scan_btn.setEnabled(True)
         self._waiting = False
 
@@ -174,43 +192,27 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ {err}")
             return
 
-        # 掛機中且正在等下一隻 → 自動挑同種的接上去
+        # 掛機中且正在等下一隻 → 自動挑同名的接上去
         if self.run_cb.isChecked() and self._cur is None:
             self._pick_next()
             return
-
-        cur = entity.read_target(self.sc, state) if state else 0
-        hit = next((m.name for m in self.mons if m.eid == cur), None)
-        self.status.setText(
-            f"找到 {len(self.mons)} 隻　"
-            + (f"目前目標：{hit}" if hit
-               else ("目前沒有選定目標" if not cur else
-                     f"目前目標 {cur:#x}（不在清單裡）")))
+        self.status.setText(f"找到 {len(self.mons)} 隻，"
+                            f"{self.near.count()} 種")
 
     def _pick_next(self) -> None:
-        """從最新的掃描結果裡挑一隻同種類的接著打。"""
+        """從最新的掃描結果裡挑一隻**同名**的接著打。
+
+        用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
+        """
+        want = self.pick.text().strip()
         pool = [m for m in self.mons
-                if m.type_id == self._farm_type
-                and entity.is_alive(self.sc, m)]
+                if m.name == want and entity.is_alive(self.sc, m)]
         if not pool:
             self.status.setText(
-                f"附近沒有種類 {self._farm_type} 的怪了（已擊殺 {self._kills} 隻）"
-                "　→ 繼續等待新的怪出現…")
+                f"附近沒有「{want}」了（已擊殺 {self._kills} 隻）→ 等新的出現…")
             return
         self._cur = pool[0]
         self._wrote = False
-        # 讓表格反白目前這隻，看得出來在打誰
-        for r, m in enumerate(self.mons):
-            if m.eid == self._cur.eid:
-                self.table.selectRow(r)
-                break
-
-    def selected(self) -> entity.Entity | None:
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        i = rows[0].row()
-        return self.mons[i] if 0 <= i < len(self.mons) else None
 
     def _on_toggle(self, on: bool) -> None:
         if not on:
@@ -223,19 +225,18 @@ class CharFarmPage(QWidget):
             QMessageBox.information(self, "還不能開始",
                                     "請先按「掃描周圍怪物」。")
             return
-        m = self.selected()
-        if m is None:
+        want = self.pick.text().strip()
+        if not want:
             self.run_cb.setChecked(False)
-            QMessageBox.information(self, "還不能開始",
-                                    "請先在清單裡選一隻要打的怪。")
+            QMessageBox.information(
+                self, "還不能開始",
+                "請先在「選中怪物」填入名稱（點右邊清單，或直接打字）。")
             return
-        # 記住種類 —— 之後自動接續時只打同一種，不會跑去打 NPC 或圖騰
-        self._farm_type = m.type_id
-        self._cur = m
         self._kills = 0
         self._acc = 0.0
-        self._since_scan = 0.0
-        self.status.setText(f"掛機中：{m.name}（只打種類 {m.type_id}）")
+        self._since_scan = RESCAN_GAP      # 立刻找一隻來打
+        self._cur = None
+        self.status.setText(f"掛機中：只打「{want}」")
 
     def tick(self, dt: float) -> None:
         """迴圈的一次心跳。由分頁的計時器統一驅動。
@@ -323,10 +324,10 @@ class FarmTab(BaseTab):
         root.addWidget(self.tabs, 1)
 
         hint = QLabel(
-            "① 按「掃描周圍怪物」→ ② 在清單選一隻 → ③ 勾「開始掛機」。\n"
-            "會持續送 F2；那隻死掉後**自動重掃並接著打同種類的下一隻**，"
+            "① 按「掃描周圍怪物」→ ② 點右邊挑一個名字（也可以自己打字）"
+            "→ ③ 勾「開始掛機」。\n"
+            "會持續送 F2；那隻死掉後自動重掃、接著打**同名的**下一隻，"
             "不必手動再選。取消勾選才停。\n"
-            "原理：把目標的實體 ID 寫進遊戲的「目前目標」欄位。"
             "不搶視窗焦點，可以同時掛多個分身。")
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
