@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import ctypes
 
-from collections import Counter
-
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -31,7 +29,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QTabWidget,
@@ -147,25 +144,44 @@ class CharFarmPage(QWidget):
         bar.addStretch(1)
         root.addLayout(bar)
 
-        # 兩個小區塊：左邊是要打的目標（可手動輸入），右邊是附近有什麼
+        # 兩個小區塊：左邊是要打哪些怪（可多選、可手動輸入），右邊是附近有什麼。
         # 一律只顯示中文名字 —— 比對也是用名字，所以手動打字才會通。
         panes = QHBoxLayout()
 
         left = QGroupBox("選中怪物")
+        left.setFixedWidth(190)
         lv = QVBoxLayout(left)
-        self.pick = QLineEdit()
-        self.pick.setPlaceholderText("點右邊挑一個，或直接打字")
-        lv.addWidget(self.pick)
-        lv.addStretch(1)
-        left.setFixedWidth(200)
+        self.picked = QListWidget()
+        self.picked.setFixedHeight(NEAR_HEIGHT)
+        self.picked.setSelectionMode(QListWidget.ExtendedSelection)
+        lv.addWidget(self.picked)
+        self.manual = QLineEdit()
+        self.manual.setPlaceholderText("手動輸入後按 Enter")
+        self.manual.returnPressed.connect(self._add_manual)
+        lv.addWidget(self.manual)
         panes.addWidget(left)
+
+        # 中間的刪除鈕：把「選中怪物」裡選起來的移除
+        mid = QVBoxLayout()
+        mid.addStretch(1)
+        # 用 ASCII 的 X，不要用 ✕ —— 部分中文字型沒有那個字形，會變成豆腐。
+        # ⚠ 還要覆寫 padding：主題給 QPushButton 的是 `padding: 6px 14px`，
+        #   左右各 14px 就吃掉 28px，小按鈕會完全看不到文字（踩過）。
+        self.del_btn = QPushButton("X")
+        self.del_btn.setFixedSize(32, 32)
+        self.del_btn.setStyleSheet("padding: 0;")
+        self.del_btn.setToolTip("把「選中怪物」裡選起來的項目刪掉")
+        self.del_btn.clicked.connect(self._remove_picked)
+        mid.addWidget(self.del_btn)
+        mid.addStretch(1)
+        panes.addLayout(mid)
 
         right = QGroupBox("周圍怪物")
         rv = QVBoxLayout(right)
         self.near = QListWidget()
         self.near.setFixedHeight(NEAR_HEIGHT)
-        self.near.itemClicked.connect(
-            lambda it: self.pick.setText(it.data(Qt.UserRole)))
+        self.near.setSelectionMode(QListWidget.ExtendedSelection)
+        self.near.itemClicked.connect(lambda it: self._add_name(it.text()))
         rv.addWidget(self.near)
         panes.addWidget(right, 1)
         root.addLayout(panes)
@@ -176,15 +192,34 @@ class CharFarmPage(QWidget):
         root.addStretch(1)
 
     # ------------------------------------------------------------------
+    # -- 選中怪物清單 --------------------------------------------------
+    def wanted(self) -> list[str]:
+        return [self.picked.item(i).text() for i in range(self.picked.count())]
+
+    def _add_name(self, name: str) -> None:
+        name = name.strip()
+        if name and name not in self.wanted():
+            self.picked.addItem(name)
+
+    def _add_manual(self) -> None:
+        self._add_name(self.manual.text())
+        self.manual.clear()
+
+    def _remove_picked(self) -> None:
+        for it in self.picked.selectedItems():
+            self.picked.takeItem(self.picked.row(it))
+
+    # ------------------------------------------------------------------
     def apply_scan(self, state, mons, err: str) -> None:
         self.state = state
         self.mons = mons or []
-        # 只列中文名字 + 數量，不顯示任何 ID
+        # 只列中文名字（去重、不顯示數量、不顯示任何 ID）
         self.near.clear()
-        for name, n in Counter(m.name for m in self.mons).most_common():
-            it = QListWidgetItem(f"{name}　×{n}")
-            it.setData(Qt.UserRole, name)
-            self.near.addItem(it)
+        seen = []
+        for m in self.mons:
+            if m.name not in seen:
+                seen.append(m.name)
+        self.near.addItems(seen)
         self.scan_btn.setEnabled(True)
         self._waiting = False
 
@@ -192,7 +227,7 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ {err}")
             return
 
-        # 掛機中且正在等下一隻 → 自動挑同名的接上去
+        # 掛機中且正在等下一隻 → 自動挑名字在清單裡的接上去
         if self.run_cb.isChecked() and self._cur is None:
             self._pick_next()
             return
@@ -200,16 +235,16 @@ class CharFarmPage(QWidget):
                             f"{self.near.count()} 種")
 
     def _pick_next(self) -> None:
-        """從最新的掃描結果裡挑一隻**同名**的接著打。
+        """從最新的掃描結果裡挑一隻名字在「選中怪物」裡的接著打。
 
         用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
         """
-        want = self.pick.text().strip()
+        want = self.wanted()
         pool = [m for m in self.mons
-                if m.name == want and entity.is_alive(self.sc, m)]
+                if m.name in want and entity.is_alive(self.sc, m)]
         if not pool:
             self.status.setText(
-                f"附近沒有「{want}」了（已擊殺 {self._kills} 隻）→ 等新的出現…")
+                f"附近沒有選中的怪了（已擊殺 {self._kills} 隻）→ 等新的出現…")
             return
         self._cur = pool[0]
         self._wrote = False
@@ -225,18 +260,18 @@ class CharFarmPage(QWidget):
             QMessageBox.information(self, "還不能開始",
                                     "請先按「掃描周圍怪物」。")
             return
-        want = self.pick.text().strip()
+        want = self.wanted()
         if not want:
             self.run_cb.setChecked(False)
             QMessageBox.information(
                 self, "還不能開始",
-                "請先在「選中怪物」填入名稱（點右邊清單，或直接打字）。")
+                "「選中怪物」是空的。點右邊的名字加進來，或自己打字後按 Enter。")
             return
         self._kills = 0
         self._acc = 0.0
         self._since_scan = RESCAN_GAP      # 立刻找一隻來打
         self._cur = None
-        self.status.setText(f"掛機中：只打「{want}」")
+        self.status.setText("掛機中：只打「" + "、".join(want) + "」")
 
     def tick(self, dt: float) -> None:
         """迴圈的一次心跳。由分頁的計時器統一驅動。
@@ -324,11 +359,11 @@ class FarmTab(BaseTab):
         root.addWidget(self.tabs, 1)
 
         hint = QLabel(
-            "① 按「掃描周圍怪物」→ ② 點右邊挑一個名字（也可以自己打字）"
+            "① 按「掃描周圍怪物」→ ② 點右邊的名字加進「選中怪物」"
+            "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除）"
             "→ ③ 勾「開始掛機」。\n"
-            "會持續送 F2；那隻死掉後自動重掃、接著打**同名的**下一隻，"
-            "不必手動再選。取消勾選才停。\n"
-            "不搶視窗焦點，可以同時掛多個分身。")
+            "會持續送 F2；打死之後自動重掃、接著打清單裡的下一隻，不必手動再選。"
+            "取消勾選才停。不搶視窗焦點，可以同時掛多個分身。")
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
 
