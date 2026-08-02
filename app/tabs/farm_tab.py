@@ -80,6 +80,7 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，�
 WALK_GAP = 1.5                  # 多久可以重下一次移動指令（走一步要時間，別狂送）
 WALK_STOP_SHORT = 3.0           # 走到離怪幾格就好（不要站在牠身上）
 HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
+LEASH_RADIUS = 30.0             # 「守住原點」的預設活動範圍（格）
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
@@ -543,10 +544,23 @@ class CharFarmPage(QWidget):
         self.home_lbl.setStyleSheet("color: #9aa2b8;")
         mbar.addWidget(self.home_lbl)
         mbar.addSpacing(12)
-        self.back_cb = QCheckBox("沒怪時回原點")
+        self.back_cb = QCheckBox("守住原點")
         self.back_cb.setToolTip(
-            "附近沒有選中的怪時走回原點，避免一路追怪越跑越遠。")
+            "以原點為中心的「牽繩」：\n"
+            "· 只打活動範圍內的怪（範圍外的一律不理）\n"
+            "· 範圍內沒怪、或已經跑出範圍 → 走回原點\n"
+            "沒有這個的話，開了「自動走過去」會一路追怪越跑越遠。")
         mbar.addWidget(self.back_cb)
+        self.leash = QDoubleSpinBox()
+        self.leash.setRange(3.0, 300.0)
+        self.leash.setSingleStep(5.0)
+        self.leash.setDecimals(0)
+        self.leash.setValue(LEASH_RADIUS)
+        self.leash.setPrefix("活動範圍 ")
+        self.leash.setSuffix(" 格")
+        self.leash.setFixedWidth(130)
+        self.leash.setToolTip("離原點超過這個距離的怪不打；人也會被拉回來。")
+        mbar.addWidget(self.leash)
         mbar.addStretch(1)
         root.addLayout(mbar)
 
@@ -628,6 +642,12 @@ class CharFarmPage(QWidget):
         self._home = p
         self.home_lbl.setText(f"原點：({p[0]:.0f}, {p[1]:.0f})")
         self._save_settings()
+
+    def leash_center(self) -> tuple[tuple[float, float], float] | None:
+        """「守住原點」開著且原點已設定時，回傳 (原點, 活動範圍)；否則 None。"""
+        if not self.back_cb.isChecked() or not self._home:
+            return None
+        return self._home, self.leash.value()
 
     def _ensure_mover(self) -> bool:
         """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。"""
@@ -717,6 +737,7 @@ class CharFarmPage(QWidget):
         for eid, t in list(self._killed.items()):     # 淘汰太舊的死亡記錄
             if now - t > KILL_MEMORY:
                 del self._killed[eid]
+        leash = self.leash_center()
         pool = []
         for m in self.mons:
             if m.name not in want or m.eid in self._killed:
@@ -725,6 +746,11 @@ class CharFarmPage(QWidget):
                 continue
             # 座標要當場重讀：怪會走、角色也在走，掃描時記的早就過期了
             p = entity.read_pos(self.sc, m.addr)
+            # ★ 守住原點時，範圍外的怪直接不理 —— 不然開了「自動走過去」
+            # 就會一路追著跑，離原點越來越遠（使用者實測遇到的問題）。
+            if leash and p and math.hypot(p[0] - leash[0][0],
+                                          p[1] - leash[0][1]) > leash[1]:
+                continue
             pool.append((math.hypot(p[0] - me[0], p[1] - me[1])
                          if p and me else float("inf"), m))
         pool.sort(key=lambda t: t[0])
@@ -842,22 +868,37 @@ class CharFarmPage(QWidget):
                     return
 
         self._walk_t += dt
+        leash = self.leash_center()
+        me = self.my_pos()
+
+        # ★ 目標跑出活動範圍就放掉（怪會自己走，也可能是我們被拉著追出去了）。
+        # 少了這一步，開打之後就再也不會回原點 —— 使用者實測遇到的問題。
+        if leash and self._cur is not None and me:
+            mp = entity.read_pos(self.sc, self._cur.addr)
+            if mp and math.hypot(mp[0] - leash[0][0],
+                                 mp[1] - leash[0][1]) > leash[1]:
+                self._atk.hold_off()
+                self._keys.set_on(False)
+                self._cur = None
+
         if self._cur is None:
-            # 沒怪可打時走回原點，免得一路追怪越跑越遠
-            me = self.my_pos()
-            if (self.back_cb.isChecked() and self._home and me
-                    and self._walk_t >= WALK_GAP
-                    and math.hypot(me[0] - self._home[0],
-                                   me[1] - self._home[1]) > HOME_SLACK):
-                self._walk_toward(self._home[0], self._home[1], me, 0.0)
-                self.status.setText(
-                    f"附近沒有選中的怪 → 走回原點"
-                    f"({self._home[0]:.0f},{self._home[1]:.0f})…")
+            # 範圍內沒怪可打（或根本沒設守住原點）→ 該回去就回去
+            if leash and me:
+                d = math.hypot(me[0] - leash[0][0], me[1] - leash[0][1])
+                if d > HOME_SLACK:
+                    if self._walk_t >= WALK_GAP:
+                        self._walk_toward(leash[0][0], leash[0][1], me, 0.0)
+                    self.status.setText(
+                        f"範圍內沒有選中的怪 → 走回原點"
+                        f"({leash[0][0]:.0f},{leash[0][1]:.0f})　還有 {d:.0f} 格")
+                else:
+                    self.status.setText(
+                        f"已在原點，等活動範圍（{leash[1]:.0f} 格）內出現選中的怪…"
+                        f"　累計擊殺 {self._kills}")
             return
 
         m = self._cur
         hp = self._atk.hp
-        me = self.my_pos()
 
         # ★ 半徑外的怪就自己走過去（遊戲的攻擊指令雖然也會接近，但只能走向怪、
         # 而且到攻擊範圍就停；主動走比較好控制，也才能配合回原點）。
@@ -928,6 +969,7 @@ class CharFarmPage(QWidget):
         self.radius.setValue(float(g(self._key("radius"), ATTACK_RADIUS)))
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.back_cb.setChecked(bool(g(self._key("back"), False)))
+        self.leash.setValue(float(g(self._key("leash"), LEASH_RADIUS)))
         home = g(self._key("home"), None)
         if isinstance(home, (list, tuple)) and len(home) == 2:
             self._home = (float(home[0]), float(home[1]))
@@ -947,6 +989,7 @@ class CharFarmPage(QWidget):
         s(self._key("radius"), self.radius.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("back"), self.back_cb.isChecked())
+        s(self._key("leash"), self.leash.value())
         s(self._key("home"), list(self._home) if self._home else None)
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
@@ -961,6 +1004,7 @@ class CharFarmPage(QWidget):
         self.radius.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.back_cb.toggled.connect(self._save_settings)
+        self.leash.valueChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
 
@@ -1008,9 +1052,11 @@ class FarmTab(BaseTab):
             "① 按「掃描周圍怪物」→ ② 點右邊的名字加進「選中怪物」"
             "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除）"
             "→ ③ 勾「開始掛機」。\n"
-            "會挑**離自己最近**的一隻持續送技能鍵；打死之後立刻接下一隻，"
-            "不必手動再選。清單在背景持續更新（跟人搶怪也不會拿到過期資料）。\n"
-            "取消勾選才停。不搶視窗焦點、不占用你的鍵盤滑鼠，可以同時掛多個分身。")
+            "會挑**離自己最近**的一隻持續送技能鍵；打死之後立刻接下一隻。"
+            "怕越跑越遠就按「設為原點」再勾「守住原點」—— 只打活動範圍內的怪，"
+            "跑出去會自己走回來。\n"
+            "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
+            "不搶視窗焦點、不占用你的鍵盤滑鼠。")
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
 
