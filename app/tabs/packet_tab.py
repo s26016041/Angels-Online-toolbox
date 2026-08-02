@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -61,9 +62,19 @@ class PacketTab(BaseTab):
             )
         )
 
-        root.addWidget(self._build_process_group())
-        root.addWidget(self._build_packet_group(), stretch=2)
-        root.addWidget(self._build_detail_group(), stretch=1)
+        # ⚠ 三個區塊原本是直接疊在 QVBoxLayout 裡，各自又有「最小高度」，
+        #   三段最小高度加起來超過視窗高度時，Qt 不會縮 —— 而是把最下面那段
+        #   擠到看不見（使用者回報「送出的封包看不到最下面」）。
+        #   改用垂直分割器：空間不夠時三段一起縮，而且可以自己拖拉分配。
+        split = QSplitter(Qt.Vertical)
+        split.addWidget(self._build_process_group())
+        split.addWidget(self._build_packet_group())
+        split.addWidget(self._build_detail_group())
+        split.setStretchFactor(0, 0)      # 程序清單：固定感，不搶空間
+        split.setStretchFactor(1, 3)      # 封包表：多出來的空間都給它
+        split.setStretchFactor(2, 1)
+        split.setChildrenCollapsible(False)
+        root.addWidget(split, stretch=1)
 
         self.status = QLabel("就緒")
         self.status.setWordWrap(True)
@@ -104,8 +115,10 @@ class PacketTab(BaseTab):
         self.proc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.proc_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         # 保底高度：至少看得到約 5~7 個程序。原本只設 maximum，視窗一變矮就會被
-        # 下方（封包表 stretch=2、內容 stretch=1）擠到只剩一列。列高約 30px。
-        self.proc_table.setMinimumHeight(200)
+        # 下方（封包表、內容）擠到只剩一列。列高約 30px。
+        # ⚠ 最小值別開太大：視窗一矮，三段的最小高度加起來就超過可用高度，
+        #   最下面那段會被擠到看不見。分割器可以拖，所以這裡只要保底就好。
+        self.proc_table.setMinimumHeight(90)
         self.proc_table.setMaximumHeight(280)
         lay.addWidget(self.proc_table)
 
@@ -168,8 +181,8 @@ class PacketTab(BaseTab):
         self.pkt_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.pkt_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.pkt_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        # 保底高度：即使視窗偏矮，也至少看得到約 5 個封包。
-        self.pkt_table.setMinimumHeight(200)
+        # 保底高度：即使視窗偏矮，也至少看得到約 4 個封包（分割器可再拖大）。
+        self.pkt_table.setMinimumHeight(120)
         self.pkt_table.itemSelectionChanged.connect(self._show_detail)
         self._apply_headers()
         lay.addWidget(self.pkt_table)
@@ -181,6 +194,7 @@ class PacketTab(BaseTab):
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
         self.detail.setStyleSheet("font-family: Consolas, monospace;")
+        self.detail.setMinimumHeight(70)
         lay.addWidget(self.detail)
         return box
 
