@@ -58,7 +58,7 @@ from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import aob, entity, inventory, move, player
+from app.game import aob, attack, entity, inventory, move, player
 from app.tabs.base_tab import BaseTab
 
 SKILL_KEYS = [(f"F{i}", 0x6F + i) for i in range(1, 13)]   # F1=0x70 … F12=0x7B
@@ -157,32 +157,75 @@ class _Paced(QThread):
 
 
 class KeyWorker(_Paced):
-    """**只**負責送技能鍵，什麼都不判斷。
+    """**只**負責發動攻擊，什麼都不判斷。
 
-    刻意跟「寫入目標」拆開：送鍵只要準時，而讀寫記憶體偶爾會慢。
-    綁在一起的話，任何一次記憶體操作變慢都會拖到送鍵的節奏（使用者感受到的
-    「施放速度卡卡的」）。拆開之後這條執行緒永遠只做一件事：到點就送一次。
+    刻意跟「寫入目標」拆開：發動只要準時，而讀寫記憶體偶爾會慢。
+    綁在一起的話，任何一次記憶體操作變慢都會拖到節奏（使用者感受到的
+    「施放速度卡卡的」）。拆開之後這條執行緒永遠只做一件事：到點就發一次。
+
+    兩種發動方式
+    ------------
+    ① **送技能鍵**（一定做得到，不需要注入）
+    ② **直接送三連包**（attack.send_trio）—— 需要技能 ID 和 Mover
+
+    ★ 技能 ID 是自己學來的：送出技能鍵之後，遊戲會把剛放的技能 ID 寫進
+      「角色屬性基準 −0x50」（見 app/game/player.py 的 read_last_skill）。
+      所以流程是「先按鍵打第一下 → 學到 ID → 之後改送封包」，
+      使用者不必自己去攔封包。
 
     ⚠ 送鍵一定是**一次次按放**。曾經想改成「只送 KEYDOWN 模擬按住」，
       方向是錯的 —— 使用者實測這個遊戲按住不放並不會一直放技能。
     """
 
-    def __init__(self, hwnd: int) -> None:
+    learned = Signal(object)        # 學到技能 ID（給 UI 顯示）
+
+    def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
         super().__init__(DEFAULT_INTERVAL)
         self.hwnd = hwnd
+        self.sc = sc
         self.vk = DEFAULT_KEY
         self.sent = 0
+        self.packets = True         # 使用者要不要用封包攻擊
+        self.stats = None           # 角色屬性基準（學技能 ID 用）
+        self.mover = None
+        self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
+        self.eid = None             # 現在要打誰
+        self.skill = None           # 學到的技能 ID
         self._on = False
 
     def set_on(self, on: bool) -> None:
         self._on = on
 
+    def forget_skill(self) -> None:
+        """重新學一次技能 ID。每次「開始掛機」都做，因為使用者可能換了技能。"""
+        self.skill = None
+
+    def _learn(self) -> None:
+        """剛按完鍵，趁機把技能 ID 讀回來。"""
+        if self.skill or not self.stats:
+            return
+        try:
+            sid = player.read_last_skill(self.sc, self.stats)
+        except Exception:                      # noqa: BLE001
+            return
+        if sid:
+            self.skill = sid
+            self.learned.emit(sid)
+
     def step(self) -> None:
         if not self._on:
             return
         try:
+            if (self.packets and self.skill and self.eid
+                    and self.pf and self.mover is not None):
+                if attack.send_trio(self.mover, self.pf, self.skill, self.eid):
+                    self.sent += 1
+                    return
+                # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
+                # 別讓角色空等。
             _send_scan(self.hwnd, self.vk)
             self.sent += 1
+            self._learn()
         except Exception:                      # noqa: BLE001
             pass
 
@@ -429,6 +472,7 @@ class CharFarmPage(QWidget):
         self._keys = keys
         tgt.died.connect(self._on_died)
         tgt.failed.connect(lambda msg: self._stop_with(f"⚠ 記憶體存取失敗：{msg}"))
+        keys.learned.connect(self._on_skill_learned)
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
@@ -512,6 +556,24 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._keys.set_interval)
         self._keys.set_interval(DEFAULT_INTERVAL)
         bar.addWidget(self.interval)
+        bar.addSpacing(12)
+        # ★ 封包攻擊：按「開始掛機」時先按一下技能鍵把技能 ID 學起來
+        #   （遊戲會把剛放的技能寫進「角色屬性基準 −0x50」），之後就改成直接
+        #   送 ①動作 ②選定 ③施放 三連包。
+        self.pkt_cb = QCheckBox("封包攻擊")
+        self.pkt_cb.setChecked(True)
+        self.pkt_cb.setToolTip(
+            "開始後先按一次技能鍵，把那個鍵上的技能 ID 學起來，\n"
+            "之後改用直接送封包的方式攻擊（①動作 ②選定 ③施放）。\n"
+            "⚠ 需要跟「自動走過去」一樣在遊戲行程裡掛跳板；\n"
+            "　 學不到 ID 或掛不上時會自動退回按鍵，掛機不受影響。")
+        self.pkt_cb.toggled.connect(
+            lambda on: setattr(self._keys, "packets", on))
+        bar.addWidget(self.pkt_cb)
+        self.skill_lbl = QLabel("技能 ID：－")
+        self.skill_lbl.setStyleSheet("color: #9aa2b8;")
+        self.skill_lbl.setToolTip("按下技能鍵之後從遊戲讀回來的技能 ID。")
+        bar.addWidget(self.skill_lbl)
         bar.addSpacing(12)
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setToolTip(
@@ -676,6 +738,14 @@ class CharFarmPage(QWidget):
         self.stats = s.stats
         self.inv = s.inv
         self.mons = s.mons or []
+        # 送鍵執行緒要的兩樣東西，跟著掃描一起更新（物件會搬家）：
+        #   stats —— 學技能 ID 用（角色屬性基準 −0x50）
+        #   pf    —— 三連包第①包的參數，**玩家物件 −8**（純讀取算得出來）
+        self._keys.stats = s.stats
+        self._keys.pf = move.pathfinder_this(self.sc) if s.player else None
+        # 跳板可能是「自動走過去」那邊裝上的（比開始掛機晚），所以跟著更新
+        self._keys.mover = self._mover if (
+            self._mover is not None and self._mover.active) else None
         err = s.err
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）。
         # 掛機時每秒都在刷新，內容沒變就別重建清單 —— 不然使用者的選取會一直被清掉。
@@ -753,11 +823,19 @@ class CharFarmPage(QWidget):
         self._last_hp = -1
         self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
-        self._keys.set_on(True)                   # 送鍵執行緒：開始狂按
+        self._keys.eid = self._cur.eid            # 送封包時要指名打誰
+        self._keys.set_on(True)                   # 攻擊執行緒：開始發動
         self.status.setText(
             f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
             f"　累計擊殺 {self._kills}")
         return True
+
+    def _on_skill_learned(self, sid: int) -> None:
+        """按第一下技能鍵之後從遊戲讀回技能 ID —— 之後就能直接送封包了。"""
+        self.skill_lbl.setText(f"技能 ID：{sid:#x}")
+        self.skill_lbl.setToolTip(
+            f"{self.key_box.currentText()} 上的技能 ID = {sid:#x}（{sid}）。\n"
+            "按下技能鍵後由遊戲自己寫進記憶體，我們讀回來的。")
 
     def _on_died(self, eid: int) -> None:
         """攻擊執行緒回報目標倒了 —— 立刻從既有清單接下一隻。
@@ -769,6 +847,7 @@ class CharFarmPage(QWidget):
         self._kills += 1
         self._killed[eid] = time.monotonic()   # 免得又挑到同一具還沒回收的屍體
         self._cur = None
+        self._keys.eid = None                  # 別再對著屍體送封包
         if not self.run_cb.isChecked():
             self._keys.set_on(False)
             return
@@ -781,6 +860,7 @@ class CharFarmPage(QWidget):
     def _on_toggle(self, on: bool) -> None:
         if not on:
             self._keys.set_on(False)
+            self._keys.eid = None
             self._atk.hold_off()
             self._cur = None
             # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
@@ -802,6 +882,14 @@ class CharFarmPage(QWidget):
         self._killed.clear()
         self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
         self._cur = None
+        # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
+        #   學法：先按鍵打第一下，遊戲會把剛放的技能寫進記憶體，我們讀回來。
+        self._keys.forget_skill()
+        self.skill_lbl.setText("技能 ID：學習中…")
+        if self.pkt_cb.isChecked():
+            self._ensure_mover()           # 送封包要用它的跳板；失敗就退回按鍵
+        self._keys.mover = self._mover if (
+            self._mover is not None and self._mover.active) else None
         self.status.setText("掛機中：只打「" + "、".join(want) + "」")
 
     def tick(self, dt: float) -> None:
@@ -879,20 +967,16 @@ class CharFarmPage(QWidget):
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
 
-        # 三種情況（使用者列的）：
-        #   ① 中間有障礙物 → 走到怪臉上（隔著牆時「直線距離近」是假的）
-        #   ② 超出攻擊封包範圍 → 走到範圍內（走到範圍的九成就好）
-        #   ③ 在範圍內 → 直接送攻擊封包，**不自己走**
-        #      （遊戲收到攻擊指令本來就會讓角色走過去打）
-        blocked = self._path_pts > 1
+        # 規則只有一條（使用者定的）：
+        #   **在攻擊範圍外就走進來，進到範圍內才送攻擊封包組。**
+        # 不再為「中間有障礙物」特別走到怪臉上 —— 攻擊改用封包之後，
+        # 剩下的接近動作交給遊戲自己處理就好；真的過不去會由卡住偵測換一隻。
         in_range = dist is None or dist <= ATTACK_PACKET_RANGE
-        keep = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE * RANGE_KEEP
+        keep = ATTACK_PACKET_RANGE * RANGE_KEEP    # 走到範圍的九成，留點餘裕
         if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
-                and (blocked or not in_range)
-                and dist is not None and dist > keep):
+                and not in_range and dist is not None and dist > keep):
             self._path_pts = self._walk_toward(mp[0], mp[1], me, keep)
 
-        # ★ 確認在攻擊封包範圍內才送（使用者要求第 3 點）
         self._keys.set_on(in_range)
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
@@ -911,6 +995,7 @@ class CharFarmPage(QWidget):
             self._killed[m.eid] = time.monotonic()   # 走不過去，暫時別再挑它
             self._atk.hold_off()
             self._cur = None
+            self._keys.eid = None
             if not self._pick_next():
                 self._keys.set_on(False)
                 self._since_scan = RESCAN_GAP
@@ -926,9 +1011,10 @@ class CharFarmPage(QWidget):
         d = dist if dist is not None else float("nan")
         self.status.setText(
             f"掛機中：{m.name}　距離 {d:.1f} 格"
-            + ("　⛰ 隔著地形，走到臉上" if blocked
-               else "" if in_range else "　→ 走進攻擊範圍")
+            + ("" if in_range else "　→ 走進攻擊範圍")
             + f"　目標血量 {hp}%"
+            + ("　📦 封包攻擊" if (self._keys.packets and self._keys.skill
+                                 and self._keys.mover) else "")
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
             + (f"　武器耐久 {self._dura[0]}"
                + (f"/{self._dura[1]}" if self._dura[1] > 0 else "")
@@ -956,6 +1042,8 @@ class CharFarmPage(QWidget):
         self.interval.setValue(float(g(self._key("interval"), DEFAULT_INTERVAL)))
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.back_cb.setChecked(bool(g(self._key("back"), False)))
+        self.pkt_cb.setChecked(bool(g(self._key("packets"), True)))
+        self._keys.packets = self.pkt_cb.isChecked()
         home = g(self._key("home"), None)
         if isinstance(home, (list, tuple)) and len(home) == 2:
             self._home = (float(home[0]), float(home[1]))
@@ -974,6 +1062,7 @@ class CharFarmPage(QWidget):
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("back"), self.back_cb.isChecked())
+        s(self._key("packets"), self.pkt_cb.isChecked())
         s(self._key("home"), list(self._home) if self._home else None)
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
@@ -987,6 +1076,7 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.back_cb.toggled.connect(self._save_settings)
+        self.pkt_cb.toggled.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
 
@@ -1077,7 +1167,7 @@ class FarmTab(BaseTab):
         self._inv.found.connect(self._on_inv_found)
         self._inv.start(QThread.LowestPriority)
         for pid, hwnd, title, sc in insts:
-            tgt, keys = TargetWorker(sc), KeyWorker(hwnd)
+            tgt, keys = TargetWorker(sc), KeyWorker(hwnd, sc)
             tgt.start(QThread.HighPriority)
             keys.start(QThread.HighPriority)
             self._keys += [tgt, keys]

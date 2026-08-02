@@ -43,6 +43,7 @@ from __future__ import annotations
 import math
 import random
 import struct
+import threading
 import time
 
 from app.game import entity
@@ -144,7 +145,15 @@ def _stub_asm(block: int) -> str:
 
 
 class Mover:
-    """單一遊戲行程的移動控制。非執行緒安全，請在同一執行緒使用。"""
+    """單一遊戲行程的「呼叫遊戲函式」跳板（移動、攻擊封包都借它）。
+
+    ⚠ **指令槽只有一個**，而且會被兩邊同時用：
+        · 移動 —— UI 執行緒的 walk_to()
+        · 攻擊封包 —— 送鍵執行緒的 attack.send_trio()
+      沒有鎖的話兩邊會交錯寫進同一塊參數區，變成「用 A 的函式配 B 的參數」
+      —— 這遊戲對錯誤參數的反應是**當場崩潰**（踩過）。所以整個
+      「寫參數 → 舉旗標 → 等執行完」必須是不可分割的一段。
+    """
 
     def __init__(self, pid: int, exe_path: str) -> None:
         self._pid = pid
@@ -154,10 +163,20 @@ class Mover:
         self._orig = 0
         self._block = 0
         self._active = False
+        # RLock 而非 Lock：call_sync() 內部會再呼叫 call()，同一條執行緒要能重入。
+        self._lock = threading.RLock()
 
     @property
     def active(self) -> bool:
         return self._active
+
+    @property
+    def lock(self) -> threading.RLock:
+        """要「連續送好幾個呼叫、中間不能被插隊」時，自己抓著它。
+
+        例如攻擊三連包必須照 ①②③ 送出，不能被移動指令切開。
+        """
+        return self._lock
 
     def start(self) -> None:
         """安裝 hook。失敗會丟例外，呼叫端要能接住（沒有移動功能也要能掛機）。"""
@@ -203,12 +222,13 @@ class Mover:
         if not self._active:
             return False
         pm = self._pm
-        if pm.read_uint(self._block + _FLAG):
-            return False                       # 上一個還沒執行
-        for off, val in ((_FN, fn), (_A1, a1), (_A2, a2), (_CNT, a3),
-                         (_A4, a4), (_A5, a5), (_ECX, ecx)):
-            pm.write_uint(self._block + off, val & 0xFFFFFFFF)
-        pm.write_uint(self._block + _FLAG, 1)
+        with self._lock:                       # ⚠ 見類別說明：不能兩邊交錯寫
+            if pm.read_uint(self._block + _FLAG):
+                return False                   # 上一個還沒執行
+            for off, val in ((_FN, fn), (_A1, a1), (_A2, a2), (_CNT, a3),
+                             (_A4, a4), (_A5, a5), (_ECX, ecx)):
+                pm.write_uint(self._block + off, val & 0xFFFFFFFF)
+            pm.write_uint(self._block + _FLAG, 1)
         return True
 
     def call_sync(self, fn: int, *args, ecx: int = 0,
@@ -218,13 +238,16 @@ class Mover:
         用在「先尋路、拿到點數，再送移動封包」這種有先後relation的兩步。
         指令槽只有一個，所以一定要等前一個做完才排下一個。
         """
-        if not self.call(fn, *args, ecx=ecx):
-            return None
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            if not self._pm.read_uint(self._block + _FLAG):
-                return self._pm.read_uint(self._block + _RET)
-            time.sleep(0.005)
+        # ⚠ 鎖要**含等待那段**：只鎖 call() 的話，別人可以在我們等結果時排下一個
+        #   呼叫，我們就會讀到別人的 eax。
+        with self._lock:
+            if not self.call(fn, *args, ecx=ecx):
+                return None
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                if not self._pm.read_uint(self._block + _FLAG):
+                    return self._pm.read_uint(self._block + _RET)
+                time.sleep(0.005)
         return None
 
     def walk_to(self, scanner, player_obj: int,
@@ -259,16 +282,20 @@ class Mover:
         this = pathfinder_this(scanner)
         if not this:
             return 0
-        for hop in (full,) + PATH_TRY:
-            if hop > full:
-                continue
-            tx = int((cx + dx / full * hop) * entity.TILE_UNITS) & 0xFFFF
-            ty = int((cy + dy / full * hop) * entity.TILE_UNITS) & 0xFFFF
-            n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
-                               ecx=this, timeout=0.15)
-            if n and 0 < n <= MAX_POINTS:
-                self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
-                return n
+        # ★ 「算路徑 → 送移動封包」中間不能被插隊：路徑點是寫在**全域**陣列
+        #   0x9B6684 裡的，別人（攻擊封包）中間插一個呼叫倒是不會動到它，
+        #   但我們自己若被切開就可能拿舊路徑去送。整段一起鎖最安全。
+        with self._lock:
+            for hop in (full,) + PATH_TRY:
+                if hop > full:
+                    continue
+                tx = int((cx + dx / full * hop) * entity.TILE_UNITS) & 0xFFFF
+                ty = int((cy + dy / full * hop) * entity.TILE_UNITS) & 0xFFFF
+                n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
+                                   ecx=this, timeout=0.15)
+                if n and 0 < n <= MAX_POINTS:
+                    self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
+                    return n
 
         # ⚠ 連最短的中繼點都算不出路徑 = 那個方向真的不通。
         # **不要退回直線走** —— 那只會讓角色貼著牆推、原地卡住

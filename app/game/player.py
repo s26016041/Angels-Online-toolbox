@@ -50,6 +50,14 @@ OFF_GOLD = 0x50
 
 STRUCT_BYTES = OFF_GOLD + 4
 
+# ★ 最近使用的技能 ID（**在基準之前** 0x50）。使用者找到的欄位。
+#   按下技能鍵（F1~F12）放技能時，這裡會被寫成那個技能的 ID。
+#   所以「送一次 F2 再讀這裡」就知道 F2 上是哪個技能 —— 不必攔封包。
+#   驗證：黑狐送 F2 前是 0x103、送出後變成 0x101，正是封包量到的 F2 技能；
+#   雪狐讀到 0x2E7，也與封包一致。五台的偏移都一樣。
+#   ⚠ 它記的是「最近用過的」不是「F2 上的」—— 要在送出 F2 之後立刻讀。
+OFF_LAST_SKILL = -0x50
+
 # --- 結構特徵 ---------------------------------------------------------------
 GAME_MODULE = "angel.dat"
 # vtable 指標的值 = 模組基底 + 這個偏移。用 RVA 記錄、執行時才加基底，所以不怕
@@ -142,6 +150,21 @@ def locate(scanner, should_stop=None) -> int | None:
             if _signature_ok(scanner, obj, vtable):
                 return obj - OFF_VTABLE
     return None
+
+
+def read_last_skill(scanner, base: int) -> int | None:
+    """最近放出的技能 ID；讀不到或還沒放過技能回傳 None。
+
+    用法：送一次技能鍵之後馬上讀，就知道那個鍵上是哪個技能。
+    （攻擊封包 0x559FF8 的第一個參數就是這個值，兩邊實測一致。）
+    """
+    if not base:
+        return None
+    raw = scanner._read_bytes(base + OFF_LAST_SKILL, 4)
+    if not raw:
+        return None
+    sid = struct.unpack("<I", raw)[0]
+    return sid if 0 < sid < 0x10000 else None
 
 
 def read(scanner, base: int) -> PlayerStats | None:
