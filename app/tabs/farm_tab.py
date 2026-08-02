@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+import ctypes
+
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -48,14 +50,53 @@ NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要�
 
 
 def send_key(hwnd: int, vk: int = VK_F2) -> None:
-    """對指定視窗送一次按鍵。
+    """對指定視窗送一次按鍵（目前掛機迴圈用的方式）。
 
     走 app/core/window.py 的共用實作 —— 它會帶上正確的 lParam（含掃描碼）。
-    ⚠ lParam 傳 0 這個遊戲會直接忽略，實測完全沒反應；帶掃描碼才生效。
-
     用 PostMessage：不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
+
+    ⚠ 這個遊戲匯入了 DINPUT8，鍵盤**可能**是走 DirectInput 從裝置層讀，
+      那樣視窗訊息永遠無效。到底哪種可行要靠下面那排測試按鈕實測，別用猜的。
     """
     win.send_key(hwnd, vk)
+
+
+# --- 各種送鍵方式，給測試按鈕用 ---------------------------------------
+# 遊戲吃哪一種只能實測。前三種都不碰使用者的鍵盤、不搶焦點；
+# 第四種會真的操作鍵盤（需要遊戲在前景），只拿來當診斷對照。
+def _post_plain(hwnd: int) -> None:
+    u = ctypes.windll.user32
+    u.PostMessageW(hwnd, 0x0100, VK_F2, 0)
+    u.PostMessageW(hwnd, 0x0101, VK_F2, 0)
+
+
+def _post_scan(hwnd: int) -> None:
+    win.send_key(hwnd, VK_F2)
+
+
+def _send_scan(hwnd: int) -> None:
+    u = ctypes.windll.user32
+    down, up = win.key_lparam(VK_F2)
+    u.SendMessageW(hwnd, 0x0100, VK_F2, down)
+    u.SendMessageW(hwnd, 0x0101, VK_F2, up)
+
+
+def _keybd(hwnd: int) -> None:
+    """真的按下鍵盤（會佔用使用者的鍵盤，且遊戲必須在前景）。只用於診斷。"""
+    u = ctypes.windll.user32
+    scan = u.MapVirtualKeyW(VK_F2, 0)
+    u.keybd_event(VK_F2, scan, 0, 0)          # KEYDOWN
+    u.keybd_event(VK_F2, scan, 2, 0)          # KEYEVENTF_KEYUP
+
+
+SEND_WAYS = [
+    ("① PostMsg", _post_plain, "PostMessage，lParam=0（最早的做法）"),
+    ("② PostMsg+掃描碼", _post_scan, "PostMessage，lParam 帶掃描碼"),
+    ("③ SendMsg+掃描碼", _send_scan,
+     "SendMessage，lParam 帶掃描碼（會等遊戲處理完才返回）"),
+    ("④ 真實按鍵", _keybd,
+     "⚠ 會真的操作你的鍵盤，而且遊戲必須在前景。只拿來當診斷對照。"),
+]
 
 
 class ScanWorker(QThread):
@@ -187,6 +228,18 @@ class CharFarmPage(QWidget):
         panes.addWidget(right, 1)
         root.addLayout(panes)
 
+        # 測試列：遊戲吃哪種送鍵方式只能實測 —— 按一下就會「鎖定選中的怪 + 送一次 F2」，
+        # 使用者直接看畫面判斷哪個有效。
+        test = QHBoxLayout()
+        test.addWidget(QLabel("測試送鍵："))
+        for label, fn, tip in SEND_WAYS:
+            b = QPushButton(label)
+            b.setToolTip(tip + "\n按下會先鎖定「選中怪物」的第一隻，再送一次 F2。")
+            b.clicked.connect(lambda _=False, f=fn, n=label: self._try_key(f, n))
+            test.addWidget(b)
+        test.addStretch(1)
+        root.addLayout(test)
+
         self.status = QLabel("尚未掃描")
         self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
@@ -209,6 +262,32 @@ class CharFarmPage(QWidget):
     def _remove_picked(self) -> None:
         for it in self.picked.selectedItems():
             self.picked.takeItem(self.picked.row(it))
+
+    # ------------------------------------------------------------------
+    def _try_key(self, fn, label: str) -> None:
+        """測試按鈕：鎖定「選中怪物」的第一隻，再用指定方式送一次 F2。
+
+        鎖定與送鍵一起做，不然按了也看不出效果（沒目標就不會出手）。
+        """
+        if self.state is None:
+            self.status.setText("請先按「掃描周圍怪物」")
+            return
+        want = self.wanted()
+        pool = [m for m in self.mons
+                if (not want or m.name in want) and entity.is_alive(self.sc, m)]
+        if not pool:
+            self.status.setText("找不到可打的怪，請重新掃描或調整「選中怪物」")
+            return
+        m = pool[0]
+        try:
+            entity.set_target(self.sc, self.state, m.eid)
+        except Exception as exc:                   # noqa: BLE001
+            self.status.setText(f"⚠ 寫入失敗：{exc}")
+            return
+        for _ in range(5):                  # 連送 5 次，比較看得出來
+            fn(self.hwnd)
+        self.status.setText(
+            f"{label}：已鎖定「{m.name}」並送出 5 次 F2 —— 請看畫面有沒有出手")
 
     # ------------------------------------------------------------------
     def apply_scan(self, state, mons, err: str) -> None:
