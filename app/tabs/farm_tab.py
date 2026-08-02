@@ -111,6 +111,7 @@ class CharFarmPage(QWidget):
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
         self._acc = 0.0
+        self._wrote = False        # 這一輪掛機有沒有寫過目標（判斷死亡用）
 
         root = QVBoxLayout(self)
 
@@ -183,6 +184,7 @@ class CharFarmPage(QWidget):
         if not on:
             self.status.setText("已停止")
             return
+        self._wrote = False
         if self.state is None:
             self.run_cb.setChecked(False)
             QMessageBox.information(self, "還不能開始",
@@ -197,7 +199,16 @@ class CharFarmPage(QWidget):
         self.status.setText("掛機中…")
 
     def tick(self, dt: float) -> None:
-        """迴圈的一次心跳。由分頁的計時器統一驅動。"""
+        """迴圈的一次心跳。由分頁的計時器統一驅動。
+
+        ★ 停止條件是實測出來的：**目標死掉時，遊戲會自己把 +0x2D8 清成 0**
+        （盯一台練功中的分身 60 秒，看到 6 次「設定目標 → 幾秒後被清成 0」）。
+        所以「我們寫過、現在卻是 0」就是那隻死了 —— 這比 is_alive() 更即時，
+        因為物件被回收再利用之前，vtable 和 ID 可能都還在。
+
+        不這樣做的話，迴圈會一直把死掉的 ID 寫回去，跟遊戲的清理互相搶，
+        而且對著不存在的怪一直送 F2。
+        """
         if not self.run_cb.isChecked() or self.state is None:
             return
         m = self.selected()
@@ -207,18 +218,35 @@ class CharFarmPage(QWidget):
         if self._acc < self.interval.value():
             return
         self._acc = 0.0
+
         try:
-            # 每次都重寫目標 —— 遊戲自己也可能改動它（例如怪死了）
-            entity.set_target(self.sc, self.state, m.eid)
+            cur = entity.read_target(self.sc, self.state)
         except Exception as exc:                   # noqa: BLE001
-            self.run_cb.setChecked(False)
-            self.status.setText(f"⚠ 寫入失敗：{exc}")
+            self._stop_with(f"⚠ 讀取失敗：{exc}")
             return
+
+        if self._wrote and cur == 0:
+            self._stop_with(f"「{m.name}」已死亡（遊戲清空了目標），已停止。"
+                            "請重新掃描並選下一隻。")
+            return
+        if not entity.is_alive(self.sc, m):
+            self._stop_with(f"「{m.name}」已經不在了，已停止。"
+                            "請重新掃描並選下一隻。")
+            return
+
+        if cur != m.eid:                    # 已經是這隻就不用重寫，別跟遊戲搶
+            try:
+                entity.set_target(self.sc, self.state, m.eid)
+            except Exception as exc:               # noqa: BLE001
+                self._stop_with(f"⚠ 寫入失敗：{exc}")
+                return
+            self._wrote = True
         send_key(self.hwnd)
-        alive = entity.is_alive(self.sc, m)
-        self.status.setText(
-            f"掛機中：{m.name} {m.eid:#010x}"
-            + ("" if alive else "　⚠ 這隻已經不在了，請重新掃描並選一隻"))
+        self.status.setText(f"掛機中：{m.name} {m.eid:#010x}")
+
+    def _stop_with(self, msg: str) -> None:
+        self.run_cb.setChecked(False)
+        self.status.setText(msg)
 
 
 class FarmTab(BaseTab):
