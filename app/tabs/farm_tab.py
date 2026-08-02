@@ -112,6 +112,7 @@ ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
+NOVIEW_SECS = 1.5               # 讀不到目標座標這麼久就換一隻（別等 STUCK_SECS）
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -535,6 +536,9 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
+        self._walked_ok = True     # 上次下移動指令有沒有成功
+        self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
+        self._noview = 0.0         # 讀不到目標座標多久了
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -871,6 +875,9 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
+        self._walked_ok = True
+        self._noview = 0.0
+        self._why = ""
         self._last_hp = -1
         self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
@@ -1053,9 +1060,49 @@ class CharFarmPage(QWidget):
         keep = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE * RANGE_KEEP
         if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
                 and not in_range and dist is not None and dist > keep):
-            self._path_pts = self._walk_toward(mp[0], mp[1], me, keep)
+            n = self._walk_toward(mp[0], mp[1], me, keep)
+            # ⚠ 走不了（尋路算不出路徑，或指令槽被佔）**不要把它記成「沒有障礙物」**。
+            #   記成 0 會讓下一拍 blocked 變 False、reach 變回 15，於是站在原地
+            #   對著走不到的怪空打；記成 -1（還不知道）才會再問一次。
+            self._path_pts = n if n > 0 else -1
+            self._walked_ok = n > 0
 
         self._keys.set_on(in_range)
+
+        # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
+        #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
+        #   直接標出來才不必猜。
+        if in_range:
+            self._why = ""
+        elif dist is None:
+            self._why = "⚠ 讀不到座標"
+        elif not self.move_cb.isChecked():
+            self._why = "⚠ 沒開「自動走過去」"
+        elif self._mover is None or not self._mover.active:
+            self._why = "⚠ 移動跳板沒裝上"
+        elif not self._walked_ok:
+            self._why = "⛔ 走不過去"
+        elif blocked:
+            self._why = f"⛰ 隔著地形，走到 {CLOSE_ENOUGH:.0f} 格內"
+        else:
+            self._why = "→ 走進攻擊範圍"
+
+        # ★ 讀不到座標就別傻等 STUCK_SECS（10 秒）—— 那多半是怪的物件已經被
+        #   回收了，等於對著空氣鎖定。1.5 秒還讀不到就換一隻。
+        if dist is None:
+            self._noview += dt
+            if self._noview >= NOVIEW_SECS:
+                self._killed[m.eid] = time.monotonic()
+                self._atk.hold_off()
+                self._cur = None
+                self._keys.eid = None
+                if not self._pick_next():
+                    self._keys.set_on(False)
+                    self._since_scan = RESCAN_GAP
+                self.status.setText(f"「{m.name}」讀不到座標 → 換一隻")
+                return
+        else:
+            self._noview = 0.0
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
@@ -1089,8 +1136,7 @@ class CharFarmPage(QWidget):
         d = dist if dist is not None else float("nan")
         self.status.setText(
             f"掛機中：{m.name}　距離 {d:.1f} 格"
-            + ("　⛰ 隔著地形，走到臉上" if blocked
-               else "" if in_range else "　→ 走進攻擊範圍")
+            + (f"　{self._why}" if self._why else "")
             + f"　目標血量 {hp}%"
             + ("　📦 封包攻擊" if (self._keys.packets and self._keys.skill
                                  and self._keys.mover) else "")
