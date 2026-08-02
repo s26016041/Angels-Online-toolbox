@@ -51,10 +51,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core import charname
+from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import entity, player
+from app.game import entity, move, player
 from app.tabs.base_tab import BaseTab
 
 SKILL_KEYS = [(f"F{i}", 0x6F + i) for i in range(1, 13)]   # F1=0x70 … F12=0x7B
@@ -71,6 +71,9 @@ REFRESH_GAP = 0.5
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
 STATUS_GAP = 0.2                # 狀態列多久重畫一次（心跳 10ms，不必每拍都畫）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
+WALK_GAP = 1.5                  # 多久可以重下一次移動指令（走一步要時間，別狂送）
+WALK_STOP_SHORT = 3.0           # 走到離怪幾格就好（不要站在牠身上）
+HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
@@ -347,6 +350,9 @@ class CharFarmPage(QWidget):
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
+        self._mover: move.Mover | None = None
+        self._walk_t = 0.0         # 距離上次下移動指令過了多久
+        self._home: tuple[float, float] | None = None   # 原點
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -409,6 +415,31 @@ class CharFarmPage(QWidget):
         bar.addWidget(self.run_cb)
         bar.addStretch(1)
         root.addLayout(bar)
+
+        # 移動列：走過去遠處的怪、以及回原點
+        mbar = QHBoxLayout()
+        self.move_cb = QCheckBox("自動走過去")
+        self.move_cb.setChecked(True)
+        self.move_cb.setToolTip(
+            "半徑內沒有選中的怪時，主動走到最近那隻旁邊。\n"
+            "⚠ 這項功能需要在遊戲行程裡執行一小段程式碼（掛 PeekMessageA），\n"
+            "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
+        mbar.addWidget(self.move_cb)
+        mbar.addSpacing(12)
+        self.home_btn = QPushButton("設為原點")
+        self.home_btn.setToolTip("把角色目前的位置記成原點。")
+        self.home_btn.clicked.connect(self._set_home)
+        mbar.addWidget(self.home_btn)
+        self.home_lbl = QLabel("原點：未設定")
+        self.home_lbl.setStyleSheet("color: #9aa2b8;")
+        mbar.addWidget(self.home_lbl)
+        mbar.addSpacing(12)
+        self.back_cb = QCheckBox("沒怪時回原點")
+        self.back_cb.setToolTip(
+            "附近沒有選中的怪時走回原點，避免一路追怪越跑越遠。")
+        mbar.addWidget(self.back_cb)
+        mbar.addStretch(1)
+        root.addLayout(mbar)
 
         # 兩個小區塊：左邊是要打哪些怪（可多選、可手動輸入），右邊是附近有什麼。
         # 一律只顯示中文名字 —— 比對也是用名字，所以手動打字才會通。
@@ -476,6 +507,43 @@ class CharFarmPage(QWidget):
             self.picked.takeItem(self.picked.row(it))
 
     # ------------------------------------------------------------------
+    def _set_home(self) -> None:
+        p = self.my_pos()
+        if p is None:
+            self.status.setText("讀不到位置，請先按「掃描周圍怪物」")
+            return
+        self._home = p
+        self.home_lbl.setText(f"原點：({p[0]:.0f}, {p[1]:.0f})")
+
+    def _ensure_mover(self) -> bool:
+        """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。"""
+        if self._mover is not None and self._mover.active:
+            return True
+        if self._mover is not None:
+            return False                       # 之前裝失敗過，別一直重試
+        try:
+            mv = move.Mover(self.pid, injector.process_path(self.pid))
+            mv.start()
+            self._mover = mv
+            return True
+        except Exception as exc:               # noqa: BLE001
+            self._mover = move.Mover(self.pid, "")   # 佔位，代表試過了
+            self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
+            return False
+
+    def _walk_toward(self, gx: float, gy: float, me, keep: float) -> None:
+        """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。"""
+        if not self._ensure_mover():
+            return
+        d = math.hypot(gx - me[0], gy - me[1])
+        if d <= keep:
+            return
+        r = (d - keep) / d                     # 只走到剩 keep 格的位置
+        self._mover.walk_to(self.sc, self.player,
+                            me[0] + (gx - me[0]) * r,
+                            me[1] + (gy - me[1]) * r)
+        self._walk_t = 0.0
+
     def my_pos(self) -> tuple[float, float] | None:
         """玩家目前的格子座標（每次都重讀，因為角色會走動）。"""
         if self.player is None:
@@ -644,12 +712,31 @@ class CharFarmPage(QWidget):
             self._since_scan = 0.0
             self._waiting = True
             self._on_scan(self.pid)
+        self._walk_t += dt
         if self._cur is None:
+            # 沒怪可打時走回原點，免得一路追怪越跑越遠
+            me = self.my_pos()
+            if (self.back_cb.isChecked() and self._home and me
+                    and self._walk_t >= WALK_GAP
+                    and math.hypot(me[0] - self._home[0],
+                                   me[1] - self._home[1]) > HOME_SLACK):
+                self._walk_toward(self._home[0], self._home[1], me, 0.0)
+                self.status.setText(
+                    f"附近沒有選中的怪 → 走回原點"
+                    f"({self._home[0]:.0f},{self._home[1]:.0f})…")
             return
 
         m = self._cur
         hp = self._atk.hp
         me = self.my_pos()
+
+        # ★ 半徑外的怪就自己走過去（遊戲的攻擊指令雖然也會接近，但只能走向怪、
+        # 而且到攻擊範圍就停；主動走比較好控制，也才能配合回原點）。
+        if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP):
+            mp = entity.read_pos(self.sc, m.addr)
+            if mp and math.hypot(mp[0] - me[0],
+                                 mp[1] - me[1]) > self.radius.value():
+                self._walk_toward(mp[0], mp[1], me, WALK_STOP_SHORT)
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
@@ -796,6 +883,9 @@ class FarmTab(BaseTab):
     def _teardown(self) -> None:
         for page in self._pages.values():
             page.run_cb.setChecked(False)
+            # ⚠ 一定要拆掉移動 hook —— 不還原 IAT 就等於在遊戲裡留了一段跳板
+            if page._mover is not None:
+                page._mover.stop()
         for th in ([self._worker] if self._worker else []) + self._keys:
             th.stop()
             th.wait(5000)
