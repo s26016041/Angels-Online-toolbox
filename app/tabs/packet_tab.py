@@ -419,7 +419,18 @@ class PacketTab(BaseTab):
         pkt = next((p for p in self._packets if p.seq == seq), None)
         if not pkt:
             return
-        chain = "\n".join(f"    0x{a:X}" for a in pkt.call_chain) or "    （無）"
+        # ★ 呼叫鏈每一層的**參數**也一起列出來。
+        #   線上封包是 16 bytes 一塊混淆過的，從 hex 看不出內容；
+        #   但攔截時已經把各層函式收到的參數記下來了（見 app/core/injector.py），
+        #   那才是真正看得懂的東西 —— 例如施放技能那層會直接顯示
+        #   (技能ID, 目標實體ID, …)。以前只顯示位址，等於把最有用的資訊丟掉。
+        lines = []
+        for addr, args in zip(pkt.frames, pkt.args):
+            if not (injector.CODE_LO <= addr < injector.CODE_HI):
+                continue
+            shown = [f"0x{v:X}" if v > 9 else str(v) for v in args]
+            lines.append(f"    0x{addr:X}　參數 ({', '.join(shown)})")
+        chain = "\n".join(lines) or "    （無）"
         verdict = "疑似加密/壓縮" if pkt.entropy > 7.5 else "疑似明文/輕度混淆"
         note = ""
         if self._group_mode:
@@ -430,7 +441,8 @@ class PacketTab(BaseTab):
             note
             + f"封包 #{pkt.seq}　長度 {pkt.length}　亂度 {pkt.entropy:.2f}/8 → {verdict}\n"
             f"直接呼叫者(send wrapper)：0x{pkt.caller:X}\n"
-            f"呼叫鏈（遊戲內位址，動作/登入函式候選在較上層）：\n{chain}\n"
+            "呼叫鏈與各層收到的參數（動作/登入函式候選在較上層）：\n"
+            f"{chain}\n"
             f"\n內容：\n{pkt.hexdump()}"
         )
 
