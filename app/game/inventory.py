@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import struct
+from collections import Counter
 
 import numpy as np
 
@@ -56,7 +57,13 @@ def slot_side(index: int) -> str:
 
 # 物品結構內的偏移
 ITEM_TYPE_OFF = 0x08         # 種類 ID
+ITEM_SLOT_OFF = 0x25         # ★ **物品自己記著它在第幾格**（單一 byte）
+ITEM_COUNT_OFF = 0x27        # 數量（可疊物品，例如藥水 60 個）
+ITEM_DURA_OFF = 0x2C         # 耐久度現值；**0 = 壞掉**（使用者確認）
+ITEM_DURA_MAX_OFF = 0x5C     # 疑似耐久上限：五台都是 70，尚未證實是「上限」
 ITEM_BALL_OFF = 0xA0         # 技能經驗球的值
+
+SLOT_WEAPON = 3              # 武器欄
 
 # 判定表頭用：前這麼多格裡至少要有這麼多個有效物品指標
 HEAD_WINDOW = 64
@@ -259,6 +266,72 @@ def scan_slots(scanner, head: int, count: int = 128):
         raw = scanner._read_bytes(p + ITEM_BALL_OFF, 4)
         out.append((i, tid, p, struct.unpack("<i", raw)[0] if raw else 0))
     return out
+
+
+HEAD_BACK = 24               # 校正表頭時往前多看幾格
+
+
+def _item_slot(scanner, ptr: int) -> int | None:
+    """這個指標指向的是不是物品？是的話回傳它自己記的格號。"""
+    if not (0x01000000 < ptr < 0x40000000):
+        return None
+    raw = scanner._read_bytes(ptr, ITEM_COUNT_OFF + 1)
+    if not raw or len(raw) < ITEM_COUNT_OFF + 1:
+        return None
+    tid = struct.unpack_from("<I", raw, ITEM_TYPE_OFF)[0]
+    if not 0 < tid < MAX_ITEM_ID:
+        return None
+    slot = raw[ITEM_SLOT_OFF]
+    return slot if slot < 200 else None
+
+
+def align_head(scanner, head: int, window: int = HEAD_WINDOW) -> int:
+    """用「物品自己記的格號」校正表頭位置。
+
+    ★ 每個物品物件的 +0x25 就是它在第幾格。所以對每個看起來像物品的指標，
+      「這個指標的位址 - 格號*4」都會指向同一個表頭 —— 取最多票的就是答案。
+      這比靠數量門檻猜可靠得多：實測五台裡有一台原本偏了 5 格
+      （往後偏，所以連往後掃都找不到第 3 格的武器）。
+
+    找不到任何物品時回傳原值，不做無謂的更動。
+    """
+    votes: Counter = Counter()
+    for i in range(-HEAD_BACK, window):
+        a = head + i * 4
+        p = _dword(scanner, a)
+        slot = _item_slot(scanner, p) if p else None
+        if slot is not None:
+            votes[a - slot * 4] += 1
+    return votes.most_common(1)[0][0] if votes else head
+
+
+def find_by_slot(scanner, head: int, slot: int,
+                 window: int = HEAD_WINDOW) -> int | None:
+    """找出「自己說它在第 slot 格」的物品，回傳物件位址；沒有回傳 None。
+
+    ★ 為什麼不直接用 `read_pointers(head)[slot]`：
+      表頭有可能挑偏（實測五台裡有一台偏了 5 格，結果拿飾品當武器讀）。
+      這裡先用 align_head() 依格號校正，再認格號取值，完全不受表頭影響。
+      驗證：飾品確實落在 8、9 格，跟既有的 SLOT_ACCESSORY 完全吻合。
+    """
+    base = align_head(scanner, head, window)
+    for i in range(window):
+        p = _dword(scanner, base + i * 4)
+        if p and _item_slot(scanner, p) == slot:
+            return p
+    return None
+
+
+def durability(scanner, head: int) -> tuple[int, int] | None:
+    """武器的 (耐久現值, 疑似上限)；找不到武器回傳 None。**現值 0 = 壞掉。**"""
+    ptr = find_by_slot(scanner, head, SLOT_WEAPON)
+    if not ptr:
+        return None
+    raw = scanner._read_bytes(ptr, ITEM_DURA_MAX_OFF + 4)
+    if not raw or len(raw) < ITEM_DURA_MAX_OFF + 4:
+        return None
+    return (struct.unpack_from("<i", raw, ITEM_DURA_OFF)[0],
+            struct.unpack_from("<i", raw, ITEM_DURA_MAX_OFF)[0])
 
 
 def is_valid(scanner, head: int) -> bool:

@@ -54,7 +54,8 @@ from PySide6.QtWidgets import (
 from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import entity, move, player
+from app.core.notifier import Notifier
+from app.game import aob, entity, inventory, move, player
 from app.tabs.base_tab import BaseTab
 
 SKILL_KEYS = [(f"F{i}", 0x6F + i) for i in range(1, 13)]   # F1=0x70 … F12=0x7B
@@ -69,8 +70,10 @@ RESCAN_GAP = 0.3                # 沒得打了要多快重掃
 #   別人已經殺掉的、或錯過剛生出來的那隻。
 REFRESH_GAP = 0.5
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
+INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 STATUS_GAP = 0.2                # 狀態列多久重畫一次（心跳 10ms，不必每拍都畫）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
+GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，不必常看）
 WALK_GAP = 1.5                  # 多久可以重下一次移動指令（走一步要時間，別狂送）
 WALK_STOP_SHORT = 3.0           # 走到離怪幾格就好（不要站在牠身上）
 HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
@@ -233,6 +236,7 @@ class Scan:
     state: int | None = None      # 狀態物件（寫目標用）
     player: int | None = None     # 玩家實體物件（讀自己的座標用）
     stats: int | None = None      # 角色屬性基準（讀 HP 用；見 app/game/player.py）
+    inv: int | None = None        # 物品指標陣列表頭（讀武器耐久用）
     mons: list = field(default_factory=list)
     err: str = ""
 
@@ -261,7 +265,24 @@ class ScanWorker(QThread):
         self._queue: list[tuple[int, MemoryScanner]] = []
         self._hot: dict[int, list] = {}          # pid → 上次命中的區塊
         self._full_at: dict[int, float] = {}     # pid → 上次全掃的時間
+        self._inv: dict[int, int] = {}           # pid → 物品陣列表頭
+        self._inv_at: dict[int, float] = {}      # pid → 上次找表頭的時間
         self._running = True
+
+    def _inventory_head(self, pid: int, sc: MemoryScanner, now: float):
+        """物品陣列表頭。有效就直接用 —— 重找要跑 AOB 全掃，很貴。"""
+        head = self._inv.get(pid)
+        if head and inventory.is_valid(sc, head):
+            return head
+        if now - self._inv_at.get(pid, -99.0) < INV_RELOCATE_GAP:
+            return None                          # 剛找過還是失敗，先別一直重試
+        self._inv_at[pid] = now
+        hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096,
+                        should_stop=lambda: not self._running)
+        head = inventory.locate(sc, {a - inventory.ITEM_BALL_OFF for a in hits})
+        if head:
+            self._inv[pid] = head
+        return head
 
     def request(self, pid: int, sc: MemoryScanner) -> None:
         if not any(p == pid for p, _ in self._queue):
@@ -304,6 +325,7 @@ class ScanWorker(QThread):
                         self._hot[pid] = found
                 out.state, out.player = state, pobj
                 out.stats = player.pick(sc, extra.get(stats_vt, []))
+                out.inv = self._inventory_head(pid, sc, now)
                 out.mons = [e for e in ents if e.is_monster]
                 if state is None:
                     out.err = "找不到狀態物件（掃到 0 個或多個）"
@@ -322,12 +344,17 @@ class CharFarmPage(QWidget):
     """單一分身的掛機介面。"""
 
     def __init__(self, pid: int, hwnd: int, title: str, sc: MemoryScanner,
-                 on_scan, tgt: TargetWorker, keys: KeyWorker) -> None:
+                 on_scan, tgt: TargetWorker, keys: KeyWorker,
+                 notifier: Notifier | None = None,
+                 account: str = "", char_name: str = "") -> None:
         super().__init__()
         self.pid = pid
         self.hwnd = hwnd
         self.title = title
         self.sc = sc
+        self.account = account
+        self.char_name = char_name
+        self._notifier = notifier
         # 三件事各自跑自己的執行緒，互不干擾：
         #   掃描更新清單（ScanWorker，全分身共用）
         #   寫入目標＋偵測死亡（TargetWorker，50 Hz）
@@ -340,6 +367,7 @@ class CharFarmPage(QWidget):
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
+        self.inv: int | None = None              # 物品陣列表頭（拿來讀武器耐久）
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
         self._cur: entity.Entity | None = None   # 正在打的那隻
@@ -350,6 +378,8 @@ class CharFarmPage(QWidget):
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
+        self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
+        self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
         self._mover: move.Mover | None = None
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         self._home: tuple[float, float] | None = None   # 原點
@@ -554,6 +584,7 @@ class CharFarmPage(QWidget):
         self.state = s.state
         self.player = s.player
         self.stats = s.stats
+        self.inv = s.inv
         self.mons = s.mons or []
         err = s.err
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）。
@@ -712,6 +743,20 @@ class CharFarmPage(QWidget):
             self._since_scan = 0.0
             self._waiting = True
             self._on_scan(self.pid)
+        # ★ 武器壞了（耐久 0）就停下來並通知 —— 壞掉的武器打不動怪，
+        # 繼續掛只是白費時間。耐久掉得很慢，幾秒看一次就夠。
+        self._gear_t += dt
+        if self._gear_t >= GEAR_CHECK_GAP and self.inv:
+            self._gear_t = 0.0
+            d = inventory.durability(self.sc, self.inv)
+            if d is not None:
+                self._dura = d
+                if d[0] <= 0:
+                    self._stop_with(f"🔧 武器已損壞（耐久 0）→ 已自動停止掛機"
+                                    f"（本次擊殺 {self._kills} 隻）")
+                    self.notify("武器已損壞（耐久 0），掛機已自動停止。")
+                    return
+
         self._walk_t += dt
         if self._cur is None:
             # 沒怪可打時走回原點，免得一路追怪越跑越遠
@@ -773,7 +818,17 @@ class CharFarmPage(QWidget):
         self.status.setText(
             f"掛機中：{m.name}　距離 {d:.1f} 格　目標血量 {hp}%"
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
+            + (f"　武器耐久 {self._dura[0]}/{self._dura[1]}"
+               if self._dura[0] >= 0 else "")
             + f"　累計擊殺 {self._kills}")
+
+    def notify(self, msg: str) -> None:
+        """送警報通知。設定沿用收益監控那一份（使用者只要設定一次）。"""
+        if self._notifier is None:
+            return
+        who = f"{self.account}（{self.char_name}）"
+        note = self._notifier.fire(who, msg)
+        self.status.setText(self.status.text() + f"　[{note}]")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)
@@ -789,6 +844,10 @@ class FarmTab(BaseTab):
         self._scanners: list[MemoryScanner] = []
         self._worker: ScanWorker | None = None
         self._keys: list[_Paced] = []         # 每個分身：寫入執行緒 + 送鍵執行緒
+        # 通知設定沿用收益監控那一份，使用者只要在那邊設定一次
+        self._notifier = Notifier(self, "⚠ 自動掛機警報")
+        self._notifier.failed.connect(
+            lambda msg: self.found.setText(msg))
 
         root = QVBoxLayout(self)
 
@@ -851,11 +910,11 @@ class FarmTab(BaseTab):
             tgt.start(QThread.HighPriority)
             keys.start(QThread.HighPriority)
             self._keys += [tgt, keys]
-            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
-                                tgt, keys)
-            self._pages[pid] = page
             acct = charname.account_from_title(title)
             nm = charname.read_character_name(sc, acct) or acct
+            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
+                                tgt, keys, self._notifier, acct, nm)
+            self._pages[pid] = page
             self.tabs.addTab(page, nm)
         self.found.setText(f"偵測到 {len(insts)} 個分身")
 
