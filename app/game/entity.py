@@ -6,6 +6,10 @@
 --------------------------------------------------------------
     實體物件 = 開頭是 VT_ENTITY 的物件
     狀態物件 = 開頭是 VT_STATE 的物件（實測每個分身剛好 1 個）
+    玩家物件 = 開頭是 VT_PLAYER 的物件（實測每個分身剛好 1 個）
+
+⚠ 玩家自己**不在**實體串列上（它是另一個類別），但版面跟怪一模一樣
+  —— 名字同樣在 +0x1D4、位置同樣在 +0xBC/+0xC0，所以雙方座標可以直接相減。
 
 ⚠ 實體物件有**兩個 vtable，相差 8 bytes**：真正的物件起點是 VT_ENTITY2，
   +8 才是 VT_ENTITY。本檔所有偏移都以「掃 VT_ENTITY 得到的位址」為基準。
@@ -22,11 +26,21 @@
 （曾經走過「注入 stub 讓遊戲主執行緒呼叫送出函式」那條路，能跑但畫面沒反應
 ——因為血條是客戶端自己畫的，它看的就是 +0x2D8 這個欄位。）
 
+要打哪一隻 —— 用距離挑最近的
+----------------------------
+實體串列本身沒有順序可言，直接拿第一隻會挑到天邊那隻。實測 +0xBC/+0xC0
+是位置（見下方常數），按「離玩家的距離」排序取最近的就穩了。
+
+而且實測**遊戲的攻擊指令內建自動接近**：鎖定 22 格外的怪並送 F2 後，
+玩家座標會自己一路走過去，8 秒後把牠打死。所以距離只影響效率，不影響可行性
+——先前「有時打得到有時打不到」純粹是挑到了很遠的那隻。
+
 驗證狀況（2026-08-02）：五個分身、五張不同地圖全部通過；其中一台當下有目標，
 且該值確實等於清單裡某隻的實體 ID（兩個獨立發現的交叉驗證）。
 """
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -38,13 +52,21 @@ from app.core.memory import VALUE_TYPES
 VT_ENTITY = 0x007D2A24    # 實體物件（掃這個；注意它在物件起點 +8）
 VT_ENTITY2 = 0x007D29D8   # 同一物件的第二個 vtable，位於物件起點
 VT_STATE = 0x007E3E40     # 玩家狀態物件（每個分身剛好 1 個）
+VT_PLAYER = 0x007D8BE0    # 玩家自己的物件（每個分身剛好 1 個）
 
 # --- 實體物件的欄位（基準 = 掃 VT_ENTITY 得到的位址）---
 OFF_PREV = 0x08           # 雙向串列
 OFF_NEXT = 0x0C
+OFF_POS_X = 0xBC          # 位置 X（見 TILE_UNITS）
+OFF_POS_Y = 0xC0          # 位置 Y
 OFF_ID = 0x1C8            # 實體 ID，每隻唯一 —— 攻擊目標就是傳這個
 OFF_TYPE = 0x1D0          # 種類 ID；0 = 其他玩家
 OFF_NAME = 0x1D4          # 名字，內嵌 UTF-8
+
+# 位置是 16.16 定點數：高 16 位是世界單位，一格 = 32 個世界單位。
+# （怪站定時值恆為 tile*32+16，也就是格子中心；移動中才會出現小數。）
+# 玩家物件用的是同一組偏移、同一種編碼 —— 所以能直接相減算距離。
+TILE_UNITS = 32.0
 
 # --- 狀態物件的欄位 ---
 OFF_TARGET = 0x2D8        # 目前選定的目標（實體 ID）
@@ -56,16 +78,27 @@ NAME_MAX = 40             # 名字最多讀幾 bytes
 
 @dataclass(frozen=True)
 class Entity:
-    """一個附近的實體。type_id 為 0 代表是其他玩家，不是怪。"""
+    """一個附近的實體。type_id 為 0 代表是其他玩家，不是怪。
+
+    x / y 是掃描當下的格子座標（怪會走動，要最新的請用 read_pos）。
+    """
 
     addr: int
     eid: int
     type_id: int
     name: str
+    x: float = 0.0
+    y: float = 0.0
 
     @property
     def is_monster(self) -> bool:
         return self.type_id != 0
+
+    def distance_to(self, pos: tuple[float, float] | None) -> float:
+        """到某個座標幾格。pos 為 None（玩家位置不明）時回傳無限大。"""
+        if pos is None:
+            return float("inf")
+        return math.hypot(self.x - pos[0], self.y - pos[1])
 
 
 def _u32(scanner, addr: int) -> int:
@@ -73,13 +106,17 @@ def _u32(scanner, addr: int) -> int:
     return struct.unpack("<I", raw)[0] if raw else 0
 
 
-def _scan_vtable(scanner, vt: int, should_stop=None) -> list[int]:
-    """找出所有「開頭是這個 vtable」的物件。要掃全記憶體，約 1～3 秒。
+def _scan_vtables(scanner, vts, should_stop=None) -> dict[int, list[int]]:
+    """一次掃完，同時找出好幾種 vtable 的物件。
+
+    ★ 全記憶體掃描的成本幾乎全在「把 700MB 讀出來」，比對本身很便宜。
+      所以要三種物件時，讀一遍比對三次，比掃三遍快將近三倍。
 
     should_stop: 可選 callable，每個區塊前呼叫；回傳 True 就中止。
     """
-    target = np.uint32(vt)
-    out: list[int] = []
+    vts = list(vts)
+    out: dict[int, list[int]] = {v: [] for v in vts}
+    targets = [(np.uint32(v), out[v]) for v in vts]
     for base, size in scanner._iter_regions(writable_only=True):
         if should_stop is not None and should_stop():
             return out
@@ -87,9 +124,24 @@ def _scan_vtable(scanner, vt: int, should_stop=None) -> list[int]:
         if not raw:
             continue
         arr = np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<u4")
-        for i in np.flatnonzero(arr == target):
-            out.append(base + int(i) * 4)
+        for target, bucket in targets:
+            for i in np.flatnonzero(arr == target):
+                bucket.append(base + int(i) * 4)
     return out
+
+
+def _scan_vtable(scanner, vt: int, should_stop=None) -> list[int]:
+    """找出所有「開頭是這個 vtable」的物件。要掃全記憶體，約 1～3 秒。"""
+    return _scan_vtables(scanner, (vt,), should_stop)[vt]
+
+
+def read_pos(scanner, addr: int) -> tuple[float, float] | None:
+    """讀出格子座標；讀不到回傳 None。實體與玩家物件通用。"""
+    raw = scanner._read_bytes(addr + OFF_POS_X, 8)
+    if not raw:
+        return None
+    vx, vy = struct.unpack("<II", raw)
+    return (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS
 
 
 def locate_state(scanner, should_stop=None) -> int | None:
@@ -102,10 +154,18 @@ def locate_state(scanner, should_stop=None) -> int | None:
     return hits[0] if len(hits) == 1 else None
 
 
-def list_entities(scanner, should_stop=None) -> list[Entity]:
-    """列出附近所有實體（怪、NPC、其他玩家）。名字解不出來的會被略過。"""
+def locate_player(scanner, should_stop=None) -> int | None:
+    """定位玩家自己的物件；找不到（或掃到多個）回傳 None。
+
+    實測每個分身剛好 1 個，且 +0x1D4 的名字就是該帳號的角色名、+0x1D0 型別為 0。
+    """
+    hits = _scan_vtable(scanner, VT_PLAYER, should_stop)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _build(scanner, addrs: list[int]) -> list[Entity]:
     out: list[Entity] = []
-    for addr in _scan_vtable(scanner, VT_ENTITY, should_stop):
+    for addr in addrs:
         raw = scanner._read_bytes(addr + OFF_NAME, NAME_MAX)
         if not raw:
             continue
@@ -115,14 +175,34 @@ def list_entities(scanner, should_stop=None) -> list[Entity]:
             continue
         if not name:
             continue
+        pos = read_pos(scanner, addr) or (0.0, 0.0)
         out.append(Entity(addr, _u32(scanner, addr + OFF_ID),
-                          _u32(scanner, addr + OFF_TYPE), name))
+                          _u32(scanner, addr + OFF_TYPE), name, *pos))
     return out
+
+
+def list_entities(scanner, should_stop=None) -> list[Entity]:
+    """列出附近所有實體（怪、NPC、其他玩家）。名字解不出來的會被略過。"""
+    return _build(scanner, _scan_vtable(scanner, VT_ENTITY, should_stop))
 
 
 def monsters(scanner, should_stop=None) -> list[Entity]:
     """只要怪與 NPC，排除其他玩家。"""
     return [e for e in list_entities(scanner, should_stop) if e.is_monster]
+
+
+def snapshot(scanner, should_stop=None) -> tuple[int | None, int | None,
+                                                 list[Entity]]:
+    """掛機要的東西一次拿齊：(狀態物件, 玩家物件, 附近實體)。
+
+    三種都要掃全記憶體，合成一遍讀取 —— 這是掃描能不能夠快的關鍵。
+    狀態／玩家物件掃到的數量不是剛好 1 個時回傳 None（寧可讓上層知道情況不對，
+    也不要拿錯的物件去寫入）。
+    """
+    hits = _scan_vtables(scanner, (VT_STATE, VT_PLAYER, VT_ENTITY), should_stop)
+    state = hits[VT_STATE][0] if len(hits[VT_STATE]) == 1 else None
+    player = hits[VT_PLAYER][0] if len(hits[VT_PLAYER]) == 1 else None
+    return state, player, _build(scanner, hits[VT_ENTITY])
 
 
 def read_target(scanner, state: int) -> int:

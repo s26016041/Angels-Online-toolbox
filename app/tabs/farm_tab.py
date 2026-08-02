@@ -8,6 +8,10 @@
 角色就會打那隻怪。不必注入會執行的程式碼、不必自己組封包、不必搶視窗焦點
 （背景視窗吃得到鍵盤訊息，吃不到滑鼠點擊 —— 所以選目標非走記憶體不可）。
 
+打哪一隻：**離玩家最近的那一隻**。實體串列沒有順序，直接拿第一隻常常是天邊那隻
+——先前「有時打得到、有時打不到」就是這個原因。現在怪和玩家都讀得到座標，
+排序取最近的即可；而且遊戲的攻擊指令內建自動接近，選最近的只是為了少走路。
+
 介面
 ----
 每個分身一個子分頁（標題就是角色名）。各自可以掃描周圍怪物、選一隻，
@@ -18,7 +22,7 @@
 """
 from __future__ import annotations
 
-import ctypes
+import math
 
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -47,53 +51,23 @@ DEFAULT_INTERVAL = 0.1          # 秒；使用者指定預設每 0.1 秒按一�
 TICK_MS = 20                    # 迴圈計時器解析度
 RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻（掃一次約 0.4 秒）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
-NO_DAMAGE_SECS = 3.0            # 打了這麼久還沒掉血 → 判定打不到，換下一隻
+STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
+
+# 攻擊半徑（格）。使用者實測：人站在 (154,40) 時打得到 (130,49) 的怪，
+# 再遠就打不到 —— √(24²+9²) ≈ 25.6，也就是以角色為圓心的一個圓。
+# 半徑內的怪優先打；半徑內沒有時仍會挑最近的（遊戲的攻擊指令會自己走過去），
+# 免得站在原地發呆。可在介面上調整。
+ATTACK_RADIUS = 26.0
 
 
-def send_key(hwnd: int, vk: int = VK_F2) -> bool:
-    """對指定視窗送一次按鍵（掛機迴圈用的方式）。
+def _send_scan(hwnd: int) -> None:
+    """對指定視窗送一次 F2。
 
     走 app/core/window.py 的共用實作：SendMessageTimeout + 帶掃描碼的 lParam。
     ⚠ 實測這個遊戲**只吃 SendMessage**，PostMessage 完全沒反應（不管 lParam）。
     不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
     """
-    return win.send_key(hwnd, vk)
-
-
-# --- 各種送鍵方式，給測試按鈕用 ---------------------------------------
-# 遊戲吃哪一種只能實測。前三種都不碰使用者的鍵盤、不搶焦點；
-# 第四種會真的操作鍵盤（需要遊戲在前景），只拿來當診斷對照。
-def _post_plain(hwnd: int) -> None:
-    u = ctypes.windll.user32
-    u.PostMessageW(hwnd, 0x0100, VK_F2, 0)
-    u.PostMessageW(hwnd, 0x0101, VK_F2, 0)
-
-
-def _post_scan(hwnd: int) -> None:
     win.send_key(hwnd, VK_F2)
-
-
-def _send_scan(hwnd: int) -> None:
-    """③ —— 實測就是這個有效，已成為正式做法。"""
-    win.send_key(hwnd, VK_F2)
-
-
-def _keybd(hwnd: int) -> None:
-    """真的按下鍵盤（會佔用使用者的鍵盤，且遊戲必須在前景）。只用於診斷。"""
-    u = ctypes.windll.user32
-    scan = u.MapVirtualKeyW(VK_F2, 0)
-    u.keybd_event(VK_F2, scan, 0, 0)          # KEYDOWN
-    u.keybd_event(VK_F2, scan, 2, 0)          # KEYEVENTF_KEYUP
-
-
-SEND_WAYS = [
-    ("① PostMsg", _post_plain, "PostMessage，lParam=0　（實測無效）"),
-    ("② PostMsg+掃描碼", _post_scan, "PostMessage，lParam 帶掃描碼　（實測無效）"),
-    ("③ SendMsg+掃描碼", _send_scan,
-     "SendMessageTimeout，lParam 帶掃描碼　★ 實測有效，掛機迴圈就是用這個"),
-    ("④ 真實按鍵", _keybd,
-     "⚠ 會真的操作你的鍵盤，而且遊戲必須在前景。只拿來當診斷對照。"),
-]
 
 
 class KeyWorker(QThread):
@@ -130,13 +104,14 @@ class KeyWorker(QThread):
 
 
 class ScanWorker(QThread):
-    """背景掃描：定位狀態物件 + 列出附近怪物。
+    """背景掃描：一次拿齊狀態物件、玩家物件、附近怪物。
 
     全記憶體掃描一次約 1～3 秒，不能放在 UI 執行緒。
     用一條常駐執行緒處理所有分身的請求，比每次開新執行緒好收尾。
+    三種物件走 entity.snapshot() 合併成一遍讀取 —— 掃三遍會慢將近三倍。
     """
 
-    done = Signal(int, object, object, str)   # pid, state, monsters, err
+    done = Signal(int, object, object, object, str)  # pid, state, 玩家, 怪, err
 
     def __init__(self) -> None:
         super().__init__()
@@ -153,18 +128,20 @@ class ScanWorker(QThread):
                 self.msleep(80)
                 continue
             pid, sc = self._queue.pop(0)
-            state = mons = None
+            state = player = mons = None
             err = ""
             try:
-                state = entity.locate_state(
+                state, player, ents = entity.snapshot(
                     sc, should_stop=lambda: not self._running)
+                mons = [e for e in ents if e.is_monster]
                 if state is None:
                     err = "找不到狀態物件（掃到 0 個或多個）"
-                mons = entity.monsters(sc, should_stop=lambda: not self._running)
+                elif player is None:
+                    err = "找不到玩家物件（掃到 0 個或多個）"
             except Exception as exc:               # noqa: BLE001
                 err = f"掃描失敗：{exc}"
             if self._running:
-                self.done.emit(pid, state, mons, err)
+                self.done.emit(pid, state, player, mons, err)
 
     def stop(self) -> None:
         self._running = False
@@ -182,17 +159,18 @@ class CharFarmPage(QWidget):
         self.sc = sc
         self._keys = keys              # KeyWorker：送鍵一律丟給它，別擋住 UI
         self.state: int | None = None
+        self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
         self._acc = 0.0
         self._wrote = False        # 這一輪掛機有沒有寫過目標（判斷死亡用）
         self._cur: entity.Entity | None = None   # 正在打的那隻
-        self._pool: list[entity.Entity] = []     # 這次掃描裡所有候選
-        self._tried = 0            # 目前試到候選清單的第幾個
-        self._trying = 0.0         # 打現在這隻試了多久（沒掉血就換下一個）
         self._kills = 0
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
+        self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
+        self._last_hp = -1
+        self._last_pos: tuple[float, float] | None = None
 
         root = QVBoxLayout(self)
 
@@ -210,6 +188,20 @@ class CharFarmPage(QWidget):
         self.interval.setSuffix(" 秒按一次 F2")
         self.interval.setFixedWidth(150)
         bar.addWidget(self.interval)
+        bar.addSpacing(12)
+        bar.addWidget(QLabel("攻擊半徑"))
+        self.radius = QDoubleSpinBox()
+        self.radius.setRange(1.0, 200.0)
+        self.radius.setSingleStep(1.0)
+        self.radius.setDecimals(1)
+        self.radius.setValue(ATTACK_RADIUS)
+        self.radius.setSuffix(" 格")
+        self.radius.setFixedWidth(90)
+        self.radius.setToolTip(
+            "以角色為圓心、這個半徑內的怪優先打（實測約 25.6 格）。\n"
+            "半徑內沒有選中的怪時，仍會挑最近的一隻 —— 遊戲的攻擊指令\n"
+            "會讓角色自己走過去，只是要多花點時間。")
+        bar.addWidget(self.radius)
         bar.addSpacing(12)
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setToolTip(
@@ -262,18 +254,6 @@ class CharFarmPage(QWidget):
         panes.addWidget(right, 1)
         root.addLayout(panes)
 
-        # 測試列：遊戲吃哪種送鍵方式只能實測 —— 按一下就會「鎖定選中的怪 + 送一次 F2」，
-        # 使用者直接看畫面判斷哪個有效。
-        test = QHBoxLayout()
-        test.addWidget(QLabel("測試送鍵："))
-        for label, fn, tip in SEND_WAYS:
-            b = QPushButton(label)
-            b.setToolTip(tip + "\n按下會先鎖定「選中怪物」的第一隻，再送一次 F2。")
-            b.clicked.connect(lambda _=False, f=fn, n=label: self._try_key(f, n))
-            test.addWidget(b)
-        test.addStretch(1)
-        root.addLayout(test)
-
         self.status = QLabel("尚未掃描")
         self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
@@ -298,34 +278,15 @@ class CharFarmPage(QWidget):
             self.picked.takeItem(self.picked.row(it))
 
     # ------------------------------------------------------------------
-    def _try_key(self, fn, label: str) -> None:
-        """測試按鈕：鎖定「選中怪物」的第一隻，再用指定方式送一次 F2。
+    def my_pos(self) -> tuple[float, float] | None:
+        """玩家目前的格子座標（每次都重讀，因為角色會走動）。"""
+        if self.player is None:
+            return None
+        return entity.read_pos(self.sc, self.player)
 
-        鎖定與送鍵一起做，不然按了也看不出效果（沒目標就不會出手）。
-        """
-        if self.state is None:
-            self.status.setText("請先按「掃描周圍怪物」")
-            return
-        want = self.wanted()
-        pool = [m for m in self.mons
-                if (not want or m.name in want) and entity.is_alive(self.sc, m)]
-        if not pool:
-            self.status.setText("找不到可打的怪，請重新掃描或調整「選中怪物」")
-            return
-        m = pool[0]
-        try:
-            entity.set_target(self.sc, self.state, m.eid)
-        except Exception as exc:                   # noqa: BLE001
-            self.status.setText(f"⚠ 寫入失敗：{exc}")
-            return
-        for _ in range(5):                  # 連送 5 次，比較看得出來
-            self._keys.request(fn, self.hwnd)
-        self.status.setText(
-            f"{label}：已鎖定「{m.name}」並送出 5 次 F2 —— 請看畫面有沒有出手")
-
-    # ------------------------------------------------------------------
-    def apply_scan(self, state, mons, err: str) -> None:
+    def apply_scan(self, state, player, mons, err: str) -> None:
         self.state = state
+        self.player = player
         self.mons = mons or []
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）
         self.near.clear()
@@ -341,7 +302,7 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ {err}")
             return
 
-        # 掛機中且正在等下一隻 → 自動挑名字在清單裡的接上去
+        # 掛機中且正在等下一隻 → 自動挑名字在清單裡、離自己最近的接上去
         if self.run_cb.isChecked() and self._cur is None:
             self._pick_next()
             return
@@ -349,38 +310,36 @@ class CharFarmPage(QWidget):
                             f"{self.near.count()} 種")
 
     def _pick_next(self) -> None:
-        """從最新的掃描結果裡挑一隻名字在「選中怪物」裡的接著打。
+        """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打。
 
         用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
+
+        ★ 一定要按距離排序。實體串列是靠掃 vtable 得到的，順序等同記憶體位址，
+          直接拿第一隻常常是地圖另一頭那隻 —— 這就是先前「有時打得到、
+          有時打不到」的原因。現在怪和玩家都讀得到座標，排序即可，
+          不需要一隻一隻試。
         """
         want = self.wanted()
-        self._pool = [m for m in self.mons
-                      if m.name in want and entity.is_alive(self.sc, m)]
-        self._tried = 0
-        if not self._pool:
+        me = self.my_pos()
+        pool = [m for m in self.mons
+                if m.name in want and entity.is_alive(self.sc, m)]
+        pool.sort(key=lambda m: m.distance_to(me))
+        if not pool:
             self.status.setText(
                 f"附近沒有選中的怪了（已擊殺 {self._kills} 隻）→ 等新的出現…")
             return
-        self._use(0)
-
-    def _use(self, idx: int) -> None:
-        """改用候選清單裡的第 idx 隻。"""
-        self._tried = idx
-        self._cur = self._pool[idx]
+        # 半徑內的優先；半徑內沒有就挑最近的（遊戲會自己走過去，不要站在原地）
+        r = self.radius.value()
+        inside = [m for m in pool if m.distance_to(me) <= r]
+        self._cur = (inside or pool)[0]
         self._wrote = False
-        self._trying = 0.0
-
-    def _next_candidate(self) -> bool:
-        """換下一個候選；沒有了回傳 False。
-
-        為什麼需要這個：清單是靠 vtable 掃出來的，**沒有距離資訊**，
-        第一隻可能在很遠的地方根本打不到。使用者實測「測試按鈕有時可以、
-        掛機不行」就是這個現象 —— 偶爾剛好挑到附近的。
-        """
-        if self._tried + 1 < len(self._pool):
-            self._use(self._tried + 1)
-            return True
-        return False
+        self._stuck = 0.0
+        self._last_hp = -1
+        self._last_pos = me
+        d = self._cur.distance_to(me)
+        self.status.setText(
+            f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
+            + ("" if inside else "（半徑外，會自己走過去）"))
 
     def _on_toggle(self, on: bool) -> None:
         if not on:
@@ -388,7 +347,7 @@ class CharFarmPage(QWidget):
             self._cur = None
             return
         self._wrote = False
-        if self.state is None:
+        if self.state is None or self.player is None:
             self.run_cb.setChecked(False)
             QMessageBox.information(self, "還不能開始",
                                     "請先按「掃描周圍怪物」。")
@@ -469,22 +428,33 @@ class CharFarmPage(QWidget):
         self._wrote = True
         self._keys.request(_send_scan, self.hwnd)
 
-        # 打不到就換下一隻：清單沒有距離資訊，第一隻可能遠在天邊。
-        # 用「目標血量有沒有掉」當回饋 —— 打得到就會掉血，打不到就一直滿血。
-        self._trying += self.interval.value()
-        if hp >= entity.TARGET_HP_FULL and self._trying >= NO_DAMAGE_SECS:
-            if self._next_candidate():
-                self.status.setText(
-                    f"「{m.name}」打不到（{NO_DAMAGE_SECS:.0f} 秒沒掉血）"
-                    f"→ 換第 {self._tried + 1}/{len(self._pool)} 隻")
-            else:
-                self._cur = None
-                self._since_scan = RESCAN_GAP
-                self.status.setText("這批候選都打不到 → 重新掃描…")
+        # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
+        # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
+        # 代表這隻走不過去（隔著地形之類），換一隻。
+        me = self.my_pos()
+        moving = (me is not None and self._last_pos is not None
+                  and (abs(me[0] - self._last_pos[0]) > 0.2
+                       or abs(me[1] - self._last_pos[1]) > 0.2))
+        if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
+            self._stuck = 0.0
+        else:
+            self._stuck += self.interval.value()
+        self._last_pos = me
+        self._last_hp = hp
+        if self._stuck >= STUCK_SECS:
+            self._cur = None
+            self._since_scan = RESCAN_GAP
+            self.status.setText(
+                f"「{m.name}」{STUCK_SECS:.0f} 秒沒進展（走不過去？）→ 重新挑…")
             return
+
+        # 距離要用當下的座標算：怪會走、角色也在走，掃描時的座標早就過期了
+        mp = entity.read_pos(self.sc, m.addr)
+        d = (math.hypot(mp[0] - me[0], mp[1] - me[1])
+             if mp and me else float("nan"))
         self.status.setText(
-            f"掛機中：{m.name}（第 {self._tried + 1}/{len(self._pool)} 隻）"
-            f"　血量 {hp}%　累計擊殺 {self._kills}")
+            f"掛機中：{m.name}　距離 {d:.1f} 格　血量 {hp}%"
+            f"　累計擊殺 {self._kills}")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)
@@ -520,8 +490,8 @@ class FarmTab(BaseTab):
             "① 按「掃描周圍怪物」→ ② 點右邊的名字加進「選中怪物」"
             "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除）"
             "→ ③ 勾「開始掛機」。\n"
-            "會持續送 F2；打死之後自動重掃、接著打清單裡的下一隻，不必手動再選。"
-            "取消勾選才停。不搶視窗焦點，可以同時掛多個分身。")
+            "會挑**離自己最近**的一隻持續送 F2；打死之後自動重掃、接著打下一隻，"
+            "不必手動再選。取消勾選才停。不搶視窗焦點，可以同時掛多個分身。")
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
 
@@ -574,10 +544,10 @@ class FarmTab(BaseTab):
         page.status.setText("掃描中…（全記憶體掃描，約 1～3 秒）")
         self._worker.request(pid, page.sc)
 
-    def _on_scan_done(self, pid: int, state, mons, err: str) -> None:
+    def _on_scan_done(self, pid: int, state, player, mons, err: str) -> None:
         page = self._pages.get(pid)
         if page is not None:
-            page.apply_scan(state, mons, err)
+            page.apply_scan(state, player, mons, err)
 
     def _tick(self) -> None:
         dt = TICK_MS / 1000.0
