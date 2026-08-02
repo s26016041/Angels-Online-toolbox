@@ -106,33 +106,47 @@ def _u32(scanner, addr: int) -> int:
     return struct.unpack("<I", raw)[0] if raw else 0
 
 
-def _scan_vtables(scanner, vts, should_stop=None) -> dict[int, list[int]]:
+def _scan_vtables(scanner, vts, should_stop=None,
+                  regions=None) -> tuple[dict[int, list[int]], list]:
     """一次掃完，同時找出好幾種 vtable 的物件。
+
+    回傳 (命中位址, 有命中的區塊清單)。後者拿去當下次的 regions 就是「熱區掃描」。
 
     ★ 全記憶體掃描的成本幾乎全在「把 700MB 讀出來」，比對本身很便宜。
       所以要三種物件時，讀一遍比對三次，比掃三遍快將近三倍。
+
+    ★ regions 不是 None 時**只掃指定的區塊**。實測這些物件全部集中在
+      單一一塊記憶體（佔全部的 0.1%～1.9%），所以拿上次的命中區塊再掃一次，
+      成本只有全掃的百分之幾 —— 這是「刷新怪物清單」能做到即時的關鍵。
+      ⚠ 但堆積是會變的，熱區掃描必須搭配定期的全掃當保險（見 snapshot）。
 
     should_stop: 可選 callable，每個區塊前呼叫；回傳 True 就中止。
     """
     vts = list(vts)
     out: dict[int, list[int]] = {v: [] for v in vts}
     targets = [(np.uint32(v), out[v]) for v in vts]
-    for base, size in scanner._iter_regions(writable_only=True):
+    hot: list = []
+    for base, size in (regions if regions is not None
+                       else scanner._iter_regions(writable_only=True)):
         if should_stop is not None and should_stop():
-            return out
+            return out, hot
         raw = scanner._read_region(base, size)
         if not raw:
             continue
         arr = np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<u4")
+        found = False
         for target, bucket in targets:
             for i in np.flatnonzero(arr == target):
                 bucket.append(base + int(i) * 4)
-    return out
+                found = True
+        if found:
+            hot.append((base, size))
+    return out, hot
 
 
 def _scan_vtable(scanner, vt: int, should_stop=None) -> list[int]:
-    """找出所有「開頭是這個 vtable」的物件。要掃全記憶體，約 1～3 秒。"""
-    return _scan_vtables(scanner, (vt,), should_stop)[vt]
+    """找出所有「開頭是這個 vtable」的物件。要掃全記憶體，約 0.4 秒。"""
+    return _scan_vtables(scanner, (vt,), should_stop)[0][vt]
 
 
 def read_pos(scanner, addr: int) -> tuple[float, float] | None:
@@ -191,18 +205,25 @@ def monsters(scanner, should_stop=None) -> list[Entity]:
     return [e for e in list_entities(scanner, should_stop) if e.is_monster]
 
 
-def snapshot(scanner, should_stop=None) -> tuple[int | None, int | None,
-                                                 list[Entity]]:
-    """掛機要的東西一次拿齊：(狀態物件, 玩家物件, 附近實體)。
+def snapshot(scanner, should_stop=None,
+             regions=None) -> tuple[int | None, int | None,
+                                    list[Entity], list]:
+    """掛機要的東西一次拿齊：(狀態物件, 玩家物件, 附近實體, 命中的區塊)。
 
-    三種都要掃全記憶體，合成一遍讀取 —— 這是掃描能不能夠快的關鍵。
+    三種都要掃，合成一遍讀取 —— 這是掃描能不能夠快的第一個關鍵。
     狀態／玩家物件掃到的數量不是剛好 1 個時回傳 None（寧可讓上層知道情況不對，
     也不要拿錯的物件去寫入）。
+
+    ★ 第二個關鍵：把回傳的「命中的區塊」記下來，下次當 regions 傳回來，
+      就只掃那幾塊（實測快兩位數倍）。⚠ **必須定期做一次全掃當保險** ——
+      堆積會變，換地圖或重連之後物件可能搬到別的區塊；只要熱區掃描的結果
+      看起來不對（狀態或玩家物件不見了），呼叫端就該退回全掃。
     """
-    hits = _scan_vtables(scanner, (VT_STATE, VT_PLAYER, VT_ENTITY), should_stop)
+    hits, hot = _scan_vtables(scanner, (VT_STATE, VT_PLAYER, VT_ENTITY),
+                              should_stop, regions)
     state = hits[VT_STATE][0] if len(hits[VT_STATE]) == 1 else None
     player = hits[VT_PLAYER][0] if len(hits[VT_PLAYER]) == 1 else None
-    return state, player, _build(scanner, hits[VT_ENTITY])
+    return state, player, _build(scanner, hits[VT_ENTITY]), hot
 
 
 def read_target(scanner, state: int) -> int:
