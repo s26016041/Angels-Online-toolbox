@@ -183,7 +183,8 @@ class KeyWorker(_Paced):
     兩種發動方式
     ------------
     ① **送技能鍵**（一定做得到，不需要注入）
-    ② **直接送三連包**（attack.send_trio）—— 需要技能 ID 和 Mover
+    ② **直接送封包**（attack.select 一次 + attack.strike 重複）
+       —— 需要技能 ID 和 Mover
 
     ★ 技能 ID 是自己學來的：送出技能鍵之後，遊戲會把剛放的技能 ID 寫進
       「角色屬性基準 −0x50」（見 app/game/player.py 的 read_last_skill）。
@@ -207,6 +208,7 @@ class KeyWorker(_Paced):
         self.mover = None
         self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
         self.eid = None             # 現在要打誰
+        self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
         self.skill = None           # 學到的技能 ID
         self._on = False
         self._learning = False
@@ -259,12 +261,21 @@ class KeyWorker(_Paced):
 
     def step(self) -> None:
         try:
+            if self.eid is None:
+                self._sel = None       # 沒目標了，下一隻要重新送「選定」
             # 已經在打了 → 學習搭便車在攻擊的按鍵上，不額外花時間。
             if self._on:
                 if (self.packets and self.skill and self.eid
                         and self.pf and self.mover is not None):
-                    if attack.send_trio(self.mover, self.pf,
-                                        self.skill, self.eid):
+                    # ★ 照遊戲自己的節奏：**換目標才送一次「選定」**，
+                    #   之後就一直重複「動作 + 施放」直到怪死掉。
+                    #   （使用者攔到的分組計數：選定 1 包、動作與施放各 2 包）
+                    if self.eid != self._sel:
+                        if not attack.select(self.mover, self.eid):
+                            return                 # 選不到就這一拍不打
+                        self._sel = self.eid
+                    if attack.strike(self.mover, self.pf,
+                                     self.skill, self.eid):
                         self.sent += 1
                         return
                     # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
