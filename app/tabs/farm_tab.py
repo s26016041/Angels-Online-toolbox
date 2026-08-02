@@ -576,6 +576,7 @@ class CharFarmPage(QWidget):
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._walked_ok = True     # 上次下移動指令有沒有成功
+        self._home_pts = 1         # 上次「走回原點」算出的路徑點數
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
         # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
@@ -1058,11 +1059,18 @@ class CharFarmPage(QWidget):
             if self.back_cb.isChecked() and self._home and me:
                 d = math.hypot(me[0] - self._home[0], me[1] - self._home[1])
                 if d > HOME_SLACK:
+                    # ⚠ 回傳值不能丟掉：走不了（尋路算不出路徑、或指令槽被佔）
+                    #   時什麼都不會發生，狀態列卻還寫著「走回原點」——
+                    #   看起來就像沒在算路徑、站在原地發呆。
                     if self._walk_t >= WALK_GAP:
-                        self._walk_toward(self._home[0], self._home[1], me, 0.0)
+                        self._home_pts = self._walk_toward(
+                            self._home[0], self._home[1], me, 0.0)
                     self.status.setText(
                         f"周圍沒有選中的怪 → 走回原點"
-                        f"({self._home[0]:.0f},{self._home[1]:.0f})　還有 {d:.0f} 格")
+                        f"({self._home[0]:.0f},{self._home[1]:.0f})　還有 {d:.0f} 格"
+                        + ("　⛔ 算不出路徑（被地形擋住？）" if self._home_pts == 0
+                           else f"　⛰ 繞路 {self._home_pts} 點"
+                           if self._home_pts > 1 else "　直線可通"))
                 else:
                     self.status.setText(
                         f"已在原點，等選中的怪出現…　累計擊殺 {self._kills}")
