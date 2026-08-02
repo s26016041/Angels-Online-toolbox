@@ -42,25 +42,52 @@ import struct
 import time
 
 from app.game import entity
-from app.game.entity import read_pos
 
 MOVE_FN = 0x0055A046        # 移動封包建構＋送出函式
 WAYPOINTS = 0x009B6684      # 全域路徑點陣列
-# ⛔⛔ 遊戲自己的尋路：**不要呼叫，會弄崩遊戲**（實測把黑狐打掛了）。
-# 反組譯 0x556982~0x556990（滑鼠點地板走路的那條路）長這樣：
-#       call 0x54A572
+# ★ 遊戲自己的尋路。反組譯 0x556982~0x556990（滑鼠點地板走路那條路）：
 #       push 0x9B6684        ← 輸出：路徑點陣列
 #       push edi             ← 目標 Y（世界座標）
 #       push esi             ← 目標 X
-#       mov  ecx, ebx        ← this
-#       call 0x549B81        ← 尋路，eax = 路徑點數量
-# 實測直接呼叫（ecx 給我們的玩家物件 VT_PLAYER=0x7D8BE0）：
-#   · 回傳 0（算不出路徑），連呼叫幾次之後**遊戲當場崩潰**
-#   · 原因推測：`this` 不是這個物件 —— 上面的 ebx 來自
-#     `0x5045de([0x96e638]+0x2a90)`，是另一個東西；而且前面那個
-#     `call 0x54A572` 可能有必要的前置狀態。**沒有證據前別再試。**
-# 真要走這條路，得先把 ebx 的來源鏈完整解出來並驗證，不能用猜的。
-PATHFIND_FN = 0x00549B81        # 只留作紀錄，程式不呼叫它
+#       mov  ecx, ebx        ← this（**不是**我們掃到的玩家物件，見下）
+#       call 0x549B81        ← eax = 算出來的路徑點數量，0 = 算不出來
+PATHFIND_FN = 0x00549B81
+PATH_MAX_TILES = 28.0       # 尋路的有效範圍實測約 30~40 格，超過就回 0
+# 這段算不出來就縮短再試（由遠到近）
+PATH_TRY = (28.0, 18.0, 10.0, 5.0)
+
+# --- 尋路要的 this ----------------------------------------------------------
+# ⚠⚠ **不是**我們用 VT_PLAYER 掃到的那個位址，而是**它 −8**。
+#     第一次直接拿掃到的位址去呼叫，遊戲當場崩潰 —— 就是本專案踩過兩次的老坑：
+#     同一個物件有兩個 vtable、相隔 8 bytes。
+# 來源鏈（`0x5045DE` 只是表查找，可以純讀取重現，不必呼叫）：
+MGR_PTR = 0x0096E638        # 管理器指標
+MGR_ID = 0x2A90             # 本尊的實體 ID
+MGR_TBL = 0x2A74            # ID → 物件的表
+MGR_MAX = 0x2AA4            # 表的上限
+OBJ_ID = 0xBC               # 物件裡回存的 ID（要跟查表用的 ID 一致才算數）
+
+
+def pathfinder_this(scanner) -> int | None:
+    """算出尋路要的 this；算不出或驗不過回 None（那就別呼叫）。
+
+    驗證（實測 5/5 台）：算出來的物件 +0xC6/+0xCA（int16 世界座標）÷32
+    與玩家的格子座標完全一致，而且它正好等於「VT_PLAYER 掃到的位址 − 8」。
+    """
+    def u32(a):
+        raw = scanner._read_bytes(a, 4)
+        return struct.unpack("<I", raw)[0] if raw else None
+
+    mgr = u32(MGR_PTR)
+    if not mgr:
+        return None
+    ident, tbl, mx = u32(mgr + MGR_ID), u32(mgr + MGR_TBL), u32(mgr + MGR_MAX)
+    if None in (ident, tbl, mx) or (ident & 0xFFFF) > mx:
+        return None
+    obj = u32(tbl + (ident & 0xFFFF) * 4)
+    if not obj or u32(obj + OBJ_ID) != ident:
+        return None
+    return obj
 HOOK_IMPORT = "PeekMessageA"
 MAX_POINTS = 32             # 一次最多送幾個路徑點（封包大小 = 點數*4+9）
 
@@ -116,70 +143,6 @@ def _stub_asm(block: int) -> str:
     popad
     jmp dword ptr [{block + _ORIG:#x}]
     """
-
-
-# --- 繞行導航 ---------------------------------------------------------------
-# 我們只送直線的單一路徑點，**沒有尋路**（遊戲自己的路徑是腳本算的，我們拿不到）。
-# 所以撞到地形時角色會一直往牆裡走、原地不動 —— 使用者回報的「往那個方向卡住」。
-NAV_STUCK_SECS = 1.2        # 位置沒動這麼久就當作撞牆
-NAV_MOVED = 0.4             # 位移超過這麼多格才算「有在動」
-NAV_DETOUR = 10.0           # 繞行時往側面走幾格
-NAV_DETOUR_SECS = 2.5       # 一次繞行持續多久
-
-
-class Navigator:
-    """朝目標走，撞牆就往側面繞一段再繼續。一個分身一個。
-
-    這不是真正的尋路，是最土的「撞牆就側移」（bug algorithm）：
-    左右輪流試，繞不過去就換邊。對付一般地形夠用，
-    真的被包死時呼叫端的「卡住偵測」會換目標。
-    """
-
-    def __init__(self, mover: "Mover") -> None:
-        self._mv = mover
-        self.reset()
-
-    def reset(self) -> None:
-        self._last: tuple[float, float] | None = None
-        self._stuck = 0.0
-        self._side = 1              # 1 = 往左繞，-1 = 往右繞
-        self._detour: tuple[float, float] | None = None
-        self._detour_left = 0.0
-        self.detours = 0            # 這一趟繞了幾次（診斷用）
-
-    def step(self, scanner, player_obj: int, gx: float, gy: float,
-             dt: float) -> bool:
-        """朝 (gx,gy) 前進一步。回傳這次是否正在繞行。"""
-        pos = read_pos(scanner, player_obj)
-        if pos is None:
-            return False
-        if self._last is not None:
-            moved = math.hypot(pos[0] - self._last[0], pos[1] - self._last[1])
-            self._stuck = 0.0 if moved > NAV_MOVED else self._stuck + dt
-        self._last = pos
-
-        if self._detour_left > 0:
-            self._detour_left -= dt
-            if self._detour_left > 0 and self._detour:
-                self._mv.walk_to(scanner, player_obj, *self._detour)
-                return True
-            self._detour = None
-
-        if self._stuck >= NAV_STUCK_SECS:
-            # 撞牆了：往「面向目標的側面」走一段，繞過去再說
-            self._stuck = 0.0
-            self.detours += 1
-            self._side = -self._side          # 左右輪流試
-            dx, dy = gx - pos[0], gy - pos[1]
-            n = math.hypot(dx, dy) or 1.0
-            self._detour = (pos[0] - dy / n * NAV_DETOUR * self._side,
-                            pos[1] + dx / n * NAV_DETOUR * self._side)
-            self._detour_left = NAV_DETOUR_SECS
-            self._mv.walk_to(scanner, player_obj, *self._detour)
-            return True
-
-        self._mv.walk_to(scanner, player_obj, gx, gy)
-        return False
 
 
 class Mover:
@@ -280,10 +243,32 @@ class Mover:
             return False
         wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
         cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
-        d = math.hypot(tile_x - cx, tile_y - cy)
-        k = max(1, min(MAX_POINTS, math.ceil(d / HOP_TILES)))
-        pts = [(cx + (tile_x - cx) * (i + 1) / k,
-                cy + (tile_y - cy) * (i + 1) / k) for i in range(k)]
+        dx, dy = tile_x - cx, tile_y - cy
+        full = math.hypot(dx, dy)
+        if full < 0.5:
+            return False
+
+        # ★ 先請遊戲自己尋路：它會繞過地形，我們自己只會畫直線。
+        # 尋路有效範圍約 30~40 格，太遠回 0，所以由遠到近試幾個中繼距離；
+        # 走到中繼點後呼叫端再下一次，就能接力走很遠
+        # （實測 85.9 格、8.5 秒到達，全程繞過地形）。
+        this = pathfinder_this(scanner)
+        if this:
+            for hop in (full,) + PATH_TRY:
+                if hop > full:
+                    continue
+                tx = int((cx + dx / full * hop) * entity.TILE_UNITS) & 0xFFFF
+                ty = int((cy + dy / full * hop) * entity.TILE_UNITS) & 0xFFFF
+                n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
+                                   ecx=this, timeout=0.15)
+                if n and 0 < n <= MAX_POINTS:
+                    return self.call(MOVE_FN, wx, wy, n,
+                                     random.randint(1, 0xFFFF))
+
+        # 尋路不給路徑（不可達／算不出來）就退回自己切直線，總比不動好
+        k = max(1, min(MAX_POINTS, math.ceil(full / HOP_TILES)))
+        pts = [(cx + dx * (i + 1) / k, cy + dy * (i + 1) / k)
+               for i in range(k)]
         return self.walk_path(scanner, player_obj, pts)
 
     def walk_path(self, scanner, player_obj: int, tiles) -> bool:
