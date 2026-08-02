@@ -22,7 +22,9 @@
 """
 from __future__ import annotations
 
+import ctypes
 import math
+import time
 
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -47,9 +49,10 @@ from app.game import entity
 from app.tabs.base_tab import BaseTab
 
 VK_F2 = 0x71
-DEFAULT_INTERVAL = 0.1          # 秒；使用者指定預設每 0.1 秒按一次
-TICK_MS = 20                    # 迴圈計時器解析度
-RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻（掃一次約 0.4 秒）
+DEFAULT_INTERVAL = 0.05         # 秒；每秒送 20 次 F2
+TICK_MS = 10                    # 迴圈計時器解析度（要比送鍵間隔小才吃得滿）
+RESCAN_GAP = 0.3                # 清單裡真的沒得打了，才重掃（一次約 0.5 秒）
+STATUS_GAP = 0.2                # 狀態列多久重畫一次（心跳 10ms，不必每拍都畫）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
 
@@ -70,37 +73,103 @@ def _send_scan(hwnd: int) -> None:
     win.send_key(hwnd, VK_F2)
 
 
-class KeyWorker(QThread):
-    """在背景送按鍵。
+class AttackWorker(QThread):
+    """一個分身的攻擊迴圈，跑在**自己的執行緒**上。
 
-    為什麼不直接在 UI 執行緒送：SendMessageTimeout 會等對方處理完才返回，
-    實測平均 4.6ms，但遊戲一卡就會用滿逾時（200ms）。五個分身同時掛機、
-    每 0.1 秒各送一次 —— 最壞情況 UI 會被凍住一整秒。
-    （這跟先前「全記憶體掃描卡住渲染」是同一類問題，見 watcher.py 的說明。）
+    為什麼不掛在 UI 的 QTimer 上（原本的做法）：
+      · Qt 計時器不精準，UI 一忙節奏就漂掉 —— 使用者的感受就是「很卡」。
+      · SendMessageTimeout 會等對方處理完才返回（平均 4.6ms，遊戲卡住時
+        會用滿 200ms 逾時），放在 UI 執行緒等於拿遊戲的卡頓來凍自己的畫面。
+      · 五個分身共用一條也不行：節奏互相排擠，一台卡住其他四台跟著餓死。
+
+    所以一個分身一條執行緒，只做這個循環：
+        讀目標 → 判斷死亡 → 寫回目標 → 送一次 F2（按+放）→ 睡到下一拍
+
+    ⚠ 送鍵一定是**一次次按放**。曾經想改成「只送 KEYDOWN 模擬按住」，
+      方向是錯的 —— 使用者實測這個遊戲按住不放並不會一直放技能，
+      他自己就是狂點鍵盤的。
     """
 
-    def __init__(self) -> None:
+    died = Signal(int)          # 目標倒了（實體 ID）→ UI 執行緒去挑下一隻
+    failed = Signal(str)        # 讀寫記憶體失敗
+
+    def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
         super().__init__()
-        self._jobs: list[tuple] = []
+        self.hwnd = hwnd
+        self.sc = sc
+        self.hp = 0                 # 最近讀到的目標血量，給 UI 顯示
+        self._job: tuple[int, entity.Entity] | None = None
+        self._interval = DEFAULT_INTERVAL
+        self._wrote = False
         self._running = True
 
-    def request(self, fn, hwnd: int) -> None:
-        if len(self._jobs) < 32:          # 積太多代表遊戲卡住了，丟掉就好
-            self._jobs.append((fn, hwnd))
+    # -- 以下三個由 UI 執行緒呼叫 --------------------------------------
+    def set_interval(self, secs: float) -> None:
+        self._interval = max(0.02, secs)
 
+    def attack(self, state: int, ent: entity.Entity) -> None:
+        self._wrote = False
+        self._job = (state, ent)
+
+    def hold_off(self) -> None:
+        """停手。"""
+        self._job = None
+
+    # ------------------------------------------------------------------
     def run(self) -> None:
+        # ⚠ Windows 的 Sleep() 預設精度只有約 15.6ms —— msleep(50) 可能睡成 62ms，
+        # 節奏會忽快忽慢（就是「很卡」的來源之一）。timeBeginPeriod(1) 把系統
+        # 計時器解析度調到 1ms；這是行程層級的設定，用完一定要成對還原。
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        try:
+            self._loop()
+        finally:
+            ctypes.windll.winmm.timeEndPeriod(1)
+
+    def _loop(self) -> None:
+        due = time.perf_counter()
         while self._running:
-            if not self._jobs:
+            job = self._job
+            if job is None:
                 self.msleep(5)
+                due = time.perf_counter()
                 continue
-            fn, hwnd = self._jobs.pop(0)
+            state, ent = job
             try:
-                fn(hwnd)
-            except Exception:             # noqa: BLE001
-                pass
+                # ★ 先讀後判斷、最後才寫 —— 順序不能換。
+                # 目標死掉時遊戲會把 +0x2D8 清成 0，那是我們唯一的死亡訊號；
+                # 先寫回去就把訊號蓋掉了。
+                cur = entity.read_target(self.sc, state)
+                self.hp = entity.read_target_hp(self.sc, state)
+                if self._wrote and (cur == 0
+                                    or not entity.is_alive(self.sc, ent)):
+                    self._job = None
+                    self._wrote = False
+                    self.died.emit(ent.eid)
+                    continue
+
+                # ⚠ **每一圈都要重寫兩個欄位**，不能「已經是這隻就跳過」：
+                # 遊戲會把 +0x2DC（目標血量%）改回 0，而攻擊前會檢查它 > 0
+                # （`cmp [esi+0x2dc],0 / jle 跳過`）。只寫一次的話之後全被跳掉。
+                entity.set_target(self.sc, state, ent.eid)
+                self._wrote = True
+                _send_scan(self.hwnd)
+            except Exception as exc:           # noqa: BLE001
+                self._job = None
+                self.failed.emit(str(exc))
+                continue
+            # 睡「到下一拍為止」，不是「睡一個間隔」—— 送鍵本身要 3~5ms，
+            # 直接睡固定長度的話週期會變成 間隔+送鍵時間，節奏也會隨遊戲卡頓漂移。
+            due += self._interval
+            left = due - time.perf_counter()
+            if left > 0:
+                self.msleep(int(left * 1000) or 1)
+            else:
+                due = time.perf_counter()      # 落後太多就重新對時，不要補償性狂送
 
     def stop(self) -> None:
         self._running = False
+        self._job = None
 
 
 class ScanWorker(QThread):
@@ -151,26 +220,32 @@ class CharFarmPage(QWidget):
     """單一分身的掛機介面。"""
 
     def __init__(self, pid: int, hwnd: int, title: str,
-                 sc: MemoryScanner, on_scan, keys) -> None:
+                 sc: MemoryScanner, on_scan, atk: AttackWorker) -> None:
         super().__init__()
         self.pid = pid
         self.hwnd = hwnd
         self.title = title
         self.sc = sc
-        self._keys = keys              # KeyWorker：送鍵一律丟給它，別擋住 UI
+        # 攻擊迴圈（寫目標 + 送 F2）整個在這條執行緒上跑，本頁只負責挑目標。
+        self._atk = atk
+        atk.died.connect(self._on_died)
+        atk.failed.connect(lambda msg: self._stop_with(f"⚠ 記憶體存取失敗：{msg}"))
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
-        self._acc = 0.0
-        self._wrote = False        # 這一輪掛機有沒有寫過目標（判斷死亡用）
         self._cur: entity.Entity | None = None   # 正在打的那隻
         self._kills = 0
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
+        self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
+        # 這輪掃描裡已經打死（或判定走不過去）的實體 ID。
+        # 怪死掉後物件不會馬上被回收，is_alive() 可能還是 true —— 沒這層擋著，
+        # 換下一隻時會又挑到同一具屍體。每次重掃後清空（新的掃描結果才算數）。
+        self._killed: set[int] = set()
 
         root = QVBoxLayout(self)
 
@@ -181,12 +256,14 @@ class CharFarmPage(QWidget):
         bar.addSpacing(12)
         bar.addWidget(QLabel("每隔"))
         self.interval = QDoubleSpinBox()
-        self.interval.setRange(0.05, 5.0)
-        self.interval.setSingleStep(0.05)
+        self.interval.setRange(0.02, 5.0)
+        self.interval.setSingleStep(0.01)
         self.interval.setDecimals(2)
         self.interval.setValue(DEFAULT_INTERVAL)
         self.interval.setSuffix(" 秒按一次 F2")
         self.interval.setFixedWidth(150)
+        self.interval.valueChanged.connect(self._atk.set_interval)
+        self._atk.set_interval(DEFAULT_INTERVAL)
         bar.addWidget(self.interval)
         bar.addSpacing(12)
         bar.addWidget(QLabel("攻擊半徑"))
@@ -288,6 +365,7 @@ class CharFarmPage(QWidget):
         self.state = state
         self.player = player
         self.mons = mons or []
+        self._killed.clear()       # 新的掃描結果才算數；殘留的屍體靠死亡偵測擋
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）
         self.near.clear()
         seen = []
@@ -304,13 +382,15 @@ class CharFarmPage(QWidget):
 
         # 掛機中且正在等下一隻 → 自動挑名字在清單裡、離自己最近的接上去
         if self.run_cb.isChecked() and self._cur is None:
-            self._pick_next()
+            if not self._pick_next():
+                self.status.setText(
+                    f"附近沒有選中的怪了（已擊殺 {self._kills} 隻）→ 等新的出現…")
             return
         self.status.setText(f"找到 {len(self.mons)} 隻，"
                             f"{self.near.count()} 種")
 
-    def _pick_next(self) -> None:
-        """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打。
+    def _pick_next(self) -> bool:
+        """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打；挑不到回傳 False。
 
         用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
 
@@ -318,35 +398,64 @@ class CharFarmPage(QWidget):
           直接拿第一隻常常是地圖另一頭那隻 —— 這就是先前「有時打得到、
           有時打不到」的原因。現在怪和玩家都讀得到座標，排序即可，
           不需要一隻一隻試。
+
+        ★ 這裡**不重掃記憶體**，直接用上一次掃描的清單。一張圖上通常有十幾隻，
+          打死一隻就重掃等於白等 2 秒（1.5 秒間隔 + 0.5 秒掃描），
+          而換下一隻其實只要挑清單裡還活著的即可 —— 這是換怪速度的關鍵。
+          清單裡真的沒得打了，才由 tick() 去排重掃。
         """
         want = self.wanted()
         me = self.my_pos()
-        pool = [m for m in self.mons
-                if m.name in want and entity.is_alive(self.sc, m)]
-        pool.sort(key=lambda m: m.distance_to(me))
+        pool = []
+        for m in self.mons:
+            if m.name not in want or m.eid in self._killed:
+                continue
+            if not entity.is_alive(self.sc, m):
+                continue
+            # 座標要當場重讀：怪會走、角色也在走，掃描時記的早就過期了
+            p = entity.read_pos(self.sc, m.addr)
+            pool.append((math.hypot(p[0] - me[0], p[1] - me[1])
+                         if p and me else float("inf"), m))
+        pool.sort(key=lambda t: t[0])
         if not pool:
-            self.status.setText(
-                f"附近沒有選中的怪了（已擊殺 {self._kills} 隻）→ 等新的出現…")
-            return
+            return False
         # 半徑內的優先；半徑內沒有就挑最近的（遊戲會自己走過去，不要站在原地）
         r = self.radius.value()
-        inside = [m for m in pool if m.distance_to(me) <= r]
-        self._cur = (inside or pool)[0]
-        self._wrote = False
+        inside = [t for t in pool if t[0] <= r]
+        d, self._cur = (inside or pool)[0]
         self._stuck = 0.0
         self._last_hp = -1
         self._last_pos = me
-        d = self._cur.distance_to(me)
+        self._atk.attack(self.state, self._cur)     # 交給攻擊執行緒，立刻開打
         self.status.setText(
             f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
-            + ("" if inside else "（半徑外，會自己走過去）"))
+            + ("" if inside else "（半徑外，會自己走過去）")
+            + f"　累計擊殺 {self._kills}")
+        return True
+
+    def _on_died(self, eid: int) -> None:
+        """攻擊執行緒回報目標倒了 —— 立刻從既有清單接下一隻。
+
+        不重掃記憶體：重掃要 0.5 秒還要排隊，每殺一隻就等一次會非常卡。
+        清單裡真的沒得打了，才由 tick() 去排重掃。
+        """
+        m = self._cur
+        self._kills += 1
+        self._killed.add(eid)     # 物件可能還沒被回收，記下來免得又打同一具屍體
+        self._cur = None
+        if not self.run_cb.isChecked():
+            return
+        if not self._pick_next():
+            self._since_scan = RESCAN_GAP         # 清單空了，才排重掃
+            self.status.setText(
+                f"「{m.name if m else ''}」倒了（累計 {self._kills} 隻）→ 重新掃描…")
 
     def _on_toggle(self, on: bool) -> None:
         if not on:
+            self._atk.hold_off()
             self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
             self._cur = None
             return
-        self._wrote = False
         if self.state is None or self.player is None:
             self.run_cb.setChecked(False)
             QMessageBox.information(self, "還不能開始",
@@ -360,94 +469,64 @@ class CharFarmPage(QWidget):
                 "「選中怪物」是空的。點右邊的名字加進來，或自己打字後按 Enter。")
             return
         self._kills = 0
-        self._acc = 0.0
-        self._since_scan = RESCAN_GAP      # 立刻找一隻來打
+        self._killed.clear()
+        self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
         self._cur = None
         self.status.setText("掛機中：只打「" + "、".join(want) + "」")
 
     def tick(self, dt: float) -> None:
-        """迴圈的一次心跳。由分頁的計時器統一驅動。
+        """UI 側的心跳：只做「挑目標、卡住偵測、更新狀態列」。
 
-        ★ 停止條件是實測出來的：**目標死掉時，遊戲會自己把 +0x2D8 清成 0**
-        （盯一台練功中的分身 60 秒，看到 6 次「設定目標 → 幾秒後被清成 0」）。
-        所以「我們寫過、現在卻是 0」就是那隻死了 —— 這比 is_alive() 更即時，
-        因為物件被回收再利用之前，vtable 和 ID 可能都還在。
-
-        不這樣做的話，迴圈會一直把死掉的 ID 寫回去，跟遊戲的清理互相搶，
-        而且對著不存在的怪一直送 F2。
+        真正的攻擊迴圈（寫目標 + 送 F2）在 AttackWorker 自己的執行緒上跑，
+        節奏不受 UI 影響 —— 原本整個迴圈掛在這裡，UI 一忙節奏就漂掉，
+        使用者的感受就是「很卡」。
         """
         if not self.run_cb.isChecked() or self.state is None:
             return
         self._since_scan += dt
         if self._waiting:                   # 正在等重新掃描的結果
             return
-        if self._cur is None:               # 沒有目標 → 重新掃描找下一隻
+        if self._cur is None:
+            # 清單裡挑得到就直接接上（不必等重掃）；真的沒了才排重掃
+            if self._pick_next():
+                return
             if self._since_scan >= RESCAN_GAP:
                 self._since_scan = 0.0
                 self._waiting = True
                 self._on_scan(self.pid)
             return
 
-        self._acc += dt
-        if self._acc < self.interval.value():
-            return
-        self._acc = 0.0
         m = self._cur
-
-        try:
-            cur = entity.read_target(self.sc, self.state)
-        except Exception as exc:                   # noqa: BLE001
-            self._stop_with(f"⚠ 讀取失敗：{exc}")
-            return
-
-        # ★ 先讀後判斷、再寫 —— 順序很重要（見下方說明）
-        hp = entity.read_target_hp(self.sc, self.state)
-
-        # 目標死了 → 換下一隻（不是停下來）。
-        # 只用「遊戲把目標清成 0」與「物件已被回收」當訊號 —— 不能用血量歸零，
-        # 因為下面每輪都會把血量寫回 100，那個訊號已經被我們自己蓋掉了。
-        dead = (self._wrote and cur == 0) or not entity.is_alive(self.sc, m)
-        if dead:
-            self._kills += 1
-            self._cur = None
-            self._since_scan = RESCAN_GAP       # 立刻重掃
-            self.status.setText(
-                f"「{m.name}」倒了（累計 {self._kills} 隻）→ 找下一隻…")
-            return
-
-        # ⚠ **每一輪都要重寫兩個欄位**，不能「已經是這隻就跳過」。
-        # 使用者實測：測試按鈕（寫入後立刻連送 5 次）有時成功，但迴圈完全不行。
-        # 差別就在這裡 —— 遊戲會把 +0x2DC 改回 0（伺服器沒確認這個目標），
-        # 而攻擊前會檢查它 > 0。只寫一次的話，之後每次送鍵都被 jle 跳掉。
-        # 兩個 4-byte 寫入成本可以忽略，寧可每輪都寫。
-        try:
-            entity.set_target(self.sc, self.state, m.eid)
-        except Exception as exc:                   # noqa: BLE001
-            self._stop_with(f"⚠ 寫入失敗：{exc}")
-            return
-        self._wrote = True
-        self._keys.request(_send_scan, self.hwnd)
+        hp = self._atk.hp
+        me = self.my_pos()
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
         # 代表這隻走不過去（隔著地形之類），換一隻。
-        me = self.my_pos()
         moving = (me is not None and self._last_pos is not None
                   and (abs(me[0] - self._last_pos[0]) > 0.2
                        or abs(me[1] - self._last_pos[1]) > 0.2))
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
             self._stuck = 0.0
         else:
-            self._stuck += self.interval.value()
+            self._stuck += dt
         self._last_pos = me
         self._last_hp = hp
         if self._stuck >= STUCK_SECS:
+            self._killed.add(m.eid)   # 這隻走不過去，這輪別再挑它
+            self._atk.hold_off()
             self._cur = None
-            self._since_scan = RESCAN_GAP
+            if not self._pick_next():
+                self._since_scan = RESCAN_GAP
             self.status.setText(
-                f"「{m.name}」{STUCK_SECS:.0f} 秒沒進展（走不過去？）→ 重新挑…")
+                f"「{m.name}」{STUCK_SECS:.0f} 秒沒進展（走不過去？）→ 換一隻")
             return
 
+        # 狀態列不必每一拍都重畫（心跳 10ms，重畫太頻繁反而拖慢 UI）
+        self._show += dt
+        if self._show < STATUS_GAP:
+            return
+        self._show = 0.0
         # 距離要用當下的座標算：怪會走、角色也在走，掃描時的座標早就過期了
         mp = entity.read_pos(self.sc, m.addr)
         d = (math.hypot(mp[0] - me[0], mp[1] - me[1])
@@ -469,7 +548,7 @@ class FarmTab(BaseTab):
         self._pages: dict[int, CharFarmPage] = {}
         self._scanners: list[MemoryScanner] = []
         self._worker: ScanWorker | None = None
-        self._keys: KeyWorker | None = None
+        self._keys: list[AttackWorker] = []   # 每個分身一條攻擊執行緒
 
         root = QVBoxLayout(self)
 
@@ -525,11 +604,11 @@ class FarmTab(BaseTab):
         self._worker = ScanWorker()
         self._worker.done.connect(self._on_scan_done)
         self._worker.start()
-        self._keys = KeyWorker()
-        self._keys.start()
         for pid, hwnd, title, sc in insts:
-            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
-                                self._keys)
+            atk = AttackWorker(hwnd, sc)
+            atk.start()
+            self._keys.append(atk)
+            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan, atk)
             self._pages[pid] = page
             acct = charname.account_from_title(title)
             nm = charname.read_character_name(sc, acct) or acct
@@ -558,12 +637,11 @@ class FarmTab(BaseTab):
     def _teardown(self) -> None:
         for page in self._pages.values():
             page.run_cb.setChecked(False)
-        for th in (self._worker, self._keys):
-            if th is not None:
-                th.stop()
-                th.wait(5000)
+        for th in ([self._worker] if self._worker else []) + self._keys:
+            th.stop()
+            th.wait(5000)
         self._worker = None
-        self._keys = None
+        self._keys = []
         self.tabs.clear()
         self._pages = {}
         for sc in self._scanners:

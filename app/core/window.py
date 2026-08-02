@@ -195,6 +195,10 @@ SEND_TIMEOUT_MS = 200
 def send_key(hwnd: int, vk_code: int, timeout_ms: int = SEND_TIMEOUT_MS) -> bool:
     """送出一次完整的按鍵（KEYDOWN + KEYUP）。回傳是否送達。
 
+    ⚠ 要連續施法就是**重複呼叫這個**，不要改成「只送 KEYDOWN 模擬按住」。
+    使用者實測：這個遊戲**按住不放不會一直放技能**，必須一次次按放；
+    他自己就是狂點鍵盤的。（試過改成按住，方向是錯的。）
+
     ⚠ 一定要用 SendMessage，不能用 PostMessage —— 實測本專案的遊戲
     **只吃 SendMessage**（PostMessage 不管 lParam 帶不帶掃描碼都沒反應）。
     原因：SendMessage 是直接呼叫目標視窗的訊息處理函式，而 PostMessage 只是
