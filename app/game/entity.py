@@ -255,6 +255,19 @@ def _write_u32(scanner, addr: int, value: int) -> None:
     scanner.write_value(addr, VALUE_TYPES["int32"], signed)
 
 
+def set_target_id(scanner, state: int, eid: int) -> None:
+    """**只寫目標 ID，不碰血量欄位。**
+
+    ★ 用封包攻擊時要用這個，不要用 set_target()。
+      血量欄位（+0x2DC）是遊戲用來告訴我們「這隻剩多少血、死了沒」的，
+      set_target() 會把它寫成 100 —— 那是為了餵飽**按鍵**攻擊的前置檢查
+      （`cmp [esi+0x2dc],0 / jle 跳過`）。封包攻擊是直接呼叫施放函式，
+      不經過那個檢查，所以沒必要寫；一寫就把死亡訊號蓋掉了，
+      結果是打死了還一直打屍體（使用者回報的「鎖定一隻怪發呆」）。
+    """
+    _write_u32(scanner, state + OFF_TARGET, eid)
+
+
 def set_target(scanner, state: int, eid: int,
                hp_pct: int = TARGET_HP_FULL) -> None:
     """把目標寫進客戶端狀態。之後送出攻擊按鍵，角色就會打這隻。

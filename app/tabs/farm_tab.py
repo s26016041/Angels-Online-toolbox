@@ -112,7 +112,6 @@ ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
-NOVIEW_SECS = 1.5               # 讀不到目標座標這麼久就換一隻（別等 STUCK_SECS）
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -297,11 +296,16 @@ class TargetWorker(_Paced):
         super().__init__(WRITE_INTERVAL)
         self.sc = sc
         self.hp = 0                 # 最近讀到的目標血量，給 UI 顯示
+        # 用封包攻擊時 True：只寫目標 ID、**不碰血量欄位**，
+        # 這樣血量才是遊戲寫的真值，0 就真的代表死了。見 entity.set_target_id。
+        self.packets = False
         self._job: tuple[int, entity.Entity] | None = None
         self._wrote = False
+        self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
+        self._saw_hp = False
         self._job = (state, ent)
 
     def hold_off(self) -> None:
@@ -318,16 +322,30 @@ class TargetWorker(_Paced):
             # 先寫回去就把訊號蓋掉了。
             cur = entity.read_target(self.sc, state)
             self.hp = entity.read_target_hp(self.sc, state)
-            if self._wrote and (cur == 0 or not entity.is_alive(self.sc, ent)):
+            if self.hp > 0:
+                self._saw_hp = True
+            # ★ 用封包攻擊時，血量歸零就是**遊戲告訴我們這隻死了**。
+            #   這才是可靠的死亡訊號 —— 屍體不會馬上從實體清單消失，
+            #   `is_alive()`（vtable + 實體 ID）也分不出死活，
+            #   所以以前只能等卡住偵測 10 秒才換怪，看起來就是「鎖定一隻怪發呆」。
+            #   ⚠ 要先看過 > 0 才能用：剛選定的那幾毫秒遊戲還沒填，讀到的是 0。
+            dead_by_hp = self.packets and self._saw_hp and self.hp == 0
+            if self._wrote and (cur == 0 or dead_by_hp
+                                or not entity.is_alive(self.sc, ent)):
                 self._job = None
                 self._wrote = False
                 self.died.emit(ent.eid)
                 return
 
-            # ⚠ **每一圈都要重寫兩個欄位**，不能「已經是這隻就跳過」：
-            # 遊戲會把 +0x2DC（目標血量%）改回 0，而攻擊前會檢查它 > 0
-            # （`cmp [esi+0x2dc],0 / jle 跳過`）。只寫一次的話之後全被跳掉。
-            entity.set_target(self.sc, state, ent.eid)
+            if self.packets:
+                # 只寫 ID。**不要寫血量** —— 那是遊戲用來回報死活的欄位，
+                # 寫下去就把死亡訊號蓋掉了（見 entity.set_target_id）。
+                entity.set_target_id(self.sc, state, ent.eid)
+            else:
+                # 按鍵攻擊才需要餵血量：遊戲攻擊前會檢查 +0x2DC > 0
+                # （`cmp [esi+0x2dc],0 / jle 跳過`），而它每輪都會清回 0，
+                # 所以**每一圈都要重寫**，不能「已經是這隻就跳過」。
+                entity.set_target(self.sc, state, ent.eid)
             self._wrote = True
         except Exception as exc:               # noqa: BLE001
             self._job = None
@@ -538,7 +556,6 @@ class CharFarmPage(QWidget):
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
-        self._noview = 0.0         # 讀不到目標座標多久了
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -876,7 +893,6 @@ class CharFarmPage(QWidget):
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
         self._walked_ok = True
-        self._noview = 0.0
         self._why = ""
         self._last_hp = -1
         self._last_pos = me
@@ -1067,6 +1083,10 @@ class CharFarmPage(QWidget):
             self._path_pts = n if n > 0 else -1
             self._walked_ok = n > 0
 
+        # 兩條執行緒對「現在是不是用封包打」要有共識：
+        # 寫目標那條要據此決定「寫不寫血量」（寫了就蓋掉死亡訊號）。
+        self._atk.packets = bool(self._keys.packets and self._keys.skill
+                                 and self._keys.mover is not None)
         self._keys.set_on(in_range)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
@@ -1087,22 +1107,9 @@ class CharFarmPage(QWidget):
         else:
             self._why = "→ 走進攻擊範圍"
 
-        # ★ 讀不到座標就別傻等 STUCK_SECS（10 秒）—— 那多半是怪的物件已經被
-        #   回收了，等於對著空氣鎖定。1.5 秒還讀不到就換一隻。
-        if dist is None:
-            self._noview += dt
-            if self._noview >= NOVIEW_SECS:
-                self._killed[m.eid] = time.monotonic()
-                self._atk.hold_off()
-                self._cur = None
-                self._keys.eid = None
-                if not self._pick_next():
-                    self._keys.set_on(False)
-                    self._since_scan = RESCAN_GAP
-                self.status.setText(f"「{m.name}」讀不到座標 → 換一隻")
-                return
-        else:
-            self._noview = 0.0
+        # ⛔ 這裡曾經加過「讀不到座標超過 N 秒就換一隻」—— 拿掉了。
+        #    那是用 timeout 蓋過症狀，而且量過根本沒發生：
+        #    掃描 100 輪，狀態與玩家物件**都是 100/100 剛好命中 1 個**。
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
