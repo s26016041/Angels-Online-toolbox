@@ -26,7 +26,7 @@ import math
 import struct
 from collections import Counter
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # angel.dat 程式碼(.text)大致範圍，用來從堆疊挑出「遊戲內的返回位址」= 呼叫鏈。
@@ -36,9 +36,13 @@ CODE_HI = 0x7D0000
 
 # 環狀緩衝參數
 _N = 128            # 槽數（2 的次方，取模用 and）
-_FRAMES = 12        # 沿 EBP 往上走幾層，每層記一個返回位址
+_FRAMES = 12        # 沿 EBP 往上走幾層
+# 每層記 5 個 dword：[ebp+4] 返回位址，加上 [ebp+8/+c/+10/+14] 前四個參數。
+# 記參數是為了看清楚「建構這種封包的函式」被傳了什麼 —— 那些函式是腳本 VM 的
+# 原生函式，參數從腳本堆疊推進來，光看呼叫端的組語看不出語意。
+_FRAME_DWORDS = 5
 _CAP = 200          # 每筆最多記幾 bytes payload
-_PAYLOAD_OFF = 8 + _FRAMES * 4     # caller(4)+len(4)+frames
+_PAYLOAD_OFF = 8 + _FRAMES * _FRAME_DWORDS * 4   # caller(4)+len(4)+frames
 _SLOT = _PAYLOAD_OFF + _CAP
 
 
@@ -114,6 +118,12 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
       1. 下界：必須大於目前 esp，而且每層都要比前一層高（防止繞回去無限迴圈）
       2. 上界：TEB(fs:[0x18]) 的 StackBase，也就是這條執行緒堆疊真正的頂端
       3. 對齊：必須 4 對齊
+
+    ★ 每層除了返回位址，還記 [ebp+8/+c/+10/+14] = 那一層函式的前四個參數。
+      這樣就能直接看到「建構封包的函式」收到什麼 —— 那些是腳本 VM 的原生函式，
+      參數從腳本堆疊推進來，看呼叫端的組語推不出語意。
+      ⚠ 因為現在會讀到 [ebp+0x14]，上界必須從 StackBase-8 收緊到 **-0x20**，
+        否則最後一層可能讀出堆疊頂端 —— 那就是當場崩潰。
     """
     return f"""
     pushad
@@ -132,7 +142,7 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     mov edx, ebp
     mov eax, dword ptr fs:[0x18]
     mov ebp, dword ptr [eax+0x4]
-    sub ebp, 0x8
+    sub ebp, 0x20
     mov ecx, {_FRAMES:#x}
     walk:
     cmp edx, esi
@@ -143,7 +153,15 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     jnz fill
     mov eax, dword ptr [edx+0x4]
     mov dword ptr [edi], eax
-    add edi, 0x4
+    mov eax, dword ptr [edx+0x8]
+    mov dword ptr [edi+0x4], eax
+    mov eax, dword ptr [edx+0xc]
+    mov dword ptr [edi+0x8], eax
+    mov eax, dword ptr [edx+0x10]
+    mov dword ptr [edi+0xc], eax
+    mov eax, dword ptr [edx+0x14]
+    mov dword ptr [edi+0x10], eax
+    add edi, 0x14
     mov esi, edx
     mov edx, dword ptr [edx]
     dec ecx
@@ -151,7 +169,11 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     jmp payload
     fill:
     mov dword ptr [edi], 0x0
-    add edi, 0x4
+    mov dword ptr [edi+0x4], 0x0
+    mov dword ptr [edi+0x8], 0x0
+    mov dword ptr [edi+0xc], 0x0
+    mov dword ptr [edi+0x10], 0x0
+    add edi, 0x14
     dec ecx
     jnz fill
 
@@ -187,6 +209,11 @@ class Packet:
     length: int          # 實際送出長度
     data: bytes          # 內容（截斷到 CAP）
     frames: list[int]    # 沿 EBP 走出來的各層返回位址（0 = 走不下去了）
+    # 各層函式的前四個參數，與 frames 同索引。
+    # ⚠ 索引 i 的參數屬於「返回位址是 frames[i] 的那一層」，也就是**被呼叫的那個
+    #   函式自己**的參數 —— 例如 frames[i] == 0x664608 時，args[i] 就是
+    #   移動封包建構函式 0x55A046 收到的 (a1, a2, count, a4)。
+    args: list[tuple[int, int, int, int]] = field(default_factory=list)
 
     @property
     def call_chain(self) -> list[int]:
@@ -303,12 +330,15 @@ class SendCapture:
         for idx in range(start, wc):
             slot = ring + (idx % _N) * _SLOT
             head = pm.read_bytes(slot, _PAYLOAD_OFF)
-            vals = struct.unpack(f"<II{_FRAMES}I", head)
+            vals = struct.unpack(f"<II{_FRAMES * _FRAME_DWORDS}I", head)
             caller, length = vals[0], vals[1]
-            frames = list(vals[2:])
+            rec = vals[2:]
+            frames = [rec[i * _FRAME_DWORDS] for i in range(_FRAMES)]
+            args = [tuple(rec[i * _FRAME_DWORDS + 1:i * _FRAME_DWORDS + 5])
+                    for i in range(_FRAMES)]
             n = min(length, _CAP)
             data = bytes(pm.read_bytes(slot + _PAYLOAD_OFF, n)) if n > 0 else b""
-            out.append(Packet(idx, caller, length, data, frames))
+            out.append(Packet(idx, caller, length, data, frames, args))
         self._read = wc
         return out
 
