@@ -250,26 +250,40 @@ class Mover:
                 time.sleep(0.005)
         return None
 
-    def path_to(self, scanner, tile_x: float, tile_y: float) -> int:
+    def path_to(self, scanner, tile_x: float, tile_y: float,
+                wait: float = 0.0) -> int:
         """**只算路徑、不移動**，回傳路徑點數。
 
         這是「中間有沒有障礙物」最直接的答案，不必先走一步再看：
             1 個點  = 直線過得去
             多個點  = 要繞，代表中間有地形
             0       = 算不出路徑（那個方向不通，或超出尋路範圍）
-        一次呼叫約一幀（十幾毫秒），挑到新目標時算一次就夠。
+           -1       = 指令槽正被別人用（攻擊封包），這次先跳過，等一下再問
+        一次呼叫約一幀（實測 5～6ms），挑到新目標時算一次就夠。
+
+        ⚠ **這個函式常常是在 UI 執行緒上呼叫的**，所以預設 wait=0：
+          搶不到鎖就馬上回 -1，絕不卡住畫面。攻擊執行緒送三連包時會連續
+          佔著指令槽（約 50ms／次、每 50ms 一次），阻塞等待等於凍結整個介面
+          —— 使用者回報的「打一打卡住」就是這樣來的。
         """
         this = pathfinder_this(scanner)
         if not this:
             return 0
-        tx = int(tile_x * entity.TILE_UNITS) & 0xFFFF
-        ty = int(tile_y * entity.TILE_UNITS) & 0xFFFF
-        n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
-                           ecx=this, timeout=0.15)
+        got = (self._lock.acquire(timeout=wait) if wait > 0
+               else self._lock.acquire(blocking=False))
+        if not got:
+            return -1
+        try:
+            tx = int(tile_x * entity.TILE_UNITS) & 0xFFFF
+            ty = int(tile_y * entity.TILE_UNITS) & 0xFFFF
+            n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
+                               ecx=this, timeout=0.15)
+        finally:
+            self._lock.release()
         return n if (n and 0 < n <= MAX_POINTS) else 0
 
     def walk_to(self, scanner, player_obj: int,
-                tile_x: float, tile_y: float) -> int:
+                tile_x: float, tile_y: float, wait: float = 0.12) -> int:
         """走到指定的格子座標。**回傳尋路算出的路徑點數**（0 = 走不了）。
 
         ★ 那個點數就是免費的「有沒有障礙物」指標：
@@ -303,7 +317,11 @@ class Mover:
         # ★ 「算路徑 → 送移動封包」中間不能被插隊：路徑點是寫在**全域**陣列
         #   0x9B6684 裡的，別人（攻擊封包）中間插一個呼叫倒是不會動到它，
         #   但我們自己若被切開就可能拿舊路徑去送。整段一起鎖最安全。
-        with self._lock:
+        # ⚠ 但這也常在 UI 執行緒上呼叫，所以只等 wait 秒 —— 等不到就回 0，
+        #   呼叫端過一下會再試一次，總之不要凍住畫面（見 path_to 的說明）。
+        if not self._lock.acquire(timeout=wait):
+            return 0
+        try:
             for hop in (full,) + PATH_TRY:
                 if hop > full:
                     continue
@@ -314,6 +332,8 @@ class Mover:
                 if n and 0 < n <= MAX_POINTS:
                     self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
                     return n
+        finally:
+            self._lock.release()
 
         # ⚠ 連最短的中繼點都算不出路徑 = 那個方向真的不通。
         # **不要退回直線走** —— 那只會讓角色貼著牆推、原地卡住

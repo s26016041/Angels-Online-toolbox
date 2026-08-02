@@ -111,6 +111,7 @@ LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密�
 ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
+PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -533,6 +534,7 @@ class CharFarmPage(QWidget):
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
+        self._path_t = 0.0         # 距離上次問尋路過了多久
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -868,6 +870,7 @@ class CharFarmPage(QWidget):
         d, self._cur = pool[0]                    # 就打最近的
         self._stuck = 0.0
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
+        self._path_t = PATH_GAP                   # 下一拍就問
         self._last_hp = -1
         self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
@@ -1029,11 +1032,16 @@ class CharFarmPage(QWidget):
         # ⚠ 讀不到座標（dist is None）算「不在範圍內」—— 位置不明就別亂送封包，
         #   那多半是怪的物件已經被回收了。
         #
-        # ★ 有沒有障礙物**直接問遊戲的尋路函式**（只算不走，約一幀）：
+        # ★ 有沒有障礙物**直接問遊戲的尋路函式**（只算不走，實測 5～6ms）：
         #   回 1 點就是直線通、多點就是要繞。挑到新目標時算一次即可，
         #   不必先走一步再看 —— 否則近距離隔著牆的怪會被當成「在範圍內」空打。
-        if (self._path_pts < 0 and mp is not None and me
-                and self._mover is not None and self._mover.active):
+        # ⚠ 搶不到指令槽時會回 -1（攻擊執行緒正在送封包）。**絕不阻塞等待**，
+        #   那是在 UI 執行緒上，一等畫面就凍住（使用者回報的「打一打卡住」）。
+        #   維持 -1 = 還不知道，隔 PATH_GAP 再問一次就好。
+        self._path_t += dt
+        if (self._path_pts < 0 and self._path_t >= PATH_GAP and mp is not None
+                and me and self._mover is not None and self._mover.active):
+            self._path_t = 0.0
             self._path_pts = self._mover.path_to(self.sc, mp[0], mp[1])
         # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
