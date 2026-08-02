@@ -85,17 +85,14 @@ KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
 
-# ★ 不設「攻擊半徑」——**每個角色的射程不一樣，寫死任何數字都是錯的**。
-# 改成用「目標有沒有在掉血」自己判斷：
-#     掉血 = 打得到 → 站著打，別再移動（移動會打斷節奏）
-#     沒掉血超過 NO_DMG_WAIT 秒 → 打不到，繼續走過去
-# 這樣不管是近戰還是遠程、換武器換技能，都不必重設。
-#
-# 為什麼不用固定半徑：實測黑狐的射程約 14 格（125 次攻擊的距離分佈上緣），
-# 但先前預設 26 —— 怪在 16~26 格時程式以為打得到就不走，只能等遊戲自己慢慢
-# 接近；真的走時又停在 26-3=23 格、還在射程外。實測 36% 的時間耗在空檔上。
+# ★ 射程**自己量出來**，不設定也不寫死 —— 每個角色、每把武器都不一樣。
+#   證據來源：目標掉血的那一刻，當下的距離就是「這個距離打得到」的證明。
+#   取看過的最大值當射程，之後就走到那個距離就好，不必貼到怪臉上。
+#   （實測黑狐約 14 格；先前寫死 26 害得 36% 的時間都在空等。）
 NO_DMG_WAIT = 1.2               # 沒掉血這麼久就判定打不到，繼續走過去
-CLOSE_ENOUGH = 2.0              # 走到離怪這麼近就別再走了（不要疊在牠身上）
+CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
+RANGE_KEEP = 0.9                # 走到「量到的射程 × 這個」就停，留一點餘裕
+RANGE_DECAY = 0.995             # 射程每輪微幅衰減，免得偶然的大值卡住不修正
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -439,6 +436,9 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._no_dmg = 0.0         # 目標多久沒掉血（用來判斷打不打得到）
         self._path_pts = 1         # 上次尋路的路徑點數（>1 = 中間有地形）
+        # 量出來的射程：目標掉血時的距離就是「打得到」的證據，取最大值。
+        # None = 還沒量到（第一次打怪時會先貼近，量到就放寬）。
+        self._range: float | None = None
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -868,24 +868,31 @@ class CharFarmPage(QWidget):
         m = self._cur
         hp = self._atk.hp
 
-        # ★ 打得到就別動，打不到就走過去 —— 用「目標有沒有掉血」判斷，
-        # 不設固定射程（每個角色不一樣）。掉血就把計時歸零、停止移動。
+        mp = entity.read_pos(self.sc, m.addr)
+        dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
+
+        # ★ 掉血 = 這個距離打得到 → 記下來當射程（取看過的最大值）
         if 0 < hp < self._last_hp:
             self._no_dmg = 0.0
+            if dist is not None:
+                self._range = max(self._range or 0.0, dist)
         else:
             self._no_dmg += dt
+        if self._range:
+            self._range *= RANGE_DECAY      # 慢慢衰減，換武器變短也會跟著修正
 
-        # ★ 隔著地形時「距離近」是假的 —— 站在牆這邊打不到牆那邊的怪。
-        # 尋路回傳的路徑點數就是免費的障礙偵測（1 = 直線通，>1 = 要繞），
-        # 只要還要繞就一路走到牠臉上，不要因為直線距離近就停下來乾等。
-        # （這個做法是使用者提的。）
+        # 走多近才停：
+        #   隔著地形（路徑要繞）→ 貼到臉上，不然打不到（使用者指出的重點）
+        #   射程已經量到　　　　→ 走到射程的九成就好，不必貼臉
+        #   還不知道射程　　　　→ 先貼近，量到第一次掉血就會放寬
+        # ★ 隔著地形時「直線距離近」是假的，所以那時不看距離、照走。
         blocked = self._path_pts > 1
+        keep = CLOSE_ENOUGH if (blocked or not self._range) \
+            else self._range * RANGE_KEEP
         if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
-                and (blocked or self._no_dmg >= NO_DMG_WAIT)):
-            mp = entity.read_pos(self.sc, m.addr)
-            if mp and math.hypot(mp[0] - me[0], mp[1] - me[1]) > CLOSE_ENOUGH:
-                self._path_pts = self._walk_toward(mp[0], mp[1], me,
-                                                   CLOSE_ENOUGH)
+                and (blocked or self._no_dmg >= NO_DMG_WAIT)
+                and dist is not None and dist > keep):
+            self._path_pts = self._walk_toward(mp[0], mp[1], me, keep)
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
@@ -915,12 +922,12 @@ class CharFarmPage(QWidget):
         if self._show < STATUS_GAP:
             return
         self._show = 0.0
-        # 距離要用當下的座標算：怪會走、角色也在走，掃描時的座標早就過期了
-        mp = entity.read_pos(self.sc, m.addr)
-        d = (math.hypot(mp[0] - me[0], mp[1] - me[1])
-             if mp and me else float("nan"))
+        d = dist if dist is not None else float("nan")
         self.status.setText(
-            f"掛機中：{m.name}　距離 {d:.1f} 格　目標血量 {hp}%"
+            f"掛機中：{m.name}　距離 {d:.1f} 格"
+            + (f"（射程 {self._range:.0f}）" if self._range else "（射程量測中）")
+            + (f"　⛰ 隔著地形，走到臉上" if blocked else "")
+            + f"　目標血量 {hp}%"
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
             + (f"　武器耐久 {self._dura[0]}"
                + (f"/{self._dura[1]}" if self._dura[1] > 0 else "")
