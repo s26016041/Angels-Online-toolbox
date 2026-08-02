@@ -10,14 +10,17 @@
 
 所以走遊戲自己的移動函式，讓它處理尋路封包、混淆與加密。
 
-移動函式（反組譯 + 實測參數，見 app/core/injector.py 的參數擷取）
+兩個函式（反組譯 + 實測參數，見 app/core/injector.py 的參數擷取）
 ---------------------------------------------------------------
-    0x55A046   f(u16 起點世界X, u16 起點世界Y, int 路徑點數, u16 亂數)
+    0x549B81   尋路。__thiscall，eax = 算出來的路徑點數（0 = 算不出來）
+               f(u16 目標世界X, u16 目標世界Y, 輸出緩衝=0x9B6684)
+               ★ **一般移動一律先走這個** —— 它會繞過地形。
+
+    0x55A046   送出移動封包。f(起點世界X, 起點世界Y, 路徑點數, 亂數)
                封包 = 上面四個欄位 + 全域陣列 0x9B6684 的 路徑點數*4 bytes
                每個路徑點 = 兩個 u16 世界座標（一格 32，見 app/game/entity.py）
-
-    a4 是 16 位元亂數（實測 7 筆全不同、跟 GetTickCount 對不上、也不遞增），
-    隨便給即可。
+               最後那個是 16 位元亂數（實測 7 筆全不同、跟 GetTickCount 對不上、
+               也不遞增），隨便給即可。
 
 怎麼呼叫（不開新執行緒）
 ------------------------
@@ -28,11 +31,12 @@
 連線物件與封包佇列，在別的執行緒上動它等於資料競爭。
 這跟 app/core/injector.py 的 send 攔截是同一套已驗證的 IAT hook 機制。
 
-實測（黑狐）：走 3 格準確停在 3.00 格、走 18 格 2 秒精準抵達，位置穩定不回彈
-（伺服器認），遊戲全程正常、IAT 乾淨還原。
+實測（黑狐）：短距離誤差 0.00 格、位置穩定不回彈（伺服器認）；
+長距離從 (139.5,31.5) 走到 (54,40) 共 85.9 格、8.5 秒，全程自動繞地形。
+遊戲全程正常、IAT 乾淨還原。
 
-⚠ 只給 1 個路徑點 = 直線走。遇到地形障礙會卡住（遊戲自己的路徑有 2～3 個點，
-是它的尋路算出來的，我們沒有）。呼叫端要自己做「位置沒變 = 卡住」的偵測。
+⚠ 尋路算不出路徑時 walk_to() 回 False 而**不會**退回直線走 ——
+直線只會讓角色貼著牆推、原地卡住。回 False 讓呼叫端換目標比較好。
 """
 from __future__ import annotations
 
@@ -91,12 +95,6 @@ def pathfinder_this(scanner) -> int | None:
 HOOK_IMPORT = "PeekMessageA"
 MAX_POINTS = 32             # 一次最多送幾個路徑點（封包大小 = 點數*4+9）
 
-# ★ 每個路徑點之間隔多遠（格）。**只送一個點的話走不遠**：
-#     送 10 格 → 走 9.5　送 20 格 → 走 19.0　送 30 格 → **還是只走 19.0**
-#   超過約 19~20 格的部分會被默默丟掉，症狀是「走到一半停住」而且不會報錯。
-#   遊戲自己送的移動封包是 38 bytes = 3 個路徑點，就是為了這個。
-#   所以我們也切成多點；用比上限小不少的間距，留餘裕。
-HOP_TILES = 12.0
 
 # 注入區塊的版面
 _FLAG, _ORIG, _A1, _A2, _CNT, _A4, _DONE, _FN = (
@@ -248,31 +246,37 @@ class Mover:
         if full < 0.5:
             return False
 
-        # ★ 先請遊戲自己尋路：它會繞過地形，我們自己只會畫直線。
+        # ★ 一律走遊戲自己的尋路：它會繞過地形，我們自己只會畫直線。
         # 尋路有效範圍約 30~40 格，太遠回 0，所以由遠到近試幾個中繼距離；
         # 走到中繼點後呼叫端再下一次，就能接力走很遠
         # （實測 85.9 格、8.5 秒到達，全程繞過地形）。
         this = pathfinder_this(scanner)
-        if this:
-            for hop in (full,) + PATH_TRY:
-                if hop > full:
-                    continue
-                tx = int((cx + dx / full * hop) * entity.TILE_UNITS) & 0xFFFF
-                ty = int((cy + dy / full * hop) * entity.TILE_UNITS) & 0xFFFF
-                n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
-                                   ecx=this, timeout=0.15)
-                if n and 0 < n <= MAX_POINTS:
-                    return self.call(MOVE_FN, wx, wy, n,
-                                     random.randint(1, 0xFFFF))
+        if not this:
+            return False
+        for hop in (full,) + PATH_TRY:
+            if hop > full:
+                continue
+            tx = int((cx + dx / full * hop) * entity.TILE_UNITS) & 0xFFFF
+            ty = int((cy + dy / full * hop) * entity.TILE_UNITS) & 0xFFFF
+            n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
+                               ecx=this, timeout=0.15)
+            if n and 0 < n <= MAX_POINTS:
+                return self.call(MOVE_FN, wx, wy, n,
+                                 random.randint(1, 0xFFFF))
 
-        # 尋路不給路徑（不可達／算不出來）就退回自己切直線，總比不動好
-        k = max(1, min(MAX_POINTS, math.ceil(full / HOP_TILES)))
-        pts = [(cx + dx * (i + 1) / k, cy + dy * (i + 1) / k)
-               for i in range(k)]
-        return self.walk_path(scanner, player_obj, pts)
+        # ⚠ 連最短的中繼點都算不出路徑 = 那個方向真的不通。
+        # **不要退回直線走** —— 那只會讓角色貼著牆推、原地卡住
+        # （使用者回報的「往那個方向卡住」就是這樣來的）。
+        # 回 False 讓呼叫端自己決定（掛機那邊會由卡住偵測換目標）。
+        return False
 
     def walk_path(self, scanner, player_obj: int, tiles) -> bool:
-        """依序走過多個格子座標（最後一個是終點）。"""
+        """低階：直接送出指定的路徑點（最後一個是終點）。
+
+        ⚠ **不會尋路**，遊戲就照你給的點走直線 —— 撞到地形會卡住。
+        一般移動請用 walk_to()，它會先叫遊戲算路徑。
+        這個留給「已經有現成路徑」的情況（例如測試）。
+        """
         if not self._active or not player_obj or not tiles:
             return False
         pts = list(tiles)[:MAX_POINTS]
