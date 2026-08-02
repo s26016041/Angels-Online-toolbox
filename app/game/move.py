@@ -228,8 +228,14 @@ class Mover:
         return None
 
     def walk_to(self, scanner, player_obj: int,
-                tile_x: float, tile_y: float) -> bool:
-        """走到指定的格子座標。回傳是否成功送出請求。
+                tile_x: float, tile_y: float) -> int:
+        """走到指定的格子座標。**回傳尋路算出的路徑點數**（0 = 走不了）。
+
+        ★ 那個點數就是免費的「有沒有障礙物」指標：
+              1 個點  = 直線過得去，中間沒東西擋
+              多個點  = 要繞，代表我們跟目標之間有地形
+          呼叫端可以拿它決定「是不是該一路走到怪臉上」——
+          隔著牆的話站在原地打是打不到的，距離再近也一樣。
 
         ★ **會自動切成多個路徑點**，一個指令走完全程。
           只送一個點的話超過約 19~20 格就會半路停住（實測：送 30 格只走 19.0），
@@ -238,13 +244,13 @@ class Mover:
         """
         raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
         if not raw:
-            return False
+            return 0
         wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
         cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
         dx, dy = tile_x - cx, tile_y - cy
         full = math.hypot(dx, dy)
         if full < 0.5:
-            return False
+            return 0
 
         # ★ 一律走遊戲自己的尋路：它會繞過地形，我們自己只會畫直線。
         # 尋路有效範圍約 30~40 格，太遠回 0，所以由遠到近試幾個中繼距離；
@@ -252,7 +258,7 @@ class Mover:
         # （實測 85.9 格、8.5 秒到達，全程繞過地形）。
         this = pathfinder_this(scanner)
         if not this:
-            return False
+            return 0
         for hop in (full,) + PATH_TRY:
             if hop > full:
                 continue
@@ -261,14 +267,14 @@ class Mover:
             n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
                                ecx=this, timeout=0.15)
             if n and 0 < n <= MAX_POINTS:
-                return self.call(MOVE_FN, wx, wy, n,
-                                 random.randint(1, 0xFFFF))
+                self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
+                return n
 
         # ⚠ 連最短的中繼點都算不出路徑 = 那個方向真的不通。
         # **不要退回直線走** —— 那只會讓角色貼著牆推、原地卡住
         # （使用者回報的「往那個方向卡住」就是這樣來的）。
-        # 回 False 讓呼叫端自己決定（掛機那邊會由卡住偵測換目標）。
-        return False
+        # 回 0 讓呼叫端自己決定（掛機那邊會由卡住偵測換目標）。
+        return 0
 
     def walk_path(self, scanner, player_obj: int, tiles) -> bool:
         """低階：直接送出指定的路徑點（最後一個是終點）。

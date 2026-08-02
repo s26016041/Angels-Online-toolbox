@@ -438,6 +438,7 @@ class CharFarmPage(QWidget):
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._no_dmg = 0.0         # 目標多久沒掉血（用來判斷打不打得到）
+        self._path_pts = 1         # 上次尋路的路徑點數（>1 = 中間有地形）
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -640,23 +641,26 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
             return False
 
-    def _walk_toward(self, gx: float, gy: float, me, keep: float) -> None:
+    def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
         """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
 
         走的是 move.Mover.walk_to()，它會先請**遊戲自己的尋路**算路徑，
         所以會繞過地形；太遠時自動縮短成中繼點，靠這裡定期重下接力走完
         （實測 85.9 格、8.5 秒到達）。
+
+        回傳尋路算出的路徑點數（0 = 走不了，1 = 直線通，>1 = 中間有地形）。
         """
         if not self._ensure_mover():
-            return
+            return 0
         d = math.hypot(gx - me[0], gy - me[1])
         if d <= keep:
-            return
+            return 0
         r = (d - keep) / d                     # 只走到剩 keep 格的位置
-        self._mover.walk_to(self.sc, self.player,
-                            me[0] + (gx - me[0]) * r,
-                            me[1] + (gy - me[1]) * r)
+        n = self._mover.walk_to(self.sc, self.player,
+                                me[0] + (gx - me[0]) * r,
+                                me[1] + (gy - me[1]) * r)
         self._walk_t = 0.0
+        return n
 
     def my_pos(self) -> tuple[float, float] | None:
         """玩家目前的格子座標（每次都重讀，因為角色會走動）。"""
@@ -734,7 +738,10 @@ class CharFarmPage(QWidget):
             return False
         d, self._cur = pool[0]                    # 就打最近的
         self._stuck = 0.0
-        self._no_dmg = 0.0
+        # ★ 剛鎖定時還不知道打不打得到，先當作「打不到」立刻走過去
+        # —— 等第一次掉血再停下來。這樣省掉「先站著空等 NO_DMG_WAIT 秒」。
+        self._no_dmg = NO_DMG_WAIT
+        self._path_pts = 1                        # 還沒算過，先當作直線通
         self._last_hp = -1
         self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
@@ -867,11 +874,18 @@ class CharFarmPage(QWidget):
             self._no_dmg = 0.0
         else:
             self._no_dmg += dt
-        if (self.move_cb.isChecked() and me
-                and self._no_dmg >= NO_DMG_WAIT and self._walk_t >= WALK_GAP):
+
+        # ★ 隔著地形時「距離近」是假的 —— 站在牆這邊打不到牆那邊的怪。
+        # 尋路回傳的路徑點數就是免費的障礙偵測（1 = 直線通，>1 = 要繞），
+        # 只要還要繞就一路走到牠臉上，不要因為直線距離近就停下來乾等。
+        # （這個做法是使用者提的。）
+        blocked = self._path_pts > 1
+        if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
+                and (blocked or self._no_dmg >= NO_DMG_WAIT)):
             mp = entity.read_pos(self.sc, m.addr)
             if mp and math.hypot(mp[0] - me[0], mp[1] - me[1]) > CLOSE_ENOUGH:
-                self._walk_toward(mp[0], mp[1], me, CLOSE_ENOUGH)
+                self._path_pts = self._walk_toward(mp[0], mp[1], me,
+                                                   CLOSE_ENOUGH)
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
         # 正常情況下不是打得到就是角色正在走過去。若血量不掉、玩家座標也不動，
