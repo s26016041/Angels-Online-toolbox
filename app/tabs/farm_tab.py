@@ -116,8 +116,12 @@ WALK_KEEP = 10.0
 #   近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，兩邊都對。
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
-LEARN_TRIES = 6                 # 還沒開打時，最多主動按幾次去學
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
+# 兩種攻擊方式（兩個分頁各用一種）：
+#   MODE_PACKET —— 選定封包 + 動作/施放封包（原本的「自動掛機」）
+#   MODE_KEY    —— 選定封包 + 狂按技能鍵（「自動掛機（按鍵）」）
+MODE_PACKET = "packet"
+MODE_KEY = "key"
 # ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
 #    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
@@ -210,7 +214,8 @@ class KeyWorker(_Paced):
         self.sc = sc
         self.vk = DEFAULT_KEY
         self.sent = 0
-        self.packets = True         # 使用者要不要用封包攻擊
+        self.mode = MODE_PACKET     # 這個分頁用哪種攻擊方式
+        self.packets = True         # 使用者要不要用封包攻擊（封包模式才有意義）
         self.stats = None           # 角色屬性基準（學技能 ID 用）
         self.mover = None
         self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
@@ -219,25 +224,25 @@ class KeyWorker(_Paced):
         self.skill = None           # 學到的技能 ID
         self._on = False
         self._learning = False
-        self._tries = 0
         self._next_learn = 0.0
 
     def set_on(self, on: bool) -> None:
         self._on = on
 
     def begin_learning(self) -> None:
-        """學技能 ID：**先把欄位清成 0**，再送使用者選的那個鍵，讀回來就是答案。
+        """開始學技能 ID —— 只有三步：**清零 → 按選定的 Fx → 讀記憶體**。
 
-        ★ 只按那一個鍵，其他鍵一概不碰。
+        這裡做第一步（清零），後面兩步在 step() 裡：攻擊本來就會按那個鍵，
+        每 LEARN_GAP 讀一次，讀到非零值就結束。
+
         ⚠⚠ **一定要先清零**。單次按鍵不保證會寫入（冷卻／間隔；黑狐在沒有
-          目標時甚至完全不寫），不清零就會讀到**上一次殘留的技能 ID**——
+          目標時甚至完全不寫），不清零就會讀到**上一次殘留的技能 ID** ——
           雪狐就是這樣把 F3 的 0x2E1 當成 F2 的技能，結果完全打不動怪。
-          清零之後，讀到任何非零值就一定是這次按出來的。
-        ★ 學不到也沒關係：`skill` 保持 None，攻擊就走按鍵那條（本來就有效），
-          而且每按一次都會再讀一次 —— 等於**邊打邊學，不花額外時間**。
+          清零之後，讀到任何非零值就一定是這個鍵按出來的。
+
+        學不到就一直是 None，攻擊自然留在按鍵那條（本來就有效）。
         """
         self.skill = None
-        self._tries = 0
         self._learning = True
         self._next_learn = 0.0
         try:
@@ -247,63 +252,45 @@ class KeyWorker(_Paced):
             pass
 
     def stop_learning(self) -> None:
-        """取消掛機時要叫 —— 否則學習期間的按鍵會繼續送出去。"""
         self._learning = False
 
-    def _check_learn(self) -> bool:
-        """讀一次欄位；拿到技能 ID 就結束學習。回傳「這一拍還要不要主動按鍵」。
-
-        節流到 LEARN_GAP —— 按鍵到遊戲寫入要隔一幀，讀太密只是白讀。
-        欄位已經清成 0 了，所以讀到非零值就一定是這個鍵的技能。
-        """
+    def _learn(self) -> None:
+        """第三步：讀記憶體。欄位已清零，所以非零值就是這個鍵的技能。"""
         now = time.perf_counter()
         if now < self._next_learn:
-            return False
+            return                             # 按鍵到寫入要隔一幀，別讀太密
         self._next_learn = now + LEARN_GAP
-        if self._tries and self.stats:         # 按過了才讀得準
-            sid = player.read_last_skill(self.sc, self.stats)
-            if sid:
-                self.skill = sid
-                self._learning = False
-                self.learned.emit(sid)
-                return False
-        self._tries += 1
-        # ⚠ 學不到**不要放棄**：黑狐實測在沒有目標時按鍵根本不會寫入這個欄位，
-        #   要真的打到怪才會。所以這裡只停止「還沒開打就一直按鍵」，
-        #   學習本身繼續 —— 等開打之後每按一次就再讀一次（不花額外時間）。
-        return self._tries <= LEARN_TRIES
+        if not self.stats:
+            return
+        sid = player.read_last_skill(self.sc, self.stats)
+        if sid:
+            self.skill = sid
+            self._learning = False
+            self.learned.emit(sid)
 
     def step(self) -> None:
         try:
             if self.eid is None:
                 self._sel = None       # 沒目標了，下一隻要重新送「選定」
-            # 已經在打了 → 學習搭便車在攻擊的按鍵上，不額外花時間。
-            if self._on:
-                if (self.packets and self.skill and self.eid
-                        and self.pf and self.mover is not None):
-                    # ★ 照遊戲自己的節奏：**換目標才送一次「選定」**，
-                    #   之後就一直重複「動作 + 施放」直到怪死掉。
-                    #   （使用者攔到的分組計數：選定 1 包、動作與施放各 2 包）
-                    if self.eid != self._sel:
-                        if not attack.select(self.mover, self.eid):
-                            return                 # 選不到就這一拍不打
-                        self._sel = self.eid
-                    if attack.strike(self.mover, self.pf,
-                                     self.skill, self.eid):
-                        self.sent += 1
-                        return
-                    # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
-                    # 別讓角色空等。
+            if not self._on:
+                return
+            # ① 換目標才送一次「選定」封包 —— 我們是直接寫記憶體選怪的，
+            #    遊戲不會自己送這一包。兩種模式都要送。
+            if self.mover is not None and self.eid and self._sel != self.eid:
+                if not attack.select(self.mover, self.eid):
+                    return                     # 這一拍先不打，下一拍再試
+                self._sel = self.eid
+            # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
+            if (self.mode == MODE_PACKET and self.packets and self.skill
+                    and self.eid and self.pf and self.mover is not None
+                    and attack.strike(self.mover, self.pf,
+                                      self.skill, self.eid)):
+                self.sent += 1
+            else:
                 _send_scan(self.hwnd, self.vk)
                 self.sent += 1
                 if self._learning:
-                    self._check_learn()
-                return
-            # 剛按下開始、還沒挑到怪 → 自己送一次那個鍵把技能 ID 讀回來，
-            # 這樣一挑到怪就能直接送封包。
-            if self._learning and self._check_learn():
-                _send_scan(self.hwnd, self.vk)
-                self.sent += 1
+                    self._learn()              # 剛按過鍵，順手讀一下
         except Exception:                      # noqa: BLE001
             pass
 
@@ -546,7 +533,8 @@ class CharFarmPage(QWidget):
     def __init__(self, pid: int, hwnd: int, title: str, sc: MemoryScanner,
                  on_scan, tgt: TargetWorker, keys: KeyWorker,
                  notifier: Notifier | None = None,
-                 account: str = "", char_name: str = "") -> None:
+                 account: str = "", char_name: str = "",
+                 mode: str = MODE_PACKET, prefix: str = "farm") -> None:
         super().__init__()
         self.pid = pid
         self.hwnd = hwnd
@@ -554,6 +542,10 @@ class CharFarmPage(QWidget):
         self.sc = sc
         self.account = account
         self.char_name = char_name
+        # 兩個分頁共用這個類別，只差攻擊方式；設定也要分開存（各自一份）。
+        self.mode = mode
+        self._prefix = prefix
+        keys.mode = mode
         self._loading = True          # 載入設定期間不要反過來又存一次
         # 通知器每個分身一個，設定讀自己頁面上的那一列（使用者要求各自獨立）
         self._notifier = notifier or Notifier(
@@ -665,6 +657,8 @@ class CharFarmPage(QWidget):
         #   送 ①動作 ②選定 ③施放 三連包。
         self.pkt_cb = QCheckBox("封包攻擊")
         self.pkt_cb.setChecked(True)
+        # 按鍵模式的分頁沒有這個選項（它本來就是靠按鍵打）
+        self.pkt_cb.setVisible(self.mode == MODE_PACKET)
         self.pkt_cb.setToolTip(
             "開始後先按一次技能鍵，把那個鍵上的技能 ID 學起來，\n"
             "之後改用直接送封包的方式攻擊（①動作 ②選定 ③施放）。\n"
@@ -1124,8 +1118,11 @@ class CharFarmPage(QWidget):
             self._walked_ok = n > 0
 
         # 兩條執行緒對「現在是不是用封包打」要有共識：
-        # 寫目標那條要據此決定「寫不寫血量」（寫了就蓋掉死亡訊號）。
-        self._atk.packets = bool(self._keys.packets and self._keys.skill
+        # 寫目標那條要據此決定「寫不寫血量」——
+        #   封包攻擊：**不寫**，血量交給遊戲，讀到 0 就是死亡訊號
+        #   按鍵攻擊：**要寫**，遊戲出手前會檢查 +0x2DC > 0，不餵就不打
+        self._atk.packets = bool(self.mode == MODE_PACKET
+                                 and self._keys.packets and self._keys.skill
                                  and self._keys.mover is not None)
         self._keys.set_on(in_range)
 
@@ -1192,8 +1189,8 @@ class CharFarmPage(QWidget):
             f"掛機中：{m.name}　距離 {d:.1f} 格"
             + (f"　{self._why}" if self._why else "")
             + f"　目標血量 {hp}%"
-            + ("　📦 封包攻擊" if (self._keys.packets and self._keys.skill
-                                 and self._keys.mover) else "")
+            + ("　📦 封包攻擊" if self._atk.packets else
+               "　⌨ 按鍵攻擊" if self.mode == MODE_KEY else "")
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
             + (f"　武器耐久 {self._dura[0]}"
                + (f"/{self._dura[1]}" if self._dura[1] > 0 else "")
@@ -1208,7 +1205,8 @@ class CharFarmPage(QWidget):
     # ★ 「開始掛機」刻意**不存**：使用者明講「那個每次都要是關閉的，
     #   因為我不能幫他打開」—— 程式一開就自己開打太危險。
     def _key(self, field: str) -> str:
-        return f"farm.{self.account}.{field}"
+        # ★ 前綴要跟分頁綁在一起，兩個掛機分頁的設定才不會互相覆蓋。
+        return f"{self._prefix}.{self.account}.{field}"
 
     def _load_settings(self) -> None:
         g = config.get
@@ -1274,8 +1272,18 @@ class CharFarmPage(QWidget):
 
 
 class FarmTab(BaseTab):
+    """自動掛機（封包攻擊）。
+
+    ★ 「自動掛機（按鍵）」分頁是這個類別的子類別，只改三個類別屬性
+      （見 app/tabs/farm_key_tab.py）—— 邏輯完全共用，不要複製一份程式碼，
+      不然兩邊會慢慢長歪。
+    """
+
     TAB_TITLE = "自動掛機"
     ORDER = 5
+    ATTACK_MODE = MODE_PACKET
+    SETTINGS_PREFIX = "farm"          # 設定存在 config 的哪個前綴底下
+    HINT_ATTACK = "會挑**離自己最近**的一隻，用攻擊封包持續施放技能；"
 
     def build_ui(self) -> None:
         self._pages: dict[int, CharFarmPage] = {}
@@ -1303,9 +1311,10 @@ class FarmTab(BaseTab):
             "① 按「掃描周圍怪物」→ ② 點右邊的名字加進「選中怪物」"
             "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除）"
             "→ ③ 勾「開始掛機」。\n"
-            "會挑**離自己最近**的一隻持續送技能鍵；打死之後立刻接下一隻。"
-            "怕越跑越遠就按「設為原點」再勾「守住原點」—— 只打活動範圍內的怪，"
-            "跑出去會自己走回來。\n"
+            + self.HINT_ATTACK +
+            "打死之後立刻接下一隻。"
+            "怕越跑越遠就按「設為原點」再勾「沒怪時回原點」—— "
+            "周圍完全沒有選中的怪時會自己走回去。\n"
             "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
             "不搶視窗焦點、不占用你的鍵盤滑鼠。")
         hint.setStyleSheet("color: #9aa2b8;")
@@ -1354,7 +1363,8 @@ class FarmTab(BaseTab):
             nm = charname.read_character_name(sc, acct) or acct
             # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
             page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
-                                tgt, keys, None, acct, nm)
+                                tgt, keys, None, acct, nm,
+                                self.ATTACK_MODE, self.SETTINGS_PREFIX)
             page._notifier.failed.connect(self.found.setText)
             self._pages[pid] = page
             self.tabs.addTab(page, nm)
