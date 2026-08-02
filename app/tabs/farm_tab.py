@@ -47,6 +47,7 @@ DEFAULT_INTERVAL = 0.1          # 秒；使用者指定預設每 0.1 秒按一�
 TICK_MS = 20                    # 迴圈計時器解析度
 RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻（掃一次約 0.4 秒）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
+NO_DAMAGE_SECS = 3.0            # 打了這麼久還沒掉血 → 判定打不到，換下一隻
 
 
 def send_key(hwnd: int, vk: int = VK_F2) -> bool:
@@ -186,6 +187,9 @@ class CharFarmPage(QWidget):
         self._acc = 0.0
         self._wrote = False        # 這一輪掛機有沒有寫過目標（判斷死亡用）
         self._cur: entity.Entity | None = None   # 正在打的那隻
+        self._pool: list[entity.Entity] = []     # 這次掃描裡所有候選
+        self._tried = 0            # 目前試到候選清單的第幾個
+        self._trying = 0.0         # 打現在這隻試了多久（沒掉血就換下一個）
         self._kills = 0
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
@@ -350,14 +354,33 @@ class CharFarmPage(QWidget):
         用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
         """
         want = self.wanted()
-        pool = [m for m in self.mons
-                if m.name in want and entity.is_alive(self.sc, m)]
-        if not pool:
+        self._pool = [m for m in self.mons
+                      if m.name in want and entity.is_alive(self.sc, m)]
+        self._tried = 0
+        if not self._pool:
             self.status.setText(
                 f"附近沒有選中的怪了（已擊殺 {self._kills} 隻）→ 等新的出現…")
             return
-        self._cur = pool[0]
+        self._use(0)
+
+    def _use(self, idx: int) -> None:
+        """改用候選清單裡的第 idx 隻。"""
+        self._tried = idx
+        self._cur = self._pool[idx]
         self._wrote = False
+        self._trying = 0.0
+
+    def _next_candidate(self) -> bool:
+        """換下一個候選；沒有了回傳 False。
+
+        為什麼需要這個：清單是靠 vtable 掃出來的，**沒有距離資訊**，
+        第一隻可能在很遠的地方根本打不到。使用者實測「測試按鈕有時可以、
+        掛機不行」就是這個現象 —— 偶爾剛好挑到附近的。
+        """
+        if self._tried + 1 < len(self._pool):
+            self._use(self._tried + 1)
+            return True
+        return False
 
     def _on_toggle(self, on: bool) -> None:
         if not on:
@@ -418,12 +441,13 @@ class CharFarmPage(QWidget):
             self._stop_with(f"⚠ 讀取失敗：{exc}")
             return
 
-        # 目標死了 → 換下一隻（不是停下來）
-        # 三個訊號任一成立就算死：遊戲清空目標、血量歸零、物件已被回收
+        # ★ 先讀後判斷、再寫 —— 順序很重要（見下方說明）
         hp = entity.read_target_hp(self.sc, self.state)
-        dead = ((self._wrote and cur == 0)
-                or (self._wrote and cur == m.eid and hp == 0)
-                or not entity.is_alive(self.sc, m))
+
+        # 目標死了 → 換下一隻（不是停下來）。
+        # 只用「遊戲把目標清成 0」與「物件已被回收」當訊號 —— 不能用血量歸零，
+        # 因為下面每輪都會把血量寫回 100，那個訊號已經被我們自己蓋掉了。
+        dead = (self._wrote and cur == 0) or not entity.is_alive(self.sc, m)
         if dead:
             self._kills += 1
             self._cur = None
@@ -432,16 +456,35 @@ class CharFarmPage(QWidget):
                 f"「{m.name}」倒了（累計 {self._kills} 隻）→ 找下一隻…")
             return
 
-        if cur != m.eid:                    # 已經是這隻就不用重寫，別跟遊戲搶
-            try:
-                entity.set_target(self.sc, self.state, m.eid)
-            except Exception as exc:               # noqa: BLE001
-                self._stop_with(f"⚠ 寫入失敗：{exc}")
-                return
-            self._wrote = True
+        # ⚠ **每一輪都要重寫兩個欄位**，不能「已經是這隻就跳過」。
+        # 使用者實測：測試按鈕（寫入後立刻連送 5 次）有時成功，但迴圈完全不行。
+        # 差別就在這裡 —— 遊戲會把 +0x2DC 改回 0（伺服器沒確認這個目標），
+        # 而攻擊前會檢查它 > 0。只寫一次的話，之後每次送鍵都被 jle 跳掉。
+        # 兩個 4-byte 寫入成本可以忽略，寧可每輪都寫。
+        try:
+            entity.set_target(self.sc, self.state, m.eid)
+        except Exception as exc:                   # noqa: BLE001
+            self._stop_with(f"⚠ 寫入失敗：{exc}")
+            return
+        self._wrote = True
         self._keys.request(_send_scan, self.hwnd)
+
+        # 打不到就換下一隻：清單沒有距離資訊，第一隻可能遠在天邊。
+        # 用「目標血量有沒有掉」當回饋 —— 打得到就會掉血，打不到就一直滿血。
+        self._trying += self.interval.value()
+        if hp >= entity.TARGET_HP_FULL and self._trying >= NO_DAMAGE_SECS:
+            if self._next_candidate():
+                self.status.setText(
+                    f"「{m.name}」打不到（{NO_DAMAGE_SECS:.0f} 秒沒掉血）"
+                    f"→ 換第 {self._tried + 1}/{len(self._pool)} 隻")
+            else:
+                self._cur = None
+                self._since_scan = RESCAN_GAP
+                self.status.setText("這批候選都打不到 → 重新掃描…")
+            return
         self.status.setText(
-            f"掛機中：{m.name}　目標血量 {hp}%　累計擊殺 {self._kills} 隻")
+            f"掛機中：{m.name}（第 {self._tried + 1}/{len(self._pool)} 隻）"
+            f"　血量 {hp}%　累計擊殺 {self._kills}")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)
