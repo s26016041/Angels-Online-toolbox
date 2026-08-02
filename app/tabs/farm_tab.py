@@ -68,13 +68,13 @@ WRITE_INTERVAL = 0.02           # 秒；多久重寫一次目標＋檢查它死�
 SEND_TIMEOUT_MS = 60            # 送鍵最多等遊戲多久（正常 3.4ms，卡住就放棄這一拍）
 TICK_MS = 10                    # UI 心跳
 RESCAN_GAP = 0.3                # 沒得打了要多快重掃
+IDLE_SCAN_GAP = 1.5             # 沒在掛機時也持續刷新「周圍怪物」的間隔
 # 掛機時多久刷新一次怪物清單。熱區掃描實測約 28ms，所以可以一直刷。
 # ★ 必須「一直刷」而不是「沒怪才刷」：跟別人搶怪時，清單一過期就會去打
 #   別人已經殺掉的、或錯過剛生出來的那隻。
 REFRESH_GAP = 0.5
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
-STATUS_GAP = 0.2                # 狀態列多久重畫一次（心跳 10ms，不必每拍都畫）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，不必常看）
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
@@ -577,7 +577,6 @@ class CharFarmPage(QWidget):
         self._keys = keys
         tgt.died.connect(self._on_died)
         tgt.failed.connect(lambda msg: self._stop_with(f"⚠ 記憶體存取失敗：{msg}"))
-        keys.learned.connect(self._on_skill_learned)
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
@@ -599,7 +598,6 @@ class CharFarmPage(QWidget):
         # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
         self._hit_dist = 0.0
-        self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
@@ -645,11 +643,9 @@ class CharFarmPage(QWidget):
         nbar.addStretch(1)
         root.addLayout(nbar)
 
+        # ★ 沒有「掃描周圍怪物」按鈕：分頁一開就會自動持續刷新（見 tick），
+        #   所以「周圍怪物」永遠是即時的，也不必先掃過才能開始掛機。
         bar = QHBoxLayout()
-        self.scan_btn = QPushButton("掃描周圍怪物")
-        self.scan_btn.clicked.connect(lambda: self._on_scan(self.pid))
-        bar.addWidget(self.scan_btn)
-        bar.addSpacing(12)
         bar.addWidget(QLabel("技能鍵"))
         self.key_box = QComboBox()
         for label, vk in SKILL_KEYS:
@@ -674,26 +670,9 @@ class CharFarmPage(QWidget):
         self._keys.set_interval(DEFAULT_INTERVAL)
         bar.addWidget(self.interval)
         bar.addSpacing(12)
-        # ★ 封包攻擊：按「開始掛機」時先按一下技能鍵把技能 ID 學起來
-        #   （遊戲會把剛放的技能寫進「角色屬性基準 −0x50」），之後就改成直接
-        #   送 ①動作 ②選定 ③施放 三連包。
-        self.pkt_cb = QCheckBox("封包攻擊")
-        self.pkt_cb.setChecked(True)
-        # 按鍵模式的分頁沒有這個選項（它本來就是靠按鍵打）
-        self.pkt_cb.setVisible(self.mode == MODE_PACKET)
-        self.pkt_cb.setToolTip(
-            "開始後先按一次技能鍵，把那個鍵上的技能 ID 學起來，\n"
-            "之後改用直接送封包的方式攻擊（①動作 ②選定 ③施放）。\n"
-            "⚠ 需要跟「自動走過去」一樣在遊戲行程裡掛跳板；\n"
-            "　 學不到 ID 或掛不上時會自動退回按鍵，掛機不受影響。")
-        self.pkt_cb.toggled.connect(
-            lambda on: setattr(self._keys, "packets", on))
-        bar.addWidget(self.pkt_cb)
-        self.skill_lbl = QLabel("技能 ID：－")
-        self.skill_lbl.setStyleSheet("color: #9aa2b8;")
-        self.skill_lbl.setToolTip("按下技能鍵之後從遊戲讀回來的技能 ID。")
-        bar.addWidget(self.skill_lbl)
-        bar.addSpacing(12)
+        # ★ 沒有「封包攻擊」勾選框、也不顯示技能 ID —— 用哪種方式打由
+        #   下面的「攻擊型態」決定（遠程送封包、近戰按鍵），技能 ID 是內部
+        #   自己學的（清零 → 按選定的 Fx → 讀記憶體），使用者不需要看。
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setToolTip(
             "勾選後開始：把「選中怪物」裡離自己最近的一隻寫進遊戲的目前目標，"
@@ -920,7 +899,6 @@ class CharFarmPage(QWidget):
         if seen != [self.near.item(i).text() for i in range(self.near.count())]:
             self.near.clear()
             self.near.addItems(seen)
-        self.scan_btn.setEnabled(True)
         self._waiting = False
 
         if err:
@@ -942,8 +920,11 @@ class CharFarmPage(QWidget):
                 self.status.setText(
                     f"附近沒有選中的怪了（已擊殺 {self._kills} 隻）→ 等新的出現…")
             return          # 掛機中的狀態列由 tick() 負責，別蓋掉
-        self.status.setText(f"找到 {len(self.mons)} 隻，"
-                            f"{self.near.count()} 種")
+        # 沒在掛機時：掃描一直在背景跑，狀態列**不要**跟著一直重寫，
+        # 只有內容真的變了才更新一次（不然又變成一直跳的那種）。
+        msg = f"周圍 {len(self.mons)} 隻、{self.near.count()} 種"
+        if self.status.text() != msg:
+            self.status.setText(msg)
 
     def _pick_next(self) -> bool:
         """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打；挑不到回傳 False。
@@ -997,17 +978,6 @@ class CharFarmPage(QWidget):
             f"　累計擊殺 {self._kills}")
         return True
 
-    def _on_skill_learned(self, sid: int) -> None:
-        """送一次技能鍵之後從遊戲讀回技能 ID —— 之後就能直接送封包了。"""
-        if not sid:
-            self.skill_lbl.setText("技能 ID：讀不到")
-            self.skill_lbl.setToolTip("讀不到技能 ID，改用按鍵攻擊。")
-            return
-        self.skill_lbl.setText(f"技能 ID：{sid:#x}")
-        self.skill_lbl.setToolTip(
-            f"{self.key_box.currentText()} 上的技能 ID = {sid:#x}（{sid}）。\n"
-            "按下該鍵後由遊戲自己寫進記憶體，我們讀回來的。")
-
     def _on_died(self, eid: int) -> None:
         """攻擊執行緒回報目標倒了 —— 立刻從既有清單接下一隻。
 
@@ -1038,18 +1008,10 @@ class CharFarmPage(QWidget):
             # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
             self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
             return
-        if self.state is None or self.player is None:
-            self.run_cb.setChecked(False)
-            QMessageBox.information(self, "還不能開始",
-                                    "請先按「掃描周圍怪物」。")
-            return
+        # ★ 不再擋「還沒掃描」或「還沒選怪」：掃描本來就一直在背景跑，
+        #   選中怪物也可以邊掛邊加。沒選到怪就只是不打而已 ——
+        #   不需要用彈窗擋住使用者。
         want = self.wanted()
-        if not want:
-            self.run_cb.setChecked(False)
-            QMessageBox.information(
-                self, "還不能開始",
-                "「選中怪物」是空的。點右邊的名字加進來，或自己打字後按 Enter。")
-            return
         self._kills = 0
         self._killed.clear()
         self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
@@ -1059,12 +1021,12 @@ class CharFarmPage(QWidget):
         #   學到之前用按鍵攻擊（本來就有效），所以不會空等。
         self._keys.stats = self.stats          # 清零要用，先確保是最新的
         self._keys.begin_learning()
-        self.skill_lbl.setText("技能 ID：學習中…")
-        if self.pkt_cb.isChecked():
-            self._ensure_mover()           # 送封包要用它的跳板；失敗就退回按鍵
+        self._ensure_mover()               # 選怪／移動都要用它的跳板
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
-        self.status.setText("掛機中：只打「" + "、".join(want) + "」")
+        self.status.setText(
+            "掛機中：只打「" + "、".join(want) + "」" if want
+            else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
 
     def tick(self, dt: float) -> None:
         """UI 側的心跳：只做「挑目標、卡住偵測、更新狀態列」。
@@ -1072,6 +1034,17 @@ class CharFarmPage(QWidget):
         寫目標與送鍵各自在 TargetWorker / KeyWorker 的執行緒上跑，節奏不受 UI
         影響 —— 原本整個迴圈掛在這裡，UI 一忙節奏就漂掉，感受就是「很卡」。
         """
+        # ★ 掃描**一直都在跑**，不管有沒有在掛機 ——
+        #   這樣「周圍怪物」永遠是即時的，使用者隨時可以把名字加進來，
+        #   也不必先按什麼按鈕才能開始（掃描只掃熱區，很便宜）。
+        self._since_scan += dt
+        gap = (IDLE_SCAN_GAP if not self.run_cb.isChecked()
+               else RESCAN_GAP if self._cur is None else REFRESH_GAP)
+        if self._since_scan >= gap and not self._waiting:
+            self._since_scan = 0.0
+            self._waiting = True
+            self._on_scan(self.pid)
+
         if not self.run_cb.isChecked() or self.state is None:
             return
 
@@ -1094,15 +1067,6 @@ class CharFarmPage(QWidget):
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
 
-        # ★ 掛機時持續在背景刷新清單，不要等到沒怪可打才去掃。
-        # 掃描已經降到只掃熱區（很便宜），所以可以每秒刷一次；
-        # 這樣打完一批怪也有現成的名單可接，不會原地發呆等掃描。
-        self._since_scan += dt
-        gap = RESCAN_GAP if self._cur is None else REFRESH_GAP
-        if self._since_scan >= gap and not self._waiting:
-            self._since_scan = 0.0
-            self._waiting = True
-            self._on_scan(self.pid)
         # ★ 武器壞了（耐久 0）就停下來並通知 —— 壞掉的武器打不動怪，
         # 繼續掛只是白費時間。耐久掉得很慢，幾秒看一次就夠。
         self._gear_t += dt
@@ -1282,23 +1246,9 @@ class CharFarmPage(QWidget):
                 f"「{m.name}」{STUCK_SECS:.0f} 秒沒進展（走不過去？）→ 換一隻")
             return
 
-        # 狀態列不必每一拍都重畫（心跳 10ms，重畫太頻繁反而拖慢 UI）
-        self._show += dt
-        if self._show < STATUS_GAP:
-            return
-        self._show = 0.0
-        d = dist if dist is not None else float("nan")
-        self.status.setText(
-            f"掛機中：{m.name}　距離 {d:.1f} 格"
-            + (f"　{self._why}" if self._why else "")
-            + f"　目標血量 {hp}%"
-            + ("　📦 封包攻擊" if self._atk.packets else
-               "　⌨ 按鍵攻擊" if self._keys.mode == MODE_KEY else "")
-            + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
-            + (f"　武器耐久 {self._dura[0]}"
-               + (f"/{self._dura[1]}" if self._dura[1] > 0 else "")
-               if self._dura[0] >= 0 else "")
-            + f"　累計擊殺 {self._kills}")
+        # ⛔ 這裡不再每 0.2 秒重寫一次「掛機中：…」——
+        #    使用者明講那行一直在跳、看了很煩。狀態列只保留**有事發生**時的
+        #    訊息（換目標、走不過去、武器壞了、角色死亡、巡邏中…）。
 
     # ------------------------------------------------------------------
     # -- 設定的保存與載入（每個帳號各自一份）----------------------------
@@ -1349,8 +1299,6 @@ class CharFarmPage(QWidget):
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
-        self.pkt_cb.setChecked(bool(g(self._key("packets"), True)))
-        self._keys.packets = self.pkt_cb.isChecked()
         self.type_box.setCurrentIndex(1 if g(self._key("melee"), False) else 0)
         # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
         spots = g(self._key("spots"), None)
@@ -1374,7 +1322,6 @@ class CharFarmPage(QWidget):
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
-        s(self._key("packets"), self.pkt_cb.isChecked())
         s(self._key("melee"), bool(self.type_box.currentData()))
         s(self._key("spots"), [list(p) for p in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
@@ -1389,7 +1336,6 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
-        self.pkt_cb.toggled.connect(self._save_settings)
         self.type_box.currentIndexChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
@@ -1409,18 +1355,16 @@ class CharFarmPage(QWidget):
 
 
 class FarmTab(BaseTab):
-    """自動掛機（封包攻擊）。
+    """自動掛機。
 
-    ★ 「自動掛機（按鍵）」分頁是這個類別的子類別，只改三個類別屬性
-      （見 app/tabs/farm_key_tab.py）—— 邏輯完全共用，不要複製一份程式碼，
-      不然兩邊會慢慢長歪。
+    出手方式由頁面上的「攻擊型態」決定（遠程送封包、近戰按鍵），
+    所以不需要兩個分頁 —— 之前那個「自動練功按鍵」分頁已經移除。
     """
 
     TAB_TITLE = "自動掛機"
     ORDER = 5
-    ATTACK_MODE = MODE_PACKET
+    ATTACK_MODE = MODE_PACKET         # 頁面上的「攻擊型態」會覆寫這個
     SETTINGS_PREFIX = "farm"          # 設定存在 config 的哪個前綴底下
-    HINT_ATTACK = "會挑**離自己最近**的一隻，用攻擊封包持續施放技能；"
 
     def build_ui(self) -> None:
         self._pages: dict[int, CharFarmPage] = {}
@@ -1445,13 +1389,13 @@ class FarmTab(BaseTab):
         root.addWidget(self.tabs, 1)
 
         hint = QLabel(
-            "① 按「掃描周圍怪物」→ ② 點右邊的名字加進「選中怪物」"
-            "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除）"
-            "→ ③ 勾「開始掛機」。\n"
-            + self.HINT_ATTACK +
-            "打死之後立刻接下一隻。"
-            "怕越跑越遠就按「設為原點」再勾「沒怪時回原點」—— "
-            "周圍完全沒有選中的怪時會自己走回去。\n"
+            "①「周圍怪物」是即時的 —— 點名字就加進「選中怪物」"
+            "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除，"
+            "掛機中也能隨時加）→ ② 勾「開始掛機」。\n"
+            "挑**離自己最近**的一隻打，打死立刻接下一隻。"
+            "攻擊型態：遠程送攻擊封包、近戰改成按你選的那個 F 鍵。\n"
+            "想固定範圍就按「加入目前位置」記幾個巡邏點再勾「沒怪時去巡邏點找」"
+            "—— 周圍完全沒有選中的怪時會依序走過去找。\n"
             "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
             "不搶視窗焦點、不占用你的鍵盤滑鼠。")
         hint.setStyleSheet("color: #9aa2b8;")
@@ -1511,10 +1455,6 @@ class FarmTab(BaseTab):
         page = self._pages.get(pid)
         if page is None or self._worker is None:
             return
-        # 掛機中每秒都會刷新，這時不要動按鈕與狀態列（會一直閃）
-        if not page.run_cb.isChecked():
-            page.scan_btn.setEnabled(False)
-            page.status.setText("掃描中…（全記憶體掃描，約 0.5 秒）")
         self._worker.request(pid, page.sc)
 
     def _on_scan_done(self, s: Scan) -> None:
