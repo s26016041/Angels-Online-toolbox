@@ -36,6 +36,7 @@
 """
 from __future__ import annotations
 
+import math
 import random
 import struct
 
@@ -45,6 +46,14 @@ MOVE_FN = 0x0055A046        # 移動封包建構＋送出函式
 WAYPOINTS = 0x009B6684      # 全域路徑點陣列
 HOOK_IMPORT = "PeekMessageA"
 MAX_POINTS = 32             # 一次最多送幾個路徑點（封包大小 = 點數*4+9）
+
+# ★ 單次移動指令走得到的上限（格）。實測：
+#     送 10 格 → 走 9.5　送 20 格 → 走 19.0　送 30 格 → **還是只走 19.0**
+#   也就是超過約 19~20 格的部分會被丟掉。使用者回報「太遠會失效、走不回原點」
+#   就是這個 —— 而且症狀是「走到一半停住」，不會報錯，很容易誤判成程式沒送出。
+#   （試過改送多個路徑點，有進步但仍走不完：45 格只走 32 格。）
+# 所以一律把目的地夾到這個距離內，靠呼叫端重複下令接力走完全程。
+MAX_HOP = 15.0
 
 # 注入區塊的版面
 _FLAG, _ORIG, _A1, _A2, _CNT, _A4, _DONE, _FN = (
@@ -153,10 +162,20 @@ class Mover:
 
     def walk_to(self, scanner, player_obj: int,
                 tile_x: float, tile_y: float) -> bool:
-        """走到指定的格子座標。回傳是否成功送出請求。
+        """朝指定的格子座標走。回傳是否成功送出請求。
 
-        只送一個路徑點 = 直線走過去。遊戲自己會處理速度與動畫。
+        ★ 太遠的目的地會**自動夾到 MAX_HOP 格**（見上面的實測）——
+          單次指令走不到那麼遠，硬送只會走一半就停。
+          呼叫端定期重下就會一段一段接力走完，不必自己算分段。
         """
+        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
+        if raw:
+            wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
+            cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
+            d = math.hypot(tile_x - cx, tile_y - cy)
+            if d > MAX_HOP:
+                r = MAX_HOP / d
+                tile_x, tile_y = cx + (tile_x - cx) * r, cy + (tile_y - cy) * r
         return self.walk_path(scanner, player_obj, [(tile_x, tile_y)])
 
     def walk_path(self, scanner, player_obj: int, tiles) -> bool:
