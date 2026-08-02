@@ -49,6 +49,7 @@ MAX_POINTS = 32             # 一次最多送幾個路徑點（封包大小 = �
 # 注入區塊的版面
 _FLAG, _ORIG, _A1, _A2, _CNT, _A4, _DONE, _FN = (
     0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C)
+_A5 = 0x20
 _CODE = 0x40
 
 
@@ -57,7 +58,8 @@ def _stub_asm(block: int) -> str:
 
     ⚠ keystone 把無前綴數字當十六進位，所以一律寫 0x。
     ⚠ pushad/pushfd 必須成對而且順序相反地還原，否則遊戲的暫存器會壞掉。
-    ⚠ 那個函式是 cdecl（結尾是單純的 ret），所以參數要由我們自己清（add esp,0x10）。
+    ⚠ 目標函式都是 cdecl（結尾是單純的 ret），所以參數要由我們自己清
+      （一律推五個 = add esp,0x14）。推得比它需要的多不會有事，它只是不看後面幾個。
     """
     return f"""
     pushad
@@ -66,13 +68,14 @@ def _stub_asm(block: int) -> str:
     test eax, eax
     jz skip
     mov dword ptr [{block + _FLAG:#x}], 0x0
+    push dword ptr [{block + _A5:#x}]
     push dword ptr [{block + _A4:#x}]
     push dword ptr [{block + _CNT:#x}]
     push dword ptr [{block + _A2:#x}]
     push dword ptr [{block + _A1:#x}]
     mov eax, dword ptr [{block + _FN:#x}]
     call eax
-    add esp, 0x10
+    add esp, 0x14
     inc dword ptr [{block + _DONE:#x}]
     skip:
     popfd
@@ -112,7 +115,8 @@ class Mover:
         orig = pm.read_uint(iat)
         block = pm.allocate(0x1000)
         for off, val in ((_FLAG, 0), (_ORIG, orig), (_A1, 0), (_A2, 0),
-                         (_CNT, 0), (_A4, 0), (_DONE, 0), (_FN, MOVE_FN)):
+                         (_CNT, 0), (_A4, 0), (_DONE, 0), (_FN, MOVE_FN),
+                         (_A5, 0)):
             pm.write_uint(block + off, val)
 
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -127,10 +131,10 @@ class Mover:
         self._active = True
 
     def call(self, fn: int, a1: int = 0, a2: int = 0,
-             a3: int = 0, a4: int = 0) -> bool:
-        """請遊戲主執行緒呼叫 fn(a1, a2, a3, a4)。回傳是否排得進去。
+             a3: int = 0, a4: int = 0, a5: int = 0) -> bool:
+        """請遊戲主執行緒呼叫 fn(a1, a2, a3, a4, a5)。回傳是否排得進去。
 
-        ★ 一律推四個參數。目標函式是 cdecl（呼叫端清堆疊），
+        ★ 一律推五個參數。目標函式都是 cdecl（呼叫端清堆疊），
           參數比它需要的多不會有事 —— 它只是不看後面那幾個。
 
         只有一個指令槽：上一個還沒被執行完就回 False，呼叫端自己決定要不要重試。
@@ -142,7 +146,7 @@ class Mover:
         if pm.read_uint(self._block + _FLAG):
             return False                       # 上一個還沒執行
         for off, val in ((_FN, fn), (_A1, a1), (_A2, a2),
-                         (_CNT, a3), (_A4, a4)):
+                         (_CNT, a3), (_A4, a4), (_A5, a5)):
             pm.write_uint(self._block + off, val & 0xFFFFFFFF)
         pm.write_uint(self._block + _FLAG, 1)
         return True

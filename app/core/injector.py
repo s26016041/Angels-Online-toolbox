@@ -37,10 +37,11 @@ CODE_HI = 0x7D0000
 # 環狀緩衝參數
 _N = 128            # 槽數（2 的次方，取模用 and）
 _FRAMES = 12        # 沿 EBP 往上走幾層
-# 每層記 5 個 dword：[ebp+4] 返回位址，加上 [ebp+8/+c/+10/+14] 前四個參數。
+# 每層記 6 個 dword：[ebp+4] 返回位址，加上 [ebp+8/+c/+10/+14/+18] 前五個參數。
 # 記參數是為了看清楚「建構這種封包的函式」被傳了什麼 —— 那些函式是腳本 VM 的
 # 原生函式，參數從腳本堆疊推進來，光看呼叫端的組語看不出語意。
-_FRAME_DWORDS = 5
+# （記到第五個是因為 0x559FF8 有五個參數，第五個在 ebp+0x18。）
+_FRAME_DWORDS = 6
 _CAP = 200          # 每筆最多記幾 bytes payload
 _PAYLOAD_OFF = 8 + _FRAMES * _FRAME_DWORDS * 4   # caller(4)+len(4)+frames
 _SLOT = _PAYLOAD_OFF + _CAP
@@ -161,7 +162,9 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     mov dword ptr [edi+0xc], eax
     mov eax, dword ptr [edx+0x14]
     mov dword ptr [edi+0x10], eax
-    add edi, 0x14
+    mov eax, dword ptr [edx+0x18]
+    mov dword ptr [edi+0x14], eax
+    add edi, 0x18
     mov esi, edx
     mov edx, dword ptr [edx]
     dec ecx
@@ -173,7 +176,8 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     mov dword ptr [edi+0x8], 0x0
     mov dword ptr [edi+0xc], 0x0
     mov dword ptr [edi+0x10], 0x0
-    add edi, 0x14
+    mov dword ptr [edi+0x14], 0x0
+    add edi, 0x18
     dec ecx
     jnz fill
 
@@ -213,7 +217,7 @@ class Packet:
     # ⚠ 索引 i 的參數屬於「返回位址是 frames[i] 的那一層」，也就是**被呼叫的那個
     #   函式自己**的參數 —— 例如 frames[i] == 0x664608 時，args[i] 就是
     #   移動封包建構函式 0x55A046 收到的 (a1, a2, count, a4)。
-    args: list[tuple[int, int, int, int]] = field(default_factory=list)
+    args: list[tuple[int, int, int, int, int]] = field(default_factory=list)
 
     @property
     def call_chain(self) -> list[int]:
@@ -334,7 +338,8 @@ class SendCapture:
             caller, length = vals[0], vals[1]
             rec = vals[2:]
             frames = [rec[i * _FRAME_DWORDS] for i in range(_FRAMES)]
-            args = [tuple(rec[i * _FRAME_DWORDS + 1:i * _FRAME_DWORDS + 5])
+            args = [tuple(rec[i * _FRAME_DWORDS + 1:i * _FRAME_DWORDS
+                              + _FRAME_DWORDS])
                     for i in range(_FRAMES)]
             n = min(length, _CAP)
             data = bytes(pm.read_bytes(slot + _PAYLOAD_OFF, n)) if n > 0 else b""
