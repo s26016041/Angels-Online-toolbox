@@ -1216,7 +1216,33 @@ class CharFarmPage(QWidget):
         # ★ 前綴要跟分頁綁在一起，兩個掛機分頁的設定才不會互相覆蓋。
         return f"{self._prefix}.{self.account}.{field}"
 
+    def _seed_from_default_tab(self) -> None:
+        """這個帳號第一次用這個分頁 → 把「自動掛機」那邊的設定整份帶過來。
+
+        ⚠ 沒有這段的話，新分頁對使用者來說就是「設定全不見了」——
+          實際踩過：在新分頁掛機時角色不回原點，看起來像「沒在算路徑」，
+          其實是那份設定裡原點是 null、「沒怪時回原點」也沒勾。
+        帶過來之後才照常載入，所以使用者之後在這個分頁改的設定不受影響。
+        """
+        if self._prefix == "farm":
+            return
+        src = config.get(f"farm.{self.account}", None)
+        if not isinstance(src, dict):
+            return
+        mine = config.get(f"{self._prefix}.{self.account}", None)
+        mine = mine if isinstance(mine, dict) else {}
+        changed = False
+        for k, v in src.items():
+            # 只補「沒有」或「存成 null」的欄位 —— 使用者在這個分頁明確設過的
+            # （例如把「沒怪時回原點」關掉）就不要覆蓋回去。
+            if mine.get(k, None) is None:
+                config.set(self._key(k), v)
+                changed = True
+        if changed:
+            config.save()
+
     def _load_settings(self) -> None:
+        self._seed_from_default_tab()
         g = config.get
         for name in g(self._key("monsters"), []) or []:
             self._add_name(str(name))
