@@ -5,8 +5,9 @@
 找出「送出登入封包的那段遊戲程式（= 登入函式候選）」，並判斷封包是明文或加密。
 每攔到一次 send，就把下列資訊記進目標行程裡一塊環狀緩衝：
   1. 封包內容（可能截斷到 CAP bytes）
-  2. 送出時的一段呼叫堆疊 → 從中挑出落在 angel.dat 程式碼範圍的位址 = 呼叫鏈
-     （最上層那幾個位址就是「登入函式」等高階邏輯）
+  2. 沿 EBP 框架鏈走出來的各層返回位址 = 呼叫鏈
+     （第三層開始就是「建構這種封包的函式」，登入 / 攻擊 / 移動各不相同）
+     ⚠ 一定要走框架鏈，不能直接複製堆疊 —— 原因見 build_stub_asm 的說明。
 
 原理
 ----
@@ -35,9 +36,9 @@ CODE_HI = 0x7D0000
 
 # 環狀緩衝參數
 _N = 128            # 槽數（2 的次方，取模用 and）
-_STK = 24           # 每筆抓幾個 dword 的堆疊
+_FRAMES = 12        # 沿 EBP 往上走幾層，每層記一個返回位址
 _CAP = 200          # 每筆最多記幾 bytes payload
-_PAYLOAD_OFF = 8 + _STK * 4        # caller(4)+len(4)+stack
+_PAYLOAD_OFF = 8 + _FRAMES * 4     # caller(4)+len(4)+frames
 _SLOT = _PAYLOAD_OFF + _CAP
 
 
@@ -91,8 +92,28 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     """產生 send 攔截 stub 的組合語言（32 位元）。
 
     ⚠ keystone 把無前綴數字當「十六進位」解析，所以所有數字一律用 0x 十六進位。
-    stub 在每次 send 時：把 caller 返回位址、長度、一段堆疊、payload 記進環狀緩衝，
+    stub 在每次 send 時：把 caller 返回位址、長度、呼叫鏈、payload 記進環狀緩衝，
     再跳回真正的 send（jmp，對遊戲完全透明）。
+
+    ★ 呼叫鏈為什麼要沿 EBP 走，不能直接複製堆疊 ★
+    ------------------------------------------------
+    送封包的函式（實測 0x712840）開頭是
+        mov eax, 0xfdf8 ; call __chkstk      ← 配置 64KB 區域變數
+    所以**真正呼叫它的動作函式的返回位址在約 65,000 bytes 之外**。
+    原本的做法是從 esp+0x20 複製 96 bytes 堆疊，永遠搆不到那裡 ——
+    抓到的全是堆疊殘值（例如 0x712AB3，其實是那個函式自己的 mov esp,ebp）。
+    結果就是「每種封包看起來都出自同一個地方」，完全找不到動作函式。
+
+    這個函式有標準的 push ebp / mov ebp,esp，所以 send 當下：
+        [ebp+4] = 呼叫它的人 = 建構這種封包的函式
+        [ebp]   = 上一層的 ebp，可以一直往上走
+    改走框架鏈之後，實測五種封包各自對應到不同的建構函式，馬上就分得出來。
+
+    ⚠ 走鏈要解參考堆疊上的位址，讀到壞位址 = 存取違規 = 遊戲當場關閉。
+    三道保護，任一不過就停止並把剩下的補 0：
+      1. 下界：必須大於目前 esp，而且每層都要比前一層高（防止繞回去無限迴圈）
+      2. 上界：TEB(fs:[0x18]) 的 StackBase，也就是這條執行緒堆疊真正的頂端
+      3. 對齊：必須 4 對齊
     """
     return f"""
     pushad
@@ -105,11 +126,36 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     mov dword ptr [ebx], ecx
     mov ecx, dword ptr [esp+0x2c]
     mov dword ptr [ebx+0x4], ecx
-    lea esi, [esp+0x20]
+
     lea edi, [ebx+0x8]
-    mov ecx, {(_STK * 4):#x}
-    cld
-    rep movsb
+    mov esi, esp
+    mov edx, ebp
+    mov eax, dword ptr fs:[0x18]
+    mov ebp, dword ptr [eax+0x4]
+    sub ebp, 0x8
+    mov ecx, {_FRAMES:#x}
+    walk:
+    cmp edx, esi
+    jbe fill
+    cmp edx, ebp
+    jae fill
+    test dl, 0x3
+    jnz fill
+    mov eax, dword ptr [edx+0x4]
+    mov dword ptr [edi], eax
+    add edi, 0x4
+    mov esi, edx
+    mov edx, dword ptr [edx]
+    dec ecx
+    jnz walk
+    jmp payload
+    fill:
+    mov dword ptr [edi], 0x0
+    add edi, 0x4
+    dec ecx
+    jnz fill
+
+    payload:
     mov ecx, dword ptr [esp+0x2c]
     cmp ecx, {_CAP:#x}
     jbe cap_ok
@@ -117,6 +163,7 @@ def build_stub_asm(wcnt: int, ring: int, origp: int) -> str:
     cap_ok:
     mov esi, dword ptr [esp+0x28]
     lea edi, [ebx+{_PAYLOAD_OFF:#x}]
+    cld
     rep movsb
     inc dword ptr [{wcnt:#x}]
     popad
@@ -139,13 +186,17 @@ class Packet:
     caller: int          # 直接呼叫 send 者的返回位址（多半是遊戲的 send wrapper，固定）
     length: int          # 實際送出長度
     data: bytes          # 內容（截斷到 CAP）
-    stack: list[int]     # 抓到的原始堆疊 dword
+    frames: list[int]    # 沿 EBP 走出來的各層返回位址（0 = 走不下去了）
 
     @property
     def call_chain(self) -> list[int]:
-        """堆疊中落在 angel.dat 程式碼範圍的位址 = 呼叫鏈（含登入函式候選）。"""
+        """呼叫鏈：落在 angel.dat 程式碼範圍的返回位址，由內而外。
+
+        前兩層通常固定（送出佇列 wrapper、封包送出層），**第三層開始才是
+        「建構這種封包的函式」**，不同動作會不一樣 —— 那才是要找的東西。
+        """
         out: list[int] = []
-        for v in self.stack:
+        for v in self.frames:
             if CODE_LO <= v < CODE_HI and v not in out:
                 out.append(v)
         return out
@@ -252,12 +303,12 @@ class SendCapture:
         for idx in range(start, wc):
             slot = ring + (idx % _N) * _SLOT
             head = pm.read_bytes(slot, _PAYLOAD_OFF)
-            vals = struct.unpack(f"<II{_STK}I", head)
+            vals = struct.unpack(f"<II{_FRAMES}I", head)
             caller, length = vals[0], vals[1]
-            stack = list(vals[2:])
+            frames = list(vals[2:])
             n = min(length, _CAP)
             data = bytes(pm.read_bytes(slot + _PAYLOAD_OFF, n)) if n > 0 else b""
-            out.append(Packet(idx, caller, length, data, stack))
+            out.append(Packet(idx, caller, length, data, frames))
         self._read = wc
         return out
 
