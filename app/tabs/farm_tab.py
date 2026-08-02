@@ -85,22 +85,20 @@ KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
 
-# ★ 射程 = **客戶端願意送出攻擊封包的最遠距離**，開打時自己量，不寫死也不設定
-#   （每個角色、每把武器、每個技能都不一樣）。
+# ★ 攻擊封包的最遠距離。**這是遊戲的固定值，不是角色屬性，所以不量測**
+#   （使用者指出的：每個角色都一樣）。
+#   實測黑狐 125 次攻擊：中位 12.1、95% 分位 14.0、**最大 15.7**、16 格以上 0 次。
+#   取 15 留一點餘裕。
 #
-#   量法：攻擊封包 0x559FF8 的第二個參數就是目標實體 ID，所以每攔到一個攻擊封包
-#   就能算出「送這一包時離目標多遠」。客戶端超出射程根本不會送，
-#   所以那些距離的**最大值**就是射程。
-#   實測黑狐 125 次：中位 12.1、95% 分位 14.0、**最大 15.7**、16 格以上 0 次。
+#   ⚠ 別把「某個角色觀察到的最大攻擊距離」當成它的射程上限 ——
+#     雪狐量到只有 3.7，那只是因為牠是近戰、怪一直都很近，
+#     不代表牠不能從遠處送攻擊封包。曾經想靠這個自動量測，是錯的方向。
 #
-#   ⚠ 一開始用「目標掉血時的距離」當證據，那是下游的間接訊號
-#     （會受閃避、伺服器延遲影響）。直接量封包準得多。
-RET_ATTACK = 0x664627           # 攻擊封包 0x559FF8 在框架鏈裡的返回位址
-CALIB_SECS = 25.0               # 開打後量這麼久（量夠樣本就提早結束）
-CALIB_MIN = 25                  # 收集到這麼多次攻擊就夠了
-NO_DMG_WAIT = 1.2               # 沒掉血這麼久就判定打不到，繼續走過去
+#   ★ 範圍內就直接送攻擊封包，**不必自己走過去** ——
+#     遊戲收到攻擊指令本來就會讓角色走過去打（實測 22 格外會自己走到約 6 格）。
+ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
-RANGE_KEEP = 0.9                # 走到「量到的射程 × 這個」就停，留一點餘裕
+RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -442,14 +440,7 @@ class CharFarmPage(QWidget):
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
-        self._no_dmg = 0.0         # 目標多久沒掉血（用來判斷打不打得到）
         self._path_pts = 1         # 上次尋路的路徑點數（>1 = 中間有地形）
-        # 量出來的射程（客戶端送攻擊封包的最遠距離）。None = 還沒量到，
-        # 那時先貼近打，量到之後就走到射程邊緣即可。
-        self._range: float | None = None
-        self._cap = None                      # 量射程用的封包攔截
-        self._calib_t = 0.0
-        self._samples: list[float] = []
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -758,9 +749,6 @@ class CharFarmPage(QWidget):
             return False
         d, self._cur = pool[0]                    # 就打最近的
         self._stuck = 0.0
-        # ★ 剛鎖定時還不知道打不打得到，先當作「打不到」立刻走過去
-        # —— 等第一次掉血再停下來。這樣省掉「先站著空等 NO_DMG_WAIT 秒」。
-        self._no_dmg = NO_DMG_WAIT
         self._path_pts = 1                        # 還沒算過，先當作直線通
         self._last_hp = -1
         self._last_pos = me
@@ -794,7 +782,6 @@ class CharFarmPage(QWidget):
         if not on:
             self._keys.set_on(False)
             self._atk.hold_off()
-            self._calib_stop()
             self._cur = None
             # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
             self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
@@ -815,7 +802,6 @@ class CharFarmPage(QWidget):
         self._killed.clear()
         self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
         self._cur = None
-        self._calib_start()                # 還不知道射程就順便量
         self.status.setText("掛機中：只打「" + "、".join(want) + "」")
 
     def tick(self, dt: float) -> None:
@@ -893,26 +879,20 @@ class CharFarmPage(QWidget):
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
 
-        self._calib_tick(dt, me)            # 還沒量到射程的話，量它
-        self._no_dmg = 0.0 if 0 < hp < self._last_hp else self._no_dmg + dt
-
-        # 走多近才停：
-        #   隔著地形（路徑要繞）→ 貼到臉上，不然打不到（使用者指出的重點）
-        #   射程已經量到　　　　→ 走到射程的九成就好，不必貼臉
-        #   還不知道射程　　　　→ 先貼近，量到第一次掉血就會放寬
-        # ★ 隔著地形時「直線距離近」是假的，所以那時不看距離、照走。
+        # 三種情況（使用者列的）：
+        #   ① 中間有障礙物 → 走到怪臉上（隔著牆時「直線距離近」是假的）
+        #   ② 超出攻擊封包範圍 → 走到範圍內（走到範圍的九成就好）
+        #   ③ 在範圍內 → 直接送攻擊封包，**不自己走**
+        #      （遊戲收到攻擊指令本來就會讓角色走過去打）
         blocked = self._path_pts > 1
-        keep = CLOSE_ENOUGH if (blocked or not self._range) \
-            else self._range * RANGE_KEEP
+        in_range = dist is None or dist <= ATTACK_PACKET_RANGE
+        keep = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE * RANGE_KEEP
         if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
-                and (blocked or self._no_dmg >= NO_DMG_WAIT)
+                and (blocked or not in_range)
                 and dist is not None and dist > keep):
             self._path_pts = self._walk_toward(mp[0], mp[1], me, keep)
 
-        # ★ 只有「在攻擊封包射程內」才送鍵（使用者要求第 3 點）。
-        # 射程還沒量到時一定要送 —— 不送就不會有攻擊封包，也就量不到。
-        in_range = (self._range is None or dist is None
-                    or dist <= self._range)
+        # ★ 確認在攻擊封包範圍內才送（使用者要求第 3 點）
         self._keys.set_on(in_range)
 
         # 卡住偵測（次要保險，不是主要機制）：目標已經是最近的一隻，
@@ -946,10 +926,8 @@ class CharFarmPage(QWidget):
         d = dist if dist is not None else float("nan")
         self.status.setText(
             f"掛機中：{m.name}　距離 {d:.1f} 格"
-            + (f"（射程 {self._range:.0f}）" if self._range
-               else f"（射程量測中 {len(self._samples)}/{CALIB_MIN}）")
             + ("　⛰ 隔著地形，走到臉上" if blocked
-               else "" if in_range else "　→ 走進射程中")
+               else "" if in_range else "　→ 走進攻擊範圍")
             + f"　目標血量 {hp}%"
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
             + (f"　武器耐久 {self._dura[0]}"
@@ -1011,57 +989,6 @@ class CharFarmPage(QWidget):
         self.back_cb.toggled.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
-
-    # ------------------------------------------------------------------
-    # -- 射程量測（攔攻擊封包算距離）------------------------------------
-    def _calib_start(self) -> None:
-        """開打時啟動量測。已經量到就不再量。"""
-        if self._range or self._cap is not None:
-            return
-        try:
-            cap = injector.SendCapture(self.pid,
-                                       injector.process_path(self.pid))
-            cap.start()
-            self._cap = cap
-            self._calib_t = 0.0
-            self._samples = []
-        except Exception:                      # noqa: BLE001
-            self._cap = None                   # 量不了就算了，會退回貼臉走法
-
-    def _calib_stop(self) -> None:
-        if self._cap is not None:
-            try:
-                self._cap.stop()
-            except Exception:                  # noqa: BLE001
-                pass
-            self._cap = None
-
-    def _calib_tick(self, dt: float, me) -> None:
-        """把攔到的攻擊封包換算成「送出當下離目標多遠」。"""
-        if self._cap is None or me is None:
-            return
-        self._calib_t += dt
-        by_id = {m.eid: m for m in self.mons}
-        try:
-            packets = self._cap.read_new()
-        except Exception:                      # noqa: BLE001
-            self._calib_stop()
-            return
-        for p in packets:
-            if RET_ATTACK not in p.frames:
-                continue
-            eid = p.args[p.frames.index(RET_ATTACK)][1]
-            ent = by_id.get(eid)
-            if ent is None:
-                continue
-            mp = entity.read_pos(self.sc, ent.addr)
-            if mp:
-                self._samples.append(math.hypot(mp[0] - me[0], mp[1] - me[1]))
-        if len(self._samples) >= CALIB_MIN or self._calib_t >= CALIB_SECS:
-            if self._samples:
-                # 客戶端超出射程不會送，所以最大值就是射程
-                self._range = max(self._samples)
-            self._calib_stop()
 
     # ------------------------------------------------------------------
     def notify(self, msg: str) -> None:
