@@ -188,15 +188,35 @@ def key_lparam(vk_code: int) -> tuple[int, int]:
     return down, up
 
 
-def send_key(hwnd: int, vk_code: int) -> None:
-    """送出一次完整的按鍵（KEYDOWN + KEYUP）。
+SMTO_ABORTIFHUNG = 0x0002
+SEND_TIMEOUT_MS = 200
 
-    用 PostMessage：只是把訊息丟進目標視窗的佇列，**不碰使用者真正的鍵盤、
-    也不搶焦點**，所以可以在背景同時操作多個視窗。
+
+def send_key(hwnd: int, vk_code: int, timeout_ms: int = SEND_TIMEOUT_MS) -> bool:
+    """送出一次完整的按鍵（KEYDOWN + KEYUP）。回傳是否送達。
+
+    ⚠ 一定要用 SendMessage，不能用 PostMessage —— 實測本專案的遊戲
+    **只吃 SendMessage**（PostMessage 不管 lParam 帶不帶掃描碼都沒反應）。
+    原因：SendMessage 是直接呼叫目標視窗的訊息處理函式，而 PostMessage 只是
+    丟進佇列等它自己來取，這個遊戲的迴圈不會去取被貼進來的按鍵訊息。
+
+    lParam 也必須帶掃描碼（見 key_lparam），傳 0 一樣會被忽略。
+
+    但 SendMessage 會**卡住呼叫端直到對方處理完**，遊戲一卡（讀地圖、掉幀）
+    就會把我們的 UI 一起凍住。所以走 SendMessageTimeout：
+    設定逾時並加上 SMTO_ABORTIFHUNG，對方沒回應就放棄，不會拖住自己。
+
+    全程不碰使用者真正的鍵盤、不搶焦點，可以同時操作多個視窗。
     """
     down, up = key_lparam(vk_code)
-    win32gui.PostMessage(hwnd, WM_KEYDOWN, vk_code, down)
-    win32gui.PostMessage(hwnd, WM_KEYUP, vk_code, up)
+    res = ctypes.c_ulong()
+    ok = True
+    for msg, lp in ((WM_KEYDOWN, down), (WM_KEYUP, up)):
+        r = windll.user32.SendMessageTimeoutW(
+            hwnd, msg, vk_code, lp, SMTO_ABORTIFHUNG, timeout_ms,
+            ctypes.byref(res))
+        ok = ok and bool(r)
+    return ok
 
 
 # 常用虛擬鍵碼

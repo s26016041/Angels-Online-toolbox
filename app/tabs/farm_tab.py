@@ -49,16 +49,14 @@ RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻�
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 
 
-def send_key(hwnd: int, vk: int = VK_F2) -> None:
-    """對指定視窗送一次按鍵（目前掛機迴圈用的方式）。
+def send_key(hwnd: int, vk: int = VK_F2) -> bool:
+    """對指定視窗送一次按鍵（掛機迴圈用的方式）。
 
-    走 app/core/window.py 的共用實作 —— 它會帶上正確的 lParam（含掃描碼）。
-    用 PostMessage：不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
-
-    ⚠ 這個遊戲匯入了 DINPUT8，鍵盤**可能**是走 DirectInput 從裝置層讀，
-      那樣視窗訊息永遠無效。到底哪種可行要靠下面那排測試按鈕實測，別用猜的。
+    走 app/core/window.py 的共用實作：SendMessageTimeout + 帶掃描碼的 lParam。
+    ⚠ 實測這個遊戲**只吃 SendMessage**，PostMessage 完全沒反應（不管 lParam）。
+    不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
     """
-    win.send_key(hwnd, vk)
+    return win.send_key(hwnd, vk)
 
 
 # --- 各種送鍵方式，給測試按鈕用 ---------------------------------------
@@ -75,10 +73,8 @@ def _post_scan(hwnd: int) -> None:
 
 
 def _send_scan(hwnd: int) -> None:
-    u = ctypes.windll.user32
-    down, up = win.key_lparam(VK_F2)
-    u.SendMessageW(hwnd, 0x0100, VK_F2, down)
-    u.SendMessageW(hwnd, 0x0101, VK_F2, up)
+    """③ —— 實測就是這個有效，已成為正式做法。"""
+    win.send_key(hwnd, VK_F2)
 
 
 def _keybd(hwnd: int) -> None:
@@ -90,13 +86,46 @@ def _keybd(hwnd: int) -> None:
 
 
 SEND_WAYS = [
-    ("① PostMsg", _post_plain, "PostMessage，lParam=0（最早的做法）"),
-    ("② PostMsg+掃描碼", _post_scan, "PostMessage，lParam 帶掃描碼"),
+    ("① PostMsg", _post_plain, "PostMessage，lParam=0　（實測無效）"),
+    ("② PostMsg+掃描碼", _post_scan, "PostMessage，lParam 帶掃描碼　（實測無效）"),
     ("③ SendMsg+掃描碼", _send_scan,
-     "SendMessage，lParam 帶掃描碼（會等遊戲處理完才返回）"),
+     "SendMessageTimeout，lParam 帶掃描碼　★ 實測有效，掛機迴圈就是用這個"),
     ("④ 真實按鍵", _keybd,
      "⚠ 會真的操作你的鍵盤，而且遊戲必須在前景。只拿來當診斷對照。"),
 ]
+
+
+class KeyWorker(QThread):
+    """在背景送按鍵。
+
+    為什麼不直接在 UI 執行緒送：SendMessageTimeout 會等對方處理完才返回，
+    實測平均 4.6ms，但遊戲一卡就會用滿逾時（200ms）。五個分身同時掛機、
+    每 0.1 秒各送一次 —— 最壞情況 UI 會被凍住一整秒。
+    （這跟先前「全記憶體掃描卡住渲染」是同一類問題，見 watcher.py 的說明。）
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._jobs: list[tuple] = []
+        self._running = True
+
+    def request(self, fn, hwnd: int) -> None:
+        if len(self._jobs) < 32:          # 積太多代表遊戲卡住了，丟掉就好
+            self._jobs.append((fn, hwnd))
+
+    def run(self) -> None:
+        while self._running:
+            if not self._jobs:
+                self.msleep(5)
+                continue
+            fn, hwnd = self._jobs.pop(0)
+            try:
+                fn(hwnd)
+            except Exception:             # noqa: BLE001
+                pass
+
+    def stop(self) -> None:
+        self._running = False
 
 
 class ScanWorker(QThread):
@@ -144,12 +173,13 @@ class CharFarmPage(QWidget):
     """單一分身的掛機介面。"""
 
     def __init__(self, pid: int, hwnd: int, title: str,
-                 sc: MemoryScanner, on_scan) -> None:
+                 sc: MemoryScanner, on_scan, keys) -> None:
         super().__init__()
         self.pid = pid
         self.hwnd = hwnd
         self.title = title
         self.sc = sc
+        self._keys = keys              # KeyWorker：送鍵一律丟給它，別擋住 UI
         self.state: int | None = None
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
@@ -285,7 +315,7 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ 寫入失敗：{exc}")
             return
         for _ in range(5):                  # 連送 5 次，比較看得出來
-            fn(self.hwnd)
+            self._keys.request(fn, self.hwnd)
         self.status.setText(
             f"{label}：已鎖定「{m.name}」並送出 5 次 F2 —— 請看畫面有沒有出手")
 
@@ -405,7 +435,7 @@ class CharFarmPage(QWidget):
                 self._stop_with(f"⚠ 寫入失敗：{exc}")
                 return
             self._wrote = True
-        send_key(self.hwnd)
+        self._keys.request(_send_scan, self.hwnd)
         self.status.setText(
             f"掛機中：{m.name} {m.eid:#010x}　累計擊殺 {self._kills} 隻")
 
@@ -422,6 +452,7 @@ class FarmTab(BaseTab):
         self._pages: dict[int, CharFarmPage] = {}
         self._scanners: list[MemoryScanner] = []
         self._worker: ScanWorker | None = None
+        self._keys: KeyWorker | None = None
 
         root = QVBoxLayout(self)
 
@@ -477,8 +508,11 @@ class FarmTab(BaseTab):
         self._worker = ScanWorker()
         self._worker.done.connect(self._on_scan_done)
         self._worker.start()
+        self._keys = KeyWorker()
+        self._keys.start()
         for pid, hwnd, title, sc in insts:
-            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan)
+            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
+                                self._keys)
             self._pages[pid] = page
             acct = charname.account_from_title(title)
             nm = charname.read_character_name(sc, acct) or acct
@@ -507,10 +541,12 @@ class FarmTab(BaseTab):
     def _teardown(self) -> None:
         for page in self._pages.values():
             page.run_cb.setChecked(False)
-        if self._worker is not None:
-            self._worker.stop()
-            self._worker.wait(5000)
-            self._worker = None
+        for th in (self._worker, self._keys):
+            if th is not None:
+                th.stop()
+                th.wait(5000)
+        self._worker = None
+        self._keys = None
         self.tabs.clear()
         self._pages = {}
         for sc in self._scanners:
