@@ -96,11 +96,10 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → �
 #
 #   ★ 範圍內就直接送攻擊封包，**不必自己走過去** ——
 #     遊戲收到攻擊指令本來就會讓角色走過去打（實測 22 格外會自己走到約 6 格）。
-# 學技能 ID：最多按幾次、每次間隔多久。
-# 實測單次按鍵不一定寫得進去（冷卻／間隔），5～6 次通常就會變；
-# 給到 16 次是留餘裕，全部按完也才 4 秒。
-LEARN_TRIES = 16
-LEARN_GAP = 0.25                # 太密遊戲會忽略
+# 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
+# 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
+LEARN_TRIES = 6
+LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
 ATTACK_PACKET_RANGE = 15.0
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 RANGE_KEEP = 0.9                # 超出範圍時走到「範圍 × 這個」就停
@@ -182,9 +181,7 @@ class KeyWorker(_Paced):
       方向是錯的 —— 使用者實測這個遊戲按住不放並不會一直放技能。
     """
 
-    # 第二個參數：True = 按鍵當場看到值改變（確定）；False = 值沒變，
-    # 沿用按鍵前就有的舊值（推定，多半也是對的 —— 使用者通常一直用同一個鍵）
-    learned = Signal(object, bool)
+    learned = Signal(object)        # 讀到的技能 ID（0 = 讀不到）
 
     def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
         super().__init__(DEFAULT_INTERVAL)
@@ -208,14 +205,15 @@ class KeyWorker(_Paced):
         self._on = on
 
     def begin_learning(self) -> None:
-        """開始學技能 ID：按幾下那個鍵，看遊戲寫進記憶體的是什麼。
+        """學技能 ID：送一次**使用者選的那個鍵**，隔一下讀回那個欄位就好。
 
-        ★ **不需要有怪**（實測）：雪狐在全程沒有目標的情況下，
+        ★ 只按那一個鍵、只花一次來回（約 0.25 秒）。
+          其他鍵一概不碰 —— 我們只需要要用的那一個。
+        ★ **不需要有怪**（實測）：雪狐全程沒有目標時按鍵，
           F3 → 0x2E1、F5 → 0x279，跟有目標時量到的完全一致。
-        ⚠ 但**單次按鍵不保證寫得進去**（冷卻／間隔），所以要按幾下再判定。
+        ⚠ 讀不到（欄位是 0 = 這個角色登入後還沒放過任何技能）才多按幾次。
         """
         self.skill = None
-        self._v0 = None
         self._tries = 0
         self._learning = True
         self._next_learn = 0.0
@@ -224,55 +222,51 @@ class KeyWorker(_Paced):
         """取消掛機時要叫 —— 否則學習期間的按鍵會繼續送出去。"""
         self._learning = False
 
-    def _learn_step(self) -> None:
-        """學習期間的一拍：先看上一次按鍵的結果，再按下一次。
+    def _check_learn(self) -> bool:
+        """讀一次欄位；拿到技能 ID 就結束學習。回傳「這一拍還要不要按鍵」。
 
-        順序是「先讀後按」—— 按下去到遊戲寫入要隔一幀，
-        按完馬上讀會讀到還沒更新的舊值。
+        節流到 LEARN_GAP —— 按鍵到遊戲寫入要隔一幀，讀太密只是白讀。
         """
         now = time.perf_counter()
         if now < self._next_learn:
-            return
+            return False
         self._next_learn = now + LEARN_GAP
-        if not self.stats:                     # 還沒定位到角色屬性物件
-            self._tries += 1
-            if self._tries >= LEARN_TRIES:
+        if self._tries and self.stats:         # 按過了才讀得準
+            sid = player.read_last_skill(self.sc, self.stats)
+            if sid:
+                self.skill = sid
                 self._learning = False
-            return
-        sid = player.read_last_skill(self.sc, self.stats)
-        if self._v0 is None:
-            self._v0 = sid
-        elif sid and sid != self._v0:
-            self.skill = sid                   # 值變了 = 確定是這個鍵的技能
-            self._learning = False
-            self.learned.emit(sid, True)
-            return
-        _send_scan(self.hwnd, self.vk)
-        self.sent += 1
+                self.learned.emit(sid)
+                return False
         self._tries += 1
-        if self._tries >= LEARN_TRIES:
+        if self._tries > LEARN_TRIES:          # 一直是 0，放棄，退回按鍵攻擊
             self._learning = False
-            if self._v0:
-                # 按了這麼多次值都沒變 —— 多半是「本來就是這個鍵的技能」。
-                self.skill = self._v0
-                self.learned.emit(self._v0, False)
+            self.learned.emit(0)
+            return False
+        return True
 
     def step(self) -> None:
         try:
-            if self._learning:
-                self._learn_step()             # 學習期間的按鍵本身就是攻擊
+            # 已經在打了 → 學習搭便車在攻擊的按鍵上，不額外花時間。
+            if self._on:
+                if (self.packets and self.skill and self.eid
+                        and self.pf and self.mover is not None):
+                    if attack.send_trio(self.mover, self.pf,
+                                        self.skill, self.eid):
+                        self.sent += 1
+                        return
+                    # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
+                    # 別讓角色空等。
+                _send_scan(self.hwnd, self.vk)
+                self.sent += 1
+                if self._learning:
+                    self._check_learn()
                 return
-            if not self._on:
-                return
-            if (self.packets and self.skill and self.eid
-                    and self.pf and self.mover is not None):
-                if attack.send_trio(self.mover, self.pf, self.skill, self.eid):
-                    self.sent += 1
-                    return
-                # 封包排不進去（例如移動正在用指令槽）→ 這一拍改用按鍵，
-                # 別讓角色空等。
-            _send_scan(self.hwnd, self.vk)
-            self.sent += 1
+            # 剛按下開始、還沒挑到怪 → 自己送一次那個鍵把技能 ID 讀回來，
+            # 這樣一挑到怪就能直接送封包。
+            if self._learning and self._check_learn():
+                _send_scan(self.hwnd, self.vk)
+                self.sent += 1
         except Exception:                      # noqa: BLE001
             pass
 
@@ -877,14 +871,16 @@ class CharFarmPage(QWidget):
             f"　累計擊殺 {self._kills}")
         return True
 
-    def _on_skill_learned(self, sid: int, confirmed: bool) -> None:
-        """按了幾下技能鍵之後從遊戲讀回技能 ID —— 之後就能直接送封包了。"""
-        self.skill_lbl.setText(f"技能 ID：{sid:#x}" + ("" if confirmed else "?"))
+    def _on_skill_learned(self, sid: int) -> None:
+        """送一次技能鍵之後從遊戲讀回技能 ID —— 之後就能直接送封包了。"""
+        if not sid:
+            self.skill_lbl.setText("技能 ID：讀不到")
+            self.skill_lbl.setToolTip("讀不到技能 ID，改用按鍵攻擊。")
+            return
+        self.skill_lbl.setText(f"技能 ID：{sid:#x}")
         self.skill_lbl.setToolTip(
             f"{self.key_box.currentText()} 上的技能 ID = {sid:#x}（{sid}）。\n"
-            + ("按下該鍵時值當場改變 —— 確定是這個鍵的技能。" if confirmed else
-               "按了幾次值都沒變，沿用按鍵前就有的值。\n"
-               "多半是對的（本來就一直用這個鍵），但若剛才用過別的鍵就可能不準。"))
+            "按下該鍵後由遊戲自己寫進記憶體，我們讀回來的。")
 
     def _on_died(self, eid: int) -> None:
         """攻擊執行緒回報目標倒了 —— 立刻從既有清單接下一隻。
