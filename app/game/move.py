@@ -48,8 +48,15 @@ import time
 
 from app.game import entity
 
-MOVE_FN = 0x0055A046        # 移動封包建構＋送出函式
+MOVE_FN = 0x0055A046        # 移動封包建構＋送出函式（指令表 0x201）
 WAYPOINTS = 0x009B6684      # 全域路徑點陣列
+# ★ 遊戲自己的「走到指定座標」完整常式（反組譯確認，見 [[command-table]]）：
+#       f(this, 起點X, 起點Y, 終點X, 終點Y, flag)   全部是世界座標，cdecl
+#   內容：起終點同格就直接返回 → 用 this 尋路到終點（寫進 WAYPOINTS）
+#         → 有路就送移動封包 → 收尾（0x549B59 / 0x5B5C60）
+#   比我們原本「自己呼叫尋路再自己送 MOVE_FN」多做了兩個收尾步驟，
+#   那正是遊戲自己走路時會做的，所以改用它。
+WALK_FN = 0x005D7D96
 # ★ 遊戲自己的尋路。反組譯 0x556982~0x556990（滑鼠點地板走路那條路）：
 #       push 0x9B6684        ← 輸出：路徑點陣列
 #       push edi             ← 目標 Y（世界座標）
@@ -109,6 +116,7 @@ MAX_POINTS = 32             # 一次最多送幾個路徑點（封包大小 = �
 _FLAG, _ORIG, _A1, _A2, _CNT, _A4, _DONE, _FN = (
     0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C)
 _A5, _ECX, _RET, _ESP = 0x20, 0x24, 0x28, 0x2C
+_A6 = 0x30                  # 第六個參數（WALK_FN 要六個）
 _CODE = 0x40
 
 
@@ -124,7 +132,8 @@ def _stub_asm(block: int) -> str:
       固定 `add esp,0x14` 遇到後者就會把 esp 推高 12 bytes → 堆疊壞掉 → 當場崩潰。
       存 esp 再還原，兩種都安全，也不必記哪個函式是哪種。
 
-    ★ 一律推五個參數：推得比它需要的多不會有事，它只是不看後面幾個。
+    ★ 一律推六個參數：推得比它需要的多不會有事，它只是不看後面幾個。
+      （六個是因為 WALK_FN 0x5D7D96 要 this + 起點XY + 終點XY + flag。）
     """
     return f"""
     pushad
@@ -134,6 +143,7 @@ def _stub_asm(block: int) -> str:
     jz skip
     mov dword ptr [{block + _FLAG:#x}], 0x0
     mov dword ptr [{block + _ESP:#x}], esp
+    push dword ptr [{block + _A6:#x}]
     push dword ptr [{block + _A5:#x}]
     push dword ptr [{block + _A4:#x}]
     push dword ptr [{block + _CNT:#x}]
@@ -202,7 +212,7 @@ class Mover:
         block = pm.allocate(0x1000)
         for off, val in ((_FLAG, 0), (_ORIG, orig), (_A1, 0), (_A2, 0),
                          (_CNT, 0), (_A4, 0), (_DONE, 0), (_FN, MOVE_FN),
-                         (_A5, 0)):
+                         (_A5, 0), (_A6, 0)):
             pm.write_uint(block + off, val)
 
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -217,7 +227,7 @@ class Mover:
         self._active = True
 
     def call(self, fn: int, a1: int = 0, a2: int = 0, a3: int = 0,
-             a4: int = 0, a5: int = 0, ecx: int = 0) -> bool:
+             a4: int = 0, a5: int = 0, a6: int = 0, ecx: int = 0) -> bool:
         """請遊戲主執行緒呼叫 fn(a1..a5)；ecx 給 __thiscall 的 this。
         回傳是否排得進去。
 
@@ -234,7 +244,7 @@ class Mover:
             if pm.read_uint(self._block + _FLAG):
                 return False                   # 上一個還沒執行
             for off, val in ((_FN, fn), (_A1, a1), (_A2, a2), (_CNT, a3),
-                             (_A4, a4), (_A5, a5), (_ECX, ecx)):
+                             (_A4, a4), (_A5, a5), (_A6, a6), (_ECX, ecx)):
                 pm.write_uint(self._block + off, val & 0xFFFFFFFF)
             pm.write_uint(self._block + _FLAG, 1)
         return True
@@ -332,10 +342,13 @@ class Mover:
         def try_point(px: float, py: float) -> int:
             tx = int(px * entity.TILE_UNITS) & 0xFFFF
             ty = int(py * entity.TILE_UNITS) & 0xFFFF
+            # 先問路徑點數：一來確認走得到，二來點數是「有沒有障礙物」的指標。
             n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
                                ecx=this, timeout=0.15)
             if n and 0 < n <= MAX_POINTS:
-                self.call(MOVE_FN, wx, wy, n, random.randint(1, 0xFFFF))
+                # ★ 交給遊戲自己的「走到座標」常式，不要自己送 MOVE_FN ——
+                #   它會重算一次路徑並補做收尾（我們手動那版少了那兩步）。
+                self.call(WALK_FN, this, wx, wy, tx, ty, 0)
                 return n
             return 0
 

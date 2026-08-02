@@ -90,7 +90,6 @@ WALK_GAP = 0.4
 #   幾乎永遠判定「沒在動」（卡住偵測也一起誤判，走路中照樣累積秒數）。
 MOVE_SAMPLE = 0.3
 MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
-HOME_SLACK = 4.0                # 離原點超過幾格才值得走回去
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
@@ -136,6 +135,12 @@ MODE_KEY = "key"
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
 #    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
+# ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
+#   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
+#   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
+#   —— 實測雪狐就是這樣完全打不到怪。
+MELEE_RANGE = 2.0
+SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 
 
@@ -586,7 +591,6 @@ class CharFarmPage(QWidget):
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._walked_ok = True     # 上次下移動指令有沒有成功
-        self._home_pts = 1         # 上次「走回原點」算出的路徑點數
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
         self._move_t = 0.0
@@ -601,7 +605,10 @@ class CharFarmPage(QWidget):
         self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
         self._mover: move.Mover | None = None
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
-        self._home: tuple[float, float] | None = None   # 原點
+        # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）
+        self._spots: list[tuple[float, float]] = []
+        self._spot_i = 0           # 現在要去第幾個
+        self._spot_pts = 1         # 上次往巡邏點算出的路徑點數
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -705,19 +712,24 @@ class CharFarmPage(QWidget):
             "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
         mbar.addWidget(self.move_cb)
         mbar.addSpacing(12)
-        self.home_btn = QPushButton("設為原點")
-        self.home_btn.setToolTip("把角色目前的位置記成原點。")
-        self.home_btn.clicked.connect(self._set_home)
-        mbar.addWidget(self.home_btn)
-        self.home_lbl = QLabel("原點：未設定")
-        self.home_lbl.setStyleSheet("color: #9aa2b8;")
-        mbar.addWidget(self.home_lbl)
+        mbar.addWidget(QLabel("攻擊型態"))
+        self.type_box = QComboBox()
+        self.type_box.addItem("遠程", False)
+        self.type_box.addItem("近戰", True)
+        self.type_box.setFixedWidth(80)
+        self.type_box.setToolTip(
+            f"遠程：距離 {ATTACK_PACKET_RANGE:.0f} 格內就送攻擊封包"
+            f"（走到 {WALK_KEEP:.0f} 格內）。\n"
+            f"近戰：一定要走到 {MELEE_RANGE:.0f} 格以內才送。\n"
+            "⚠ 射程每個角色不一樣：近戰角色在遠處送攻擊封包，伺服器不會理，\n"
+            "　 症狀是站著不動、怪完全不掉血。")
+        mbar.addWidget(self.type_box)
         mbar.addSpacing(12)
-        self.back_cb = QCheckBox("沒怪時回原點")
-        self.back_cb.setToolTip(
+        self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
+        self.patrol_cb.setToolTip(
             "追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
-            "**完全沒有**選中的怪時才走回原點。")
-        mbar.addWidget(self.back_cb)
+            "**完全沒有**選中的怪時，才依序走去右邊的巡邏點找。")
+        mbar.addWidget(self.patrol_cb)
         mbar.addStretch(1)
         root.addLayout(mbar)
 
@@ -761,6 +773,29 @@ class CharFarmPage(QWidget):
         self.near.itemClicked.connect(lambda it: self._add_name(it.text()))
         rv.addWidget(self.near)
         panes.addWidget(right, 1)
+
+        # 巡邏點：沒怪時依序走過去找怪（取代原本只有一個的「原點」）
+        spot = QGroupBox("巡邏點")
+        spot.setFixedWidth(170)
+        sv = QVBoxLayout(spot)
+        self.spot_list = QListWidget()
+        self.spot_list.setFixedHeight(NEAR_HEIGHT)
+        self.spot_list.setSelectionMode(QListWidget.ExtendedSelection)
+        sv.addWidget(self.spot_list)
+        srow = QHBoxLayout()
+        add_btn = QPushButton("加入目前位置")
+        add_btn.setToolTip("把角色現在站的位置加進巡邏點。")
+        add_btn.clicked.connect(self._add_spot)
+        srow.addWidget(add_btn)
+        # 用 ASCII 的 X，不要用 ✕（部分中文字型沒有那個字形會變豆腐）
+        rm_btn = QPushButton("X")
+        rm_btn.setFixedSize(32, 32)
+        rm_btn.setStyleSheet("padding: 0;")
+        rm_btn.setToolTip("刪掉選起來的巡邏點")
+        rm_btn.clicked.connect(self._remove_spots)
+        srow.addWidget(rm_btn)
+        sv.addLayout(srow)
+        panes.addWidget(spot)
         root.addLayout(panes)
 
         self.status = QLabel("尚未掃描")
@@ -791,13 +826,29 @@ class CharFarmPage(QWidget):
             self.picked.takeItem(self.picked.row(it))
 
     # ------------------------------------------------------------------
-    def _set_home(self) -> None:
+    # -- 巡邏點 --------------------------------------------------------
+    def _refresh_spots(self) -> None:
+        self.spot_list.clear()
+        self.spot_list.addItems(
+            [f"{n + 1}. ({x:.0f}, {y:.0f})"
+             for n, (x, y) in enumerate(self._spots)])
+
+    def _add_spot(self) -> None:
         p = self.my_pos()
         if p is None:
             self.status.setText("讀不到位置，請先按「掃描周圍怪物」")
             return
-        self._home = p
-        self.home_lbl.setText(f"原點：({p[0]:.0f}, {p[1]:.0f})")
+        self._spots.append(p)
+        self._refresh_spots()
+        self._save_settings()
+
+    def _remove_spots(self) -> None:
+        for row in sorted((self.spot_list.row(i)
+                           for i in self.spot_list.selectedItems()),
+                          reverse=True):
+            del self._spots[row]
+        self._spot_i = 0
+        self._refresh_spots()
         self._save_settings()
 
     def _ensure_mover(self) -> bool:
@@ -1078,25 +1129,30 @@ class CharFarmPage(QWidget):
             self._move_ref = me
 
         if self._cur is None:
-            # ★ 追怪不限距離，只有「周圍完全沒有選中的怪」才回原點（使用者要求）
-            if self.back_cb.isChecked() and self._home and me:
-                d = math.hypot(me[0] - self._home[0], me[1] - self._home[1])
-                if d > HOME_SLACK:
-                    # ⚠ 回傳值不能丟掉：走不了（尋路算不出路徑、或指令槽被佔）
-                    #   時什麼都不會發生，狀態列卻還寫著「走回原點」——
-                    #   看起來就像沒在算路徑、站在原地發呆。
-                    if not self._moving and self._walk_t >= WALK_GAP:
-                        self._home_pts = self._walk_toward(
-                            self._home[0], self._home[1], me, 0.0)
+            # ★ 追怪不限距離；「周圍完全沒有選中的怪」時才去巡邏點找（使用者要求）
+            if self.patrol_cb.isChecked() and self._spots and me:
+                self._spot_i %= len(self._spots)
+                sx, sy = self._spots[self._spot_i]
+                d = math.hypot(me[0] - sx, me[1] - sy)
+                if d <= SPOT_SLACK:
+                    # 到了這個點還是沒怪 → 換下一個點繼續找
+                    self._spot_i = (self._spot_i + 1) % len(self._spots)
+                    self._spot_pts = 1
+                    self._walk_t = WALK_GAP        # 下一拍就往新的點走
                     self.status.setText(
-                        f"周圍沒有選中的怪 → 走回原點"
-                        f"({self._home[0]:.0f},{self._home[1]:.0f})　還有 {d:.0f} 格"
-                        + ("　⛔ 算不出路徑（被地形擋住？）" if self._home_pts == 0
-                           else f"　⛰ 繞路 {self._home_pts} 點"
-                           if self._home_pts > 1 else "　直線可通"))
-                else:
-                    self.status.setText(
-                        f"已在原點，等選中的怪出現…　累計擊殺 {self._kills}")
+                        f"巡邏點 {self._spot_i or len(self._spots)} 沒怪"
+                        f" → 前往下一個（共 {len(self._spots)} 點）")
+                    return
+                # ⚠ 回傳值不能丟掉：走不了（尋路算不出、或指令槽被佔）時什麼都
+                #   不會發生，狀態列卻還寫著「前往」，看起來就像站著發呆。
+                if not self._moving and self._walk_t >= WALK_GAP:
+                    self._spot_pts = self._walk_toward(sx, sy, me, 0.0)
+                self.status.setText(
+                    f"周圍沒有選中的怪 → 前往巡邏點 {self._spot_i + 1}"
+                    f"/{len(self._spots)} ({sx:.0f},{sy:.0f})　還有 {d:.0f} 格"
+                    + ("　⛔ 算不出路徑（被地形擋住？）" if self._spot_pts == 0
+                       else f"　⛰ 繞路 {self._spot_pts} 點"
+                       if self._spot_pts > 1 else "　直線可通"))
             return
 
         m = self._cur
@@ -1128,14 +1184,17 @@ class CharFarmPage(QWidget):
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
         #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
+        # ★ 近戰／遠程（使用者在頁面上選）：
+        #   近戰 —— 一定要走到 MELEE_RANGE 格以內才送攻擊封包
+        #   遠程 —— 維持原本：ATTACK_PACKET_RANGE 內就送，走到 WALK_KEEP 內
+        melee = bool(self.type_box.currentData())
         blocked = self._path_pts > 1
-        reach = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE
+        reach = MELEE_RANGE if (blocked or melee) else ATTACK_PACKET_RANGE
         in_range = dist is not None and dist <= reach
-        # ★ 走到多近：還沒看過這個角色打中任何東西之前，一路走到貼臉
-        #   （近戰唯一能打到的距離）；看過掉血之後就用那個距離，最多 WALK_KEEP。
-        #   這樣近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，不必寫死射程。
-        keep = (CLOSE_ENOUGH if blocked
-                else max(CLOSE_ENOUGH, min(WALK_KEEP, self._hit_dist)))
+        # 走到多近：近戰或隔著地形就貼臉；否則走到「看過掉血的距離」，最多
+        # WALK_KEEP。還沒看過掉血（_hit_dist=0）時一路走到貼臉，比較保險。
+        keep = (MELEE_RANGE if (blocked or melee)
+                else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
         #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
@@ -1277,14 +1336,20 @@ class CharFarmPage(QWidget):
             self.key_box.setCurrentIndex(i)
         self.interval.setValue(float(g(self._key("interval"), DEFAULT_INTERVAL)))
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
-        self.back_cb.setChecked(bool(g(self._key("back"), False)))
+        self.patrol_cb.setChecked(bool(g(self._key("patrol"),
+                                         g(self._key("back"), False))))
         self.pkt_cb.setChecked(bool(g(self._key("packets"), True)))
         self._keys.packets = self.pkt_cb.isChecked()
-        home = g(self._key("home"), None)
-        if isinstance(home, (list, tuple)) and len(home) == 2:
-            self._home = (float(home[0]), float(home[1]))
-            self.home_lbl.setText(f"原點：({self._home[0]:.0f},"
-                                  f" {self._home[1]:.0f})")
+        self.type_box.setCurrentIndex(1 if g(self._key("melee"), False) else 0)
+        # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
+        spots = g(self._key("spots"), None)
+        if not spots:
+            home = g(self._key("home"), None)
+            spots = [home] if (isinstance(home, (list, tuple))
+                               and len(home) == 2) else []
+        self._spots = [(float(p[0]), float(p[1])) for p in spots
+                       if isinstance(p, (list, tuple)) and len(p) == 2]
+        self._refresh_spots()
         if g(self._key("notify"), "sound") == "telegram":
             self.rb_tg.setChecked(True)
         self.tg_id.setText(str(g(self._key("tg_id"), "") or ""))
@@ -1297,9 +1362,10 @@ class CharFarmPage(QWidget):
         s(self._key("vk"), self.key_box.currentData())
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
-        s(self._key("back"), self.back_cb.isChecked())
+        s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("packets"), self.pkt_cb.isChecked())
-        s(self._key("home"), list(self._home) if self._home else None)
+        s(self._key("melee"), bool(self.type_box.currentData()))
+        s(self._key("spots"), [list(p) for p in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
         config.save()
@@ -1311,8 +1377,9 @@ class CharFarmPage(QWidget):
         self.key_box.currentIndexChanged.connect(self._save_settings)
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
-        self.back_cb.toggled.connect(self._save_settings)
+        self.patrol_cb.toggled.connect(self._save_settings)
         self.pkt_cb.toggled.connect(self._save_settings)
+        self.type_box.currentIndexChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
 
