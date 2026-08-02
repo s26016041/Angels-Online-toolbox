@@ -107,9 +107,16 @@ ATTACK_PACKET_RANGE = 12.0
 # 留 2 格餘裕是必要的：怪自己會動，停在射程邊緣的話牠一走就又出界，
 # 然後又得重走一次 —— 那就是「卡卡的」的來源。
 WALK_KEEP = 10.0
+# ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
+#   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
+#   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
+#   —— 症狀就是「雪狐完全無法打怪」。
+#   解法不寫死也不量測：**還沒打中過就一路走到貼臉**，
+#   一旦看到怪掉血就把那個距離記起來，之後就不必再靠近。
+#   近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，兩邊都對。
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
-LEARN_TRIES = 6
+LEARN_TRIES = 6                 # 還沒開打時，最多主動按幾次去學
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
 # ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
@@ -219,27 +226,35 @@ class KeyWorker(_Paced):
         self._on = on
 
     def begin_learning(self) -> None:
-        """學技能 ID：送一次**使用者選的那個鍵**，隔一下讀回那個欄位就好。
+        """學技能 ID：**先把欄位清成 0**，再送使用者選的那個鍵，讀回來就是答案。
 
-        ★ 只按那一個鍵、只花一次來回（約 0.25 秒）。
-          其他鍵一概不碰 —— 我們只需要要用的那一個。
-        ★ **不需要有怪**（實測）：雪狐全程沒有目標時按鍵，
-          F3 → 0x2E1、F5 → 0x279，跟有目標時量到的完全一致。
-        ⚠ 讀不到（欄位是 0 = 這個角色登入後還沒放過任何技能）才多按幾次。
+        ★ 只按那一個鍵，其他鍵一概不碰。
+        ⚠⚠ **一定要先清零**。單次按鍵不保證會寫入（冷卻／間隔；黑狐在沒有
+          目標時甚至完全不寫），不清零就會讀到**上一次殘留的技能 ID**——
+          雪狐就是這樣把 F3 的 0x2E1 當成 F2 的技能，結果完全打不動怪。
+          清零之後，讀到任何非零值就一定是這次按出來的。
+        ★ 學不到也沒關係：`skill` 保持 None，攻擊就走按鍵那條（本來就有效），
+          而且每按一次都會再讀一次 —— 等於**邊打邊學，不花額外時間**。
         """
         self.skill = None
         self._tries = 0
         self._learning = True
         self._next_learn = 0.0
+        try:
+            if self.stats:
+                player.clear_last_skill(self.sc, self.stats)
+        except Exception:                      # noqa: BLE001
+            pass
 
     def stop_learning(self) -> None:
         """取消掛機時要叫 —— 否則學習期間的按鍵會繼續送出去。"""
         self._learning = False
 
     def _check_learn(self) -> bool:
-        """讀一次欄位；拿到技能 ID 就結束學習。回傳「這一拍還要不要按鍵」。
+        """讀一次欄位；拿到技能 ID 就結束學習。回傳「這一拍還要不要主動按鍵」。
 
         節流到 LEARN_GAP —— 按鍵到遊戲寫入要隔一幀，讀太密只是白讀。
+        欄位已經清成 0 了，所以讀到非零值就一定是這個鍵的技能。
         """
         now = time.perf_counter()
         if now < self._next_learn:
@@ -253,11 +268,10 @@ class KeyWorker(_Paced):
                 self.learned.emit(sid)
                 return False
         self._tries += 1
-        if self._tries > LEARN_TRIES:          # 一直是 0，放棄，退回按鍵攻擊
-            self._learning = False
-            self.learned.emit(0)
-            return False
-        return True
+        # ⚠ 學不到**不要放棄**：黑狐實測在沒有目標時按鍵根本不會寫入這個欄位，
+        #   要真的打到怪才會。所以這裡只停止「還沒開打就一直按鍵」，
+        #   學習本身繼續 —— 等開打之後每按一次就再讀一次（不花額外時間）。
+        return self._tries <= LEARN_TRIES
 
     def step(self) -> None:
         try:
@@ -571,6 +585,9 @@ class CharFarmPage(QWidget):
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
+        # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
+        # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
+        self._hit_dist = 0.0
         self._show = 0.0           # 距離上次重畫狀態列過了多久
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -977,8 +994,9 @@ class CharFarmPage(QWidget):
         self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
         self._cur = None
         # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
-        #   學法：按幾下那個鍵，遊戲會把技能 ID 寫進記憶體，我們讀回來。
-        #   **不需要有怪**（實測），所以按下開始就能學，不必等到打起來。
+        #   學法：先把欄位清成 0，再按那個鍵，讀回來的非零值就是答案。
+        #   學到之前用按鍵攻擊（本來就有效），所以不會空等。
+        self._keys.stats = self.stats          # 清零要用，先確保是最新的
         self._keys.begin_learning()
         self.skill_lbl.setText("技能 ID：學習中…")
         if self.pkt_cb.isChecked():
@@ -1088,9 +1106,16 @@ class CharFarmPage(QWidget):
         blocked = self._path_pts > 1
         reach = CLOSE_ENOUGH if blocked else ATTACK_PACKET_RANGE
         in_range = dist is not None and dist <= reach
-        keep = CLOSE_ENOUGH if blocked else WALK_KEEP
+        # ★ 走到多近：還沒看過這個角色打中任何東西之前，一路走到貼臉
+        #   （近戰唯一能打到的距離）；看過掉血之後就用那個距離，最多 WALK_KEEP。
+        #   這樣近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，不必寫死射程。
+        keep = (CLOSE_ENOUGH if blocked
+                else max(CLOSE_ENOUGH, min(WALK_KEEP, self._hit_dist)))
+        # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
+        #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
+        #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
         if (self.move_cb.isChecked() and me and self._walk_t >= WALK_GAP
-                and not in_range and dist is not None and dist > keep):
+                and dist is not None and dist > keep):
             n = self._walk_toward(mp[0], mp[1], me, keep)
             # ⚠ 走不了（尋路算不出路徑，或指令槽被佔）**不要把它記成「沒有障礙物」**。
             #   記成 0 會讓下一拍 blocked 變 False、reach 變回 15，於是站在原地
@@ -1107,8 +1132,11 @@ class CharFarmPage(QWidget):
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
         #   直接標出來才不必猜。
-        if in_range:
+        if in_range and dist is not None and dist <= keep:
             self._why = ""
+        elif in_range:
+            self._why = (f"打得到，同時走近到 {keep:.0f} 格"
+                         if self._hit_dist else "打得到，同時走過去（還沒確認射程）")
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif not self.move_cb.isChecked():
@@ -1132,6 +1160,10 @@ class CharFarmPage(QWidget):
         moving = (me is not None and self._last_pos is not None
                   and (abs(me[0] - self._last_pos[0]) > 0.2
                        or abs(me[1] - self._last_pos[1]) > 0.2))
+        # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
+        #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
+        if 0 < hp < self._last_hp and dist is not None:
+            self._hit_dist = max(self._hit_dist, dist)
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
             self._stuck = 0.0
         else:

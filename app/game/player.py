@@ -37,6 +37,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from app.core.memory import VALUE_TYPES
+
 # 欄位偏移（相對「角色資料基準」，全部是 int32）
 OFF_LEVEL = 0x00
 OFF_HP = 0x04
@@ -153,6 +155,23 @@ def locate(scanner, should_stop=None) -> int | None:
             if _signature_ok(scanner, obj, vtable):
                 return obj - OFF_VTABLE
     return None
+
+
+def clear_last_skill(scanner, base: int) -> None:
+    """把「最近使用的技能」欄位清成 0，之後讀到的非零值就一定是新按出來的。
+
+    ⚠⚠ **學技能 ID 之前一定要先清**。不清的話，按鍵沒生效時會讀到
+      **上一次殘留的技能 ID**，看起來像成功、其實拿到的是別的鍵的技能。
+      實際踩過：雪狐設定用 F2（技能 0x2E7），卻學成 F3 的 0x2E1，
+      於是一直對怪施放不能打的技能 —— 症狀是「完全無法打怪」。
+      而單次按鍵**本來就不保證會寫入**（冷卻／間隔；黑狐在沒有目標時
+      更是完全不寫），所以殘留值被誤用的機會很高。
+
+    這是純資料欄位，遊戲下次放技能就會自己覆蓋回去。
+    實測寫 0 之後遊戲一切正常（HP/MP 不變、不當機）。
+    """
+    if base:
+        scanner.write_value(base + OFF_LAST_SKILL, VALUE_TYPES["int32"], 0)
 
 
 def read_last_skill(scanner, base: int) -> int | None:
