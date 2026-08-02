@@ -47,6 +47,7 @@ VK_F2 = 0x71
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 DEFAULT_INTERVAL = 0.1          # 秒；使用者指定預設每 0.1 秒按一次
 TICK_MS = 20                    # 迴圈計時器解析度
+RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻（掃一次約 0.4 秒）
 
 
 def send_key(hwnd: int, vk: int = VK_F2) -> None:
@@ -112,6 +113,11 @@ class CharFarmPage(QWidget):
         self._on_scan = on_scan
         self._acc = 0.0
         self._wrote = False        # 這一輪掛機有沒有寫過目標（判斷死亡用）
+        self._cur: entity.Entity | None = None   # 正在打的那隻
+        self._farm_type: int | None = None       # 只打這個種類
+        self._kills = 0
+        self._waiting = False      # 正在等重新掃描的結果
+        self._since_scan = 0.0     # 距離上次自動重掃過了多久
 
         root = QVBoxLayout(self)
 
@@ -161,17 +167,43 @@ class CharFarmPage(QWidget):
             self.table.setItem(r, 0, QTableWidgetItem(m.name))
             self.table.setItem(r, 1, QTableWidgetItem(str(m.type_id)))
             self.table.setItem(r, 2, QTableWidgetItem(f"{m.eid:#010x}"))
+        self.scan_btn.setEnabled(True)
+        self._waiting = False
+
         if err:
             self.status.setText(f"⚠ {err}")
-        else:
-            cur = entity.read_target(self.sc, state) if state else 0
-            hit = next((m.name for m in self.mons if m.eid == cur), None)
+            return
+
+        # 掛機中且正在等下一隻 → 自動挑同種的接上去
+        if self.run_cb.isChecked() and self._cur is None:
+            self._pick_next()
+            return
+
+        cur = entity.read_target(self.sc, state) if state else 0
+        hit = next((m.name for m in self.mons if m.eid == cur), None)
+        self.status.setText(
+            f"找到 {len(self.mons)} 隻　"
+            + (f"目前目標：{hit}" if hit
+               else ("目前沒有選定目標" if not cur else
+                     f"目前目標 {cur:#x}（不在清單裡）")))
+
+    def _pick_next(self) -> None:
+        """從最新的掃描結果裡挑一隻同種類的接著打。"""
+        pool = [m for m in self.mons
+                if m.type_id == self._farm_type
+                and entity.is_alive(self.sc, m)]
+        if not pool:
             self.status.setText(
-                f"找到 {len(self.mons)} 隻　"
-                + (f"目前目標：{hit}" if hit
-                   else ("目前沒有選定目標" if not cur else
-                         f"目前目標 {cur:#x}（不在清單裡）")))
-        self.scan_btn.setEnabled(True)
+                f"附近沒有種類 {self._farm_type} 的怪了（已擊殺 {self._kills} 隻）"
+                "　→ 繼續等待新的怪出現…")
+            return
+        self._cur = pool[0]
+        self._wrote = False
+        # 讓表格反白目前這隻，看得出來在打誰
+        for r, m in enumerate(self.mons):
+            if m.eid == self._cur.eid:
+                self.table.selectRow(r)
+                break
 
     def selected(self) -> entity.Entity | None:
         rows = self.table.selectionModel().selectedRows()
@@ -182,7 +214,8 @@ class CharFarmPage(QWidget):
 
     def _on_toggle(self, on: bool) -> None:
         if not on:
-            self.status.setText("已停止")
+            self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
+            self._cur = None
             return
         self._wrote = False
         if self.state is None:
@@ -190,13 +223,19 @@ class CharFarmPage(QWidget):
             QMessageBox.information(self, "還不能開始",
                                     "請先按「掃描周圍怪物」。")
             return
-        if self.selected() is None:
+        m = self.selected()
+        if m is None:
             self.run_cb.setChecked(False)
             QMessageBox.information(self, "還不能開始",
                                     "請先在清單裡選一隻要打的怪。")
             return
+        # 記住種類 —— 之後自動接續時只打同一種，不會跑去打 NPC 或圖騰
+        self._farm_type = m.type_id
+        self._cur = m
+        self._kills = 0
         self._acc = 0.0
-        self.status.setText("掛機中…")
+        self._since_scan = 0.0
+        self.status.setText(f"掛機中：{m.name}（只打種類 {m.type_id}）")
 
     def tick(self, dt: float) -> None:
         """迴圈的一次心跳。由分頁的計時器統一驅動。
@@ -211,13 +250,21 @@ class CharFarmPage(QWidget):
         """
         if not self.run_cb.isChecked() or self.state is None:
             return
-        m = self.selected()
-        if m is None:
+        self._since_scan += dt
+        if self._waiting:                   # 正在等重新掃描的結果
             return
+        if self._cur is None:               # 沒有目標 → 重新掃描找下一隻
+            if self._since_scan >= RESCAN_GAP:
+                self._since_scan = 0.0
+                self._waiting = True
+                self._on_scan(self.pid)
+            return
+
         self._acc += dt
         if self._acc < self.interval.value():
             return
         self._acc = 0.0
+        m = self._cur
 
         try:
             cur = entity.read_target(self.sc, self.state)
@@ -225,13 +272,14 @@ class CharFarmPage(QWidget):
             self._stop_with(f"⚠ 讀取失敗：{exc}")
             return
 
-        if self._wrote and cur == 0:
-            self._stop_with(f"「{m.name}」已死亡（遊戲清空了目標），已停止。"
-                            "請重新掃描並選下一隻。")
-            return
-        if not entity.is_alive(self.sc, m):
-            self._stop_with(f"「{m.name}」已經不在了，已停止。"
-                            "請重新掃描並選下一隻。")
+        # 目標死了 → 換下一隻（不是停下來）
+        dead = (self._wrote and cur == 0) or not entity.is_alive(self.sc, m)
+        if dead:
+            self._kills += 1
+            self._cur = None
+            self._since_scan = RESCAN_GAP       # 立刻重掃
+            self.status.setText(
+                f"「{m.name}」倒了（累計 {self._kills} 隻）→ 找下一隻…")
             return
 
         if cur != m.eid:                    # 已經是這隻就不用重寫，別跟遊戲搶
@@ -242,7 +290,8 @@ class CharFarmPage(QWidget):
                 return
             self._wrote = True
         send_key(self.hwnd)
-        self.status.setText(f"掛機中：{m.name} {m.eid:#010x}")
+        self.status.setText(
+            f"掛機中：{m.name} {m.eid:#010x}　累計擊殺 {self._kills} 隻")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)
@@ -275,8 +324,10 @@ class FarmTab(BaseTab):
 
         hint = QLabel(
             "① 按「掃描周圍怪物」→ ② 在清單選一隻 → ③ 勾「開始掛機」。\n"
-            "原理：把選中那隻的實體 ID 寫進遊戲的「目前目標」欄位，再持續送 F2。"
-            "不會搶視窗焦點，可以同時掛多個分身。")
+            "會持續送 F2；那隻死掉後**自動重掃並接著打同種類的下一隻**，"
+            "不必手動再選。取消勾選才停。\n"
+            "原理：把目標的實體 ID 寫進遊戲的「目前目標」欄位。"
+            "不搶視窗焦點，可以同時掛多個分身。")
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
 
