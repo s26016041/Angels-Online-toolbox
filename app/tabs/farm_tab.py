@@ -720,9 +720,10 @@ class CharFarmPage(QWidget):
         self.type_box.setFixedWidth(80)
         self.type_box.setToolTip(
             f"遠程：距離 {ATTACK_PACKET_RANGE:.0f} 格內就送攻擊封包"
-            f"（走到 {WALK_KEEP:.0f} 格內）。\n"
-            f"近戰：一定要走到 {MELEE_RANGE:.0f} 格以內才送。\n"
-            "⚠ 射程每個角色不一樣：近戰角色在遠處送攻擊封包，伺服器不會理，\n"
+            f"（走到 {WALK_KEEP:.0f} 格內就停）。\n"
+            "近戰：直接用怪物座標 —— 攻擊封包帶牠的位置，走路也直接走到\n"
+            "　　　牠身上，不停在幾格外等。\n"
+            "⚠ 射程每個角色不一樣，近戰角色站太遠送攻擊封包伺服器不會理，\n"
             "　 症狀是站著不動、怪完全不掉血。")
         mbar.addWidget(self.type_box)
         mbar.addSpacing(12)
@@ -1190,15 +1191,18 @@ class CharFarmPage(QWidget):
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
         #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
         # ★ 近戰／遠程（使用者在頁面上選）：
-        #   近戰 —— 一定要走到 MELEE_RANGE 格以內才送攻擊封包
+        #   近戰 —— **直接用怪物座標**：攻擊封包帶牠的座標，走路也直接走到
+        #           牠身上（不停在幾格外等）。施放封包的第 3、4 個參數就是
+        #           座標，所以近戰不必自己算「要站多近」。
         #   遠程 —— 維持原本：ATTACK_PACKET_RANGE 內就送，走到 WALK_KEEP 內
         melee = bool(self.type_box.currentData())
         blocked = self._path_pts > 1
-        reach = MELEE_RANGE if (blocked or melee) else ATTACK_PACKET_RANGE
+        reach = MELEE_RANGE if blocked else ATTACK_PACKET_RANGE
         in_range = dist is not None and dist <= reach
-        # 走到多近：近戰或隔著地形就貼臉；否則走到「看過掉血的距離」，最多
-        # WALK_KEEP。還沒看過掉血（_hit_dist=0）時一路走到貼臉，比較保險。
-        keep = (MELEE_RANGE if (blocked or melee)
+        # 走到多近：近戰直接走到怪身上（0）；隔著地形就貼臉；
+        # 否則走到「看過掉血的距離」，最多 WALK_KEEP
+        # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
+        keep = (0.0 if melee else MELEE_RANGE if blocked
                 else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
