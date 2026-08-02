@@ -440,6 +440,7 @@ class CharFarmPage(QWidget):
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
         self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
         self._mover: move.Mover | None = None
+        self._nav: move.Navigator | None = None   # 撞牆繞行
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         self._home: tuple[float, float] | None = None   # 原點
         self._last_hp = -1
@@ -644,6 +645,7 @@ class CharFarmPage(QWidget):
             mv = move.Mover(self.pid, injector.process_path(self.pid))
             mv.start()
             self._mover = mv
+            self._nav = move.Navigator(mv)
             return True
         except Exception as exc:               # noqa: BLE001
             self._mover = move.Mover(self.pid, "")   # 佔位，代表試過了
@@ -651,16 +653,23 @@ class CharFarmPage(QWidget):
             return False
 
     def _walk_toward(self, gx: float, gy: float, me, keep: float) -> None:
-        """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。"""
+        """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
+
+        走的是 move.Navigator：撞到地形就自動往側面繞一段再繼續
+        —— 我們只送直線路徑，沒有尋路，不繞的話會一直往牆裡走
+        （使用者回報的「他會往那個方向卡住」）。
+        """
         if not self._ensure_mover():
             return
         d = math.hypot(gx - me[0], gy - me[1])
         if d <= keep:
+            self._nav.reset()                  # 到了，下次重新算繞行狀態
             return
         r = (d - keep) / d                     # 只走到剩 keep 格的位置
-        self._mover.walk_to(self.sc, self.player,
-                            me[0] + (gx - me[0]) * r,
-                            me[1] + (gy - me[1]) * r)
+        elapsed = max(self._walk_t, 0.05)
+        self._nav.step(self.sc, self.player,
+                       me[0] + (gx - me[0]) * r,
+                       me[1] + (gy - me[1]) * r, elapsed)
         self._walk_t = 0.0
 
     def my_pos(self) -> tuple[float, float] | None:
