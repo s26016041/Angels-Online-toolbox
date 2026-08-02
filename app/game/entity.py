@@ -205,10 +205,14 @@ def monsters(scanner, should_stop=None) -> list[Entity]:
     return [e for e in list_entities(scanner, should_stop) if e.is_monster]
 
 
-def snapshot(scanner, should_stop=None,
-             regions=None) -> tuple[int | None, int | None,
-                                    list[Entity], list]:
-    """掛機要的東西一次拿齊：(狀態物件, 玩家物件, 附近實體, 命中的區塊)。
+def snapshot(scanner, should_stop=None, regions=None,
+             extra_vts=()) -> tuple[int | None, int | None,
+                                    list[Entity], list, dict]:
+    """掛機要的東西一次拿齊：(狀態物件, 玩家物件, 附近實體, 命中的區塊, 額外命中)。
+
+    extra_vts: 呼叫端想順便掃的其他 vtable（例如角色屬性物件，用來讀 HP）。
+    多比對一種幾乎不花錢 —— 成本全在把記憶體讀出來 —— 所以要什麼一次掃完。
+    回傳的「額外命中」是 {vtable: [位址,...]}，怎麼認由呼叫端自己決定。
 
     三種都要掃，合成一遍讀取 —— 這是掃描能不能夠快的第一個關鍵。
     狀態／玩家物件掃到的數量不是剛好 1 個時回傳 None（寧可讓上層知道情況不對，
@@ -219,11 +223,14 @@ def snapshot(scanner, should_stop=None,
       堆積會變，換地圖或重連之後物件可能搬到別的區塊；只要熱區掃描的結果
       看起來不對（狀態或玩家物件不見了），呼叫端就該退回全掃。
     """
-    hits, hot = _scan_vtables(scanner, (VT_STATE, VT_PLAYER, VT_ENTITY),
+    extra = [v for v in extra_vts if v]
+    hits, hot = _scan_vtables(scanner,
+                              [VT_STATE, VT_PLAYER, VT_ENTITY] + extra,
                               should_stop, regions)
     state = hits[VT_STATE][0] if len(hits[VT_STATE]) == 1 else None
     player = hits[VT_PLAYER][0] if len(hits[VT_PLAYER]) == 1 else None
-    return state, player, _build(scanner, hits[VT_ENTITY]), hot
+    return (state, player, _build(scanner, hits[VT_ENTITY]), hot,
+            {v: hits[v] for v in extra})
 
 
 def read_target(scanner, state: int) -> int:

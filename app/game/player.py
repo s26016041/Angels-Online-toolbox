@@ -98,6 +98,25 @@ def _vtable_value(scanner) -> int | None:
     return (base + VTABLE_RVA) if base else None
 
 
+def vtable_value(scanner) -> int | None:
+    """這個類別的 vtable 指標值。給「已經要掃記憶體的呼叫端」把它一起掃走用。"""
+    return _vtable_value(scanner)
+
+
+def pick(scanner, hits) -> int | None:
+    """從別人掃到的 vtable 命中位址裡挑出玩家物件，回傳「角色資料基準」。
+
+    給已經在掃記憶體的呼叫端用（例如自動掛機的合併掃描），免得為了同一個物件
+    再掃一遍 700MB。判定跟 locate() 完全一樣：只看結構特徵，不看數值。
+    掃到 0 個或多個都回傳 None —— 寧可不顯示，也不要拿錯的物件。
+    """
+    vtable = _vtable_value(scanner)
+    if vtable is None:
+        return None
+    ok = [a for a in hits if _signature_ok(scanner, a, vtable)]
+    return (ok[0] - OFF_VTABLE) if len(ok) == 1 else None
+
+
 def locate(scanner, should_stop=None) -> int | None:
     """找玩家物件，回傳「角色資料基準」位址；找不到回傳 None。
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 import ctypes
 import math
 import time
+from dataclasses import dataclass, field
 
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -53,7 +54,7 @@ from PySide6.QtWidgets import (
 from app.core import charname
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import entity
+from app.game import entity, player
 from app.tabs.base_tab import BaseTab
 
 SKILL_KEYS = [(f"F{i}", 0x6F + i) for i in range(1, 13)]   # F1=0x70 … F12=0x7B
@@ -69,6 +70,7 @@ RESCAN_GAP = 0.3                # 沒得打了要多快重掃
 REFRESH_GAP = 0.5
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
 STATUS_GAP = 0.2                # 狀態列多久重畫一次（心跳 10ms，不必每拍都畫）
+HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
@@ -220,8 +222,20 @@ class TargetWorker(_Paced):
             self.failed.emit(str(exc))
 
 
+@dataclass
+class Scan:
+    """一次掃描的結果。欄位一直在增加，包成一個物件比一直加訊號參數清楚。"""
+
+    pid: int
+    state: int | None = None      # 狀態物件（寫目標用）
+    player: int | None = None     # 玩家實體物件（讀自己的座標用）
+    stats: int | None = None      # 角色屬性基準（讀 HP 用；見 app/game/player.py）
+    mons: list = field(default_factory=list)
+    err: str = ""
+
+
 class ScanWorker(QThread):
-    """背景掃描：一次拿齊狀態物件、玩家物件、附近怪物。
+    """背景掃描：一次拿齊狀態物件、玩家物件、角色屬性、附近怪物。
 
     不能放在 UI 執行緒（全掃約 0.4 秒）。用一條常駐執行緒處理所有分身的請求，
     比每次開新執行緒好收尾。三種物件走 entity.snapshot() 合併成一遍讀取。
@@ -237,7 +251,7 @@ class ScanWorker(QThread):
         · 熱區掃描只要找不到狀態或玩家物件，立刻退回全掃重新定位
     """
 
-    done = Signal(int, object, object, object, str)  # pid, state, 玩家, 怪, err
+    done = Signal(object)                        # 一個 Scan
 
     def __init__(self) -> None:
         super().__init__()
@@ -260,19 +274,23 @@ class ScanWorker(QThread):
                 self.msleep(20)
                 continue
             pid, sc = self._queue.pop(0)
-            state = player = mons = None
-            err = ""
+            out = Scan(pid)
             try:
                 now = time.monotonic()
+                stats_vt = player.vtable_value(sc)   # 角色屬性物件，順便一起掃
                 hot = self._hot.get(pid)
                 if now - self._full_at.get(pid, 0.0) >= FULL_EVERY:
                     hot = None                   # 到期了，做一次全掃保險
-                state, player, ents, found = entity.snapshot(
-                    sc, should_stop=lambda: not self._running, regions=hot)
-                if hot is not None and (state is None or player is None):
+
+                def scan(regions):
+                    return entity.snapshot(
+                        sc, should_stop=lambda: not self._running,
+                        regions=regions, extra_vts=(stats_vt,))
+
+                state, pobj, ents, found, extra = scan(hot)
+                if hot is not None and (state is None or pobj is None):
                     # 熱區裡找不到本體 → 物件搬家了，立刻退回全掃
-                    state, player, ents, found = entity.snapshot(
-                        sc, should_stop=lambda: not self._running)
+                    state, pobj, ents, found, extra = scan(None)
                     hot = None
                 # ⚠ 只有全掃的結果可以拿來「重設」熱區。熱區掃描找到的區塊
                 # 必然是熱區的子集，拿它覆寫的話熱區只會越縮越小 ——
@@ -281,15 +299,17 @@ class ScanWorker(QThread):
                     self._full_at[pid] = now
                     if found:
                         self._hot[pid] = found
-                mons = [e for e in ents if e.is_monster]
+                out.state, out.player = state, pobj
+                out.stats = player.pick(sc, extra.get(stats_vt, []))
+                out.mons = [e for e in ents if e.is_monster]
                 if state is None:
-                    err = "找不到狀態物件（掃到 0 個或多個）"
-                elif player is None:
-                    err = "找不到玩家物件（掃到 0 個或多個）"
+                    out.err = "找不到狀態物件（掃到 0 個或多個）"
+                elif pobj is None:
+                    out.err = "找不到玩家物件（掃到 0 個或多個）"
             except Exception as exc:               # noqa: BLE001
-                err = f"掃描失敗：{exc}"
+                out.err = f"掃描失敗：{exc}"
             if self._running:
-                self.done.emit(pid, state, player, mons, err)
+                self.done.emit(out)
 
     def stop(self) -> None:
         self._running = False
@@ -316,6 +336,7 @@ class CharFarmPage(QWidget):
         tgt.failed.connect(lambda msg: self._stop_with(f"⚠ 記憶體存取失敗：{msg}"))
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
+        self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
         self._cur: entity.Entity | None = None   # 正在打的那隻
@@ -324,6 +345,8 @@ class CharFarmPage(QWidget):
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._show = 0.0           # 距離上次重畫狀態列過了多久
+        self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
+        self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -459,10 +482,12 @@ class CharFarmPage(QWidget):
             return None
         return entity.read_pos(self.sc, self.player)
 
-    def apply_scan(self, state, player, mons, err: str) -> None:
-        self.state = state
-        self.player = player
-        self.mons = mons or []
+    def apply_scan(self, s: Scan) -> None:
+        self.state = s.state
+        self.player = s.player
+        self.stats = s.stats
+        self.mons = s.mons or []
+        err = s.err
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）。
         # 掛機時每秒都在刷新，內容沒變就別重建清單 —— 不然使用者的選取會一直被清掉。
         seen = []
@@ -560,8 +585,9 @@ class CharFarmPage(QWidget):
         if not on:
             self._keys.set_on(False)
             self._atk.hold_off()
-            self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
             self._cur = None
+            # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
+            self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
             return
         if self.state is None or self.player is None:
             self.run_cb.setChecked(False)
@@ -589,6 +615,25 @@ class CharFarmPage(QWidget):
         """
         if not self.run_cb.isChecked() or self.state is None:
             return
+
+        # ★ 角色死了就自動停：不然會對著空氣一直送技能鍵。
+        # HP 走 app/game/player.py（跨 5 台驗證過的定位）。
+        # ⚠ 它的 read() 刻意不做數值檢查，HP 歸零照樣讀得到 —— 早期版本把
+        #   「HP > 0」寫進合理性檢查，結果角色一死就回 None，死亡永遠測不到。
+        self._hp_t += dt
+        if self._hp_t >= HP_CHECK_GAP:
+            self._hp_t = 0.0
+            if self.stats:
+                st = player.read(self.sc, self.stats)
+                if st is not None:
+                    self._hp = st.hp
+                    if st.hp <= 0:
+                        self._stop_with(
+                            f"☠ 角色死亡 → 已自動停止掛機"
+                            f"（本次擊殺 {self._kills} 隻）")
+                        return
+                else:
+                    self.stats = None       # 物件搬家了，等下次掃描重新定位
 
         # ★ 掛機時持續在背景刷新清單，不要等到沒怪可打才去掃。
         # 掃描已經降到只掃熱區（很便宜），所以可以每秒刷一次；
@@ -639,8 +684,9 @@ class CharFarmPage(QWidget):
         d = (math.hypot(mp[0] - me[0], mp[1] - me[1])
              if mp and me else float("nan"))
         self.status.setText(
-            f"掛機中：{m.name}　距離 {d:.1f} 格　血量 {hp}%"
-            f"　累計擊殺 {self._kills}")
+            f"掛機中：{m.name}　距離 {d:.1f} 格　目標血量 {hp}%"
+            + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
+            + f"　累計擊殺 {self._kills}")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)
@@ -736,10 +782,10 @@ class FarmTab(BaseTab):
             page.status.setText("掃描中…（全記憶體掃描，約 0.5 秒）")
         self._worker.request(pid, page.sc)
 
-    def _on_scan_done(self, pid: int, state, player, mons, err: str) -> None:
-        page = self._pages.get(pid)
+    def _on_scan_done(self, s: Scan) -> None:
+        page = self._pages.get(s.pid)
         if page is not None:
-            page.apply_scan(state, player, mons, err)
+            page.apply_scan(s)
 
     def _tick(self) -> None:
         dt = TICK_MS / 1000.0
