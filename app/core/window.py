@@ -172,10 +172,31 @@ def send_text(hwnd: int, text: str) -> None:
         win32gui.PostMessage(hwnd, WM_CHAR, ord(ch), 0)
 
 
+def key_lparam(vk_code: int) -> tuple[int, int]:
+    """算出 WM_KEYDOWN / WM_KEYUP 該帶的 lParam。
+
+    lParam 的格式：低 16 位 = 重複次數、16~23 位 = **掃描碼**、
+    30 位 = 前一次的鍵位狀態、31 位 = 放開旗標。
+
+    ⚠ 傳 0 會讓不少遊戲直接忽略這則訊息（重複次數 0、掃描碼 0 = 無效輸入）。
+    實測本專案的遊戲就是這樣：lParam=0 的 F2 完全沒反應，
+    帶上掃描碼（F2 = 0x3C）之後才生效。
+    """
+    scan = windll.user32.MapVirtualKeyW(vk_code, 0)     # MAPVK_VK_TO_VSC
+    down = 0x00000001 | (scan << 16)
+    up = 0xC0000001 | (scan << 16)
+    return down, up
+
+
 def send_key(hwnd: int, vk_code: int) -> None:
-    """送出一次完整的按鍵（KEYDOWN + KEYUP）。"""
-    win32gui.PostMessage(hwnd, WM_KEYDOWN, vk_code, 0)
-    win32gui.PostMessage(hwnd, WM_KEYUP, vk_code, 0)
+    """送出一次完整的按鍵（KEYDOWN + KEYUP）。
+
+    用 PostMessage：只是把訊息丟進目標視窗的佇列，**不碰使用者真正的鍵盤、
+    也不搶焦點**，所以可以在背景同時操作多個視窗。
+    """
+    down, up = key_lparam(vk_code)
+    win32gui.PostMessage(hwnd, WM_KEYDOWN, vk_code, down)
+    win32gui.PostMessage(hwnd, WM_KEYUP, vk_code, up)
 
 
 # 常用虛擬鍵碼

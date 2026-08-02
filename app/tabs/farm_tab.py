@@ -18,8 +18,6 @@
 """
 from __future__ import annotations
 
-import ctypes
-
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -43,7 +41,6 @@ from app.game import entity
 from app.tabs.base_tab import BaseTab
 
 VK_F2 = 0x71
-WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 DEFAULT_INTERVAL = 0.1          # 秒；使用者指定預設每 0.1 秒按一次
 TICK_MS = 20                    # 迴圈計時器解析度
 RESCAN_GAP = 1.5                # 目標死掉後多久重掃一次找下一隻（掃一次約 0.4 秒）
@@ -51,10 +48,14 @@ NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要�
 
 
 def send_key(hwnd: int, vk: int = VK_F2) -> None:
-    """對指定視窗送一次按鍵。用 PostMessage 所以不會搶焦點。"""
-    u = ctypes.windll.user32
-    u.PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
-    u.PostMessageW(hwnd, WM_KEYUP, vk, 0)
+    """對指定視窗送一次按鍵。
+
+    走 app/core/window.py 的共用實作 —— 它會帶上正確的 lParam（含掃描碼）。
+    ⚠ lParam 傳 0 這個遊戲會直接忽略，實測完全沒反應；帶掃描碼才生效。
+
+    用 PostMessage：不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
+    """
+    win.send_key(hwnd, vk)
 
 
 class ScanWorker(QThread):
