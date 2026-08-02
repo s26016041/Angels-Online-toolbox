@@ -66,12 +66,17 @@ def select(mover, target_id: int) -> bool:
     return _send(mover, ((SELECT_FN, (SELECT_CODE, target_id)),))
 
 
-def strike(mover, pf_this: int, skill_id: int, target_id: int) -> bool:
+def strike(mover, pf_this: int, skill_id: int, target_id: int,
+           tile_x: float = 0.0, tile_y: float = 0.0) -> bool:
     """打一下：動作 + 施放。選定之後就一直重複這兩包，直到怪死掉。
 
     pf_this: move.pathfinder_this() 的結果 —— **玩家物件 −8**
+    tile_x/tile_y: 目標的**格子座標**。施放封包的第 3、4 個參數就是座標
+        —— 順移用的是同一個函式，只是把目標 ID 換成座標
+        （見 [[teleport-skill]]）。這裡兩個都給，讓伺服器自己取它要的。
     """
     if not (mover and mover.active and pf_this and skill_id and target_id):
         return False
     return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
-                         (CAST_FN, (skill_id, target_id, 0, 0, 0))))
+                         (CAST_FN, (skill_id, target_id,
+                                    int(tile_x), int(tile_y), 0))))

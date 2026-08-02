@@ -235,6 +235,7 @@ class KeyWorker(_Paced):
         self.mover = None
         self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
         self.eid = None             # 現在要打誰
+        self.pos = (0.0, 0.0)       # 那隻怪的格子座標（施放封包會帶上）
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
         self.skill = None           # 學到的技能 ID
         self._on = False
@@ -298,8 +299,8 @@ class KeyWorker(_Paced):
             # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
             if (self.mode == MODE_PACKET and self.packets and self.skill
                     and self.eid and self.pf and self.mover is not None
-                    and attack.strike(self.mover, self.pf,
-                                      self.skill, self.eid)):
+                    and attack.strike(self.mover, self.pf, self.skill,
+                                      self.eid, *self.pos)):
                 self.sent += 1
             else:
                 _send_scan(self.hwnd, self.vk)
@@ -1160,6 +1161,10 @@ class CharFarmPage(QWidget):
 
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
+        # 施放封包的第 3、4 個參數是座標（順移用的就是這兩個），一併帶上。
+        # 實測不會影響一般攻擊：黑狐用 0x101 在 8 格外照樣 100→47→0。
+        if mp:
+            self._keys.pos = (round(mp[0]), round(mp[1]))
 
         # 接近規則（改用封包攻擊後，接近**完全由我們自己走**，不靠按鍵）：
         #   ① 中間有障礙物（尋路點數 > 1）→ 走到怪臉上
