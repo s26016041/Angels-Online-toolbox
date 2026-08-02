@@ -922,7 +922,8 @@ class CharFarmPage(QWidget):
         self.status.setText(
             f"掛機中：{m.name}　距離 {d:.1f} 格　目標血量 {hp}%"
             + (f"　我的 HP {self._hp:,}" if self._hp >= 0 else "")
-            + (f"　武器耐久 {self._dura[0]}/{self._dura[1]}"
+            + (f"　武器耐久 {self._dura[0]}"
+               + (f"/{self._dura[1]}" if self._dura[1] > 0 else "")
                if self._dura[0] >= 0 else "")
             + f"　累計擊殺 {self._kills}")
 

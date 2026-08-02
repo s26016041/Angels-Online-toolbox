@@ -60,7 +60,11 @@ ITEM_TYPE_OFF = 0x08         # 種類 ID
 ITEM_SLOT_OFF = 0x25         # ★ **物品自己記著它在第幾格**（單一 byte）
 ITEM_COUNT_OFF = 0x27        # 數量（可疊物品，例如藥水 60 個）
 ITEM_DURA_OFF = 0x2C         # 耐久度現值；**0 = 壞掉**（使用者確認）
-ITEM_DURA_MAX_OFF = 0x5C     # 疑似耐久上限：五台都是 70，尚未證實是「上限」
+# ⚠ +0x5C **不是**耐久上限。第一次量到五台都是 70 才會這樣猜，
+# 但遊戲重開後同一個欄位讀到 793772102 —— 那只是剛好同階武器的某個值。
+# 目前**沒有**已知的耐久上限欄位，所以只用「現值 0 = 壞掉」做判斷。
+ITEM_DURA_MAX_OFF = 0x5C     # 保留供日後查證，別拿來當上限用
+DURA_MAX_SANE = 1000         # 超過這個就當作讀到的不是上限
 ITEM_BALL_OFF = 0xA0         # 技能經驗球的值
 
 SLOT_WEAPON = 3              # 武器欄
@@ -323,15 +327,22 @@ def find_by_slot(scanner, head: int, slot: int,
 
 
 def durability(scanner, head: int) -> tuple[int, int] | None:
-    """武器的 (耐久現值, 疑似上限)；找不到武器回傳 None。**現值 0 = 壞掉。**"""
+    """武器的 (耐久現值, 上限)；找不到武器回傳 None。**現值 0 = 壞掉。**
+
+    上限回傳 0 代表「不知道」——`+0x5C` 曾經看起來像上限（五台都是 70），
+    但重開遊戲後讀到 793772102，證實不是。判斷只用現值。
+    """
     ptr = find_by_slot(scanner, head, SLOT_WEAPON)
     if not ptr:
         return None
     raw = scanner._read_bytes(ptr, ITEM_DURA_MAX_OFF + 4)
     if not raw or len(raw) < ITEM_DURA_MAX_OFF + 4:
         return None
-    return (struct.unpack_from("<i", raw, ITEM_DURA_OFF)[0],
-            struct.unpack_from("<i", raw, ITEM_DURA_MAX_OFF)[0])
+    cur = struct.unpack_from("<i", raw, ITEM_DURA_OFF)[0]
+    mx = struct.unpack_from("<i", raw, ITEM_DURA_MAX_OFF)[0]
+    if not 0 < mx <= DURA_MAX_SANE or mx < cur:
+        mx = 0                      # 讀到的顯然不是上限，就別顯示
+    return cur, mx
 
 
 def is_valid(scanner, head: int) -> bool:
