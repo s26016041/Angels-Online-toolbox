@@ -419,7 +419,11 @@ class CharFarmPage(QWidget):
             return
 
         # 目標死了 → 換下一隻（不是停下來）
-        dead = (self._wrote and cur == 0) or not entity.is_alive(self.sc, m)
+        # 三個訊號任一成立就算死：遊戲清空目標、血量歸零、物件已被回收
+        hp = entity.read_target_hp(self.sc, self.state)
+        dead = ((self._wrote and cur == 0)
+                or (self._wrote and cur == m.eid and hp == 0)
+                or not entity.is_alive(self.sc, m))
         if dead:
             self._kills += 1
             self._cur = None
@@ -437,7 +441,7 @@ class CharFarmPage(QWidget):
             self._wrote = True
         self._keys.request(_send_scan, self.hwnd)
         self.status.setText(
-            f"掛機中：{m.name} {m.eid:#010x}　累計擊殺 {self._kills} 隻")
+            f"掛機中：{m.name}　目標血量 {hp}%　累計擊殺 {self._kills} 隻")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)

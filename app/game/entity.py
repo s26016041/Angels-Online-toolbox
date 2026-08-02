@@ -48,6 +48,8 @@ OFF_NAME = 0x1D4          # 名字，內嵌 UTF-8
 
 # --- 狀態物件的欄位 ---
 OFF_TARGET = 0x2D8        # 目前選定的目標（實體 ID）
+OFF_TARGET_HP = 0x2DC     # 目標的血量百分比；**攻擊前會檢查它 > 0**
+TARGET_HP_FULL = 100      # 實測選中滿血目標時這裡是 0x64 = 100
 
 NAME_MAX = 40             # 名字最多讀幾 bytes
 
@@ -128,18 +130,45 @@ def read_target(scanner, state: int) -> int:
     return _u32(scanner, state + OFF_TARGET)
 
 
-def set_target(scanner, state: int, eid: int) -> None:
-    """把目標寫進客戶端狀態。之後送出攻擊按鍵，角色就會打這隻。
+def read_target_hp(scanner, state: int) -> int:
+    """目標的血量百分比（0~100）。目標死亡或沒有目標時是 0。"""
+    return _u32(scanner, state + OFF_TARGET_HP)
 
-    只寫這 4 bytes —— 這是遊戲自己每次選目標都會寫的欄位。
+
+def _write_u32(scanner, addr: int, value: int) -> None:
+    """寫入一個無號 32 位元值。
 
     ⚠ 實體 ID 是**無號** 32 位元（實測有 0x8E8D04DA = 23 億這種值），
-    但 MemoryScanner 只提供有號的 int32。直接傳會炸：
+    但 MemoryScanner 只提供有號的 int32，直接傳會炸：
         'i' format requires -2147483648 <= number <= 2147483647
-    所以先轉成等價的有號值 —— 寫進記憶體的 4 個位元組完全相同。
+    先轉成等價的有號值 —— 寫進記憶體的 4 個位元組完全相同。
     """
-    signed = struct.unpack("<i", struct.pack("<I", eid & 0xFFFFFFFF))[0]
-    scanner.write_value(state + OFF_TARGET, VALUE_TYPES["int32"], signed)
+    signed = struct.unpack("<i", struct.pack("<I", value & 0xFFFFFFFF))[0]
+    scanner.write_value(addr, VALUE_TYPES["int32"], signed)
+
+
+def set_target(scanner, state: int, eid: int,
+               hp_pct: int = TARGET_HP_FULL) -> None:
+    """把目標寫進客戶端狀態。之後送出攻擊按鍵，角色就會打這隻。
+
+    ★ 必須**同時寫兩個欄位**，只寫 ID 是不夠的：
+
+        +0x2D8  目標實體 ID
+        +0x2DC  目標血量百分比
+
+    因為攻擊的程式碼長這樣（反組譯 0x60266C）：
+
+        cmp  dword ptr [esi+0x2dc], 0
+        jle  跳過攻擊                    ← 血量 ≤ 0 就當成目標已死，不出手
+        push [esi+0x2d8] ; push 0xc ; call 0x5d3eb5
+
+    只寫 +0x2D8 的話，+0x2DC 停在 0，遊戲會認為那隻已經死了而直接跳過攻擊
+    —— 症狀是「血條出現了（那只看 +0x2D8），但按 F2 完全沒反應」。
+
+    遊戲自己選目標時也是兩個一起設（0x5FA550 寫 +0x2DC、0x5FA5F0 寫 +0x2D8）。
+    """
+    _write_u32(scanner, state + OFF_TARGET, eid)
+    _write_u32(scanner, state + OFF_TARGET_HP, hp_pct)
 
 
 def is_alive(scanner, ent: Entity) -> bool:
