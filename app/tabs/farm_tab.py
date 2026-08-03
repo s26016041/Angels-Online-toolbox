@@ -142,6 +142,9 @@ CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 MELEE_RANGE = 2.0
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
+# 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
+# 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
+PATHFIND_RANGE = 25.0
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -1181,6 +1184,27 @@ class CharFarmPage(QWidget):
         # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
         keep = (0.0 if melee else MELEE_RANGE if blocked
                 else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
+
+        # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
+        #   這就是使用者說的「怪卡在奇怪的地方」：牠站在走不進去的角落，
+        #   我們既走不過去、也打不到，等下去不會有任何變化。
+        #
+        # 「非走不可」兩種模式的條件不一樣：
+        #   遠程 —— 超出攻擊範圍才需要走（範圍內就算走不到也照樣打得到）
+        #   近戰 —— **一定要走到牠身邊**才打得到，所以只要不是貼著就得走
+        #           （這條漏掉的話，近戰會在 12 格外一直空按到逾時）
+        must_walk = melee or not in_range
+        if (self._path_pts == 0 and must_walk and dist is not None
+                and dist > MELEE_RANGE and dist <= PATHFIND_RANGE):
+            self._killed[m.eid] = time.monotonic()
+            self._atk.hold_off()
+            self._cur = None
+            self._keys.eid = None
+            if not self._pick_next():
+                self._keys.set_on(False)
+                self._since_scan = RESCAN_GAP
+            self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
+            return
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
         #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
