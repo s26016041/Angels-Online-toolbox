@@ -91,6 +91,9 @@ WALK_GAP = 0.4
 # 判斷「有沒有在移動」要隔一段時間再比位置。
 # ⚠ 心跳是 10ms，而角色約 9 格/秒 = 每拍才 0.09 格 —— 拿相鄰兩拍比
 #   幾乎永遠判定「沒在動」（卡住偵測也一起誤判，走路中照樣累積秒數）。
+# 走路的到達容差：距離只超過目標一點點就不要再走了。
+# 沒有它的話角色會在定位附近一直被推一小步（「打一打又往前一格」）。
+WALK_SLACK = 1.5
 MOVE_SAMPLE = 0.3
 MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
@@ -1067,12 +1070,16 @@ class CharFarmPage(QWidget):
             # ★ 不限距離：多遠的怪都收進來（使用者要求「想打多遠都可以」），
             #   排序後自然會先打最近的，遠的靠移動封包導航過去。
             p = entity.read_pos(self.sc, m.addr)
-            pool.append((math.hypot(p[0] - me[0], p[1] - me[1])
-                         if p and me else float("inf"), m))
-        pool.sort(key=lambda t: t[0])
+            d = (math.hypot(p[0] - me[0], p[1] - me[1])
+                 if p and me else float("inf"))
+            # ★ 正在打我的排前面（見 entity.OFF_FOE）—— 不先解決牠們的話，
+            #   會一路結仇、被圍毆致死（使用者實際遇到）。
+            foe = entity.attacking(self.sc, m, self.player)
+            pool.append((0 if foe else 1, d, m))
+        pool.sort(key=lambda t: (t[0], t[1]))
         if not pool:
             return False
-        d, self._cur = pool[0]                    # 就打最近的
+        foe, d, self._cur = pool[0]      # 正在打我的優先，其次才是最近的
         self._stuck = 0.0
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
@@ -1089,7 +1096,8 @@ class CharFarmPage(QWidget):
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
         self.status.setText(
             f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
-            f"　累計擊殺 {self._kills}")
+            + ("　⚔ 牠正在打我" if foe == 0 else "")
+            + f"　累計擊殺 {self._kills}")
         return True
 
     def _on_died(self, eid: int, confirmed: bool = True) -> None:
@@ -1353,9 +1361,12 @@ class CharFarmPage(QWidget):
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
         #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
+        # ⚠ 要超過 gkeep **再多 WALK_SLACK 格**才走 —— 沒有這個容差的話，
+        #   角色停在定位附近時 gd 只比 gkeep 多一點點，每個 WALK_GAP 就再推
+        #   一小步，看起來就是「打一打又往前一格」（使用者回報的不流暢）。
         if (self.move_cb.isChecked() and me and not self._moving
                 and self._walk_t >= WALK_GAP
-                and gd is not None and gd > gkeep):
+                and gd is not None and gd > gkeep + WALK_SLACK):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
             self._walked_ok = self._walk_toward(gx, gy, me, gkeep) > 0

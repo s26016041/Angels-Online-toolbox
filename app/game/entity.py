@@ -69,6 +69,19 @@ OFF_NAME = 0x1D4          # 名字，內嵌 UTF-8
 #   比「種類 ID != 0」準得多 —— 那個只排得掉玩家，NPC、寵物、召喚物都排不掉。
 OFF_KIND = 0x2E4
 KIND_MONSTER = 7
+# ★ 「這隻怪正在跟誰交戰」—— 存的是**指向對方角色物件的指標**（不是實體 ID）。
+#   實測搜怪的物件 0x600 bytes：實體 ID 一次都沒出現，但玩家物件的指標
+#   出現在 +0x4D8 / +0x4E0 / +0x4E8，命中率約 5%
+#   （同時只有少數幾隻在打我，比例合理）。
+#   用途：挑目標時**優先打正在打我的那幾隻**，免得一路結仇被圍毆。
+OFF_FOE = 0x4D8
+
+
+def attacking(scanner, ent, player_obj: int) -> bool:
+    """這隻怪是不是正在跟我交戰。"""
+    if not player_obj:
+        return False
+    return _u32(scanner, ent.addr + OFF_FOE) == player_obj
 
 # 位置是 16.16 定點數：高 16 位是世界單位，一格 = 32 個世界單位。
 # （怪站定時值恆為 tile*32+16，也就是格子中心；移動中才會出現小數。）
