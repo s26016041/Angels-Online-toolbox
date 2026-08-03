@@ -949,6 +949,14 @@ class CharFarmPage(QWidget):
         n = self._mover.walk_to(self.sc, self.player,
                                 me[0] + (gx - me[0]) * r,
                                 me[1] + (gy - me[1]) * r)
+        # ★ 縮短版的落點走不了，就直接走去目標本身，讓**遊戲照它自己算的
+        #   路徑繞過去**。
+        #   ⚠ 這是複雜地形「不會繞路」的主因：遊戲明明算得出到那隻怪的
+        #     5 點繞路路徑，但我們是走「直線上距離牠 keep 格的那個點」——
+        #     那個幾何點常常正好落在地形裡，於是尋路失敗、角色站著不動，
+        #     等於把遊戲算好的繞路丟掉了。
+        if n <= 0:
+            n = self._mover.walk_to(self.sc, self.player, gx, gy)
         self._walk_t = 0.0
         return n
 
@@ -1276,15 +1284,12 @@ class CharFarmPage(QWidget):
                 else WALK_KEEP if self._hit_dist <= 0
                 else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
 
-        # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
-        #   這就是使用者說的「怪卡在奇怪的地方」：牠站在走不進去的角落，
-        #   我們既走不過去、也打不到，等下去不會有任何變化。
-        #
-        # 「非走不可」= 還沒進到各自的接手距離：
-        #   遠程 —— 超出攻擊封包範圍（12 格）
-        #   近戰 —— 超出客戶端接手的距離（20 格）；進去之後走位歸客戶端管，
-        #           就算尋路說我們走不到，客戶端照樣有辦法。
-        if (self._path_pts == 0 and not in_range and dist is not None
+        # ★ 尋路說「到不了」→ **立刻換一隻**（使用者定的規則）。
+        #   牠站在走不進去的角落，我們走不過去，隔著地形多半也打不到，
+        #   等下去不會有任何變化 —— 不必耗到 10 秒逾時。
+        #   ⚠ 只在尋路射程內才算數：更遠時尋路本來就回 0
+        #     （一次只算得出約 30~40 格），那是要接力走過去，不是到不了。
+        if (self._path_pts == 0 and dist is not None
                 and dist <= PATHFIND_RANGE):
             self._killed[m.eid] = time.monotonic() + KILL_MEMORY
             self._atk.hold_off()
