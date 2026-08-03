@@ -670,6 +670,7 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
+        self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
@@ -1059,6 +1060,7 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
+        self._way = []
         self._walked_ok = True
         self._why = ""
         self._last_hp = -1
@@ -1254,6 +1256,12 @@ class CharFarmPage(QWidget):
             n = self._mover.path_to(self.sc, mp[0], mp[1])
             if n >= 0:                 # -1 = 這次沒問到，保留上一次的判斷
                 self._path_pts = n
+                # ★ 緊接著把路徑點讀下來（下一次尋路就會覆蓋掉）。
+                #   要繞路時就走去**倒數第二個點** —— 那個點到怪之間一定是
+                #   直線（中間若有地形，尋路會再插一個轉折點），
+                #   走到那裡就能無阻礙地打，不必一路擠到牠臉上。
+                self._way = (self._mover.read_path(self.sc, n)
+                             if n > 1 else [])
         # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
@@ -1300,15 +1308,34 @@ class CharFarmPage(QWidget):
                 self._since_scan = RESCAN_GAP
             self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
             return
+        # ★ 要繞路時，目標改成**路徑的倒數第二個點**（使用者的觀察）：
+        #   那個點到怪之間一定是直線 —— 中間若有地形，尋路會再插一個轉折點。
+        #   走那裡就不必一路擠到牠臉上，也不會在半路被地形卡住。
+        # ⚠ 但那個點到怪可能還是超過攻擊範圍，所以再沿著**最後那段直線**
+        #   往前推到剩 WALK_KEEP 格 —— 走到定位就直接打得到，不用多跑一趟。
+        # ★ 近戰也走同一套：牠平常把走位交給客戶端，但隔著地形時客戶端
+        #   常常卡住，這時由我們把牠帶到那個「看得到怪」的點最有效。
+        gx, gy, gkeep = (mp[0], mp[1], keep) if mp else (None, None, keep)
+        if blocked and len(self._way) >= 2 and mp:
+            ax, ay = self._way[-2]
+            seg = math.hypot(mp[0] - ax, mp[1] - ay)
+            if seg > WALK_KEEP:            # 最後一段太長 → 沿著它再往前
+                r = (seg - WALK_KEEP) / seg
+                gx, gy = ax + (mp[0] - ax) * r, ay + (mp[1] - ay) * r
+            else:
+                gx, gy = ax, ay
+            gkeep = 0.0
+        gd = (math.hypot(gx - me[0], gy - me[1])
+              if (me and gx is not None) else None)
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
         #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
         if (self.move_cb.isChecked() and me and not self._moving
                 and self._walk_t >= WALK_GAP
-                and dist is not None and dist > keep):
+                and gd is not None and gd > gkeep):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
-            self._walked_ok = self._walk_toward(mp[0], mp[1], me, keep) > 0
+            self._walked_ok = self._walk_toward(gx, gy, me, gkeep) > 0
 
         # 兩條執行緒對「現在是不是用封包打」要有共識：
         # 寫目標那條要據此決定「寫不寫血量」——
@@ -1338,7 +1365,9 @@ class CharFarmPage(QWidget):
         elif not self._walked_ok:
             self._why = "⛔ 走不過去"
         elif blocked:
-            self._why = f"⛰ 隔著地形，走到 {CLOSE_ENOUGH:.0f} 格內"
+            self._why = (f"⛰ 隔著地形 → 沿路徑走到 ({gx:.0f},{gy:.0f})"
+                         if gx is not None and len(self._way) >= 2
+                         else "⛰ 隔著地形，走近一點")
         else:
             self._why = "→ 走進攻擊範圍"
 
