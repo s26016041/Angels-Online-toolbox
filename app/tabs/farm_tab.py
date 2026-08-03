@@ -1361,12 +1361,17 @@ class CharFarmPage(QWidget):
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
         #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
         #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
-        # ⚠ 要超過 gkeep **再多 WALK_SLACK 格**才走 —— 沒有這個容差的話，
-        #   角色停在定位附近時 gd 只比 gkeep 多一點點，每個 WALK_GAP 就再推
-        #   一小步，看起來就是「打一打又往前一格」（使用者回報的不流暢）。
+        # 要超過 gkeep **再多 WALK_SLACK 格**才走 —— 沒有這個容差的話，
+        # 角色停在定位附近時 gd 只比 gkeep 多一點點，每個 WALK_GAP 就再推
+        # 一小步，看起來就是「打一打又往前一格」（使用者回報的不流暢）。
+        # ⚠⚠ 但**打不到的時候容差要失效**，否則會出現死區：
+        #   攻擊範圍 12 格、走路門檻 11+1.5=12.5 格 → 怪停在 12.3 格時
+        #   既不打也不走，就是「朝一個方向發呆」（監控抓到 3 次，
+        #   距離全是 12.3~12.4）。
+        need_walk = gd is not None and (
+            gd > gkeep + WALK_SLACK or (not in_range and gd > gkeep))
         if (self.move_cb.isChecked() and me and not self._moving
-                and self._walk_t >= WALK_GAP
-                and gd is not None and gd > gkeep + WALK_SLACK):
+                and self._walk_t >= WALK_GAP and need_walk):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
             self._walked_ok = self._walk_toward(gx, gy, me, gkeep) > 0
