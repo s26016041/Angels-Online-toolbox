@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -61,6 +62,9 @@ from app.core.notifier import Notifier
 from app.game import aob, attack, entity, inventory, move, player
 from app.tabs.base_tab import BaseTab
 
+# 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
+# 平常是關的 —— 從外面看不到「為什麼不走」，只能靠這個。
+_FARM_LOG = os.environ.get("AO_FARM_LOG") == "1"
 SKILL_KEYS = [(f"F{i}", 0x6F + i) for i in range(1, 13)]   # F1=0x70 … F12=0x7B
 DEFAULT_KEY = 0x71              # F2
 DEFAULT_INTERVAL = 0.05         # 秒；每秒送 20 次技能鍵
@@ -712,6 +716,7 @@ class CharFarmPage(QWidget):
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
+        self._dbg_t = 0.0          # 診斷紀錄的計時（見 _FARM_LOG）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
@@ -1467,6 +1472,27 @@ class CharFarmPage(QWidget):
                          else "⛰ 隔著地形，走近一點")
         else:
             self._why = "→ 走進攻擊範圍"
+
+        # ★ 診斷紀錄：每秒把這一拍的**決策**寫進檔案。
+        #   從外面只看得到「站太遠」，看不到為什麼不走 —— 這幾輪我猜了太多次。
+        #   環境變數 AO_FARM_LOG=1 才會開，平常完全不做事。
+        self._dbg_t += dt
+        if _FARM_LOG and self._dbg_t >= 1.0:
+            self._dbg_t = 0.0
+            try:
+                with open(f"farm_debug_{self.account}.log", "a",
+                          encoding="utf-8") as fh:
+                    fh.write(
+                        f"{time.strftime('%H:%M:%S')} "
+                        f"離怪 {dist if dist is None else round(dist,1)} "
+                        f"停 {keep:.1f} 打得到={in_range} "
+                        f"路徑點={self._path_pts} 走不到次數={self._unreach} "
+                        f"要走={need_walk} 走成功={self._walked_ok} "
+                        f"移動中={self._moving} 卡住={self._stuck:.1f}s "
+                        f"血={hp} 冷卻中={len(self._killed)} "
+                        f"｜{self._why or '正常攻擊中'}\n")
+            except OSError:
+                pass
 
         # ⛔ 這裡曾經加過「讀不到座標超過 N 秒就換一隻」—— 拿掉了。
         #    那是用 timeout 蓋過症狀，而且量過根本沒發生：
