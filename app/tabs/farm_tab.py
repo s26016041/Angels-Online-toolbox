@@ -535,9 +535,12 @@ class ScanWorker(QThread):
                     hot = None                   # 到期了，做一次全掃保險
 
                 def scan(regions):
+                    # 地圖怪物表跟其他物件一起掃 —— 成本全在把記憶體讀出來，
+                    # 多比對一種 vtable 幾乎不花錢。
                     return entity.snapshot(
                         sc, should_stop=lambda: not self._running,
-                        regions=regions, extra_vts=(stats_vt,))
+                        regions=regions,
+                        extra_vts=(stats_vt, entity.VT_MAP_MOBS))
 
                 state, pobj, ents, found, extra = scan(hot)
                 if hot is not None and (state is None or pobj is None):
@@ -554,7 +557,14 @@ class ScanWorker(QThread):
                 out.state, out.player = state, pobj
                 out.stats = player.pick(sc, extra.get(stats_vt, []))
                 out.inv = self._inventory_head(pid, sc, now)
-                out.mons = [e for e in ents if e.is_monster]
+                # ★ 只留「這張地圖的怪物表」裡有的名字 —— 寵物、召喚物、
+                #   戰鬥化身的型別 ID 也不是 0，光看型別分不出來，
+                #   但它們不會出現在地圖的怪物表裡。
+                #   ⚠ 表讀不到時**不過濾**（寧可多列，也不要整個清單變空）。
+                names = entity.map_monster_names(
+                    sc, extra.get(entity.VT_MAP_MOBS, []))
+                out.mons = [e for e in ents if e.is_monster
+                            and (not names or e.name in names)]
                 if state is None:
                     out.err = "找不到狀態物件（掃到 0 個或多個）"
                 elif pobj is None:

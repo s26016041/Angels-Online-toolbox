@@ -233,6 +233,48 @@ def snapshot(scanner, should_stop=None, regions=None,
             {v: hits[v] for v in extra})
 
 
+# --- 這張地圖有哪些怪 -------------------------------------------------------
+# 換地圖時內容會更新的「怪物類型表」（見 [[monster-entity-found]]）：
+#     +0x00 vtable = VT_MAP_MOBS
+#     +0x04 容量（實測 0x3FF / 0x400）
+#     +0x0C 這張地圖的怪物種類數
+#     +0x10 起 指向名稱字串的指標陣列
+# 用途：把「周圍怪物」過濾成**只剩真正的怪** —— 寵物、召喚物、戰鬥化身
+# 這些的型別 ID 也不是 0，光看型別分不出來，但它們不會出現在這張表裡。
+VT_MAP_MOBS = 0x007D8E88
+_MAP_CAPS = (0x3FF, 0x400)     # 同一個 vtable 也用在別的結構上，用容量篩掉
+_MAP_MAX_KINDS = 64
+
+
+def map_monster_names(scanner, hits) -> set[str]:
+    """讀出「這張地圖的怪物名稱」集合；讀不到就回空集合（呼叫端別過濾）。
+
+    hits: 掃到的 VT_MAP_MOBS 位址（交給 snapshot 的 extra_vts 一起掃）。
+    ⚠ 同一個 vtable 會命中好幾個物件，只有容量對得上的才是地圖怪物表。
+    """
+    names: set[str] = set()
+    for obj in hits:
+        if _u32(scanner, obj + 4) not in _MAP_CAPS:
+            continue
+        cnt = _u32(scanner, obj + 0x0C)
+        if not 0 < cnt <= _MAP_MAX_KINDS:
+            continue
+        for i in range(cnt):
+            ptr = _u32(scanner, obj + 0x10 + i * 4)
+            if not ptr:
+                continue
+            raw = scanner._read_bytes(ptr, NAME_MAX)
+            if not raw:
+                continue
+            try:
+                nm = raw.split(b"\x00")[0].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if nm:
+                names.add(nm)
+    return names
+
+
 def read_target(scanner, state: int) -> int:
     """目前選定的目標實體 ID；沒有選定時是 0。"""
     return _u32(scanner, state + OFF_TARGET)
