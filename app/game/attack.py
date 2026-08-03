@@ -36,6 +36,24 @@ ACTION_FN = 0x005DA9F4      # ①動作。f(玩家物件−8, 動作碼)
 SELECT_FN = 0x005D3EB5      # ②選定。f(0x0C, 目標實體ID)
 CAST_FN = 0x00559FF8        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 
+# ★★★ ④第四包。遊戲自己打怪時會夾在施放之間送，我們原本完全沒送。
+#   反組譯 0x559FBE：
+#       f(目標實體ID, u16)   cdecl，兩個參數
+#       sub esp,0x10 / push 8 / push 5 / lea ecx,[ebp-0x10] → 建構封包
+#       [封包+2] = 第一個參數（目標 ID）；[0x9B67D4] 也存一份
+#       [封包+6] = 第二個參數的低 16 位
+#   ⚠ 兩個參數都只是被寫進封包緩衝，**沒有任何指標解參考** ——
+#     給錯值最多是伺服器忽略，不會崩潰。實際用 (目標ID, 0) 就有效。
+#
+#   A/B 實測（雪狐，純淨迴圈，各 60 秒兩輪，只差這一包）：
+#       只送 動作＋施放   0 隻、0 隻
+#       加上這一包        3 隻、4 隻
+#   以前近戰站在 1.0 格送 240 發攻擊卻打不死怪，就是少了它。
+#
+#   遊戲自己的比例：45 秒內施放 34 次、這一包 17 次（約每兩次夾一次）。
+#   我們每次都送 —— 測出來有效的就是這個組態。
+KEEPUP_FN = 0x00559FBE
+
 SELECT_CODE = 0x0C          # ②的第一個參數（遊戲自己的程式碼就是推 0xC）
 ACTION_CODE = 0             # ①的動作碼，實測攔到 0（另看過 5/7）
 
@@ -98,4 +116,5 @@ def strike(mover, pf_this: int, skill_id: int, target_id: int,
         return False
     return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
                          (CAST_FN, (skill_id, target_id,
-                                    int(tile_x), int(tile_y), 0))))
+                                    int(tile_x), int(tile_y), 0)),
+                         (KEEPUP_FN, (target_id, 0))))
