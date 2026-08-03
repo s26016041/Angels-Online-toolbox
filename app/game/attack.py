@@ -79,12 +79,19 @@ def select(mover, target_id: int) -> bool:
 
 def strike(mover, pf_this: int, skill_id: int, target_id: int,
            tile_x: float = 0.0, tile_y: float = 0.0) -> bool:
-    """打一下：動作 + 施放。選定之後就一直重複這兩包，直到怪死掉。
+    """打一下：動作 + 施放。選定之後就一直重複，直到怪死掉。
 
     pf_this: move.pathfinder_this() 的結果 —— **玩家物件 −8**
-    tile_x/tile_y: 目標的**格子座標**。施放封包的第 3、4 個參數就是座標
-        —— 順移用的是同一個函式，只是把目標 ID 換成座標
-        （見 [[teleport-skill]]）。這裡兩個都給，讓伺服器自己取它要的。
+    tile_x/tile_y: 目標的**格子座標**，填在施放封包的第 3、4 個參數。
+        ★ **順移這類對地技能沒有座標就發不動**（見 [[teleport-skill]]），
+          所以照給；使用者把順移放在攻擊鍵時才有辦法用。
+
+    ⚠ 座標**只能放在同一發裡**，不要另外多送一發「目標 ID = 0 + 座標」的
+      對地施放 —— 實測多送那一發時，怪連續 3.3 秒零傷害，而只送這一發
+      1.3 秒就打死。
+    ⚠ 我曾經說過「同一發帶座標會讓攻擊失效」，那是**錯的**：
+      當時每種只測 1 隻。後來同一批怪交替測 3 對 3，
+      帶座標與不帶座標都是 100% 打得到。
     """
     if (not (mover and mover.active and pf_this and skill_id and target_id)
             or _yield_now(mover)):

@@ -321,6 +321,21 @@ class Mover:
             self._lock.release()
         return n if (n and 0 < n <= MAX_POINTS) else 0
 
+    @staticmethod
+    def read_path(scanner, count: int) -> list[tuple[float, float]]:
+        """讀出剛才 path_to() 算好的路徑點（格子座標）。
+
+        ★ 要**緊接在 path_to() 之後**讀 —— 路徑點寫在全域陣列 WAYPOINTS，
+          下一次尋路就會覆蓋掉。
+        路徑的最後一個點是目標本身，所以**倒數第二個點到目標之間一定是直線**
+        （中間若有地形，尋路會再插一個轉折點）。走到那個點就能無阻礙地打。
+        """
+        raw = scanner._read_bytes(WAYPOINTS, max(0, count) * 4)
+        if not raw:
+            return []
+        return [(x / entity.TILE_UNITS, y / entity.TILE_UNITS)
+                for x, y in struct.iter_unpack("<HH", bytes(raw))]
+
     def walk_to(self, scanner, player_obj: int,
                 tile_x: float, tile_y: float, wait: float = 0.12) -> int:
         """走到指定的格子座標。**回傳尋路算出的路徑點數**（0 = 走不了）。
