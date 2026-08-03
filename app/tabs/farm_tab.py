@@ -111,7 +111,14 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒前進這麼久 → �
 #   門檻，於是每一拍都被當成「正在走路」，_stuck 永遠被歸零 ——
 #   唯讀監控實拍**卡了 32 秒**都沒觸發（STUCK_SECS 是 10 秒）。
 #   只要人還在這個半徑裡打轉，就一律算沒有前進。
-STUCK_EPS = 2.0
+# ⚠ 2.0 太小：實拍到角色在 (88.5,40.5) 與 (90.5,42.5) 之間來回，
+#   相距 2.8 格，錨點一直被重設，卡了 35 秒還是沒觸發。
+STUCK_EPS = 4.0
+# ★★ 「走不到」的冷卻。**絕對不能跟確定打死的怪一樣長**（KILL_MEMORY 60 秒）——
+#   尋路失敗多半是位置造成的暫時現象（角色站的地方剛好算不出來），
+#   換個位置就好了。用 60 秒的後果實拍到了：近處 12.6 / 13.0 格的怪
+#   全部被自己冷凍，只剩 29.4 格外的可挑，追過去又失敗，越陷越深。
+UNREACH_MEMORY = 8.0
 # ⛔ 曾經有「正在打我的優先」（FOE_RANGE），已經拿掉 —— 見 _pick_next()。
 # ⛔ 不要做「打不到就一步一步走近」那種自動收斂 —— 使用者明講看起來卡卡的，
 #    而且根本不需要：實測（黑狐，目標有寫進記憶體）12.2 / 11.6 / 8.9 格
@@ -1344,7 +1351,8 @@ class CharFarmPage(QWidget):
         #   結果一路結仇、被圍毆致死（使用者實際遇到）。
         if (self._unreach >= UNREACH_HITS and not self._hurt
                 and dist is not None and dist <= PATHFIND_RANGE):
-            self._killed[m.eid] = time.monotonic() + KILL_MEMORY
+            # ⚠ 用短冷卻，不是 KILL_MEMORY（見 UNREACH_MEMORY 的說明）
+            self._killed[m.eid] = time.monotonic() + UNREACH_MEMORY
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
@@ -1446,7 +1454,8 @@ class CharFarmPage(QWidget):
         self._last_pos = me
         self._last_hp = hp
         if self._stuck >= STUCK_SECS:
-            self._killed[m.eid] = time.monotonic() + KILL_MEMORY  # 走不過去
+            # 走不過去 —— 一樣用短冷卻，這多半是位置造成的暫時現象
+            self._killed[m.eid] = time.monotonic() + UNREACH_MEMORY
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
