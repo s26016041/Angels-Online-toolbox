@@ -125,10 +125,11 @@ ATTACK_PACKET_RANGE = 12.0
 # 超出範圍時**一次就走到 10 格內**（使用者定的）。
 # 留 2 格餘裕是必要的：怪自己會動，停在射程邊緣的話牠一走就又出界，
 # 然後又得重走一次 —— 那就是「卡卡的」的來源。
-# ⚠ 監控實測：站在**正好 10.0 格**、路徑直線通、卻連續數秒打不到
-#   （300 秒 6 次卡住裡有 2 次是這樣）。而 8.0 格是實測會掉血的
-#   （100 → 47 → 0）。所以停在 8 格，留 4 格餘裕給怪的走動。
-WALK_KEEP = 8.0
+# 走進攻擊範圍後停在幾格。使用者查到「遠程技能基本上都是 12 射程」，
+# 所以停 11 格、只留 1 格餘裕（停 8 格太保守，會多走一段冤枉路）。
+# ⚠ 先前量到「站在 10.0 格打不到」，那是路徑點數被誤用造成的
+#   （blocked 誤判 → 攻擊距離被縮成 2 格），已經修掉，不是射程問題。
+WALK_KEEP = 11.0
 # 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
 # —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
@@ -265,9 +266,6 @@ class KeyWorker(_Paced):
         self.mover = None
         self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
         self.eid = None             # 現在要打誰
-        # 那隻怪的格子座標。★ 會**另外**送一發「對地施放」給吃座標的技能用；
-        #   絕不能跟目標 ID 塞在同一發裡（見 attack.strike 的說明）。
-        self.pos: tuple[float, float] | None = None
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
         self.skill = None           # 學到的技能 ID
         self._on = False
@@ -342,8 +340,8 @@ class KeyWorker(_Paced):
             # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
             if (self.mode == MODE_PACKET and self.packets and self.skill
                     and self.eid and self.pf and self.mover is not None
-                    and attack.strike(self.mover, self.pf, self.skill,
-                                      self.eid, *(self.pos or (None, None)))):
+                    and attack.strike(self.mover, self.pf,
+                                      self.skill, self.eid)):
                 self.sent += 1
             else:
                 _send_scan(self.hwnd, self.vk)
@@ -1213,8 +1211,6 @@ class CharFarmPage(QWidget):
 
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
-        # 給「對地施放」那一發用（另外一發，不是塞進目標 ID 那發）
-        self._keys.pos = (round(mp[0]), round(mp[1])) if mp else None
 
         # 接近規則（改用封包攻擊後，接近**完全由我們自己走**，不靠按鍵）：
         #   ① 中間有障礙物（尋路點數 > 1）→ 走到怪臉上
