@@ -1272,8 +1272,16 @@ class CharFarmPage(QWidget):
         # ⚠ 這**不是**「走路很卡」的原因：對照實測（黑狐走 18 格）走路中每
         #   0.2 秒問一次尋路，1.2 秒走完、零倒退，跟不問完全一樣。
         #   留著只是為了少跟攻擊搶指令槽。真正的原因見下面 set_on() 那段。
+        # ⚠⚠⚠ **貼在身上的怪不要問尋路** —— 尋路到「自己腳下那一格」本來
+        #   就會回 0，而 0 在這裡是「走不過去」的意思。近戰走到怪旁邊之後
+        #   每一隻都會踩到，於是好好的目標被連續判定走不到、丟進黑名單。
+        #   實測（雪狐，封包攻擊）：殺完第一隻之後
+        #       ⛔ 走不到「焦炎罪贖者」(0.1 格) → 換一隻
+        #   接著空轉 42 秒。這**只會打到近戰** —— 遠程停在 11~12 格，
+        #   尋路正常，所以同一份程式碼在黑狐身上看不出問題。
         self._path_t += dt
         if (self._path_t >= PATH_GAP and mp is not None and me
+                and dist is not None and dist > MELEE_RANGE
                 and not self._moving and self._walk_t >= PATH_QUIET
                 and self._mover is not None and self._mover.active):
             self._path_t = 0.0
@@ -1326,9 +1334,11 @@ class CharFarmPage(QWidget):
         #   才算數 —— 怪會走動，打鬥中某一瞬間牠站到走不進去的格子，
         #   路徑就會變 0。少了這兩條會變成「打一下就換下一隻」，
         #   結果一路結仇、被圍毆致死（使用者實際遇到）。
+        # ⚠⚠ **已經走到旁邊的怪永遠不算「走不到」**：都貼上去了，還需要走去
+        #   哪裡？那個 0 只是「尋路到自己腳下那格」的結果，不是走不過去。
         self._unreach = (self._unreach + 1) if self._path_pts == 0 else 0
         if (self._unreach >= UNREACH_HITS and not self._hurt
-                and dist is not None and dist <= PATHFIND_RANGE):
+                and dist is not None and MELEE_RANGE < dist <= PATHFIND_RANGE):
             self._killed[m.eid] = time.monotonic() + KILL_MEMORY
             self._atk.hold_off()
             self._cur = None
@@ -1351,7 +1361,9 @@ class CharFarmPage(QWidget):
         #   ⚠⚠ 反覆下移動 = 走到一半又插一條新路徑進去，伺服器會把角色
         #     拉回最後承認的位置 —— 使用者看到的「往前然後回縮回到原點」。
         #   只有在「**已經停下來**、卻還離得遠」時才補送一次（怪自己跑掉了）。
-        need_walk = gd is not None and (
+        # ⚠ 已經在旁邊就不要下移動指令 —— 目的地會落在自己腳下，尋路回 0、
+        #   角色不動，還把「走不到」的旗標弄髒（見上面 _unreach 那段）。
+        need_walk = gd is not None and gd > MELEE_RANGE and (
             self._walked_for != m.eid
             or (not self._moving and gd > REWALK_DIST
                 and self._walk_t >= REWALK_GAP))
