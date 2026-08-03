@@ -119,8 +119,8 @@ ATTACK_PACKET_RANGE = 12.0
 #   （300 秒 6 次卡住裡有 2 次是這樣）。而 8.0 格是實測會掉血的
 #   （100 → 47 → 0）。所以停在 8 格，留 4 格餘裕給怪的走動。
 WALK_KEEP = 8.0
-# 剛鎖定目標之後，等遊戲把血量填進來的緩衝時間。
-# 這段時間內讀到 0 不算死亡（遊戲還沒寫）。
+# 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
+# —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
 # ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
@@ -348,11 +348,13 @@ class TargetWorker(_Paced):
         self.packets = False
         self._job: tuple[int, entity.Entity] | None = None
         self._wrote = False
-        self._since = 0.0           # 鎖定這隻多久了（判定死亡要有緩衝）
+        self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
+        self._zero_at = 0.0         # 血量開始連續讀到 0 的時間
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
-        self._since = time.monotonic()
+        self._saw_hp = False
+        self._zero_at = 0.0
         self._job = (state, ent)
 
     def hold_off(self) -> None:
@@ -369,15 +371,23 @@ class TargetWorker(_Paced):
             # 先寫回去就把訊號蓋掉了。
             cur = entity.read_target(self.sc, state)
             self.hp = entity.read_target_hp(self.sc, state)
+            now = time.monotonic()
+            if self.hp > 0:
+                self._saw_hp = True
+                self._zero_at = 0.0
+            elif not self._zero_at:
+                self._zero_at = now
             # ★ 用封包攻擊時，血量歸零就是**遊戲告訴我們這隻死了**。
             #   這才是可靠的死亡訊號 —— 屍體不會馬上從實體清單消失，
             #   `is_alive()`（vtable + 實體 ID）也分不出死活。
-            # ⚠ 要給遊戲一點時間把血量填進去（剛選定的那幾毫秒讀到的是 0），
-            #   但**不能要求「先看過 > 0」** —— 接手一隻已經快死的怪時，
-            #   從頭到尾都讀到 0，那條件永遠不成立，於是鎖著屍體撐到 10 秒
-            #   逾時才換（監控 300 秒抓到的 6 次卡住，有 4 次是這樣）。
-            dead_by_hp = (self.packets and self.hp == 0
-                          and time.monotonic() - self._since >= HP_SETTLE)
+            # ⚠⚠ 兩個條件缺一不可，**都是實測踩出來的**：
+            #   ① 要先看過血量 > 0 —— 遊戲對「還沒交戰」的目標本來就回報 0，
+            #      少了這條會剛鎖定就判死（實測 150 秒誤判放棄 22 次、
+            #      真正擊殺只有 4 次）。
+            #   ② 0 要**連續**持續 HP_SETTLE 秒 —— 中途偶爾讀到一次 0
+            #      不算，免得把還活著的怪丟掉。
+            dead_by_hp = (self.packets and self._saw_hp and self.hp == 0
+                          and now - self._zero_at >= HP_SETTLE)
             if self._wrote and (cur == 0 or dead_by_hp
                                 or not entity.is_alive(self.sc, ent)):
                 self._job = None
@@ -1199,7 +1209,11 @@ class CharFarmPage(QWidget):
         # 走到多近：近戰只要進到客戶端接手的距離；隔著地形就貼臉；
         # 否則走到「看過掉血的距離」，最多 WALK_KEEP
         # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
+        # ⚠ 還沒看過掉血時（_hit_dist = 0）要用 WALK_KEEP，**不能用 2 格** ——
+        #   否則一開始就一路走到怪臉上（使用者回報的「都走很近」，實測
+        #   鎖定距離最小 0.5 格）。8 格是實測會掉血的距離，本來就夠近。
         keep = (CLIENT_RANGE if melee else MELEE_RANGE if blocked
+                else WALK_KEEP if self._hit_dist <= 0
                 else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
 
         # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
