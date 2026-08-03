@@ -535,12 +535,9 @@ class ScanWorker(QThread):
                     hot = None                   # 到期了，做一次全掃保險
 
                 def scan(regions):
-                    # 地圖怪物表跟其他物件一起掃 —— 成本全在把記憶體讀出來，
-                    # 多比對一種 vtable 幾乎不花錢。
                     return entity.snapshot(
                         sc, should_stop=lambda: not self._running,
-                        regions=regions,
-                        extra_vts=(stats_vt, entity.VT_MAP_MOBS))
+                        regions=regions, extra_vts=(stats_vt,))
 
                 state, pobj, ents, found, extra = scan(hot)
                 if hot is not None and (state is None or pobj is None):
@@ -557,17 +554,13 @@ class ScanWorker(QThread):
                 out.state, out.player = state, pobj
                 out.stats = player.pick(sc, extra.get(stats_vt, []))
                 out.inv = self._inventory_head(pid, sc, now)
-                # ★ 只留「遊戲的怪物類型表」裡有的名字 —— 寵物、召喚物、
-                #   戰鬥化身的型別 ID 也不是 0，光看型別分不出來，
-                #   但它們不會出現在那些表裡。
-                mons = [e for e in ents if e.is_monster]
-                names = entity.map_monster_names(
-                    sc, extra.get(entity.VT_MAP_MOBS, []))
-                kept = [e for e in mons if e.name in names]
-                # ⚠ 兩道保險，寧可多列也不要列不出來：
-                #   · 表讀不到（names 是空的）→ 不過濾
-                #   · 過濾後全空、但原本有怪 → 這張圖的表可能沒載到，也不過濾
-                out.mons = kept if (names and kept) else mons
+                # ★ is_monster 現在看實體的「種類」欄位（見 entity.OFF_KIND），
+                #   NPC、別人的寵物、召喚物都會被排掉。
+                # ⛔ 曾經改用「遊戲的怪物名稱表」過濾 —— 不可靠，別再試：
+                #    那個 vtable 是通用的字串清單容器（同一個 vtable 底下還有
+                #    購買紀錄、裝備名稱、角色名），而且**不會跟著換地圖更新**
+                #    （換到沼澤之後，表裡還是前一張圖的名字）。
+                out.mons = [e for e in ents if e.is_monster]
                 if state is None:
                     out.err = "找不到狀態物件（掃到 0 個或多個）"
                 elif pobj is None:

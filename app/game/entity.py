@@ -62,6 +62,13 @@ OFF_POS_Y = 0xC0          # 位置 Y
 OFF_ID = 0x1C8            # 實體 ID，每隻唯一 —— 攻擊目標就是傳這個
 OFF_TYPE = 0x1D0          # 種類 ID；0 = 其他玩家
 OFF_NAME = 0x1D4          # 名字，內嵌 UTF-8
+# ★ 實體種類。實測（同一畫面同時有三種）：
+#       7 = 怪物（沼澤青鱗戰士 0xE12、猩大嬸 0xE11）
+#       2 = 其他玩家（超級菲比，種類 ID 是 0）
+#       0 = NPC（隱士查洛 0x995）
+#   比「種類 ID != 0」準得多 —— 那個只排得掉玩家，NPC、寵物、召喚物都排不掉。
+OFF_KIND = 0x2E4
+KIND_MONSTER = 7
 
 # 位置是 16.16 定點數：高 16 位是世界單位，一格 = 32 個世界單位。
 # （怪站定時值恆為 tile*32+16，也就是格子中心；移動中才會出現小數。）
@@ -89,10 +96,20 @@ class Entity:
     name: str
     x: float = 0.0
     y: float = 0.0
+    kind: int = -1            # 見 OFF_KIND；-1 = 沒讀到
 
     @property
     def is_monster(self) -> bool:
-        return self.type_id != 0
+        """是不是**可以打的怪**（不是玩家、不是 NPC、不是寵物／召喚物）。
+
+        ★ 用 OFF_KIND 判斷。以前用 `type_id != 0`，那只排得掉其他玩家 ——
+          NPC、別人的寵物、戰鬥化身的種類 ID 也不是 0，會一起跑進清單裡
+          （使用者回報「還是有 NPC 以及別人寵物」）。
+        ⚠ 讀不到 kind（-1）時退回舊判斷，寧可多列也不要整個列不出來。
+        """
+        if self.kind < 0:
+            return self.type_id != 0
+        return self.kind == KIND_MONSTER
 
     def distance_to(self, pos: tuple[float, float] | None) -> float:
         """到某個座標幾格。pos 為 None（玩家位置不明）時回傳無限大。"""
@@ -191,7 +208,8 @@ def _build(scanner, addrs: list[int]) -> list[Entity]:
             continue
         pos = read_pos(scanner, addr) or (0.0, 0.0)
         out.append(Entity(addr, _u32(scanner, addr + OFF_ID),
-                          _u32(scanner, addr + OFF_TYPE), name, *pos))
+                          _u32(scanner, addr + OFF_TYPE), name, *pos,
+                          kind=_u32(scanner, addr + OFF_KIND)))
     return out
 
 
