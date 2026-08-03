@@ -122,6 +122,10 @@ WALK_KEEP = 8.0
 # 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
 # —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
+# 鎖定這麼久還**從來沒**看到血量 → 那是屍體（別人先打死的），換一隻。
+# ⚠ 門檻是量出來的：活著的目標鎖定後看到血量，中位 0.30 秒、最久 2.22 秒
+#   （34 隻樣本），所以 3 秒不會誤殺活的怪。
+CORPSE_SECS = 3.0
 # ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
 #   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
@@ -350,11 +354,13 @@ class TargetWorker(_Paced):
         self._wrote = False
         self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
         self._zero_at = 0.0         # 血量開始連續讀到 0 的時間
+        self._since = 0.0           # 鎖定這隻的時間（判斷屍體用）
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
         self._saw_hp = False
         self._zero_at = 0.0
+        self._since = time.monotonic()
         self._job = (state, ent)
 
     def hold_off(self) -> None:
@@ -388,7 +394,16 @@ class TargetWorker(_Paced):
             #      不算，免得把還活著的怪丟掉。
             dead_by_hp = (self.packets and self._saw_hp and self.hp == 0
                           and now - self._zero_at >= HP_SETTLE)
-            if self._wrote and (cur == 0 or dead_by_hp
+            # ★ 屍體：鎖定這麼久了還**從來沒有**看到血量 —— 那是別人先打死的。
+            #   搶怪嚴重的地方這種很多，實測 120 秒有 26 隻，白白鎖住 52 秒
+            #   ＝ 44% 的時間在對屍體發呆。
+            #   ⚠ 門檻是量出來的：活著的目標鎖定後看到血量的時間，
+            #     中位 0.30 秒、**最久 2.22 秒**（34 隻），所以 3 秒很安全。
+            #   ⚠ 只有封包模式能用：按鍵模式我們自己會把血量寫成 100，
+            #     `_saw_hp` 一定是 True（見下面寫入那段）。
+            corpse = (self.packets and not self._saw_hp
+                      and now - self._since >= CORPSE_SECS)
+            if self._wrote and (cur == 0 or dead_by_hp or corpse
                                 or not entity.is_alive(self.sc, ent)):
                 self._job = None
                 self._wrote = False
