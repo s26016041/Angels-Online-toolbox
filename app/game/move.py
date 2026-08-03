@@ -108,6 +108,10 @@ def pathfinder_this(scanner) -> int | None:
     if not obj or u32(obj + OBJ_ID) != ident:
         return None
     return obj
+# 尋路／移動舉手之後，最多等這麼久拿指令槽。
+# 攻擊那邊看到有人舉手就會跳過一拍（約 50ms），所以這個時間綽綽有餘；
+# 而且是在 UI 執行緒上等，不能太長。
+SLOT_YIELD = 0.12
 HOOK_IMPORT = "PeekMessageA"
 MAX_POINTS = 32             # 一次最多送幾個路徑點（封包大小 = 點數*4+9）
 
@@ -183,10 +187,23 @@ class Mover:
         self._active = False
         # RLock 而非 Lock：call_sync() 內部會再呼叫 call()，同一條執行緒要能重入。
         self._lock = threading.RLock()
+        # ★ 「有人在等指令槽」的計數（見 slot_wanted）。
+        self._wanted = 0
 
     @property
     def active(self) -> bool:
         return self._active
+
+    @property
+    def slot_wanted(self) -> bool:
+        """尋路／移動那邊正在等指令槽 —— 攻擊要讓路。
+
+        ⚠⚠ 沒有這個機制的話，攻擊執行緒會把指令槽佔到 **82%**（實測），
+          UI 想問「這隻怪跟我之間有沒有障礙物」幾乎永遠問不到，
+          於是一直當成「沒有障礙物、已經走夠近」→ 站著打卻打不到，
+          直到 10 秒卡住偵測才換怪（使用者回報的「掛機還是會卡住」）。
+        """
+        return self._wanted > 0
 
     @property
     def lock(self) -> threading.RLock:
@@ -287,8 +304,12 @@ class Mover:
         this = pathfinder_this(scanner)
         if not this:
             return 0
-        got = (self._lock.acquire(timeout=wait) if wait > 0
-               else self._lock.acquire(blocking=False))
+        # 舉手說「我要用指令槽」，攻擊那邊看到就會讓一拍出來（見 slot_wanted）。
+        self._wanted += 1
+        try:
+            got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
+        finally:
+            self._wanted -= 1
         if not got:
             return -1
         try:
@@ -337,8 +358,14 @@ class Mover:
         #   但我們自己若被切開就可能拿舊路徑去送。整段一起鎖最安全。
         # ⚠ 但這也常在 UI 執行緒上呼叫，所以只等 wait 秒 —— 等不到就回 0，
         #   呼叫端過一下會再試一次，總之不要凍住畫面（見 path_to 的說明）。
-        if not self._lock.acquire(timeout=wait):
+        self._wanted += 1                  # 舉手要指令槽，攻擊會讓一拍
+        try:
+            got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
+        finally:
+            self._wanted -= 1
+        if not got:
             return 0
+
         def try_point(px: float, py: float) -> int:
             tx = int(px * entity.TILE_UNITS) & 0xFFFF
             ty = int(py * entity.TILE_UNITS) & 0xFFFF

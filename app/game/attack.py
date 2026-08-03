@@ -42,6 +42,17 @@ ACTION_CODE = 0             # ①的動作碼，實測攔到 0（另看過 5/7�
 CALL_TIMEOUT = 0.12         # 每一包等它被主執行緒執行的上限（一幀約 16ms）
 
 
+def _yield_now(mover) -> bool:
+    """尋路／移動正在等指令槽 → 這一拍不打，把槽讓出去。
+
+    ⚠⚠ 沒有這個讓路，攻擊會把指令槽佔到 82%（實測），
+      掛機那邊就問不到「跟這隻怪之間有沒有障礙物」，
+      於是站在原地打不到的位置一直空打，直到卡住偵測才換怪。
+      少打一拍（約 50ms）換到正確的判斷，非常划算。
+    """
+    return bool(mover) and mover.slot_wanted
+
+
 def _send(mover, calls) -> bool:
     """照順序送出一串呼叫；有任何一個排不進去就回 False。
 
@@ -61,7 +72,7 @@ def select(mover, target_id: int) -> bool:
 
     mover: 已 start() 的 move.Mover（我們借它的 PeekMessageA 跳板呼叫遊戲函式）
     """
-    if not (mover and mover.active and target_id):
+    if not (mover and mover.active and target_id) or _yield_now(mover):
         return False
     return _send(mover, ((SELECT_FN, (SELECT_CODE, target_id)),))
 
@@ -75,7 +86,8 @@ def strike(mover, pf_this: int, skill_id: int, target_id: int,
         —— 順移用的是同一個函式，只是把目標 ID 換成座標
         （見 [[teleport-skill]]）。這裡兩個都給，讓伺服器自己取它要的。
     """
-    if not (mover and mover.active and pf_this and skill_id and target_id):
+    if (not (mover and mover.active and pf_this and skill_id and target_id)
+            or _yield_now(mover)):
         return False
     return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
                          (CAST_FN, (skill_id, target_id,
