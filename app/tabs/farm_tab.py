@@ -757,14 +757,16 @@ class CharFarmPage(QWidget):
 
         # 巡邏點：沒怪時依序走過去找怪（取代原本只有一個的「原點」）
         spot = QGroupBox("巡邏點")
-        spot.setFixedWidth(170)
+        spot.setFixedWidth(190)
         sv = QVBoxLayout(spot)
         self.spot_list = QListWidget()
         self.spot_list.setFixedHeight(NEAR_HEIGHT)
         self.spot_list.setSelectionMode(QListWidget.ExtendedSelection)
         sv.addWidget(self.spot_list)
         srow = QHBoxLayout()
-        add_btn = QPushButton("加入目前位置")
+        # ⚠ 字別太長：主題給按鈕的 padding 是左右各 14px，
+        #   「加入目前位置」要 108px，加上 X 鈕就超出區塊寬度被切掉（踩過）。
+        add_btn = QPushButton("加入位置")
         add_btn.setToolTip("把角色現在站的位置加進巡邏點。")
         add_btn.clicked.connect(self._add_spot)
         srow.addWidget(add_btn)
