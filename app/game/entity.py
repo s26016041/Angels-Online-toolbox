@@ -315,6 +315,22 @@ def map_monster_names(scanner, hits) -> set[str]:
     return names
 
 
+# ★ 客戶端自己算出來的「要走到哪裡」（16.16 定點，跟座標同一種編碼）。
+#   按下技能鍵時，客戶端會依**這招的射程**算出落腳點寫在這裡 ——
+#   所以 距離(落腳點, 怪) 就是官方的射程，不必自己量、也不必找射程欄位。
+#   實測（雪狐近戰）：客戶端算出的落腳點離怪 1.5 格。
+OFF_DEST = 0x144
+
+
+def read_dest(scanner, player_obj: int) -> tuple[float, float] | None:
+    """客戶端目前的移動目的地（格子座標）；讀不到回 None。"""
+    raw = scanner._read_bytes(player_obj + OFF_DEST, 8)
+    if not raw:
+        return None
+    x, y = struct.unpack("<II", raw)
+    return (x >> 16) / TILE_UNITS, (y >> 16) / TILE_UNITS
+
+
 def read_target(scanner, state: int) -> int:
     """目前選定的目標實體 ID；沒有選定時是 0。"""
     return _u32(scanner, state + OFF_TARGET)
