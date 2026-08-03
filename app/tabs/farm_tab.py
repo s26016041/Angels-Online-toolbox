@@ -140,6 +140,10 @@ CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
 #   —— 實測雪狐就是這樣完全打不到怪。
 MELEE_RANGE = 2.0
+# ★ 近戰模式：進到這個距離就開始鎖定＋狂按 Fx，剩下的走位交給遊戲客戶端 ——
+#   它知道每招的射程，也會自己繞地形。我們只負責把角色帶進這個圈子，
+#   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
+CLIENT_RANGE = 20.0
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
@@ -703,8 +707,9 @@ class CharFarmPage(QWidget):
         self.type_box.setToolTip(
             f"遠程：送攻擊封包（距離 {ATTACK_PACKET_RANGE:.0f} 格內就送，"
             f"走到 {WALK_KEEP:.0f} 格內就停）。\n"
-            "近戰：用封包選定怪物，然後**狂按你選的那個 F 鍵**出手，\n"
-            "　　　射程與走位交給遊戲客戶端判斷；我們只負責走到怪身上。\n"
+            f"近戰：用封包選定怪物，然後**狂按你選的那個 F 鍵**出手。\n"
+            f"　　　我們只把角色帶到 {CLIENT_RANGE:.0f} 格內，剩下的射程與走位\n"
+            "　　　全交給遊戲客戶端 —— 它知道每招要站多近，也會自己繞地形。\n"
             "⚠ 射程每個角色不一樣，近戰角色站太遠送攻擊封包伺服器不會理，\n"
             "　 症狀是站著不動、怪完全不掉血 —— 所以近戰交給客戶端比較穩。")
         mbar.addWidget(self.type_box)
@@ -1177,25 +1182,29 @@ class CharFarmPage(QWidget):
         melee = bool(self.type_box.currentData())
         self._keys.mode = MODE_KEY if melee else self.mode
         blocked = self._path_pts > 1
-        reach = MELEE_RANGE if blocked else ATTACK_PACKET_RANGE
+        # ★ 近戰是「鎖定 + 狂按 Fx」，**走位由客戶端自己算** ——
+        #   所以我們只要把角色帶到 CLIENT_RANGE 內就交給它，
+        #   不要再自己往怪身上推（兩邊搶著下移動指令會互相打架）。
+        #   隔著地形也不必特別處理：客戶端用的就是遊戲自己的尋路。
+        reach = (CLIENT_RANGE if melee
+                 else MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
         in_range = dist is not None and dist <= reach
-        # 走到多近：近戰直接走到怪身上（0）；隔著地形就貼臉；
+        # 走到多近：近戰只要進到客戶端接手的距離；隔著地形就貼臉；
         # 否則走到「看過掉血的距離」，最多 WALK_KEEP
         # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
-        keep = (0.0 if melee else MELEE_RANGE if blocked
+        keep = (CLIENT_RANGE if melee else MELEE_RANGE if blocked
                 else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
 
         # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
         #   這就是使用者說的「怪卡在奇怪的地方」：牠站在走不進去的角落，
         #   我們既走不過去、也打不到，等下去不會有任何變化。
         #
-        # 「非走不可」兩種模式的條件不一樣：
-        #   遠程 —— 超出攻擊範圍才需要走（範圍內就算走不到也照樣打得到）
-        #   近戰 —— **一定要走到牠身邊**才打得到，所以只要不是貼著就得走
-        #           （這條漏掉的話，近戰會在 12 格外一直空按到逾時）
-        must_walk = melee or not in_range
-        if (self._path_pts == 0 and must_walk and dist is not None
-                and dist > MELEE_RANGE and dist <= PATHFIND_RANGE):
+        # 「非走不可」= 還沒進到各自的接手距離：
+        #   遠程 —— 超出攻擊封包範圍（12 格）
+        #   近戰 —— 超出客戶端接手的距離（20 格）；進去之後走位歸客戶端管，
+        #           就算尋路說我們走不到，客戶端照樣有辦法。
+        if (self._path_pts == 0 and not in_range and dist is not None
+                and dist <= PATHFIND_RANGE):
             self._killed[m.eid] = time.monotonic()
             self._atk.hold_off()
             self._cur = None
