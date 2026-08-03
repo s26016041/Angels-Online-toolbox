@@ -105,7 +105,14 @@ KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到
 #   冷卻 5 秒時 64 段裡有 23 段是重複挑同一具屍體。20 秒才擋得住。
 NOHP_MEMORY = 20.0
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
-STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
+STUCK_SECS = 10.0               # 沒掉血、玩家也沒前進這麼久 → 這隻走不過去，換一隻
+# ★★ 卡住偵測用「離錨點的**淨位移**」，不是「每 0.3 秒有沒有動」。
+#   撞牆時角色會小幅抖動（實測約 0.5~0.6 格），剛好跨過舊的 MOVE_EPS(0.5)
+#   門檻，於是每一拍都被當成「正在走路」，_stuck 永遠被歸零 ——
+#   唯讀監控實拍**卡了 32 秒**都沒觸發（STUCK_SECS 是 10 秒）。
+#   只要人還在這個半徑裡打轉，就一律算沒有前進。
+STUCK_EPS = 2.0
+# ⛔ 曾經有「正在打我的優先」（FOE_RANGE），已經拿掉 —— 見 _pick_next()。
 # ⛔ 不要做「打不到就一步一步走近」那種自動收斂 —— 使用者明講看起來卡卡的，
 #    而且根本不需要：實測（黑狐，目標有寫進記憶體）12.2 / 11.6 / 8.9 格
 #    都打得死（血量 100 → 47 → 0）。曾經以為 13 格打不到，那是診斷時
@@ -679,6 +686,7 @@ class CharFarmPage(QWidget):
         self._waiting = False      # 正在等重新掃描的結果
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
+        self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
@@ -1078,15 +1086,19 @@ class CharFarmPage(QWidget):
             p = entity.read_pos(self.sc, m.addr)
             d = (math.hypot(p[0] - me[0], p[1] - me[1])
                  if p and me else float("inf"))
-            # ★ 正在打我的排前面（見 entity.OFF_FOE）—— 不先解決牠們的話，
-            #   會一路結仇、被圍毆致死（使用者實際遇到）。
-            foe = entity.attacking(self.sc, m, self.player)
-            pool.append((0 if foe else 1, d, m))
-        pool.sort(key=lambda t: (t[0], t[1]))
+            # ⛔ 這裡曾經有「正在打我的排最前面」（entity.attacking）——
+            #   **拿掉了**。沒有距離限制的話，20 格外的仇人會贏過 13 格的
+            #   正常目標（唯讀監控實拍：目標 20.3 格，周圍就有 13.1/13.3 格），
+            #   然後為了追那隻遠的去撞牆。
+            #   使用者的判斷：純粹挑最近的就好 —— 打我的怪本來就貼在身上，
+            #   排序自然會先輪到牠們。
+            pool.append((d, m))
+        pool.sort(key=lambda t: t[0])
         if not pool:
             return False
-        foe, d, self._cur = pool[0]      # 正在打我的優先，其次才是最近的
+        d, self._cur = pool[0]           # 純粹挑最近的
         self._stuck = 0.0
+        self._anchor = me                # 換目標 → 卡住偵測從這裡重新算
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
         self._way = []
@@ -1102,7 +1114,6 @@ class CharFarmPage(QWidget):
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
         self.status.setText(
             f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
-            + ("　⚔ 牠正在打我" if foe == 0 else "")
             + f"　累計擊殺 {self._kills}")
         return True
 
@@ -1427,15 +1438,23 @@ class CharFarmPage(QWidget):
         # ⚠ 用上面那個「隔 0.3 秒取樣」的結果，不要拿相鄰兩拍比 ——
         #   心跳 10ms，角色每拍才走 0.09 格，那樣比永遠都是「沒在動」，
         #   於是走路途中也會一直累積卡住秒數，走到一半就被判定走不過去換怪。
-        moving = self._moving
         # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp:
             self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
             if dist is not None:
                 self._hit_dist = max(self._hit_dist, dist)
-        if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
+        # ⚠⚠ **用「離錨點的淨位移」判斷有沒有前進**，不要用 self._moving。
+        #   撞牆時角色會抖動約 0.5~0.6 格，剛好跨過 MOVE_EPS(0.5)，
+        #   於是每一拍都被當成在走路，這個計時器永遠歸零 ——
+        #   唯讀監控實拍卡了 32 秒都沒觸發（見 STUCK_EPS 的說明）。
+        if me and (self._anchor is None
+                   or math.hypot(me[0] - self._anchor[0],
+                                 me[1] - self._anchor[1]) > STUCK_EPS):
+            self._anchor = me          # 真的移動了 → 重設錨點
             self._stuck = 0.0
+        elif (0 < hp < self._last_hp) or self._last_hp < 0:
+            self._stuck = 0.0          # 在掉血 = 有進展，站著打也算
         else:
             self._stuck += dt
         self._last_pos = me
