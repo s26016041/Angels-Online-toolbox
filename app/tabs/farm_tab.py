@@ -114,11 +114,23 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒前進這麼久 → �
 # ⚠ 2.0 太小：實拍到角色在 (88.5,40.5) 與 (90.5,42.5) 之間來回，
 #   相距 2.8 格，錨點一直被重設，卡了 35 秒還是沒觸發。
 STUCK_EPS = 4.0
-# ★★ 「走不到」的冷卻。**絕對不能跟確定打死的怪一樣長**（KILL_MEMORY 60 秒）——
-#   尋路失敗多半是位置造成的暫時現象（角色站的地方剛好算不出來），
-#   換個位置就好了。用 60 秒的後果實拍到了：近處 12.6 / 13.0 格的怪
-#   全部被自己冷凍，只剩 29.4 格外的可挑，追過去又失敗，越陷越深。
+# ★★ 「走不到」的冷卻，**會遞增**。有兩種完全不同的走不到，一個數字擋不住：
+#
+#   · 暫時的 —— 角色站的地方剛好算不出那個方向。換個位置就好了。
+#     用 60 秒（跟確定打死同長）的後果實拍到了：近處 12.6 / 13.0 格的怪
+#     全部被自己冷凍，只剩 29.4 格外的可挑，追過去又失敗，越陷越深。
+#
+#   · 永久的 —— **那隻怪就站在尋路走不進去的格子上**。實測（黑狐）：
+#     同一個位置對周圍每隻怪各問一次尋路，
+#         曼陀羅怪菇 ×9（11.8~28.3 格）全部回 0
+#         夜香食人花 ×4（12.8~28.6 格）全部回 1（直線可通）
+#     跟距離無關，就是那一種怪站在走不到的地形上。
+#     這種用 8 秒的話每 8 秒就白試一次。
+#
+#   所以：第一次 8 秒，同一隻再失敗就翻倍，上限 UNREACH_MAX。
+#   暫時性的很快恢復，永久走不到的自動淡出。
 UNREACH_MEMORY = 8.0
+UNREACH_MAX = 120.0
 # ⛔ 曾經有「正在打我的優先」（FOE_RANGE），已經拿掉 —— 見 _pick_next()。
 # ⛔ 不要做「打不到就一步一步走近」那種自動收斂 —— 使用者明講看起來卡卡的，
 #    而且根本不需要：實測（黑狐，目標有寫進記憶體）12.2 / 11.6 / 8.9 格
@@ -726,6 +738,8 @@ class CharFarmPage(QWidget):
         # ⚠ 不能在每次重掃時清空：現在每秒都在刷新清單，一清就等於沒擋。
         #   改成保留 KILL_MEMORY 秒後自動淘汰（實體 ID 久了才可能被重用）。
         self._killed: dict[int, float] = {}
+        # 「走不到」失敗過幾次（每隻怪各自算）—— 冷卻時間照這個翻倍。
+        self._unreach_n: dict[int, int] = {}
 
         root = QVBoxLayout(self)
 
@@ -1052,6 +1066,18 @@ class CharFarmPage(QWidget):
         if self.status.text() != msg:
             self.status.setText(msg)
 
+    def _cool_unreach(self, eid: int) -> None:
+        """把「走不到」的怪冷凍起來，**時間隨失敗次數翻倍**。
+
+        暫時算不出來的（角色站的位置的問題）8 秒後就會再試；
+        真的站在走不進去的地形上的（實測：曼陀羅怪菇一律回 0），
+        會一路翻倍到 UNREACH_MAX，等於自動淡出，不再浪費時間。
+        """
+        n = self._unreach_n.get(eid, 0)
+        self._unreach_n[eid] = n + 1
+        wait = min(UNREACH_MEMORY * (2 ** n), UNREACH_MAX)
+        self._killed[eid] = time.monotonic() + wait
+
     def _pick_next(self) -> bool:
         """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打；挑不到回傳 False。
 
@@ -1351,8 +1377,7 @@ class CharFarmPage(QWidget):
         #   結果一路結仇、被圍毆致死（使用者實際遇到）。
         if (self._unreach >= UNREACH_HITS and not self._hurt
                 and dist is not None and dist <= PATHFIND_RANGE):
-            # ⚠ 用短冷卻，不是 KILL_MEMORY（見 UNREACH_MEMORY 的說明）
-            self._killed[m.eid] = time.monotonic() + UNREACH_MEMORY
+            self._cool_unreach(m.eid)
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
@@ -1454,8 +1479,7 @@ class CharFarmPage(QWidget):
         self._last_pos = me
         self._last_hp = hp
         if self._stuck >= STUCK_SECS:
-            # 走不過去 —— 一樣用短冷卻，這多半是位置造成的暫時現象
-            self._killed[m.eid] = time.monotonic() + UNREACH_MEMORY
+            self._cool_unreach(m.eid)      # 走不過去，一樣用遞增冷卻
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
