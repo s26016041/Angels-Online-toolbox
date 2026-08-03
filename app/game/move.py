@@ -88,6 +88,34 @@ MGR_MAX = 0x2AA4            # 表的上限
 OBJ_ID = 0xBC               # 物件裡回存的 ID（要跟查表用的 ID 一致才算數）
 
 
+def _route_point_back(here: tuple[float, float],
+                      pts: list[tuple[float, float]],
+                      back: float) -> tuple[float, float] | None:
+    """沿著路徑從**終點**往回退 `back` 格，回傳退到的那個點。
+
+    ★ 退到的點一定落在遊戲自己算出來的路段上，所以保證走得到 ——
+      這正是「在直線上取一個點」會失敗的地方（那個點常常在地形裡）。
+    整條路徑都不夠退 → 回 None（代表已經在 `back` 格之內，呼叫端自理）。
+
+    ⚠ 一定要把**目前位置**接在路徑前面：只有一個路徑點時（直線通），
+      沒有起點就沒有線段可以退，會誤判成「已經夠近」。
+    """
+    if not pts:
+        return None
+    if back <= 0:
+        return pts[-1]
+    route = [here] + list(pts)
+    rem = back
+    for i in range(len(route) - 1, 0, -1):
+        (x1, y1), (x0, y0) = route[i], route[i - 1]
+        seg = math.hypot(x1 - x0, y1 - y0)
+        if seg >= rem:
+            r = (rem / seg) if seg else 0.0
+            return (x1 + (x0 - x1) * r, y1 + (y0 - y1) * r)
+        rem -= seg
+    return None
+
+
 def pathfinder_this(scanner) -> int | None:
     """算出尋路要的 this；算不出或驗不過回 None（那就別呼叫）。
 
@@ -320,6 +348,98 @@ class Mover:
         finally:
             self._lock.release()
         return n if (n and 0 < n <= MAX_POINTS) else 0
+
+    def walk_route(self, scanner, player_obj: int,
+                   tile_x: float, tile_y: float, stop_short: float = 0.0,
+                   wait: float = 0.12) -> int:
+        """★ 對**目標本身**尋路，走它算出來的那條路，停在離終點 stop_short 格。
+
+        回傳路徑點數（0 = 算不出路徑）。
+
+        為什麼要有這個（跟 walk_to() 的差別）
+        --------------------------------------
+        walk_to() 是「先在往目標的**直線上**取一個點，再對那個點尋路」。
+        那個幾何點落在牆後面時尋路就失敗，接著往回縮短還是同一條直線、
+        還是撞牆，等於把遊戲算得出來的繞路整條丟掉 ——
+        使用者實拍：站在原地 32 秒撞牆，而遊戲自己點地圖是走得過去的。
+
+        這裡反過來：先算到目標的完整路徑，要留距離就**沿著那條路徑退**，
+        退到的點一定落在遊戲自己走得到的路段上。
+        （實測遊戲點地圖走長路時，就是連送好幾包、每包最多 5 個點，
+          起點是上一段的終點 —— 那條路正是這裡算出來的東西。）
+
+        ⚠⚠ **一定要用 WALK_FN，不能直接送 MOVE_FN**：MOVE_FN 只把封包送出去，
+          少了 WALK_FN 的兩個收尾（0x549B59 設目的地 / 0x5B5C60）。實測用
+          MOVE_FN 走完之後站在 1.0 格連送 67 發攻擊**全部零傷害**，
+          換回 WALK_FN 立刻正常 —— 移動狀態沒收乾淨，攻擊會被忽略。
+        ⚠ 終點只用遊戲算出來的路徑點或那些點之間的內插，**不要自己捏座標**：
+          落在目標自己的格子上時伺服器不給站，整段移動會被退回
+          （症狀是「往前走然後縮回原點」）。
+        """
+        if not self._active or not player_obj:
+            return 0
+        this = pathfinder_this(scanner)
+        if not this:
+            return 0
+        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
+        if not raw:
+            return 0
+        wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
+        cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
+
+        self._wanted += 1                  # 舉手要指令槽，攻擊會讓一拍
+        try:
+            got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
+        finally:
+            self._wanted -= 1
+        if not got:
+            return 0
+        try:
+            def path(px: float, py: float) -> int:
+                v = self.call_sync(
+                    PATHFIND_FN,
+                    int(px * entity.TILE_UNITS) & 0xFFFF,
+                    int(py * entity.TILE_UNITS) & 0xFFFF,
+                    WAYPOINTS, ecx=this, timeout=0.15)
+                return v if (v and 0 < v <= MAX_POINTS) else 0
+
+            n = path(tile_x, tile_y)
+            short = stop_short
+            if not n:
+                # 目標超出尋路一次算得出的範圍（實測約 28~40 格）→ 走中繼點
+                # 接力，呼叫端下一拍再下一次就能走很遠。
+                # ⚠ 直線方向整條算不出來 = 那個方向有牆，換角度繞。
+                dx, dy = tile_x - cx, tile_y - cy
+                full = math.hypot(dx, dy) or 1.0
+                for hop in PATH_TRY:
+                    if hop < full:
+                        n = path(cx + dx / full * hop, cy + dy / full * hop)
+                        if n:
+                            break
+                if not n:
+                    ang = math.atan2(dy, dx)
+                    for hop, deg in DETOUR_TRY:
+                        if hop >= full:
+                            continue
+                        a = ang + math.radians(deg)
+                        px, py = cx + math.cos(a) * hop, cy + math.sin(a) * hop
+                        if math.hypot(tile_x - px, tile_y - py) >= full:
+                            continue      # 繞過去反而更遠，不要
+                        n = path(px, py)
+                        if n:
+                            break
+                if not n:
+                    return 0
+                short = 0.0               # 中繼點本身就要走到底
+
+            pts = self.read_path(scanner, n)
+            gx, gy = _route_point_back((cx, cy), pts, short) or pts[-1]
+            self.call(WALK_FN, this, wx, wy,
+                      int(gx * entity.TILE_UNITS) & 0xFFFF,
+                      int(gy * entity.TILE_UNITS) & 0xFFFF, 0)
+            return n
+        finally:
+            self._lock.release()
 
     @staticmethod
     def read_path(scanner, count: int) -> list[tuple[float, float]]:

@@ -961,29 +961,23 @@ class CharFarmPage(QWidget):
     def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
         """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
 
-        走的是 move.Mover.walk_to()，它會先請**遊戲自己的尋路**算路徑，
-        所以會繞過地形；太遠時自動縮短成中繼點，靠這裡定期重下接力走完
-        （實測 85.9 格、8.5 秒到達）。
+        ★★ 走的是 move.Mover.walk_route()：**對目標本身尋路**，走遊戲算出來
+        的那條路，要留距離就沿著那條路往回退 —— 退到的點一定在它走得到的
+        路段上。
+
+        ⛔ 以前是「先在直線上取一個距離目標 keep 格的點，再對那個點尋路」。
+           那個幾何點落在牆後面時尋路就失敗，往回縮短還是同一條直線、
+           還是撞牆 —— 使用者實拍：站在原地 **32 秒**撞牆，而同樣的位置
+           自己點地圖遊戲是走得過去的（那時它一包送 5 個繞路點）。
 
         回傳尋路算出的路徑點數（0 = 走不了，1 = 直線通，>1 = 中間有地形）。
         """
         if not self._ensure_mover():
             return 0
-        d = math.hypot(gx - me[0], gy - me[1])
-        if d <= keep:
+        if math.hypot(gx - me[0], gy - me[1]) <= keep:
             return 0
-        r = (d - keep) / d                     # 只走到剩 keep 格的位置
-        n = self._mover.walk_to(self.sc, self.player,
-                                me[0] + (gx - me[0]) * r,
-                                me[1] + (gy - me[1]) * r)
-        # ★ 縮短版的落點走不了，就直接走去目標本身，讓**遊戲照它自己算的
-        #   路徑繞過去**。
-        #   ⚠ 這是複雜地形「不會繞路」的主因：遊戲明明算得出到那隻怪的
-        #     5 點繞路路徑，但我們是走「直線上距離牠 keep 格的那個點」——
-        #     那個幾何點常常正好落在地形裡，於是尋路失敗、角色站著不動，
-        #     等於把遊戲算好的繞路丟掉了。
-        if n <= 0:
-            n = self._mover.walk_to(self.sc, self.player, gx, gy)
+        n = self._mover.walk_route(self.sc, self.player, gx, gy,
+                                   stop_short=keep)
         self._walk_t = 0.0
         return n
 
