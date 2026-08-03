@@ -125,6 +125,13 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → �
 #     12.2 / 11.6 / 8.9 / 8.3 / 1.2 格 → 正常掉血、正常擊殺
 #   → 真正的界線在 12.2 與 13.0 之間，取 12.0 留餘裕。
 ATTACK_PACKET_RANGE = 12.0
+# ★ 「一邊走一邊打」時，從幾格外就開始送攻擊（使用者的點子）。
+#   伺服器只在 12 格內受理，超過就是白送 —— 但白送不會有害，換來的是
+#   走進射程那一刻攻擊已經在節奏上，沒有邊界死區。
+# ⚠ 這個值**不是隨便取的**，也不能設成無限遠：15.7 是量到的
+#   「客戶端自己最遠會在幾格外送出攻擊封包」。超過它就會送出真人客戶端
+#   永遠不會產生的封包，那是多餘的破綻。取 15.5 留一點餘裕。
+FIRE_RANGE = 15.5
 # 超出範圍時**一次就走到 10 格內**（使用者定的）。
 # 留 2 格餘裕是必要的：怪自己會動，停在射程邊緣的話牠一走就又出界，
 # 然後又得重走一次 —— 那就是「卡卡的」的來源。
@@ -1314,7 +1321,18 @@ class CharFarmPage(QWidget):
         #   隔著地形也不必特別處理：客戶端用的就是遊戲自己的尋路。
         reach = (CLIENT_RANGE if melee
                  else MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
+        # in_range = **真的打得到** → 只拿來決定「還要不要再往前走」。
         in_range = dist is not None and dist <= reach
+        # ★★ firing = **要不要送攻擊**，門檻放寬到 FIRE_RANGE（使用者的點子）：
+        #   一邊走一邊打，就是遊戲客戶端自己的行為（雪狐那次攔到
+        #   6 包移動 + 4 包動作 + 3 包施放交錯送）。
+        #   好處有兩個，都不是猜的：
+        #     1. 走進射程的那一瞬間攻擊已經在節奏上了，不必再等一拍 ——
+        #        以前「進了範圍卻慢半拍」和射程邊界的死區都是這樣來的。
+        #     2. 選定封包也跟著提早送 → 提早讀得到血量，走到一半就知道
+        #        那是不是屍體（別人先打死的），不用白跑完整段路。
+        firing = dist is not None and dist <= (CLIENT_RANGE if melee
+                                               else FIRE_RANGE)
         # ★★ 停止距離：近戰交給客戶端（帶到 CLIENT_RANGE 內就好），
         #   遠程停在 WALK_KEEP（11 格，使用者查到技能射程都是 12）。
         #   ⛔ 不要再試圖「自動問出射程」讓兩者共用一套 —— 四條路都失敗，
@@ -1389,7 +1407,7 @@ class CharFarmPage(QWidget):
                                  and self._keys.mover is not None)
         # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
         self._atk.engaged = self._keys.selected
-        self._keys.set_on(in_range)
+        self._keys.set_on(firing)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
@@ -1398,6 +1416,8 @@ class CharFarmPage(QWidget):
             self._why = ""
         elif in_range:
             self._why = f"打得到，同時走近到 {keep:.0f} 格"
+        elif firing:
+            self._why = "→ 一邊走一邊打"
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif not self.move_cb.isChecked():
