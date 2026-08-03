@@ -198,11 +198,6 @@ CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 #   於是每隻都被冷凍，只好去追遠處打不到的（實拍：周圍 1.2 格有怪，
 #   卻鎖著 16.0 格外的那隻）。取 3.0：實拍貼身距離落在 1.0~2.1 格。
 NO_PATH_NEED = 3.0
-# ★★ 「卡進怪身體裡」的自動解除。我們走過去時已經留 1.4 格（move.MIN_GAP），
-#   但**怪會自己貼上來**（牠在打我們），所以還是會重疊。
-#   貼得比 MIN_GAP 近、又連續這麼久沒造成傷害 → 呼叫遊戲自己的「移動結束」
-#   收尾把狀態收掉（move.Mover.end_move()）。**角色不會移動。**
-NUDGE_SECS = 1.2
 # ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
 #   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
@@ -722,7 +717,6 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
         self._dbg_t = 0.0          # 診斷紀錄的計時（見 _FARM_LOG）
-        self._no_dmg = 0.0         # 在射程內卻連續多久沒造成傷害
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
@@ -1142,7 +1136,6 @@ class CharFarmPage(QWidget):
             return False
         d, self._cur = pool[0]           # 純粹挑最近的
         self._stuck = 0.0
-        self._no_dmg = 0.0
         self._anchor = me                # 換目標 → 卡住偵測從這裡重新算
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
@@ -1515,24 +1508,8 @@ class CharFarmPage(QWidget):
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp:
             self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
-            self._no_dmg = 0.0
             if dist is not None:
                 self._hit_dist = max(self._hit_dist, dist)
-        elif in_range:
-            self._no_dmg += dt
-        # ★★ 「卡進怪身體裡」的解除（使用者確認的症狀：可以正常打，但會卡進
-        #   怪身體，手動挪一點點就又會打）。
-        #   機制：角色跟怪重疊時伺服器不給站，那段移動不算完成，客戶端一直
-        #   停在「移動中」狀態，之後的攻擊全部被忽略（實測站 0.7 格送 80 發
-        #   零傷害，等怪自己走開才恢復）。
-        #   ⚠ **不要用「退開一步」**（使用者否決）—— 直接把移動狀態收掉就好，
-        #     角色不會動。見 move.Mover.end_move()。
-        if (self._no_dmg >= NUDGE_SECS and dist is not None
-                and dist < move.MIN_GAP
-                and self._mover is not None and self._mover.active):
-            self._mover.end_move(self.sc, self.player)
-            self._no_dmg = 0.0
-            self._why = "⚠ 卡在怪身上 → 結束移動狀態"
         # ⚠⚠ **用「離錨點的淨位移」判斷有沒有前進**，不要用 self._moving。
         #   撞牆時角色會抖動約 0.5~0.6 格，剛好跨過 MOVE_EPS(0.5)，
         #   於是每一拍都被當成在走路，這個計時器永遠歸零 ——

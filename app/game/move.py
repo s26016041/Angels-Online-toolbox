@@ -57,10 +57,6 @@ WAYPOINTS = 0x009B6684      # 全域路徑點陣列
 #   比我們原本「自己呼叫尋路再自己送 MOVE_FN」多做了兩個收尾步驟，
 #   那正是遊戲自己走路時會做的，所以改用它。
 WALK_FN = 0x005D7D96
-# ★ WALK_FN 結尾的「移動結束」收尾，可以單獨呼叫（見 Mover.end_move）：
-#       ecx = *0x9B66AC ；0x5B5C60(1, 終點X, 終點Y)
-END_MOVE_FN = 0x005B5C60
-END_MOVE_THIS = 0x009B66AC
 # ★ 遊戲自己的尋路。反組譯 0x556982~0x556990（滑鼠點地板走路那條路）：
 #       push 0x9B6684        ← 輸出：路徑點陣列
 #       push edi             ← 目標 Y（世界座標）
@@ -363,36 +359,6 @@ class Mover:
         finally:
             self._lock.release()
         return n if (n and 0 < n <= MAX_POINTS) else 0
-
-    def end_move(self, scanner, player_obj: int) -> bool:
-        """告訴客戶端「移動結束了、我就停在這裡」。**不會讓角色移動。**
-
-        用在「卡進怪身體裡」：角色跟怪重疊時伺服器不給站，那段移動不算完成，
-        客戶端就一直停在「移動中」狀態，之後的攻擊全部被忽略
-        （實測：雪狐站 0.7 格連送 80 發零傷害，等怪自己走開才恢復）。
-        使用者手動挪一步就會解除 —— 這裡改成直接把那個狀態收掉。
-
-        參數全部來自 WALK_FN(0x5D7D96) 結尾那段的反組譯，沒有猜的成分：
-            0x5D7E28  push [ebp+0x18]          ← 終點 Y
-            0x5D7E2B  mov  ecx, [0x9B66AC]     ← this（全域單例）
-            0x5D7E31  push [ebp+0x14]          ← 終點 X
-            0x5D7E34  push 1
-            0x5D7E36  call 0x5B5C60
-        →  0x5B5C60(this, 1, 終點X, 終點Y)，終點就給「我現在站的地方」。
-
-        ⚠ this 是全域指標，讀到 0 就不呼叫（遊戲還沒初始化好）。
-        """
-        if not self._active or not player_obj:
-            return False
-        raw = scanner._read_bytes(END_MOVE_THIS, 4)
-        this = struct.unpack("<I", bytes(raw))[0] if raw else 0
-        if not this:
-            return False
-        pos = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
-        if not pos:
-            return False
-        wx, wy = (v >> 16 for v in struct.unpack("<II", bytes(pos)))
-        return self.call(END_MOVE_FN, 1, wx, wy, ecx=this)
 
     def walk_route(self, scanner, player_obj: int,
                    tile_x: float, tile_y: float, stop_short: float = 0.0,
