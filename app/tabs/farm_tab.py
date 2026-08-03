@@ -132,9 +132,10 @@ HP_SETTLE = 0.5
 # 鎖定這麼久還**從來沒**看到血量 → 那是屍體（別人先打死的），換一隻。
 # ⚠ 門檻是量出來的：活著的目標鎖定後看到血量，中位 0.30 秒、最久 2.22 秒
 #   （34 隻樣本），所以 3 秒不會誤殺活的怪。
-#   使用者要求縮到 0.5 秒（「不給血量就先不打」）—— 會有一部分活著的怪
-#   被誤跳過，所以那種只冷卻 NOHP_MEMORY 秒，很快就會再輪到。
-CORPSE_SECS = 0.5
+#   使用者先要求 0.5 秒，實測誤跳過 5% 的活怪、而且「常常真的有那隻怪」，
+#   所以放寬到 0.8 秒（活著的目標實測最久 0.52 秒就會顯示血量）。
+#   被誤跳過的只冷卻 NOHP_MEMORY 秒，很快會再輪到。
+CORPSE_SECS = 0.8
 # ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
 #   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
@@ -273,6 +274,17 @@ class KeyWorker(_Paced):
     def set_on(self, on: bool) -> None:
         self._on = on
 
+    @property
+    def selected(self) -> bool:
+        """「選定」封包已經替現在這個目標送出去了嗎？
+
+        ★ 很重要：遊戲**收到選定封包才會填目標血量**。沒送之前血量一直是 0，
+          跟屍體長得一模一樣（實測：只寫記憶體選目標，6 隻活怪全部沒血量；
+          補送選定封包後同樣那 6 隻全部顯示血 75）。
+          所以「多久沒看到血量就算屍體」一定要從這裡開始算。
+        """
+        return bool(self.eid) and self._sel == self.eid
+
     def begin_learning(self) -> None:
         """開始學技能 ID —— 只有三步：**清零 → 按選定的 Fx → 讀記憶體**。
 
@@ -366,7 +378,10 @@ class TargetWorker(_Paced):
         self._wrote = False
         self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
         self._zero_at = 0.0         # 血量開始連續讀到 0 的時間
-        self._since = 0.0           # 鎖定這隻的時間（判斷屍體用）
+        self._since = 0.0           # **選定封包送出**之後過了多久（判斷屍體用）
+        # 「選定」封包送出去了沒。⚠ 遊戲收到那一包才會填血量，
+        #   所以沒送之前不能開始算屍體 —— 否則走過去的路上會把活怪全丟掉。
+        self.engaged = False
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
@@ -413,6 +428,11 @@ class TargetWorker(_Paced):
             #     中位 0.30 秒、**最久 2.22 秒**（34 隻），所以 3 秒很安全。
             #   ⚠ 只有封包模式能用：按鍵模式我們自己會把血量寫成 100，
             #     `_saw_hp` 一定是 True（見下面寫入那段）。
+            # ⚠ 還沒送出選定封包就一直重設計時 —— 遊戲收到那一包才會填血量。
+            #   少了這條，走過去的路上（還沒進攻擊範圍、還沒送選定）會把
+            #   活著的怪全部當成屍體丟掉（使用者回報「明明有怪，過去看一下就跑」）。
+            if not self.engaged:
+                self._since = now
             corpse = (self.packets and not self._saw_hp
                       and now - self._since >= CORPSE_SECS)
             if self._wrote and (cur == 0 or dead_by_hp or corpse
@@ -1287,6 +1307,8 @@ class CharFarmPage(QWidget):
         self._atk.packets = bool(self._keys.mode == MODE_PACKET
                                  and self._keys.packets and self._keys.skill
                                  and self._keys.mover is not None)
+        # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
+        self._atk.engaged = self._keys.selected
         self._keys.set_on(in_range)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
