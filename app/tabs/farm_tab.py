@@ -592,8 +592,9 @@ class CharFarmPage(QWidget):
         self._move_ref: tuple[float, float] | None = None
         self._move_t = 0.0
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
-        # 看過「怪在幾格外掉血」的最大值。**只拿來顯示，不再決定走多近**
-        # —— 走多近由頁面上的「接戰距離」決定（使用者自己調）。
+        # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
+        # 0 = 還沒看過任何一次掉血 → 先走到貼臉（一定打得到的距離）確認。
+        # ⚠ 這個機制不能拿掉，見 tick() 裡 keep 那段。
         self._hit_dist = 0.0
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -698,15 +699,16 @@ class CharFarmPage(QWidget):
         self.range_spin.setSuffix(" 格")
         self.range_spin.setFixedWidth(90)
         self.range_spin.setToolTip(
-            "走到怪這麼近就停下來，並且開始送攻擊封包。\n"
+            "追到怪之後最遠停在幾格 —— 也就是「不用再靠近」的門檻。\n"
             "\n"
-            "遠程角色：11～12（技能射程實測 12 格，留一點餘裕）。\n"
-            "近戰角色：調小到 1～2 —— 站太遠送攻擊封包伺服器不會理，\n"
+            "遠程角色：10～12（技能射程實測 12 格）。\n"
+            "近戰角色：調小到 1～2，不然站太遠伺服器不受理施放，\n"
             "　　　　　症狀是站著不動、怪完全不掉血。\n"
             "\n"
-            "⚠ 這一個數字同時決定「走多近」和「多近才開始打」，\n"
-            "　 所以不會出現「既不打也不走」的死區。\n"
-            "⚠ 隔著地形時會自動改成貼臉走過去，不受這個設定影響。")
+            "★ 還沒打中過任何一隻之前，會**先走到貼臉**確認打得到，\n"
+            "　 看到怪掉血才把那個距離記起來、放寬到這裡設的值。\n"
+            "⚠ 送攻擊封包仍固定在 12 格內，不受這個設定影響。\n"
+            "⚠ 隔著地形時一律貼臉走過去，也不受這個設定影響。")
         mbar.addWidget(self.range_spin)
         mbar.addSpacing(12)
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
@@ -1177,10 +1179,20 @@ class CharFarmPage(QWidget):
         self._keys.mode = self.mode
         want = float(self.range_spin.value())
         blocked = self._path_pts > 1
-        # 隔著地形時直線距離不算數（怪在牆的另一邊），一律走到貼臉再說。
-        reach = MELEE_RANGE if blocked else want
+        # 送不送攻擊：**固定 12 格**，不跟著設定走。
+        # ⚠ 這兩個值不能綁在一起 —— 綁一起的話「還沒打中過就先貼上去」
+        #   那段（見下面 keep）就會連攻擊一起關掉。
+        reach = MELEE_RANGE if blocked else ATTACK_PACKET_RANGE
         in_range = dist is not None and dist <= reach
-        keep = MELEE_RANGE if blocked else want
+        # ★★ 走到多近。**這段流程不要動**（動過一次，使用者回報「壞掉，原本超順」）：
+        #   `_hit_dist` 一開始是 0 → keep 取到下限 → **第一隻怪先走到貼臉打**，
+        #   確定打得中之後把那個距離記起來（例如 11.6），之後才放寬到設定值。
+        #   少了這段「先貼上去確認」，一開始就停在 11 格，打不中時就只會發呆。
+        # 下限平常是 MELEE_RANGE(2)；使用者把設定調得比 2 還小（近戰）時
+        # 就用他的值，否則永遠走不到近戰射程內。
+        floor = min(MELEE_RANGE, want)
+        keep = (MELEE_RANGE if blocked
+                else max(floor, min(want, self._hit_dist)))
 
         # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
         #   這就是使用者說的「怪卡在奇怪的地方」：牠站在走不進去的角落，
@@ -1226,7 +1238,8 @@ class CharFarmPage(QWidget):
         if in_range and dist is not None and dist <= keep:
             self._why = ""
         elif in_range:
-            self._why = f"打得到，同時走近到 {keep:.1f} 格"
+            self._why = (f"打得到，同時走近到 {keep:.1f} 格"
+                         if self._hit_dist else "打得到，同時走過去（還沒確認射程）")
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif not self.move_cb.isChecked():
@@ -1251,7 +1264,8 @@ class CharFarmPage(QWidget):
         #   心跳 10ms，角色每拍才走 0.09 格，那樣比永遠都是「沒在動」，
         #   於是走路途中也會一直累積卡住秒數，走到一半就被判定走不過去換怪。
         moving = self._moving
-        # 怪掉血的最遠距離：只記下來給狀態列參考，不影響行為。
+        # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
+        #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp and dist is not None:
             self._hit_dist = max(self._hit_dist, dist)
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
