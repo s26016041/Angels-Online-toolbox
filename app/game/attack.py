@@ -45,6 +45,12 @@ CAST_FN = 0x00559FF8        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 #       [封包+6] = 第二個參數的低 16 位
 #   ⚠ 兩個參數都只是被寫進封包緩衝，**沒有任何指標解參考** ——
 #     給錯值最多是伺服器忽略，不會崩潰。
+#
+# ★★★ **這一包就是近戰封包攻擊一直打不動的原因。**
+#   A/B 實測（雪狐，純淨迴圈，各 60 秒兩輪）：
+#       只送 動作＋施放        0 隻、0 隻
+#       加上這一包             3 隻、4 隻
+#   以前近戰站在 1.0 格送 240 發攻擊卻打不死怪，就是少了它。
 KEEPUP_FN = 0x00559FBE
 SELECT_CODE = 0x0C          # ②的第一個參數（遊戲自己的程式碼就是推 0xC）
 # ★ ①的動作碼。**寫死 1**（使用者定的）。
@@ -116,4 +122,5 @@ def strike(mover, pf_this: int, skill_id: int, target_id: int,
         return False
     return _send(mover, ((ACTION_FN, (pf_this, action_code)),
                          (CAST_FN, (skill_id, target_id,
-                                    int(tile_x), int(tile_y), 0))))
+                                    int(tile_x), int(tile_y), 0)),
+                         (KEEPUP_FN, (target_id, 0))))
