@@ -1353,21 +1353,13 @@ class CharFarmPage(QWidget):
                 self._since_scan = RESCAN_GAP
             self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
             return
-        # ★ 要繞路時，目標改成**路徑的倒數第二個點**（使用者的觀察）：
-        #   那個點到怪之間一定是直線 —— 中間若有地形，尋路會再插一個轉折點。
-        #   走那裡就不必一路擠到牠臉上，也不會在半路被地形卡住。
-        # ⚠ 但那個點到怪可能還是超過攻擊範圍，所以再沿著**最後那段直線**
-        #   往前推到剩「接戰距離」格 —— 走到定位就直接打得到，不用多跑一趟。
+        # ★★ 走路目標**一律就是怪本身**，繞路完全交給 walk_route()：
+        #   它會對怪尋路，然後照 _approach_point() 的規則決定這一趟走到哪
+        #   —— 路徑 2 點以上就走下一個轉角、只剩 1 點才朝怪推進到接戰距離。
+        # ⛔ 這裡曾經自己算「路徑倒數第二點再沿最後一段推進」。**拿掉了**：
+        #   那等於叫遊戲重新規劃一條到那個點的路（可能走別條），
+        #   而且跟 walk_route 的逐點走法互相打架（使用者指出的）。
         gx, gy, gkeep = (mp[0], mp[1], keep) if mp else (None, None, keep)
-        if blocked and len(self._way) >= 2 and mp:
-            ax, ay = self._way[-2]
-            seg = math.hypot(mp[0] - ax, mp[1] - ay)
-            if seg > want:                 # 最後一段太長 → 沿著它再往前
-                r = (seg - want) / seg
-                gx, gy = ax + (mp[0] - ax) * r, ay + (mp[1] - ay) * r
-            else:
-                gx, gy = ax, ay
-            gkeep = 0.0
         gd = (math.hypot(gx - me[0], gy - me[1])
               if (me and gx is not None) else None)
         # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
