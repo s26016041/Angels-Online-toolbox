@@ -1292,6 +1292,14 @@ class CharFarmPage(QWidget):
             n = self._mover.path_to(self.sc, mp[0], mp[1])
             if n >= 0:                 # -1 = 這次沒問到，保留上一次的判斷
                 self._path_pts = n
+                # ★★ 「連續幾次算不出路徑」**只能在這裡數** —— 這裡才是
+                #   真的問到一次新結果。以前放在下面每一拍都跑的地方，
+                #   而 _path_pts 每 PATH_GAP(0.2s) 才更新一次，於是
+                #   「連續 3 次」實際變成「連續 3 個心跳」= **30 毫秒**：
+                #   尋路只要失敗一次，30ms 後就把那隻怪丟掉並加黑名單 60 秒。
+                #   症狀是一直換目標、跑來跑去卻沒進帳（實測 3 分鐘裡
+                #   39% 的時間在空轉，每秒目標都不一樣）。
+                self._unreach = (self._unreach + 1) if n == 0 else 0
                 # ★ 緊接著把路徑點讀下來（下一次尋路就會覆蓋掉）。
                 #   要繞路時就走去**倒數第二個點** —— 那個點到怪之間一定是
                 #   直線（中間若有地形，尋路會再插一個轉折點），
@@ -1329,7 +1337,6 @@ class CharFarmPage(QWidget):
         #   才算數 —— 怪會走動，打鬥中某一瞬間牠站到走不進去的格子，
         #   路徑就會變 0。少了這兩條會變成「打一下就換下一隻」，
         #   結果一路結仇、被圍毆致死（使用者實際遇到）。
-        self._unreach = (self._unreach + 1) if self._path_pts == 0 else 0
         if (self._unreach >= UNREACH_HITS and not self._hurt
                 and dist is not None and dist <= PATHFIND_RANGE):
             self._killed[m.eid] = time.monotonic() + KILL_MEMORY

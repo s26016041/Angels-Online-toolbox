@@ -35,3 +35,6 @@ scratchpad/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 遊戲自己的資料夾（從遊戲目錄複製進來的，不是專案的東西）
+SETTING/
