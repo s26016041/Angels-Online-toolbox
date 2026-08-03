@@ -173,6 +173,12 @@ PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重�
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
 # 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
 PATHFIND_RANGE = 25.0
+# 要連續這麼多次「算不出路徑」才判定走不到。怪會走動，單一次很可能只是
+# 牠剛好站到走不進去的格子 —— 每次都信就會變成「打一下就換下一隻」。
+UNREACH_HITS = 3
+# 目標要連續這麼多次掃不到才當作牠死了／離開視野。
+# 熱區掃描偶爾會漏，單次就放棄會在打鬥中間換目標。
+GONE_SCANS = 2
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -671,6 +677,9 @@ class CharFarmPage(QWidget):
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
+        self._unreach = 0          # 連續幾次尋路算不出路徑
+        self._hurt = False         # 這隻有沒有被我們打傷過
+        self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
@@ -1001,10 +1010,17 @@ class CharFarmPage(QWidget):
         # 這是**獨立於血量的死亡訊號**：使用者回報「打死了卻還在選他」，
         # 原因是我們每輪把目標血量寫回 100，等於把遊戲的死亡訊號蓋掉了
         # （`read_target_hp() or 100` —— 死掉時讀到 0，`0 or 100` 就變 100）。
+        # ⚠ 要**連續兩次**掃不到才算 —— 熱區掃描偶爾會漏掉一隻，
+        #   單次就放棄會在打鬥中間換目標（使用者回報「打一下就換下一隻，
+        #   結果一路結仇被打死」）。
         if (self.run_cb.isChecked() and self._cur is not None
                 and not any(m.eid == self._cur.eid for m in self.mons)):
-            self._on_died(self._cur.eid)
-            return
+            self._gone += 1
+            if self._gone >= GONE_SCANS:
+                self._on_died(self._cur.eid)
+                return
+        else:
+            self._gone = 0
 
         # 掛機中且正在等下一隻 → 自動挑名字在清單裡、離自己最近的接上去
         if self.run_cb.isChecked():
@@ -1061,6 +1077,9 @@ class CharFarmPage(QWidget):
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
         self._way = []
+        self._unreach = 0
+        self._hurt = False
+        self._gone = 0
         self._walked_ok = True
         self._why = ""
         self._last_hp = -1
@@ -1292,13 +1311,17 @@ class CharFarmPage(QWidget):
                 else WALK_KEEP if self._hit_dist <= 0
                 else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
 
-        # ★ 尋路說「到不了」→ **立刻換一隻**（使用者定的規則）。
-        #   牠站在走不進去的角落，我們走不過去，隔著地形多半也打不到，
-        #   等下去不會有任何變化 —— 不必耗到 10 秒逾時。
-        #   ⚠ 只在尋路射程內才算數：更遠時尋路本來就回 0
-        #     （一次只算得出約 30~40 格），那是要接力走過去，不是到不了。
-        if (self._path_pts == 0 and dist is not None
-                and dist <= PATHFIND_RANGE):
+        # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
+        #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
+        # ⚠ 只在尋路射程內才算數：更遠時尋路本來就回 0（一次只算得出約
+        #   30~40 格），那是要接力走過去，不是到不了。
+        # ⚠⚠ **已經打傷的怪絕不放棄**，而且要連續 UNREACH_HITS 次算不出來
+        #   才算數 —— 怪會走動，打鬥中某一瞬間牠站到走不進去的格子，
+        #   路徑就會變 0。少了這兩條會變成「打一下就換下一隻」，
+        #   結果一路結仇、被圍毆致死（使用者實際遇到）。
+        self._unreach = (self._unreach + 1) if self._path_pts == 0 else 0
+        if (self._unreach >= UNREACH_HITS and not self._hurt
+                and dist is not None and dist <= PATHFIND_RANGE):
             self._killed[m.eid] = time.monotonic() + KILL_MEMORY
             self._atk.hold_off()
             self._cur = None
@@ -1384,8 +1407,10 @@ class CharFarmPage(QWidget):
         moving = self._moving
         # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
-        if 0 < hp < self._last_hp and dist is not None:
-            self._hit_dist = max(self._hit_dist, dist)
+        if 0 < hp < self._last_hp:
+            self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
+            if dist is not None:
+                self._hit_dist = max(self._hit_dist, dist)
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
             self._stuck = 0.0
         else:
