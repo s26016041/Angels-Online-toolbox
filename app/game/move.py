@@ -492,10 +492,50 @@ class Mover:
         if not got:
             return 0
         try:
-            n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
-                               ecx=this, timeout=0.15)
-            if not n or not (0 < n <= MAX_POINTS):
-                return 0
+            def path(px: float, py: float) -> int:
+                v = self.call_sync(
+                    PATHFIND_FN,
+                    int(px * entity.TILE_UNITS) & 0xFFFF,
+                    int(py * entity.TILE_UNITS) & 0xFFFF,
+                    WAYPOINTS, ecx=this, timeout=0.15)
+                return v if (v and 0 < v <= MAX_POINTS) else 0
+
+            n = path(tile_x, tile_y)
+            if not n:
+                # ★★ 目標超出尋路一次算得出的範圍（實測約 28~40 格）→
+                #   改走**中繼點**接力，呼叫端下一拍再下一次就能走很遠。
+                #   ⚠⚠ 少了這段的症狀：30 格外的怪一律被判「走不到」，
+                #     附近清光之後角色就站著發呆（實測 90 秒只有前 6.6 秒
+                #     在殺怪，之後全是「走不到」）。巡邏點也會一起壞掉。
+                #   ⚠ 直線方向整條算不出來 = 那個方向有牆，換角度繞
+                #     （見 DETOUR_TRY 的說明）。
+                cx = wx / entity.TILE_UNITS
+                cy = wy / entity.TILE_UNITS
+                dx, dy = tile_x - cx, tile_y - cy
+                full = math.hypot(dx, dy) or 1.0
+                for hop in PATH_TRY:
+                    if hop >= full:
+                        continue
+                    n = path(cx + dx / full * hop, cy + dy / full * hop)
+                    if n:
+                        break
+                if not n:
+                    ang = math.atan2(dy, dx)
+                    for hop, deg in DETOUR_TRY:
+                        if hop >= full:
+                            continue
+                        a = ang + math.radians(deg)
+                        px = cx + math.cos(a) * hop
+                        py = cy + math.sin(a) * hop
+                        # 繞過去要比現在更靠近目標，否則會原地打轉
+                        if math.hypot(tile_x - px, tile_y - py) >= full:
+                            continue
+                        n = path(px, py)
+                        if n:
+                            break
+                if not n:
+                    return 0
+                stop_short = 0.0       # 中繼點本身就要走到底
             # ★★ 目的地只用**遊戲自己算出來的路徑點**，不自己捏座標
             #   （使用者指出的：「func 拿到的點位直接輸入就好別偷改」）。
             #   ⛔ 先前是「沿路徑退 N 格算一個新座標」，退太少就等於叫角色
