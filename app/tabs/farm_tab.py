@@ -72,10 +72,7 @@ IDLE_SCAN_GAP = 1.5             # 沒在掛機時也持續刷新「周圍怪物�
 # 掛機時多久刷新一次怪物清單。熱區掃描實測約 28ms，所以可以一直刷。
 # ★ 必須「一直刷」而不是「沒怪才刷」：跟別人搶怪時，清單一過期就會去打
 #   別人已經殺掉的、或錯過剛生出來的那隻。
-# 掛機中、已經有目標時的刷新間隔。熱區掃描只要約 28ms，所以可以很密。
-# ⚠ 刷新變快**不會讓屍體消失** —— 牠們是真的還在遊戲的實體清單裡。
-#   加快只對「新出現的怪」有幫助。
-REFRESH_GAP = 0.3
+REFRESH_GAP = 0.5
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
@@ -94,13 +91,6 @@ WALK_GAP = 0.4
 MOVE_SAMPLE = 0.3
 MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
-# 「一直沒給血量」而跳過的冷卻。那只是推測，牠可能還活著，所以比擊殺短。
-# ⚠ 不能設 0：挑目標永遠挑最近的，冷卻 0 的話下一拍又挑到同一具，
-#   變成無限迴圈。
-# ⚠ 也不能太短：實測搶怪區 90 秒有 41 隻「沒給血量」的實體，其中 12 隻被
-#   反覆挑到（從第一次到最後一次**中位相隔 13 秒**、最久 34 秒）——
-#   冷卻 5 秒時 64 段裡有 23 段是重複挑同一具屍體。20 秒才擋得住。
-NOHP_MEMORY = 20.0
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
 # ⛔ 不要做「打不到就一步一步走近」那種自動收斂 —— 使用者明講看起來卡卡的，
@@ -122,84 +112,50 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → �
 #     12.2 / 11.6 / 8.9 / 8.3 / 1.2 格 → 正常掉血、正常擊殺
 #   → 真正的界線在 12.2 與 13.0 之間，取 12.0 留餘裕。
 ATTACK_PACKET_RANGE = 12.0
-# ★★ 上面那個 12 只用來決定「還要不要再往前走」，**不拿來擋攻擊**。
-#   鎖定目標之後就一路送攻擊、一邊走過去（使用者定的）：
-#   伺服器只在 12 格內受理，更遠就是白送，但白送不會有害，換來的是
-#   走進射程那一刻攻擊已經在節奏上 —— 射程邊界的死區整個消失。
-#   （曾經想把開火距離壓在 15.5，理由是量到客戶端自己最遠只在 15.7 格
-#     送出攻擊封包；使用者評估後決定不設限，這裡記著當時的量測值。）
 # 超出範圍時**一次就走到 10 格內**（使用者定的）。
 # 留 2 格餘裕是必要的：怪自己會動，停在射程邊緣的話牠一走就又出界，
 # 然後又得重走一次 —— 那就是「卡卡的」的來源。
-# 走進攻擊範圍後停在幾格。使用者查到「遠程技能基本上都是 12 射程」，
-# 所以停 11 格、只留 1 格餘裕（停 8 格太保守，會多走一段冤枉路）。
-# ⚠ 先前量到「站在 10.0 格打不到」，那是路徑點數被誤用造成的
-#   （blocked 誤判 → 攻擊距離被縮成 2 格），已經修掉，不是射程問題。
-WALK_KEEP = 11.0
-# ★ 移動指令一隻怪只送一次；已經停下來卻還離這麼遠才補送（怪自己跑掉了）。
-#   ⚠ 不能設太小：怪在打鬥中會小幅走動，門檻太小就變成每隔一下就重下指令
-#     —— 那正是「往前又回縮」的成因。
-REWALK_DIST = 3.0
-REWALK_GAP = 1.5                # 補送移動指令的最短間隔（比 WALK_GAP 保守）
-# ★★ 剛下完移動指令之後的靜默窗：這段時間內**不攻擊也不問尋路**。
-#   攻擊會打斷移動（實測見 tick 裡 set_on 那段），而角色要約 0.3 秒才真的
-#   動起來 —— 在那之前 _moving 還是 False，光靠它擋不住。
-ATTACK_QUIET = 0.4
-PATH_QUIET = 0.4
-# 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
-# —— 那會把還活著的怪丟掉。
-HP_SETTLE = 0.5
-# 鎖定這麼久還**從來沒**看到血量 → 那是屍體（別人先打死的），換一隻。
-# ⚠ 門檻是量出來的：活著的目標鎖定後看到血量，中位 0.30 秒、最久 2.22 秒
-#   （34 隻樣本），所以 3 秒不會誤殺活的怪。
-#   使用者先要求 0.5 秒，實測誤跳過 5% 的活怪、而且「常常真的有那隻怪」，
-#   所以放寬到 0.8 秒（活著的目標實測最久 0.52 秒就會顯示血量）。
-#   被誤跳過的只冷卻 NOHP_MEMORY 秒，很快會再輪到。
-CORPSE_SECS = 0.8
-# ★★ 射程**每個角色不一樣**，上面那個 12 是遠程（黑狐）的。
+WALK_KEEP = 10.0
+# ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
 #   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
 #   —— 症狀就是「雪狐完全無法打怪」。
-#   ★ 定案（使用者決定）：**頁面上分「近戰／遠程」兩種攻擊型態**，不自動判斷。
-#     近戰 = 選定封包 + 狂按 Fx，走位與射程全交給客戶端；
-#     遠程 = 送施放封包，用上面的 12 / 11 格。
-#   ⛔ 不要再嘗試讓兩者共用一套 —— 找射程欄位、找自動接近的封包、
-#     逆向客戶端攻擊函式、猜靜態單例，四條路全部失敗；
-#     自己按鍵量測也被使用者否決（有些技能是原地施放）。
-#     完整紀錄見記憶 client-attack-fn-deadend。
+#   解法不寫死也不量測：**還沒打中過就一路走到貼臉**，
+#   一旦看到怪掉血就把那個距離記起來，之後就不必再靠近。
+#   近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，兩邊都對。
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
-# 攻擊方式只剩一種（2026-08-03 合併，近戰遠程都用它）：
-#   選定封包 + 動作/施放封包。
-# ★ 近戰角色一樣有效 —— 實測雪狐（近戰）走到怪旁邊之後用封包打，
-#   30 秒 8 次掉血、90 秒殺 6 隻。以前以為「近戰非用按鍵不可」，
-#   那是因為當時停在 10 格外送施放，伺服器不受理，不是封包不能用。
-# ⛔ MODE_KEY（狂按 Fx）只留給舊設定相容，介面上已經沒有這個選項。
+# 兩種攻擊方式（兩個分頁各用一種）：
+#   MODE_PACKET —— 選定封包 + 動作/施放封包（原本的「自動掛機」）
+#   MODE_KEY    —— 選定封包 + 狂按技能鍵（「自動掛機（按鍵）」）
 MODE_PACKET = "packet"
 MODE_KEY = "key"
+# ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
+#    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
+#    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
-# 隔著地形時要走到這麼近才算「真的打得到」（只影響要不要繼續走）。
+# ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
+#   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
+#   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
+#   —— 實測雪狐就是這樣完全打不到怪。
 MELEE_RANGE = 2.0
+# ★ 近戰模式：進到這個距離就開始鎖定＋狂按 Fx，剩下的走位交給遊戲客戶端 ——
+#   它知道每招的射程，也會自己繞地形。我們只負責把角色帶進這個圈子，
+#   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
+CLIENT_RANGE = 20.0
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
 # 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
 PATHFIND_RANGE = 25.0
-# 要連續這麼多次「算不出路徑」才判定走不到。怪會走動，單一次很可能只是
-# 牠剛好站到走不進去的格子 —— 每次都信就會變成「打一下就換下一隻」。
-UNREACH_HITS = 3
-# 目標要連續這麼多次掃不到才當作牠死了／離開視野。
-# 熱區掃描偶爾會漏，單次就放棄會在打鬥中間換目標。
-GONE_SCANS = 2
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
     """對指定視窗送一次技能鍵。
 
-    走 app/core/window.py 的共用實作：SendMessageTimeout + 帶掃描碼的 lParam
-    + **按住 40ms 才放開**（見 window.KEY_HOLD_MS —— 不按住的話成功率只有
-    26.7%，遊戲每幀取樣鍵盤，同一幀按下又放開會漏掉）。
+    走 app/core/window.py 的共用實作：SendMessageTimeout + 帶掃描碼的 lParam。
+    ⚠ 實測這個遊戲**只吃 SendMessage**，PostMessage 完全沒反應（不管 lParam）。
     不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
 
     ★ 逾時設短（SEND_TIMEOUT_MS）：SendMessage 會等對方處理完才返回，
@@ -286,8 +242,7 @@ class KeyWorker(_Paced):
         self.mover = None
         self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
         self.eid = None             # 現在要打誰
-        # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
-        self.pos: tuple[float, float] = (0.0, 0.0)
+        self.pos = (0.0, 0.0)       # 那隻怪的格子座標（施放封包會帶上）
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
         self.skill = None           # 學到的技能 ID
         self._on = False
@@ -296,17 +251,6 @@ class KeyWorker(_Paced):
 
     def set_on(self, on: bool) -> None:
         self._on = on
-
-    @property
-    def selected(self) -> bool:
-        """「選定」封包已經替現在這個目標送出去了嗎？
-
-        ★ 很重要：遊戲**收到選定封包才會填目標血量**。沒送之前血量一直是 0，
-          跟屍體長得一模一樣（實測：只寫記憶體選目標，6 隻活怪全部沒血量；
-          補送選定封包後同樣那 6 隻全部顯示血 75）。
-          所以「多久沒看到血量就算屍體」一定要從這裡開始算。
-        """
-        return bool(self.eid) and self._sel == self.eid
 
     def begin_learning(self) -> None:
         """開始學技能 ID —— 只有三步：**清零 → 按選定的 Fx → 讀記憶體**。
@@ -360,7 +304,6 @@ class KeyWorker(_Paced):
                     return                     # 這一拍先不打，下一拍再試
                 self._sel = self.eid
             # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
-            #    動作碼用 attack.ACTION_CODE（寫死 1，見 attack.py 的說明）。
             if (self.mode == MODE_PACKET and self.packets and self.skill
                     and self.eid and self.pf and self.mover is not None
                     and attack.strike(self.mover, self.pf, self.skill,
@@ -385,10 +328,7 @@ class TargetWorker(_Paced):
     # ⚠ 用 Signal(object) 不能用 Signal(int)：實體 ID 是**無號** 32 位元
     # （實測有 0x8E8D04DA = 23 億這種值），而 PySide6 的 int 對應 C++ 的
     # 有號 int，emit 超過 21 億的值會丟 OverflowError，死亡偵測就斷了。
-    # 目標沒了（實體 ID, 是不是確定死了）→ UI 執行緒去挑下一隻。
-    # 第二個參數 False = 只是「一直沒給血量」的推測，那隻可能還活著，
-    # 所以只短暫跳過、不要封鎖一分鐘。
-    died = Signal(object, bool)
+    died = Signal(object)       # 目標倒了（實體 ID）→ UI 執行緒去挑下一隻
     failed = Signal(str)        # 讀寫記憶體失敗
 
     def __init__(self, sc: MemoryScanner) -> None:
@@ -401,17 +341,10 @@ class TargetWorker(_Paced):
         self._job: tuple[int, entity.Entity] | None = None
         self._wrote = False
         self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
-        self._zero_at = 0.0         # 血量開始連續讀到 0 的時間
-        self._since = 0.0           # **選定封包送出**之後過了多久（判斷屍體用）
-        # 「選定」封包送出去了沒。⚠ 遊戲收到那一包才會填血量，
-        #   所以沒送之前不能開始算屍體 —— 否則走過去的路上會把活怪全丟掉。
-        self.engaged = False
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
         self._saw_hp = False
-        self._zero_at = 0.0
-        self._since = time.monotonic()
         self._job = (state, ent)
 
     def hold_off(self) -> None:
@@ -428,42 +361,19 @@ class TargetWorker(_Paced):
             # 先寫回去就把訊號蓋掉了。
             cur = entity.read_target(self.sc, state)
             self.hp = entity.read_target_hp(self.sc, state)
-            now = time.monotonic()
             if self.hp > 0:
                 self._saw_hp = True
-                self._zero_at = 0.0
-            elif not self._zero_at:
-                self._zero_at = now
             # ★ 用封包攻擊時，血量歸零就是**遊戲告訴我們這隻死了**。
             #   這才是可靠的死亡訊號 —— 屍體不會馬上從實體清單消失，
-            #   `is_alive()`（vtable + 實體 ID）也分不出死活。
-            # ⚠⚠ 兩個條件缺一不可，**都是實測踩出來的**：
-            #   ① 要先看過血量 > 0 —— 遊戲對「還沒交戰」的目標本來就回報 0，
-            #      少了這條會剛鎖定就判死（實測 150 秒誤判放棄 22 次、
-            #      真正擊殺只有 4 次）。
-            #   ② 0 要**連續**持續 HP_SETTLE 秒 —— 中途偶爾讀到一次 0
-            #      不算，免得把還活著的怪丟掉。
-            dead_by_hp = (self.packets and self._saw_hp and self.hp == 0
-                          and now - self._zero_at >= HP_SETTLE)
-            # ★ 屍體：鎖定這麼久了還**從來沒有**看到血量 —— 那是別人先打死的。
-            #   搶怪嚴重的地方這種很多，實測 120 秒有 26 隻，白白鎖住 52 秒
-            #   ＝ 44% 的時間在對屍體發呆。
-            #   ⚠ 門檻是量出來的：活著的目標鎖定後看到血量的時間，
-            #     中位 0.30 秒、**最久 2.22 秒**（34 隻），所以 3 秒很安全。
-            #   ⚠ 只有封包模式能用：按鍵模式我們自己會把血量寫成 100，
-            #     `_saw_hp` 一定是 True（見下面寫入那段）。
-            # ⚠ 還沒送出選定封包就一直重設計時 —— 遊戲收到那一包才會填血量。
-            #   少了這條，走過去的路上（還沒進攻擊範圍、還沒送選定）會把
-            #   活著的怪全部當成屍體丟掉（使用者回報「明明有怪，過去看一下就跑」）。
-            if not self.engaged:
-                self._since = now
-            corpse = (self.packets and not self._saw_hp
-                      and now - self._since >= CORPSE_SECS)
-            if self._wrote and (cur == 0 or dead_by_hp or corpse
+            #   `is_alive()`（vtable + 實體 ID）也分不出死活，
+            #   所以以前只能等卡住偵測 10 秒才換怪，看起來就是「鎖定一隻怪發呆」。
+            #   ⚠ 要先看過 > 0 才能用：剛選定的那幾毫秒遊戲還沒填，讀到的是 0。
+            dead_by_hp = self.packets and self._saw_hp and self.hp == 0
+            if self._wrote and (cur == 0 or dead_by_hp
                                 or not entity.is_alive(self.sc, ent)):
                 self._job = None
                 self._wrote = False
-                self.died.emit(ent.eid, not corpse)
+                self.died.emit(ent.eid)
                 return
 
             if self.packets:
@@ -577,12 +487,6 @@ class ScanWorker(QThread):
                 out.state, out.player = state, pobj
                 out.stats = player.pick(sc, extra.get(stats_vt, []))
                 out.inv = self._inventory_head(pid, sc, now)
-                # ★ is_monster 現在看實體的「種類」欄位（見 entity.OFF_KIND），
-                #   NPC、別人的寵物、召喚物都會被排掉。
-                # ⛔ 曾經改用「遊戲的怪物名稱表」過濾 —— 不可靠，別再試：
-                #    那個 vtable 是通用的字串清單容器（同一個 vtable 底下還有
-                #    購買紀錄、裝備名稱、角色名），而且**不會跟著換地圖更新**
-                #    （換到沼澤之後，表裡還是前一張圖的名字）。
                 out.mons = [e for e in ents if e.is_monster]
                 if state is None:
                     out.err = "找不到狀態物件（掃到 0 個或多個）"
@@ -693,16 +597,14 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
-        self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
-        self._unreach = 0          # 連續幾次尋路算不出路徑
-        self._hurt = False         # 這隻有沒有被我們打傷過
-        self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
-        self._walked_for = None    # 已經替哪一隻怪下過移動指令了（只下一次）
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
         self._move_t = 0.0
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
+        # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
+        # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
+        self._hit_dist = 0.0
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
@@ -765,9 +667,7 @@ class CharFarmPage(QWidget):
         bar.addSpacing(12)
         bar.addWidget(QLabel("每隔"))
         self.interval = QDoubleSpinBox()
-        # ⚠ 下限 0.06 秒：一次按鍵本身就要按住 40ms（window.KEY_HOLD_MS），
-        #   設得比它短沒有意義 —— 只會讓每一拍都超時、節奏反而更亂。
-        self.interval.setRange(0.06, 5.0)
+        self.interval.setRange(0.02, 5.0)
         self.interval.setSingleStep(0.01)
         self.interval.setDecimals(2)
         self.interval.setValue(DEFAULT_INTERVAL)
@@ -798,6 +698,21 @@ class CharFarmPage(QWidget):
             "⚠ 這項功能需要在遊戲行程裡執行一小段程式碼（掛 PeekMessageA），\n"
             "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
         mbar.addWidget(self.move_cb)
+        mbar.addSpacing(12)
+        mbar.addWidget(QLabel("攻擊型態"))
+        self.type_box = QComboBox()
+        self.type_box.addItem("遠程", False)
+        self.type_box.addItem("近戰", True)
+        self.type_box.setFixedWidth(80)
+        self.type_box.setToolTip(
+            f"遠程：送攻擊封包（距離 {ATTACK_PACKET_RANGE:.0f} 格內就送，"
+            f"走到 {WALK_KEEP:.0f} 格內就停）。\n"
+            f"近戰：用封包選定怪物，然後**狂按你選的那個 F 鍵**出手。\n"
+            f"　　　我們只把角色帶到 {CLIENT_RANGE:.0f} 格內，剩下的射程與走位\n"
+            "　　　全交給遊戲客戶端 —— 它知道每招要站多近，也會自己繞地形。\n"
+            "⚠ 射程每個角色不一樣，近戰角色站太遠送攻擊封包伺服器不會理，\n"
+            "　 症狀是站著不動、怪完全不掉血 —— 所以近戰交給客戶端比較穩。")
+        mbar.addWidget(self.type_box)
         mbar.addSpacing(12)
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
         self.patrol_cb.setToolTip(
@@ -944,19 +859,23 @@ class CharFarmPage(QWidget):
             return False
 
     def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
-        """走向 (gx,gy)，**照遊戲自己算出來的路徑點走**，離終點 keep 格處停。
+        """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
 
-        ★ 這是使用者定的作法：先叫尋路算出到**目標本身**的完整路徑，
-          要留距離就沿著那條路徑往回退 —— 退到的點一定在遊戲走得到的
-          路段上。以前是「在直線上取一個距離目標 keep 格的點」，那個幾何點
-          常常落在地形裡，尋路失敗、角色站著不動，等於把算好的繞路丟掉。
+        走的是 move.Mover.walk_to()，它會先請**遊戲自己的尋路**算路徑，
+        所以會繞過地形；太遠時自動縮短成中繼點，靠這裡定期重下接力走完
+        （實測 85.9 格、8.5 秒到達）。
 
         回傳尋路算出的路徑點數（0 = 走不了，1 = 直線通，>1 = 中間有地形）。
         """
         if not self._ensure_mover():
             return 0
-        n = self._mover.walk_route(self.sc, self.player, gx, gy,
-                                   stop_short=keep)
+        d = math.hypot(gx - me[0], gy - me[1])
+        if d <= keep:
+            return 0
+        r = (d - keep) / d                     # 只走到剩 keep 格的位置
+        n = self._mover.walk_to(self.sc, self.player,
+                                me[0] + (gx - me[0]) * r,
+                                me[1] + (gy - me[1]) * r)
         self._walk_t = 0.0
         return n
 
@@ -1000,17 +919,10 @@ class CharFarmPage(QWidget):
         # 這是**獨立於血量的死亡訊號**：使用者回報「打死了卻還在選他」，
         # 原因是我們每輪把目標血量寫回 100，等於把遊戲的死亡訊號蓋掉了
         # （`read_target_hp() or 100` —— 死掉時讀到 0，`0 or 100` 就變 100）。
-        # ⚠ 要**連續兩次**掃不到才算 —— 熱區掃描偶爾會漏掉一隻，
-        #   單次就放棄會在打鬥中間換目標（使用者回報「打一下就換下一隻，
-        #   結果一路結仇被打死」）。
         if (self.run_cb.isChecked() and self._cur is not None
                 and not any(m.eid == self._cur.eid for m in self.mons)):
-            self._gone += 1
-            if self._gone >= GONE_SCANS:
-                self._on_died(self._cur.eid)
-                return
-        else:
-            self._gone = 0
+            self._on_died(self._cur.eid)
+            return
 
         # 掛機中且正在等下一隻 → 自動挑名字在清單裡、離自己最近的接上去
         if self.run_cb.isChecked():
@@ -1042,10 +954,8 @@ class CharFarmPage(QWidget):
         want = self.wanted()
         me = self.my_pos()
         now = time.monotonic()
-        # _killed 存的是「到期時間」，不是記錄時間 —— 因為兩種跳過的冷卻長度
-        # 不一樣（確定打死 KILL_MEMORY、只是沒給血量 NOHP_MEMORY）。
-        for eid, until in list(self._killed.items()):
-            if now > until:
+        for eid, t in list(self._killed.items()):     # 淘汰太舊的死亡記錄
+            if now - t > KILL_MEMORY:
                 del self._killed[eid]
         pool = []
         for m in self.mons:
@@ -1057,25 +967,16 @@ class CharFarmPage(QWidget):
             # ★ 不限距離：多遠的怪都收進來（使用者要求「想打多遠都可以」），
             #   排序後自然會先打最近的，遠的靠移動封包導航過去。
             p = entity.read_pos(self.sc, m.addr)
-            d = (math.hypot(p[0] - me[0], p[1] - me[1])
-                 if p and me else float("inf"))
-            # ★ 正在打我的排前面（見 entity.OFF_FOE）—— 不先解決牠們的話，
-            #   會一路結仇、被圍毆致死（使用者實際遇到）。
-            foe = entity.attacking(self.sc, m, self.player)
-            pool.append((0 if foe else 1, d, m))
-        pool.sort(key=lambda t: (t[0], t[1]))
+            pool.append((math.hypot(p[0] - me[0], p[1] - me[1])
+                         if p and me else float("inf"), m))
+        pool.sort(key=lambda t: t[0])
         if not pool:
             return False
-        foe, d, self._cur = pool[0]      # 正在打我的優先，其次才是最近的
+        d, self._cur = pool[0]                    # 就打最近的
         self._stuck = 0.0
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
-        self._way = []
-        self._unreach = 0
-        self._hurt = False
-        self._gone = 0
         self._walked_ok = True
-        self._walked_for = None            # 換目標 → 重新下一次移動指令
         self._why = ""
         self._last_hp = -1
         self._last_pos = me
@@ -1084,25 +985,18 @@ class CharFarmPage(QWidget):
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
         self.status.setText(
             f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
-            + ("　⚔ 牠正在打我" if foe == 0 else "")
-            + f"　累計擊殺 {self._kills}")
+            f"　累計擊殺 {self._kills}")
         return True
 
-    def _on_died(self, eid: int, confirmed: bool = True) -> None:
-        """攻擊執行緒回報目標沒了 —— 立刻從既有清單接下一隻。
-
-        confirmed=False 代表只是「一直沒給血量」的推測（那隻可能還活著），
-        所以只短暫冷卻，不要像確定打死那樣封鎖一分鐘。
+    def _on_died(self, eid: int) -> None:
+        """攻擊執行緒回報目標倒了 —— 立刻從既有清單接下一隻。
 
         不重掃記憶體：重掃要 0.5 秒還要排隊，每殺一隻就等一次會非常卡。
         清單裡真的沒得打了，才由 tick() 去排重掃。
         """
         m = self._cur
-        if confirmed:
-            self._kills += 1
-        # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
-        self._killed[eid] = time.monotonic() + (
-            KILL_MEMORY if confirmed else NOHP_MEMORY)
+        self._kills += 1
+        self._killed[eid] = time.monotonic()   # 免得又挑到同一具還沒回收的屍體
         self._cur = None
         self._keys.eid = None                  # 別再對著屍體送封包
         if not self.run_cb.isChecked():
@@ -1242,7 +1136,8 @@ class CharFarmPage(QWidget):
 
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
-        # 施放封包要帶目標的格子座標 —— 順移那類對地技能沒有座標發不動
+        # 施放封包的第 3、4 個參數是座標（順移用的就是這兩個），一併帶上。
+        # 實測不會影響一般攻擊：黑狐用 0x101 在 8 格外照樣 100→47→0。
         if mp:
             self._keys.pos = (round(mp[0]), round(mp[1]))
 
@@ -1267,79 +1162,50 @@ class CharFarmPage(QWidget):
         #   隔著地形，攻擊距離縮成 2 格，於是 3~10 格的怪既不打、也走不到，
         #   一路卡到 10 秒逾時（監控實際抓到的距離 3.6 / 5.4 / 9.6 / 10.2）。
         # 怪會走動，所以每 PATH_GAP 重問一次，不是只在「還不知道」時問。
-        #
-        # 走路中就不要問了 —— 保留上一次的判斷即可（blocked 只影響要不要再走）。
-        # ⚠ 這**不是**「走路很卡」的原因：對照實測（黑狐走 18 格）走路中每
-        #   0.2 秒問一次尋路，1.2 秒走完、零倒退，跟不問完全一樣。
-        #   留著只是為了少跟攻擊搶指令槽。真正的原因見下面 set_on() 那段。
-        # ⚠⚠⚠ **貼在身上的怪不要問尋路** —— 尋路到「自己腳下那一格」本來
-        #   就會回 0，而 0 在這裡是「走不過去」的意思。近戰走到怪旁邊之後
-        #   每一隻都會踩到，於是好好的目標被連續判定走不到、丟進黑名單。
-        #   實測（雪狐，封包攻擊）：殺完第一隻之後
-        #       ⛔ 走不到「焦炎罪贖者」(0.1 格) → 換一隻
-        #   接著空轉 42 秒。這**只會打到近戰** —— 遠程停在 11~12 格，
-        #   尋路正常，所以同一份程式碼在黑狐身上看不出問題。
         self._path_t += dt
         if (self._path_t >= PATH_GAP and mp is not None and me
-                and dist is not None and dist > MELEE_RANGE
-                and not self._moving and self._walk_t >= PATH_QUIET
                 and self._mover is not None and self._mover.active):
             self._path_t = 0.0
             n = self._mover.path_to(self.sc, mp[0], mp[1])
             if n >= 0:                 # -1 = 這次沒問到，保留上一次的判斷
                 self._path_pts = n
-                # ★ 緊接著把路徑點讀下來（下一次尋路就會覆蓋掉）。
-                #   要繞路時就走去**倒數第二個點** —— 那個點到怪之間一定是
-                #   直線（中間若有地形，尋路會再插一個轉折點），
-                #   走到那裡就能無阻礙地打，不必一路擠到牠臉上。
-                self._way = (self._mover.read_path(self.sc, n)
-                             if n > 1 else [])
         # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
         #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
-        # ★★★ 近戰／遠程已經合併成同一套（2026-08-03，兩隻角色實測通過）：
-        #   出手 —— 一律送攻擊封包，而且**完全不看距離**。
-        #   走位 —— 照遊戲自己算的路徑走到底，目的地取它算出來的路徑點。
-        #           遊戲的尋路本來就會停在怪**旁邊**（實測 1.0 格），
-        #           所以近戰自然貼得到、遠程也不必知道射程。
-        #   實測：雪狐（近戰）20 秒 2 隻、黑狐（遠程）45 秒 4 隻，
-        #        同一份程式碼、同一組參數，兩邊都正常。
-        self._keys.mode = self.mode
+        # ★ 近戰／遠程（使用者在頁面上選）：
+        #   近戰 —— **選怪用封包、出手用按鍵**（狂按使用者選的那個 Fx）。
+        #           射程與走位交給遊戲客戶端判斷，它知道每招要站多近；
+        #           我們只負責走到怪身上，不自己算「要站多遠」。
+        #   遠程 —— 維持原本：送施放封包，ATTACK_PACKET_RANGE 內就送、
+        #           走到 WALK_KEEP 內就停。
+        melee = bool(self.type_box.currentData())
+        self._keys.mode = MODE_KEY if melee else self.mode
         blocked = self._path_pts > 1
-        # in_range = **真的打得到** → 只拿來決定「還要不要再往前走」。
-        in_range = dist is not None and dist <= (
-            MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
-        # ★★ 攻擊**完全不看距離**（使用者定的）：鎖定了就一路送，一邊走過去。
-        #   這就是遊戲客戶端自己打怪的樣子（雪狐那次攔到 6 包移動 +
-        #   4 包動作 + 3 包施放交錯送）。好處有兩個，都不是猜的：
-        #     1. 走進射程的那一瞬間攻擊已經在節奏上了，不必再等一拍 ——
-        #        以前「進了範圍卻慢半拍」和射程邊界的死區都是這樣來的。
-        #     2. 選定封包也跟著提早送 → 提早讀得到血量，走到一半就知道
-        #        那是不是屍體（別人先打死的），不用白跑完整段路。
-        #   打不到的那幾包伺服器直接忽略，實測不會有任何副作用。
-        # ★★ 停止距離 = 0：**走到遊戲算出來的最後一個路徑點**。
-        #   不用自己留距離 —— 遊戲的尋路本來就停在怪旁邊（實測 1.0 格），
-        #   而且那是它自己的點，伺服器一定收。
-        #   ⛔ 不要改成「沿路徑退 N 格算一個新座標」：退太少就等於叫角色站到
-        #     怪的格子上，伺服器把整段移動退回去 —— 症狀是「往前又縮回原點」
-        #     （使用者實際看到）。詳見 move.walk_route()。
-        keep = 0.0
+        # ★ 近戰是「鎖定 + 狂按 Fx」，**走位由客戶端自己算** ——
+        #   所以我們只要把角色帶到 CLIENT_RANGE 內就交給它，
+        #   不要再自己往怪身上推（兩邊搶著下移動指令會互相打架）。
+        #   隔著地形也不必特別處理：客戶端用的就是遊戲自己的尋路。
+        reach = (CLIENT_RANGE if melee
+                 else MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
+        in_range = dist is not None and dist <= reach
+        # 走到多近：近戰只要進到客戶端接手的距離；隔著地形就貼臉；
+        # 否則走到「看過掉血的距離」，最多 WALK_KEEP
+        # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
+        keep = (CLIENT_RANGE if melee else MELEE_RANGE if blocked
+                else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
 
-        # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
-        #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
-        # ⚠ 只在尋路射程內才算數：更遠時尋路本來就回 0（一次只算得出約
-        #   30~40 格），那是要接力走過去，不是到不了。
-        # ⚠⚠ **已經打傷的怪絕不放棄**，而且要連續 UNREACH_HITS 次算不出來
-        #   才算數 —— 怪會走動，打鬥中某一瞬間牠站到走不進去的格子，
-        #   路徑就會變 0。少了這兩條會變成「打一下就換下一隻」，
-        #   結果一路結仇、被圍毆致死（使用者實際遇到）。
-        # ⚠⚠ **已經走到旁邊的怪永遠不算「走不到」**：都貼上去了，還需要走去
-        #   哪裡？那個 0 只是「尋路到自己腳下那格」的結果，不是走不過去。
-        self._unreach = (self._unreach + 1) if self._path_pts == 0 else 0
-        if (self._unreach >= UNREACH_HITS and not self._hurt
-                and dist is not None and MELEE_RANGE < dist <= PATHFIND_RANGE):
-            self._killed[m.eid] = time.monotonic() + KILL_MEMORY
+        # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
+        #   這就是使用者說的「怪卡在奇怪的地方」：牠站在走不進去的角落，
+        #   我們既走不過去、也打不到，等下去不會有任何變化。
+        #
+        # 「非走不可」= 還沒進到各自的接手距離：
+        #   遠程 —— 超出攻擊封包範圍（12 格）
+        #   近戰 —— 超出客戶端接手的距離（20 格）；進去之後走位歸客戶端管，
+        #           就算尋路說我們走不到，客戶端照樣有辦法。
+        if (self._path_pts == 0 and not in_range and dist is not None
+                and dist <= PATHFIND_RANGE):
+            self._killed[m.eid] = time.monotonic()
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
@@ -1348,30 +1214,15 @@ class CharFarmPage(QWidget):
                 self._since_scan = RESCAN_GAP
             self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
             return
-        # ★★ 走路目標一律就是**怪本身**，繞路交給 walk_route()：
-        #   它會算出到怪的完整路徑，要留距離就**沿著那條路徑往回退**。
-        #   ⛔ 以前是在這裡自己算「路徑倒數第二點再往前推」，那是因為
-        #     walk_to() 只吃一個座標；現在退點在 move.py 裡沿路徑算，
-        #     退到的點保證落在遊戲走得到的路段上，這段就不需要了。
-        gx, gy = (mp[0], mp[1]) if mp else (None, None)
-        gd = (math.hypot(gx - me[0], gy - me[1])
-              if (me and gx is not None) else None)
-        # ★★ 移動指令**一隻怪只送一次**（使用者指出的）：
-        #   路徑算一次、移動送一次，之後就只送選定＋攻擊。
-        #   ⚠⚠ 反覆下移動 = 走到一半又插一條新路徑進去，伺服器會把角色
-        #     拉回最後承認的位置 —— 使用者看到的「往前然後回縮回到原點」。
-        #   只有在「**已經停下來**、卻還離得遠」時才補送一次（怪自己跑掉了）。
-        # ⚠ 已經在旁邊就不要下移動指令 —— 目的地會落在自己腳下，尋路回 0、
-        #   角色不動，還把「走不到」的旗標弄髒（見上面 _unreach 那段）。
-        need_walk = gd is not None and gd > MELEE_RANGE and (
-            self._walked_for != m.eid
-            or (not self._moving and gd > REWALK_DIST
-                and self._walk_t >= REWALK_GAP))
-        if self.move_cb.isChecked() and me and need_walk:
-            # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是這次移動算出的路徑
-            #   點數，跟「我跟怪之間有沒有地形」是兩件事（見上面那段說明）。
-            self._walked_ok = self._walk_toward(gx, gy, me, keep) > 0
-            self._walked_for = m.eid
+        # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
+        #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
+        #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
+        if (self.move_cb.isChecked() and me and not self._moving
+                and self._walk_t >= WALK_GAP
+                and dist is not None and dist > keep):
+            # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
+            #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
+            self._walked_ok = self._walk_toward(mp[0], mp[1], me, keep) > 0
 
         # 兩條執行緒對「現在是不是用封包打」要有共識：
         # 寫目標那條要據此決定「寫不寫血量」——
@@ -1380,28 +1231,7 @@ class CharFarmPage(QWidget):
         self._atk.packets = bool(self._keys.mode == MODE_PACKET
                                  and self._keys.packets and self._keys.skill
                                  and self._keys.mover is not None)
-        # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
-        self._atk.engaged = self._keys.selected
-        # ★★★ **走路途中不攻擊。**
-        #
-        # ★ 受控實測（黑狐，2026-08-03，用**完整三包**攻擊）：
-        #       只走路            5/5 走到
-        #       邊走邊打          1/5 走到
-        #   控制條件：目標在 19~24 格、全程 0 次掉血（確實打不到）、
-        #   目的地取遠離怪的方向（排除客戶端自己去找怪）、每輪交換 A/B 先後。
-        #   → **跟打不打得到無關，送攻擊封包本身就會中斷移動。**
-        #
-        # ⚠⚠ 這一條也只信「殺了幾隻」，不要再用微觀實驗去推翻它。
-        #   端到端實測（同一張圖、同一隻角色、各 90 秒，只差這一條）：
-        #       雪狐（近戰）　一路走一路打 **1 隻**　／　走路不打 **7 隻**
-        #       黑狐（遠程）　一路走一路打 **6 隻**　／　走路不打 **15 隻**
-        #   我曾根據不完整的攻擊（少了 0x559FBE）做過四次互相矛盾的微觀
-        #   實驗，還據此把這條規則拿掉 —— 結果實際擊殺數當場崩掉。
-        #
-        # ⚠ 光看 _moving 不夠：它是隔 MOVE_SAMPLE(0.3s) 取樣的，剛下完移動
-        #   指令那一瞬間角色還沒動起來，_moving 仍是 False —— 那時打下去
-        #   一樣會把才剛開始的移動打斷。所以再加一個 ATTACK_QUIET 靜默窗。
-        self._keys.set_on(not self._moving and self._walk_t >= ATTACK_QUIET)
+        self._keys.set_on(in_range)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
@@ -1409,7 +1239,8 @@ class CharFarmPage(QWidget):
         if in_range and dist is not None and dist <= keep:
             self._why = ""
         elif in_range:
-            self._why = f"打得到，同時走近到 {keep:.0f} 格"
+            self._why = (f"打得到，同時走近到 {keep:.0f} 格"
+                         if self._hit_dist else "打得到，同時走過去（還沒確認射程）")
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif not self.move_cb.isChecked():
@@ -1419,11 +1250,9 @@ class CharFarmPage(QWidget):
         elif not self._walked_ok:
             self._why = "⛔ 走不過去"
         elif blocked:
-            self._why = (f"⛰ 隔著地形 → 沿路徑走到 ({gx:.0f},{gy:.0f})"
-                         if gx is not None and len(self._way) >= 2
-                         else "⛰ 隔著地形，走近一點")
+            self._why = f"⛰ 隔著地形，走到 {CLOSE_ENOUGH:.0f} 格內"
         else:
-            self._why = "→ 一邊走一邊打"
+            self._why = "→ 走進攻擊範圍"
 
         # ⛔ 這裡曾經加過「讀不到座標超過 N 秒就換一隻」—— 拿掉了。
         #    那是用 timeout 蓋過症狀，而且量過根本沒發生：
@@ -1436,8 +1265,10 @@ class CharFarmPage(QWidget):
         #   心跳 10ms，角色每拍才走 0.09 格，那樣比永遠都是「沒在動」，
         #   於是走路途中也會一直累積卡住秒數，走到一半就被判定走不過去換怪。
         moving = self._moving
-        if 0 < hp < self._last_hp:
-            self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
+        # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
+        #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
+        if 0 < hp < self._last_hp and dist is not None:
+            self._hit_dist = max(self._hit_dist, dist)
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
             self._stuck = 0.0
         else:
@@ -1445,7 +1276,7 @@ class CharFarmPage(QWidget):
         self._last_pos = me
         self._last_hp = hp
         if self._stuck >= STUCK_SECS:
-            self._killed[m.eid] = time.monotonic() + KILL_MEMORY  # 走不過去
+            self._killed[m.eid] = time.monotonic()   # 走不過去，暫時別再挑它
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
@@ -1509,6 +1340,7 @@ class CharFarmPage(QWidget):
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
+        self.type_box.setCurrentIndex(1 if g(self._key("melee"), False) else 0)
         # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
         spots = g(self._key("spots"), None)
         if not spots:
@@ -1531,6 +1363,7 @@ class CharFarmPage(QWidget):
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
+        s(self._key("melee"), bool(self.type_box.currentData()))
         s(self._key("spots"), [list(p) for p in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
@@ -1544,6 +1377,7 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
+        self.type_box.currentIndexChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
 
@@ -1570,7 +1404,7 @@ class FarmTab(BaseTab):
 
     TAB_TITLE = "自動掛機"
     ORDER = 5
-    ATTACK_MODE = MODE_PACKET         # 近戰遠程已合併，一律送攻擊封包
+    ATTACK_MODE = MODE_PACKET         # 頁面上的「攻擊型態」會覆寫這個
     SETTINGS_PREFIX = "farm"          # 設定存在 config 的哪個前綴底下
 
     def build_ui(self) -> None:

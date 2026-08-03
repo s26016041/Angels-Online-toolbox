@@ -65,11 +65,6 @@ WALK_FN = 0x005D7D96
 #       call 0x549B81        ← eax = 算出來的路徑點數量，0 = 算不出來
 PATHFIND_FN = 0x00549B81
 PATH_MAX_TILES = 28.0       # 尋路的有效範圍實測約 30~40 格，超過就回 0
-# 走路終點離目標至少留幾格。**目前關閉（0）** ——
-# 觀察到「站在 0.7 格時 15 秒 80 發攻擊零傷害、怪走開再回到 1.0 格就正常」，
-# 據此試過 1.2，但實測擊殺數反而從 7 掉到 3，所以不採用。
-# 兩邊都只有單次觀察，先維持原狀，需要時改這個值即可重新試。
-MIN_GAP = 0.0
 # 這段算不出來就縮短再試（由遠到近）
 PATH_TRY = (28.0, 18.0, 10.0, 5.0)
 # ★ 直線方向被牆擋住時，換角度找繞路。
@@ -91,34 +86,6 @@ MGR_ID = 0x2A90             # 本尊的實體 ID
 MGR_TBL = 0x2A74            # ID → 物件的表
 MGR_MAX = 0x2AA4            # 表的上限
 OBJ_ID = 0xBC               # 物件裡回存的 ID（要跟查表用的 ID 一致才算數）
-
-
-def _route_point_back(here: tuple[float, float],
-                      pts: list[tuple[float, float]],
-                      back: float) -> tuple[float, float] | None:
-    """沿著路徑從**終點**往回退 `back` 格，回傳退到的那個點。
-
-    ★ 退到的點一定落在遊戲自己算出來的路段上，所以保證走得到 ——
-      這正是「在直線上取一個點」會失敗的地方（那個點常常在地形裡）。
-    整條路徑都不夠退 → 回 None，代表已經在 `back` 格之內，不用走。
-
-    ⚠ 一定要把**目前位置**接在路徑前面：只有一個路徑點時（直線通），
-      沒有起點就沒有線段可以退，會誤判成「已經夠近」。
-    """
-    if not pts:
-        return None
-    if back <= 0:
-        return pts[-1]
-    route = [here] + list(pts)
-    rem = back
-    for i in range(len(route) - 1, 0, -1):
-        (x1, y1), (x0, y0) = route[i], route[i - 1]
-        seg = math.hypot(x1 - x0, y1 - y0)
-        if seg >= rem:
-            r = (rem / seg) if seg else 0.0
-            return (x1 + (x0 - x1) * r, y1 + (y0 - y1) * r)
-        rem -= seg
-    return None
 
 
 def pathfinder_this(scanner) -> int | None:
@@ -354,21 +321,6 @@ class Mover:
             self._lock.release()
         return n if (n and 0 < n <= MAX_POINTS) else 0
 
-    @staticmethod
-    def read_path(scanner, count: int) -> list[tuple[float, float]]:
-        """讀出剛才 path_to() 算好的路徑點（格子座標）。
-
-        ★ 要**緊接在 path_to() 之後**讀 —— 路徑點寫在全域陣列 WAYPOINTS，
-          下一次尋路就會覆蓋掉。
-        路徑的最後一個點是目標本身，所以**倒數第二個點到目標之間一定是直線**
-        （中間若有地形，尋路會再插一個轉折點）。走到那個點就能無阻礙地打。
-        """
-        raw = scanner._read_bytes(WAYPOINTS, max(0, count) * 4)
-        if not raw:
-            return []
-        return [(x / entity.TILE_UNITS, y / entity.TILE_UNITS)
-                for x, y in struct.iter_unpack("<HH", bytes(raw))]
-
     def walk_to(self, scanner, player_obj: int,
                 tile_x: float, tile_y: float, wait: float = 0.12) -> int:
         """走到指定的格子座標。**回傳尋路算出的路徑點數**（0 = 走不了）。
@@ -458,130 +410,6 @@ class Mover:
         # （使用者回報的「往那個方向卡住」就是這樣來的）。
         # 回 0 讓呼叫端自己決定（掛機那邊會由卡住偵測換目標）。
         return 0
-
-    def walk_route(self, scanner, player_obj: int,
-                   tile_x: float, tile_y: float, stop_short: float = 0.0,
-                   wait: float = 0.12) -> int:
-        """★ 請遊戲算出**到目標本身**的路徑，再照它算的點位走過去。
-
-        回傳路徑點數（0 = 算不出路徑，1 = 直線通，>1 = 有繞路）。
-
-        跟 walk_to() 的差別（這是使用者指出的關鍵）：
-          walk_to() 是「自己在直線上取一個距離目標 keep 格的點」再去尋路 ——
-          **那個幾何點常常正好落在地形裡**，尋路就失敗、角色站著不動，
-          等於把遊戲已經算好的繞路整條丟掉。
-          這裡反過來：先算到目標的完整路徑，要退後就**沿著那條路徑退**，
-          退到的點一定落在遊戲自己走得到的路段上。
-
-        `stop_short` = 想提早幾格停下來（0 = 走到底，讓遊戲停在怪旁邊）。
-        ★ 提早停是用「**少送幾個路徑點**」達成的，不會去改點位本身。
-        """
-        if not self._active or not player_obj:
-            return 0
-        this = pathfinder_this(scanner)
-        if not this:
-            return 0
-        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
-        if not raw:
-            return 0
-        wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
-        tx = int(tile_x * entity.TILE_UNITS) & 0xFFFF
-        ty = int(tile_y * entity.TILE_UNITS) & 0xFFFF
-
-        # 「算路徑 → 讀路徑點 → 送移動」中間不能被插隊：路徑點在**全域**陣列。
-        self._wanted += 1                  # 舉手要指令槽，攻擊會讓一拍
-        try:
-            got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
-        finally:
-            self._wanted -= 1
-        if not got:
-            return 0
-        try:
-            def path(px: float, py: float) -> int:
-                v = self.call_sync(
-                    PATHFIND_FN,
-                    int(px * entity.TILE_UNITS) & 0xFFFF,
-                    int(py * entity.TILE_UNITS) & 0xFFFF,
-                    WAYPOINTS, ecx=this, timeout=0.15)
-                return v if (v and 0 < v <= MAX_POINTS) else 0
-
-            n = path(tile_x, tile_y)
-            if not n:
-                # ★★ 目標超出尋路一次算得出的範圍（實測約 28~40 格）→
-                #   改走**中繼點**接力，呼叫端下一拍再下一次就能走很遠。
-                #   ⚠⚠ 少了這段的症狀：30 格外的怪一律被判「走不到」，
-                #     附近清光之後角色就站著發呆（實測 90 秒只有前 6.6 秒
-                #     在殺怪，之後全是「走不到」）。巡邏點也會一起壞掉。
-                #   ⚠ 直線方向整條算不出來 = 那個方向有牆，換角度繞
-                #     （見 DETOUR_TRY 的說明）。
-                cx = wx / entity.TILE_UNITS
-                cy = wy / entity.TILE_UNITS
-                dx, dy = tile_x - cx, tile_y - cy
-                full = math.hypot(dx, dy) or 1.0
-                for hop in PATH_TRY:
-                    if hop >= full:
-                        continue
-                    n = path(cx + dx / full * hop, cy + dy / full * hop)
-                    if n:
-                        break
-                if not n:
-                    ang = math.atan2(dy, dx)
-                    for hop, deg in DETOUR_TRY:
-                        if hop >= full:
-                            continue
-                        a = ang + math.radians(deg)
-                        px = cx + math.cos(a) * hop
-                        py = cy + math.sin(a) * hop
-                        # 繞過去要比現在更靠近目標，否則會原地打轉
-                        if math.hypot(tile_x - px, tile_y - py) >= full:
-                            continue
-                        n = path(px, py)
-                        if n:
-                            break
-                if not n:
-                    return 0
-                stop_short = 0.0       # 中繼點本身就要走到底
-            # ★★ 目的地只用**遊戲自己算出來的路徑點**，不自己捏座標
-            #   （使用者指出的：「func 拿到的點位直接輸入就好別偷改」）。
-            #   ⛔ 先前是「沿路徑退 N 格算一個新座標」，退太少就等於叫角色
-            #     站到怪的格子上 —— 伺服器把整段移動退回，症狀是
-            #     「往前然後回縮回到原點」。
-            #   遊戲的尋路本來就會停在怪**旁邊**（實測停在 1.0 格），
-            #   所以走到最後一個點剛好就是可以打的位置。
-            pts = self.read_path(scanner, n)
-            k = len(pts) - 1
-            while k > 0 and math.hypot(pts[k][0] - tile_x,
-                                       pts[k][1] - tile_y) < stop_short:
-                k -= 1                     # 要提早停就整點整點往回挑
-            gx, gy = pts[k]
-            # ⚠⚠⚠ **終點絕不能落在目標自己的格子上。**
-            #   實測（雪狐，近戰）走到離怪 0.7 格之後：站著 15 秒、送 80 發
-            #   攻擊**全部零傷害**；等怪自己走開、那一格空出來，攻擊立刻生效。
-            #   伺服器不讓你站到被佔用的格子，整段移動就不算完成，
-            #   客戶端一直停在「移動中」狀態 —— 這個狀態下攻擊會被忽略
-            #   （跟 MOVE_FN 少了收尾是同一個症狀）。
-            #   ★ 客戶端自己算的落腳點永遠是離怪 1.0~1.41 格，就是為了這個。
-            #   所以最後沿著「我 → 那個點」的方向退到離目標 MIN_GAP 格。
-            gap = math.hypot(gx - tile_x, gy - tile_y)
-            if gap < MIN_GAP:
-                sx = pts[k - 1] if k > 0 else (wx / entity.TILE_UNITS,
-                                               wy / entity.TILE_UNITS)
-                seg = math.hypot(gx - sx[0], gy - sx[1])
-                if seg > 0.1:
-                    back = min(MIN_GAP - gap, seg - 0.1) / seg
-                    gx += (sx[0] - gx) * back
-                    gy += (sx[1] - gy) * back
-            # ⚠⚠ **一定要用 WALK_FN，不能直接送 MOVE_FN** ——
-            #   MOVE_FN 只是把移動封包送出去，少了 WALK_FN 會補做的兩個
-            #   收尾（0x549B59 / 0x5B5C60）。實測（雪狐）用 MOVE_FN 走完之後
-            #   站在 1.0 格連續 15 秒、送 67 次攻擊**全部零傷害**，
-            #   換回 WALK_FN 才正常 —— 移動狀態沒收乾淨，攻擊會被忽略。
-            self.call(WALK_FN, this, wx, wy,
-                      int(gx * entity.TILE_UNITS) & 0xFFFF,
-                      int(gy * entity.TILE_UNITS) & 0xFFFF, 0)
-            return n
-        finally:
-            self._lock.release()
 
     def walk_path(self, scanner, player_obj: int, tiles) -> bool:
         """低階：直接送出指定的路徑點（最後一個是終點）。

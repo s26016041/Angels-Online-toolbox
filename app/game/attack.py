@@ -36,31 +36,8 @@ ACTION_FN = 0x005DA9F4      # ①動作。f(玩家物件−8, 動作碼)
 SELECT_FN = 0x005D3EB5      # ②選定。f(0x0C, 目標實體ID)
 CAST_FN = 0x00559FF8        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 
-# ★ 第三種攻擊封包（2026-08-03 從雪狐完整攻擊攔包解出來，我們原本沒送）。
-#   遊戲的近戰攻擊迴圈是：動作 → 施放(38B) → 動作 → 施放 → 動作 → **這包(22B)**
-#   反組譯 0x559FBE：
-#       f(目標實體ID, u16)   cdecl，兩個參數
-#       sub esp,0x10 / push 8 / push 5 / lea ecx,[ebp-0x10] → 建構封包
-#       [封包+2] = 第一個參數（目標 ID）；[0x9B67D4] 也存一份
-#       [封包+6] = 第二個參數的低 16 位
-#   ⚠ 兩個參數都只是被寫進封包緩衝，**沒有任何指標解參考** ——
-#     給錯值最多是伺服器忽略，不會崩潰。
-#
-# ★★★ **這一包就是近戰封包攻擊一直打不動的原因。**
-#   A/B 實測（雪狐，純淨迴圈，各 60 秒兩輪）：
-#       只送 動作＋施放        0 隻、0 隻
-#       加上這一包             3 隻、4 隻
-#   以前近戰站在 1.0 格送 240 發攻擊卻打不死怪，就是少了它。
-KEEPUP_FN = 0x00559FBE
 SELECT_CODE = 0x0C          # ②的第一個參數（遊戲自己的程式碼就是推 0xC）
-# ★ ①的動作碼。**寫死 1**（使用者定的）。
-#   2026-08-03 攔包對照（按 F2 打怪）看到遊戲自己不是固定值：
-#       黑狐　第一下 1，之後全部 2
-#       雪狐　全部 1
-#   （更早一份記錄看過 4，所以它像是「攻擊狀態／動畫序號」。）
-#   1 是兩隻角色都出現過的值，先統一用它，不去模擬那個序號。
-#   ⚠ 我們以前一律送 0 —— 那個值在任何一份攔包裡都沒出現過。
-ACTION_CODE = 1
+ACTION_CODE = 0             # ①的動作碼，實測攔到 0（另看過 5/7）
 
 CALL_TIMEOUT = 0.12         # 每一包等它被主執行緒執行的上限（一幀約 16ms）
 
@@ -101,26 +78,17 @@ def select(mover, target_id: int) -> bool:
 
 
 def strike(mover, pf_this: int, skill_id: int, target_id: int,
-           tile_x: float = 0.0, tile_y: float = 0.0,
-           action_code: int = ACTION_CODE) -> bool:
-    """打一下：動作 + 施放。選定之後就一直重複，直到怪死掉。
+           tile_x: float = 0.0, tile_y: float = 0.0) -> bool:
+    """打一下：動作 + 施放。選定之後就一直重複這兩包，直到怪死掉。
 
     pf_this: move.pathfinder_this() 的結果 —— **玩家物件 −8**
-    tile_x/tile_y: 目標的**格子座標**，填在施放封包的第 3、4 個參數。
-        ★ **順移這類對地技能沒有座標就發不動**（見 [[teleport-skill]]），
-          所以照給；使用者把順移放在攻擊鍵時才有辦法用。
-
-    ⚠ 座標**只能放在同一發裡**，不要另外多送一發「目標 ID = 0 + 座標」的
-      對地施放 —— 實測多送那一發時，怪連續 3.3 秒零傷害，而只送這一發
-      1.3 秒就打死。
-    ⚠ 我曾經說過「同一發帶座標會讓攻擊失效」，那是**錯的**：
-      當時每種只測 1 隻。後來同一批怪交替測 3 對 3，
-      帶座標與不帶座標都是 100% 打得到。
+    tile_x/tile_y: 目標的**格子座標**。施放封包的第 3、4 個參數就是座標
+        —— 順移用的是同一個函式，只是把目標 ID 換成座標
+        （見 [[teleport-skill]]）。這裡兩個都給，讓伺服器自己取它要的。
     """
     if (not (mover and mover.active and pf_this and skill_id and target_id)
             or _yield_now(mover)):
         return False
-    return _send(mover, ((ACTION_FN, (pf_this, action_code)),
+    return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
                          (CAST_FN, (skill_id, target_id,
-                                    int(tile_x), int(tile_y), 0)),
-                         (KEEPUP_FN, (target_id, 0))))
+                                    int(tile_x), int(tile_y), 0))))
