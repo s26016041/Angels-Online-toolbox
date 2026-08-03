@@ -91,9 +91,6 @@ WALK_GAP = 0.4
 # 判斷「有沒有在移動」要隔一段時間再比位置。
 # ⚠ 心跳是 10ms，而角色約 9 格/秒 = 每拍才 0.09 格 —— 拿相鄰兩拍比
 #   幾乎永遠判定「沒在動」（卡住偵測也一起誤判，走路中照樣累積秒數）。
-# 走路的到達容差：距離只超過目標一點點就不要再走了。
-# 沒有它的話角色會在定位附近一直被推一小步（「打一打又往前一格」）。
-WALK_SLACK = 1.5
 MOVE_SAMPLE = 0.3
 MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
@@ -139,6 +136,10 @@ ATTACK_PACKET_RANGE = 12.0
 # ⚠ 先前量到「站在 10.0 格打不到」，那是路徑點數被誤用造成的
 #   （blocked 誤判 → 攻擊距離被縮成 2 格），已經修掉，不是射程問題。
 WALK_KEEP = 11.0
+# ★ 移動指令一隻怪只送一次；已經停下來卻還離這麼遠才補送（怪自己跑掉了）。
+#   ⚠ 不能設太小：怪在打鬥中會小幅走動，門檻太小就變成每隔一下就重下指令
+#     —— 那正是「往前又回縮」的成因。
+REWALK_DIST = 3.0
 # 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
 # —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
@@ -163,24 +164,17 @@ CORPSE_SECS = 0.8
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
-# 兩種攻擊方式（兩個分頁各用一種）：
-#   MODE_PACKET —— 選定封包 + 動作/施放封包（原本的「自動掛機」）
-#   MODE_KEY    —— 選定封包 + 狂按技能鍵（「自動掛機（按鍵）」）
+# 攻擊方式只剩一種（2026-08-03 合併，近戰遠程都用它）：
+#   選定封包 + 動作/施放封包。
+# ★ 近戰角色一樣有效 —— 實測雪狐（近戰）走到怪旁邊之後用封包打，
+#   30 秒 8 次掉血、90 秒殺 6 隻。以前以為「近戰非用按鍵不可」，
+#   那是因為當時停在 10 格外送施放，伺服器不受理，不是封包不能用。
+# ⛔ MODE_KEY（狂按 Fx）只留給舊設定相容，介面上已經沒有這個選項。
 MODE_PACKET = "packet"
 MODE_KEY = "key"
-# ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
-#    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
-#    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
-# ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
-#   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
-#   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
-#   —— 實測雪狐就是這樣完全打不到怪。
+# 隔著地形時要走到這麼近才算「真的打得到」（只影響要不要繼續走）。
 MELEE_RANGE = 2.0
-# ★ 近戰模式：進到這個距離就開始鎖定＋狂按 Fx，剩下的走位交給遊戲客戶端 ——
-#   它知道每招的射程，也會自己繞地形。我們只負責把角色帶進這個圈子，
-#   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
-CLIENT_RANGE = 20.0
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
@@ -696,6 +690,7 @@ class CharFarmPage(QWidget):
         self._hurt = False         # 這隻有沒有被我們打傷過
         self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
+        self._walked_for = None    # 已經替哪一隻怪下過移動指令了（只下一次）
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
         self._move_t = 0.0
@@ -793,21 +788,6 @@ class CharFarmPage(QWidget):
             "⚠ 這項功能需要在遊戲行程裡執行一小段程式碼（掛 PeekMessageA），\n"
             "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
         mbar.addWidget(self.move_cb)
-        mbar.addSpacing(12)
-        mbar.addWidget(QLabel("攻擊型態"))
-        self.type_box = QComboBox()
-        self.type_box.addItem("遠程", False)
-        self.type_box.addItem("近戰", True)
-        self.type_box.setFixedWidth(80)
-        self.type_box.setToolTip(
-            f"遠程：送攻擊封包（距離 {ATTACK_PACKET_RANGE:.0f} 格內就送，"
-            f"走到 {WALK_KEEP:.0f} 格內就停）。\n"
-            f"近戰：用封包選定怪物，然後**狂按你選的那個 F 鍵**出手。\n"
-            f"　　　我們只把角色帶到 {CLIENT_RANGE:.0f} 格內，剩下的射程與走位\n"
-            "　　　全交給遊戲客戶端 —— 它知道每招要站多近，也會自己繞地形。\n"
-            "⚠ 射程每個角色不一樣，近戰角色站太遠送攻擊封包伺服器不會理，\n"
-            "　 症狀是站著不動、怪完全不掉血 —— 所以近戰交給客戶端比較穩。")
-        mbar.addWidget(self.type_box)
         mbar.addSpacing(12)
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
         self.patrol_cb.setToolTip(
@@ -954,31 +934,19 @@ class CharFarmPage(QWidget):
             return False
 
     def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
-        """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
+        """走向 (gx,gy)，**照遊戲自己算出來的路徑點走**，離終點 keep 格處停。
 
-        走的是 move.Mover.walk_to()，它會先請**遊戲自己的尋路**算路徑，
-        所以會繞過地形；太遠時自動縮短成中繼點，靠這裡定期重下接力走完
-        （實測 85.9 格、8.5 秒到達）。
+        ★ 這是使用者定的作法：先叫尋路算出到**目標本身**的完整路徑，
+          要留距離就沿著那條路徑往回退 —— 退到的點一定在遊戲走得到的
+          路段上。以前是「在直線上取一個距離目標 keep 格的點」，那個幾何點
+          常常落在地形裡，尋路失敗、角色站著不動，等於把算好的繞路丟掉。
 
         回傳尋路算出的路徑點數（0 = 走不了，1 = 直線通，>1 = 中間有地形）。
         """
         if not self._ensure_mover():
             return 0
-        d = math.hypot(gx - me[0], gy - me[1])
-        if d <= keep:
-            return 0
-        r = (d - keep) / d                     # 只走到剩 keep 格的位置
-        n = self._mover.walk_to(self.sc, self.player,
-                                me[0] + (gx - me[0]) * r,
-                                me[1] + (gy - me[1]) * r)
-        # ★ 縮短版的落點走不了，就直接走去目標本身，讓**遊戲照它自己算的
-        #   路徑繞過去**。
-        #   ⚠ 這是複雜地形「不會繞路」的主因：遊戲明明算得出到那隻怪的
-        #     5 點繞路路徑，但我們是走「直線上距離牠 keep 格的那個點」——
-        #     那個幾何點常常正好落在地形裡，於是尋路失敗、角色站著不動，
-        #     等於把遊戲算好的繞路丟掉了。
-        if n <= 0:
-            n = self._mover.walk_to(self.sc, self.player, gx, gy)
+        n = self._mover.walk_route(self.sc, self.player, gx, gy,
+                                   stop_short=keep)
         self._walk_t = 0.0
         return n
 
@@ -1097,6 +1065,7 @@ class CharFarmPage(QWidget):
         self._hurt = False
         self._gone = 0
         self._walked_ok = True
+        self._walked_for = None            # 換目標 → 重新下一次移動指令
         self._why = ""
         self._last_hp = -1
         self._last_pos = me
@@ -1305,23 +1274,18 @@ class CharFarmPage(QWidget):
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
         #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
-        # ★ 近戰／遠程（使用者在頁面上選）：
-        #   近戰 —— **選怪用封包、出手用按鍵**（狂按使用者選的那個 Fx）。
-        #           射程與走位交給遊戲客戶端判斷，它知道每招要站多近；
-        #           我們只負責走到怪身上，不自己算「要站多遠」。
-        #   遠程 —— 維持原本：送施放封包，ATTACK_PACKET_RANGE 內就送、
-        #           走到 WALK_KEEP 內就停。
-        melee = bool(self.type_box.currentData())
-        self._keys.mode = MODE_KEY if melee else self.mode
+        # ★★★ 近戰／遠程已經合併成同一套（2026-08-03，兩隻角色實測通過）：
+        #   出手 —— 一律送攻擊封包，而且**完全不看距離**。
+        #   走位 —— 照遊戲自己算的路徑走到底，目的地取它算出來的路徑點。
+        #           遊戲的尋路本來就會停在怪**旁邊**（實測 1.0 格），
+        #           所以近戰自然貼得到、遠程也不必知道射程。
+        #   實測：雪狐（近戰）20 秒 2 隻、黑狐（遠程）45 秒 4 隻，
+        #        同一份程式碼、同一組參數，兩邊都正常。
+        self._keys.mode = self.mode
         blocked = self._path_pts > 1
-        # ★ 近戰是「鎖定 + 狂按 Fx」，**走位由客戶端自己算** ——
-        #   所以我們只要把角色帶到 CLIENT_RANGE 內就交給它，
-        #   不要再自己往怪身上推（兩邊搶著下移動指令會互相打架）。
-        #   隔著地形也不必特別處理：客戶端用的就是遊戲自己的尋路。
-        reach = (CLIENT_RANGE if melee
-                 else MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
         # in_range = **真的打得到** → 只拿來決定「還要不要再往前走」。
-        in_range = dist is not None and dist <= reach
+        in_range = dist is not None and dist <= (
+            MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
         # ★★ 攻擊**完全不看距離**（使用者定的）：鎖定了就一路送，一邊走過去。
         #   這就是遊戲客戶端自己打怪的樣子（雪狐那次攔到 6 包移動 +
         #   4 包動作 + 3 包施放交錯送）。好處有兩個，都不是猜的：
@@ -1330,13 +1294,13 @@ class CharFarmPage(QWidget):
         #     2. 選定封包也跟著提早送 → 提早讀得到血量，走到一半就知道
         #        那是不是屍體（別人先打死的），不用白跑完整段路。
         #   打不到的那幾包伺服器直接忽略，實測不會有任何副作用。
-        # ★★ 停止距離：近戰交給客戶端（帶到 CLIENT_RANGE 內就好），
-        #   遠程停在 WALK_KEEP（11 格，使用者查到技能射程都是 12）。
-        #   ⛔ 不要再試圖「自動問出射程」讓兩者共用一套 —— 四條路都失敗，
-        #      而且使用者明確否決自己量測（有些技能是原地施放）。
-        #      詳見記憶 client-attack-fn-deadend。
-        keep = (CLIENT_RANGE if melee
-                else MELEE_RANGE if blocked else WALK_KEEP)
+        # ★★ 停止距離 = 0：**走到遊戲算出來的最後一個路徑點**。
+        #   不用自己留距離 —— 遊戲的尋路本來就停在怪旁邊（實測 1.0 格），
+        #   而且那是它自己的點，伺服器一定收。
+        #   ⛔ 不要改成「沿路徑退 N 格算一個新座標」：退太少就等於叫角色站到
+        #     怪的格子上，伺服器把整段移動退回去 —— 症狀是「往前又縮回原點」
+        #     （使用者實際看到）。詳見 move.walk_route()。
+        keep = 0.0
 
         # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
         #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
@@ -1358,42 +1322,28 @@ class CharFarmPage(QWidget):
                 self._since_scan = RESCAN_GAP
             self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
             return
-        # ★ 要繞路時，目標改成**路徑的倒數第二個點**（使用者的觀察）：
-        #   那個點到怪之間一定是直線 —— 中間若有地形，尋路會再插一個轉折點。
-        #   走那裡就不必一路擠到牠臉上，也不會在半路被地形卡住。
-        # ⚠ 但那個點到怪可能還是超過攻擊範圍，所以再沿著**最後那段直線**
-        #   往前推到剩 WALK_KEEP 格 —— 走到定位就直接打得到，不用多跑一趟。
-        # ★ 近戰也走同一套：牠平常把走位交給客戶端，但隔著地形時客戶端
-        #   常常卡住，這時由我們把牠帶到那個「看得到怪」的點最有效。
-        gx, gy, gkeep = (mp[0], mp[1], keep) if mp else (None, None, keep)
-        if blocked and len(self._way) >= 2 and mp:
-            ax, ay = self._way[-2]
-            seg = math.hypot(mp[0] - ax, mp[1] - ay)
-            if seg > WALK_KEEP:            # 最後一段太長 → 沿著它再往前
-                r = (seg - WALK_KEEP) / seg
-                gx, gy = ax + (mp[0] - ax) * r, ay + (mp[1] - ay) * r
-            else:
-                gx, gy = ax, ay
-            gkeep = 0.0
+        # ★★ 走路目標一律就是**怪本身**，繞路交給 walk_route()：
+        #   它會算出到怪的完整路徑，要留距離就**沿著那條路徑往回退**。
+        #   ⛔ 以前是在這裡自己算「路徑倒數第二點再往前推」，那是因為
+        #     walk_to() 只吃一個座標；現在退點在 move.py 裡沿路徑算，
+        #     退到的點保證落在遊戲走得到的路段上，這段就不需要了。
+        gx, gy = (mp[0], mp[1]) if mp else (None, None)
         gd = (math.hypot(gx - me[0], gy - me[1])
               if (me and gx is not None) else None)
-        # ⚠ 走路的條件**不能再要求「不在範圍內」** —— 遊戲自己打怪時就是
-        #   一邊走一邊打（雪狐那次攔到 6 包移動 + 4 包動作 + 3 包施放）。
-        #   要求不在範圍內的話，近戰會站在 10 格外一直送打不到的施放封包。
-        # 要超過 gkeep **再多 WALK_SLACK 格**才走 —— 沒有這個容差的話，
-        # 角色停在定位附近時 gd 只比 gkeep 多一點點，每個 WALK_GAP 就再推
-        # 一小步，看起來就是「打一打又往前一格」（使用者回報的不流暢）。
-        # ⚠⚠ 但**打不到的時候容差要失效**，否則會出現死區：
-        #   攻擊範圍 12 格、走路門檻 11+1.5=12.5 格 → 怪停在 12.3 格時
-        #   既不打也不走，就是「朝一個方向發呆」（監控抓到 3 次，
-        #   距離全是 12.3~12.4）。
+        # ★★ 移動指令**一隻怪只送一次**（使用者指出的）：
+        #   路徑算一次、移動送一次，之後就只送選定＋攻擊。
+        #   ⚠⚠ 反覆下移動 = 走到一半又插一條新路徑進去，伺服器會把角色
+        #     拉回最後承認的位置 —— 使用者看到的「往前然後回縮回到原點」。
+        #   只有在「**已經停下來**、卻還離得遠」時才補送一次（怪自己跑掉了）。
         need_walk = gd is not None and (
-            gd > gkeep + WALK_SLACK or (not in_range and gd > gkeep))
-        if (self.move_cb.isChecked() and me and not self._moving
-                and self._walk_t >= WALK_GAP and need_walk):
-            # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
-            #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
-            self._walked_ok = self._walk_toward(gx, gy, me, gkeep) > 0
+            self._walked_for != m.eid
+            or (not self._moving and gd > REWALK_DIST
+                and self._walk_t >= WALK_GAP))
+        if self.move_cb.isChecked() and me and need_walk:
+            # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是這次移動算出的路徑
+            #   點數，跟「我跟怪之間有沒有地形」是兩件事（見上面那段說明）。
+            self._walked_ok = self._walk_toward(gx, gy, me, keep) > 0
+            self._walked_for = m.eid
 
         # 兩條執行緒對「現在是不是用封包打」要有共識：
         # 寫目標那條要據此決定「寫不寫血量」——
@@ -1512,7 +1462,6 @@ class CharFarmPage(QWidget):
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
-        self.type_box.setCurrentIndex(1 if g(self._key("melee"), False) else 0)
         # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
         spots = g(self._key("spots"), None)
         if not spots:
@@ -1535,7 +1484,6 @@ class CharFarmPage(QWidget):
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
-        s(self._key("melee"), bool(self.type_box.currentData()))
         s(self._key("spots"), [list(p) for p in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
@@ -1549,7 +1497,6 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
-        self.type_box.currentIndexChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
 
@@ -1576,7 +1523,7 @@ class FarmTab(BaseTab):
 
     TAB_TITLE = "自動掛機"
     ORDER = 5
-    ATTACK_MODE = MODE_PACKET         # 頁面上的「攻擊型態」會覆寫這個
+    ATTACK_MODE = MODE_PACKET         # 近戰遠程已合併，一律送攻擊封包
     SETTINGS_PREFIX = "farm"          # 設定存在 config 的哪個前綴底下
 
     def build_ui(self) -> None:
