@@ -557,14 +557,17 @@ class ScanWorker(QThread):
                 out.state, out.player = state, pobj
                 out.stats = player.pick(sc, extra.get(stats_vt, []))
                 out.inv = self._inventory_head(pid, sc, now)
-                # ★ 只留「這張地圖的怪物表」裡有的名字 —— 寵物、召喚物、
+                # ★ 只留「遊戲的怪物類型表」裡有的名字 —— 寵物、召喚物、
                 #   戰鬥化身的型別 ID 也不是 0，光看型別分不出來，
-                #   但它們不會出現在地圖的怪物表裡。
-                #   ⚠ 表讀不到時**不過濾**（寧可多列，也不要整個清單變空）。
+                #   但它們不會出現在那些表裡。
+                mons = [e for e in ents if e.is_monster]
                 names = entity.map_monster_names(
                     sc, extra.get(entity.VT_MAP_MOBS, []))
-                out.mons = [e for e in ents if e.is_monster
-                            and (not names or e.name in names)]
+                kept = [e for e in mons if e.name in names]
+                # ⚠ 兩道保險，寧可多列也不要列不出來：
+                #   · 表讀不到（names 是空的）→ 不過濾
+                #   · 過濾後全空、但原本有怪 → 這張圖的表可能沒載到，也不過濾
+                out.mons = kept if (names and kept) else mons
                 if state is None:
                     out.err = "找不到狀態物件（掃到 0 個或多個）"
                 elif pobj is None:
