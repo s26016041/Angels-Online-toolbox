@@ -133,12 +133,6 @@ ATTACK_PACKET_RANGE = 12.0
 # ⚠ 先前量到「站在 10.0 格打不到」，那是路徑點數被誤用造成的
 #   （blocked 誤判 → 攻擊距離被縮成 2 格），已經修掉，不是射程問題。
 WALK_KEEP = 11.0
-# ★ 問「官方射程」用的（見 CharFarmPage._probe_range）：
-#   目標要這麼遠客戶端才會需要走過去（太近它直接出手，不會算落腳點）。
-RANGE_PROBE_MIN = 6.0
-RANGE_PROBE_TRIES = 12          # 最多按幾次鍵去問
-PROBE_GAP = 0.4                 # 兩次之間隔多久
-NO_DMG_SECS = 2.0
 # 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
 # —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
@@ -149,13 +143,17 @@ HP_SETTLE = 0.5
 #   所以放寬到 0.8 秒（活著的目標實測最久 0.52 秒就會顯示血量）。
 #   被誤跳過的只冷卻 NOHP_MEMORY 秒，很快會再輪到。
 CORPSE_SECS = 0.8
-# ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
+# ★★ 射程**每個角色不一樣**，上面那個 12 是遠程（黑狐）的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
 #   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
 #   —— 症狀就是「雪狐完全無法打怪」。
-#   解法不寫死也不量測：**還沒打中過就一路走到貼臉**，
-#   一旦看到怪掉血就把那個距離記起來，之後就不必再靠近。
-#   近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，兩邊都對。
+#   ★ 定案（使用者決定）：**頁面上分「近戰／遠程」兩種攻擊型態**，不自動判斷。
+#     近戰 = 選定封包 + 狂按 Fx，走位與射程全交給客戶端；
+#     遠程 = 送施放封包，用上面的 12 / 11 格。
+#   ⛔ 不要再嘗試讓兩者共用一套 —— 找射程欄位、找自動接近的封包、
+#     逆向客戶端攻擊函式、猜靜態單例，四條路全部失敗；
+#     自己按鍵量測也被使用者否決（有些技能是原地施放）。
+#     完整紀錄見記憶 client-attack-fn-deadend。
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
@@ -691,21 +689,11 @@ class CharFarmPage(QWidget):
         self._unreach = 0          # 連續幾次尋路算不出路徑
         self._hurt = False         # 這隻有沒有被我們打傷過
         self._gone = 0             # 連續幾次掃描沒看到目標
-        self._no_dmg = 0.0         # 在自認的射程內卻打不動多久了
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
         self._move_t = 0.0
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
-        # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
-        # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
-        self._hit_dist = 0.0
-        # ★ 官方射程（問客戶端問到的，見 _probe_range）；None = 還沒問到
-        self._range: float | None = None
-        self._probe_t = 0.0
-        self._probes = 0
-        # 自己最近一次下的移動目的地（問射程時要排掉，見 _probe_range）
-        self._my_dest: tuple[float, float] | None = None
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
@@ -764,8 +752,6 @@ class CharFarmPage(QWidget):
         self.key_box.setToolTip("要一直按的攻擊／技能鍵。")
         self.key_box.currentIndexChanged.connect(
             lambda i: setattr(self._keys, "vk", self.key_box.itemData(i)))
-        # 換了技能鍵 → 射程也不一樣了，要重問
-        self.key_box.currentIndexChanged.connect(self._forget_range)
         bar.addWidget(self.key_box)
         bar.addSpacing(12)
         bar.addWidget(QLabel("每隔"))
@@ -961,47 +947,6 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
             return False
 
-    def _forget_range(self) -> None:
-        """換技能鍵之後射程就不一樣了，清掉重問。"""
-        self._range = None
-        self._probes = 0
-        config.set(self._key("range"), None)
-
-    def _probe_range(self, mp, me, dist: float, dt: float) -> None:
-        """問客戶端「這招要站多近」—— 按一次技能鍵，讀它算出來的落腳點。
-
-        ★ 這是**官方的計算**，不是我們自己量的：客戶端知道每招的射程，
-          對遠處目標按技能鍵時會依射程算出落腳點寫進 `entity.OFF_DEST`。
-          實測雪狐（近戰）算出來是離怪 1.5 格、黑狐（遠程）是 12 格上下。
-        ⚠ 目標要夠遠（RANGE_PROBE_MIN 以上）客戶端才會需要走，
-          太近的話它直接出手、不會寫落腳點。
-        """
-        self._probe_t += dt
-        if self._probe_t < PROBE_GAP:
-            return
-        self._probe_t = 0.0
-        dst = entity.read_dest(self.sc, self.player)
-        # ⚠⚠ **我們自己下的移動指令也會寫進這個欄位** —— 讀到那個就不是
-        #   客戶端算的落腳點，射程會整個算錯。所以先排掉自己剛送出去的目的地。
-        if dst and self._my_dest and math.hypot(
-                dst[0] - self._my_dest[0], dst[1] - self._my_dest[1]) < 1.0:
-            dst = None
-        # 落腳點離我夠遠 = 客戶端真的算了一個新的目的地
-        if dst and math.hypot(dst[0] - me[0], dst[1] - me[1]) > 1.0:
-            r = math.hypot(dst[0] - mp[0], dst[1] - mp[1])
-            if 0.5 <= r <= WALK_KEEP + 2:
-                self._range = r
-                config.set(self._key("range"), r)
-                config.save()
-                self.status.setText(
-                    f"已問到官方射程：{r:.1f} 格（客戶端自己算的）")
-                return
-        # 還沒問到 → 餵目標血量並按一次鍵，讓客戶端去算
-        self._probes += 1
-        if self._probes <= RANGE_PROBE_TRIES and self.state:
-            entity.set_target(self.sc, self.state, self._cur.eid)
-            _send_scan(self.hwnd, self._keys.vk)
-
     def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
         """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
 
@@ -1028,8 +973,6 @@ class CharFarmPage(QWidget):
         #     等於把遊戲算好的繞路丟掉了。
         if n <= 0:
             n = self._mover.walk_to(self.sc, self.player, gx, gy)
-        # 記下自己下的目的地 —— 問官方射程時要用它排掉「自己寫的」那個值
-        self._my_dest = (gx, gy)
         self._walk_t = 0.0
         return n
 
@@ -1147,7 +1090,6 @@ class CharFarmPage(QWidget):
         self._unreach = 0
         self._hurt = False
         self._gone = 0
-        self._no_dmg = 0.0
         self._walked_ok = True
         self._why = ""
         self._last_hp = -1
@@ -1373,13 +1315,13 @@ class CharFarmPage(QWidget):
         reach = (CLIENT_RANGE if melee
                  else MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
         in_range = dist is not None and dist <= reach
-        # ★★ 停止距離 = **官方算出來的射程**（見 _probe_range）——
-        #   遠程近戰共用一套，使用者不必選、程式也不必一格一格試。
-        #   實測射程差很多（黑狐 12 格、雪狐 1.5 格），而記憶體裡找不到
-        #   可靠的射程欄位，所以改成「問客戶端」。還沒問到前用保守值。
-        keep = (CLIENT_RANGE if melee else MELEE_RANGE if blocked
-                else max(MELEE_RANGE, min(WALK_KEEP, self._range))
-                if self._range else MELEE_RANGE)
+        # ★★ 停止距離：近戰交給客戶端（帶到 CLIENT_RANGE 內就好），
+        #   遠程停在 WALK_KEEP（11 格，使用者查到技能射程都是 12）。
+        #   ⛔ 不要再試圖「自動問出射程」讓兩者共用一套 —— 四條路都失敗，
+        #      而且使用者明確否決自己量測（有些技能是原地施放）。
+        #      詳見記憶 client-attack-fn-deadend。
+        keep = (CLIENT_RANGE if melee
+                else MELEE_RANGE if blocked else WALK_KEEP)
 
         # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
         #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
@@ -1449,21 +1391,13 @@ class CharFarmPage(QWidget):
         self._atk.engaged = self._keys.selected
         self._keys.set_on(in_range)
 
-        # ★★ 問出「這招的官方射程」：對夠遠的目標按一次技能鍵，客戶端會依
-        #   射程算出落腳點寫進 +0x144 —— 距離(落腳點, 怪) 就是射程。
-        #   只做一次、之後記在設定裡，不必土法煉鋼一格一格試。
-        if (self._range is None and mp is not None and me and dist is not None
-                and dist >= RANGE_PROBE_MIN and self.stats):
-            self._probe_range(mp, me, dist, dt)
-
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
         #   直接標出來才不必猜。
         if in_range and dist is not None and dist <= keep:
             self._why = ""
         elif in_range:
-            self._why = (f"打得到，同時走近到 {keep:.0f} 格" if self._range
-                         else "走近一點（還沒問到官方射程）")
+            self._why = f"打得到，同時走近到 {keep:.0f} 格"
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif not self.move_cb.isChecked():
@@ -1490,22 +1424,8 @@ class CharFarmPage(QWidget):
         #   心跳 10ms，角色每拍才走 0.09 格，那樣比永遠都是「沒在動」，
         #   於是走路途中也會一直累積卡住秒數，走到一半就被判定走不過去換怪。
         moving = self._moving
-        # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
-        #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp:
             self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
-            self._no_dmg = 0.0
-            if dist is not None:
-                # 打得到 → 把「打得到的最遠距離」往外推
-                self._hit_dist = max(self._hit_dist, dist)
-        elif in_range and self._keys.skill and self._range:
-            # ⚠ 保險：如果問到的射程其實打不到（例如換了技能沒被偵測到），
-            #   連續 NO_DMG_SECS 秒打不動就把它清掉、重新問一次官方射程。
-            #   ⛔ 不要改成「一格一格往前試」—— 使用者明確說那種體驗很差。
-            self._no_dmg += dt
-            if self._no_dmg >= NO_DMG_SECS:
-                self._no_dmg = 0.0
-                self._forget_range()
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
             self._stuck = 0.0
         else:
@@ -1578,9 +1498,6 @@ class CharFarmPage(QWidget):
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
         self.type_box.setCurrentIndex(1 if g(self._key("melee"), False) else 0)
-        # 官方射程問過就記著，之後不必再問（換技能鍵時會重問，見 _on_toggle）
-        r = g(self._key("range"), None)
-        self._range = float(r) if r else None
         # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
         spots = g(self._key("spots"), None)
         if not spots:
