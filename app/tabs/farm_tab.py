@@ -112,38 +112,28 @@ STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → �
 #     12.2 / 11.6 / 8.9 / 8.3 / 1.2 格 → 正常掉血、正常擊殺
 #   → 真正的界線在 12.2 與 13.0 之間，取 12.0 留餘裕。
 ATTACK_PACKET_RANGE = 12.0
-# 超出範圍時**一次就走到 10 格內**（使用者定的）。
-# 留 2 格餘裕是必要的：怪自己會動，停在射程邊緣的話牠一走就又出界，
-# 然後又得重走一次 —— 那就是「卡卡的」的來源。
-WALK_KEEP = 10.0
-# ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
-#   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
-#   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
-#   —— 症狀就是「雪狐完全無法打怪」。
-#   解法不寫死也不量測：**還沒打中過就一路走到貼臉**，
-#   一旦看到怪掉血就把那個距離記起來，之後就不必再靠近。
-#   近戰會收斂到 ~2 格、遠程第一隻之後就回到 10 格，兩邊都對。
+# ★★ 「接戰距離」的預設值 —— 頁面上可以自己調（見 range_spin）。
+#   走到怪這麼近就停下來並開始送攻擊封包。**一個數字同時管兩件事**，
+#   所以不會出現「既不打也不走」的死區（踩過：攻擊 12 格、走路門檻
+#   12.5 格，怪停在 12.3 就發呆）。
+#   遠程留 1 格餘裕（射程 12 → 停 11）：怪自己會動，停在射程邊緣的話
+#   牠一走就出界，又得重走一次 —— 那就是「卡卡的」的來源。
+#   近戰角色要自己調到 1~2 格，站太遠伺服器不受理施放。
+DEFAULT_RANGE = 11.0
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
-# 兩種攻擊方式（兩個分頁各用一種）：
-#   MODE_PACKET —— 選定封包 + 動作/施放封包（原本的「自動掛機」）
-#   MODE_KEY    —— 選定封包 + 狂按技能鍵（「自動掛機（按鍵）」）
+# 攻擊方式只剩一種：選定封包 + 動作/施放封包。
+# 近戰角色靠把「接戰距離」調小（1~2 格）來用同一套。
+# ⛔ MODE_KEY（狂按 Fx）保留給舊設定相容，介面上已經沒有這個選項。
 MODE_PACKET = "packet"
 MODE_KEY = "key"
 # ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
 #    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
-# ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
-#   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
-#   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
-#   —— 實測雪狐就是這樣完全打不到怪。
+# 隔著地形時要走到這麼近才算真的打得到（不受「接戰距離」設定影響）。
 MELEE_RANGE = 2.0
-# ★ 近戰模式：進到這個距離就開始鎖定＋狂按 Fx，剩下的走位交給遊戲客戶端 ——
-#   它知道每招的射程，也會自己繞地形。我們只負責把角色帶進這個圈子，
-#   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
-CLIENT_RANGE = 20.0
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
@@ -602,8 +592,8 @@ class CharFarmPage(QWidget):
         self._move_ref: tuple[float, float] | None = None
         self._move_t = 0.0
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
-        # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
-        # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
+        # 看過「怪在幾格外掉血」的最大值。**只拿來顯示，不再決定走多近**
+        # —— 走多近由頁面上的「接戰距離」決定（使用者自己調）。
         self._hit_dist = 0.0
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
@@ -699,20 +689,25 @@ class CharFarmPage(QWidget):
             "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
         mbar.addWidget(self.move_cb)
         mbar.addSpacing(12)
-        mbar.addWidget(QLabel("攻擊型態"))
-        self.type_box = QComboBox()
-        self.type_box.addItem("遠程", False)
-        self.type_box.addItem("近戰", True)
-        self.type_box.setFixedWidth(80)
-        self.type_box.setToolTip(
-            f"遠程：送攻擊封包（距離 {ATTACK_PACKET_RANGE:.0f} 格內就送，"
-            f"走到 {WALK_KEEP:.0f} 格內就停）。\n"
-            f"近戰：用封包選定怪物，然後**狂按你選的那個 F 鍵**出手。\n"
-            f"　　　我們只把角色帶到 {CLIENT_RANGE:.0f} 格內，剩下的射程與走位\n"
-            "　　　全交給遊戲客戶端 —— 它知道每招要站多近，也會自己繞地形。\n"
-            "⚠ 射程每個角色不一樣，近戰角色站太遠送攻擊封包伺服器不會理，\n"
-            "　 症狀是站著不動、怪完全不掉血 —— 所以近戰交給客戶端比較穩。")
-        mbar.addWidget(self.type_box)
+        mbar.addWidget(QLabel("接戰距離"))
+        self.range_spin = QDoubleSpinBox()
+        self.range_spin.setRange(1.0, 15.0)
+        self.range_spin.setSingleStep(0.5)
+        self.range_spin.setDecimals(1)
+        self.range_spin.setValue(DEFAULT_RANGE)
+        self.range_spin.setSuffix(" 格")
+        self.range_spin.setFixedWidth(90)
+        self.range_spin.setToolTip(
+            "走到怪這麼近就停下來，並且開始送攻擊封包。\n"
+            "\n"
+            "遠程角色：11～12（技能射程實測 12 格，留一點餘裕）。\n"
+            "近戰角色：調小到 1～2 —— 站太遠送攻擊封包伺服器不會理，\n"
+            "　　　　　症狀是站著不動、怪完全不掉血。\n"
+            "\n"
+            "⚠ 這一個數字同時決定「走多近」和「多近才開始打」，\n"
+            "　 所以不會出現「既不打也不走」的死區。\n"
+            "⚠ 隔著地形時會自動改成貼臉走過去，不受這個設定影響。")
+        mbar.addWidget(self.range_spin)
         mbar.addSpacing(12)
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
         self.patrol_cb.setToolTip(
@@ -1173,27 +1168,19 @@ class CharFarmPage(QWidget):
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
         #   就是使用者回報的「走過去卻不打」「旁邊有怪也不打」。
-        # ★ 近戰／遠程（使用者在頁面上選）：
-        #   近戰 —— **選怪用封包、出手用按鍵**（狂按使用者選的那個 Fx）。
-        #           射程與走位交給遊戲客戶端判斷，它知道每招要站多近；
-        #           我們只負責走到怪身上，不自己算「要站多遠」。
-        #   遠程 —— 維持原本：送施放封包，ATTACK_PACKET_RANGE 內就送、
-        #           走到 WALK_KEEP 內就停。
-        melee = bool(self.type_box.currentData())
-        self._keys.mode = MODE_KEY if melee else self.mode
+        # ★★ 不再分近戰／遠程，一律用「送攻擊封包」這一套（使用者定的）。
+        #   唯一的參數是頁面上那個**接戰距離**：走到怪這麼近就停下來打。
+        #   遠程角色放 11~12（技能射程 12）；近戰角色自己調小到 1~2。
+        #   ⚠ 這個值同時決定「走多近」與「多近才開始送攻擊」—— 一個數字，
+        #     不要再有隱藏的第二個門檻，否則會出現「既不打也不走」的死區
+        #     （踩過：攻擊範圍 12、走路門檻 12.5，怪停在 12.3 就發呆）。
+        self._keys.mode = self.mode
+        want = float(self.range_spin.value())
         blocked = self._path_pts > 1
-        # ★ 近戰是「鎖定 + 狂按 Fx」，**走位由客戶端自己算** ——
-        #   所以我們只要把角色帶到 CLIENT_RANGE 內就交給它，
-        #   不要再自己往怪身上推（兩邊搶著下移動指令會互相打架）。
-        #   隔著地形也不必特別處理：客戶端用的就是遊戲自己的尋路。
-        reach = (CLIENT_RANGE if melee
-                 else MELEE_RANGE if blocked else ATTACK_PACKET_RANGE)
+        # 隔著地形時直線距離不算數（怪在牆的另一邊），一律走到貼臉再說。
+        reach = MELEE_RANGE if blocked else want
         in_range = dist is not None and dist <= reach
-        # 走到多近：近戰只要進到客戶端接手的距離；隔著地形就貼臉；
-        # 否則走到「看過掉血的距離」，最多 WALK_KEEP
-        # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
-        keep = (CLIENT_RANGE if melee else MELEE_RANGE if blocked
-                else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
+        keep = MELEE_RANGE if blocked else want
 
         # ★ 尋路說「到不了」而且非走不可 → **立刻換一隻**，不必等 10 秒逾時。
         #   這就是使用者說的「怪卡在奇怪的地方」：牠站在走不進去的角落，
@@ -1239,8 +1226,7 @@ class CharFarmPage(QWidget):
         if in_range and dist is not None and dist <= keep:
             self._why = ""
         elif in_range:
-            self._why = (f"打得到，同時走近到 {keep:.0f} 格"
-                         if self._hit_dist else "打得到，同時走過去（還沒確認射程）")
+            self._why = f"打得到，同時走近到 {keep:.1f} 格"
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif not self.move_cb.isChecked():
@@ -1265,8 +1251,7 @@ class CharFarmPage(QWidget):
         #   心跳 10ms，角色每拍才走 0.09 格，那樣比永遠都是「沒在動」，
         #   於是走路途中也會一直累積卡住秒數，走到一半就被判定走不過去換怪。
         moving = self._moving
-        # ★ 怪掉血 = 這個距離打得到 → 記下來當作「不用再靠近」的門檻。
-        #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
+        # 怪掉血的最遠距離：只記下來給狀態列參考，不影響行為。
         if 0 < hp < self._last_hp and dist is not None:
             self._hit_dist = max(self._hit_dist, dist)
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
@@ -1340,7 +1325,7 @@ class CharFarmPage(QWidget):
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
-        self.type_box.setCurrentIndex(1 if g(self._key("melee"), False) else 0)
+        self.range_spin.setValue(float(g(self._key("range"), DEFAULT_RANGE)))
         # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
         spots = g(self._key("spots"), None)
         if not spots:
@@ -1363,7 +1348,7 @@ class CharFarmPage(QWidget):
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
-        s(self._key("melee"), bool(self.type_box.currentData()))
+        s(self._key("range"), float(self.range_spin.value()))
         s(self._key("spots"), [list(p) for p in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
@@ -1377,7 +1362,7 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
-        self.type_box.currentIndexChanged.connect(self._save_settings)
+        self.range_spin.valueChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
 
