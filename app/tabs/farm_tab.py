@@ -133,6 +133,12 @@ ATTACK_PACKET_RANGE = 12.0
 # ⚠ 先前量到「站在 10.0 格打不到」，那是路徑點數被誤用造成的
 #   （blocked 誤判 → 攻擊距離被縮成 2 格），已經修掉，不是射程問題。
 WALK_KEEP = 11.0
+# ★ 停止距離的自動校正（遠程近戰共用，不必使用者設定）：
+#   每次都往「打得到的最遠距離」外面再推這麼多格去試；
+#   在射程內卻連續 NO_DMG_SECS 秒打不動，就把紀錄縮回來一格。
+#   實測射程差很大：黑狐（遠程）12 格、雪狐（近戰）3~4 格。
+PROBE_STEP = 2.0
+NO_DMG_SECS = 2.0
 # 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
 # —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
@@ -685,6 +691,7 @@ class CharFarmPage(QWidget):
         self._unreach = 0          # 連續幾次尋路算不出路徑
         self._hurt = False         # 這隻有沒有被我們打傷過
         self._gone = 0             # 連續幾次掃描沒看到目標
+        self._no_dmg = 0.0         # 在自認的射程內卻打不動多久了
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
         self._move_ref: tuple[float, float] | None = None
@@ -693,6 +700,8 @@ class CharFarmPage(QWidget):
         # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
         self._hit_dist = 0.0
+        # 探到打不到就把上限記下來，避免一直在同一個距離來回試
+        self._reach_cap = WALK_KEEP
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
@@ -1089,6 +1098,7 @@ class CharFarmPage(QWidget):
         self._unreach = 0
         self._hurt = False
         self._gone = 0
+        self._no_dmg = 0.0
         self._walked_ok = True
         self._why = ""
         self._last_hp = -1
@@ -1317,12 +1327,15 @@ class CharFarmPage(QWidget):
         # 走到多近：近戰只要進到客戶端接手的距離；隔著地形就貼臉；
         # 否則走到「看過掉血的距離」，最多 WALK_KEEP
         # （還沒看過掉血時 _hit_dist=0，會一路走到貼臉，比較保險）。
-        # ⚠ 還沒看過掉血時（_hit_dist = 0）要用 WALK_KEEP，**不能用 2 格** ——
-        #   否則一開始就一路走到怪臉上（使用者回報的「都走很近」，實測
-        #   鎖定距離最小 0.5 格）。8 格是實測會掉血的距離，本來就夠近。
+        # ★★ 停止距離**自己量出來**，遠程近戰共用一套（使用者要求）：
+        #   實測射程差很多 —— 黑狐（遠程）12 格、雪狐（近戰）只有 3~4 格 ——
+        #   而記憶體裡找不到可靠的射程欄位（找過三條路都失敗）。
+        #   所以：從「打得到的最遠距離」往外推 PROBE_STEP 格去試，
+        #   打得到就把紀錄往外推、打不到就縮回來（見下面 NO_DMG_SECS 那段）。
+        #   一開始 _hit_dist = 0 → 停在 2 格（近戰也安全），之後幾隻就會收斂。
         keep = (CLIENT_RANGE if melee else MELEE_RANGE if blocked
-                else WALK_KEEP if self._hit_dist <= 0
-                else max(MELEE_RANGE, min(WALK_KEEP, self._hit_dist)))
+                else max(MELEE_RANGE, min(WALK_KEEP, self._reach_cap,
+                                          self._hit_dist + PROBE_STEP)))
 
         # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
         #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
@@ -1430,8 +1443,22 @@ class CharFarmPage(QWidget):
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp:
             self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
+            self._no_dmg = 0.0
             if dist is not None:
+                # 打得到 → 把「打得到的最遠距離」往外推
                 self._hit_dist = max(self._hit_dist, dist)
+        elif in_range and self._keys.skill:
+            # ★ 在自己認定的射程內卻打不動 → 那個距離太遠，縮回來一點。
+            #   這是「遠程近戰共用」的另一半：只在**換目標之前**調一次，
+            #   不是打到一半一直往前挪（那看起來很卡）。
+            self._no_dmg += dt
+            if self._no_dmg >= NO_DMG_SECS and dist is not None:
+                self._no_dmg = 0.0
+                # 這個距離探失敗了 → 記住上限，不要再往外探到這裡
+                # （沒有這條的話近戰會在 3↔5 格之間一直來回試）
+                self._reach_cap = min(self._reach_cap, max(MELEE_RANGE,
+                                                           dist - 1.0))
+                self._hit_dist = min(self._hit_dist, self._reach_cap)
         if moving or (0 < hp < self._last_hp) or self._last_hp < 0:
             self._stuck = 0.0
         else:
