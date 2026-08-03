@@ -360,6 +360,7 @@ class KeyWorker(_Paced):
                     return                     # 這一拍先不打，下一拍再試
                 self._sel = self.eid
             # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
+            #    動作碼用 attack.ACTION_CODE（寫死 1，見 attack.py 的說明）。
             if (self.mode == MODE_PACKET and self.packets and self.skill
                     and self.eid and self.pf and self.mover is not None
                     and attack.strike(self.mover, self.pf, self.skill,
@@ -1369,18 +1370,18 @@ class CharFarmPage(QWidget):
                                  and self._keys.mover is not None)
         # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
         self._atk.engaged = self._keys.selected
-        # ★★★ **走路途中不能攻擊** —— 攻擊會把移動打斷。
-        #   對照實測（黑狐，每趟 16 格，同一段路來回各測）：
-        #       只走路            1.6s 走完 15.7/16 格，倒退 0.0　✔
-        #       走路＋動作封包    8.0s 只走 4.3/10 格，沒走到　　 ✘
-        #       走路＋完整攻擊    8.0s **走了 −2.1 格**（往後退），倒退 2.1 ✘
-        #   → 這就是使用者回報的「走路很卡、會一直回朔」。
-        #   遊戲客戶端自己能一邊走一邊打，是因為**它自己在排程**；
-        #   我們直接呼叫施放函式會把移動狀態打掉。
-        # ⚠ 光看 _moving 不夠：它是隔 MOVE_SAMPLE(0.3s) 取樣的，剛下完移動
-        #   指令那一瞬間角色還沒動起來，_moving 仍是 False —— 那時打下去
-        #   一樣會把才剛開始的移動打斷。所以再加一個 ATTACK_QUIET 靜默窗。
-        self._keys.set_on(not self._moving and self._walk_t >= ATTACK_QUIET)
+        # ★★★ 一路走一路打，**攻擊不看距離**。
+        #   受控實測（黑狐，固定兩點來回 14 格，三種情況交錯各 3 次）：
+        #       只走路                        6/6 走到，1.2~1.5s，倒退 0
+        #       走路＋打**遠處**的怪(打不到)  6/6 走到，時間與只走路一樣
+        #       走路＋打**近處**的怪(打得到)  **0/4 走到**，只走 1.2~1.9 格
+        #   → 打不到的封包伺服器直接忽略，角色照常走；
+        #     **一旦真的出手，移動就停**。
+        #   ★ 這正好就是我們要的停止機制：一路打過去，打得到的那一刻自動
+        #     停下來 —— 近戰停在 1.4 格、遠程停在 12 格，**不必知道射程**。
+        #   ⛔ 先前寫成「走路途中完全不攻擊」是過度保守，而且當時的證據
+        #     （目標取隨機方向、A 組永遠排在 B 組後面）本來就不可信。
+        self._keys.set_on(True)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，

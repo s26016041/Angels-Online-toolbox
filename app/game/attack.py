@@ -37,7 +37,14 @@ SELECT_FN = 0x005D3EB5      # ②選定。f(0x0C, 目標實體ID)
 CAST_FN = 0x00559FF8        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 
 SELECT_CODE = 0x0C          # ②的第一個參數（遊戲自己的程式碼就是推 0xC）
-ACTION_CODE = 0             # ①的動作碼，實測攔到 0（另看過 5/7）
+# ★ ①的動作碼。**寫死 1**（使用者定的）。
+#   2026-08-03 攔包對照（按 F2 打怪）看到遊戲自己不是固定值：
+#       黑狐　第一下 1，之後全部 2
+#       雪狐　全部 1
+#   （更早一份記錄看過 4，所以它像是「攻擊狀態／動畫序號」。）
+#   1 是兩隻角色都出現過的值，先統一用它，不去模擬那個序號。
+#   ⚠ 我們以前一律送 0 —— 那個值在任何一份攔包裡都沒出現過。
+ACTION_CODE = 1
 
 CALL_TIMEOUT = 0.12         # 每一包等它被主執行緒執行的上限（一幀約 16ms）
 
@@ -78,7 +85,8 @@ def select(mover, target_id: int) -> bool:
 
 
 def strike(mover, pf_this: int, skill_id: int, target_id: int,
-           tile_x: float = 0.0, tile_y: float = 0.0) -> bool:
+           tile_x: float = 0.0, tile_y: float = 0.0,
+           action_code: int = ACTION_CODE) -> bool:
     """打一下：動作 + 施放。選定之後就一直重複，直到怪死掉。
 
     pf_this: move.pathfinder_this() 的結果 —— **玩家物件 −8**
@@ -96,6 +104,6 @@ def strike(mover, pf_this: int, skill_id: int, target_id: int,
     if (not (mover and mover.active and pf_this and skill_id and target_id)
             or _yield_now(mover)):
         return False
-    return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
+    return _send(mover, ((ACTION_FN, (pf_this, action_code)),
                          (CAST_FN, (skill_id, target_id,
                                     int(tile_x), int(tile_y), 0))))
