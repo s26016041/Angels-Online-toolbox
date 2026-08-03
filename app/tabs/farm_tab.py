@@ -188,6 +188,12 @@ MODE_KEY = "key"
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
 #    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
 CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
+# ★★ 比這個近就**不問尋路、也不算走不到**。
+#   尋路到「貼在自己身上的怪」等於算路徑到自己腳下那一格，一定回 0，
+#   而 0 在 tick 裡的意思是「走不過去」。近戰每打一隻都會貼上去，
+#   於是每隻都被冷凍，只好去追遠處打不到的（實拍：周圍 1.2 格有怪，
+#   卻鎖著 16.0 格外的那隻）。取 3.0：實拍貼身距離落在 1.0~2.1 格。
+NO_PATH_NEED = 3.0
 # ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
 #   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
@@ -1323,8 +1329,17 @@ class CharFarmPage(QWidget):
         #   隔著地形，攻擊距離縮成 2 格，於是 3~10 格的怪既不打、也走不到，
         #   一路卡到 10 秒逾時（監控實際抓到的距離 3.6 / 5.4 / 9.6 / 10.2）。
         # 怪會走動，所以每 PATH_GAP 重問一次，不是只在「還不知道」時問。
+        # ⚠⚠⚠ **貼在身上的怪不要問尋路** —— 尋路到「自己腳下那一格」本來
+        #   就會回 0，而 0 在這裡是「走不過去」的意思。
+        #   近戰每打一隻就會貼上去，於是每隻都被判定走不到、丟進冷卻，
+        #   然後跑去鎖 3~16 格外的怪 —— 唯讀監控實拍（雪狐）：
+        #       目標 16.0 格，而周圍 1.2 / 2.7 格就有怪
+        #   使用者的症狀是「沒打幾隻就卡，手動按 F2 也沒用」
+        #   （目標欄位裡是那隻遠的，按 F2 打的是打不到的那隻）。
+        #   遠程停在 10~12 格所以完全看不出這個問題。
         self._path_t += dt
         if (self._path_t >= PATH_GAP and mp is not None and me
+                and dist is not None and dist > NO_PATH_NEED
                 and self._mover is not None and self._mover.active):
             self._path_t = 0.0
             n = self._mover.path_to(self.sc, mp[0], mp[1])
@@ -1375,8 +1390,10 @@ class CharFarmPage(QWidget):
         #   才算數 —— 怪會走動，打鬥中某一瞬間牠站到走不進去的格子，
         #   路徑就會變 0。少了這兩條會變成「打一下就換下一隻」，
         #   結果一路結仇、被圍毆致死（使用者實際遇到）。
+        # ⚠ 貼在身上的**永遠不算走不到**：都走到牠旁邊了，還需要走去哪？
         if (self._unreach >= UNREACH_HITS and not self._hurt
-                and dist is not None and dist <= PATHFIND_RANGE):
+                and dist is not None
+                and NO_PATH_NEED < dist <= PATHFIND_RANGE):
             self._cool_unreach(m.eid)
             self._atk.hold_off()
             self._cur = None
