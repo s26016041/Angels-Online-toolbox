@@ -140,6 +140,12 @@ WALK_KEEP = 11.0
 #   ⚠ 不能設太小：怪在打鬥中會小幅走動，門檻太小就變成每隔一下就重下指令
 #     —— 那正是「往前又回縮」的成因。
 REWALK_DIST = 3.0
+REWALK_GAP = 1.5                # 補送移動指令的最短間隔（比 WALK_GAP 保守）
+# ★★ 剛下完移動指令之後的靜默窗：這段時間內**不攻擊也不問尋路**。
+#   攻擊會打斷移動（實測見 tick 裡 set_on 那段），而角色要約 0.3 秒才真的
+#   動起來 —— 在那之前 _moving 還是 False，光靠它擋不住。
+ATTACK_QUIET = 0.4
+PATH_QUIET = 0.4
 # 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
 # —— 那會把還活著的怪丟掉。
 HP_SETTLE = 0.5
@@ -1257,8 +1263,14 @@ class CharFarmPage(QWidget):
         #   隔著地形，攻擊距離縮成 2 格，於是 3~10 格的怪既不打、也走不到，
         #   一路卡到 10 秒逾時（監控實際抓到的距離 3.6 / 5.4 / 9.6 / 10.2）。
         # 怪會走動，所以每 PATH_GAP 重問一次，不是只在「還不知道」時問。
+        #
+        # 走路中就不要問了 —— 保留上一次的判斷即可（blocked 只影響要不要再走）。
+        # ⚠ 這**不是**「走路很卡」的原因：對照實測（黑狐走 18 格）走路中每
+        #   0.2 秒問一次尋路，1.2 秒走完、零倒退，跟不問完全一樣。
+        #   留著只是為了少跟攻擊搶指令槽。真正的原因見下面 set_on() 那段。
         self._path_t += dt
         if (self._path_t >= PATH_GAP and mp is not None and me
+                and not self._moving and self._walk_t >= PATH_QUIET
                 and self._mover is not None and self._mover.active):
             self._path_t = 0.0
             n = self._mover.path_to(self.sc, mp[0], mp[1])
@@ -1338,7 +1350,7 @@ class CharFarmPage(QWidget):
         need_walk = gd is not None and (
             self._walked_for != m.eid
             or (not self._moving and gd > REWALK_DIST
-                and self._walk_t >= WALK_GAP))
+                and self._walk_t >= REWALK_GAP))
         if self.move_cb.isChecked() and me and need_walk:
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是這次移動算出的路徑
             #   點數，跟「我跟怪之間有沒有地形」是兩件事（見上面那段說明）。
@@ -1354,7 +1366,18 @@ class CharFarmPage(QWidget):
                                  and self._keys.mover is not None)
         # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
         self._atk.engaged = self._keys.selected
-        self._keys.set_on(True)          # 有目標就打，距離交給伺服器判斷
+        # ★★★ **走路途中不能攻擊** —— 攻擊會把移動打斷。
+        #   對照實測（黑狐，每趟 16 格，同一段路來回各測）：
+        #       只走路            1.6s 走完 15.7/16 格，倒退 0.0　✔
+        #       走路＋動作封包    8.0s 只走 4.3/10 格，沒走到　　 ✘
+        #       走路＋完整攻擊    8.0s **走了 −2.1 格**（往後退），倒退 2.1 ✘
+        #   → 這就是使用者回報的「走路很卡、會一直回朔」。
+        #   遊戲客戶端自己能一邊走一邊打，是因為**它自己在排程**；
+        #   我們直接呼叫施放函式會把移動狀態打掉。
+        # ⚠ 光看 _moving 不夠：它是隔 MOVE_SAMPLE(0.3s) 取樣的，剛下完移動
+        #   指令那一瞬間角色還沒動起來，_moving 仍是 False —— 那時打下去
+        #   一樣會把才剛開始的移動打斷。所以再加一個 ATTACK_QUIET 靜默窗。
+        self._keys.set_on(not self._moving and self._walk_t >= ATTACK_QUIET)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
