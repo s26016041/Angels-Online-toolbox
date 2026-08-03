@@ -91,6 +91,10 @@ WALK_GAP = 0.4
 MOVE_SAMPLE = 0.3
 MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
+# 「一直沒給血量」而跳過的，只冷卻這麼短 —— 那只是推測，牠可能還活著。
+# ⚠ 不能設 0：挑目標永遠挑最近的，冷卻 0 的話下一拍又挑到同一具，
+#   變成無限迴圈。幾秒就夠讓它先去打別的，屍體本來也會從清單消失。
+NOHP_MEMORY = 5.0
 NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒移動這麼久 → 這隻走不過去，換一隻
 # ⛔ 不要做「打不到就一步一步走近」那種自動收斂 —— 使用者明講看起來卡卡的，
@@ -125,7 +129,9 @@ HP_SETTLE = 0.5
 # 鎖定這麼久還**從來沒**看到血量 → 那是屍體（別人先打死的），換一隻。
 # ⚠ 門檻是量出來的：活著的目標鎖定後看到血量，中位 0.30 秒、最久 2.22 秒
 #   （34 隻樣本），所以 3 秒不會誤殺活的怪。
-CORPSE_SECS = 3.0
+#   使用者要求縮到 0.5 秒（「不給血量就先不打」）—— 會有一部分活著的怪
+#   被誤跳過，所以那種只冷卻 NOHP_MEMORY 秒，很快就會再輪到。
+CORPSE_SECS = 0.5
 # ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
 #   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
@@ -340,7 +346,10 @@ class TargetWorker(_Paced):
     # ⚠ 用 Signal(object) 不能用 Signal(int)：實體 ID 是**無號** 32 位元
     # （實測有 0x8E8D04DA = 23 億這種值），而 PySide6 的 int 對應 C++ 的
     # 有號 int，emit 超過 21 億的值會丟 OverflowError，死亡偵測就斷了。
-    died = Signal(object)       # 目標倒了（實體 ID）→ UI 執行緒去挑下一隻
+    # 目標沒了（實體 ID, 是不是確定死了）→ UI 執行緒去挑下一隻。
+    # 第二個參數 False = 只是「一直沒給血量」的推測，那隻可能還活著，
+    # 所以只短暫跳過、不要封鎖一分鐘。
+    died = Signal(object, bool)
     failed = Signal(str)        # 讀寫記憶體失敗
 
     def __init__(self, sc: MemoryScanner) -> None:
@@ -407,7 +416,7 @@ class TargetWorker(_Paced):
                                 or not entity.is_alive(self.sc, ent)):
                 self._job = None
                 self._wrote = False
-                self.died.emit(ent.eid)
+                self.died.emit(ent.eid, not corpse)
                 return
 
             if self.packets:
@@ -988,8 +997,10 @@ class CharFarmPage(QWidget):
         want = self.wanted()
         me = self.my_pos()
         now = time.monotonic()
-        for eid, t in list(self._killed.items()):     # 淘汰太舊的死亡記錄
-            if now - t > KILL_MEMORY:
+        # _killed 存的是「到期時間」，不是記錄時間 —— 因為兩種跳過的冷卻長度
+        # 不一樣（確定打死 KILL_MEMORY、只是沒給血量 NOHP_MEMORY）。
+        for eid, until in list(self._killed.items()):
+            if now > until:
                 del self._killed[eid]
         pool = []
         for m in self.mons:
@@ -1022,15 +1033,21 @@ class CharFarmPage(QWidget):
             f"　累計擊殺 {self._kills}")
         return True
 
-    def _on_died(self, eid: int) -> None:
-        """攻擊執行緒回報目標倒了 —— 立刻從既有清單接下一隻。
+    def _on_died(self, eid: int, confirmed: bool = True) -> None:
+        """攻擊執行緒回報目標沒了 —— 立刻從既有清單接下一隻。
+
+        confirmed=False 代表只是「一直沒給血量」的推測（那隻可能還活著），
+        所以只短暫冷卻，不要像確定打死那樣封鎖一分鐘。
 
         不重掃記憶體：重掃要 0.5 秒還要排隊，每殺一隻就等一次會非常卡。
         清單裡真的沒得打了，才由 tick() 去排重掃。
         """
         m = self._cur
-        self._kills += 1
-        self._killed[eid] = time.monotonic()   # 免得又挑到同一具還沒回收的屍體
+        if confirmed:
+            self._kills += 1
+        # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
+        self._killed[eid] = time.monotonic() + (
+            KILL_MEMORY if confirmed else NOHP_MEMORY)
         self._cur = None
         self._keys.eid = None                  # 別再對著屍體送封包
         if not self.run_cb.isChecked():
@@ -1241,7 +1258,7 @@ class CharFarmPage(QWidget):
         #           就算尋路說我們走不到，客戶端照樣有辦法。
         if (self._path_pts == 0 and not in_range and dist is not None
                 and dist <= PATHFIND_RANGE):
-            self._killed[m.eid] = time.monotonic()
+            self._killed[m.eid] = time.monotonic() + KILL_MEMORY
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
@@ -1312,7 +1329,7 @@ class CharFarmPage(QWidget):
         self._last_pos = me
         self._last_hp = hp
         if self._stuck >= STUCK_SECS:
-            self._killed[m.eid] = time.monotonic()   # 走不過去，暫時別再挑它
+            self._killed[m.eid] = time.monotonic() + KILL_MEMORY  # 走不過去
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
