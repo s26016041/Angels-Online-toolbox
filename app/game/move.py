@@ -94,25 +94,29 @@ def _approach_point(here: tuple[float, float],
     """這一趟要走到哪 —— **只在路徑的最後一段上退，絕不退過倒數第二個點**。
 
     規則（使用者定的）：
-      · 路徑只有 **1 個點** = 中間完全沒有障礙物 → 直接朝目標走，
-        走到剩 keep 格為止（起點就是我們現在站的地方）。
-      · 路徑有 **2 個點以上** = 要繞 → 先走到**倒數第二個點**；那個點到
-        目標之間一定是直線（中間若有地形，尋路會再插一個轉折點）。
-        最後那段比 keep 長的話，就沿著它再往前推到剩 keep 格。
-        比 keep 短就停在倒數第二個點，下一拍重算（那時多半只剩 1 個點）。
+      · 路徑有 **2 個點以上** = 中間還有地形要繞 →
+        **走下一個轉角（pts[0]）就好，一個點一個點照著走**。
+        走到之後下一拍重新尋路，剩下的路徑會少一個點，如此推進。
+      · 路徑只剩 **1 個點** = 中間完全沒有障礙物 →
+        這時才朝目標直走，走到剩 keep 格為止，然後開始送攻擊。
 
-    ⚠⚠ **不可以沿著整條路徑一路往回退** —— 退過轉角就會落在「看不到怪」
-      的地方，站在那裡打不到。只有最後一段保證跟目標之間沒有障礙物。
+    ⚠⚠ **不可以直接跳到倒數第二個點，也不可以沿整條路徑往回退。**
+      直接跳過去等於叫遊戲重新規劃一條到那裡的路（可能走別條）；
+      沿整條退則會退過轉角，落在「看不到怪」的地方，站在那裡打不到。
+      只有「最後一段」保證跟目標之間沒有地形。
     """
     if not pts:
         return None
-    tx, ty = pts[-1]
-    px, py = pts[-2] if len(pts) >= 2 else here
-    seg = math.hypot(tx - px, ty - py)
-    if keep <= 0 or seg <= keep:
-        return (px, py) if len(pts) >= 2 else None
+    if len(pts) >= 2:
+        return pts[0]              # 照著路徑走下一個轉角
+    tx, ty = pts[-1]               # 只剩最後一個點 = 直線可通
+    seg = math.hypot(tx - here[0], ty - here[1])
+    if keep <= 0:
+        return (tx, ty)
+    if seg <= keep:
+        return None                # 已經在接戰距離內，不用走
     r = (seg - keep) / seg
-    return (px + (tx - px) * r, py + (ty - py) * r)
+    return (here[0] + (tx - here[0]) * r, here[1] + (ty - here[1]) * r)
 
 
 def pathfinder_this(scanner) -> int | None:
