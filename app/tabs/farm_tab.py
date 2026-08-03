@@ -197,8 +197,9 @@ GONE_SCANS = 2
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
     """對指定視窗送一次技能鍵。
 
-    走 app/core/window.py 的共用實作：SendMessageTimeout + 帶掃描碼的 lParam。
-    ⚠ 實測這個遊戲**只吃 SendMessage**，PostMessage 完全沒反應（不管 lParam）。
+    走 app/core/window.py 的共用實作：SendMessageTimeout + 帶掃描碼的 lParam
+    + **按住 40ms 才放開**（見 window.KEY_HOLD_MS —— 不按住的話成功率只有
+    26.7%，遊戲每幀取樣鍵盤，同一幀按下又放開會漏掉）。
     不碰使用者真正的鍵盤、不搶焦點，可以同時掛多個分身。
 
     ★ 逾時設短（SEND_TIMEOUT_MS）：SendMessage 會等對方處理完才返回，
@@ -763,7 +764,9 @@ class CharFarmPage(QWidget):
         bar.addSpacing(12)
         bar.addWidget(QLabel("每隔"))
         self.interval = QDoubleSpinBox()
-        self.interval.setRange(0.02, 5.0)
+        # ⚠ 下限 0.06 秒：一次按鍵本身就要按住 40ms（window.KEY_HOLD_MS），
+        #   設得比它短沒有意義 —— 只會讓每一拍都超時、節奏反而更亂。
+        self.interval.setRange(0.06, 5.0)
         self.interval.setSingleStep(0.01)
         self.interval.setDecimals(2)
         self.interval.setValue(DEFAULT_INTERVAL)
