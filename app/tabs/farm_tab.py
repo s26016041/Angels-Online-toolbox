@@ -1147,11 +1147,20 @@ class CharFarmPage(QWidget):
         # ⚠ 搶不到指令槽時會回 -1（攻擊執行緒正在送封包）。**絕不阻塞等待**，
         #   那是在 UI 執行緒上，一等畫面就凍住（使用者回報的「打一打卡住」）。
         #   維持 -1 = 還不知道，隔 PATH_GAP 再問一次就好。
+        #
+        # ⚠⚠ **只有這裡可以寫 _path_pts**。以前 _walk_toward() 的回傳值也會寫進來，
+        #   但那是「走到某個中繼點」的路徑點數，跟「我跟這隻怪之間有沒有地形」
+        #   根本是兩回事 —— 只要走過一次要繞路的路徑（點數 > 1），就會被當成
+        #   隔著地形，攻擊距離縮成 2 格，於是 3~10 格的怪既不打、也走不到，
+        #   一路卡到 10 秒逾時（監控實際抓到的距離 3.6 / 5.4 / 9.6 / 10.2）。
+        # 怪會走動，所以每 PATH_GAP 重問一次，不是只在「還不知道」時問。
         self._path_t += dt
-        if (self._path_pts < 0 and self._path_t >= PATH_GAP and mp is not None
-                and me and self._mover is not None and self._mover.active):
+        if (self._path_t >= PATH_GAP and mp is not None and me
+                and self._mover is not None and self._mover.active):
             self._path_t = 0.0
-            self._path_pts = self._mover.path_to(self.sc, mp[0], mp[1])
+            n = self._mover.path_to(self.sc, mp[0], mp[1])
+            if n >= 0:                 # -1 = 這次沒問到，保留上一次的判斷
+                self._path_pts = n
         # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
@@ -1178,12 +1187,9 @@ class CharFarmPage(QWidget):
         if (self.move_cb.isChecked() and me and not self._moving
                 and self._walk_t >= WALK_GAP
                 and dist is not None and dist > keep):
-            n = self._walk_toward(mp[0], mp[1], me, keep)
-            # ⚠ 走不了（尋路算不出路徑，或指令槽被佔）**不要把它記成「沒有障礙物」**。
-            #   記成 0 會讓下一拍 blocked 變 False、reach 變回 15，於是站在原地
-            #   對著走不到的怪空打；記成 -1（還不知道）才會再問一次。
-            self._path_pts = n if n > 0 else -1
-            self._walked_ok = n > 0
+            # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
+            #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
+            self._walked_ok = self._walk_toward(mp[0], mp[1], me, keep) > 0
 
         # 兩條執行緒對「現在是不是用封包打」要有共識：
         # 寫目標那條要據此決定「寫不寫血量」——
