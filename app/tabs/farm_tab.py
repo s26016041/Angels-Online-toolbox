@@ -115,7 +115,13 @@ ATTACK_PACKET_RANGE = 12.0
 # 超出範圍時**一次就走到 10 格內**（使用者定的）。
 # 留 2 格餘裕是必要的：怪自己會動，停在射程邊緣的話牠一走就又出界，
 # 然後又得重走一次 —— 那就是「卡卡的」的來源。
-WALK_KEEP = 10.0
+# ⚠ 監控實測：站在**正好 10.0 格**、路徑直線通、卻連續數秒打不到
+#   （300 秒 6 次卡住裡有 2 次是這樣）。而 8.0 格是實測會掉血的
+#   （100 → 47 → 0）。所以停在 8 格，留 4 格餘裕給怪的走動。
+WALK_KEEP = 8.0
+# 剛鎖定目標之後，等遊戲把血量填進來的緩衝時間。
+# 這段時間內讀到 0 不算死亡（遊戲還沒寫）。
+HP_SETTLE = 0.5
 # ★★ 射程其實**每個角色不一樣**（近戰 vs 遠程），上面那個 12 是在黑狐量的。
 #   雪狐是近戰：牠自己打怪時會送一堆移動封包（使用者攔到 6 包），
 #   靠客戶端走到怪身上才打得到。我們停在 10 格送施放，伺服器完全不理
@@ -242,6 +248,9 @@ class KeyWorker(_Paced):
         self.mover = None
         self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
         self.eid = None             # 現在要打誰
+        # 那隻怪的格子座標。★ 會**另外**送一發「對地施放」給吃座標的技能用；
+        #   絕不能跟目標 ID 塞在同一發裡（見 attack.strike 的說明）。
+        self.pos: tuple[float, float] | None = None
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
         self.skill = None           # 學到的技能 ID
         self._on = False
@@ -305,8 +314,8 @@ class KeyWorker(_Paced):
             # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
             if (self.mode == MODE_PACKET and self.packets and self.skill
                     and self.eid and self.pf and self.mover is not None
-                    and attack.strike(self.mover, self.pf,
-                                      self.skill, self.eid)):
+                    and attack.strike(self.mover, self.pf, self.skill,
+                                      self.eid, *(self.pos or (None, None)))):
                 self.sent += 1
             else:
                 _send_scan(self.hwnd, self.vk)
@@ -339,11 +348,11 @@ class TargetWorker(_Paced):
         self.packets = False
         self._job: tuple[int, entity.Entity] | None = None
         self._wrote = False
-        self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
+        self._since = 0.0           # 鎖定這隻多久了（判定死亡要有緩衝）
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
-        self._saw_hp = False
+        self._since = time.monotonic()
         self._job = (state, ent)
 
     def hold_off(self) -> None:
@@ -360,14 +369,15 @@ class TargetWorker(_Paced):
             # 先寫回去就把訊號蓋掉了。
             cur = entity.read_target(self.sc, state)
             self.hp = entity.read_target_hp(self.sc, state)
-            if self.hp > 0:
-                self._saw_hp = True
             # ★ 用封包攻擊時，血量歸零就是**遊戲告訴我們這隻死了**。
             #   這才是可靠的死亡訊號 —— 屍體不會馬上從實體清單消失，
-            #   `is_alive()`（vtable + 實體 ID）也分不出死活，
-            #   所以以前只能等卡住偵測 10 秒才換怪，看起來就是「鎖定一隻怪發呆」。
-            #   ⚠ 要先看過 > 0 才能用：剛選定的那幾毫秒遊戲還沒填，讀到的是 0。
-            dead_by_hp = self.packets and self._saw_hp and self.hp == 0
+            #   `is_alive()`（vtable + 實體 ID）也分不出死活。
+            # ⚠ 要給遊戲一點時間把血量填進去（剛選定的那幾毫秒讀到的是 0），
+            #   但**不能要求「先看過 > 0」** —— 接手一隻已經快死的怪時，
+            #   從頭到尾都讀到 0，那條件永遠不成立，於是鎖著屍體撐到 10 秒
+            #   逾時才換（監控 300 秒抓到的 6 次卡住，有 4 次是這樣）。
+            dead_by_hp = (self.packets and self.hp == 0
+                          and time.monotonic() - self._since >= HP_SETTLE)
             if self._wrote and (cur == 0 or dead_by_hp
                                 or not entity.is_alive(self.sc, ent)):
                 self._job = None
@@ -1135,6 +1145,8 @@ class CharFarmPage(QWidget):
 
         mp = entity.read_pos(self.sc, m.addr)
         dist = math.hypot(mp[0] - me[0], mp[1] - me[1]) if (mp and me) else None
+        # 給「對地施放」那一發用（另外一發，不是塞進目標 ID 那發）
+        self._keys.pos = (round(mp[0]), round(mp[1])) if mp else None
 
         # 接近規則（改用封包攻擊後，接近**完全由我們自己走**，不靠按鍵）：
         #   ① 中間有障礙物（尋路點數 > 1）→ 走到怪臉上

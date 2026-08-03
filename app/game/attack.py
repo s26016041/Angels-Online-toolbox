@@ -77,21 +77,31 @@ def select(mover, target_id: int) -> bool:
     return _send(mover, ((SELECT_FN, (SELECT_CODE, target_id)),))
 
 
-def strike(mover, pf_this: int, skill_id: int, target_id: int) -> bool:
-    """打一下：動作 + 施放。選定之後就一直重複這兩包，直到怪死掉。
+def strike(mover, pf_this: int, skill_id: int, target_id: int,
+           tile_x: float | None = None, tile_y: float | None = None) -> bool:
+    """打一下：動作 + 施放。選定之後就一直重複，直到怪死掉。
 
     pf_this: move.pathfinder_this() 的結果 —— **玩家物件 −8**
+    tile_x/tile_y: 目標的格子座標。給了就**額外**送一發「對地施放」，
+        涵蓋那種吃座標而不吃目標 ID 的技能。
 
-    ⚠⚠ **第 3、4 個參數一定要是 0，不要塞目標座標。**
-      那兩個是「對地施放」用的（順移就是這樣送的，見 [[teleport-skill]]），
-      對打怪的技能塞座標會讓攻擊**完全失效**。
-      實測對照（黑狐，同一隻怪、同一個時間點、距離 1.9 格）：
-          帶座標的施放  → 怪血量甚至回升（完全沒打到）
-          不帶座標 ×4   → 血 49 → 0，當場打死
-      曾經以為「兩個都給，讓伺服器自己取它要的」比較省事 —— 是錯的。
+    ⚠⚠ **兩種參數不能塞在同一發裡。** 施放封包的第 3、4 個參數是對地施放
+      用的（順移就是這樣送，見 [[teleport-skill]]）；同一發裡既給目標 ID
+      又給座標，攻擊會**完全失效**。決定性對照（黑狐，同一隻怪、同一個
+      時間點、距離 1.9 格）：
+          目標ID + 座標同一發 → 怪的血量甚至從 47 回升到 49（完全沒打到）
+          只給目標 ID ×4      → 血 49 → 0，當場打死
+      所以要涵蓋兩種技能就得**分成兩發**。
+
+    ★ 順序：對地那發先送、**目標 ID 那發最後送**。
+      萬一兩發會互相取消，後送的會贏 —— 而目標 ID 那發是實測有效的，
+      要贏也是它贏。
     """
     if (not (mover and mover.active and pf_this and skill_id and target_id)
             or _yield_now(mover)):
         return False
-    return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
-                         (CAST_FN, (skill_id, target_id, 0, 0, 0))))
+    calls = [(ACTION_FN, (pf_this, ACTION_CODE))]
+    if tile_x is not None and tile_y is not None:
+        calls.append((CAST_FN, (skill_id, 0, int(tile_x), int(tile_y), 0)))
+    calls.append((CAST_FN, (skill_id, target_id, 0, 0, 0)))
+    return _send(mover, calls)
