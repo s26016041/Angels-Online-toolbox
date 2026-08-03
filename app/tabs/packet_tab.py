@@ -15,7 +15,11 @@
 """
 from __future__ import annotations
 
+import datetime
+import pathlib
+
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -176,6 +180,30 @@ class PacketTab(BaseTab):
         ctrl.addStretch(1)
         lay.addLayout(ctrl)
 
+        # ★ 第二列：把「一直重複、看不出順序、沒辦法整份複製」這三件事解決掉。
+        #   狂按同一個鍵時會攔到幾百包幾乎一樣的東西，逐包列出來根本讀不了。
+        ctrl2 = QHBoxLayout()
+        self.fold_chk = QCheckBox("摺疊連續重複")
+        self.fold_chk.setChecked(True)
+        self.fold_chk.setToolTip(
+            "把**連續**送出、來源與長度都相同的封包併成一列，標成「×N」。\n"
+            "★ 跟上面的『依呼叫鏈分組』不一樣：那個會把整份打散重排、看不出\n"
+            "　 先後順序；這個**保留順序**，只是把重複的疊起來 ——\n"
+            "　 狂按同一個鍵時，順序才是你要看的東西。")
+        self.fold_chk.toggled.connect(self._rebuild_table)
+        ctrl2.addWidget(self.fold_chk)
+        self.copy_btn = QPushButton("複製全部")
+        self.copy_btn.setToolTip("把整份攔截結果（含每層參數）複製到剪貼簿。")
+        self.copy_btn.clicked.connect(self.copy_report)
+        self.save_btn = QPushButton("匯出成檔案")
+        self.save_btn.setToolTip(
+            "存成純文字檔，路徑會顯示在下方狀態列 —— 檔案比剪貼簿好給人看。")
+        self.save_btn.clicked.connect(self.save_report)
+        ctrl2.addWidget(self.copy_btn)
+        ctrl2.addWidget(self.save_btn)
+        ctrl2.addStretch(1)
+        lay.addLayout(ctrl2)
+
         self.pkt_table = QTableWidget(0, 5)
         self.pkt_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.pkt_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -288,9 +316,9 @@ class PacketTab(BaseTab):
         if len(self._packets) > MAX_ROWS:  # 超過上限裁掉最舊的
             self._packets = self._packets[-MAX_ROWS:]
             trimmed = True
-        if self._group_mode:
-            self._rebuild_grouped()
-        elif trimmed:
+        if self._group_mode or self.fold_chk.isChecked() or trimmed:
+            # 摺疊要看「跟前一包是不是同一種」，沒辦法只補最後一列，整表重畫。
+            # 500 列的重畫實測遠比每秒攔到的封包量便宜，不會拖慢畫面。
             self._rebuild_table()
         else:
             for pkt in new:
@@ -308,7 +336,7 @@ class PacketTab(BaseTab):
             )
         else:
             self.pkt_table.setHorizontalHeaderLabels(
-                ["#", "長度", "亂度/8", "呼叫鏈（登入函式候選）", "內容預覽"]
+                ["#", "重複", "長度", "呼叫鏈（動作函式候選）", "內容預覽"]
             )
 
     def _on_group_toggled(self, checked: bool) -> None:
@@ -317,14 +345,15 @@ class PacketTab(BaseTab):
         self.baseline_btn.setEnabled(checked)
         self.clearbase_btn.setEnabled(checked)
         self._apply_headers()
+        # 分組模式會把整份打散重排，跟「摺疊」是兩種看法，不要同時開
+        self.fold_chk.setEnabled(not checked)
+        self._rebuild_table()
         if checked:
-            self._rebuild_grouped()
             self.status.setText(
-                "分組模式：相同呼叫鏈併成一列。做法→先站著不動幾秒，按「設為基線」，"
-                "再回遊戲只做一個動作（如攻擊同一隻怪），標紅置頂那列就是它的來源。"
+                "分組模式：相同呼叫鏈併成一列（**不保順序**）。做法→先站著不動幾秒，"
+                "按「設為基線」，再回遊戲只做一個動作，標紅置頂那列就是它的來源。"
+                "　想看先後順序請取消勾選，改用「摺疊連續重複」。"
             )
-        else:
-            self._rebuild_table()
 
     def _on_depth_changed(self, _value: int) -> None:
         if self._baseline_sigs:  # 深度變了，舊基線的簽章對不上，得清掉
@@ -388,25 +417,101 @@ class PacketTab(BaseTab):
                     if it:
                         it.setForeground(Qt.red)
 
-    def _rebuild_table(self) -> None:
-        self.pkt_table.setRowCount(len(self._packets))
-        for r, pkt in enumerate(self._packets):
-            self._fill_row(r, pkt)
+    # ---- 摺疊連續重複（保留順序）-----------------------------------------
+    @staticmethod
+    def _fold_key(pkt: injector.Packet) -> tuple:
+        """兩包算不算「同一種」：來源相同、長度相同就算。
 
-    def _fill_row(self, r: int, pkt: injector.Packet) -> None:
+        ⚠ 不能拿內容比 —— 封包有混淆，同一個動作每次的 bytes 都不一樣，
+          用內容比等於完全摺不起來。
+        """
+        return (tuple(pkt.call_chain[:6]), pkt.length)
+
+    def _folded(self) -> list[list[injector.Packet]]:
+        """把**連續**的同種封包併成一段。順序保留，這是跟分組模式的差別。"""
+        out: list[list[injector.Packet]] = []
+        for p in self._packets:
+            if out and self._fold_key(out[-1][0]) == self._fold_key(p):
+                out[-1].append(p)
+            else:
+                out.append([p])
+        return out
+
+    def _rebuild_table(self) -> None:
+        if self._group_mode:
+            self._rebuild_grouped()
+            return
+        runs = (self._folded() if self.fold_chk.isChecked()
+                else [[p] for p in self._packets])
+        self.pkt_table.setRowCount(len(runs))
+        for r, run in enumerate(runs):
+            self._fill_row(r, run[0], len(run))
+        self.pkt_table.scrollToBottom()
+
+    def _fill_row(self, r: int, pkt: injector.Packet, count: int = 1) -> None:
         chain = " ← ".join(f"0x{a:X}" for a in pkt.call_chain[:6]) or "—"
         preview = pkt.data[:24].hex(" ")
-        ent = f"{pkt.entropy:.2f}"
         seq_item = QTableWidgetItem(str(pkt.seq))
         seq_item.setData(Qt.UserRole, pkt.seq)
         self.pkt_table.setItem(r, 0, seq_item)
-        self.pkt_table.setItem(r, 1, QTableWidgetItem(str(pkt.length)))
-        ent_item = QTableWidgetItem(ent)
-        if pkt.entropy > 7.5:
-            ent_item.setForeground(Qt.red)  # 高亂度 → 疑似加密
-        self.pkt_table.setItem(r, 2, ent_item)
+        self.pkt_table.setItem(r, 1, QTableWidgetItem(
+            f"×{count}" if count > 1 else ""))
+        self.pkt_table.setItem(r, 2, QTableWidgetItem(str(pkt.length)))
         self.pkt_table.setItem(r, 3, QTableWidgetItem(chain))
         self.pkt_table.setItem(r, 4, QTableWidgetItem(preview))
+
+    # ---- 匯出（整份給人看）------------------------------------------------
+    def _report(self) -> str:
+        """整份攔截結果的純文字版：**照順序**、連續重複摺起來、附各層參數。
+
+        ★ 重點是「各層收到的參數」而不是 hex —— 封包內容混淆過看不出東西，
+          參數才看得懂（例如施放那層直接就是 技能ID、目標實體ID）。
+        """
+        runs = self._folded()
+        head = [
+            f"封包攔截記錄　{datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"共 {len(self._packets)} 包，摺疊後 {len(runs)} 個步驟"
+            "（連續且來源+長度相同的算同一步）",
+            "",
+        ]
+        body = []
+        for i, run in enumerate(runs, 1):
+            p = run[0]
+            rng = (f"#{run[0].seq}" if len(run) == 1
+                   else f"#{run[0].seq}~{run[-1].seq}")
+            body.append(f"── 步驟 {i}　{rng}　×{len(run)}　長度 {p.length}"
+                        f"　亂度 {p.entropy:.2f}/8")
+            for addr, args in zip(p.frames, p.args):
+                if not (injector.CODE_LO <= addr < injector.CODE_HI):
+                    continue
+                shown = [f"0x{v:X}" if v > 9 else str(v) for v in args]
+                body.append(f"     0x{addr:X}　參數 ({', '.join(shown)})")
+            body.append(f"     內容 {p.data[:32].hex(' ')}")
+            body.append("")
+        return "\n".join(head + body)
+
+    def copy_report(self) -> None:
+        if not self._packets:
+            self.status.setText("還沒攔到任何封包。")
+            return
+        text = self._report()
+        QGuiApplication.clipboard().setText(text)
+        self.status.setText(
+            f"已複製整份記錄到剪貼簿（{len(self._packets)} 包，"
+            f"{len(text)} 個字）。")
+
+    def save_report(self) -> None:
+        if not self._packets:
+            self.status.setText("還沒攔到任何封包。")
+            return
+        name = f"封包記錄_{datetime.datetime.now():%m%d_%H%M%S}.txt"
+        path = pathlib.Path.cwd() / name
+        try:
+            path.write_text(self._report(), encoding="utf-8")
+        except OSError as exc:
+            self.status.setText(f"存檔失敗：{exc}")
+            return
+        self.status.setText(f"已存檔：{path}")
 
     def _show_detail(self) -> None:
         rows = self.pkt_table.selectionModel().selectedRows()
