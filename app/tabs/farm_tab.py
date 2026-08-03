@@ -198,6 +198,13 @@ CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 #   於是每隻都被冷凍，只好去追遠處打不到的（實拍：周圍 1.2 格有怪，
 #   卻鎖著 16.0 格外的那隻）。取 3.0：實拍貼身距離落在 1.0~2.1 格。
 NO_PATH_NEED = 3.0
+# ★★ 「卡進怪身體裡」的自動解除（使用者實測：手動挪一點點就會開始打）。
+#   貼得比 move.MIN_GAP 還近又打不動時，往反方向退到 NUDGE_DIST 格。
+#   我們走過去時已經留 1.4 格了，但**怪會自己貼上來** —— 牠在打我們。
+#   實測過這個狀態：站 0.7 格連送 80 發零傷害，等怪自己走開才恢復
+#   （移動狀態沒收乾淨，攻擊全被忽略）。
+NUDGE_SECS = 1.2                # 貼太近又這麼久沒造成傷害才退
+NUDGE_DIST = 2.0                # 退到離怪幾格
 # ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
 #   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
@@ -717,6 +724,7 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
         self._dbg_t = 0.0          # 診斷紀錄的計時（見 _FARM_LOG）
+        self._no_dmg = 0.0         # 在射程內卻連續多久沒造成傷害
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
@@ -1136,6 +1144,7 @@ class CharFarmPage(QWidget):
             return False
         d, self._cur = pool[0]           # 純粹挑最近的
         self._stuck = 0.0
+        self._no_dmg = 0.0
         self._anchor = me                # 換目標 → 卡住偵測從這裡重新算
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._path_t = PATH_GAP                   # 下一拍就問
@@ -1508,8 +1517,27 @@ class CharFarmPage(QWidget):
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp:
             self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
+            self._no_dmg = 0.0
             if dist is not None:
                 self._hit_dist = max(self._hit_dist, dist)
+        elif in_range:
+            self._no_dmg += dt
+        # ★★ 卡進怪身體裡 → **自動退開一小步**（使用者實測：手動挪一下就會打）。
+        #   我們走過去時已經留 1.4 格，但怪會自己貼上來（牠在打我們）。
+        #   貼得比 MIN_GAP 還近、又連續 NUDGE_SECS 秒沒造成傷害 = 卡住了。
+        #   ⚠ 用 walk_to()（走到指定座標）而不是 walk_route() ——
+        #     後者會對「退到的那個點」再留 1.4 格，等於退不出去。
+        if (self._no_dmg >= NUDGE_SECS and dist is not None
+                and dist < move.MIN_GAP and mp and me
+                and self._mover is not None and self._mover.active
+                and self._walk_t >= WALK_GAP):
+            ang = math.atan2(me[1] - mp[1], me[0] - mp[0])
+            self._mover.walk_to(self.sc, self.player,
+                                mp[0] + math.cos(ang) * NUDGE_DIST,
+                                mp[1] + math.sin(ang) * NUDGE_DIST)
+            self._walk_t = 0.0
+            self._no_dmg = 0.0
+            self._why = "⚠ 卡在怪身上 → 退開一步"
         # ⚠⚠ **用「離錨點的淨位移」判斷有沒有前進**，不要用 self._moving。
         #   撞牆時角色會抖動約 0.5~0.6 格，剛好跨過 MOVE_EPS(0.5)，
         #   於是每一拍都被當成在走路，這個計時器永遠歸零 ——
