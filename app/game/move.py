@@ -88,32 +88,31 @@ MGR_MAX = 0x2AA4            # 表的上限
 OBJ_ID = 0xBC               # 物件裡回存的 ID（要跟查表用的 ID 一致才算數）
 
 
-def _route_point_back(here: tuple[float, float],
-                      pts: list[tuple[float, float]],
-                      back: float) -> tuple[float, float] | None:
-    """沿著路徑從**終點**往回退 `back` 格，回傳退到的那個點。
+def _approach_point(here: tuple[float, float],
+                    pts: list[tuple[float, float]],
+                    keep: float) -> tuple[float, float] | None:
+    """這一趟要走到哪 —— **只在路徑的最後一段上退，絕不退過倒數第二個點**。
 
-    ★ 退到的點一定落在遊戲自己算出來的路段上，所以保證走得到 ——
-      這正是「在直線上取一個點」會失敗的地方（那個點常常在地形裡）。
-    整條路徑都不夠退 → 回 None（代表已經在 `back` 格之內，呼叫端自理）。
+    規則（使用者定的）：
+      · 路徑只有 **1 個點** = 中間完全沒有障礙物 → 直接朝目標走，
+        走到剩 keep 格為止（起點就是我們現在站的地方）。
+      · 路徑有 **2 個點以上** = 要繞 → 先走到**倒數第二個點**；那個點到
+        目標之間一定是直線（中間若有地形，尋路會再插一個轉折點）。
+        最後那段比 keep 長的話，就沿著它再往前推到剩 keep 格。
+        比 keep 短就停在倒數第二個點，下一拍重算（那時多半只剩 1 個點）。
 
-    ⚠ 一定要把**目前位置**接在路徑前面：只有一個路徑點時（直線通），
-      沒有起點就沒有線段可以退，會誤判成「已經夠近」。
+    ⚠⚠ **不可以沿著整條路徑一路往回退** —— 退過轉角就會落在「看不到怪」
+      的地方，站在那裡打不到。只有最後一段保證跟目標之間沒有障礙物。
     """
     if not pts:
         return None
-    if back <= 0:
-        return pts[-1]
-    route = [here] + list(pts)
-    rem = back
-    for i in range(len(route) - 1, 0, -1):
-        (x1, y1), (x0, y0) = route[i], route[i - 1]
-        seg = math.hypot(x1 - x0, y1 - y0)
-        if seg >= rem:
-            r = (rem / seg) if seg else 0.0
-            return (x1 + (x0 - x1) * r, y1 + (y0 - y1) * r)
-        rem -= seg
-    return None
+    tx, ty = pts[-1]
+    px, py = pts[-2] if len(pts) >= 2 else here
+    seg = math.hypot(tx - px, ty - py)
+    if keep <= 0 or seg <= keep:
+        return (px, py) if len(pts) >= 2 else None
+    r = (seg - keep) / seg
+    return (px + (tx - px) * r, py + (ty - py) * r)
 
 
 def pathfinder_this(scanner) -> int | None:
@@ -363,8 +362,8 @@ class Mover:
         還是撞牆，等於把遊戲算得出來的繞路整條丟掉 ——
         使用者實拍：站在原地 32 秒撞牆，而遊戲自己點地圖是走得過去的。
 
-        這裡反過來：先算到目標的完整路徑，要留距離就**沿著那條路徑退**，
-        退到的點一定落在遊戲自己走得到的路段上。
+        這裡反過來：先算到目標的完整路徑，再照 `_approach_point()` 的規則
+        決定要走到哪 —— **只在最後一段上退**，那一段跟目標之間保證沒有地形。
         （實測遊戲點地圖走長路時，就是連送好幾包、每包最多 5 個點，
           起點是上一段的終點 —— 那條路正是這裡算出來的東西。）
 
@@ -433,7 +432,7 @@ class Mover:
                 short = 0.0               # 中繼點本身就要走到底
 
             pts = self.read_path(scanner, n)
-            gx, gy = _route_point_back((cx, cy), pts, short) or pts[-1]
+            gx, gy = _approach_point((cx, cy), pts, short) or pts[-1]
             self.call(WALK_FN, this, wx, wy,
                       int(gx * entity.TILE_UNITS) & 0xFFFF,
                       int(gy * entity.TILE_UNITS) & 0xFFFF, 0)
