@@ -704,6 +704,8 @@ class CharFarmPage(QWidget):
         self._range: float | None = None
         self._probe_t = 0.0
         self._probes = 0
+        # 自己最近一次下的移動目的地（問射程時要排掉，見 _probe_range）
+        self._my_dest: tuple[float, float] | None = None
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
@@ -979,6 +981,11 @@ class CharFarmPage(QWidget):
             return
         self._probe_t = 0.0
         dst = entity.read_dest(self.sc, self.player)
+        # ⚠⚠ **我們自己下的移動指令也會寫進這個欄位** —— 讀到那個就不是
+        #   客戶端算的落腳點，射程會整個算錯。所以先排掉自己剛送出去的目的地。
+        if dst and self._my_dest and math.hypot(
+                dst[0] - self._my_dest[0], dst[1] - self._my_dest[1]) < 1.0:
+            dst = None
         # 落腳點離我夠遠 = 客戶端真的算了一個新的目的地
         if dst and math.hypot(dst[0] - me[0], dst[1] - me[1]) > 1.0:
             r = math.hypot(dst[0] - mp[0], dst[1] - mp[1])
@@ -1021,6 +1028,8 @@ class CharFarmPage(QWidget):
         #     等於把遊戲算好的繞路丟掉了。
         if n <= 0:
             n = self._mover.walk_to(self.sc, self.player, gx, gy)
+        # 記下自己下的目的地 —— 問官方射程時要用它排掉「自己寫的」那個值
+        self._my_dest = (gx, gy)
         self._walk_t = 0.0
         return n
 
