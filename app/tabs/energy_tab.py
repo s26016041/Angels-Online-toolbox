@@ -70,6 +70,9 @@ class EnergyTab(BaseTab):
         self._boxes: list[QCheckBox] = []
         # 按晶化之前的狀態。要靠它跟按之後比對，才算得出「實際入帳幾點到誰」
         self._pre = None
+        # 使用者「想要」的次數（_load 會覆寫）。先給預設值，免得 _clamp_limit
+        # 比 _load 早跑到就炸掉。
+        self._limit_want = DEFAULT_LIMIT
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
@@ -119,10 +122,11 @@ class EnergyTab(BaseTab):
         row.addWidget(self.auto_cb)
         row.addSpacing(16)
         self.roll_btn = QPushButton("能量晶化")
-        self.roll_btn.setToolTip(
+        self._roll_tip = (
             "送出一次能量晶化（遊戲裡那顆按鈕）。\n"
             "⚠ 每 1 點能量可進行 1 次，屬性隨機 —— 按幾次由你決定，"
             "程式不會自動連按。")
+        self.roll_btn.setToolTip(self._roll_tip)
         self.roll_btn.clicked.connect(self._roll)
         row.addWidget(self.roll_btn)
         self.double_btn = QPushButton("我要晶能加倍")
@@ -159,10 +163,12 @@ class EnergyTab(BaseTab):
         arow.addWidget(self.interval)
         arow.addWidget(QLabel("秒一次，最多"))
         self.limit = QSpinBox()
-        # ★ 下限 1：不允許 0 或負數。上限會跟著目前能量動態調整（見 _refresh）
-        #   —— 填一個比能量還大的數字沒有意義，直接擋在輸入端。
-        #   「不限」不做成特殊值（那會在框裡顯示文字），要用完全部請勾右邊那個。
-        self.limit.setRange(1, DEFAULT_LIMIT)
+        # ★ 下限 **0**：能量是 0 的人就該看到 0，不該被逼著顯示 1。
+        #   不允許負數。上限跟著目前能量動態調整（見 _clamp_limit）——
+        #   填一個比能量還大的數字沒有意義，直接擋在輸入端。
+        #   ⚠ 0 **不是**「不限」（舊版是，那會變成無限狂按）——
+        #     0 就是不跑，見 _auto_tick。要用完全部請勾右邊那個。
+        self.limit.setRange(0, DEFAULT_LIMIT)
         self.limit.setValue(DEFAULT_LIMIT)
         self.limit.setFixedWidth(70)
         self.limit.setToolTip(
@@ -292,11 +298,16 @@ class EnergyTab(BaseTab):
         ⚠ 用 blockSignals 包起來：setRange/setValue 會發 valueChanged，
           沒擋掉的話每 0.5 秒的更新都會觸發一次存檔。
         """
-        top = max(1, int(energy_now))
+        top = max(0, int(energy_now))
         if self.limit.maximum() == top:
             return
         self.limit.blockSignals(True)
-        self.limit.setRange(1, top)
+        self.limit.setRange(0, top)
+        # ⚠ 只調範圍不夠：能量歸零時值會被夾成 0，**能量回來之後不會自己回去**，
+        #   使用者就會看到一個永遠是 0 的欄位。所以每次都用「他設定的值」
+        #   重新夾一次。`_limit_want` 只有在**使用者自己改**時才更新
+        #   （這裡有 blockSignals，不會觸發 _save）。
+        self.limit.setValue(min(self._limit_want, top))
         self.limit.blockSignals(False)
 
     def _on_all_toggled(self, on: bool) -> None:
@@ -309,12 +320,33 @@ class EnergyTab(BaseTab):
             self._stop_auto("換了分身")
         self._refresh()
 
+    def _set_buttons(self, energy_left: int | None) -> None:
+        """能量是 0（或讀不到）就把按鈕變灰 —— 不要讓使用者亂送封包。
+
+        ⚠ 三顆都關掉，包含「我要晶能加倍」：能量 0 的時候實測 +0xBC 也是
+          「沒抽過」的狀態，加倍沒有對象可以加。
+        """
+        can = bool(energy_left)
+        why = ("" if can else
+               "　（能量是 0，沒得按）" if energy_left == 0 else
+               "　（讀不到狀態，先選一個分身）")
+        for w in (self.roll_btn, self.double_btn, self.auto_roll_cb,
+                  self.all_cb):
+            w.setEnabled(can)
+        self.interval.setEnabled(can)
+        self.limit.setEnabled(can and not self.all_cb.isChecked())
+        if not can and self.auto_roll_cb.isChecked():
+            self._stop_auto("能量用完了")
+        self.roll_btn.setToolTip(self._roll_tip + why)
+
     def _refresh(self) -> None:
         got = self._read()
         if got is None:
             self.energy_lbl.setText("能量 —")
             self.cur_lbl.setText("目前選中 —")
+            self._set_buttons(None)
             return
+        self._set_buttons(got.energy)
         self.energy_lbl.setText(f"能量 {got.energy}（還能按 {got.energy} 次）")
         self._clamp_limit(got.energy)
         self.cur_lbl.setText(
@@ -420,10 +452,17 @@ class EnergyTab(BaseTab):
             self._stop_auto("能量用完了")
             return
         # 勾了「晶化全部能量」就不看次數，只靠能量歸零收工
-        limit = 0 if self.all_cb.isChecked() else int(self.limit.value())
-        if limit and self._auto_n >= limit:
-            self._stop_auto(f"到達設定的 {limit} 次")
-            return
+        if self.all_cb.isChecked():
+            limit = 0
+        else:
+            limit = int(self.limit.value())
+            # ⚠ 0 **不是**「不限」（舊版是，那會變成無限狂按到能量歸零）
+            if limit <= 0:
+                self._stop_auto("次數設成 0")
+                return
+            if self._auto_n >= limit:
+                self._stop_auto(f"到達設定的 {limit} 次")
+                return
         if not self._roll():
             self.auto_lbl.setText("　指令槽忙碌，下一拍再試")
             return
@@ -505,13 +544,14 @@ class EnergyTab(BaseTab):
                                      (self.limit, "limit", DEFAULT_LIMIT)):
             widget.blockSignals(True)
             val = type(widget.value())(config.get(self._key(key), default))
-            # ⚠ 舊設定檔可能存著 0（那時候 0 代表「不限」）或負數。
-            #   那種值不是「使用者選的 1 次」，是**沒有意義的舊值** ——
-            #   一律當成沒設過、用預設值，不要夾成 1。
+            # ⚠ 舊設定檔可能存著負數、或間隔存著比下限小的值 —— 當成沒設過。
+            #   （次數的 0 現在是合法值：能量 0 的人就該看到 0。）
             if val < widget.minimum():
                 val = default
             widget.setValue(val)
             widget.blockSignals(False)
+        # 使用者「想要」的次數。能量歸零把值夾成 0 之後，能量回來要靠它復原。
+        self._limit_want = max(1, int(self.limit.value()))
         self.all_cb.blockSignals(True)
         self.all_cb.setChecked(bool(config.get(self._key("all"), False)))
         self.all_cb.blockSignals(False)
@@ -521,6 +561,9 @@ class EnergyTab(BaseTab):
         #   （「晶化全部能量」有記住，但它只是模式 —— 真正的開關是自動晶化。）
 
     def _save(self) -> None:
+        # 只有使用者自己動過才更新「想要的次數」——
+        # _clamp_limit 改值時是 blockSignals 的，不會走到這裡。
+        self._limit_want = int(self.limit.value())
         config.set(self._key("watch"),
                    [i for i, cb in enumerate(self._boxes) if cb.isChecked()])
         config.set(self._key("auto"), self.auto_cb.isChecked())
