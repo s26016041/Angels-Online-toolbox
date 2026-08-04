@@ -2040,10 +2040,12 @@ class FarmTab(BaseTab):
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
 
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(TICK_MS)
+
     def _show_locate(self) -> None:
         """把 AOB 自動定位的結果顯示出來（沒事就不顯示）。"""
-        if not hasattr(self, "locate_lbl"):
-            return
         moved, failed = locate.moved(), locate.failed()
         if failed:
             self.locate_lbl.setText(
@@ -2056,11 +2058,6 @@ class FarmTab(BaseTab):
             self.locate_lbl.setStyleSheet("color: #7fc97f;")
         else:
             self.locate_lbl.setText("")
-
-        self._show_locate()
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(TICK_MS)
 
     # ------------------------------------------------------------------
     def on_show(self) -> None:
