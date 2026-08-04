@@ -27,9 +27,12 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
 )
 
@@ -50,6 +53,9 @@ MIN_INTERVAL = 0.8
 DEFAULT_INTERVAL = 1.5
 # 自動晶化的預設次數。刻意**不是「不限」** —— 預設值不該是「花光你全部能量」。
 DEFAULT_LIMIT = 10
+LOG_COLS = ("時間", "動作", "結果", "實際入帳", "剩餘能量")
+LOG_HEIGHT = 150
+LOG_MAX = 500             # 只留最近這麼多列，跑一整晚也不會吃掉記憶體
 
 
 class EnergyTab(BaseTab):
@@ -62,6 +68,8 @@ class EnergyTab(BaseTab):
         self._state: dict[int, int] = {}          # pid -> 狀態物件
         self._names = energy.FALLBACK_NAMES
         self._boxes: list[QCheckBox] = []
+        # 按晶化之前的狀態。要靠它跟按之後比對，才算得出「實際入帳幾點到誰」
+        self._pre = None
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
@@ -179,10 +187,25 @@ class EnergyTab(BaseTab):
         arow.addStretch(1)
         root.addLayout(arow)
 
+        # --- 歷史紀錄 ---------------------------------------------------
+        # ★ 為什麼要有：晶化的點數是「下一次按的時候才入帳」，加倍成功與否
+        #   也只反映在「下次入帳幾點」。光看畫面很難確定加倍到底有沒有生效
+        #   —— 使用者原話「讓人心穩一點」。所以這裡把每一次的**實際入帳**
+        #   也記下來，看得到 20 點真的進去了。
+        self.log = QTableWidget(0, len(LOG_COLS))
+        self.log.setHorizontalHeaderLabels(LOG_COLS)
+        self.log.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.log.setSelectionMode(QTableWidget.NoSelection)
+        self.log.verticalHeader().setVisible(False)
+        self.log.setFixedHeight(LOG_HEIGHT)
+        hh = self.log.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Stretch)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        root.addWidget(self.log)
+
         self.status = QLabel("尚未選擇分身")
         self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
-        root.addStretch(1)
 
         self._auto_n = 0
         self._auto_timer = QTimer(self)
@@ -331,13 +354,27 @@ class EnergyTab(BaseTab):
             f"　{(time.time() - t0) * 1000:.0f} ms")
         return ok
 
+    def _log(self, action: str, result: str, credit: str = "",
+             energy_left="") -> None:
+        """在歷史表最上面插一列。"""
+        self.log.insertRow(0)
+        cells = (time.strftime("%H:%M:%S"), action, result, credit,
+                 str(energy_left))
+        for col, text in enumerate(cells):
+            self.log.setItem(0, col, QTableWidgetItem(text))
+        while self.log.rowCount() > LOG_MAX:
+            self.log.removeRow(self.log.rowCount() - 1)
+
     def _roll(self) -> bool:
         before = self._read()
         if before is not None and before.energy <= 0:
             self.status.setText("⚠ 能量是 0，按了也不會有事發生")
             return False
         ok = self._do("能量晶化", energy.roll)
-        if ok and self.auto_cb.isChecked():
+        if ok:
+            # ★ 記下按之前的狀態：這一次的點數是入帳到「按之前選中的那個屬性」，
+            #   所以要靠前後比對才算得出「實際入帳了幾點到誰身上」。
+            self._pre = before
             # 結果要等一下才寫進記憶體（實測 106ms），用 singleShot 不卡畫面
             QTimer.singleShot(SETTLE_MS, self._after_roll)
         return ok
@@ -398,21 +435,56 @@ class EnergyTab(BaseTab):
                if self.all_cb.isChecked() else "")
             + f"　剩餘能量 {got.energy - 1}")
 
-    def _double(self) -> None:
-        self._do("我要晶能加倍", energy.double)
+    def _double(self, _checked: bool = False, auto: bool = False) -> bool:
+        before = self._read()
+        ok = self._do(("自動加倍" if auto else "我要晶能加倍"), energy.double)
+        if ok:
+            # 加倍成不成功看「下次入帳點數」有沒有變大，也要等它寫進記憶體
+            QTimer.singleShot(
+                SETTLE_MS + 300, lambda: self._after_double(before, auto))
+        elif auto:
+            self._log("加倍", "⚠ 沒送出去（指令槽忙碌）")
+        return ok
+
+    def _after_double(self, before, auto: bool) -> None:
+        got = self._read()
+        self._refresh()
+        if got is None or before is None:
+            self._log("加倍", "讀不到結果")
+            return
+        if got.per_roll > before.per_roll:
+            self._log("加倍", f"★ 成功　下次入帳 {got.per_roll} 點",
+                      energy_left=got.energy)
+        else:
+            self._log("加倍", f"沒中　下次入帳 {got.per_roll} 點",
+                      energy_left=got.energy)
 
     def _after_roll(self) -> None:
         got = self._read()
         self._refresh()
-        if got is None or got.result is None:
+        pre = self._pre
+        self._pre = None
+        if got is None:
+            self._log("晶化", "讀不到結果")
+            return
+        # 這一次入帳到「按之前選中的那個屬性」—— 前後相減才知道實際進了幾點
+        credit = ""
+        if pre is not None and pre.result is not None:
+            delta = got.points[pre.result] - pre.points[pre.result]
+            if delta:
+                credit = f"{self._names[pre.result]} +{delta}"
+        name = got.result_name(self._names)
+        self._log("晶化", f"抽到 {name}", credit, got.energy)
+
+        if got.result is None:
             self.status.setText(self.status.text() + "　（讀不到結果，沒有加倍）")
             return
-        name = got.result_name(self._names)
+        if not self.auto_cb.isChecked():
+            return
         if not self._boxes[got.result].isChecked():
             self.status.setText(f"抽到「{name}」——沒勾，不加倍")
             return
-        ok = self._do(f"抽到「{name}」→ 自動加倍", energy.double)
-        if not ok:
+        if not self._double(auto=True):
             self.status.setText(f"抽到「{name}」→ ⚠ 加倍沒送出去，請手動按一次")
 
     # ------------------------------------------------------------------
