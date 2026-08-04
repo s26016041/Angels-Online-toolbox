@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -226,6 +227,14 @@ def _mmss(seconds: float) -> str:
 # 客戶端重連實測約 1 秒，但重連後所有物件都會搬家，還要等掃描重新定位到，
 # 所以留寬一點。這段期間不打怪、不下移動指令。
 ROT_SETTLE = 5.0
+# --- 血/魔不足時坐下回復 ---------------------------------------------------
+VK_INSERT = 0x2D          # 遊戲裡按 Insert 切換坐下／站起
+REST_FULL = 100           # 回到這個百分比才起身
+REST_HP_DEFAULT = 50
+REST_MP_DEFAULT = 30
+# 送出 Insert 之後隔多久才准再送一次。坐下要一段時間才反映到記憶體
+# （實測 91ms），太快重送會變成坐下→站起→坐下。
+SIT_GAP = 1.5
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
 # 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
@@ -787,6 +796,11 @@ class CharFarmPage(QWidget):
         self._rot_home = 0           # 出發時在哪一頻（只給顯示用）
         self._rot_max = 0            # 這台伺服器有幾個分流（開始巡迴時讀）
         self._rot_last = ""          # 上次顯示的巡迴文字（沒變就不重畫）
+        # 休息（血/魔不足 → 收尾 → 坐下 → 回滿 → 起身）
+        self._rest = ""              # "" / "finish"（打完手上這隻）/ "sit"
+        self._rest_why = ""          # 為什麼要休息，顯示用
+        self._rest_key_t = SIT_GAP   # 距離上次送 Insert 過了多久
+        self._hp_pct = self._mp_pct = 100.0
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -960,6 +974,44 @@ class CharFarmPage(QWidget):
         rbar.addStretch(1)
         root.addLayout(rbar)
 
+        # ★ 血/魔不足就坐下回復。流程：低於門檻 → **先把手上的怪打完、
+        #   確認沒有怪在打我** → 坐下 → 回到 100% → 起身繼續。
+        #   「要先清乾淨才坐」是使用者明確要求的，理由很實際：
+        #   坐著被怪打會死（這個專案有前科，測試時留著怪沒殺，角色被打死）。
+        sbar = QHBoxLayout()
+        self.rest_hp_cb = QCheckBox("HP 低於")
+        self.rest_hp_cb.setToolTip(
+            "血量低於這個百分比就停下來坐著回血，回到 100% 再繼續。\n"
+            "⚠ 不會馬上坐 —— 會先把手上的怪打完、確認沒有怪在打你。")
+        self.rest_hp_cb.toggled.connect(self._save_settings)
+        sbar.addWidget(self.rest_hp_cb)
+        self.rest_hp = QSpinBox()
+        self.rest_hp.setRange(1, 99)
+        self.rest_hp.setValue(REST_HP_DEFAULT)
+        self.rest_hp.setFixedWidth(60)
+        self.rest_hp.valueChanged.connect(self._save_settings)
+        sbar.addWidget(self.rest_hp)
+        sbar.addWidget(QLabel("%"))
+        sbar.addSpacing(12)
+        self.rest_mp_cb = QCheckBox("MP 低於")
+        self.rest_mp_cb.setToolTip(
+            "魔力低於這個百分比就停下來坐著回魔，回到 100% 再繼續。\n"
+            "⚠ 同樣會先把手上的怪打完才坐。")
+        self.rest_mp_cb.toggled.connect(self._save_settings)
+        sbar.addWidget(self.rest_mp_cb)
+        self.rest_mp = QSpinBox()
+        self.rest_mp.setRange(1, 99)
+        self.rest_mp.setValue(REST_MP_DEFAULT)
+        self.rest_mp.setFixedWidth(60)
+        self.rest_mp.valueChanged.connect(self._save_settings)
+        sbar.addWidget(self.rest_mp)
+        sbar.addWidget(QLabel("% 就坐下休息，回到 100% 再繼續"))
+        self.rest_lbl = QLabel("")
+        self.rest_lbl.setStyleSheet("color: #9aa2b8;")
+        sbar.addWidget(self.rest_lbl)
+        sbar.addStretch(1)
+        root.addLayout(sbar)
+
         # 兩個小區塊：左邊是要打哪些怪（可多選、可手動輸入），右邊是附近有什麼。
         # 一律只顯示中文名字 —— 比對也是用名字，所以手動打字才會通。
         panes = QHBoxLayout()
@@ -1086,6 +1138,100 @@ class CharFarmPage(QWidget):
         self._scene_scanned = False
         self._since_scan = RESCAN_GAP     # 重連完立刻重掃
         return True
+
+    # ------------------------------------------------------------------
+    # -- 血/魔不足時坐下回復 ---------------------------------------------
+    def _foes(self) -> list:
+        """現在有哪些怪正在打我（用實體的「交戰對象」欄位，見 entity.OFF_FOE）。
+
+        ⚠ 屍體要排掉：怪死了物件不會馬上回收，交戰欄位還留著舊值。
+        """
+        if not self.player:
+            return []
+        return [m for m in self.mons
+                if entity.read_state(self.sc, m.addr) != "Dead"
+                and entity.attacking(self.sc, m, self.player)]
+
+    def _press_insert(self) -> bool:
+        """送一次 Insert（坐下／站起）。有冷卻，不會狂送。"""
+        if self._rest_key_t < SIT_GAP:
+            return False
+        self._rest_key_t = 0.0
+        return _send_scan(self.hwnd, VK_INSERT)
+
+    def _rest_wanted(self) -> str:
+        """現在該不該休息；要的話回傳原因文字，不要回空字串。"""
+        if self.rest_hp_cb.isChecked() and self._hp_pct < self.rest_hp.value():
+            return f"HP {self._hp_pct:.0f}%"
+        if self.rest_mp_cb.isChecked() and self._mp_pct < self.rest_mp.value():
+            return f"MP {self._mp_pct:.0f}%"
+        return ""
+
+    def _rest_full(self) -> bool:
+        """有勾的那幾項都回到 100% 了嗎。"""
+        if self.rest_hp_cb.isChecked() and self._hp_pct < REST_FULL:
+            return False
+        if self.rest_mp_cb.isChecked() and self._mp_pct < REST_FULL:
+            return False
+        return True
+
+    def _end_rest(self, why: str) -> None:
+        if entity.is_sitting(self.sc, self.player):
+            self._press_insert()               # 起身
+        self._rest = ""
+        self.rest_lbl.setText(f"　休息結束（{why}）")
+
+    def _rest_tick(self, dt: float) -> bool:
+        """休息流程。回傳 True = 這一拍不要打怪。
+
+        三個階段：
+          ""       正常打怪，只是盯著血魔
+          "finish" 已經低於門檻，**但還在收尾** —— 手上的怪要打完、
+                   而且不能有怪在打我，才准坐下（使用者明確要求）
+          "sit"    坐著回復，回滿就起身
+        """
+        self._rest_key_t += dt
+        if not (self.rest_hp_cb.isChecked() or self.rest_mp_cb.isChecked()):
+            if self._rest:
+                self._rest = ""
+                self.rest_lbl.setText("")
+            return False
+
+        if self._rest == "sit":
+            foes = self._foes()
+            if foes:
+                # ⚠ 坐著被打會死。有怪打過來就立刻起身反擊，不要傻坐著。
+                self._end_rest(f"有 {len(foes)} 隻怪在打我")
+                return False
+            if self._rest_full():
+                self._end_rest(f"HP {self._hp_pct:.0f}% MP {self._mp_pct:.0f}%")
+                return False
+            if not entity.is_sitting(self.sc, self.player):
+                self._press_insert()           # 被打斷了就再坐一次
+            self.rest_lbl.setText(
+                f"　休息中：HP {self._hp_pct:.0f}%　MP {self._mp_pct:.0f}%")
+            return True
+
+        if self._rest == "finish":
+            foes = self._foes()
+            if self._cur is not None or foes:
+                self.rest_lbl.setText(
+                    f"　{self._rest_why} → 收尾中"
+                    + ("（手上還有一隻）" if self._cur is not None else "")
+                    + (f"（{len(foes)} 隻怪在打我）" if foes else ""))
+                return False                   # ← 繼續打，把牠們解決掉
+            if self._press_insert():
+                self._rest = "sit"
+                self.rest_lbl.setText("　坐下休息…")
+            return True
+
+        why = self._rest_wanted()
+        if why:
+            self._rest = "finish"
+            self._rest_why = why
+            return False
+        self.rest_lbl.setText("")
+        return False
 
     def _rot_say(self, text: str) -> None:
         """更新巡迴狀態文字。**內容沒變就不要動它** ——
@@ -1378,6 +1524,10 @@ class CharFarmPage(QWidget):
           而換下一隻其實只要挑清單裡還活著的即可 —— 這是換怪速度的關鍵。
           清單裡真的沒得打了，才由 tick() 去排重掃。
         """
+        # ★ 休息流程一啟動就不再挑新目標 —— 收尾階段要「打完手上這隻」，
+        #   再挑一隻新的就永遠收不了尾。
+        if self._rest:
+            return False
         want = self.wanted()
         me = self.my_pos()
         now = time.monotonic()
@@ -1536,6 +1686,11 @@ class CharFarmPage(QWidget):
         if self.state is None:
             return
 
+        # ★ 休息（血/魔不足坐下）。要放在挑目標之前 —— 收尾階段還是會回 False
+        #   讓它繼續打，只有真的坐下時才接管。
+        if self._rest_tick(dt):
+            return
+
         # ★ 角色死了就自動停：不然會對著空氣一直送技能鍵。
         # HP 走 app/game/player.py（跨 5 台驗證過的定位）。
         # ⚠ 它的 read() 刻意不做數值檢查，HP 歸零照樣讀得到 —— 早期版本把
@@ -1547,6 +1702,12 @@ class CharFarmPage(QWidget):
                 st = player.read(self.sc, self.stats)
                 if st is not None:
                     self._hp = st.hp
+                    # 血/魔百分比：休息判斷用。上限是 0 時當作滿的，
+                    # 免得剛換地圖讀到一半的資料就誤觸發休息。
+                    self._hp_pct = (st.hp / st.max_hp * 100
+                                    if st.max_hp else 100.0)
+                    self._mp_pct = (st.mp / st.max_mp * 100
+                                    if st.max_mp else 100.0)
                     if st.hp <= 0:
                         self._stop_with(
                             f"☠ 角色死亡 → 已自動停止掛機"
@@ -1933,6 +2094,10 @@ class CharFarmPage(QWidget):
         self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
         self.rot_every.setValue(float(g(self._key("rot_every"), 30.0)))
         self.rot_stay.setValue(float(g(self._key("rot_stay"), 60.0)))
+        self.rest_hp_cb.setChecked(bool(g(self._key("rest_hp_on"), False)))
+        self.rest_hp.setValue(int(g(self._key("rest_hp"), REST_HP_DEFAULT)))
+        self.rest_mp_cb.setChecked(bool(g(self._key("rest_mp_on"), False)))
+        self.rest_mp.setValue(int(g(self._key("rest_mp"), REST_MP_DEFAULT)))
         self.range_spin.setValue(float(g(self._key("range"), WALK_KEEP)))
         # 巡邏點。兩種舊格式都要吃得下，不然使用者設好的點會憑空消失：
         #   最舊：只有一個「原點」home = [x, y]
@@ -1967,6 +2132,10 @@ class CharFarmPage(QWidget):
         s(self._key("rotate"), self.rot_cb.isChecked())
         s(self._key("rot_every"), float(self.rot_every.value()))
         s(self._key("rot_stay"), float(self.rot_stay.value()))
+        s(self._key("rest_hp_on"), self.rest_hp_cb.isChecked())
+        s(self._key("rest_hp"), int(self.rest_hp.value()))
+        s(self._key("rest_mp_on"), self.rest_mp_cb.isChecked())
+        s(self._key("rest_mp"), int(self.rest_mp.value()))
         s(self._key("range"), float(self.range_spin.value()))
         s(self._key("spots"), [[x, y, sid] for x, y, sid in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
@@ -2053,6 +2222,8 @@ class FarmTab(BaseTab):
             "不會拿別張圖的座標亂衝（同一張圖的不同分流算同一張）。\n"
             "勾「只打王」就**不看選中怪物的名字**，改成只打王（清單上標【王】）"
             "—— 是讀遊戲自己的怪物資料判斷的，不是靠名字猜。\n"
+            "血/魔低於門檻會坐下回復，但**一定先把手上的怪打完、確認沒有怪在打你**"
+            "才坐；坐著被打會立刻起身反擊。\n"
             "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
             "不搶視窗焦點、不占用你的鍵盤滑鼠。")
         hint.setStyleSheet("color: #9aa2b8;")
