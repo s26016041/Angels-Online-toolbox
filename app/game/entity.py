@@ -91,6 +91,11 @@ OFF_FOE = 0x4D8
 #   （'Wait' 5579、'Dead' 1483、'Run' 317、'Att' 129、'Att2' 118），
 #   另外在別的分身看到 'Cast'。**除了 'Dead' 以外一律當活的**，
 #   所以之後多出新狀態也不會誤殺（五台實測沒有一次讀不到）。
+#
+# ★ **玩家自己的物件用同一個偏移**（版面跟怪一樣，見 VT_PLAYER 那段），
+#   而且多一個怪不會有的狀態：**'Sit'（坐下）**。
+#   實測（黑狐，送 Insert）：'Wait' → 'Sit' 91ms、'Sit' → 'Wait' 92ms。
+#   → 見 is_sitting()。
 #   **`'Dead'` 就是屍體**，而且是唯一可靠又即時的死活訊號：
 #     · 64 隻死掉的怪裡只有 1 隻後來又變回 'Wait'（該格被回收再用）
 #     · 屍體會一直留在實體清單裡：中位 5.0 秒、最久 79.8 秒，
@@ -266,8 +271,14 @@ def _build(scanner, addrs: list[int]) -> list[Entity]:
     return out
 
 
+STATE_SIT = "Sit"     # 只有玩家會有；遊戲裡按 Insert 切換
+
+
 def read_state(scanner, addr: int) -> str:
-    """動畫狀態（`'Wait'` / `'Run'` / `'Att'` / `'Att2'` / `'Cast'` / `'Dead'`）。
+    """動畫狀態。
+
+    怪：`'Wait'` / `'Run'` / `'Att'` / `'Att2'` / `'Cast'` / `'Dead'`
+    玩家：同上，另外有 `'Sit'`（坐下）
 
     讀不到就回空字串 —— 呼叫端一律把空字串當「活的」（見 Entity.dead）。
     """
@@ -278,6 +289,22 @@ def read_state(scanner, addr: int) -> str:
         return bytes(raw).split(b"\x00")[0].decode("ascii")
     except UnicodeDecodeError:
         return ""
+
+
+def is_sitting(scanner, player_obj: int) -> bool:
+    """角色現在是不是坐著（遊戲裡按 Insert 切換）。
+
+    ★ 讀的就是跟怪共用的那個動畫狀態欄位（OFF_STATE），所以**零成本**、
+      也已經在 AOB 自動定位的保護範圍內。
+
+    實測（黑狐，用 win.send_key 送 Insert）：
+        'Wait' → 'Sit'  91 ms
+        'Sit'  → 'Wait' 92 ms
+    另外五台同時觀察時，剛好坐著的那一台直接讀到 'Sit'，其餘為 'Wait'。
+
+    ⚠ 讀不到（空字串）時回 False —— 不知道就當沒坐著，不要據此做動作。
+    """
+    return bool(player_obj) and read_state(scanner, player_obj) == STATE_SIT
 
 
 def list_entities(scanner, should_stop=None) -> list[Entity]:
