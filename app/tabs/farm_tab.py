@@ -1200,8 +1200,15 @@ class CharFarmPage(QWidget):
         if self._rest == "sit":
             foes = self._foes()
             if foes:
-                # ⚠ 坐著被打會死。有怪打過來就立刻起身反擊，不要傻坐著。
-                self._end_rest(f"有 {len(foes)} 隻怪在打我")
+                # ⚠ 坐著被打會死，要起身反擊 —— 但**只回到收尾階段**
+                #   （只打那幾隻），不是回到完整掛機。
+                #   第一版是直接結束休息，結果它跑去打新怪、把魔力又花掉，
+                #   MP 在門檻附近來回震盪、永遠到不了 100%（實測黑狐
+                #   86~93% 上上下下）。
+                if entity.is_sitting(self.sc, self.player):
+                    self._press_insert()       # 起身
+                self._rest = "finish"
+                self._rest_why = f"{len(foes)} 隻怪在打我"
                 return False
             if self._rest_full():
                 self._end_rest(f"HP {self._hp_pct:.0f}% MP {self._mp_pct:.0f}%")
@@ -1213,9 +1220,11 @@ class CharFarmPage(QWidget):
             return True
 
         if self._rest == "finish":
-            # ⚠ 收尾途中血魔自己回來了（喝藥、被補、門檻調高）就取消休息。
-            #   沒有這個出口的話會永遠停在收尾中、不再挑新目標 —— 等於掛機停擺。
-            if not self._rest_wanted():
+            # ⚠⚠ **進出用不同門檻**：低於設定值才進休息，但要回到 100% 才出來。
+            #   用同一個門檻判斷進出的話，在門檻附近必然來回震盪 ——
+            #   實測黑狐 MP 在 86~93% 之間坐下站起來反覆，永遠到不了 100%。
+            #   （這也正是使用者要的：「多少% 以下停止打怪，坐下直到 100% 再繼續」。）
+            if self._rest_full():
                 self._rest = ""
                 self.rest_lbl.setText("")
                 return False
