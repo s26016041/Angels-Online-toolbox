@@ -271,6 +271,36 @@ class Mover:
         """
         return self._lock
 
+    @staticmethod
+    def _orphan_orig(pm, iat: int) -> int | None:
+        """IAT 上如果是**我們自己留下的孤兒跳板**，回傳它記著的原始函式位址。
+
+        ⚠⚠ 為什麼需要這個：工具箱如果不是正常關閉（當掉、直接砍行程），
+          `stop()` 就不會跑，IAT 會一直指著那塊配置的跳板。遊戲照常運作
+          （跳板本身還在），但**下次再安裝就會疊成兩層** —— 誰先收尾誰後收尾
+          會決定 IAT 最後指到一塊已經釋放的記憶體，那才是真的會崩。
+          實際發生過：使用者被迫關掉工具箱三次，最後發現那個 hook 是孤兒。
+
+        判定條件很嚴（寧可不動，也不要亂改別人的 hook）：
+          · IAT 指向的位址**不在任何模組裡**（＝確實被 hook 了）
+          · 往前 `_CODE` 當成我們的區塊起點，讀出的 `_ORIG`
+            **必須落在 USER32.dll 裡**（那才是真正的 PeekMessageA）
+        """
+        try:
+            cur = pm.read_uint(iat)
+            block = cur - _CODE
+            orig = pm.read_uint(block + _ORIG)
+            mods = [(m.lpBaseOfDll, m.lpBaseOfDll + m.SizeOfImage,
+                     (m.name or "").lower()) for m in pm.list_modules()]
+        except Exception:                          # noqa: BLE001
+            return None
+        if any(lo <= cur < hi for lo, hi, _ in mods):
+            return None                            # 本來就沒被 hook
+        for lo, hi, name in mods:
+            if lo <= orig < hi and name.startswith("user32"):
+                return orig
+        return None
+
     def start(self) -> None:
         """安裝 hook。失敗會丟例外，呼叫端要能接住（沒有移動功能也要能掛機）。"""
         import keystone
@@ -283,6 +313,11 @@ class Mover:
             raise RuntimeError(f"匯入表裡找不到 {HOOK_IMPORT}")
         pm = pymem.Pymem()
         pm.open_process_from_id(self._pid)
+        # ★ 先清掉「上次沒收乾淨」留下的孤兒跳板，不要疊第二層（見 _orphan_orig）
+        orphan = self._orphan_orig(pm, iat)
+        if orphan:
+            injector.SendCapture._protect(pm, iat, 8, 0x40)
+            pm.write_uint(iat, orphan)
         orig = pm.read_uint(iat)
         block = pm.allocate(0x1000)
         for off, val in ((_FLAG, 0), (_ORIG, orig), (_A1, 0), (_A2, 0),
