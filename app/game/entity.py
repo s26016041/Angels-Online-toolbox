@@ -51,8 +51,19 @@ from app.core.memory import VALUE_TYPES
 # --- vtable（angel.dat 內的絕對位址，無 ASLR）---
 VT_ENTITY = 0x007D2A24    # 實體物件（掃這個；注意它在物件起點 +8）
 VT_ENTITY2 = 0x007D29D8   # 同一物件的第二個 vtable，位於物件起點
-VT_STATE = 0x007E3E40     # 玩家狀態物件（每個分身剛好 1 個）
-VT_PLAYER = 0x007D8BE0    # 玩家自己的物件（每個分身剛好 1 個）
+# ⚠⚠ **遊戲改版會讓 vtable 位移** —— 2026-08-04 12:22 那次改版：
+#       VT_STATE   0x7E3E40 → 0x7E3E50（+0x10）
+#       VT_PLAYER  0x7D8BE0 → 0x7D8BF8（+0x18）
+#       VT_ENTITY  沒有變
+#   症狀是「突然掃不到怪物」（其實是掃不到玩家/狀態物件，整個掃描判定失敗）。
+#   ⚠ 啟動器的 patch.log 會寫 "no update needed"，**不能當作沒改版** ——
+#     那是版本號檢查，angel.dat 本身還是被換掉了（看檔案時間）。
+#   重新定位的方法（scratchpad 有腳本）：
+#     · 玩家物件 —— move.pathfinder_this() 不靠 vtable，算出來 +8 讀 [+0] 就是新值
+#     · 狀態物件 —— 掃舊值附近的候選，取「+0x2DC 是 0~100 的百分比、
+#                   而且 +0x2D8 有真實目標 ID」的那個
+VT_STATE = 0x007E3E50     # 玩家狀態物件（每個分身剛好 1 個）
+VT_PLAYER = 0x007D8BF8    # 玩家自己的物件（每個分身剛好 1 個）
 
 # --- 實體物件的欄位（基準 = 掃 VT_ENTITY 得到的位址）---
 OFF_PREV = 0x08           # 雙向串列

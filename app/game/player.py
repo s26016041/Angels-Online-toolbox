@@ -67,7 +67,12 @@ OFF_LAST_SKILL = -0x50
 GAME_MODULE = "angel.dat"
 # vtable 指標的值 = 模組基底 + 這個偏移。用 RVA 記錄、執行時才加基底，所以不怕
 # 模組載到別的位址（這遊戲其實無 ASLR，固定 0x400000，但這樣寫比較保險）。
-VTABLE_RVA = 0x3E3E0C
+# ⚠⚠ **遊戲改版會讓它位移**。2026-08-04 12:22 那次：0x3E3E0C → 0x3E3E1C（+0x10）
+#   ★ 物件版面完全沒變，只有 vtable 位址移了（等級仍在 vtable+0x20、
+#     HP +0x24/+0x28、MP +0x2C/+0x30，跟下面的 OFF_* 完全吻合）。
+#   重新定位：拿已知的等級/最大HP/最大MP 去掃舊值附近的候選即可
+#   （scratchpad/find_stats.py）。同一次改版 entity.py 的 VT_STATE 也是 +0x10。
+VTABLE_RVA = 0x3E3E1C
 # 物件起點相對「角色資料基準」的位置
 OFF_VTABLE = -0x20
 # vtable 之後有幾個 dword 是 0（五台一致）。加這條讓特徵更不容易誤中。
