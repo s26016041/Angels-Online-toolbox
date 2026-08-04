@@ -48,26 +48,103 @@ from __future__ import annotations
 
 import ctypes
 import re
+import struct
 
 from app.game import attack
 
 # 泛用送包函式的「切換分流」種類碼。函式本身沿用 attack.SELECT_FN。
 SWITCH_CODE = 0x47
 
-# 遊戲共 5 個分流（使用者確認）。超出範圍不送 —— 沒驗過的值不要亂送給伺服器。
 MIN_CHANNEL = 1
-MAX_CHANNEL = 5
+# ⚠ 只在**真的讀不到 server.xml** 時才用（見 count()）。不要拿它當常數用 ——
+#   分流數是遊戲隨時會調的東西，寫死就會在改版後安靜地壞掉。
+FALLBACK_MAX = 5
 
 
-def switch(mover, channel: int) -> bool:
-    """換到指定分流（**1 起算**，1~5）。排不進指令槽或編號超範圍時回 False。
+def switch(mover, channel: int, max_channel: int = FALLBACK_MAX) -> bool:
+    """換到指定分流（**1 起算**）。排不進指令槽或編號超範圍時回 False。
 
-    mover: 已 start() 的 move.Mover（借它的跳板讓遊戲主執行緒替我們呼叫）。
+    mover:       已 start() 的 move.Mover（借它的跳板讓遊戲主執行緒替我們呼叫）
+    max_channel: 這個伺服器有幾個分流，用 `count()` 拿。超範圍一律不送 ——
+                 沒驗過的值不要丟給伺服器。
     """
-    if not (MIN_CHANNEL <= channel <= MAX_CHANNEL):
+    if not (MIN_CHANNEL <= channel <= max_channel):
         return False
     return attack._send(
         mover, ((attack.SELECT_FN, (SWITCH_CODE, channel - 1)),))
+
+
+# --- 記憶體裡的伺服器清單 ---------------------------------------------------
+# 客戶端啟動時把伺服器清單解析進記憶體，是一個等距陣列（相鄰記錄差 0x178），
+# 記錄開頭就是伺服器名字串。用視窗標題的伺服器名去找那筆，就能讀到分流數。
+#
+# 版面（相對記錄起點＝名稱字串）：
+#     +0x00  名稱（UTF-8，內嵌）        +0x40  ip 字串（內嵌）
+#     +0x50  port      +0x54  分流?     +0x58  編號      +0x5C  分流?
+#     +0x60  fip 字串  +0x70  fport     +0x74  tip 字串
+#
+# ⚠ +0x54 與 +0x5C **兩格都是 5**，三台伺服器都一樣，所以分不出哪一格才是
+#   「分流」。因此 `count()` 兩格都讀、**要求兩格一致**才採用 ——
+#   哪天版面變了或兩格意義分岔，我們會得到 None（不換頻道），而不是一個錯的數字。
+OFF_IP = 0x40
+OFF_PORT = 0x50
+OFF_SUBSET_A = 0x54
+OFF_ID = 0x58
+OFF_SUBSET_B = 0x5C
+REC_SPAN = 0x60           # 讀到 +0x5C 就夠了
+MAX_SUBSET = 32           # 合理性上限：分流數不可能比這大
+
+
+def count(scanner, hwnd: int) -> int | None:
+    """這個伺服器有幾個分流；**讀不到就回 None**（呼叫端應該乾脆不要換頻道）。
+
+    ★ 純讀記憶體，不碰任何檔案。改版增減分流會自動跟上，因為讀的是客戶端
+      自己解析出來的那份清單。
+
+    ⛔ 這兩條走不通，別再試（五台實測）：
+       · `SYSTEM_CHANNEL_SIZE` 具名變數 —— 讀到垃圾值
+       · `SYSTEM_CUR_CHANNEL` 具名變數 —— 五台全是 1，不管實際在第幾頻
+    """
+    name = server_name(hwnd)
+    if not name:
+        return None
+    pat = name.encode("utf-8") + b"\x00"
+    for base, size in scanner._iter_regions(writable_only=True):
+        if base + size > 0xFFFFFFFF:
+            continue
+        raw = scanner._read_region(base, size)
+        if not raw:
+            continue
+        raw = bytes(raw)
+        i = raw.find(pat)
+        while i >= 0:
+            got = _read_record(raw, i)
+            if got is not None:
+                return got
+            i = raw.find(pat, i + 1)
+    return None
+
+
+def _read_record(raw: bytes, i: int) -> int | None:
+    """從候選記錄起點讀分流數；不像伺服器記錄就回 None。
+
+    合理性條件全部是**結構性的**（不看特定數值），所以換伺服器、改分流數
+    都照樣成立：port 要像 port、編號要小、兩格分流要一致且合理。
+    """
+    if i + REC_SPAN > len(raw):
+        return None
+    port, a, sid, b = struct.unpack_from("<IIII", raw, i + OFF_PORT)
+    if not (1024 <= port <= 65535):
+        return None
+    if not (1 <= sid <= 99):
+        return None
+    if a != b or not (1 <= a <= MAX_SUBSET):
+        return None
+    # ip 欄位要是像 IPv4 的字串，才不會撞到剛好長得像的資料
+    ip = raw[i + OFF_IP:i + OFF_IP + 16].split(b"\x00")[0]
+    if not re.fullmatch(rb"\d{1,3}(\.\d{1,3}){3}", ip):
+        return None
+    return a
 
 
 _TITLE_RE = re.compile(r"\(([^()]*?)-(\d+)\)\s*$")

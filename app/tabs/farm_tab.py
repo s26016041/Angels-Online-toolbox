@@ -60,8 +60,8 @@ from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, entity, inventory, monsters, move, player,
-                      scene)
+from app.game import (aob, attack, channel, entity, inventory, monsters, move,
+                      player, scene)
 from app.tabs.base_tab import BaseTab
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -216,6 +216,10 @@ SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換�
 # 多久讀一次「目前在哪張地圖」。換圖是很少發生的事，而心跳是 10ms 一拍，
 # 每拍都讀等於白花 CPU（雖然一次只要 1.5ms）。
 SCENE_SAMPLE = 0.5
+# 自動巡迴換頻道：換完之後要停多久才恢復打怪。
+# 客戶端重連實測約 1 秒，但重連後所有物件都會搬家，還要等掃描重新定位到，
+# 所以留寬一點。這段期間不打怪、不下移動指令。
+ROT_SETTLE = 5.0
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
 # 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
@@ -769,6 +773,13 @@ class CharFarmPage(QWidget):
         self._scene_t = SCENE_SAMPLE    # 第一拍就讀
         self._scene_obj: int | None = None   # 靜態指標失效時掃到的物件，快取起來
         self._scene_scanned = False          # 全掃備援只做一次，不要每次重掃
+        # 自動巡迴換頻道。從目前這一頻出發繞一圈再回來（在 3 頻 → 4,5,1,2,3）。
+        self._rot_t = 0.0            # 距離上次開始巡迴過了多久
+        self._rot_seq: list[int] = []   # 這一輪還沒去的頻道（依序）
+        self._rot_wait = 0.0         # 這一頻還要待多久才換下一個
+        self._rot_settle = 0.0       # 剛換完，還在重連／重新定位，先別打怪
+        self._rot_home = 0           # 出發時在哪一頻（只給顯示用）
+        self._rot_max = 0            # 這台伺服器有幾個分流（開始巡迴時讀）
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -899,6 +910,46 @@ class CharFarmPage(QWidget):
         mbar.addStretch(1)
         root.addLayout(mbar)
 
+        # ★ 自動巡迴換頻道：從目前這一頻出發繞一圈再回到原本那一頻。
+        #   在 3 頻就是 3 → 4 → 5 → 1 → 2 → 3。切換靠 app/game/channel.py
+        #   （跟選定怪物同一個遊戲函式，只差種類碼）。
+        rbar = QHBoxLayout()
+        self.rot_cb = QCheckBox("自動巡迴換頻道")
+        self.rot_cb.setToolTip(
+            "從**目前這一頻**出發，依序換過每一頻再回到原本那一頻。\n"
+            "例：現在在 3 頻 → 4 → 5 → 1 → 2 → 3（共 5 次切換）。\n"
+            "\n"
+            "換頻道期間會暫停打怪幾秒（要等重連＋重新定位），\n"
+            "停留那段時間照常掛機。")
+        rbar.addWidget(self.rot_cb)
+        rbar.addWidget(QLabel("每"))
+        self.rot_every = QDoubleSpinBox()
+        self.rot_every.setRange(1.0, 600.0)
+        self.rot_every.setSingleStep(5.0)
+        self.rot_every.setDecimals(0)
+        self.rot_every.setValue(30.0)
+        self.rot_every.setSuffix(" 分巡一輪")
+        self.rot_every.setFixedWidth(120)
+        self.rot_every.setToolTip("隔多久開始新的一輪巡迴（從上一輪開始算）。")
+        rbar.addWidget(self.rot_every)
+        rbar.addWidget(QLabel("每頻停留"))
+        self.rot_stay = QDoubleSpinBox()
+        self.rot_stay.setRange(5.0, 3600.0)
+        self.rot_stay.setSingleStep(10.0)
+        self.rot_stay.setDecimals(0)
+        self.rot_stay.setValue(60.0)
+        self.rot_stay.setSuffix(" 秒")
+        self.rot_stay.setFixedWidth(100)
+        self.rot_stay.setToolTip(
+            "換到一頻之後待多久才換下一頻。這段時間照常打怪。\n"
+            "⚠ 最少 5 秒 —— 客戶端重連要 1~2 秒，太短會一直在換線。")
+        rbar.addWidget(self.rot_stay)
+        self.rot_lbl = QLabel("")
+        self.rot_lbl.setStyleSheet("color: #9aa2b8;")
+        rbar.addWidget(self.rot_lbl)
+        rbar.addStretch(1)
+        root.addLayout(rbar)
+
         # 兩個小區塊：左邊是要打哪些怪（可多選、可手動輸入），右邊是附近有什麼。
         # 一律只顯示中文名字 —— 比對也是用名字，所以手動打字才會通。
         panes = QHBoxLayout()
@@ -998,6 +1049,102 @@ class CharFarmPage(QWidget):
     def _remove_picked(self) -> None:
         for it in self.picked.selectedItems():
             self.picked.takeItem(self.picked.row(it))
+
+    # ------------------------------------------------------------------
+    # -- 自動巡迴換頻道 --------------------------------------------------
+    def _switch_channel(self, n: int) -> bool:
+        """換到第 n 頻，並把所有快取的位址作廢。
+
+        ⚠⚠ **作廢位址是必要的，不是保險**：換頻道會斷線重連，狀態物件／玩家
+          物件／角色屬性／物品陣列全部搬家。舊位址還留著的話，寫入執行緒每
+          20ms 就會往一塊已經是別人的記憶體寫目標 ID —— 那是在亂改遊戲的堆積。
+        """
+        if not self._ensure_mover():
+            return False
+        self._keys.set_on(False)          # 先停手，別對著要消失的目標送封包
+        self._atk.hold_off()
+        self._cur = None
+        if not channel.switch(self._mover, n, self._rot_max):
+            return False
+        self.state = self.player = self.stats = self.inv = None
+        self._keys.eid = None
+        self._keys.stats = None
+        self._keys.pf = None
+        self._killed.clear()              # 換頻＝整批怪都換了，冷卻名單沒意義
+        self._unreach_n.clear()
+        self._scene_obj = None            # 場景物件也會搬家
+        self._scene_scanned = False
+        self._since_scan = RESCAN_GAP     # 重連完立刻重掃
+        return True
+
+    def _tick_rotation(self, dt: float) -> bool:
+        """巡迴換頻道的節奏。回傳 True = 這一拍不要打怪（正在換／剛換完）。
+
+        ★ 只有「切換的那幾秒」會暫停，**停留期間照常掛機** ——
+          不然巡迴就只是在浪費時間。
+        """
+        if not self.rot_cb.isChecked():
+            if self._rot_seq or self._rot_settle:
+                self._rot_seq, self._rot_settle = [], 0.0
+                self.rot_lbl.setText("")
+            return False
+
+        # 剛換完 → 等重連與重新定位，這段不打怪
+        if self._rot_settle > 0:
+            self._rot_settle -= dt
+            here = channel.current(self.hwnd)
+            self.rot_lbl.setText(
+                f"　換到 {here or '?'} 頻，穩定中…{self._rot_settle:.0f}s")
+            return True
+
+        if self._rot_seq:
+            self._rot_wait -= dt
+            if self._rot_wait > 0:
+                left = len(self._rot_seq)
+                self.rot_lbl.setText(
+                    f"　巡迴中：{channel.current(self.hwnd) or '?'} 頻"
+                    f"　還有 {self._rot_wait:.0f}s 換下一個（剩 {left} 站）")
+                return False              # ← 停留期間照常打怪
+            nxt = self._rot_seq.pop(0)
+            if not self._switch_channel(nxt):
+                self._rot_seq.insert(0, nxt)   # 排不進指令槽，下一拍再試
+                self._rot_wait = 1.0
+                self.rot_lbl.setText("　換頻道失敗，重試中…")
+                return True
+            self._rot_wait = float(self.rot_stay.value())
+            self._rot_settle = ROT_SETTLE
+            self._rot_settle = ROT_SETTLE
+            if not self._rot_seq:
+                self._rot_t = 0.0        # 繞完一圈了，重新計時
+                self.rot_lbl.setText(f"　巡迴完成，回到 {self._rot_home} 頻")
+            return True
+
+        # 沒在巡迴 → 累積時間，到了就排一輪
+        self._rot_t += dt
+        every = float(self.rot_every.value()) * 60.0
+        if self._rot_t < every:
+            left = every - self._rot_t
+            self.rot_lbl.setText(f"　下一輪巡迴還有 {left / 60:.0f} 分")
+            return False
+        here = channel.current(self.hwnd)
+        # ★ 分流數讀遊戲自己的 server.xml（不是寫死、也不是記憶體位址），
+        #   所以改版增減分流會自動跟上。讀不到就整輪跳過 ——
+        #   寧可不換，也不要拿猜的數字去送。
+        n = channel.count(self.sc, self.hwnd)
+        if here is None or not n:
+            self._rot_t = 0.0
+            self.rot_lbl.setText(
+                "　⚠ 讀不到目前頻道或分流數，這一輪跳過"
+                if here is None else "　⚠ 讀不到分流數（server.xml），這一輪跳過")
+            return False
+        # 從目前這一頻繞一圈回來：在 3 頻（共 5 頻）→ 4,5,1,2,3
+        self._rot_max = n
+        self._rot_home = here
+        self._rot_seq = [(here - 1 + i) % n + 1 for i in range(1, n + 1)]
+        self._rot_wait = 0.0             # 下一拍就出發
+        self.rot_lbl.setText(
+            "　開始巡迴：" + " → ".join(str(c) for c in [here] + self._rot_seq))
+        return True
 
     # ------------------------------------------------------------------
     # -- 目前在哪張地圖 --------------------------------------------------
@@ -1360,7 +1507,15 @@ class CharFarmPage(QWidget):
             self._waiting = True
             self._on_scan(self.pid)
 
-        if not self.run_cb.isChecked() or self.state is None:
+        if not self.run_cb.isChecked():
+            return
+
+        # ★ 巡迴換頻道要在「state is None」的檢查**之前** —— 換頻道會斷線重連，
+        #   那幾秒 state 本來就是 None，放後面的話狀態機會停在半路。
+        if self._tick_rotation(dt):
+            return
+
+        if self.state is None:
             return
 
         # ★ 角色死了就自動停：不然會對著空氣一直送技能鍵。
@@ -1757,6 +1912,9 @@ class CharFarmPage(QWidget):
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
         self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
+        self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
+        self.rot_every.setValue(float(g(self._key("rot_every"), 30.0)))
+        self.rot_stay.setValue(float(g(self._key("rot_stay"), 60.0)))
         self.range_spin.setValue(float(g(self._key("range"), WALK_KEEP)))
         # 巡邏點。兩種舊格式都要吃得下，不然使用者設好的點會憑空消失：
         #   最舊：只有一個「原點」home = [x, y]
@@ -1788,6 +1946,9 @@ class CharFarmPage(QWidget):
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("boss_only"), self.boss_cb.isChecked())
+        s(self._key("rotate"), self.rot_cb.isChecked())
+        s(self._key("rot_every"), float(self.rot_every.value()))
+        s(self._key("rot_stay"), float(self.rot_stay.value()))
         s(self._key("range"), float(self.range_spin.value()))
         s(self._key("spots"), [[x, y, sid] for x, y, sid in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
@@ -1803,6 +1964,9 @@ class CharFarmPage(QWidget):
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
         self.boss_cb.toggled.connect(self._save_settings)
+        self.rot_cb.toggled.connect(self._save_settings)
+        self.rot_every.valueChanged.connect(self._save_settings)
+        self.rot_stay.valueChanged.connect(self._save_settings)
         self.range_spin.valueChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
