@@ -1213,6 +1213,12 @@ class CharFarmPage(QWidget):
             return True
 
         if self._rest == "finish":
+            # ⚠ 收尾途中血魔自己回來了（喝藥、被補、門檻調高）就取消休息。
+            #   沒有這個出口的話會永遠停在收尾中、不再挑新目標 —— 等於掛機停擺。
+            if not self._rest_wanted():
+                self._rest = ""
+                self.rest_lbl.setText("")
+                return False
             foes = self._foes()
             if self._cur is not None or foes:
                 self.rest_lbl.setText(
@@ -1524,10 +1530,12 @@ class CharFarmPage(QWidget):
           而換下一隻其實只要挑清單裡還活著的即可 —— 這是換怪速度的關鍵。
           清單裡真的沒得打了，才由 tick() 去排重掃。
         """
-        # ★ 休息流程一啟動就不再挑新目標 —— 收尾階段要「打完手上這隻」，
-        #   再挑一隻新的就永遠收不了尾。
-        if self._rest:
-            return False
+        # ★ 休息流程啟動後**只挑「正在打我的怪」**。
+        #   ⚠⚠ 第一版是「一律不挑」，結果死結：有怪在打我 → 不准坐下，
+        #     但也不准挑目標 → 那隻怪永遠殺不掉 → 卡在收尾中，畫面上就是
+        #     「收尾中（1 隻怪在打我）」不動（使用者實際遇到）。
+        #   坐著也要 —— 坐著被打會起身，起身後要能反擊。
+        only_foes = bool(self._rest)
         want = self.wanted()
         me = self.my_pos()
         now = time.monotonic()
@@ -1544,7 +1552,13 @@ class CharFarmPage(QWidget):
         for m in self.mons:
             if m.eid in self._killed:
                 continue
-            if boss_only:
+            # 休息中／收尾中：只打正在打我的那幾隻，把牠們清掉才坐得下去。
+            # ⚠ 這裡**不看「選中怪物」也不看只打王** —— 打我的怪不管是什麼
+            #   都得處理掉，不然就是站在那裡挨打。
+            if only_foes:
+                if not entity.attacking(self.sc, m, self.player):
+                    continue
+            elif boss_only:
                 # ⚠ is_boss 回 None 代表「查不到」（改版位移之類）——
                 #   這種模式下一律不打，寧可不動也不要打到不該打的。
                 if monsters.is_boss(self.sc, m.type_id, idx) is not True:
@@ -1686,15 +1700,15 @@ class CharFarmPage(QWidget):
         if self.state is None:
             return
 
-        # ★ 休息（血/魔不足坐下）。要放在挑目標之前 —— 收尾階段還是會回 False
-        #   讓它繼續打，只有真的坐下時才接管。
-        if self._rest_tick(dt):
-            return
-
         # ★ 角色死了就自動停：不然會對著空氣一直送技能鍵。
         # HP 走 app/game/player.py（跨 5 台驗證過的定位）。
         # ⚠ 它的 read() 刻意不做數值檢查，HP 歸零照樣讀得到 —— 早期版本把
         #   「HP > 0」寫進合理性檢查，結果角色一死就回 None，死亡永遠測不到。
+        #
+        # ⚠⚠ 這一段**必須在 _rest_tick 之前**。放在後面的話，一旦坐下
+        #   （_rest_tick 回 True → tick 直接 return），血魔百分比就再也不會更新
+        #   → 永遠等不到「回滿」→ 坐著不動。實際發生過（使用者回報
+        #   「血魔 100 了也不會開始打」，現場看到黑狐 100%/100% 還坐著）。
         self._hp_t += dt
         if self._hp_t >= HP_CHECK_GAP:
             self._hp_t = 0.0
@@ -1715,6 +1729,11 @@ class CharFarmPage(QWidget):
                         return
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
+
+        # ★ 休息（血/魔不足坐下）。收尾階段會回 False 讓它繼續打，
+        #   只有真的坐下時才接管。放在讀完血魔之後（見上面那段的警告）。
+        if self._rest_tick(dt):
+            return
 
         # ★ 武器壞了（耐久 0）就停下來並通知 —— 壞掉的武器打不動怪，
         # 繼續掛只是白費時間。耐久掉得很慢，幾秒看一次就夠。
