@@ -45,8 +45,8 @@ class EnergyTab(BaseTab):
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
-            "按一下遊戲裡的「能量晶化」。跟你手動點那顆按鈕送出的是同一個封包"
-            "（呼叫遊戲自己的函式，加解密都由客戶端處理）。"))
+            "按一下遊戲裡的「能量晶化」或「我要晶能加倍」。跟你手動點那兩顆按鈕"
+            "送出的是同一個封包（呼叫遊戲自己的函式，加解密都由客戶端處理）。"))
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("分身"))
@@ -60,11 +60,17 @@ class EnergyTab(BaseTab):
         bar.addSpacing(16)
         self.roll_btn = QPushButton("能量晶化")
         self.roll_btn.setToolTip(
-            "送出一次能量晶化。\n"
+            "送出一次能量晶化（遊戲裡那顆按鈕）。\n"
             "⚠ 每 1 點能量可進行 1 次，屬性隨機 —— 按幾次由你決定，"
             "程式不會自動連按。")
         self.roll_btn.clicked.connect(self._roll)
         bar.addWidget(self.roll_btn)
+        self.double_btn = QPushButton("我要晶能加倍")
+        self.double_btn.setToolTip(
+            "送出一次「我要晶能加倍」（遊戲裡那顆按鈕）。\n"
+            "搖一下，有機會獲得加倍晶能。")
+        self.double_btn.clicked.connect(self._double)
+        bar.addWidget(self.double_btn)
         bar.addStretch(1)
         root.addLayout(bar)
 
@@ -128,7 +134,7 @@ class EnergyTab(BaseTab):
         self._movers[pid] = mv
         return mv
 
-    def _roll(self) -> None:
+    def _do(self, what: str, fn) -> None:
         pid = self.who.currentData()
         if pid is None:
             self.status.setText("請先選一個分身")
@@ -137,12 +143,17 @@ class EnergyTab(BaseTab):
         if mv is None:
             return
         t0 = time.time()
-        ok = energy.roll(mv)
+        ok = fn(mv)
         ms = (time.time() - t0) * 1000
-        who = self.who.currentText()
         self.status.setText(
             f"{'✔ 已送出' if ok else '⚠ 送不出去（指令槽忙碌，再按一次）'}"
-            f"　{who}　能量晶化　{ms:.0f} ms")
+            f"　{self.who.currentText()}　{what}　{ms:.0f} ms")
+
+    def _roll(self) -> None:
+        self._do("能量晶化", energy.roll)
+
+    def _double(self) -> None:
+        self._do("我要晶能加倍", energy.double)
 
     def on_close(self) -> None:
         for mv in self._movers.values():
