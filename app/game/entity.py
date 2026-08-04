@@ -86,6 +86,20 @@ KIND_MONSTER = 7
 #   （同時只有少數幾隻在打我，比例合理）。
 #   用途：挑目標時**優先打正在打我的那幾隻**，免得一路結仇被圍毆。
 OFF_FOE = 0x4D8
+# ★★ 動畫狀態的 ASCII（不是指標，字串直接內嵌在物件裡）。
+#   實測 90 秒、98 隻怪、7,626 次觀測只出現五種值
+#   （'Wait' 5579、'Dead' 1483、'Run' 317、'Att' 129、'Att2' 118），
+#   另外在別的分身看到 'Cast'。**除了 'Dead' 以外一律當活的**，
+#   所以之後多出新狀態也不會誤殺（五台實測沒有一次讀不到）。
+#   **`'Dead'` 就是屍體**，而且是唯一可靠又即時的死活訊號：
+#     · 64 隻死掉的怪裡只有 1 隻後來又變回 'Wait'（該格被回收再用）
+#     · 屍體會一直留在實體清單裡：中位 5.0 秒、最久 79.8 秒，
+#       64 隻裡有 50 隻超過 5 秒
+#     · 任何一個瞬間，清單裡有 **中位 20%、最高 50%** 是屍體
+#   → 不篩掉的話「挑最近的一隻」很常挑到別人剛殺掉的，這就是搶怪區
+#     「卡卡的、一直對著空氣」的來源。見 Entity.dead。
+OFF_STATE = 0x12C
+STATE_MAX = 8             # 讀幾 bytes；最長的是 'Att2'
 
 
 def attacking(scanner, ent, player_obj: int) -> bool:
@@ -121,6 +135,20 @@ class Entity:
     x: float = 0.0
     y: float = 0.0
     kind: int = -1            # 見 OFF_KIND；-1 = 沒讀到
+    state: str = ""           # 動畫狀態，見 OFF_STATE
+
+    @property
+    def dead(self) -> bool:
+        """牠是不是屍體 —— **挑目標之前一定要問這個**。
+
+        遊戲把動畫狀態的 ASCII 放在 OFF_STATE，死掉就是 `'Dead'`。
+        屍體不會馬上從實體清單消失（實測中位賴 5 秒、最久 79.8 秒），
+        `is_alive()`（只比對 vtable + 實體 ID）**分不出死活**，所以搶怪的
+        地方會一直挑到別人剛殺掉的那具。
+        ⚠ 讀不到狀態（空字串）時一律當成活的 —— 寧可多打一隻，
+          也不要因為讀取失敗把整批怪都跳過。
+        """
+        return self.state == "Dead"
 
     @property
     def is_monster(self) -> bool:
@@ -233,8 +261,23 @@ def _build(scanner, addrs: list[int]) -> list[Entity]:
         pos = read_pos(scanner, addr) or (0.0, 0.0)
         out.append(Entity(addr, _u32(scanner, addr + OFF_ID),
                           _u32(scanner, addr + OFF_TYPE), name, *pos,
-                          kind=_u32(scanner, addr + OFF_KIND)))
+                          kind=_u32(scanner, addr + OFF_KIND),
+                          state=read_state(scanner, addr)))
     return out
+
+
+def read_state(scanner, addr: int) -> str:
+    """動畫狀態（`'Wait'` / `'Run'` / `'Att'` / `'Att2'` / `'Cast'` / `'Dead'`）。
+
+    讀不到就回空字串 —— 呼叫端一律把空字串當「活的」（見 Entity.dead）。
+    """
+    raw = scanner._read_bytes(addr + OFF_STATE, STATE_MAX)
+    if not raw:
+        return ""
+    try:
+        return bytes(raw).split(b"\x00")[0].decode("ascii")
+    except UnicodeDecodeError:
+        return ""
 
 
 def list_entities(scanner, should_stop=None) -> list[Entity]:

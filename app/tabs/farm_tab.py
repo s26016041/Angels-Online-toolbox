@@ -59,7 +59,7 @@ from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import aob, attack, entity, inventory, move, player
+from app.game import aob, attack, entity, inventory, move, player, scene
 from app.tabs.base_tab import BaseTab
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -76,10 +76,13 @@ IDLE_SCAN_GAP = 1.5             # 沒在掛機時也持續刷新「周圍怪物�
 # 掛機時多久刷新一次怪物清單。熱區掃描實測約 28ms，所以可以一直刷。
 # ★ 必須「一直刷」而不是「沒怪才刷」：跟別人搶怪時，清單一過期就會去打
 #   別人已經殺掉的、或錯過剛生出來的那隻。
-# 掛機中、已經有目標時的刷新間隔。熱區掃描只要約 28ms，所以可以很密。
-# ⚠ 刷新變快**不會讓屍體消失** —— 牠們是真的還在遊戲的實體清單裡。
-#   加快只對「新出現的怪」有幫助。
-REFRESH_GAP = 0.3
+# 掛機中、已經有目標時的刷新間隔。熱區掃描實測 34~35ms，所以可以很密。
+# ⚠ 刷新變快**不會讓屍體消失** —— 牠們是真的還在遊戲的實體清單裡
+#   （中位賴 5 秒、最久 79.8 秒）。屍體是靠 Entity.dead 濾掉的，不是靠刷新。
+#   加快只對「早一點看到新生出來的怪」有幫助，也就是搶怪。
+# 0.3 → 0.15（使用者要求，為了搶贏別人）：掃一次 35ms，等於那條執行緒
+# 約 23% 的時間在掃，它跑在 LowPriority 不會影響畫面。
+REFRESH_GAP = 0.15
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
@@ -208,6 +211,9 @@ MELEE_RANGE = 2.0
 #   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
 CLIENT_RANGE = 20.0
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
+# 多久讀一次「目前在哪張地圖」。換圖是很少發生的事，而心跳是 10ms 一拍，
+# 每拍都讀等於白花 CPU（雖然一次只要 1.5ms）。
+SCENE_SAMPLE = 0.5
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
 # 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
@@ -453,6 +459,18 @@ class TargetWorker(_Paced):
             cur = entity.read_target(self.sc, state)
             self.hp = entity.read_target_hp(self.sc, state)
             now = time.monotonic()
+            # ★★ 最快也最準的死亡訊號：怪自己的動畫狀態變成 'Dead'。
+            #   50Hz 就讀得到，不必等 HP_SETTLE(0.5s) 或 CORPSE_SECS(0.8s)。
+            #   別人搶先殺掉我們鎖定的那隻時，這條會立刻放手去挑下一隻 ——
+            #   搶怪的地方「對著空氣卡個零點幾秒」就是這樣來的。
+            #   ⚠ confirmed 用 _saw_hp 而不是 True：沒看過血量代表我們根本
+            #     沒交戰過（那是別人的屍體），算進擊殺數會灌水。
+            #   ⚠ 不需要 self._wrote —— 我們有沒有寫過目標，跟牠死了沒無關。
+            if entity.read_state(self.sc, ent.addr) == "Dead":
+                self._job = None
+                self._wrote = False
+                self.died.emit(ent.eid, self._saw_hp)
+                return
             if self.hp > 0:
                 self._saw_hp = True
                 self._zero_at = 0.0
@@ -737,10 +755,18 @@ class CharFarmPage(QWidget):
         self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
         self._mover: move.Mover | None = None
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
-        # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）
-        self._spots: list[tuple[float, float]] = []
+        # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）。
+        # 每個點記 (x, y, 場景編號)；場景編號 None = 舊版存的、沒標記地圖。
+        # ★ 座標在每張地圖都是從 0 開始算的格子，光看座標分不出是哪張圖 ——
+        #   不記地圖就會拿 A 圖的點在 B 圖亂走（使用者要求：不同圖就不要去）。
+        self._spots: list[tuple[float, float, int | None]] = []
         self._spot_i = 0           # 現在要去第幾個
         self._spot_pts = 1         # 上次往巡邏點算出的路徑點數
+        # 目前所在地圖。心跳每 SCENE_SAMPLE 秒更新一次（見 _refresh_scene）。
+        self._scene: int | None = None
+        self._scene_t = SCENE_SAMPLE    # 第一拍就讀
+        self._scene_obj: int | None = None   # 靜態指標失效時掃到的物件，快取起來
+        self._scene_scanned = False          # 全掃備援只做一次，不要每次重掃
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -849,7 +875,9 @@ class CharFarmPage(QWidget):
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
         self.patrol_cb.setToolTip(
             "追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
-            "**完全沒有**選中的怪時，才依序走去右邊的巡邏點找。")
+            "**完全沒有**選中的怪時，才依序走去右邊的巡邏點找。\n"
+            "★ 只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
+            "　 同一張圖的不同分流算同一張，會照走。")
         mbar.addWidget(self.patrol_cb)
         mbar.addStretch(1)
         root.addLayout(mbar)
@@ -897,7 +925,9 @@ class CharFarmPage(QWidget):
 
         # 巡邏點：沒怪時依序走過去找怪（取代原本只有一個的「原點」）
         spot = QGroupBox("巡邏點")
-        spot.setFixedWidth(190)
+        # 每一列現在是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
+        # （專家級遺落之地／史萊姆晴空牧場）—— 190px 剛好卡邊會被切掉。
+        spot.setFixedWidth(240)
         sv = QVBoxLayout(spot)
         self.spot_list = QListWidget()
         self.spot_list.setFixedHeight(NEAR_HEIGHT)
@@ -907,7 +937,9 @@ class CharFarmPage(QWidget):
         # ⚠ 字別太長：主題給按鈕的 padding 是左右各 14px，
         #   「加入目前位置」要 108px，加上 X 鈕就超出區塊寬度被切掉（踩過）。
         add_btn = QPushButton("加入位置")
-        add_btn.setToolTip("把角色現在站的位置加進巡邏點。")
+        add_btn.setToolTip(
+            "把角色現在站的位置加進巡邏點，並記下是哪一張地圖。\n"
+            "掛機時只會走「目前這張地圖」的點 —— 換到別張圖就不會亂跑。")
         add_btn.clicked.connect(self._add_spot)
         srow.addWidget(add_btn)
         # 用 ASCII 的 X，不要用 ✕（部分中文字型沒有那個字形會變豆腐）
@@ -949,21 +981,68 @@ class CharFarmPage(QWidget):
             self.picked.takeItem(self.picked.row(it))
 
     # ------------------------------------------------------------------
+    # -- 目前在哪張地圖 --------------------------------------------------
+    def _read_scene(self) -> int | None:
+        """目前場景編號。優先走靜態指標（1.5ms）；它失效才掃一次留著用。"""
+        sid = scene.current_id(self.sc, allow_scan=False)
+        if sid is not None:
+            return sid
+        # 走到這裡代表靜態指標失效（多半是遊戲改版位移）。全掃 0.25 秒，
+        # 只做一次並把物件位址記下來 —— 心跳是 10ms 一拍，不能每次都掃。
+        if not self._scene_scanned:
+            self._scene_scanned = True
+            found = scene.locate(self.sc)
+            self._scene_obj = found.obj if found else None
+        if self._scene_obj is None:
+            return None
+        s = scene.read_at(self.sc, self._scene_obj)
+        if s is None:
+            self._scene_obj = None      # 物件搬家了，下次重新定位
+            self._scene_scanned = False
+        return None if s is None else s.id
+
+    def cur_scene(self) -> int | None:
+        """給 UI 用的即時版（加入巡邏點時要用，不能拿半秒前的舊值）。"""
+        self._scene = self._read_scene()
+        self._scene_t = 0.0
+        return self._scene
+
+    def _spot_here(self, sid: int | None) -> bool:
+        """這個巡邏點是不是「現在這張圖」的。
+
+        沒標記地圖的舊點一律視為可以去 —— 我們不知道它當初存在哪，
+        直接擋掉會讓使用者原本設好的巡邏路線突然全部失效。
+        """
+        if sid is None:
+            return True
+        return scene.same_map(sid, self._scene)
+
+    # ------------------------------------------------------------------
     # -- 巡邏點 --------------------------------------------------------
     def _refresh_spots(self) -> None:
         self.spot_list.clear()
-        self.spot_list.addItems(
-            [f"{n + 1}. ({x:.0f}, {y:.0f})"
-             for n, (x, y) in enumerate(self._spots)])
+        for n, (x, y, sid) in enumerate(self._spots):
+            where = scene.scene_name(sid) if sid is not None else "未標記"
+            self.spot_list.addItem(f"{n + 1}. {where} ({x:.0f}, {y:.0f})")
+            self.spot_list.item(n).setToolTip(
+                f"{where}　格子 ({x:.1f}, {y:.1f})\n"
+                + (f"場景編號 {sid}" if sid is not None else
+                   "舊版存的點，沒有記地圖 —— 在任何地圖都會走，"
+                   "想要地圖比對請刪掉重加。"))
 
     def _add_spot(self) -> None:
         p = self.my_pos()
         if p is None:
             self.status.setText("讀不到位置，請先按「掃描周圍怪物」")
             return
-        self._spots.append(p)
+        sid = self.cur_scene()
+        self._spots.append((p[0], p[1], sid))
         self._refresh_spots()
         self._save_settings()
+        where = scene.scene_name(sid) if sid is not None else "未知地圖"
+        self.status.setText(
+            f"已加入巡邏點 {len(self._spots)}：{where} ({p[0]:.0f}, {p[1]:.0f})"
+            + ("" if sid is not None else "　⚠ 讀不到地圖，這個點不會做地圖比對"))
 
     def _remove_spots(self) -> None:
         for row in sorted((self.spot_list.row(i)
@@ -1118,6 +1197,15 @@ class CharFarmPage(QWidget):
                 continue
             if not entity.is_alive(self.sc, m):
                 continue
+            # ★★ 屍體直接跳過（別人先殺掉的）。動畫狀態當場重讀 ——
+            #   掃描到現在可能已經過了 0.3 秒，牠剛好是在那之間倒下的。
+            #   ⚠ 這是搶怪區「卡卡的」的主因：實測任何一個瞬間清單裡有
+            #     中位 20%、最高 50% 是屍體，而且屍體會賴著中位 5 秒
+            #     （最久 79.8 秒）。挑最近的就常常挑到牠們，鎖上去要等
+            #     CORPSE_SECS 才發現不對 —— 每次白花快一秒。
+            #   ⚠ is_alive() 擋不掉：它只比對 vtable + 實體 ID，分不出屍體。
+            if entity.read_state(self.sc, m.addr) == "Dead":
+                continue
             # 座標要當場重讀：怪會走、角色也在走，掃描時記的早就過期了
             # ★ 不限距離：多遠的怪都收進來（使用者要求「想打多遠都可以」），
             #   排序後自然會先打最近的，遠的靠移動封包導航過去。
@@ -1267,6 +1355,13 @@ class CharFarmPage(QWidget):
         self._walk_t += dt
         me = self.my_pos()
 
+        # 目前在哪張地圖 —— 巡邏點要靠它決定「這個點是不是這張圖的」。
+        # 換圖很少發生，半秒讀一次就夠（心跳是 10ms 一拍）。
+        self._scene_t += dt
+        if self._scene_t >= SCENE_SAMPLE:
+            self._scene_t = 0.0
+            self._scene = self._read_scene()
+
         # ★ 「角色正在走路嗎」—— 隔 MOVE_SAMPLE 秒比一次位置（見常數說明）。
         #   移動中一律不重下移動指令，否則會把多點路徑砍掉、原地來回。
         self._move_t += dt
@@ -1279,29 +1374,50 @@ class CharFarmPage(QWidget):
 
         if self._cur is None:
             # ★ 追怪不限距離；「周圍完全沒有選中的怪」時才去巡邏點找（使用者要求）
-            if self.patrol_cb.isChecked() and self._spots and me:
-                self._spot_i %= len(self._spots)
-                sx, sy = self._spots[self._spot_i]
-                d = math.hypot(me[0] - sx, me[1] - sy)
-                if d <= SPOT_SLACK:
-                    # 到了這個點還是沒怪 → 換下一個點繼續找
-                    self._spot_i = (self._spot_i + 1) % len(self._spots)
-                    self._spot_pts = 1
-                    self._walk_t = WALK_GAP        # 下一拍就往新的點走
-                    self.status.setText(
-                        f"巡邏點 {self._spot_i or len(self._spots)} 沒怪"
-                        f" → 前往下一個（共 {len(self._spots)} 點）")
-                    return
-                # ⚠ 回傳值不能丟掉：走不了（尋路算不出、或指令槽被佔）時什麼都
-                #   不會發生，狀態列卻還寫著「前往」，看起來就像站著發呆。
-                if not self._moving and self._walk_t >= WALK_GAP:
-                    self._spot_pts = self._walk_toward(sx, sy, me, 0.0)
+            # ★ 只走「現在這張圖」的巡邏點 —— 座標在每張地圖都從 0 開始算，
+            #   拿別張圖的點來走會往一個完全不相干的地方衝（使用者要求擋掉）。
+            #   分流不算不同圖（天使學園 41/141/241 是同一張），見 scene.map_key。
+            if not (self.patrol_cb.isChecked() and self._spots and me):
+                return
+            # ⚠ 讀不到目前地圖時**寧可不動**：無法確認就走，等於有機會拿 A 圖的
+            #   座標在 B 圖亂衝。停下來並把原因寫在狀態列，比默默走錯好。
+            if self._scene is None and any(s[2] is not None for s in self._spots):
                 self.status.setText(
-                    f"周圍沒有選中的怪 → 前往巡邏點 {self._spot_i + 1}"
-                    f"/{len(self._spots)} ({sx:.0f},{sy:.0f})　還有 {d:.0f} 格"
-                    + ("　⛔ 算不出路徑（被地形擋住？）" if self._spot_pts == 0
-                       else f"　⛰ 繞路 {self._spot_pts} 點"
-                       if self._spot_pts > 1 else "　直線可通"))
+                    "⛔ 讀不到目前在哪張地圖 → 不移動"
+                    "（遊戲改版位移？巡邏點的地圖比對停用中）")
+                return
+            here = [n for n, s in enumerate(self._spots) if self._spot_here(s[2])]
+            if not here:
+                self.status.setText(
+                    f"⛔ {scene.scene_name(self._scene)} 沒有巡邏點"
+                    f"（已存的 {len(self._spots)} 點都在別張地圖）→ 不移動")
+                return
+            if self._spot_i not in here:
+                # 上次要去的點不在這張圖（剛換圖）→ 從這張圖的第一個開始
+                self._spot_i = here[0]
+            sx, sy, _sid = self._spots[self._spot_i]
+            d = math.hypot(me[0] - sx, me[1] - sy)
+            if d <= SPOT_SLACK:
+                # 到了這個點還是沒怪 → 換下一個點繼續找（只在這張圖的點裡輪）
+                self._spot_i = here[(here.index(self._spot_i) + 1) % len(here)]
+                self._spot_pts = 1
+                self._walk_t = WALK_GAP        # 下一拍就往新的點走
+                self.status.setText(
+                    f"巡邏點 {self._spot_i + 1} 沒怪 → 前往下一個"
+                    f"（{scene.scene_name(self._scene)} 共 {len(here)} 點）")
+                return
+            # ⚠ 回傳值不能丟掉：走不了（尋路算不出、或指令槽被佔）時什麼都
+            #   不會發生，狀態列卻還寫著「前往」，看起來就像站著發呆。
+            if not self._moving and self._walk_t >= WALK_GAP:
+                self._spot_pts = self._walk_toward(sx, sy, me, 0.0)
+            self.status.setText(
+                f"周圍沒有選中的怪 → 前往巡邏點 {self._spot_i + 1}"
+                f"（{scene.scene_name(self._scene)} 第 "
+                f"{here.index(self._spot_i) + 1}/{len(here)} 點）"
+                f" ({sx:.0f},{sy:.0f})　還有 {d:.0f} 格"
+                + ("　⛔ 算不出路徑（被地形擋住？）" if self._spot_pts == 0
+                   else f"　⛰ 繞路 {self._spot_pts} 點"
+                   if self._spot_pts > 1 else "　直線可通"))
             return
 
         m = self._cur
@@ -1597,14 +1713,21 @@ class CharFarmPage(QWidget):
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
         self.range_spin.setValue(float(g(self._key("range"), WALK_KEEP)))
-        # 巡邏點。舊版只有一個「原點」，有的話就當成第一個巡邏點帶過來。
+        # 巡邏點。兩種舊格式都要吃得下，不然使用者設好的點會憑空消失：
+        #   最舊：只有一個「原點」home = [x, y]
+        #   舊  ：spots = [[x, y], ...]        ← 沒有地圖，載進來標成「未標記」
+        #   現在：spots = [[x, y, 場景編號], ...]
         spots = g(self._key("spots"), None)
         if not spots:
             home = g(self._key("home"), None)
             spots = [home] if (isinstance(home, (list, tuple))
                                and len(home) == 2) else []
-        self._spots = [(float(p[0]), float(p[1])) for p in spots
-                       if isinstance(p, (list, tuple)) and len(p) == 2]
+        self._spots = []
+        for p in spots:
+            if not isinstance(p, (list, tuple)) or len(p) < 2:
+                continue
+            sid = int(p[2]) if len(p) > 2 and p[2] is not None else None
+            self._spots.append((float(p[0]), float(p[1]), sid))
         self._refresh_spots()
         if g(self._key("notify"), "sound") == "telegram":
             self.rb_tg.setChecked(True)
@@ -1620,7 +1743,7 @@ class CharFarmPage(QWidget):
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("range"), float(self.range_spin.value()))
-        s(self._key("spots"), [list(p) for p in self._spots])
+        s(self._key("spots"), [[x, y, sid] for x, y, sid in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
         s(self._key("tg_id"), self.tg_id.text().strip())
         config.save()
@@ -1691,8 +1814,10 @@ class FarmTab(BaseTab):
             "掛機中也能隨時加）→ ② 勾「開始掛機」。\n"
             "挑**離自己最近**的一隻打，打死立刻接下一隻。"
             "攻擊型態：遠程送攻擊封包、近戰改成按你選的那個 F 鍵。\n"
-            "想固定範圍就按「加入目前位置」記幾個巡邏點再勾「沒怪時去巡邏點找」"
+            "想固定範圍就按「加入位置」記幾個巡邏點再勾「沒怪時去巡邏點找」"
             "—— 周圍完全沒有選中的怪時會依序走過去找。\n"
+            "巡邏點會記下地圖名，**只走目前這張圖的點**；換到別張圖就原地不動，"
+            "不會拿別張圖的座標亂衝（同一張圖的不同分流算同一張）。\n"
             "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
             "不搶視窗焦點、不占用你的鍵盤滑鼠。")
         hint.setStyleSheet("color: #9aa2b8;")
