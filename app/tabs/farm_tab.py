@@ -235,6 +235,14 @@ REST_MP_DEFAULT = 30
 # 送出 Insert 之後隔多久才准再送一次。坐下要一段時間才反映到記憶體
 # （實測 91ms），太快重送會變成坐下→站起→坐下。
 SIT_GAP = 1.5
+# ⚠⚠ Insert 是**切換**不是「坐下」。所以「狀態跟預期不合就補送一次」很危險：
+#   只要讀到一次假的「沒坐著」，那一送就把角色站起來，接著又讀到沒坐著、
+#   再送、又坐下 —— 自己跟自己打架，畫面上就是不停坐下站起來（使用者回報）。
+#   解法：狀態不合要**連續**這麼久才動作，短暫的抖動一律忽略。
+SIT_CONFIRM = 1.2
+# 休息判斷多久做一次。心跳是 10ms 一拍，每拍都去讀「誰在打我」等於每秒
+# 幾千次記憶體讀取，沒必要。
+REST_SAMPLE = 0.2
 PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
 # 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
 # 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
@@ -801,6 +809,9 @@ class CharFarmPage(QWidget):
         self._rest_why = ""          # 為什麼要休息，顯示用
         self._rest_key_t = SIT_GAP   # 距離上次送 Insert 過了多久
         self._hp_pct = self._mp_pct = 100.0
+        self._sit_want = False       # 我「想要」坐著還是站著
+        self._sit_bad_t = 0.0        # 實際狀態跟想要的不合已經持續多久
+        self._rest_t = REST_SAMPLE   # 距離上次做休息判斷過了多久
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -1152,12 +1163,38 @@ class CharFarmPage(QWidget):
                 if entity.read_state(self.sc, m.addr) != "Dead"
                 and entity.attacking(self.sc, m, self.player)]
 
-    def _press_insert(self) -> bool:
-        """送一次 Insert（坐下／站起）。有冷卻，不會狂送。"""
-        if self._rest_key_t < SIT_GAP:
-            return False
-        self._rest_key_t = 0.0
-        return _send_scan(self.hwnd, VK_INSERT)
+    def _sit_down(self, dt: float) -> bool:
+        """確保角色坐著。回傳現在是不是已經坐著了。
+
+        ★ **只送「坐下」，不送「站起來」**（使用者指出的）：繼續打怪角色就會
+          自己站起來，所以起身不需要按鍵。Insert 是切換鍵，少按一個方向就少
+          一半弄反的機會。
+
+        ⚠⚠ 即使只按一個方向，也不能「讀到沒坐著就補送」——
+          讀到一次假訊號就會把剛坐好的角色又站起來，然後一路來回
+          （使用者回報的「一直坐下站起來」）。所以：
+            · 剛決定要坐 → 立刻送一次
+            · 之後要補送，得**連續** SIT_CONFIRM 秒都讀到沒坐著
+            · 兩次之間至少隔 SIT_GAP 秒（坐下要 ~91ms 才反映到記憶體）
+        """
+        if not self._sit_want:
+            self._sit_want = True
+            self._sit_bad_t = SIT_CONFIRM     # 剛決定 → 立刻可以送
+        self._rest_key_t += dt
+        if entity.is_sitting(self.sc, self.player):
+            self._sit_bad_t = 0.0
+            return True
+        self._sit_bad_t += dt
+        if self._sit_bad_t >= SIT_CONFIRM and self._rest_key_t >= SIT_GAP:
+            self._rest_key_t = 0.0
+            self._sit_bad_t = 0.0
+            _send_scan(self.hwnd, VK_INSERT)
+        return False
+
+    def _stand_up(self) -> None:
+        """不再需要坐著。**不送按鍵** —— 打怪／移動時角色會自己站起來。"""
+        self._sit_want = False
+        self._sit_bad_t = 0.0
 
     def _rest_wanted(self) -> str:
         """現在該不該休息；要的話回傳原因文字，不要回空字串。"""
@@ -1176,8 +1213,8 @@ class CharFarmPage(QWidget):
         return True
 
     def _end_rest(self, why: str) -> None:
-        if entity.is_sitting(self.sc, self.player):
-            self._press_insert()               # 起身
+        """結束休息。**不送起身按鍵** —— 恢復打怪之後角色會自己站起來。"""
+        self._stand_up()
         self._rest = ""
         self.rest_lbl.setText(f"　休息結束（{why}）")
 
@@ -1190,12 +1227,20 @@ class CharFarmPage(QWidget):
                    而且不能有怪在打我，才准坐下（使用者明確要求）
           "sit"    坐著回復，回滿就起身
         """
-        self._rest_key_t += dt
+        # 沒勾就完全不動作（也把「想坐著」清掉，免得殘留）
         if not (self.rest_hp_cb.isChecked() or self.rest_mp_cb.isChecked()):
             if self._rest:
                 self._rest = ""
+                self._sit_want = False
                 self.rest_lbl.setText("")
             return False
+
+        # ⚠ 節流：心跳 10ms 一拍，每拍都去讀「誰在打我」是每秒幾千次記憶體
+        #   讀取，沒必要。但**坐著時要維持接管**，所以沒輪到就直接沿用上次結論。
+        self._rest_t += dt
+        if self._rest_t < REST_SAMPLE:
+            return self._rest == "sit"
+        dt, self._rest_t = self._rest_t, 0.0
 
         if self._rest == "sit":
             foes = self._foes()
@@ -1205,18 +1250,17 @@ class CharFarmPage(QWidget):
                 #   第一版是直接結束休息，結果它跑去打新怪、把魔力又花掉，
                 #   MP 在門檻附近來回震盪、永遠到不了 100%（實測黑狐
                 #   86~93% 上上下下）。
-                if entity.is_sitting(self.sc, self.player):
-                    self._press_insert()       # 起身
+                self._stand_up()               # 起身不用按鍵，打下去就站起來
                 self._rest = "finish"
                 self._rest_why = f"{len(foes)} 隻怪在打我"
                 return False
             if self._rest_full():
                 self._end_rest(f"HP {self._hp_pct:.0f}% MP {self._mp_pct:.0f}%")
                 return False
-            if not entity.is_sitting(self.sc, self.player):
-                self._press_insert()           # 被打斷了就再坐一次
+            sitting = self._sit_down(dt)         # 被打斷會補坐，但不會亂切換
             self.rest_lbl.setText(
-                f"　休息中：HP {self._hp_pct:.0f}%　MP {self._mp_pct:.0f}%")
+                ("　休息中：" if sitting else "　準備坐下…　")
+                + f"HP {self._hp_pct:.0f}%　MP {self._mp_pct:.0f}%")
             return True
 
         if self._rest == "finish":
@@ -1235,9 +1279,9 @@ class CharFarmPage(QWidget):
                     + ("（手上還有一隻）" if self._cur is not None else "")
                     + (f"（{len(foes)} 隻怪在打我）" if foes else ""))
                 return False                   # ← 繼續打，把牠們解決掉
-            if self._press_insert():
-                self._rest = "sit"
-                self.rest_lbl.setText("　坐下休息…")
+            self._sit_down(dt)
+            self._rest = "sit"
+            self.rest_lbl.setText("　坐下休息…")
             return True
 
         why = self._rest_wanted()
@@ -1245,6 +1289,9 @@ class CharFarmPage(QWidget):
             self._rest = "finish"
             self._rest_why = why
             return False
+
+        # 不需要休息了 —— 直接放行去打怪，角色會自己站起來（不必送 Insert）。
+        self._stand_up()
         self.rest_lbl.setText("")
         return False
 
