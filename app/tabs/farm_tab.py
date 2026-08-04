@@ -35,7 +35,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -59,7 +60,8 @@ from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import aob, attack, entity, inventory, move, player, scene
+from app.game import (aob, attack, entity, inventory, monsters, move, player,
+                      scene)
 from app.tabs.base_tab import BaseTab
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -879,6 +881,21 @@ class CharFarmPage(QWidget):
             "★ 只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
             "　 同一張圖的不同分流算同一張，會照走。")
         mbar.addWidget(self.patrol_cb)
+        mbar.addSpacing(12)
+        # ★ 只打王：勾起來就**完全不看「選中怪物」的名字**，改成看種類 ID
+        #   是不是王（見 app/game/monsters.py）。名字比對分不出來 ——
+        #   有 20 種怪同名卻一個是王一個不是（哥布林幹部 78 / 663王…）。
+        self.boss_cb = QCheckBox("只打王")
+        self.boss_cb.setToolTip(
+            "勾起來之後**不看左邊「選中怪物」的名字**，改成只打「王」。\n"
+            "等於自動把周圍所有的王加進選中清單，而且只加王。\n"
+            "\n"
+            "王是讀遊戲自己的怪物資料判斷的（種類 ID → 王旗標），\n"
+            "不是靠名字猜 —— 有 20 種怪同名卻一個是王一個不是。\n"
+            "\n"
+            "⚠ 不分等級：周圍出現的**任何**王都會打。真的很硬的王打不贏時，\n"
+            "　 角色一死掛機會自動停下來，但還是留意一下。")
+        mbar.addWidget(self.boss_cb)
         mbar.addStretch(1)
         root.addLayout(mbar)
 
@@ -919,7 +936,9 @@ class CharFarmPage(QWidget):
         self.near = QListWidget()
         self.near.setFixedHeight(NEAR_HEIGHT)
         self.near.setSelectionMode(QListWidget.ExtendedSelection)
-        self.near.itemClicked.connect(lambda it: self._add_name(it.text()))
+        # ⚠ 用 UserRole 的名字，不要用顯示文字 —— 王的前面有「👑 」字首。
+        self.near.itemClicked.connect(
+            lambda it: self._add_name(it.data(Qt.UserRole) or it.text()))
         rv.addWidget(self.near)
         panes.addWidget(right, 1)
 
@@ -1115,13 +1134,24 @@ class CharFarmPage(QWidget):
         err = s.err
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）。
         # 掛機時每秒都在刷新，內容沒變就別重建清單 —— 不然使用者的選取會一直被清掉。
-        seen = []
+        # ★ 王的前面加「【王】」（讀遊戲自己的怪物資料，不是靠名字猜）。
+        #   ⚠ 顯示文字加了字首，所以**名字要另外存在 UserRole** —— 點名字是拿它
+        #     加進「選中怪物」的，直接用顯示文字會加成「【王】水晶傘蜥蜴」。
+        #   ⚠ 不要用 👑：中文字型沒有那個字形，會變豆腐方塊（離屏截圖實拍到）。
+        idx = monsters.index_base(self.sc)
+        seen: list[tuple[str, str]] = []          # (顯示文字, 真正的名字)
         for m in self.mons:
-            if m.name not in seen:
-                seen.append(m.name)
-        if seen != [self.near.item(i).text() for i in range(self.near.count())]:
+            if any(n == m.name for _, n in seen):
+                continue
+            crown = "【王】" if monsters.is_boss(self.sc, m.type_id, idx) else ""
+            seen.append((crown + m.name, m.name))
+        if [t for t, _ in seen] != [self.near.item(i).text()
+                                    for i in range(self.near.count())]:
             self.near.clear()
-            self.near.addItems(seen)
+            for text, name in seen:
+                it = QListWidgetItem(text)
+                it.setData(Qt.UserRole, name)
+                self.near.addItem(it)
         self._waiting = False
 
         if err:
@@ -1186,6 +1216,10 @@ class CharFarmPage(QWidget):
         want = self.wanted()
         me = self.my_pos()
         now = time.monotonic()
+        # ★ 只打王：完全不看名字，改看種類 ID 的王旗標。
+        #   索引表位址先解一次，迴圈裡每隻只要兩次 4-byte 讀取。
+        boss_only = self.boss_cb.isChecked()
+        idx = monsters.index_base(self.sc) if boss_only else None
         # _killed 存的是「到期時間」，不是記錄時間 —— 因為兩種跳過的冷卻長度
         # 不一樣（確定打死 KILL_MEMORY、只是沒給血量 NOHP_MEMORY）。
         for eid, until in list(self._killed.items()):
@@ -1193,7 +1227,14 @@ class CharFarmPage(QWidget):
                 del self._killed[eid]
         pool = []
         for m in self.mons:
-            if m.name not in want or m.eid in self._killed:
+            if m.eid in self._killed:
+                continue
+            if boss_only:
+                # ⚠ is_boss 回 None 代表「查不到」（改版位移之類）——
+                #   這種模式下一律不打，寧可不動也不要打到不該打的。
+                if monsters.is_boss(self.sc, m.type_id, idx) is not True:
+                    continue
+            elif m.name not in want:
                 continue
             if not entity.is_alive(self.sc, m):
                 continue
@@ -1238,9 +1279,12 @@ class CharFarmPage(QWidget):
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
         self._keys.eid = self._cur.eid            # 送封包時要指名打誰
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
+        info = monsters.info(self.sc, self._cur.type_id, idx) if boss_only else None
         self.status.setText(
-            f"鎖定「{self._cur.name}」　距離 {d:.1f} 格"
-            + f"　累計擊殺 {self._kills}")
+            ("【只打王】　" if boss_only else "")
+            + f"鎖定「{self._cur.name}」"
+            + (f"（{info}）" if info else "")
+            + f"　距離 {d:.1f} 格　累計擊殺 {self._kills}")
         return True
 
     def _on_died(self, eid: int, confirmed: bool = True) -> None:
@@ -1712,6 +1756,7 @@ class CharFarmPage(QWidget):
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
+        self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
         self.range_spin.setValue(float(g(self._key("range"), WALK_KEEP)))
         # 巡邏點。兩種舊格式都要吃得下，不然使用者設好的點會憑空消失：
         #   最舊：只有一個「原點」home = [x, y]
@@ -1742,6 +1787,7 @@ class CharFarmPage(QWidget):
         s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
+        s(self._key("boss_only"), self.boss_cb.isChecked())
         s(self._key("range"), float(self.range_spin.value()))
         s(self._key("spots"), [[x, y, sid] for x, y, sid in self._spots])
         s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
@@ -1756,6 +1802,7 @@ class CharFarmPage(QWidget):
         self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
+        self.boss_cb.toggled.connect(self._save_settings)
         self.range_spin.valueChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
         self.tg_id.editingFinished.connect(self._save_settings)
@@ -1818,6 +1865,8 @@ class FarmTab(BaseTab):
             "—— 周圍完全沒有選中的怪時會依序走過去找。\n"
             "巡邏點會記下地圖名，**只走目前這張圖的點**；換到別張圖就原地不動，"
             "不會拿別張圖的座標亂衝（同一張圖的不同分流算同一張）。\n"
+            "勾「只打王」就**不看選中怪物的名字**，改成只打王（清單上標【王】）"
+            "—— 是讀遊戲自己的怪物資料判斷的，不是靠名字猜。\n"
             "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
             "不搶視窗焦點、不占用你的鍵盤滑鼠。")
         hint.setStyleSheet("color: #9aa2b8;")
