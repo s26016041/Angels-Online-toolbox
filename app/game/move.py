@@ -73,6 +73,9 @@ PATH_MAX_TILES = 28.0       # 尋路的有效範圍實測約 30~40 格，超過�
 #   整段移動被退回，客戶端停在「移動中」狀態，攻擊全部被忽略。
 #   ⚠ 這是**下限**，不是設定值 —— 使用者把接戰距離調到 1.0，實際還是 1.4。
 MIN_GAP = 1.4
+# 維持距離的容差：離目標在 [keep-SLACK, keep] 之間就當作已經站好，不再微調。
+# 沒有它的話每一拍都會推一小步，看起來就是抖動。
+SLACK = 0.4
 # 這段算不出來就縮短再試（由遠到近）
 PATH_TRY = (28.0, 18.0, 10.0, 5.0)
 # ★ 直線方向被牆擋住時，換角度找繞路。
@@ -121,10 +124,26 @@ def _approach_point(here: tuple[float, float],
     # ★ 不管設定多小，離目標一律留 MIN_GAP —— 太近會被判定卡在怪身體裡。
     keep = max(keep, MIN_GAP)
     seg = math.hypot(tx - here[0], ty - here[1])
-    if seg <= keep:
-        return None                # 已經夠近，不用走
-    r = (seg - keep) / seg
-    return (here[0] + (tx - here[0]) * r, here[1] + (ty - here[1]) * r)
+    if seg > keep:                 # 太遠 → 往前走到剩 keep 格
+        r = (seg - keep) / seg
+        return (here[0] + (tx - here[0]) * r, here[1] + (ty - here[1]) * r)
+    if seg >= MIN_GAP:             # 在 [MIN_GAP, keep] 帶內 → 不動
+        return None
+    # ★★ **太近 → 退回到 keep + SLACK**（維持距離，這是遊戲自己的做法）。
+    #   唯讀觀察遊戲內建的自動打怪 45 秒：移動封包 45 包（1 秒 1 包、
+    #   點數都是 1），全程把距離維持在 1.4~1.8 格 —— 它是一邊持續微調
+    #   一邊打的，不是走到定位就不管了。
+    #   我們原本走一次就停，怪自己貼上來就再也調不回去，然後卡在牠身體裡
+    #   （遠程停在 10 格永遠不會發生，所以同一份碼黑狐正常、雪狐會卡）。
+    # ⚠ 只退到「剛好脫離重疊」（MIN_GAP+SLACK = 1.8，正好是遊戲觀察到的
+    #   上緣 1.4~1.8），**不要退回 keep** —— 遠程的 keep 是 10 格，
+    #   退回去等於放風箏，那是行為改變（使用者要求別影響黑狐）。
+    want = MIN_GAP + SLACK
+    if seg < 0.05:
+        # 完全重疊，算不出方向 —— 隨便挑一個方向退開，總比不動好
+        return (tx + want, ty)
+    return (tx + (here[0] - tx) / seg * want,
+            ty + (here[1] - ty) / seg * want)
 
 
 def pathfinder_this(scanner) -> int | None:

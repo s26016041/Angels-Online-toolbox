@@ -1430,8 +1430,15 @@ class CharFarmPage(QWidget):
         #   攻擊範圍 12 格、走路門檻 11+1.5=12.5 格 → 怪停在 12.3 格時
         #   既不打也不走，就是「朝一個方向發呆」（監控抓到 3 次，
         #   距離全是 12.3~12.4）。
+        # ★★ **太近也要下移動指令** —— 到位之後持續微調，攻擊穿插移動，
+        #   這是遊戲自己的做法（內建自動打怪 45 秒送了 45 包移動、
+        #   每包點數 1，全程把距離維持在 1.4~1.8 格）。
+        #   我們原本走一次就不管了，怪自己貼上來就再也調不回去，
+        #   然後卡在牠身體裡打不動 —— 而遠程停在 10 格永遠不會發生，
+        #   所以同一份程式碼黑狐正常、雪狐會卡。
         need_walk = gd is not None and (
-            gd > gkeep + WALK_SLACK or (not in_range and gd > gkeep))
+            gd > gkeep + WALK_SLACK or (not in_range and gd > gkeep)
+            or gd < move.MIN_GAP)
         if (self.move_cb.isChecked() and me and not self._moving
                 and self._walk_t >= WALK_GAP and need_walk):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
