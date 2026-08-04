@@ -117,6 +117,9 @@ def read(scanner, state: int) -> EnergyState | None:
     )
 
 
+_names_cache: tuple[str, ...] | None = None
+
+
 def attr_names(scanner) -> tuple[str, ...]:
     """從記憶體讀那 12 個屬性名（客戶端自己載進去的），讀不到才用後備清單。
 
@@ -129,6 +132,12 @@ def attr_names(scanner) -> tuple[str, ...]:
       現在用前四個當錨點，並且**驗證**切出來的 12 個都不含格式符 `%`。
       驗不過就用後備清單 —— 顯示錯的名字比顯示寫死的名字糟。
     """
+    # ★ 掃一遍全記憶體要 ~40ms，而這些字串一個 session 不會變（也不會因為
+    #   換分身而不同 —— 五台實測完全一樣），所以只做一次。
+    global _names_cache
+    if _names_cache is not None:
+        return _names_cache
+
     anchor = b"".join(n.encode("utf-8") + b"\x00" for n in FALLBACK_NAMES[:4])
     try:
         for base, size in scanner._iter_regions(writable_only=False):
@@ -151,10 +160,13 @@ def attr_names(scanner) -> tuple[str, ...]:
                     break
                 if len(out) == ATTR_COUNT:
                     if _names_ok(out):
-                        return tuple(out)
+                        _names_cache = tuple(out)
+                        return _names_cache
                     break                      # 抓到別張表了，換下一處
     except Exception:                          # noqa: BLE001
         pass
+    # ⚠ 讀不到時**不要快取**後備清單 —— 可能只是這一刻讀不到（剛啟動、
+    #   還在載入），下次應該再試一次讀真的。
     return FALLBACK_NAMES
 
 

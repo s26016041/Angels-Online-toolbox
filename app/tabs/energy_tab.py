@@ -285,11 +285,11 @@ class EnergyTab(BaseTab):
         sc = self._scanners.get(int(pid))
         if sc is None:
             return None, None, None
-        st = self._state.get(int(pid))
-        if not st:
-            st = entity.locate_state(sc)
-            if st:
-                self._state[int(pid)] = st
+        # ★ 用預讀好的狀態物件（開程式時跟角色名一起掃出來的）。
+        #   自己再找一次要 ~320ms，那就是「第一次切過來還會卡」的原因。
+        st = self._state.get(int(pid)) or preload.state_of(int(pid), sc)
+        if st:
+            self._state[int(pid)] = st
         return int(pid), sc, st
 
     def _read(self):
@@ -299,6 +299,7 @@ class EnergyTab(BaseTab):
         got = energy.read(sc, st)
         if got is None:                            # 物件搬家了，下次重新定位
             self._state.pop(pid, None)
+            preload.forget_state(pid)              # 預讀的那份也作廢
         return got
 
     def _clamp_limit(self, energy_now: int) -> None:

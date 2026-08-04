@@ -36,6 +36,9 @@ GAME_TITLE = "Angels Online"
 GAME_CLASS = "_MIDAGEONL_"
 
 _names: dict[int, str] = {}
+# 狀態物件位址（能量晶化、寫目標都要用）。跟角色名同一次掃描拿到，不用多掃一遍。
+# ⚠ 換地圖／重連時物件會搬家 —— 呼叫端讀到不合理的值時要 forget_state()。
+_states: dict[int, int] = {}
 
 
 @dataclass(frozen=True)
@@ -61,18 +64,27 @@ def windows() -> list:
     return out
 
 
-def _name_from_player(scanner, pid: int, account: str) -> str:
-    """從玩家物件讀角色名。**不要用 charname.read_character_name()** ——
-    那是全記憶體掃字串，一台就要 1.1~1.8 秒（實測），這裡只要 0.4~0.9 秒。
+def _scan_client(scanner, pid: int, account: str) -> str:
+    """掃一次，把**角色名與狀態物件**一起拿回來並快取。回傳角色名。
+
+    ★ 用 `entity.snapshot()` 而不是分別呼叫 `locate_player` / `locate_state`
+      —— 它一遍讀取就同時比對三種 vtable，分開叫等於多掃好幾次
+      （實測狀態物件單獨找要 ~320ms，這樣就省掉了）。
+
+    ⚠ **不要用 charname.read_character_name()** ——
+      那是全記憶體掃字串，一台就要 1.1~1.8 秒（實測）。
     """
     # 這裡才 import，避免 app.core 反過來相依 app.game（迴圈匯入）
     from app.game import entity, locate
 
     try:
         locate.warm(scanner)                  # 位址校正；全域只會真的做一次
-        obj = entity.locate_player(scanner)
-        if obj:
-            raw = scanner._read_bytes(obj + entity.OFF_NAME, entity.NAME_MAX)
+        state, player, _ents, _r, _e = entity.snapshot(scanner)
+        if state:
+            _states[pid] = state
+        if player:
+            raw = scanner._read_bytes(player + entity.OFF_NAME,
+                                      entity.NAME_MAX)
             if raw:
                 got = bytes(raw).split(b"\x00")[0].decode("utf-8")
                 if got:
@@ -80,6 +92,26 @@ def _name_from_player(scanner, pid: int, account: str) -> str:
     except Exception:                          # noqa: BLE001
         pass
     return account
+
+
+def state_of(pid: int, scanner=None):
+    """狀態物件位址。預讀過就是瞬間；沒有的話現場找一次並記起來。"""
+    got = _states.get(pid)
+    if got:
+        return got
+    if scanner is None:
+        return None
+    from app.game import entity
+
+    got = entity.locate_state(scanner)
+    if got:
+        _states[pid] = got
+    return got
+
+
+def forget_state(pid: int) -> None:
+    """狀態物件搬家了（換地圖、重連）—— 丟掉快取，下次重新找。"""
+    _states.pop(pid, None)
 
 
 def refresh(progress=None) -> list[Client]:
@@ -98,7 +130,7 @@ def refresh(progress=None) -> list[Client]:
             sc = MemoryScanner()
             try:
                 sc.open(w.pid)
-                name = _name_from_player(sc, w.pid, acc)
+                name = _scan_client(sc, w.pid, acc)
             except Exception:                  # noqa: BLE001
                 name = acc
             finally:
@@ -116,7 +148,7 @@ def name_of(pid: int, scanner=None, account: str = "") -> str:
     if got:
         return got
     if scanner is not None:
-        got = _name_from_player(scanner, pid, account)
+        got = _scan_client(scanner, pid, account)
         _names[pid] = got
         return got
     return account
@@ -126,5 +158,7 @@ def forget(pid: int | None = None) -> None:
     """清掉快取（某一台或全部）。分身關掉重開、或想強制重算時用。"""
     if pid is None:
         _names.clear()
+        _states.clear()
     else:
         _names.pop(pid, None)
+        _states.pop(pid, None)
