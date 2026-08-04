@@ -42,7 +42,7 @@ from app.core import charname, netstat, notify
 from app.core import window as win
 from app.core.alarm import Alarm, AlarmDialog
 from app.core.memory import MemoryScanner
-from app.game import items
+from app.game import items, locate
 from app.game.watcher import StatsWorker
 from app.tabs.base_tab import BaseTab
 
@@ -795,6 +795,12 @@ class ProfitTab(BaseTab):
                 sc.open(w.pid)
             except Exception:
                 continue
+            # ★ 用 AOB 把寫死的遊戲位址換成當下正確的（改版會整批位移）。
+            #   只做一次、失敗保留原值，見 app/game/locate.py。
+            try:
+                locate.warm(sc)
+            except Exception:                  # noqa: BLE001
+                pass
             insts.append((w.pid, w.hwnd, w.title, sc))
         return insts
 

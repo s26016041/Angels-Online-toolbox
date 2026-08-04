@@ -60,8 +60,8 @@ from app.core import charname, injector
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, channel, entity, inventory, monsters, move,
-                      player, scene)
+from app.game import (aob, attack, channel, entity, inventory, locate,
+                      monsters, move, player, scene)
 from app.tabs.base_tab import BaseTab
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -2013,13 +2013,17 @@ class FarmTab(BaseTab):
         self.found = QLabel("尚未偵測")
         self.found.setStyleSheet("color: #9aa2b8;")
         bar.addWidget(self.found)
+        # ★ AOB 自動定位的結果。平常是空的；遊戲改版讓位址位移時會在這裡說出來，
+        #   不然使用者只會看到「怪怪的」卻不知道發生什麼事（上次改版就是這樣）。
+        self.locate_lbl = QLabel("")
+        bar.addWidget(self.locate_lbl)
         bar.addStretch(1)
         root.addLayout(bar)
 
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
 
-        hint = QLabel(
+        hint = QLabel(  # noqa: F841 —— 版面用，之後不需要再操作
             "①「周圍怪物」是即時的 —— 點名字就加進「選中怪物」"
             "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除，"
             "掛機中也能隨時加）→ ② 勾「開始掛機」。\n"
@@ -2036,6 +2040,24 @@ class FarmTab(BaseTab):
         hint.setStyleSheet("color: #9aa2b8;")
         root.addWidget(hint)
 
+    def _show_locate(self) -> None:
+        """把 AOB 自動定位的結果顯示出來（沒事就不顯示）。"""
+        if not hasattr(self, "locate_lbl"):
+            return
+        moved, failed = locate.moved(), locate.failed()
+        if failed:
+            self.locate_lbl.setText(
+                f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（沿用舊值）："
+                + "、".join(failed[:3]))
+            self.locate_lbl.setStyleSheet("color: #e0b040;")
+        elif moved:
+            self.locate_lbl.setText(
+                f"偵測到遊戲改版，已自動重新定位 {len(moved)} 個位址")
+            self.locate_lbl.setStyleSheet("color: #7fc97f;")
+        else:
+            self.locate_lbl.setText("")
+
+        self._show_locate()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(TICK_MS)
@@ -2058,11 +2080,20 @@ class FarmTab(BaseTab):
                 sc.open(w.pid)
             except Exception:
                 continue
+            # ★ 接上第一台就用 AOB 掃一次，把所有寫死的遊戲位址換成當下正確的
+            #   —— 遊戲改版會讓它們整批位移（見 app/game/locate.py）。
+            #   只做一次（五台載的是同一份 angel.dat），失敗就保留原值。
+            try:
+                locate.warm(sc)
+                self._show_locate()
+            except Exception:                  # noqa: BLE001
+                pass                           # 定位是加分項，壞掉不能擋住掛機
             self._scanners.append(sc)
             insts.append((w.pid, w.hwnd, w.title, sc))
         if not insts:
             self.found.setText("找不到分身")
             return
+        self._show_locate()
         self._worker = ScanWorker()
         self._worker.done.connect(self._on_scan_done)
         # 掃描讓路給攻擊：掃描是大量記憶體讀取，攻擊只要準時。
