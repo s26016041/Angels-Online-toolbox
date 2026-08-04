@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import config
-from app.core import charname, injector
+from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
@@ -838,11 +838,14 @@ class CharFarmPage(QWidget):
         self.interval.setSingleStep(0.01)
         self.interval.setDecimals(2)
         self.interval.setValue(DEFAULT_INTERVAL)
-        self.interval.setSuffix(" 秒按一次")
-        self.interval.setFixedWidth(130)
+        # ⚠ 單位文字一律放在**框外**的 QLabel。用 setSuffix() 會把「秒按一次」
+        #   塞進輸入框裡，看起來像可以打字進去的內容 —— 使用者反映「怪怪的，
+        #   輸入框應該只有數字」。整個專案統一這個做法。
+        self.interval.setFixedWidth(70)
         self.interval.valueChanged.connect(self._keys.set_interval)
         self._keys.set_interval(DEFAULT_INTERVAL)
         bar.addWidget(self.interval)
+        bar.addWidget(QLabel("秒按一次"))
         bar.addSpacing(12)
         # ★ 沒有「封包攻擊」勾選框、也不顯示技能 ID —— 用哪種方式打由
         #   下面的「攻擊型態」決定（遠程送封包、近戰按鍵），技能 ID 是內部
@@ -872,8 +875,7 @@ class CharFarmPage(QWidget):
         self.range_spin.setSingleStep(0.5)
         self.range_spin.setDecimals(1)
         self.range_spin.setValue(WALK_KEEP)
-        self.range_spin.setSuffix(" 格")
-        self.range_spin.setFixedWidth(90)
+        self.range_spin.setFixedWidth(70)
         self.range_spin.setToolTip(
             "追到怪之後最遠停在幾格 —— 也就是「不用再靠近」的門檻。\n"
             "\n"
@@ -884,6 +886,7 @@ class CharFarmPage(QWidget):
             "⚠ 送攻擊封包仍固定在 12 格內，不受這個設定影響。\n"
             "⚠ 隔著地形時一律貼臉走過去，也不受這個設定影響。")
         mbar.addWidget(self.range_spin)
+        mbar.addWidget(QLabel("格"))
         mbar.addSpacing(12)
         self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
         self.patrol_cb.setToolTip(
@@ -928,22 +931,22 @@ class CharFarmPage(QWidget):
         self.rot_every.setSingleStep(5.0)
         self.rot_every.setDecimals(0)
         self.rot_every.setValue(30.0)
-        self.rot_every.setSuffix(" 分巡一輪")
-        self.rot_every.setFixedWidth(120)
+        self.rot_every.setFixedWidth(70)
         self.rot_every.setToolTip("隔多久開始新的一輪巡迴（從上一輪開始算）。")
         rbar.addWidget(self.rot_every)
+        rbar.addWidget(QLabel("分巡一輪"))
         rbar.addWidget(QLabel("每頻停留"))
         self.rot_stay = QDoubleSpinBox()
         self.rot_stay.setRange(5.0, 3600.0)
         self.rot_stay.setSingleStep(10.0)
         self.rot_stay.setDecimals(0)
         self.rot_stay.setValue(60.0)
-        self.rot_stay.setSuffix(" 秒")
-        self.rot_stay.setFixedWidth(100)
+        self.rot_stay.setFixedWidth(70)
         self.rot_stay.setToolTip(
             "換到一頻之後待多久才換下一頻。這段時間照常打怪。\n"
             "⚠ 最少 5 秒 —— 客戶端重連要 1~2 秒，太短會一直在換線。")
         rbar.addWidget(self.rot_stay)
+        rbar.addWidget(QLabel("秒"))
         self.rot_lbl = QLabel("")
         self.rot_lbl.setStyleSheet("color: #9aa2b8;")
         rbar.addWidget(self.rot_lbl)
@@ -2104,7 +2107,10 @@ class FarmTab(BaseTab):
             keys.start(QThread.HighPriority)
             self._keys += [tgt, keys]
             acct = charname.account_from_title(title)
-            nm = charname.read_character_name(sc, acct) or acct
+            # ⚠ 用預讀的快取，**不要叫 charname.read_character_name()** ——
+            #   那是全記憶體掃字串，一台 1.1~1.8 秒、五台就是七、八秒的凍結
+            #   （使用者回報「第一次切過去會卡一下」）。見 app/core/preload.py。
+            nm = preload.name_of(pid, sc, acct)
             # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
             page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
                                 tgt, keys, None, acct, nm,

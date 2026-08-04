@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import config
-from app.core import charname, injector
+from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import energy, entity, locate, move
@@ -48,6 +48,8 @@ COLS = 3                  # 跟遊戲畫面一樣排 3 欄
 # 太密會塞爆指令槽（只有一個槽，前一個還沒做完就會被擋掉）。
 MIN_INTERVAL = 0.8
 DEFAULT_INTERVAL = 1.5
+# 自動晶化的預設次數。刻意**不是「不限」** —— 預設值不該是「花光你全部能量」。
+DEFAULT_LIMIT = 10
 
 
 class EnergyTab(BaseTab):
@@ -138,26 +140,30 @@ class EnergyTab(BaseTab):
         self.interval.setSingleStep(0.5)
         self.interval.setDecimals(1)
         self.interval.setValue(DEFAULT_INTERVAL)
-        self.interval.setSuffix(" 秒一次")
-        self.interval.setFixedWidth(110)
+        # ⚠ 單位文字一律放框外的 QLabel，不要用 setSuffix() —— 那會把文字塞進
+        #   輸入框裡（使用者反映「輸入框應該只有數字」）。
+        self.interval.setFixedWidth(70)
         self.interval.setToolTip(
             f"兩次晶化之間隔多久。最少 {MIN_INTERVAL} 秒 —— 一輪要「晶化 → "
             "等 0.3 秒讀結果 → 可能再送加倍」，\n太密會塞爆指令槽（只有一個），"
             "送不出去的那次就白按了。")
         self.interval.valueChanged.connect(self._save)
         arow.addWidget(self.interval)
-        arow.addWidget(QLabel("最多"))
+        arow.addWidget(QLabel("秒一次，最多"))
         self.limit = QSpinBox()
-        self.limit.setRange(0, 100000)
-        self.limit.setValue(0)
-        self.limit.setSpecialValueText("不限")
-        self.limit.setSuffix(" 次")
-        self.limit.setFixedWidth(110)
+        # ★ 下限 1：不允許 0 或負數。上限會跟著目前能量動態調整（見 _refresh）
+        #   —— 填一個比能量還大的數字沒有意義，直接擋在輸入端。
+        #   「不限」不做成特殊值（那會在框裡顯示文字），要用完全部請勾右邊那個。
+        self.limit.setRange(1, DEFAULT_LIMIT)
+        self.limit.setValue(DEFAULT_LIMIT)
+        self.limit.setFixedWidth(70)
         self.limit.setToolTip(
-            "按幾次就自動停。設 0 = 不限（會一直按到能量歸零）。\n"
-            "⚠ 能量很多的時候建議填個數字 —— 一路按到底會花掉上千點。")
+            "按幾次就自動停。\n"
+            "⚠ 最大值會自動跟著目前能量走 —— 打不進比能量還大的數字。\n"
+            "　 要用完全部能量請勾右邊的「晶化全部能量」。")
         self.limit.valueChanged.connect(self._save)
         arow.addWidget(self.limit)
+        arow.addWidget(QLabel("次"))
         self.all_cb = QCheckBox("晶化全部能量")
         self.all_cb.setToolTip(
             "勾起來就**不看上面的次數**，一路按到能量歸零為止。\n"
@@ -214,10 +220,10 @@ class EnergyTab(BaseTab):
             except Exception:                       # noqa: BLE001
                 pass
             acc = charname.account_from_title(w.title)
-            try:
-                nm = charname.read_character_name(sc, acc) or acc
-            except Exception:                       # noqa: BLE001
-                nm = acc
+            # ⚠ 用預讀的快取，**不要叫 charname.read_character_name()** ——
+            #   那是全記憶體掃字串，一台 1.1~1.8 秒，五台就讓分頁卡七、八秒
+            #   （使用者回報的「切過去卡一下」）。見 app/core/preload.py。
+            nm = preload.name_of(w.pid, sc, acc)
             self._scanners[w.pid] = sc
             self.who.addItem(f"{nm}（{acc}）", w.pid)
         self.who.blockSignals(False)
@@ -257,6 +263,19 @@ class EnergyTab(BaseTab):
             self._state.pop(pid, None)
         return got
 
+    def _clamp_limit(self, energy_now: int) -> None:
+        """把「最多幾次」的上限釘在目前能量 —— 打不進比能量還大的數字。
+
+        ⚠ 用 blockSignals 包起來：setRange/setValue 會發 valueChanged，
+          沒擋掉的話每 0.5 秒的更新都會觸發一次存檔。
+        """
+        top = max(1, int(energy_now))
+        if self.limit.maximum() == top:
+            return
+        self.limit.blockSignals(True)
+        self.limit.setRange(1, top)
+        self.limit.blockSignals(False)
+
     def _on_all_toggled(self, on: bool) -> None:
         """勾了「全部」就把次數欄位鎖起來 —— 不然兩個設定會互相矛盾看不懂。"""
         self.limit.setEnabled(not on)
@@ -274,6 +293,7 @@ class EnergyTab(BaseTab):
             self.cur_lbl.setText("目前選中 —")
             return
         self.energy_lbl.setText(f"能量 {got.energy}（還能按 {got.energy} 次）")
+        self._clamp_limit(got.energy)
         self.cur_lbl.setText(
             f"目前選中 {got.result_name(self._names)}"
             + (f"　每次 {got.per_roll} 點" if got.per_roll else ""))
@@ -410,10 +430,15 @@ class EnergyTab(BaseTab):
         self.auto_cb.blockSignals(False)
         for widget, key, default in ((self.interval, "interval",
                                       DEFAULT_INTERVAL),
-                                     (self.limit, "limit", 0)):
+                                     (self.limit, "limit", DEFAULT_LIMIT)):
             widget.blockSignals(True)
-            widget.setValue(type(widget.value())(
-                config.get(self._key(key), default)))
+            val = type(widget.value())(config.get(self._key(key), default))
+            # ⚠ 舊設定檔可能存著 0（那時候 0 代表「不限」）或負數。
+            #   那種值不是「使用者選的 1 次」，是**沒有意義的舊值** ——
+            #   一律當成沒設過、用預設值，不要夾成 1。
+            if val < widget.minimum():
+                val = default
+            widget.setValue(val)
             widget.blockSignals(False)
         self.all_cb.blockSignals(True)
         self.all_cb.setChecked(bool(config.get(self._key("all"), False)))

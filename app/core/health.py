@@ -1,0 +1,135 @@
+"""自我監察：確認「讀遊戲記憶體」的那一套還準不準。
+
+遊戲改版會讓寫死的位址與版面失效。`app/game/locate.py` 的 AOB 能自動追上
+「位址整批位移」，但追不上「函式本體被重寫」或「物件欄位偏移改變」——
+那兩種只能重新逆向。這支的工作就是**在使用者被錯誤資料誤導之前先發現**。
+
+## ⚠⚠ 最重要的設計：寧可漏報，不可誤報
+
+誤報的代價很高 —— 會跳出「請等作者出新版」然後把程式關掉。所以：
+
+* **一個項目要在「所有分身」上都失敗才算壞掉。** 遊戲改版會讓每一台都壞；
+  只有一台失敗多半是那台在讀取畫面、剛換地圖、或正在重連。
+* **沒有任何分身時直接跳過**（沒開遊戲不是壞掉）。
+* 每個檢查都是**純讀取**，而且只認「明確讀不到」，不對數值內容做判斷。
+
+`tools/selfcheck.py` 用的是同一份檢查，所以指令列與程式內看到的結果一致。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from app.core import charname, preload
+from app.core.memory import MemoryScanner
+
+
+@dataclass
+class ClientResult:
+    """一台分身的檢查結果：項目名 -> (過了嗎, 說明)。"""
+
+    account: str
+    name: str
+    checks: dict[str, tuple[bool, str]] = field(default_factory=dict)
+
+
+@dataclass
+class Report:
+    clients: list[ClientResult] = field(default_factory=list)
+    # 全域項目（跟分身無關），目前只有 AOB 定位
+    locate_failed: list[str] = field(default_factory=list)
+    locate_moved: list[tuple[str, int, int]] = field(default_factory=list)
+
+    @property
+    def skipped(self) -> bool:
+        """沒有分身可檢查 —— 什麼結論都不該下。"""
+        return not self.clients
+
+    @property
+    def broken(self) -> list[str]:
+        """真的壞掉的項目：AOB 失敗，或某個項目在**每一台**上都失敗。"""
+        out = [f"位址定位失敗：{n}" for n in self.locate_failed]
+        if not self.clients:
+            return out
+        names = {k for c in self.clients for k in c.checks}
+        for key in sorted(names):
+            got = [c.checks.get(key) for c in self.clients]
+            got = [g for g in got if g is not None]
+            if got and all(not ok for ok, _ in got):
+                out.append(key)
+        return out
+
+
+def check_client(sc, hwnd: int, account: str) -> ClientResult:
+    """跑完一台分身的所有檢查。純讀取。"""
+    from app.game import channel, energy, entity, locate, monsters
+    from app.game import player, scene
+
+    locate.warm(sc)
+    res = ClientResult(account=account, name=account)
+
+    def put(key, ok, detail=""):
+        res.checks[key] = (bool(ok), detail)
+
+    st = pl = None
+    try:
+        st, pl, ents, _r, _e = entity.snapshot(sc)
+    except Exception as exc:                   # noqa: BLE001
+        ents = []
+        put("怪物掃描", False, str(exc))
+    else:
+        put("怪物掃描", True, f"{len([e for e in ents if e.is_monster])} 隻")
+    put("狀態物件", st is not None, st and hex(st) or "")
+    put("玩家物件", pl is not None, pl and hex(pl) or "")
+    put("玩家座標", bool(pl and entity.read_pos(sc, pl)),
+        str(entity.read_pos(sc, pl)) if pl else "")
+    mons = [e for e in ents if e.is_monster]
+    put("怪物死活狀態", all(m.state for m in mons) if mons else True,
+        f"{sum(1 for m in mons if m.dead)} 具屍體")
+
+    here = scene.current(sc)
+    put("目前地圖", here is not None, str(here))
+
+    idx = monsters.index_base(sc)
+    put("怪物範本表", idx is not None,
+        str(monsters.info(sc, mons[0].type_id, idx)) if (mons and idx) else "")
+
+    put("分流資訊",
+        channel.current(hwnd) is not None and channel.count(sc, hwnd) is not None,
+        f"{channel.current(hwnd)} / {channel.count(sc, hwnd)}")
+
+    es = energy.read(sc, st) if st else None
+    put("能量晶化欄位", es is not None, f"能量 {es.energy}" if es else "")
+    put("屬性名稱", len(energy.attr_names(sc)) == energy.ATTR_COUNT)
+
+    base = player.locate(sc)
+    stats = player.read(sc, base) if base else None
+    put("角色屬性", stats is not None,
+        f"Lv{stats.level}" if stats else "")
+    return res
+
+
+def check() -> Report:
+    """檢查所有開著的分身。沒有分身時回傳空報告（`skipped` 為 True）。"""
+    from app.game import locate
+
+    rep = Report()
+    wins = preload.windows()
+    if not wins:
+        return rep
+    for w in wins:
+        acc = charname.account_from_title(w.title) or ""
+        sc = MemoryScanner()
+        try:
+            sc.open(w.pid)
+            got = check_client(sc, w.hwnd, acc)
+            got.name = preload.name_of(w.pid, sc, acc)
+            rep.clients.append(got)
+        except Exception as exc:               # noqa: BLE001
+            bad = ClientResult(account=acc, name=acc)
+            bad.checks["讀取記憶體"] = (False, str(exc))
+            rep.clients.append(bad)
+        finally:
+            sc.close()
+    rep.locate_failed = locate.failed()
+    rep.locate_moved = locate.moved()
+    return rep

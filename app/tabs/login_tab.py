@@ -97,10 +97,16 @@ class LoginTab(BaseTab):
         exe_row.addWidget(self.exe_edit)
         exe_row.addWidget(browse_btn)
         game_form.addRow("遊戲執行檔：", exe_row)
+        # ⚠ 單位文字放框外，不要用 setSuffix() —— 那會把「秒」塞進輸入框裡，
+        #   看起來像可以打字進去的內容（使用者反映「輸入框應該只有數字」）。
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 120)
-        self.delay_spin.setSuffix(" 秒")
-        game_form.addRow("啟動後等待：", self.delay_spin)
+        self.delay_spin.setFixedWidth(70)
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(self.delay_spin)
+        delay_row.addWidget(QLabel("秒"))
+        delay_row.addStretch(1)
+        game_form.addRow("啟動後等待：", delay_row)
         root.addWidget(game_box)
 
         # --- 帳號 ---

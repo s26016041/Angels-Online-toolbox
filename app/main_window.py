@@ -38,6 +38,13 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
 
+        # ★ 先把慢的東西讀完（角色名、位址校正），配進度視窗。
+        #   不做的話第一次切到掛機／晶化分頁會凍住三、四秒，而且使用者不知道
+        #   在等什麼（他回報「切過去會卡一下」）。沒開遊戲就直接跳過。
+        from app.preload_ui import run_with_dialog
+
+        run_with_dialog(self)
+
         self._loaded_tabs: list[BaseTab] = []
         self._load_tabs()
 
@@ -48,6 +55,13 @@ class MainWindow(QMainWindow):
 
         self._updater = UpdateManager(self)
         self._updater.start()
+
+        # ★ 背景自我監察：遊戲改版讓讀取邏輯失效時，跳通知並關掉程式。
+        #   壞掉時讀到的是垃圾數值而不是「沒有數值」，繼續開著會誤導使用者。
+        #   判定很保守（要所有分身都失敗），沒開遊戲時完全不檢查。
+        from app import health_ui
+
+        self._health = health_ui.start(self)
 
     # ------------------------------------------------------------------
     # 分頁自動載入
