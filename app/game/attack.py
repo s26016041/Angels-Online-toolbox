@@ -32,9 +32,9 @@
 """
 from __future__ import annotations
 
-ACTION_FN = 0x005DA9F4      # ①動作。f(玩家物件−8, 動作碼)
-SELECT_FN = 0x005D3EB5      # ②選定。f(0x0C, 目標實體ID)
-CAST_FN = 0x00559FF8        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
+ACTION_FN = 0x005DA8E5      # ①動作。f(玩家物件−8, 動作碼)
+SELECT_FN = 0x005D3D97      # ②選定。f(0x0C, 目標實體ID)
+CAST_FN = 0x00559EDA        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 
 # ⛔ 曾經加過第四包 0x559FBE（遊戲在施放之間會夾送，45 秒 17 次）。
 #   我的 A/B 測到「只送動作＋施放 0 隻、加上它 3~4 隻」，但**使用者實跑
