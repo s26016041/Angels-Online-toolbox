@@ -23,11 +23,13 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -42,6 +44,10 @@ from app.tabs.base_tab import BaseTab
 SETTLE_MS = 300
 REFRESH_MS = 500          # 畫面更新間隔（純讀取，很便宜）
 COLS = 3                  # 跟遊戲畫面一樣排 3 欄
+# 自動晶化的最快間隔。一輪要「晶化 → 等 0.3s → 判斷 → 可能再送加倍」，
+# 太密會塞爆指令槽（只有一個槽，前一個還沒做完就會被擋掉）。
+MIN_INTERVAL = 0.8
+DEFAULT_INTERVAL = 1.5
 
 
 class EnergyTab(BaseTab):
@@ -64,7 +70,8 @@ class EnergyTab(BaseTab):
         bar.addWidget(QLabel("分身"))
         self.who = QComboBox()
         self.who.setFixedWidth(240)
-        self.who.currentIndexChanged.connect(self._refresh)
+        # ⚠ 換分身一定要停掉自動晶化 —— 不然會繼續對「新選的那台」按下去。
+        self.who.currentIndexChanged.connect(self._on_who_changed)
         bar.addWidget(self.who)
         refresh = QPushButton("重新整理")
         refresh.setToolTip("重新列出目前開著的遊戲分身。")
@@ -115,10 +122,65 @@ class EnergyTab(BaseTab):
         row.addStretch(1)
         root.addLayout(row)
 
+        # --- 自動晶化 ---------------------------------------------------
+        arow = QHBoxLayout()
+        self.auto_roll_cb = QCheckBox("自動晶化")
+        self.auto_roll_cb.setToolTip(
+            "照下面的間隔一直按「能量晶化」，抽到勾選的屬性照樣自動加倍。\n"
+            "\n"
+            "會自動停下來的情況：能量歸零、按到設定的次數、\n"
+            "換分身、取消勾選、關掉分頁。")
+        self.auto_roll_cb.toggled.connect(self._toggle_auto)
+        arow.addWidget(self.auto_roll_cb)
+        arow.addWidget(QLabel("每"))
+        self.interval = QDoubleSpinBox()
+        self.interval.setRange(MIN_INTERVAL, 30.0)
+        self.interval.setSingleStep(0.5)
+        self.interval.setDecimals(1)
+        self.interval.setValue(DEFAULT_INTERVAL)
+        self.interval.setSuffix(" 秒一次")
+        self.interval.setFixedWidth(110)
+        self.interval.setToolTip(
+            f"兩次晶化之間隔多久。最少 {MIN_INTERVAL} 秒 —— 一輪要「晶化 → "
+            "等 0.3 秒讀結果 → 可能再送加倍」，\n太密會塞爆指令槽（只有一個），"
+            "送不出去的那次就白按了。")
+        self.interval.valueChanged.connect(self._save)
+        arow.addWidget(self.interval)
+        arow.addWidget(QLabel("最多"))
+        self.limit = QSpinBox()
+        self.limit.setRange(0, 100000)
+        self.limit.setValue(0)
+        self.limit.setSpecialValueText("不限")
+        self.limit.setSuffix(" 次")
+        self.limit.setFixedWidth(110)
+        self.limit.setToolTip(
+            "按幾次就自動停。設 0 = 不限（會一直按到能量歸零）。\n"
+            "⚠ 能量很多的時候建議填個數字 —— 一路按到底會花掉上千點。")
+        self.limit.valueChanged.connect(self._save)
+        arow.addWidget(self.limit)
+        self.all_cb = QCheckBox("晶化全部能量")
+        self.all_cb.setToolTip(
+            "勾起來就**不看上面的次數**，一路按到能量歸零為止。\n"
+            "\n"
+            "⚠ 能量多的時候這會花掉全部 —— 嵐狐現在有一千多點，"
+            "按完就是一千多次。\n"
+            "　 真正的開關還是「自動晶化」，那個每次開工具箱都是關的。")
+        self.all_cb.toggled.connect(self._on_all_toggled)
+        arow.addWidget(self.all_cb)
+        self.auto_lbl = QLabel("")
+        self.auto_lbl.setStyleSheet("color: #9aa2b8;")
+        arow.addWidget(self.auto_lbl)
+        arow.addStretch(1)
+        root.addLayout(arow)
+
         self.status = QLabel("尚未選擇分身")
         self.status.setStyleSheet("color: #9aa2b8;")
         root.addWidget(self.status)
         root.addStretch(1)
+
+        self._auto_n = 0
+        self._auto_timer = QTimer(self)
+        self._auto_timer.timeout.connect(self._auto_tick)
 
         self._load()
         self._timer = QTimer(self)
@@ -195,6 +257,16 @@ class EnergyTab(BaseTab):
             self._state.pop(pid, None)
         return got
 
+    def _on_all_toggled(self, on: bool) -> None:
+        """勾了「全部」就把次數欄位鎖起來 —— 不然兩個設定會互相矛盾看不懂。"""
+        self.limit.setEnabled(not on)
+        self._save()
+
+    def _on_who_changed(self) -> None:
+        if self.auto_roll_cb.isChecked():
+            self._stop_auto("換了分身")
+        self._refresh()
+
     def _refresh(self) -> None:
         got = self._read()
         if got is None:
@@ -239,14 +311,72 @@ class EnergyTab(BaseTab):
             f"　{(time.time() - t0) * 1000:.0f} ms")
         return ok
 
-    def _roll(self) -> None:
+    def _roll(self) -> bool:
         before = self._read()
         if before is not None and before.energy <= 0:
             self.status.setText("⚠ 能量是 0，按了也不會有事發生")
-            return
-        if self._do("能量晶化", energy.roll) and self.auto_cb.isChecked():
+            return False
+        ok = self._do("能量晶化", energy.roll)
+        if ok and self.auto_cb.isChecked():
             # 結果要等一下才寫進記憶體（實測 106ms），用 singleShot 不卡畫面
             QTimer.singleShot(SETTLE_MS, self._after_roll)
+        return ok
+
+    # ------------------------------------------------------------------
+    # -- 自動晶化 -------------------------------------------------------
+    def _toggle_auto(self, on: bool) -> None:
+        self._save()
+        if not on:
+            self._auto_timer.stop()
+            self.auto_lbl.setText("")
+            return
+        got = self._read()
+        if got is None:
+            self.auto_roll_cb.setChecked(False)
+            self.status.setText("⚠ 讀不到狀態，先選一個分身")
+            return
+        if got.energy <= 0:
+            self.auto_roll_cb.setChecked(False)
+            self.status.setText("⚠ 能量是 0，沒得按")
+            return
+        self._auto_n = 0
+        self._auto_timer.start(int(self.interval.value() * 1000))
+        self._auto_tick()                       # 立刻按第一次，不要空等一輪
+
+    def _stop_auto(self, why: str) -> None:
+        self._auto_timer.stop()
+        self.auto_roll_cb.blockSignals(True)
+        self.auto_roll_cb.setChecked(False)
+        self.auto_roll_cb.blockSignals(False)
+        self.auto_lbl.setText(f"　已停止：{why}（共按 {self._auto_n} 次）")
+
+    def _auto_tick(self) -> None:
+        """自動晶化的一拍。每一個停止條件都在這裡檢查，漏一個就會停不下來。"""
+        if not self.auto_roll_cb.isChecked():
+            self._auto_timer.stop()
+            return
+        got = self._read()
+        if got is None:
+            self._stop_auto("讀不到狀態（換地圖／重連？）")
+            return
+        if got.energy <= 0:
+            self._stop_auto("能量用完了")
+            return
+        # 勾了「晶化全部能量」就不看次數，只靠能量歸零收工
+        limit = 0 if self.all_cb.isChecked() else int(self.limit.value())
+        if limit and self._auto_n >= limit:
+            self._stop_auto(f"到達設定的 {limit} 次")
+            return
+        if not self._roll():
+            self.auto_lbl.setText("　指令槽忙碌，下一拍再試")
+            return
+        self._auto_n += 1
+        self.auto_lbl.setText(
+            f"　自動晶化中：第 {self._auto_n} 次"
+            + (f" / {limit}" if limit else
+               f"（用完全部，還剩 {got.energy - 1}）"
+               if self.all_cb.isChecked() else "")
+            + f"　剩餘能量 {got.energy - 1}")
 
     def _double(self) -> None:
         self._do("我要晶能加倍", energy.double)
@@ -278,14 +408,32 @@ class EnergyTab(BaseTab):
         self.auto_cb.blockSignals(True)
         self.auto_cb.setChecked(bool(config.get(self._key("auto"), True)))
         self.auto_cb.blockSignals(False)
+        for widget, key, default in ((self.interval, "interval",
+                                      DEFAULT_INTERVAL),
+                                     (self.limit, "limit", 0)):
+            widget.blockSignals(True)
+            widget.setValue(type(widget.value())(
+                config.get(self._key(key), default)))
+            widget.blockSignals(False)
+        self.all_cb.blockSignals(True)
+        self.all_cb.setChecked(bool(config.get(self._key("all"), False)))
+        self.all_cb.blockSignals(False)
+        self.limit.setEnabled(not self.all_cb.isChecked())
+        # ★ 「自動晶化」刻意**不記住**：每次開工具箱都是關的。
+        #   它會一直花能量，不該因為上次忘了關就自己跑起來。
+        #   （「晶化全部能量」有記住，但它只是模式 —— 真正的開關是自動晶化。）
 
     def _save(self) -> None:
         config.set(self._key("watch"),
                    [i for i, cb in enumerate(self._boxes) if cb.isChecked()])
         config.set(self._key("auto"), self.auto_cb.isChecked())
+        config.set(self._key("interval"), float(self.interval.value()))
+        config.set(self._key("limit"), int(self.limit.value()))
+        config.set(self._key("all"), self.all_cb.isChecked())
         config.save()
 
     def on_close(self) -> None:
+        self._auto_timer.stop()
         for mv in self._movers.values():
             try:
                 mv.stop()
