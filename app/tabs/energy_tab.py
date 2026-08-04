@@ -73,6 +73,8 @@ class EnergyTab(BaseTab):
         # 使用者「想要」的次數（_load 會覆寫）。先給預設值，免得 _clamp_limit
         # 比 _load 早跑到就炸掉。
         self._limit_want = DEFAULT_LIMIT
+        # 歷史紀錄：**每個分身各自一份**（pid -> 列)，切分身時整張表換掉
+        self._logs: dict[int, list[tuple]] = {}
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
@@ -203,6 +205,9 @@ class EnergyTab(BaseTab):
         self.log.setEditTriggers(QTableWidget.NoEditTriggers)
         self.log.setSelectionMode(QTableWidget.NoSelection)
         self.log.verticalHeader().setVisible(False)
+        # 隔行換底色比較好讀（使用者要求）。顏色主題已經定好了
+        # （app/theme.py 的 alternate-background-color，比底色亮一階）。
+        self.log.setAlternatingRowColors(True)
         self.log.setFixedHeight(LOG_HEIGHT)
         hh = self.log.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.Stretch)
@@ -258,7 +263,11 @@ class EnergyTab(BaseTab):
         self.who.blockSignals(False)
         if not self._scanners:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")
+            self._show_log(None)
             return
+        # 分身還是同一批（pid 沒變）時歷史要留著，只是重新畫目前這一台的
+        pid = self.who.currentData()
+        self._show_log(int(pid) if pid is not None else None)
         # 屬性名從遊戲記憶體讀（讀不到會用後備清單）
         sc = next(iter(self._scanners.values()))
         self._names = energy.attr_names(sc)
@@ -318,6 +327,11 @@ class EnergyTab(BaseTab):
     def _on_who_changed(self) -> None:
         if self.auto_roll_cb.isChecked():
             self._stop_auto("換了分身")
+        # ⚠ 換分身時把「按之前的狀態」丟掉：那是上一台的，拿來算入帳會算到
+        #   別人頭上。
+        self._pre = None
+        pid = self.who.currentData()
+        self._show_log(int(pid) if pid is not None else None)
         self._refresh()
 
     def _set_buttons(self, energy_left: int | None) -> None:
@@ -388,14 +402,28 @@ class EnergyTab(BaseTab):
 
     def _log(self, action: str, result: str, credit: str = "",
              energy_left="") -> None:
-        """在歷史表最上面插一列。"""
-        self.log.insertRow(0)
-        cells = (time.strftime("%H:%M:%S"), action, result, credit,
-                 str(energy_left))
-        for col, text in enumerate(cells):
-            self.log.setItem(0, col, QTableWidgetItem(text))
-        while self.log.rowCount() > LOG_MAX:
-            self.log.removeRow(self.log.rowCount() - 1)
+        """記一列到**目前這個分身自己的**歷史。
+
+        ⚠ 每個分身各自一份，不混在一起（使用者要求）—— 混著看根本分不出
+          「精準 +20」是誰的。切分身時整張表換成那一台的。
+        """
+        pid = self.who.currentData()
+        if pid is None:
+            return
+        row = (time.strftime("%H:%M:%S"), action, result, credit,
+               str(energy_left))
+        rows = self._logs.setdefault(int(pid), [])
+        rows.insert(0, row)
+        del rows[LOG_MAX:]
+        self._show_log(int(pid))
+
+    def _show_log(self, pid: int | None) -> None:
+        """把某個分身的歷史畫進表格。pid 為 None 就清空。"""
+        rows = self._logs.get(pid, []) if pid is not None else []
+        self.log.setRowCount(len(rows))
+        for r, cells in enumerate(rows):
+            for c, text in enumerate(cells):
+                self.log.setItem(r, c, QTableWidgetItem(text))
 
     def _roll(self) -> bool:
         before = self._read()
@@ -407,8 +435,11 @@ class EnergyTab(BaseTab):
             # ★ 記下按之前的狀態：這一次的點數是入帳到「按之前選中的那個屬性」，
             #   所以要靠前後比對才算得出「實際入帳了幾點到誰身上」。
             self._pre = before
-            # 結果要等一下才寫進記憶體（實測 106ms），用 singleShot 不卡畫面
-            QTimer.singleShot(SETTLE_MS, self._after_roll)
+            # 結果要等一下才寫進記憶體（實測 106ms），用 singleShot 不卡畫面。
+            # ⚠ 把 pid 一起帶著：等這 0.3 秒的期間使用者可能換了分身，
+            #   沒帶的話結果會記到別人頭上。
+            pid = self.who.currentData()
+            QTimer.singleShot(SETTLE_MS, lambda: self._after_roll(pid))
         return ok
 
     # ------------------------------------------------------------------
@@ -479,13 +510,16 @@ class EnergyTab(BaseTab):
         ok = self._do(("自動加倍" if auto else "我要晶能加倍"), energy.double)
         if ok:
             # 加倍成不成功看「下次入帳點數」有沒有變大，也要等它寫進記憶體
+            pid = self.who.currentData()
             QTimer.singleShot(
-                SETTLE_MS + 300, lambda: self._after_double(before, auto))
+                SETTLE_MS + 300, lambda: self._after_double(before, auto, pid))
         elif auto:
             self._log("加倍", "⚠ 沒送出去（指令槽忙碌）")
         return ok
 
-    def _after_double(self, before, auto: bool) -> None:
+    def _after_double(self, before, auto: bool, pid=None) -> None:
+        if pid is not None and self.who.currentData() != pid:
+            return                             # 中途換了分身，這筆不算他的
         got = self._read()
         self._refresh()
         if got is None or before is None:
@@ -498,7 +532,9 @@ class EnergyTab(BaseTab):
             self._log("加倍", f"沒中　下次入帳 {got.per_roll} 點",
                       energy_left=got.energy)
 
-    def _after_roll(self) -> None:
+    def _after_roll(self, pid=None) -> None:
+        if pid is not None and self.who.currentData() != pid:
+            return                             # 中途換了分身，這筆不算他的
         got = self._read()
         self._refresh()
         pre = self._pre
