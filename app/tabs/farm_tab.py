@@ -216,6 +216,12 @@ SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換�
 # 多久讀一次「目前在哪張地圖」。換圖是很少發生的事，而心跳是 10ms 一拍，
 # 每拍都讀等於白花 CPU（雖然一次只要 1.5ms）。
 SCENE_SAMPLE = 0.5
+
+
+def _mmss(seconds: float) -> str:
+    """剩餘時間，精確到秒（使用者要求）。一分鐘以內就只講秒。"""
+    s = max(0, int(seconds))
+    return f"{s // 60} 分 {s % 60:02d} 秒" if s >= 60 else f"{s} 秒"
 # 自動巡迴換頻道：換完之後要停多久才恢復打怪。
 # 客戶端重連實測約 1 秒，但重連後所有物件都會搬家，還要等掃描重新定位到，
 # 所以留寬一點。這段期間不打怪、不下移動指令。
@@ -780,6 +786,7 @@ class CharFarmPage(QWidget):
         self._rot_settle = 0.0       # 剛換完，還在重連／重新定位，先別打怪
         self._rot_home = 0           # 出發時在哪一頻（只給顯示用）
         self._rot_max = 0            # 這台伺服器有幾個分流（開始巡迴時讀）
+        self._rot_last = ""          # 上次顯示的巡迴文字（沒變就不重畫）
         self._last_hp = -1
         self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
@@ -1080,6 +1087,14 @@ class CharFarmPage(QWidget):
         self._since_scan = RESCAN_GAP     # 重連完立刻重掃
         return True
 
+    def _rot_say(self, text: str) -> None:
+        """更新巡迴狀態文字。**內容沒變就不要動它** ——
+        心跳是 10ms 一拍，每拍都 setText 等於每秒重畫 100 次，白花 CPU 也會閃。
+        """
+        if text != self._rot_last:
+            self._rot_last = text
+            self.rot_lbl.setText(text)
+
     def _tick_rotation(self, dt: float) -> bool:
         """巡迴換頻道的節奏。回傳 True = 這一拍不要打怪（正在換／剛換完）。
 
@@ -1089,37 +1104,37 @@ class CharFarmPage(QWidget):
         if not self.rot_cb.isChecked():
             if self._rot_seq or self._rot_settle:
                 self._rot_seq, self._rot_settle = [], 0.0
-                self.rot_lbl.setText("")
+                self._rot_say("")
             return False
 
         # 剛換完 → 等重連與重新定位，這段不打怪
         if self._rot_settle > 0:
             self._rot_settle -= dt
             here = channel.current(self.hwnd)
-            self.rot_lbl.setText(
-                f"　換到 {here or '?'} 頻，穩定中…{self._rot_settle:.0f}s")
+            self._rot_say(
+                f"　換到 {here or '?'} 頻，穩定中…{_mmss(self._rot_settle)}")
             return True
 
         if self._rot_seq:
             self._rot_wait -= dt
             if self._rot_wait > 0:
                 left = len(self._rot_seq)
-                self.rot_lbl.setText(
+                self._rot_say(
                     f"　巡迴中：{channel.current(self.hwnd) or '?'} 頻"
-                    f"　還有 {self._rot_wait:.0f}s 換下一個（剩 {left} 站）")
+                    f"　還有 {_mmss(self._rot_wait)} 換下一個（剩 {left} 站）")
                 return False              # ← 停留期間照常打怪
             nxt = self._rot_seq.pop(0)
             if not self._switch_channel(nxt):
                 self._rot_seq.insert(0, nxt)   # 排不進指令槽，下一拍再試
                 self._rot_wait = 1.0
-                self.rot_lbl.setText("　換頻道失敗，重試中…")
+                self._rot_say("　換頻道失敗，重試中…")
                 return True
             self._rot_wait = float(self.rot_stay.value())
             self._rot_settle = ROT_SETTLE
             self._rot_settle = ROT_SETTLE
             if not self._rot_seq:
                 self._rot_t = 0.0        # 繞完一圈了，重新計時
-                self.rot_lbl.setText(f"　巡迴完成，回到 {self._rot_home} 頻")
+                self._rot_say(f"　巡迴完成，回到 {self._rot_home} 頻")
             return True
 
         # 沒在巡迴 → 累積時間，到了就排一輪
@@ -1127,7 +1142,7 @@ class CharFarmPage(QWidget):
         every = float(self.rot_every.value()) * 60.0
         if self._rot_t < every:
             left = every - self._rot_t
-            self.rot_lbl.setText(f"　下一輪巡迴還有 {left / 60:.0f} 分")
+            self._rot_say(f"　下一輪巡迴還有 {_mmss(left)}")
             return False
         here = channel.current(self.hwnd)
         # ★ 分流數讀遊戲自己的 server.xml（不是寫死、也不是記憶體位址），
@@ -1136,16 +1151,16 @@ class CharFarmPage(QWidget):
         n = channel.count(self.sc, self.hwnd)
         if here is None or not n:
             self._rot_t = 0.0
-            self.rot_lbl.setText(
-                "　⚠ 讀不到目前頻道或分流數，這一輪跳過"
-                if here is None else "　⚠ 讀不到分流數（server.xml），這一輪跳過")
+            self._rot_say(
+                "　⚠ 讀不到目前頻道（視窗標題），這一輪跳過" if here is None
+                else "　⚠ 讀不到分流數（伺服器清單），這一輪跳過")
             return False
         # 從目前這一頻繞一圈回來：在 3 頻（共 5 頻）→ 4,5,1,2,3
         self._rot_max = n
         self._rot_home = here
         self._rot_seq = [(here - 1 + i) % n + 1 for i in range(1, n + 1)]
         self._rot_wait = 0.0             # 下一拍就出發
-        self.rot_lbl.setText(
+        self._rot_say(
             "　開始巡迴：" + " → ".join(str(c) for c in [here] + self._rot_seq))
         return True
 
