@@ -137,7 +137,19 @@ def teleport(mover, scanner, jump_id: int) -> tuple[bool, str]:
         if not 0x10000 < data < 0x7FFF0000:
             return False, "封包資料指標不合理"
         mover.write(data + 2, struct.pack("<I", jump_id))
-        if mover.call_sync(SEND_FN, u32(CONN_PTR), u32(buf + 0xC),
+        # ⚠⚠ 連線與封包指標**送出去之前先擋掉 0**。
+        #   這支是補給完 3 分鐘後由計時器觸發的，那個時間點客戶端很可能正在
+        #   重連或載地圖 —— 那時 [CONN_PTR] 會是 0，而 SEND_FN 是拿它去算
+        #   位址之後才檢查 NULL 的，送 0 進去等於叫遊戲讀一個算出來的爛位址。
+        #   ⚠ 只擋 0：第一個參數到底是「連線物件指標」還是「連線編號」還沒
+        #     確定（檔頭寫物件、反組譯看起來像索引），沒把握就不要設範圍 ——
+        #     猜錯會讓趴趴GO整個失效。
+        conn, pkt = u32(CONN_PTR), u32(buf + 0xC)
+        if not conn:
+            return False, "還沒連上線（連線是 0）—— 可能正在重連"
+        if not 0x10000 < pkt < 0x7FFF0000:
+            return False, "封包指標不合理"
+        if mover.call_sync(SEND_FN, conn, pkt,
                            timeout=CALL_TIMEOUT) is None:
             return False, "送出排不進去"
     return True, f"已送出傳送：{e}"

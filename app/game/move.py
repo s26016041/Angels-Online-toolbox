@@ -190,7 +190,11 @@ _FLAG, _ORIG, _A1, _A2, _CNT, _A4, _DONE, _FN = (
     0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C)
 _A5, _ECX, _RET, _ESP = 0x20, 0x24, 0x28, 0x2C
 _A6 = 0x30                  # 第六個參數（WALK_FN 要六個）
+_BUSY = 0x34                # 跳板正在替我們執行某個函式（見 _stub_asm）
 _CODE = 0x40
+# BUSY 卡住這麼久就當作那次呼叫在遊戲那邊被例外吃掉了，強制解鎖。
+# 我們叫的函式都是幾毫秒的東西，5 秒遠遠超過任何正常情況。
+_BUSY_STUCK_SECS = 5.0
 _SCRATCH = 0x800            # 配置的是 0x1000，程式碼用不到 0x100，這之後全空
 
 
@@ -208,6 +212,22 @@ def _stub_asm(block: int) -> str:
 
     ★ 一律推六個參數：推得比它需要的多不會有事，它只是不看後面幾個。
       （六個是因為 WALK_FN 0x5D7D96 要 this + 起點XY + 終點XY + flag。）
+
+    ⚠⚠⚠ **`_BUSY` 這道閂不能拿掉**（2026-08-06 補的）。
+
+      我們掛的是 **PeekMessageA** —— 而我們請遊戲呼叫的函式裡，有些自己會
+      抽訊息（開視窗那類的 UI／Lua 函式，例如 `CreateRobotWindow`、
+      `OnPressSetSearchPoint`）。那就會**再進來一次這段 stub**。
+
+      沒有閂的話：巢狀那次會把 `_ESP` 覆蓋成它自己的 esp，外層執行完
+      `mov esp,[_ESP]` 就把 esp 設成裡層的值 → `popfd`／`popad` 讀到垃圾
+      → `jmp [_ORIG]` 帶著壞掉的堆疊與暫存器跳進真正的 PeekMessageA。
+      遊戲的訊息迴圈執行緒從此堆疊錯位，然後在**不知道多久以後**掛掉。
+      本專案記過兩次「客戶端訊息迴圈卡死」（[[jumpmap]] 的清單、
+      [[lua-engine]] 連打十幾輪），症狀完全吻合。
+
+      有閂的話：巢狀那次看到 `_BUSY` 就直接跳過，而且**旗標留著不清**，
+      所以那個請求不會遺失，下一幀再做。
     """
     return f"""
     pushad
@@ -215,7 +235,10 @@ def _stub_asm(block: int) -> str:
     mov eax, dword ptr [{block + _FLAG:#x}]
     test eax, eax
     jz skip
+    cmp dword ptr [{block + _BUSY:#x}], 0x0
+    jnz skip
     mov dword ptr [{block + _FLAG:#x}], 0x0
+    mov dword ptr [{block + _BUSY:#x}], 0x1
     mov dword ptr [{block + _ESP:#x}], esp
     push dword ptr [{block + _A6:#x}]
     push dword ptr [{block + _A5:#x}]
@@ -228,6 +251,7 @@ def _stub_asm(block: int) -> str:
     call eax
     mov esp, dword ptr [{block + _ESP:#x}]
     mov dword ptr [{block + _RET:#x}], eax
+    mov dword ptr [{block + _BUSY:#x}], 0x0
     inc dword ptr [{block + _DONE:#x}]
     skip:
     popfd
@@ -257,10 +281,16 @@ class Mover:
         self._orig = 0
         self._block = 0
         self._active = False
+        self._busy_since = None     # _BUSY 從什麼時候舉著（卡住自救用）
         # RLock 而非 Lock：call_sync() 內部會再呼叫 call()，同一條執行緒要能重入。
         self._lock = threading.RLock()
         # ★ 「有人在等指令槽」的計數（見 slot_wanted）。
+        # ⚠ `+= 1` 不是原子操作，而且**不能拿 `_lock` 來保護** —— 舉手的意思
+        #   就是「我還沒拿到 _lock」，拿它就直接卡住了。所以另外用一把小鎖。
+        #   數錯的後果不是崩潰而是**攻擊永遠停擺**：計數卡在非零 →
+        #   `slot_wanted` 恆為 True → 攻擊每一拍都讓路（見 attack._yield_now）。
         self._wanted = 0
+        self._wanted_lock = threading.Lock()
 
     @property
     def active(self) -> bool:
@@ -345,7 +375,8 @@ class Mover:
         block = pm.allocate(0x1000)
         for off, val in ((_FLAG, 0), (_ORIG, orig), (_A1, 0), (_A2, 0),
                          (_CNT, 0), (_A4, 0), (_DONE, 0), (_FN, MOVE_FN),
-                         (_A5, 0), (_A6, 0)):
+                         (_A5, 0), (_A6, 0), (_ECX, 0), (_RET, 0),
+                         (_ESP, 0), (_BUSY, 0)):
             pm.write_uint(block + off, val)
 
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -387,44 +418,92 @@ class Mover:
 
         只有一個指令槽：上一個還沒被執行完就回 False，呼叫端自己決定要不要重試。
         訊息迴圈每秒跑 60 次以上，我們的用量（每秒個位數）綽綽有餘。
+
+        ⚠⚠⚠ **`_BUSY` 也要看**，不能只看 `_FLAG`（2026-08-06 修）。
+          stub 是「讀旗標 → **清旗標** → 執行函式」，所以函式跑到一半時
+          `_FLAG` 已經是 0 了。以前只擋 `_FLAG`，等於**在 stub 正在讀參數的
+          時候把參數改掉** —— 遊戲就會拿「A 的函式配 B 的參數」去跑。
+          本類別開頭那句「這遊戲對錯誤參數的反應是當場崩潰」講的就是這個，
+          而最毒的組合是 `ACTION_FN(技能編號, …)`：第一個參數本來該是物件
+          指標，變成 0x101 之類的小整數 → 解參考 → 遊戲當場掛掉。
+          機率很低，但一秒二十幾次、五個分身、掛好幾個小時 ——
+          正好就是「偶爾、掛久了才當、完全重現不出來」的樣子。
         """
         if not self._active:
             return False
         pm = self._pm
         with self._lock:                       # ⚠ 見類別說明：不能兩邊交錯寫
             if pm.read_uint(self._block + _FLAG):
-                return False                   # 上一個還沒執行
-            for off, val in ((_FN, fn), (_A1, a1), (_A2, a2), (_CNT, a3),
-                             (_A4, a4), (_A5, a5), (_A6, a6), (_ECX, ecx)):
+                return False                   # 上一個還沒被領走
+            if not self._busy_ok(pm):
+                return False                   # 上一個還在遊戲那邊跑
+            # ⚠ `_FN` **最後才寫**（在 _FLAG 之前）：stub 的讀取順序是
+            #   參數 → ecx → fn，寫入順序跟它一致，萬一真的有人插隊也是
+            #   「舊函式配舊參數」而不是「新函式配舊參數」。
+            for off, val in ((_A1, a1), (_A2, a2), (_CNT, a3), (_A4, a4),
+                             (_A5, a5), (_A6, a6), (_ECX, ecx), (_FN, fn)):
                 pm.write_uint(self._block + off, val & 0xFFFFFFFF)
             pm.write_uint(self._block + _FLAG, 1)
         return True
 
+    def _busy_ok(self, pm) -> bool:
+        """跳板現在有空嗎？（`_BUSY` 沒舉起來）
+
+        ⚠ 附帶「卡住自救」：函式如果在遊戲那邊被例外掀掉，stub 尾巴的
+          `_BUSY = 0` 就不會執行，跳板會永遠鎖死。所以卡超過
+          `_BUSY_STUCK_SECS` 就強制解鎖 —— 我們叫的都是幾毫秒的函式，
+          卡 5 秒一定是出事了。
+        """
+        if not pm.read_uint(self._block + _BUSY):
+            self._busy_since = None
+            return True
+        now = time.monotonic()
+        if self._busy_since is None:
+            self._busy_since = now
+            return False
+        if now - self._busy_since < _BUSY_STUCK_SECS:
+            return False
+        pm.write_uint(self._block + _BUSY, 0)      # 卡太久 → 自救
+        self._busy_since = None
+        return True
+
     def call_sync(self, fn: int, *args, ecx: int = 0,
                   timeout: float = 0.5) -> int | None:
-        """呼叫並等它做完，回傳 eax；逾時回 None。
+        """呼叫並**等它真的做完**，回傳 eax；逾時回 None。
 
-        用在「先尋路、拿到點數，再送移動封包」這種有先後relation的兩步。
-        指令槽只有一個，所以一定要等前一個做完才等下一個。
+        用在「先尋路、拿到點數，再送移動封包」這種有先後關係的兩步。
+        指令槽只有一個，所以一定要等前一個做完才排下一個。
+
+        ⚠⚠⚠ **要等的是 `_DONE` 變大，不是 `_FLAG` 變 0**（2026-08-06 修）。
+          stub 的順序是「讀旗標 → 清旗標 → 執行函式 → 寫 eax → `_DONE` 加一」，
+          所以旗標在**函式開始跑之前**就已經是 0 了。以前等旗標等於
+          「請求被領走了」就回傳 —— 那時函式根本還沒跑完，讀到的 `_RET`
+          是**上一次**呼叫的回傳值。
+          實際影響：尋路回報的路徑點數是上一次的（尋路本身要 5~6ms，而輪詢
+          間隔 5ms，所以這是常態不是邊界情況），接著 `read_path()` 又在遊戲
+          還在寫 `WAYPOINTS` 的時候去讀 —— 拿到半舊半新的路線，就走去奇怪的
+          地方。`_DONE` 本來就存在而且就是為此設計的，只是沒被用到。
 
         ⚠⚠ **逾時要把旗標清掉**，否則指令槽會永久卡住：遊戲主執行緒只要忙一下
           （開視窗、等伺服器）就會來不及執行，旗標留在 1，之後**每一個**呼叫都
           回「排不進去」，而且不會自己好。實際踩過：叫了一次開視窗之後，那個
           分身的所有呼叫全部失效，只能重開遊戲。
-          清掉是安全的：跳板是「讀到旗標 → 先清掉 → 再執行」，所以我們寫 0
+          清掉是安全的：stub 是「讀到旗標 → 先清掉 → 再執行」，所以我們寫 0
           最壞情況只是那個指令不執行 —— 那本來就是逾時的意思。
+          （已經被領走、正在跑的那次不受影響，它跑完會自己把 `_BUSY` 放掉。）
         """
         # ⚠ 鎖要**含等待那段**：只鎖 call() 的話，別人可以在我們等結果時排下一個
         #   呼叫，我們就會讀到別人的 eax。
         with self._lock:
+            done0 = self._pm.read_uint(self._block + _DONE)
             if not self.call(fn, *args, ecx=ecx):
                 return None
             t0 = time.time()
             while time.time() - t0 < timeout:
-                if not self._pm.read_uint(self._block + _FLAG):
+                if self._pm.read_uint(self._block + _DONE) != done0:
                     return self._pm.read_uint(self._block + _RET)
                 time.sleep(0.005)
-            self._pm.write_uint(self._block + _FLAG, 0)      # 取消這次請求
+            self._pm.write_uint(self._block + _FLAG, 0)      # 取消還沒被領走的
         return None
 
     def path_to(self, scanner, tile_x: float, tile_y: float,
@@ -447,11 +526,13 @@ class Mover:
         if not this:
             return 0
         # 舉手說「我要用指令槽」，攻擊那邊看到就會讓一拍出來（見 slot_wanted）。
-        self._wanted += 1
+        with self._wanted_lock:
+            self._wanted += 1
         try:
             got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
         finally:
-            self._wanted -= 1
+            with self._wanted_lock:
+                self._wanted -= 1
         if not got:
             return -1
         try:
@@ -501,11 +582,13 @@ class Mover:
         wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
         cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
 
-        self._wanted += 1                  # 舉手要指令槽，攻擊會讓一拍
+        with self._wanted_lock:            # 舉手要指令槽，攻擊會讓一拍
+            self._wanted += 1
         try:
             got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
         finally:
-            self._wanted -= 1
+            with self._wanted_lock:
+                self._wanted -= 1
         if not got:
             return 0
         try:

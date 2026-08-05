@@ -380,7 +380,10 @@ class KeyWorker(_Paced):
         self.packets = True         # 使用者要不要用封包攻擊（封包模式才有意義）
         self.stats = None           # 角色屬性基準（學技能 ID 用）
         self.mover = None
-        self.pf = None              # move.pathfinder_this()：**玩家物件 −8**
+        # move.pathfinder_this()：**玩家物件 −8**。
+        # ⚠ 攻擊時**不用**這份快取（step() 會自己當場重算，見那裡的說明）；
+        #   留著只是給自動分身當「玩家物件定位好了沒」的判斷用。
+        self.pf = None
         self.eid = None             # 現在要打誰
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
@@ -449,7 +452,7 @@ class KeyWorker(_Paced):
         #   記成「已選定」，可是那一包從來沒送出去。接著 `selected` 回 True →
         #   屍體計時開始跑 → 遊戲永遠不會替這隻填血量 → 0.8 秒後把一隻活怪
         #   當屍體丟掉。每殺一隻換一次目標，這個窗口每一輪都存在。
-        eid, mover, pf, vk = self.eid, self.mover, self.pf, self.vk
+        eid, mover, vk = self.eid, self.mover, self.vk
         mode, packets, skill, pos = self.mode, self.packets, self.skill, self.pos
         try:
             if eid is None:
@@ -464,6 +467,17 @@ class KeyWorker(_Paced):
                 self._sel = eid
             # ② 攻擊。封包模式送「動作 + 施放」，送不出去（或不是封包模式）
             #    就退回狂按那個鍵。
+            #
+            # ⚠⚠⚠ `pf`（玩家物件 −8）一定要**當場重算**，不能用掃描時存的。
+            #   它是直接交給遊戲函式當 `this` 用的**裸指標**，遊戲會去解參考它
+            #   （attack.py 開頭就寫著「傳錯會當場讓遊戲崩潰」）。而玩家物件會
+            #   搬家：死亡重生、走傳送點、伺服器重連、官方精靈把人拉回城。
+            #   以前只有 `apply_scan()` 會更新它，而那是 GUI 執行緒的事 ——
+            #   掃描本身要 0.15~0.4 秒，GUI 又可能自己卡住零點幾秒，
+            #   這條執行緒 10Hz 照送，等於**拿已經被釋放的指標去叫遊戲函式好幾次**。
+            #   `pathfinder_this()` 是純讀取而且自己會驗證（沿著遊戲的管理表走，
+            #   再比對物件 ID），算不出來就回 None —— 那時寧可退回送鍵。
+            pf = move.pathfinder_this(self.sc) if mover is not None else None
             struck = (mode == MODE_PACKET and packets and skill
                       and eid and pf and mover is not None
                       and attack.strike(mover, pf, skill, eid, *pos))
@@ -1351,6 +1365,11 @@ class CharFarmPage(QWidget):
           物件／角色屬性／物品陣列全部搬家。舊位址還留著的話，寫入執行緒每
           20ms 就會往一塊已經是別人的記憶體寫目標 ID —— 那是在亂改遊戲的堆積。
         """
+        # ⚠ 先叫寫入執行緒停手，再把位址清掉 —— 順序不能反。
+        #   目前每個呼叫端都有自己先 hold_off()，但那是「剛好都有做」，
+        #   不是這支保證的。放這裡才是真的保證。
+        self._atk.hold_off()
+        self._keys.set_on(False)
         self.state = self.player = self.stats = self.inv = None
         self._keys.eid = None
         self._keys.stats = None
