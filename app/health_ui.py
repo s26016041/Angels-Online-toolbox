@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -40,8 +42,24 @@ class HealthWorker(QThread):
             self.ok.emit(rep)
 
 
-def start(parent) -> HealthWorker:
-    """開始背景監察。回傳 worker（呼叫端要留著參考，不然會被回收）。"""
+def start(parent) -> HealthWorker | None:
+    """開始背景監察。回傳 worker（呼叫端要留著參考，不然會被回收）。
+
+    ⚠⚠ **無頭模式一定要跳過**（`--selftest` 會設 offscreen）。
+      冒煙測試建好主視窗就馬上結束，而這條執行緒還在掃五台分身的記憶體
+      （`health.check()` 要 **10 秒**）—— 物件被解構時 Qt 丟
+      「QThread: Destroyed while thread is still running」，
+      Windows 直接以 **0xC0000409（STATUS_STACK_BUFFER_OVERRUN）原生當機**，
+      Python 的例外攔截完全接不到，crash.log 也不會留東西。
+
+      症狀就是「打包後的 exe 沒有載入分頁」，跟真正的白屏問題長得一模一樣，
+      很容易誤判成打包遺漏模組。實測 0.3.6 和 0.4.0 兩版都中，所以
+      **0.3.6 才會 commit 了版號卻始終沒發布**。
+
+      `app/update_ui.py` 早就有同一道防護（那邊也踩過），這裡漏掉了。
+    """
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        return None
     worker = HealthWorker(parent)
     worker.broken.connect(lambda items: _warn_and_quit(parent, items))
     worker.start(QThread.LowPriority)

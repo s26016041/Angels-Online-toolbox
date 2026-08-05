@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import QProgressDialog
 
@@ -37,7 +39,13 @@ class _Worker(QThread):
 
 
 def run_with_dialog(parent) -> None:
-    """跑預讀並顯示進度視窗。沒有遊戲開著就什麼都不做（不要跳空視窗）。"""
+    """跑預讀並顯示進度視窗。沒有遊戲開著就什麼都不做（不要跳空視窗）。
+
+    ★ 設環境變數 `AOTB_NO_PRELOAD=1` 可以整段跳過 —— 診斷打包版當機時用，
+      平常不會有人設。
+    """
+    if os.environ.get("AOTB_NO_PRELOAD") == "1":
+        return
     if not preload.windows():
         return
 
@@ -64,6 +72,20 @@ def run_with_dialog(parent) -> None:
 
     worker.progress.connect(on_progress)
     worker.done.connect(on_done)
+    # ⚠⚠ **一定要留住這個參考**。它原本只是區域變數，函式一回傳就可能被回收 ——
+    #   QThread 物件在執行緒還在跑的時候被 destroy，Windows 直接丟
+    #   0xC0000409（STATUS_STACK_BUFFER_OVERRUN）**原生當機**，
+    #   Python 的例外攔截完全接不到，crash.log 也不會有東西。
+    if parent is not None:
+        parent._preload_worker = worker
     worker.start()
     dlg.exec()                                 # 擋在這裡直到 on_done 關掉它
-    worker.wait(3000)
+    # ⚠⚠ 原本是 wait(3000)。**打包成 exe 之後預讀要 10 秒**（比原始碼慢很多），
+    #   3 秒等不完就往下走，接著物件被回收 → 就是上面那個原生當機。
+    #   症狀：exe 開起來白屏／沒視窗，而且 `--selftest` 必定失敗。
+    #   實測 0.3.6 與 0.4.0 兩版一模一樣，所以這是既有問題不是新的。
+    #   → 等到它真的結束為止；真的卡住才強制收尾。
+    if not worker.wait(60000):
+        worker.requestInterruption()
+        worker.terminate()
+        worker.wait(3000)
