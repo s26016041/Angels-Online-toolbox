@@ -27,13 +27,6 @@ KEY_METHOD = "profit.notify_method"      # "sound" | "telegram"
 KEY_ROOM = "profit.telegram_id"
 
 
-def telegram_room() -> str:
-    """目前設定的 Telegram 群組/房間 ID；沒設定回空字串。"""
-    if config.get(KEY_METHOD, "sound") != "telegram":
-        return ""
-    return str(config.get(KEY_ROOM, "") or "").strip()
-
-
 class Notifier(QObject):
     """一個分頁一份。fire() 送通知，stop() 收掉聲音與視窗。"""
 
@@ -90,7 +83,8 @@ class Notifier(QObject):
             for who, msg in payload:
                 ok, info = notify.send_telegram(room, who, "⚠ " + msg)
                 if not ok:
-                    sys.stderr.write(f"[telegram] 送出失敗 {who}: {info}\n")
+                    if sys.stderr:   # 打包版 stderr 是 None，寫了執行緒會死在 emit 之前
+                        sys.stderr.write(f"[telegram] 送出失敗 {who}: {info}\n")
                     self.failed.emit(f"⚠ Telegram 送出失敗（{who}）：{info}")
 
         threading.Thread(target=worker, daemon=True).start()

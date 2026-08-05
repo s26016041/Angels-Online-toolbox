@@ -56,8 +56,3 @@ def label(type_id: int, count: int | None = None) -> str:
     """
     name = of(type_id) or f"種類 {type_id}"
     return f"{name} ×{count}" if count is not None else name
-
-
-def loaded() -> int:
-    """已載入幾筆（0 = 還沒載入或檔案缺了）。自我監察用。"""
-    return len(_names) if _names is not None else 0

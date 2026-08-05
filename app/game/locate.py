@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 from dataclasses import dataclass
 
 GAME_MODULE = "angel.dat"
@@ -131,9 +132,11 @@ SIGS: tuple[Sig, ...] = (
     Sig("entity", "VT_PLAYER", "data", 10,
         "01 C7 07 AC 8B 7D 00 C7 47 08 F8 8B 7D 00 C7 87 10 02 00 00 00 8C 7D 00",
         0x007D8BF8),
-    Sig("entity", "VT_MAP_MOBS", "data", 1,
-        "68 88 8E 7D 00 E8 ?? ?? ?? ?? 83 C4 0C C3 FF 71 0C 0F B6 41 08 50 FF 71 04",
-        0x007D8E88),
+    # ⛔ 拿掉了：entity.VT_MAP_MOBS（怪物類型表）已經沒有任何程式在讀，
+    #    留著等於每次 warm() 都白掃一段特徵、還會多一個可能「定位失敗」的
+    #    項目餵給自我監察。要復活的話特徵是：
+    #    "68 88 8E 7D 00 E8 ?? ?? ?? ?? 83 C4 0C C3 FF 71 0C 0F B6 41 08 50 FF 71 04"
+    #    imm_at=1、2026-08-04 的值 0x007D8E88。
     Sig("player", "VTABLE_RVA", "data", 6,
         "C7 87 68 CB 00 00 1C 3E 7E 00 8D 8F 80 F2 00 00 C6 45 FC 24 E8 ?? ?? ?? ??",
         0x007E3E1C, as_rva=True),
@@ -157,6 +160,11 @@ SIGS: tuple[Sig, ...] = (
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。
 _done = False
 _report: list[tuple[str, int, int | None]] = []
+# ⚠ warm() 會被三個地方呼叫：GUI 執行緒（分頁接上分身）、預讀執行緒、
+#   自我監察執行緒。沒有鎖的話兩邊可以同時通過 `_done` 檢查，各自把
+#   6.4MB 映像讀一遍、25 段特徵掃一遍（白花 0.2~0.5 秒）。
+#   寫回的值一樣，所以不會壞，但那是浪費。
+_lock = threading.Lock()
 
 
 def _parse(pattern: str) -> tuple[bytes, bytes]:
@@ -212,40 +220,43 @@ def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
     global _done
     if _done and not force:
         return _report
-    base = scanner.module_base(GAME_MODULE)
-    if not base:
-        return []
-    info = next((m for m in scanner.list_modules()
-                 if m.name.lower() == GAME_MODULE), None)
-    if info is None:
-        return []
-    img = scanner._read_bytes(base, info.size)
-    if not img:
-        return []
-    img = bytes(img)
+    with _lock:
+        # 進到鎖裡再確認一次：等鎖的期間別人可能已經掃完了。
+        if _done and not force:
+            return _report
+        base = scanner.module_base(GAME_MODULE)
+        if not base:
+            return []
+        info = next((m for m in scanner.list_modules()
+                     if m.name.lower() == GAME_MODULE), None)
+        if info is None:
+            return []
+        img = scanner._read_bytes(base, info.size)
+        if not img:
+            return []
 
-    out: list[tuple[str, int, int | None]] = []
-    for s in SIGS:
-        sig, mask = _parse(s.pattern)
-        off = _find_unique(img, sig, mask)
-        found = None
-        if off is not None:
-            if s.kind == "fn":
-                found = base + off
-            else:
-                k = off + (s.imm_at or 0)
-                if k + 4 <= len(img):
-                    v = int.from_bytes(img[k:k + 4], "little")
-                    # 資料位址一定落在模組內，不然就是抓錯了
-                    if base <= v < base + info.size:
-                        found = v
-        if found is not None:
-            mod = importlib.import_module(f"app.game.{s.module}")
-            setattr(mod, s.attr, found - base if s.as_rva else found)
-        out.append((f"{s.module}.{s.attr}", s.known, found))
-    _done = True
-    _report[:] = out
-    return out
+        out: list[tuple[str, int, int | None]] = []
+        for s in SIGS:
+            sig, mask = _parse(s.pattern)
+            off = _find_unique(img, sig, mask)
+            found = None
+            if off is not None:
+                if s.kind == "fn":
+                    found = base + off
+                else:
+                    k = off + (s.imm_at or 0)
+                    if k + 4 <= len(img):
+                        v = int.from_bytes(img[k:k + 4], "little")
+                        # 資料位址一定落在模組內，不然就是抓錯了
+                        if base <= v < base + info.size:
+                            found = v
+            if found is not None:
+                mod = importlib.import_module(f"app.game.{s.module}")
+                setattr(mod, s.attr, found - base if s.as_rva else found)
+            out.append((f"{s.module}.{s.attr}", s.known, found))
+        _done = True
+        _report[:] = out
+        return out
 
 
 def moved(report=None) -> list[tuple[str, int, int]]:

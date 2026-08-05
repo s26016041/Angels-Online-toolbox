@@ -77,8 +77,20 @@ class ScanWorker(QThread):
         self._fn = fn
 
     def run(self) -> None:
+        # ⚠ 回呼是**每個記憶體區塊**呼叫一次（大目標有好幾千塊），而進度條
+        #   只認得 0~100。百分比沒變就不要送 —— 每一次 emit 都是一個跨執行緒
+        #   排隊事件，GUI 執行緒得一件一件處理完。
+        last = -1
+
+        def on_progress(f: float) -> None:
+            nonlocal last
+            pct = int(f * 100)
+            if pct != last:
+                last = pct
+                self.progress.emit(pct)
+
         try:
-            count = self._fn(lambda f: self.progress.emit(int(f * 100)))
+            count = self._fn(on_progress)
             self.done.emit(int(count))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
@@ -127,7 +139,7 @@ class MemoryTab(BaseTab):
         # 觀察清單即時刷新
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(800)
-        self._watch_timer.timeout.connect(self._refresh_live)
+        self._watch_timer.timeout.connect(self._refresh_watch_values)
         self._watch_timer.start()
 
         self.refresh_windows()
@@ -748,9 +760,6 @@ class MemoryTab(BaseTab):
                 value = self._scanner.read_value(entry["addr"], entry["vt"])
                 text = "讀取失敗" if value is None else str(value)
             self.watch_table.setItem(row, 2, QTableWidgetItem(text))
-
-    def _refresh_live(self) -> None:
-        self._refresh_watch_values()
 
     # ==================================================================
     # 狀態

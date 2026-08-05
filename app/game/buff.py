@@ -74,9 +74,14 @@ class AutoBuff:
             return 0.0
         return max(0.0, self.secs - (time.monotonic() - self._cast_at))
 
-    def step(self, scanner, mover, hwnd, pf_this: int, my_id: int,
+    def step(self, scanner, mover, hwnd, pf_this: int, my_id,
              stats_base: int, send_key) -> str:
-        """走一步。回傳給狀態列看的說明。"""
+        """走一步。回傳給狀態列看的說明。
+
+        my_id: 自己的實體 ID，**也可以傳一個 callable**，要用到時才呼叫。
+            ★ 那個值要讀一次記憶體，但只有真的要送補分身封包（20 分鐘一次）
+              才用得到 —— 掛機的心跳是 10ms 一拍，每拍都先算好等於白讀。
+        """
         if not self.armed:
             return self.note
         now = time.monotonic()
@@ -122,11 +127,12 @@ class AutoBuff:
             return self.note
 
         # ④ 已經知道技能編號 → 用封包補（不必停下來、不占鍵盤）
-        if not (mover is not None and mover.active and pf_this and my_id):
+        mid = my_id() if callable(my_id) else my_id
+        if not (mover is not None and mover.active and pf_this and mid):
             self.note = "⚠ 跳板沒裝上，補不了分身"
             self._sent_at = now
             return self.note
-        ok = mover.call(attack.CAST_FN, self.skill, my_id, 0, 0, 0)
+        ok = mover.call(attack.CAST_FN, self.skill, mid, 0, 0, 0)
         self._sent_at = now
         if ok:
             self._cast_at = now

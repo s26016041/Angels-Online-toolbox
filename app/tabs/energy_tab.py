@@ -40,7 +40,7 @@ from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import energy, entity, locate, move
+from app.game import energy, locate, move
 # fit_spin：數字框寬度照最大值算 —— 寫死的話上下箭頭會把數字擠掉
 # （使用者回報過「框框被砍到一半」）。
 from app.tabs.base_tab import BaseTab, fit_spin
@@ -58,6 +58,13 @@ DEFAULT_LIMIT = 10
 LOG_COLS = ("時間", "動作", "結果", "實際入帳", "剩餘能量")
 LOG_HEIGHT = 150
 LOG_MAX = 500             # 只留最近這麼多列，跑一整晚也不會吃掉記憶體
+# ⚠⚠ 狀態物件定位失敗後，隔多久才准再全掃一次。
+#   沒有這道節流的話：`_read()` 讀失敗會把快取丟掉，下一次 0.5 秒的更新就又
+#   叫一次 `entity.locate_state()`（**全記憶體掃描，0.4~1 秒，而且是在 GUI
+#   執行緒上**）。角色在登入畫面、換地圖、重連時定位本來就會失敗，於是
+#   「每 0.5 秒卡 0.5 秒以上」——畫面等於整個凍住。跟 watcher 的
+#   RELOCATE_GAP_SECS 用同一個值。
+STATE_RELOCATE_GAP = 5.0
 
 
 class EnergyTab(BaseTab):
@@ -68,6 +75,8 @@ class EnergyTab(BaseTab):
         self._movers: dict[int, move.Mover] = {}
         self._scanners: dict[int, MemoryScanner] = {}
         self._state: dict[int, int] = {}          # pid -> 狀態物件
+        # pid -> 上次「全掃找狀態物件」的時間（見 STATE_RELOCATE_GAP）
+        self._state_try: dict[int, float] = {}
         self._names = energy.FALLBACK_NAMES
         self._boxes: list[QCheckBox] = []
         # 按晶化之前的狀態。要靠它跟按之後比對，才算得出「實際入帳幾點到誰」
@@ -244,6 +253,7 @@ class EnergyTab(BaseTab):
             sc.close()
         self._scanners.clear()
         self._state.clear()
+        self._state_try.clear()      # 重新整理＝使用者要求重試，節流也一併歸零
         seen = set()
         for w in win.enumerate_windows(title_contains="Angels Online"):
             if "_MIDAGEONL_" not in w.class_name or w.pid in seen:
@@ -292,10 +302,18 @@ class EnergyTab(BaseTab):
             return None, None, None
         # ★ 用預讀好的狀態物件（開程式時跟角色名一起掃出來的）。
         #   自己再找一次要 ~320ms，那就是「第一次切過來還會卡」的原因。
-        st = self._state.get(int(pid)) or preload.state_of(int(pid), sc)
+        pid = int(pid)
+        # ⚠ 先問「不帶 scanner」的版本：那只查快取，絕對不會掃描。
+        st = self._state.get(pid) or preload.state_of(pid)
+        if not st:
+            # 真的沒有 → 才需要全掃，而且要節流（見 STATE_RELOCATE_GAP）。
+            now = time.monotonic()
+            if now - self._state_try.get(pid, 0.0) >= STATE_RELOCATE_GAP:
+                self._state_try[pid] = now
+                st = preload.state_of(pid, sc)
         if st:
-            self._state[int(pid)] = st
-        return int(pid), sc, st
+            self._state[pid] = st
+        return pid, sc, st
 
     def _read(self):
         pid, sc, st = self._cur()
@@ -384,8 +402,11 @@ class EnergyTab(BaseTab):
             mv = move.Mover(pid, injector.process_path(pid))
             mv.start()
         except Exception as exc:                    # noqa: BLE001
+            # ⚠ 失敗**不要記進 _movers**：以前記一個 active=False 的空殼進去，
+            #   上面那個 `if mv is not None` 就永遠成立 → 這台分身在關掉分頁
+            #   之前再也裝不上跳板，使用者按幾次都沒反應（連「重新整理」
+            #   也救不回來，因為那不清 _movers）。
             self.status.setText(f"⚠ 無法安裝跳板：{exc}")
-            self._movers[pid] = move.Mover(pid, "")
             return None
         self._movers[pid] = mv
         return mv
@@ -616,6 +637,9 @@ class EnergyTab(BaseTab):
 
     def on_close(self) -> None:
         self._auto_timer.stop()
+        # ⚠ 更新用的計時器也要停：下面會把 scanner 全部關掉，計時器還在跑的話
+        #   會拿已經關閉的控制碼去讀記憶體。
+        self._timer.stop()
         for mv in self._movers.values():
             try:
                 mv.stop()

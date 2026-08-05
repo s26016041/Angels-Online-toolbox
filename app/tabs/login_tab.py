@@ -40,7 +40,14 @@ from app.tabs.base_tab import BaseTab, fit_spin
 
 
 class LoginWorker(QThread):
-    """在背景執行「等待 + 自動填入帳密」，避免卡住介面。"""
+    """在背景執行「等待 + 自動填入帳密」，避免卡住介面。
+
+    ⚠⚠ 這條執行緒**沒有事件迴圈**（run() 就是一個倒數迴圈），所以
+      `quit()` 對它完全無效 —— 那只是往一個不存在的事件迴圈丟訊息。
+      以前關程式時就是這樣：等待秒數最長 120 秒，`wait(2000)` 一定逾時，
+      程式帶著一條活執行緒退出（原生當機的老坑），而且它還會繼續
+      對「當時剛好有焦點的視窗」打字。改用 requestInterruption()。
+    """
 
     status = Signal(str)
     finished_ok = Signal()
@@ -63,11 +70,22 @@ class LoginWorker(QThread):
             return
         try:
             for remaining in range(self._delay, 0, -1):
+                if self.isInterruptionRequested():
+                    return
                 self.status.emit(f"等待登入視窗… {remaining} 秒後開始輸入")
-                self.msleep(1000)
+                # ⚠ 拆成 10 段睡：整秒睡的話最久要等 1 秒才理會中止要求。
+                for _ in range(10):
+                    if self.isInterruptionRequested():
+                        return
+                    self.msleep(100)
+            # ⚠ 打字之前再確認一次：關程式的瞬間送出去的字會打進別人的視窗。
+            if self.isInterruptionRequested():
+                return
             self.status.emit("輸入帳號…")
             pyautogui.typewrite(self._account, interval=0.05)
             pyautogui.press("tab")
+            if self.isInterruptionRequested():
+                return
             self.status.emit("輸入密碼…")
             pyautogui.typewrite(self._password, interval=0.05)
             pyautogui.press("enter")
@@ -323,5 +341,7 @@ class LoginTab(BaseTab):
     def on_close(self) -> None:
         self._save_settings()
         if self._worker and self._worker.isRunning():
-            self._worker.quit()
+            # ⚠ 不能用 quit()：那條執行緒沒有事件迴圈，quit() 是空包彈
+            #   （見 LoginWorker 的說明）。
+            self._worker.requestInterruption()
             self._worker.wait(2000)

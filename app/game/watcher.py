@@ -188,9 +188,10 @@ class StatsWorker(QThread):
         # 保險：球的累積值不可能超過自己的上限。真的超過就代表表裡那筆對照有誤，
         # 這時只顯示數值、不顯示上限與百分比，也不要畫一條騙人的滿格進度條。
         if bt is not None and bt.cap and value > bt.cap:
-            sys.stderr.write(
-                f"[items] ⚠ ID {type_id} 的值 {value:,} 超過表中「{bt.name}」的"
-                f"上限 {bt.cap:,} → 對照表有誤，暫不顯示上限\n")
+            if sys.stderr:   # 打包版 stderr 是 None，寫了整個球面板會直接讀失敗
+                sys.stderr.write(
+                    f"[items] ⚠ ID {type_id} 的值 {value:,} 超過表中「{bt.name}」的"
+                    f"上限 {bt.cap:,} → 對照表有誤，暫不顯示上限\n")
             return {"value": value, "type_id": type_id, "name": bt.name,
                     "cap": 0, "pct": None, "is_ball": True}
         return {"value": value, "type_id": type_id,

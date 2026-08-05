@@ -227,15 +227,13 @@ CORPSE_SECS = 0.8
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
-# 兩種攻擊方式（兩個分頁各用一種）：
-#   MODE_PACKET —— 選定封包 + 動作/施放封包（原本的「自動掛機」）
-#   MODE_KEY    —— 選定封包 + 狂按技能鍵（「自動掛機（按鍵）」）
+# 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
+#   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
+#   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
 MODE_PACKET = "packet"
-MODE_KEY = "key"
 # ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
 #    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
-CLOSE_ENOUGH = 2.0              # 隔著地形時要走到多近（貼臉）
 # ★★ 比這個近就**不問尋路、也不算走不到**。
 #   尋路到「貼在自己身上的怪」等於算路徑到自己腳下那一格，一定回 0，
 #   而 0 在 tick 裡的意思是「走不過去」。近戰每打一隻都會貼上去，
@@ -247,10 +245,6 @@ NO_PATH_NEED = 3.0
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
 #   —— 實測雪狐就是這樣完全打不到怪。
 MELEE_RANGE = 2.0
-# ★ 近戰模式：進到這個距離就開始鎖定＋狂按 Fx，剩下的走位交給遊戲客戶端 ——
-#   它知道每招的射程，也會自己繞地形。我們只負責把角色帶進這個圈子，
-#   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
-CLIENT_RANGE = 20.0
 # ★ 自動分身按哪個鍵（使用者指定 F12）。技能編號不寫死 ——
 #   按一次讀「角色屬性 −0x50」就知道，再去 skills.py 查持續時間。
 BUFF_KEY = 0x7B                 # VK_F12
@@ -258,6 +252,10 @@ SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換�
 # 多久讀一次「目前在哪張地圖」。換圖是很少發生的事，而心跳是 10ms 一拍，
 # 每拍都讀等於白花 CPU（雖然一次只要 1.5ms）。
 SCENE_SAMPLE = 0.5
+# 靜態指標失效時，「全掃找場景物件」最快隔多久才准再做一次。
+# ⚠ 那一掃 0.25 秒、跑在 GUI 執行緒上，沒有冷卻的話換地圖／重連期間
+#   會每 SCENE_SAMPLE 掃一次，畫面直接卡住。跟 watcher 的重新定位同一個值。
+SCENE_RELOCATE_GAP = 5.0
 
 
 def _mmss(seconds: float) -> str:
@@ -373,14 +371,11 @@ class KeyWorker(_Paced):
       方向是錯的 —— 使用者實測這個遊戲按住不放並不會一直放技能。
     """
 
-    learned = Signal(object)        # 讀到的技能 ID（0 = 讀不到）
-
     def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
         super().__init__(DEFAULT_INTERVAL)
         self.hwnd = hwnd
         self.sc = sc
         self.vk = DEFAULT_KEY
-        self.sent = 0
         self.mode = MODE_PACKET     # 這個分頁用哪種攻擊方式
         self.packets = True         # 使用者要不要用封包攻擊（封包模式才有意義）
         self.stats = None           # 角色屬性基準（學技能 ID 用）
@@ -446,29 +441,34 @@ class KeyWorker(_Paced):
         if sid:
             self.skill = sid
             self._learning = False
-            self.learned.emit(sid)
 
     def step(self) -> None:
+        # ⚠⚠ 先把 GUI 執行緒會改的欄位抄成區域變數，整拍只看這份快照。
+        #   踩點在 `_sel`：以前是「送 select(self.eid) → 成功 → self._sel =
+        #   self.eid」，兩次 self.eid 之間 GUI 剛好換了目標的話，就把**新目標**
+        #   記成「已選定」，可是那一包從來沒送出去。接著 `selected` 回 True →
+        #   屍體計時開始跑 → 遊戲永遠不會替這隻填血量 → 0.8 秒後把一隻活怪
+        #   當屍體丟掉。每殺一隻換一次目標，這個窗口每一輪都存在。
+        eid, mover, pf, vk = self.eid, self.mover, self.pf, self.vk
+        mode, packets, skill, pos = self.mode, self.packets, self.skill, self.pos
         try:
-            if self.eid is None:
+            if eid is None:
                 self._sel = None       # 沒目標了，下一隻要重新送「選定」
             if not self._on:
                 return
             # ① 換目標才送一次「選定」封包 —— 我們是直接寫記憶體選怪的，
             #    遊戲不會自己送這一包。兩種模式都要送。
-            if self.mover is not None and self.eid and self._sel != self.eid:
-                if not attack.select(self.mover, self.eid):
+            if mover is not None and eid and self._sel != eid:
+                if not attack.select(mover, eid):
                     return                     # 這一拍先不打，下一拍再試
-                self._sel = self.eid
-            # ② 攻擊。封包模式送「動作 + 施放」，按鍵模式就狂按那個鍵。
-            if (self.mode == MODE_PACKET and self.packets and self.skill
-                    and self.eid and self.pf and self.mover is not None
-                    and attack.strike(self.mover, self.pf, self.skill,
-                                      self.eid, *self.pos)):
-                self.sent += 1
-            else:
-                _send_scan(self.hwnd, self.vk)
-                self.sent += 1
+                self._sel = eid
+            # ② 攻擊。封包模式送「動作 + 施放」，送不出去（或不是封包模式）
+            #    就退回狂按那個鍵。
+            struck = (mode == MODE_PACKET and packets and skill
+                      and eid and pf and mover is not None
+                      and attack.strike(mover, pf, skill, eid, *pos))
+            if not struck:
+                _send_scan(self.hwnd, vk)
                 if self._learning:
                     self._learn()              # 剛按過鍵，順手讀一下
         except Exception:                      # noqa: BLE001
@@ -522,12 +522,17 @@ class TargetWorker(_Paced):
         if job is None:
             return
         state, ent = job
+        # ⚠⚠ 這幾個欄位是 GUI 執行緒隨時會改的（換目標、切模式）。
+        #   一開始就抄成區域變數，整個 step() 只看這份快照 ——
+        #   否則同一輪裡前後讀到不同的值，會算出前後矛盾的結論。
+        packets, engaged = self.packets, self.engaged
         try:
             # ★ 先讀後判斷、最後才寫 —— 順序不能換。
             # 目標死掉時遊戲會把 +0x2D8 清成 0，那是我們唯一的死亡訊號；
             # 先寫回去就把訊號蓋掉了。
-            cur = entity.read_target(self.sc, state)
-            self.hp = entity.read_target_hp(self.sc, state)
+            # ★ ID 與血量**一次讀**（相鄰欄位）：省一次系統呼叫，而且兩個值
+            #   保證是同一瞬間的，不會出現「舊 ID 配新血量」。
+            cur, self.hp = entity.read_target_pair(self.sc, state)
             now = time.monotonic()
             # ★★ 最快也最準的死亡訊號：怪自己的動畫狀態變成 'Dead'。
             #   50Hz 就讀得到，不必等 HP_SETTLE(0.5s) 或 CORPSE_SECS(0.8s)。
@@ -536,7 +541,10 @@ class TargetWorker(_Paced):
             #   ⚠ confirmed 用 _saw_hp 而不是 True：沒看過血量代表我們根本
             #     沒交戰過（那是別人的屍體），算進擊殺數會灌水。
             #   ⚠ 不需要 self._wrote —— 我們有沒有寫過目標，跟牠死了沒無關。
-            if entity.read_state(self.sc, ent.addr) == "Dead":
+            # ★ 死活與動畫狀態一次讀回來（相鄰欄位）：以前狀態一次、
+            #   下面的 is_alive 又兩次，這是 50Hz 的迴圈。
+            alive, st, _p = entity.read_live(self.sc, ent)
+            if st == "Dead":
                 self._job = None
                 self._wrote = False
                 self.died.emit(ent.eid, self._saw_hp)
@@ -555,7 +563,7 @@ class TargetWorker(_Paced):
             #      真正擊殺只有 4 次）。
             #   ② 0 要**連續**持續 HP_SETTLE 秒 —— 中途偶爾讀到一次 0
             #      不算，免得把還活著的怪丟掉。
-            dead_by_hp = (self.packets and self._saw_hp and self.hp == 0
+            dead_by_hp = (packets and self._saw_hp and self.hp == 0
                           and now - self._zero_at >= HP_SETTLE)
             # ★ 屍體：鎖定這麼久了還**從來沒有**看到血量 —— 那是別人先打死的。
             #   搶怪嚴重的地方這種很多，實測 120 秒有 26 隻，白白鎖住 52 秒
@@ -567,18 +575,17 @@ class TargetWorker(_Paced):
             # ⚠ 還沒送出選定封包就一直重設計時 —— 遊戲收到那一包才會填血量。
             #   少了這條，走過去的路上（還沒進攻擊範圍、還沒送選定）會把
             #   活著的怪全部當成屍體丟掉（使用者回報「明明有怪，過去看一下就跑」）。
-            if not self.engaged:
+            if not engaged:
                 self._since = now
-            corpse = (self.packets and not self._saw_hp
+            corpse = (packets and not self._saw_hp
                       and now - self._since >= CORPSE_SECS)
-            if self._wrote and (cur == 0 or dead_by_hp or corpse
-                                or not entity.is_alive(self.sc, ent)):
+            if self._wrote and (cur == 0 or dead_by_hp or corpse or not alive):
                 self._job = None
                 self._wrote = False
                 self.died.emit(ent.eid, not corpse)
                 return
 
-            if self.packets:
+            if packets:
                 # 只寫 ID。**不要寫血量** —— 那是遊戲用來回報死活的欄位，
                 # 寫下去就把死亡訊號蓋掉了（見 entity.set_target_id）。
                 entity.set_target_id(self.sc, state, ent.eid)
@@ -633,7 +640,7 @@ class ScanWorker(QThread):
         self._inv: dict[int, int] = {}           # pid → 物品陣列表頭
         self._running = True
 
-    def _inventory_head(self, pid: int, sc: MemoryScanner, now: float):
+    def _inventory_head(self, pid: int, sc: MemoryScanner):
         """物品陣列表頭。★ 只讀快取，**絕不在這裡重找**。
 
         重找要跑 AOB 全掃，實測 1.7～2.1 秒／台。這條執行緒是怪物清單的關鍵路徑，
@@ -650,10 +657,6 @@ class ScanWorker(QThread):
     def request(self, pid: int, sc: MemoryScanner) -> None:
         if not any(p == pid for p, _ in self._queue):
             self._queue.append((pid, sc))
-
-    def forget(self, pid: int) -> None:
-        """丟掉熱區快取，下次強制全掃（換地圖／重新定位時用）。"""
-        self._hot.pop(pid, None)
 
     def run(self) -> None:
         while self._running:
@@ -688,7 +691,7 @@ class ScanWorker(QThread):
                         self._hot[pid] = found
                 out.state, out.player = state, pobj
                 out.stats = player.pick(sc, extra.get(stats_vt, []))
-                out.inv = self._inventory_head(pid, sc, now)
+                out.inv = self._inventory_head(pid, sc)
                 # ★ is_monster 現在看實體的「種類」欄位（見 entity.OFF_KIND），
                 #   NPC、別人的寵物、召喚物都會被排掉。
                 # ⛔ 曾經改用「遊戲的怪物名稱表」過濾 —— 不可靠，別再試：
@@ -736,11 +739,15 @@ class InvWorker(QThread):
 
     def run(self) -> None:
         while self._running:
-            if not self._want:
+            # ⚠ 用 popitem() 而不是「先檢查再 next(iter(...))」：`stop()` 是
+            #   GUI 執行緒呼叫的，它 clear() 的瞬間如果卡在 iter 與 next 之間，
+            #   會丟 StopIteration／RuntimeError 把這條執行緒炸掉 ——
+            #   關程式時 wait() 就白等了。
+            try:
+                pid, sc = self._want.popitem()
+            except KeyError:
                 self.msleep(200)
                 continue
-            pid, sc = next(iter(self._want.items()))
-            del self._want[pid]
             self._at[pid] = time.monotonic()
             head = None
             try:
@@ -818,7 +825,6 @@ class CharFarmPage(QWidget):
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
         self._hit_dist = 0.0
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
-        self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
         self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
         self._supply = False       # 正在讓天使精靈跑補給（我們完全讓開）
@@ -848,6 +854,7 @@ class CharFarmPage(QWidget):
         self._scene_t = SCENE_SAMPLE    # 第一拍就讀
         self._scene_obj: int | None = None   # 靜態指標失效時掃到的物件，快取起來
         self._scene_scanned = False          # 全掃備援只做一次，不要每次重掃
+        self._scene_try = 0.0                # 上次全掃的時間（見 SCENE_RELOCATE_GAP）
         # 自動巡迴換頻道。從目前這一頻出發繞一圈再回來（在 3 頻 → 4,5,1,2,3）。
         self._rot_t = 0.0            # 距離上次開始巡迴過了多久
         self._rot_seq: list[int] = []   # 這一輪還沒去的頻道（依序）
@@ -865,7 +872,6 @@ class CharFarmPage(QWidget):
         self._sit_bad_t = 0.0        # 實際狀態跟想要的不合已經持續多久
         self._rest_t = REST_SAMPLE   # 距離上次做休息判斷過了多久
         self._last_hp = -1
-        self._last_pos: tuple[float, float] | None = None
         # 已經打死（或判定走不過去）的實體 ID → 記下來的時間。
         # 怪死掉後物件不會馬上被回收，is_alive() 可能還是 true —— 沒這層擋著，
         # 換下一隻時會又挑到同一具屍體。
@@ -1342,6 +1348,7 @@ class CharFarmPage(QWidget):
         self._unreach_n.clear()
         self._scene_obj = None            # 場景物件也會搬家
         self._scene_scanned = False
+        self._scene_try = 0.0             # 剛傳送完，允許立刻重新定位一次
         self._since_scan = RESCAN_GAP     # 重連完立刻重掃
 
     def _fire_recall(self) -> None:
@@ -1429,21 +1436,24 @@ class CharFarmPage(QWidget):
 
     # ------------------------------------------------------------------
     # -- 回程補給（判斷 → 交棒 → 回到原地圖再接回來）-----------------------
-    def _check_dry(self) -> None:
+    def _check_dry(self) -> list | None:
         """藥水見底就通知一聲 —— **跟有沒有勾「藥水觸發」無關**（使用者要求）。
 
         ★ 用門閂（self._dry）：空著的那段期間只叫一次，補到貨才重新武裝。
           少了它每 GEAR_CHECK_GAP 秒就會吵一次。
         ★ 只通知不停機：水沒了照樣打得動，血低了本來就有「坐下休息」擋著。
           武器耐久 0 才是真的打不了，那個維持停機。
+
+        回傳算出來的見底清單（兩組都算），讓同一拍的補給判斷直接拿去用，
+        不必再走一次物品陣列；沒算成就回 None。
         """
         if not (self.inv and self._mover is not None and self._mover.active):
-            return
+            return None
         try:
             # 兩組都要看：**通知不看勾選**，勾選只決定要不要跑補給。
             dry = robot.potions_out(self._mover, self.sc, self.inv, self.pid)
         except Exception:                              # noqa: BLE001
-            return                                     # 讀不到就當沒事，別擋掛機
+            return None                                # 讀不到就當沒事，別擋掛機
         key = "|".join(w for w, _ in dry)
         if dry and key != self._dry:
             on = {"HP": self.sup_hp_cb.isChecked(),
@@ -1455,6 +1465,7 @@ class CharFarmPage(QWidget):
                 + ("即將跑回程補給。" if will
                    else "（沒勾這一項的觸發，掛機繼續）"))
         self._dry = key
+        return dry
 
     def _start_supply(self, why: str) -> bool:
         """把控制權交給官方的天使守護精靈。接得起來才回 True。
@@ -1747,7 +1758,6 @@ class CharFarmPage(QWidget):
                 return True
             self._rot_wait = float(self.rot_stay.value())
             self._rot_settle = ROT_SETTLE
-            self._rot_settle = ROT_SETTLE
             if not self._rot_seq:
                 self._rot_t = 0.0        # 繞完一圈了，重新計時
                 self._rot_say(f"　巡迴完成，回到 {self._rot_home} 頻")
@@ -1789,7 +1799,16 @@ class CharFarmPage(QWidget):
             return sid
         # 走到這裡代表靜態指標失效（多半是遊戲改版位移）。全掃 0.25 秒，
         # 只做一次並把物件位址記下來 —— 心跳是 10ms 一拍，不能每次都掃。
+        # ⚠⚠ 還要加**冷卻**：下面讀失敗時會把 _scene_scanned 放回 False，
+        #   所以「掃到了但物件一直讀不到」（換地圖、重連時的正常現象）會變成
+        #   每 SCENE_SAMPLE(0.5 秒) 就在 GUI 執行緒上全掃一次 0.25 秒 ——
+        #   畫面等於半凍住。讀不到場景本來就是容許的狀態（各處都會處理 None），
+        #   所以慢一點重試不影響任何判斷。
         if not self._scene_scanned:
+            now = time.monotonic()
+            if now - self._scene_try < SCENE_RELOCATE_GAP:
+                return None
+            self._scene_try = now
             self._scene_scanned = True
             found = scene.locate(self.sc)
             self._scene_obj = found.obj if found else None
@@ -2039,7 +2058,10 @@ class CharFarmPage(QWidget):
                     continue
             elif m.name not in want:
                 continue
-            if not entity.is_alive(self.sc, m):
+            # ★ 死活、動畫狀態、座標**一次讀回來**（相鄰欄位，見 read_live）。
+            #   以前是四次系統呼叫，場上幾十隻怪、每殺一隻重挑一次。
+            alive, st, p = entity.read_live(self.sc, m)
+            if not alive:
                 continue
             # ★★ 屍體直接跳過（別人先殺掉的）。動畫狀態當場重讀 ——
             #   掃描到現在可能已經過了 0.3 秒，牠剛好是在那之間倒下的。
@@ -2048,12 +2070,12 @@ class CharFarmPage(QWidget):
             #     （最久 79.8 秒）。挑最近的就常常挑到牠們，鎖上去要等
             #     CORPSE_SECS 才發現不對 —— 每次白花快一秒。
             #   ⚠ is_alive() 擋不掉：它只比對 vtable + 實體 ID，分不出屍體。
-            if entity.read_state(self.sc, m.addr) == "Dead":
+            if st == "Dead":
                 continue
-            # 座標要當場重讀：怪會走、角色也在走，掃描時記的早就過期了
+            # 座標也是當場讀的（跟上面同一次讀取）：怪會走、角色也在走，
+            # 掃描時記的早就過期了。
             # ★ 不限距離：多遠的怪都收進來（使用者要求「想打多遠都可以」），
             #   排序後自然會先打最近的，遠的靠移動封包導航過去。
-            p = entity.read_pos(self.sc, m.addr)
             d = (math.hypot(p[0] - me[0], p[1] - me[1])
                  if p and me else float("inf"))
             # ⛔ 這裡曾經有「正在打我的排最前面」（entity.attacking）——
@@ -2078,7 +2100,6 @@ class CharFarmPage(QWidget):
         self._walked_ok = True
         self._why = ""
         self._last_hp = -1
-        self._last_pos = me
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
         self._keys.eid = self._cur.eid            # 送封包時要指名打誰
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
@@ -2204,7 +2225,6 @@ class CharFarmPage(QWidget):
             if self.stats:
                 st = player.read(self.sc, self.stats)
                 if st is not None:
-                    self._hp = st.hp
                     # 血/魔百分比：休息判斷用。上限是 0 時當作滿的，
                     # 免得剛換地圖讀到一半的資料就誤觸發休息。
                     self._hp_pct = (st.hp / st.max_hp * 100
@@ -2238,9 +2258,12 @@ class CharFarmPage(QWidget):
         if self.buff_cb.isChecked():
             if not self._buff.armed:
                 self._buff.arm()          # 中途才勾的話，下一拍就無腦放一次
+            # ⚠ `_my_id` 傳的是**函式本身**不是值：它要讀一次記憶體，而只有
+            #   真的要補分身（20 分鐘一次）才用得到，心跳每 10ms 一拍先算好
+            #   等於每秒白讀 100 次。
             note = self._buff.step(
                 self.sc, self._mover, self.hwnd, self._keys.pf,
-                self._my_id(), self.stats, win.send_key)
+                self._my_id, self.stats, win.send_key)
             if note and self._buff_note != note:
                 self._buff_note = note
                 self.status.setText(f"✨ {note}")
@@ -2263,10 +2286,13 @@ class CharFarmPage(QWidget):
             # ★ 水沒了一律通知（使用者要求），跟觸發開關無關。
             #   放在觸發判斷**之前** —— 勾了觸發的話，這一拍就會接著跑補給，
             #   通知要先發出去才不會被 return 吃掉。
-            self._check_dry()
+            dry = self._check_dry()
             if (gear or hp_on or mp_on) and self._ensure_mover():
+                # ★ 耐久與見底清單都是這一拍剛算好的，直接傳進去別再算一次
+                #   （各要走一趟物品陣列，上百次記憶體讀取）。
                 why = robot.supply_needed(self._mover, self.sc, self.inv,
-                                          gear, hp_on, mp_on, self.pid)
+                                          gear, hp_on, mp_on, self.pid,
+                                          dura=d, dry=dry)
                 if why and self._start_supply(why):
                     return
             if d is not None and d[0] <= 0:
@@ -2593,7 +2619,6 @@ class CharFarmPage(QWidget):
             self._stuck = 0.0          # 在掉血 = 有進展，站著打也算
         else:
             self._stuck += dt
-        self._last_pos = me
         self._last_hp = hp
         if self._stuck >= STUCK_SECS:
             self._cool_unreach(m.eid)      # 走不過去，一樣用遞增冷卻
@@ -2915,14 +2940,30 @@ class FarmTab(BaseTab):
             # ⚠ 一定要拆掉移動 hook —— 不還原 IAT 就等於在遊戲裡留了一段跳板
             if page._mover is not None:
                 page._mover.stop()
+            # ⚠ 警報也要停：BeepThread／QMediaPlayer 還在響的話，物件被回收
+            #   時等於「執行緒還在跑就被解構」，而且聲音會一直放到關掉程式。
+            if page._notifier is not None:
+                try:
+                    page._notifier.stop()
+                except Exception:                    # noqa: BLE001
+                    pass
+        stuck = False
         for th in [t for t in (self._worker, self._inv) if t] + self._keys:
             th.stop()
-            th.wait(5000)
+            if not th.wait(5000):
+                stuck = True
         self._worker = None
         self._inv = None
         self._keys = []
         self.tabs.clear()
         self._pages = {}
+        # ⚠⚠ 有執行緒沒收乾淨就**不要關控制碼**：牠可能正卡在
+        #   ReadProcessMemory 裡（AOB 全掃跑很久），控制碼在腳下被關掉，
+        #   最壞的情況是那個控制碼值被系統回收給別的物件用。
+        #   寧可留著不關（行程結束時作業系統自然會收）。
+        if stuck:
+            self._scanners = []
+            return
         for sc in self._scanners:
             try:
                 sc.close()

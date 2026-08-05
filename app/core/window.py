@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import time
-from ctypes import windll
+from ctypes import windll, wintypes
 from dataclasses import dataclass
 
 import win32con
@@ -30,6 +30,16 @@ WM_KEYUP = win32con.WM_KEYUP
 
 # PrintWindow 旗標：2 = PW_RENDERFULLCONTENT（對部分 DirectX 視窗較有機會抓到內容）
 PW_RENDERFULLCONTENT = 0x00000002
+
+# ⚠⚠ SendMessageTimeoutW 最後一個參數是 PDWORD_PTR —— 64 位元 Python 上要給
+#   8 bytes 的緩衝。以前沒宣告型別、拿 4 bytes 的 c_ulong 去接，等於**每送一次鍵
+#   就越界寫 4 bytes**（被 CPython 的 8-byte 對齊剛好蓋住才沒炸）。
+windll.user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+windll.user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+windll.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+windll.user32.MapVirtualKeyW.restype = wintypes.UINT
 
 
 @dataclass
@@ -136,7 +146,7 @@ def capture_window(hwnd: int) -> Image.Image | None:
         bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
         save_dc.SelectObject(bitmap)
 
-        result = windll.user32.PrintWindow(
+        windll.user32.PrintWindow(
             hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT
         )
 
@@ -151,7 +161,7 @@ def capture_window(hwnd: int) -> Image.Image | None:
             0,
             1,
         )
-        return img if result else img  # 即使 result=0 也回傳，讓呼叫端自行判斷是否全黑
+        return img  # 即使 PrintWindow 回 0 也回傳，讓呼叫端自行判斷是否全黑
     finally:
         win32gui.DeleteObject(bitmap.GetHandle())
         save_dc.DeleteDC()
@@ -227,7 +237,7 @@ def send_key(hwnd: int, vk_code: int, timeout_ms: int = SEND_TIMEOUT_MS,
     全程不碰使用者真正的鍵盤、不搶焦點，可以同時操作多個視窗。
     """
     down, up = key_lparam(vk_code)
-    res = ctypes.c_ulong()
+    res = ctypes.c_size_t()          # DWORD_PTR：x64 上是 8 bytes，不能用 c_ulong
     ok = bool(windll.user32.SendMessageTimeoutW(
         hwnd, WM_KEYDOWN, vk_code, down, SMTO_ABORTIFHUNG, timeout_ms,
         ctypes.byref(res)))

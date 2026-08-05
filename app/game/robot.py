@@ -283,9 +283,21 @@ def potions_out(mover, scanner, inv_head: int, pid: int = 0,
     return out
 
 
+_UNSET = object()      # 「這個參數沒給」——用來跟「給了但值是 None」區分
+
+
 def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
-                  on_hp: bool, on_mp: bool, pid: int = 0) -> str | None:
+                  on_hp: bool, on_mp: bool, pid: int = 0,
+                  dura=_UNSET, dry=None) -> str | None:
     """**該回去補給了嗎？** 是的話回傳原因（可直接顯示），否則 None。
+
+    dura / dry: 呼叫端**同一拍剛算過**的耐久與見底清單，給了就不重算。
+        ⚠ 兩者都要是「這一拍」的值，不能是上一輪留下來的。
+        掛機的裝備檢查本來就會先算耐久、再叫 `potions_out()` 通知，
+        接著這裡又各算一次 —— 走一趟物品陣列要上百次記憶體讀取，
+        而且是在 GUI 執行緒上，五台同時做就是看得見的頓一下。
+        `dry` 是**兩組都算過**的完整清單，這裡只挑有勾的那幾組
+        （`_potion_out` 各組獨立計算，挑出來跟重算完全一樣）。
 
     ⚠⚠ **要不要判斷由呼叫端的三個開關決定，不看遊戲裡精靈的回城勾選**
       （使用者要求：「不要管他遊戲裡面有沒有設定」）。這樣我們的觸發跟
@@ -309,11 +321,16 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
         return None
 
     if on_broken:
-        d = inventory.durability(scanner, inv_head)
+        d = (inventory.durability(scanner, inv_head) if dura is _UNSET
+             else dura)
         if d is not None and d[0] <= 0:
             return "武器損壞"
 
-    dry = potions_out(mover, scanner, inv_head, pid, on_hp, on_mp)
+    if dry is None:
+        dry = potions_out(mover, scanner, inv_head, pid, on_hp, on_mp)
+    else:
+        want = ({"HP"} if on_hp else set()) | ({"MP"} if on_mp else set())
+        dry = [(w, text) for w, text in dry if w in want]
     if dry:
         return "、".join(d for _, d in dry) + "用完了"
     return None

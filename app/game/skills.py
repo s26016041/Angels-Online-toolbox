@@ -25,14 +25,9 @@ SELF_ONLY = "自己"          # 對象＝自己 的技能按了就對自己放�
 class Skill:
     id: int
     secs: int               # 持續時間（秒）
-    target: str             # '自己' / '角色' / …
+    target: str             # '自己'（= SELF_ONLY）/ '角色' / …
     rng: int                # 射程（格）
     mp: int
-
-    @property
-    def self_cast(self) -> bool:
-        """按了就直接對自己生效（不用多一個選自己的動作）。"""
-        return self.target == SELF_ONLY
 
 
 _table: dict[int, Skill] | None = None
@@ -58,7 +53,3 @@ def _load() -> dict[int, Skill]:
 def of(skill_id: int) -> Skill | None:
     """查一個技能；沒有持續時間（不是 buff）或查不到就回 None。"""
     return _load().get(int(skill_id or 0))
-
-
-def loaded() -> int:
-    return len(_load())

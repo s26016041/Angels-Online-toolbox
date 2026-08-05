@@ -55,10 +55,14 @@ class Config:
             self._data = {}
 
     def save(self) -> None:
-        self._path.write_text(
+        # ⚠ 先寫暫存檔再原子替換：直接 write_text 是「先清空再寫」，
+        #   寫到一半程式被關（更新重啟、崩潰、斷電）帳密就整份沒了。
+        tmp = self._path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp, self._path)
 
     def get(self, key: str, default: Any = None) -> Any:
         node: Any = self._data

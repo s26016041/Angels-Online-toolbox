@@ -35,7 +35,6 @@
 from __future__ import annotations
 
 import struct
-import time
 
 # ⚠ 這三個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 GETFIELD_FN = 0x006A4290     # lua_getfield(L, idx, k)

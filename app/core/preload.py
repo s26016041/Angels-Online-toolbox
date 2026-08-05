@@ -154,11 +154,3 @@ def name_of(pid: int, scanner=None, account: str = "") -> str:
     return account
 
 
-def forget(pid: int | None = None) -> None:
-    """清掉快取（某一台或全部）。分身關掉重開、或想強制重算時用。"""
-    if pid is None:
-        _names.clear()
-        _states.clear()
-    else:
-        _names.pop(pid, None)
-        _states.pop(pid, None)

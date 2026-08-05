@@ -128,8 +128,36 @@ def record(scanner, type_id: int, idx: int | None = None) -> int | None:
     return p if p and 0x10000 <= p < 0xFFFF0000 else None
 
 
+# ★ 查過的種類記起來：範本表是遊戲開場從 MONSTER.XML 載進去的，
+#   **整個 session 不會變**，所以同一種怪查第二次沒有必要再讀記憶體。
+#   掛機時每次刷新清單都會對每一種怪問一次「是不是王」，一秒好幾趟。
+# ⚠ 鍵要帶 idx（索引表位址）：表萬一搬家（改版重新定位）就自動變成不同的鍵，
+#   舊的答案不會被誤用 —— 這是「快取不可以比資料活得久」的做法。
+_cache: dict[tuple[int, int], MonsterInfo | None] = {}
+_CACHE_MAX = 4096         # 遊戲總共約 19000 種，實際會遇到的遠少於這個數
+
+
 def info(scanner, type_id: int, idx: int | None = None) -> MonsterInfo | None:
-    """查一種怪的固定資料；查不到或數值不合理時回 None（不會回錯的答案）。"""
+    """查一種怪的固定資料；查不到或數值不合理時回 None（不會回錯的答案）。
+
+    ★ 結果會依 (索引表位址, 種類 ID) 快取 —— 那張表整個 session 不變。
+    """
+    if idx is None:
+        idx = index_base(scanner)
+        if idx is None:
+            return None
+    key = (idx, type_id)
+    if key in _cache:
+        return _cache[key]
+    got = _read_info(scanner, type_id, idx)
+    # ⚠ 只有**讀成功**才記。查不到可能只是這一刻讀不到（剛換地圖、表還在載），
+    #   把 None 記起來就會讓那種怪從此永遠「不知道」。
+    if got is not None and len(_cache) < _CACHE_MAX:
+        _cache[key] = got
+    return got
+
+
+def _read_info(scanner, type_id: int, idx: int) -> MonsterInfo | None:
     rec = record(scanner, type_id, idx)
     if rec is None:
         return None

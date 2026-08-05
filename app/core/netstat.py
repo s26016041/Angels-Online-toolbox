@@ -19,7 +19,6 @@ AF_INET = 2
 TCP_TABLE_OWNER_PID_ALL = 5
 MIB_TCP_STATE_ESTAB = 5
 
-ERROR_INSUFFICIENT_BUFFER = 122
 
 
 class MIB_TCPROW_OWNER_PID(ctypes.Structure):
@@ -63,8 +62,3 @@ def established_pids() -> set[int]:
                 if r.dwState == MIB_TCP_STATE_ESTAB}
     except Exception:
         return set()
-
-
-def is_connected(pid: int) -> bool:
-    """單查一個 PID。要一次查多台請改用 established_pids()，只掃一次表。"""
-    return pid in established_pids()

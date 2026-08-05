@@ -58,7 +58,6 @@ class PacketTab(BaseTab):
 
         root = QVBoxLayout(self)
 
-        ok, msg = injector.available()
         root.addWidget(
             QLabel(
                 "掛住遊戲的 send，攔截送出的封包，找出「送登入封包的那段程式」(=登入函式候選)。\n"
@@ -90,11 +89,25 @@ class PacketTab(BaseTab):
         self._timer.setInterval(300)
         self._timer.timeout.connect(self._poll)
 
+        self._checked_avail = False
+        self.refresh_windows()
+
+    def on_show(self) -> None:
+        """第一次真的切到這個分頁時才檢查注入套件在不在。
+
+        ⚠⚠ `injector.available()` 會 import pymem / keystone / pefile
+          （實測合計約 430ms，keystone 還要載原生 DLL）。分頁是**開程式時
+          全部一起建**的，放在 build_ui() 等於每次啟動都多等這段 ——
+          而這個分頁是開發用的，多數時候根本不會打開。
+        """
+        if self._checked_avail:
+            return
+        self._checked_avail = True
+        ok, msg = injector.available()
         if not ok:
             self._set_enabled_capture(False)
             self.start_btn.setEnabled(False)
             self.status.setText("⚠ 注入功能不可用：" + msg)
-        self.refresh_windows()
 
     # ------------------------------------------------------------------
     def _build_process_group(self) -> QGroupBox:
@@ -255,6 +268,12 @@ class PacketTab(BaseTab):
     def start_capture(self) -> None:
         w = self._selected_window()
         if not w:
+            return
+        # 保險：萬一按到這裡時還沒檢查過套件（on_show 沒被呼叫到），現在補檢查
+        self.on_show()
+        ok, msg = injector.available()
+        if not ok:
+            QMessageBox.warning(self, "注入功能不可用", msg)
             return
         exe = injector.process_path(w.pid)
         if not exe:

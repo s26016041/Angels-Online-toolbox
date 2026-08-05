@@ -232,17 +232,8 @@ STRING_ENCODINGS: dict[str, str] = {
     "utf-8": "UTF-8",
 }
 
-# 搜尋條件：key -> 顯示名稱。
-SCAN_TYPES: dict[str, str] = {
-    "exact": "等於",
-    "bigger": "大於",
-    "smaller": "小於",
-    "increased": "增加",
-    "decreased": "減少",
-    "changed": "已改變",
-    "unchanged": "未改變",
-}
-
+# 搜尋條件的顯示名稱在 app/tabs/memory_tab.py 那邊（SCAN_TYPE_ORDER），
+# 這裡只留「哪些條件在什麼時候可用」。
 # 首次搜尋只能用這些（其餘需要「上一輪的值」才能比較）。
 FIRST_SCAN_TYPES = ("exact", "bigger", "smaller", "unknown")
 # 需要在輸入框填數值的條件。
@@ -309,13 +300,6 @@ class PointerPath:
             return head
         chain = " ".join(f"+0x{o:X}" for o in self.offsets)
         return f"[{head}] {chain}"
-
-    def to_dict(self) -> dict:
-        return {
-            "module": self.module,
-            "base_offset": self.base_offset,
-            "offsets": list(self.offsets),
-        }
 
     @staticmethod
     def from_dict(d: dict) -> "PointerPath":
@@ -429,10 +413,6 @@ class MemoryScanner:
     @property
     def pointer_size(self) -> int:
         return self._psize
-
-    @property
-    def has_pointer_map(self) -> bool:
-        return len(self._ptr_vals) > 0
 
     def reset(self) -> None:
         """清掉目前的搜尋結果，回到「尚未搜尋」狀態。"""
@@ -649,6 +629,10 @@ class MemoryScanner:
         off = 0
         while off < size:
             n = min(_READ_CHUNK, size - off)
+            # ⚠ Win32 失敗時不保證會寫 lpNumberOfBytesRead —— 不歸零的話
+            #   read.value 會殘留上一輪的計數，off 就多跳一整個 chunk，
+            #   回傳的尾巴變成沒讀過的全零緩衝（掃描會靜默漏判）。
+            read.value = 0
             ok = kernel32.ReadProcessMemory(
                 handle,
                 base + off,
@@ -1213,53 +1197,3 @@ class MemoryScanner:
             return None
         return self.read_value(addr, vt)
 
-    def trace_path(self, path: PointerPath, vt: ValueType) -> list[str]:
-        """逐步解析路徑，回傳每一步的文字說明（給人工核對 / 除錯用）。
-
-        清楚呈現「讀 [ ] → 加偏移 → 再讀 …→ 最後只加不讀 → 讀出數值」的過程。
-        """
-        mod_base = self._module_by_name.get(path.module.lower())
-        if mod_base is None:
-            return [f"找不到模組 {path.module}（未選定程序或該模組未載入）。"]
-
-        steps: list[str] = []
-        addr = mod_base + path.base_offset
-        steps.append(
-            f"起點 = {path.module} 基底(0x{mod_base:X}) + 0x{path.base_offset:X}"
-            f" = 0x{addr:X}"
-        )
-        if path.is_static:
-            v = self.read_value(addr, vt)
-            steps.append(f"靜態位址，直接以 {vt.label} 讀值 = {v}")
-            return steps
-
-        ptr = self._read_pointer(addr)
-        steps.append(
-            f"[0x{addr:X}] 讀出指標 = "
-            + ("讀取失敗 ✗" if ptr is None else f"0x{ptr:X}（十進位 {ptr}）")
-        )
-        if ptr is None:
-            steps.append("→ 這一步就斷了，路徑無效。")
-            return steps
-
-        for i, off in enumerate(path.offsets):
-            if i < len(path.offsets) - 1:
-                a = ptr + off
-                nxt = self._read_pointer(a)
-                steps.append(
-                    f"+ 0x{off:X} → [0x{a:X}] 讀出指標 = "
-                    + ("讀取失敗 ✗" if nxt is None else f"0x{nxt:X}")
-                )
-                if nxt is None:
-                    steps.append("→ 這一步就斷了，路徑無效。")
-                    return steps
-                ptr = nxt
-            else:
-                final = ptr + off
-                steps.append(
-                    f"+ 0x{off:X} → 最終位址 = 0x{final:X}"
-                    "（最後一個偏移只加、不讀指標）"
-                )
-                v = self.read_value(final, vt)
-                steps.append(f"讀 {vt.label} @ 0x{final:X} = {v}")
-        return steps

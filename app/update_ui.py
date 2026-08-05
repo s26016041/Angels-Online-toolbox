@@ -66,10 +66,18 @@ class UpdateManager:
         self._dlg: QProgressDialog | None = None
         self._info: dict | None = None
         self._timer: QTimer | None = None
+        # ⚠⚠ 收工的執行緒先擱這裡，**不要直接把參考丟掉**。
+        #   `done` 是排隊送過來的，槽跑到時 run() 往往還在收尾；那一刻要是
+        #   Python 把最後一個參考回收掉，C++ 端的 QThread 就在執行中被解構
+        #   → 「Destroyed while thread is still running」→ 原生當機。
+        self._retired: list[QThread] = []
 
     def start(self) -> None:
         """開場呼叫。只有開發模式與無頭模式不做，其餘一律檢查並強制更新。"""
-        updater.clean_leftovers()
+        # ⚠ clean_leftovers() 會 rmtree 每個殘留的 _MEIxxxxxx（一個約 80MB，
+        #   實際看過 9 個）——那是**開視窗前**的同步磁碟操作，會拖慢啟動。
+        #   純清理，晚三秒做完全沒差，所以丟到視窗出來之後。
+        QTimer.singleShot(3000, updater.clean_leftovers)
         if not updater.is_frozen():
             return
         # 無頭模式（--selftest 會設 offscreen）不要查：冒煙測試建好視窗就馬上結束，
@@ -90,20 +98,36 @@ class UpdateManager:
         self._check.done.connect(self._on_checked)
         self._check.start()
 
+    def _retire(self, thread: QThread | None) -> None:
+        """把執行緒移出「現役」但**留著參考**，等它自己結束才放掉。"""
+        if thread is None:
+            return
+        self._retired.append(thread)
+        thread.finished.connect(lambda t=thread: self._forget(t))
+        if thread.isFinished():
+            self._forget(thread)
+
+    def _forget(self, thread: QThread) -> None:
+        if thread in self._retired:
+            self._retired.remove(thread)
+            thread.deleteLater()
+
     def stop(self) -> None:
         """關閉程式前呼叫：等背景執行緒收完，別讓 Qt 在解構時抱怨。"""
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
-        for t in (self._check, self._dl):
+        for t in (self._check, self._dl, *self._retired):
             if t is not None and t.isRunning():
                 t.wait(3000)
         self._check = None
         self._dl = None
+        self._retired.clear()
 
     # ------------------------------------------------------------------
     def _on_checked(self, info) -> None:
         """查到新版就直接更新，不問使用者。"""
+        self._retire(self._check)
         self._check = None
         if not info:
             # 查不到有兩種：已是最新（正常）、或連線/憑證出問題（要讓人看得到）。
@@ -161,6 +185,7 @@ class UpdateManager:
                 f"正在更新到 {ver}…　{got / 1e6:.1f} MB\n完成後會自動重新啟動。")
 
     def _on_downloaded(self, ok: bool, dest) -> None:
+        self._retire(self._dl)
         self._dl = None
         if self._dlg:
             self._dlg.close()

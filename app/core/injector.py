@@ -29,6 +29,22 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 
 
+# ⚠⚠ 這幾支一定要宣告型別。不宣告的話 ctypes 預設把 HANDLE 當 32 位元 int 傳、
+#   回傳值也當 c_int —— 64 位元 Python 上就是「把控制碼截半」。目前是靠
+#   Windows 的行程控制碼數值都很小才沒出事，不是設計如此。
+_k32 = ctypes.windll.kernel32
+_k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_k32.OpenProcess.restype = wintypes.HANDLE
+_k32.CloseHandle.argtypes = [wintypes.HANDLE]
+_k32.CloseHandle.restype = wintypes.BOOL
+_k32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, wintypes.PDWORD]
+_k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_k32.VirtualProtectEx.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD,
+    wintypes.PDWORD]
+_k32.VirtualProtectEx.restype = wintypes.BOOL
+
 # angel.dat 程式碼(.text)大致範圍，用來從堆疊挑出「遊戲內的返回位址」= 呼叫鏈。
 # base 0x400000、.text 從 0x401000 起約 3.8MB。無 ASLR，固定。
 CODE_LO = 0x401000
@@ -64,18 +80,17 @@ def available() -> tuple[bool, str]:
 
 def process_path(pid: int) -> str | None:
     """取得指定 PID 的執行檔完整路徑。"""
-    k32 = ctypes.windll.kernel32
-    handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    handle = _k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
     if not handle:
         return None
     try:
         buf = ctypes.create_unicode_buffer(1024)
         size = wintypes.DWORD(1024)
-        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        if _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
             return buf.value
         return None
     finally:
-        k32.CloseHandle(handle)
+        _k32.CloseHandle(handle)
 
 
 def _resolve_iat(exe_path: str, func: str) -> int | None:
@@ -308,16 +323,24 @@ class SendCapture:
 
     @staticmethod
     def _protect(pm, addr: int, size: int, prot: int) -> int:
+        """改頁面保護，回傳**原本的**保護值；失敗回 0。
+
+        ⚠ 回 0 代表「沒改成」——0 不是合法的保護值，不能拿去還原。
+        """
         old = wintypes.DWORD()
-        ctypes.windll.kernel32.VirtualProtectEx(
-            pm.process_handle, ctypes.c_void_p(addr), size, prot, ctypes.byref(old)
+        ok = _k32.VirtualProtectEx(
+            pm.process_handle, ctypes.c_void_p(addr), size, prot,
+            ctypes.byref(old)
         )
-        return old.value
+        return old.value if ok else 0
 
     def _patch(self, pm, iat: int, target: int) -> None:
         old = self._protect(pm, iat, 8, 0x40)  # PAGE_EXECUTE_READWRITE
         pm.write_uint(iat, target)
-        self._protect(pm, iat, 8, old)
+        # ⚠ old = 0 代表上面那次就沒改成（頁面保護沒動過），拿 0 去還原只是
+        #   再失敗一次。以前就是這樣靜默失敗，把遊戲的 IAT 頁面留在可執行可寫。
+        if old:
+            self._protect(pm, iat, 8, old)
 
     # ------------------------------------------------------------------
     def read_new(self) -> list[Packet]:

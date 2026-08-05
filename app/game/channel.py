@@ -95,11 +95,14 @@ REC_SPAN = 0x60           # 讀到 +0x5C 就夠了
 MAX_SUBSET = 32           # 合理性上限：分流數不可能比這大
 
 
-def count(scanner, hwnd: int) -> int | None:
+def count(scanner, hwnd: int, should_stop=None) -> int | None:
     """這個伺服器有幾個分流；**讀不到就回 None**（呼叫端應該乾脆不要換頻道）。
 
     ★ 純讀記憶體，不碰任何檔案。改版增減分流會自動跟上，因為讀的是客戶端
       自己解析出來的那份清單。
+
+    ⚠ 這是**全記憶體掃描**（一台約 0.3～1 秒），不要放在每一拍會跑到的地方。
+    should_stop: 可選 callable，每個記憶體區塊前問一次；回傳 True 就中止回 None。
 
     ⛔ 這兩條走不通，別再試（五台實測）：
        · `SYSTEM_CHANNEL_SIZE` 具名變數 —— 讀到垃圾值
@@ -110,6 +113,8 @@ def count(scanner, hwnd: int) -> int | None:
         return None
     pat = name.encode("utf-8") + b"\x00"
     for base, size in scanner._iter_regions(writable_only=True):
+        if should_stop is not None and should_stop():
+            return None
         if base + size > 0xFFFFFFFF:
             continue
         raw = scanner._read_region(base, size)

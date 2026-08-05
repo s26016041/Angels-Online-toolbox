@@ -111,7 +111,8 @@ def latest_release() -> dict | None:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         _last_error[0] = f"{type(exc).__name__}: {exc}"
-        sys.stderr.write(f"[update] 查詢最新版本失敗 —— {_last_error[0]}\n")
+        if sys.stderr:   # 打包版 stderr 是 None
+            sys.stderr.write(f"[update] 查詢最新版本失敗 —— {_last_error[0]}\n")
         return None
     tag = data.get("tag_name") or ""
     assets = data.get("assets") or []

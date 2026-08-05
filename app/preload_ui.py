@@ -67,8 +67,10 @@ def run_with_dialog(parent) -> None:
             f"正在讀取遊戲資料…（{i}/{n}）" + (f"\n{who}" if who else ""))
 
     def on_done(count: int) -> None:
+        # ⚠ 這裡**不要** deleteLater()：這一刻 run() 還在收尾，而且我們是在
+        #   dlg.exec() 的巢狀事件迴圈裡，延遲刪除何時執行並不確定。
+        #   等下面 wait() 真的等到它結束再刪。
         dlg.close()
-        worker.deleteLater()
 
     worker.progress.connect(on_progress)
     worker.done.connect(on_done)
@@ -89,3 +91,7 @@ def run_with_dialog(parent) -> None:
         worker.requestInterruption()
         worker.terminate()
         worker.wait(3000)
+    # 這時執行緒已經結束（或被強制收掉），可以安全地放掉它了。
+    if parent is not None:
+        parent._preload_worker = None
+    worker.deleteLater()

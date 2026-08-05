@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -54,6 +54,19 @@ DANGER = "#ff6b6b"
 GOLD = "#e0a458"
 PANEL = "#262b3b"
 BORDER = "#3a4056"
+
+
+def _sheet(widget, css: str) -> None:
+    """樣式沒變就不要重設。
+
+    ⚠ Qt **不會**自己比對：`setStyleSheet()` 每次都重新解析樣式表並重跑
+      widget 的 polish。這裡的卡片每 0.7 秒更新一次、每張卡好幾個標籤，
+      五台就是每秒二十幾次重新解析，而其中絕大多數的字串根本一模一樣。
+    """
+    if widget.property("_css") != css:
+        widget.setProperty("_css", css)
+        widget.setStyleSheet(css)
+
 
 # 經驗球進度條的寬度（px）。條子本身不需要很長，右邊的數值與滿倉預估才是重點。
 BAR_WIDTH = 170
@@ -344,16 +357,15 @@ class CharCard(QFrame):
 
         if stats is None:
             self.locate_lbl.setText("定位中…")
-            self.locate_lbl.setStyleSheet(f"color: {TEXT_MUT};")
+            _sheet(self.locate_lbl, f"color: {TEXT_MUT};")
         else:
             if stats.hp <= 0:
                 self.locate_lbl.setText("● 死亡")
-                self.locate_lbl.setStyleSheet(
-                    f"color: {DANGER}; font-weight: bold;")
+                _sheet(self.locate_lbl, f"color: {DANGER}; font-weight: bold;")
             else:
                 # 用「●」而不是「✓」：勾號在部分中文字型裡沒有字形，會畫成豆腐方塊
                 self.locate_lbl.setText("● 已定位")
-                self.locate_lbl.setStyleSheet(f"color: {SUCCESS};")
+                _sheet(self.locate_lbl, f"color: {SUCCESS};")
             self.level_lbl.setText(f"Lv{stats.level}")
             # 當前經驗 / 升到下一級所需的經驗（都是絕對值，跟遊戲畫面同一套數字）
             self.exp_lbl.setText(
@@ -362,9 +374,9 @@ class CharCard(QFrame):
             self.gold_lbl.setText(f"金幣 {stats.gold:,}")
             low = stats.max_hp > 0 and stats.hp / stats.max_hp < 0.3
             self.hp_lbl.setText(f"HP {stats.hp:,}/{stats.max_hp:,}")
-            self.hp_lbl.setStyleSheet(
-                f"color: {DANGER if low else TEXT};"
-                + (" font-weight: bold;" if stats.hp <= 0 else ""))
+            _sheet(self.hp_lbl,
+                   f"color: {DANGER if low else TEXT};"
+                   + (" font-weight: bold;" if stats.hp <= 0 else ""))
             self.mp_lbl.setText(f"MP {stats.mp:,}/{stats.max_mp:,}")
 
         self._update_rates(stats)
@@ -391,10 +403,10 @@ class CharCard(QFrame):
                 if s.last_death else ""
             self.death_lbl.setText(
                 f"死亡 {s.deaths} 次" + (f"（最近 {when}）" if when else ""))
-            self.death_lbl.setStyleSheet(f"color: {DANGER}; font-weight: bold;")
+            _sheet(self.death_lbl, f"color: {DANGER}; font-weight: bold;")
         else:
             self.death_lbl.setText("死亡 0 次")
-            self.death_lbl.setStyleSheet(f"color: {TEXT_MUT};")
+            _sheet(self.death_lbl, f"color: {TEXT_MUT};")
 
         # 累計：總共賺了多少。經驗的百分比用「本級所需經驗」當分母 —— 講「賺了
         # 半級」比講「賺了 300 萬」直觀得多。升級會讓分母換成新一級的，屬正常。
@@ -472,7 +484,7 @@ class CharCard(QFrame):
 
         # 球的資料只有一個來源：直接讀物品陣列的飾品欄兩格。沒有「僅供參考」的模式。
         self.ball_title.setText("● 經驗球（飾品欄）")
-        self.ball_title.setStyleSheet(f"color: {ACCENT};")
+        _sheet(self.ball_title, f"color: {ACCENT};")
 
         idle = ball.get("idle") if ball else None
         if idle:
@@ -778,7 +790,8 @@ class ProfitTab(BaseTab):
             for who, msg in payload:
                 ok, info = notify.send_telegram(room, who, "⚠ " + msg)
                 if not ok:
-                    sys.stderr.write(f"[telegram] 送出失敗 {who}: {info}\n")
+                    if sys.stderr:   # 打包版 stderr 是 None，寫了執行緒會死在 emit 之前
+                        sys.stderr.write(f"[telegram] 送出失敗 {who}: {info}\n")
                     self.tg_failed.emit(f"⚠ Telegram 送出失敗（{who}）：{info}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -912,8 +925,9 @@ class ProfitTab(BaseTab):
             # （同一個帳號可能登入了不同角色）。
             for d in (self._fired, self._lost_since, self._names):
                 d.pop(old_pid, None)
-            sys.stderr.write(f"[profit] 分身重開，PID {old_pid} → {w.pid}"
-                             f"（{charname.account_from_title(w.title)}）\n")
+            if sys.stderr:   # 打包版 stderr 是 None
+                sys.stderr.write(f"[profit] 分身重開，PID {old_pid} → {w.pid}"
+                                 f"（{charname.account_from_title(w.title)}）\n")
 
         self._start_worker()
         self._retire_later()
@@ -964,9 +978,15 @@ class ProfitTab(BaseTab):
         self._dying_scanners += [m["sc"] for m in self._mons.values()]
 
         if wait:
-            for t in self._dying:
-                t.wait(5000)
-            self._finish_teardown()
+            # ⚠ 這裡的等待上限要**比 StatsWorker 內部等定位執行緒的
+            #   locator.wait(15000) 更長**，不然外面先逾時往下走，
+            #   _finish_teardown() 就會在定位執行緒還在讀記憶體時關掉它的
+            #   handle。多等一秒當餘裕。
+            ok = all(t.wait(16000) for t in self._dying)
+            if ok:
+                self._finish_teardown()
+                return
+            self._retire_later()        # 還沒停乾淨 → 改用輪詢，別硬關 handle
             return
         self._retire_later()
 

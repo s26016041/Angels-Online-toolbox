@@ -44,7 +44,10 @@ def _install_excepthook() -> None:
             log_path = None
 
         # 先印到主控台（除錯版看得到），再嘗試跳訊息框（正式版看得到）。
-        sys.stderr.write(text)
+        # ⚠ 打包成 --windowed 的 exe 沒有主控台，sys.stderr 是 None ——
+        #   直接 .write() 會在例外處理器裡再炸一次，訊息框就永遠跳不出來。
+        if sys.stderr is not None:
+            sys.stderr.write(text)
         try:
             from PySide6.QtWidgets import QApplication, QMessageBox
 

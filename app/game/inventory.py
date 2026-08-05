@@ -247,16 +247,6 @@ def read_slot(scanner, head: int, index: int) -> tuple[int, int, int] | None:
     return tid, p, val
 
 
-def accessories(scanner, head: int) -> list[tuple[int, int, int]]:
-    """飾品欄兩格的內容（空格會被略過）。"""
-    out = []
-    for i in SLOT_ACCESSORY:
-        got = read_slot(scanner, head, i)
-        if got:
-            out.append(got)
-    return out
-
-
 def scan_slots(scanner, head: int, count: int = 128):
     """走一遍整張表，回傳 [(格號, 種類 ID, 結構位址, 球值), ...]。
 
@@ -296,6 +286,27 @@ def _item_slot(scanner, ptr: int) -> int | None:
     return slot if slot < 200 else None
 
 
+def _item_row(scanner, ptr: int) -> tuple[int, int, int] | None:
+    """一次讀出 (格號, 種類 ID, 數量)；不像物品就回 None。
+
+    ★ 判定條件跟 `_item_slot()` 一模一樣，只是**順便把數量一起帶回來**。
+      `_walk()` 以前是先叫 `_item_slot()` 讀 0x28 bytes，再自己重讀 0x29 bytes
+      —— 同一塊記憶體讀兩次，每件物品都白花一次系統呼叫。
+    """
+    if not (0x01000000 < ptr < 0x40000000):
+        return None
+    raw = scanner._read_bytes(ptr, ITEM_COUNT_OFF + 2)
+    if not raw or len(raw) < ITEM_COUNT_OFF + 2:
+        return None
+    tid = struct.unpack_from("<I", raw, ITEM_TYPE_OFF)[0]
+    if not 0 < tid < MAX_ITEM_ID:
+        return None
+    slot = raw[ITEM_SLOT_OFF]
+    if slot >= 200:
+        return None
+    return slot, tid, struct.unpack_from("<H", raw, ITEM_COUNT_OFF)[0]
+
+
 def align_head(scanner, head: int, window: int = HEAD_WINDOW) -> int:
     """用「物品自己記的格號」校正表頭位置。
 
@@ -305,16 +316,35 @@ def align_head(scanner, head: int, window: int = HEAD_WINDOW) -> int:
       （往後偏，所以連往後掃都找不到第 3 格的武器）。
 
     找不到任何物品時回傳原值，不做無謂的更動。
+
+    ★ 指標**一次批次讀進來**：以前是 88 格各發一次 ReadProcessMemory，
+      而這支被 `_walk()`／`find_by_slot()` 每次呼叫都會用到，掛機每 3 秒的
+      裝備檢查光這裡就上千次系統呼叫。整段讀不齊時（表頭貼著區段邊界）
+      **原封不動退回舊的逐格讀法**，結果完全一樣。
     """
     if not head:
         return head
-    votes: Counter = Counter()
-    for i in range(-HEAD_BACK, window):
-        a = head + i * 4
-        p = _dword(scanner, a)
-        slot = _item_slot(scanner, p) if p else None
+    start = head - HEAD_BACK * 4
+    total = HEAD_BACK + window
+    ptrs = read_pointers(scanner, start, total)
+    if len(ptrs) != total:
+        # 整段讀不齊 —— 退回逐格讀，跟以前一字不差（含中間有洞的情形）
+        votes: Counter = Counter()
+        for i in range(-HEAD_BACK, window):
+            a = head + i * 4
+            p = _dword(scanner, a)
+            slot = _item_slot(scanner, p) if p else None
+            if slot is not None:
+                votes[a - slot * 4] += 1
+        return votes.most_common(1)[0][0] if votes else head
+
+    votes = Counter()
+    for k, p in enumerate(ptrs):
+        if not p:
+            continue
+        slot = _item_slot(scanner, p)
         if slot is not None:
-            votes[a - slot * 4] += 1
+            votes[start + k * 4 - slot * 4] += 1
     return votes.most_common(1)[0][0] if votes else head
 
 
@@ -330,8 +360,11 @@ def find_by_slot(scanner, head: int, slot: int,
     base = align_head(scanner, head, window)
     if not base:
         return None                 # 陣列搬家時呼叫端可能還拿著 None
+    ptrs = read_pointers(scanner, base, window)
+    if len(ptrs) != window:
+        ptrs = None                 # 讀不齊就逐格讀（跟以前一樣）
     for i in range(window):
-        p = _dword(scanner, base + i * 4)
+        p = ptrs[i] if ptrs is not None else _dword(scanner, base + i * 4)
         if p and _item_slot(scanner, p) == slot:
             return p
     return None
@@ -386,16 +419,11 @@ def _walk(scanner, head: int, window: int = FULL_WINDOW):
     for p in ptrs:
         if not p:
             continue
-        slot = _item_slot(scanner, p)
-        if slot is None:
+        got = _item_row(scanner, p)      # 格號＋種類＋數量一次讀完
+        if got is None:
             continue
-        raw = scanner._read_bytes(p, ITEM_COUNT_OFF + 2)
-        if not raw or len(raw) < ITEM_COUNT_OFF + 2:
-            continue
-        yield (slot,
-               struct.unpack_from("<I", raw, ITEM_TYPE_OFF)[0],
-               struct.unpack_from("<H", raw, ITEM_COUNT_OFF)[0],
-               p)
+        slot, tid, cnt = got
+        yield slot, tid, cnt, p
 
 
 def count_by_type(scanner, head: int, type_id: int) -> int:

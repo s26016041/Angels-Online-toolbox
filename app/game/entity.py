@@ -40,7 +40,6 @@
 """
 from __future__ import annotations
 
-import math
 import struct
 from dataclasses import dataclass
 
@@ -168,12 +167,6 @@ class Entity:
             return self.type_id != 0
         return self.kind == KIND_MONSTER
 
-    def distance_to(self, pos: tuple[float, float] | None) -> float:
-        """到某個座標幾格。pos 為 None（玩家位置不明）時回傳無限大。"""
-        if pos is None:
-            return float("inf")
-        return math.hypot(self.x - pos[0], self.y - pos[1])
-
 
 def _u32(scanner, addr: int) -> int:
     raw = scanner._read_bytes(addr, 4)
@@ -200,6 +193,12 @@ def _scan_vtables(scanner, vts, should_stop=None,
     out: dict[int, list[int]] = {v: [] for v in vts}
     targets = [(np.uint32(v), out[v]) for v in vts]
     hot: list = []
+    if not targets:
+        return out, hot            # 沒有目標就不必把記憶體讀出來
+    # 多目標時的粗篩範圍（見下面）。⚠ 一定要每次算 —— vtable 會被
+    # locate.warm() 依 AOB 改寫，snapshot 也會多帶一個角色屬性的 vtable。
+    # ⚠ 純量一定要是 np.uint32：傳 Python int 給 uint32 陣列比較會整個重轉型。
+    lo, hi = np.uint32(min(vts)), np.uint32(max(vts))
     for base, size in (regions if regions is not None
                        else scanner._iter_regions(writable_only=True)):
         if should_stop is not None and should_stop():
@@ -209,10 +208,26 @@ def _scan_vtables(scanner, vts, should_stop=None,
             continue
         arr = np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<u4")
         found = False
-        for target, bucket in targets:
-            for i in np.flatnonzero(arr == target):
-                bucket.append(base + int(i) * 4)
+        if len(targets) == 1:
+            target, bucket = targets[0]
+            idx = np.flatnonzero(arr == target)
+            if idx.size:
+                bucket.extend((base + idx.astype(np.int64) * 4).tolist())
                 found = True
+        else:
+            # ★ 多個目標時**先用範圍刷一次**再分類：以前是每個 vtable 各掃一遍
+            #   整個陣列（四個目標 = 四趟 700MB 的比對，外加四個等長的暫時陣列）。
+            #   所有 vtable 都擠在 angel.dat 的一小段位址裡，所以一次
+            #   `lo <= x <= hi` 就把 99.99% 刷掉，剩下的才逐個比對。
+            #   命中集合與順序都跟以前一模一樣（flatnonzero 本來就是遞增）。
+            idx = np.flatnonzero((arr >= lo) & (arr <= hi))
+            if idx.size:
+                vals = arr[idx]
+                for target, bucket in targets:
+                    sel = idx[vals == target]
+                    if sel.size:
+                        bucket.extend((base + sel.astype(np.int64) * 4).tolist())
+                        found = True
         if found:
             hot.append((base, size))
     return out, hot
@@ -242,32 +257,74 @@ def locate_state(scanner, should_stop=None) -> int | None:
     return hits[0] if len(hits) == 1 else None
 
 
-def locate_player(scanner, should_stop=None) -> int | None:
-    """定位玩家自己的物件；找不到（或掃到多個）回傳 None。
+# ⛔ locate_player() 移除了：玩家物件一律跟其他實體**同一遍掃出來**
+#   （`snapshot()` 一次比對三種 vtable），單獨再掃一遍等於多花一次全記憶體
+#   讀取。preload.py 的註解講的就是這件事。
 
-    實測每個分身剛好 1 個，且 +0x1D4 的名字就是該帳號的角色名、+0x1D0 型別為 0。
-    """
-    hits = _scan_vtable(scanner, VT_PLAYER, should_stop)
-    return hits[0] if len(hits) == 1 else None
+
+# 一個實體要讀到的最後一個欄位是 OFF_KIND(0x2E4)+4 —— 一次讀這麼多就全有了。
+ENT_SPAN = OFF_KIND + 4
+
+
+def _entity_from_blob(addr: int, blob: bytes) -> Entity | None:
+    """從「一次讀回來的整塊物件」切出各欄位。判定規則跟逐格讀完全相同。"""
+    try:
+        name = blob[OFF_NAME:OFF_NAME + NAME_MAX].split(b"\x00")[0] \
+            .decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not name:
+        return None
+    vx, vy = struct.unpack_from("<II", blob, OFF_POS_X)
+    try:
+        state = blob[OFF_STATE:OFF_STATE + STATE_MAX].split(b"\x00")[0] \
+            .decode("ascii")
+    except UnicodeDecodeError:
+        state = ""
+    return Entity(addr,
+                  struct.unpack_from("<I", blob, OFF_ID)[0],
+                  struct.unpack_from("<I", blob, OFF_TYPE)[0],
+                  name,
+                  (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS,
+                  kind=struct.unpack_from("<I", blob, OFF_KIND)[0],
+                  state=state)
+
+
+def _build_slow(scanner, addr: int) -> Entity | None:
+    """逐欄位讀（舊做法）。只在整塊讀不到時走這裡 —— 物件尾巴壓在未映射頁時，
+    名字那幾個欄位其實還讀得到，不能因此把整隻怪丟掉。"""
+    raw = scanner._read_bytes(addr + OFF_NAME, NAME_MAX)
+    if not raw:
+        return None
+    try:
+        name = raw.split(b"\x00")[0].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not name:
+        return None
+    pos = read_pos(scanner, addr) or (0.0, 0.0)
+    return Entity(addr, _u32(scanner, addr + OFF_ID),
+                  _u32(scanner, addr + OFF_TYPE), name, *pos,
+                  kind=_u32(scanner, addr + OFF_KIND),
+                  state=read_state(scanner, addr))
 
 
 def _build(scanner, addrs: list[int]) -> list[Entity]:
+    """把掃到的位址變成 Entity 清單。
+
+    ★ 每隻怪**只發一次 ReadProcessMemory**（整塊 0x2E8 bytes 一起讀，再自己切）。
+      以前是名字、座標、ID、種類、kind、狀態各發一次 —— 六倍的系統呼叫。
+      掃描執行緒每秒要處理幾十到上百隻，這是它最大的一筆開銷。
+    ★ 附帶好處：六個欄位變成**同一瞬間**的快照，不會出現「座標是新的、
+      狀態是舊的」這種跨時間點的組合。
+    """
     out: list[Entity] = []
     for addr in addrs:
-        raw = scanner._read_bytes(addr + OFF_NAME, NAME_MAX)
-        if not raw:
-            continue
-        try:
-            name = raw.split(b"\x00")[0].decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        if not name:
-            continue
-        pos = read_pos(scanner, addr) or (0.0, 0.0)
-        out.append(Entity(addr, _u32(scanner, addr + OFF_ID),
-                          _u32(scanner, addr + OFF_TYPE), name, *pos,
-                          kind=_u32(scanner, addr + OFF_KIND),
-                          state=read_state(scanner, addr)))
+        blob = scanner._read_bytes(addr, ENT_SPAN)
+        ent = (_entity_from_blob(addr, blob) if blob
+               else _build_slow(scanner, addr))
+        if ent is not None:
+            out.append(ent)
     return out
 
 
@@ -326,16 +383,6 @@ def is_sitting(scanner, player_obj: int) -> bool:
     return bool(player_obj) and read_state(scanner, player_obj) == STATE_SIT
 
 
-def list_entities(scanner, should_stop=None) -> list[Entity]:
-    """列出附近所有實體（怪、NPC、其他玩家）。名字解不出來的會被略過。"""
-    return _build(scanner, _scan_vtable(scanner, VT_ENTITY, should_stop))
-
-
-def monsters(scanner, should_stop=None) -> list[Entity]:
-    """只要怪與 NPC，排除其他玩家。"""
-    return [e for e in list_entities(scanner, should_stop) if e.is_monster]
-
-
 def snapshot(scanner, should_stop=None, regions=None,
              extra_vts=()) -> tuple[int | None, int | None,
                                     list[Entity], list, dict]:
@@ -364,71 +411,22 @@ def snapshot(scanner, should_stop=None, regions=None,
             {v: hits[v] for v in extra})
 
 
-# --- 已載入的怪物類型表 -----------------------------------------------------
-# 結構（見 [[monster-entity-found]]）：
-#     +0x00 vtable = VT_MAP_MOBS
-#     +0x04 容量（實測 0x3FF / 0x400）
-#     +0x0C 種類數
-#     +0x10 起 指向名稱字串的指標陣列
+# --- 逆向筆記：兩條走過但**沒有採用**的路 -------------------------------
+# 程式碼已經移除（沒有任何呼叫者），保留結論免得下次又走一遍。
 #
-# ⚠ **這不是「這張地圖的怪」**。實測同時存在好幾個這種物件，內容是
-#   跨地圖累積的（在烏托邦讀到 7 種，裡面混著先前那張圖的史萊姆／水元素／
-#   天國百合，以及血沼那張圖的兩種）。使用者指出過這一點。
+# ① 已載入的怪物類型表　vtable 0x007D8E88（2026-08-04 當時的值）
+#      +0x00 vtable  +0x04 容量(0x3FF/0x400)  +0x0C 種類數
+#      +0x10 起 指向名稱字串的指標陣列
+#    本來想拿它當「這是不是真正的怪」的白名單。
+#    ⚠ 它**不是「這張地圖的怪」**：實測同時存在好幾個這種物件，內容跨地圖
+#      累積（在烏托邦讀到 7 種，混著前一張圖的史萊姆／水元素／天國百合）。
+#    ⛔ 已被 OFF_KIND（+0x2E4，7 = 怪物）取代 —— 那個直接、即時、不必掃描。
+#      farm_tab 那邊也標了「別再試」。
 #
-# 但拿來做「這是不是一隻真正的怪」的白名單剛好合適：
-# 寵物、召喚物、戰鬥化身的型別 ID 也不是 0（光看型別分不出來），
-# 而它們**不會出現在任何一張怪物類型表裡**。
-VT_MAP_MOBS = 0x007D8E88
-_MAP_CAPS = (0x3FF, 0x400)     # 同一個 vtable 也用在別的結構上，用容量篩掉
-_MAP_MAX_KINDS = 64
-
-
-def map_monster_names(scanner, hits) -> set[str]:
-    """讀出「遊戲認得的怪物名稱」集合；讀不到就回空集合（呼叫端別過濾）。
-
-    hits: 掃到的 VT_MAP_MOBS 位址（交給 snapshot 的 extra_vts 一起掃）。
-    ⚠ 同一個 vtable 也用在別的結構上（實測有一個容量 0xFA8、內容是角色名），
-      所以用容量篩掉。
-    ⚠ 會把所有符合的物件**聯集**起來 —— 它們本來就是跨地圖累積的，
-      而我們要的只是「這個名字是不是遊戲定義的怪」。
-    """
-    names: set[str] = set()
-    for obj in hits:
-        if _u32(scanner, obj + 4) not in _MAP_CAPS:
-            continue
-        cnt = _u32(scanner, obj + 0x0C)
-        if not 0 < cnt <= _MAP_MAX_KINDS:
-            continue
-        for i in range(cnt):
-            ptr = _u32(scanner, obj + 0x10 + i * 4)
-            if not ptr:
-                continue
-            raw = scanner._read_bytes(ptr, NAME_MAX)
-            if not raw:
-                continue
-            try:
-                nm = raw.split(b"\x00")[0].decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            if nm:
-                names.add(nm)
-    return names
-
-
-# ★ 客戶端自己算出來的「要走到哪裡」（16.16 定點，跟座標同一種編碼）。
-#   按下技能鍵時，客戶端會依**這招的射程**算出落腳點寫在這裡 ——
-#   所以 距離(落腳點, 怪) 就是官方的射程，不必自己量、也不必找射程欄位。
-#   實測（雪狐近戰）：客戶端算出的落腳點離怪 1.5 格。
-OFF_DEST = 0x144
-
-
-def read_dest(scanner, player_obj: int) -> tuple[float, float] | None:
-    """客戶端目前的移動目的地（格子座標）；讀不到回 None。"""
-    raw = scanner._read_bytes(player_obj + OFF_DEST, 8)
-    if not raw:
-        return None
-    x, y = struct.unpack("<II", raw)
-    return (x >> 16) / TILE_UNITS, (y >> 16) / TILE_UNITS
+# ② 客戶端算出來的落腳點　玩家物件 +0x144（16.16 定點，同座標編碼）
+#    按技能鍵時客戶端會依**該招射程**算出落腳點寫在那裡，
+#    所以 距離(落腳點, 怪) 就是官方射程（實測雪狐近戰 1.5 格）。
+#    ⛔ 使用者已否決「問客戶端射程」這條路（見 [[skill-range]]）。
 
 
 def read_target(scanner, state: int) -> int:
@@ -439,6 +437,23 @@ def read_target(scanner, state: int) -> int:
 def read_target_hp(scanner, state: int) -> int:
     """目標的血量百分比（0~100）。目標死亡或沒有目標時是 0。"""
     return _u32(scanner, state + OFF_TARGET_HP)
+
+
+def read_target_pair(scanner, state: int) -> tuple[int, int]:
+    """一次讀回 (目標實體 ID, 血量百分比)。
+
+    ★ 這兩個欄位是**相鄰的**（+0x2D8、+0x2DC），一次讀 8 bytes 就有 ——
+      分開讀是兩次系統呼叫，而這是 50Hz 的迴圈。
+    ★ 更重要的是**兩個值變成同一瞬間的**：分開讀的話，遊戲可能在兩次讀取
+      之間把 ID 清掉，於是拿到「舊的 ID 配新的血量」這種不存在的組合。
+    讀不到就回 (0, 0)，跟舊的兩支各自讀失敗時一致。
+    """
+    if OFF_TARGET_HP != OFF_TARGET + 4:      # 版面哪天變了就退回分開讀
+        return read_target(scanner, state), read_target_hp(scanner, state)
+    raw = scanner._read_bytes(state + OFF_TARGET, 8)
+    if not raw:
+        return 0, 0
+    return struct.unpack("<II", raw)
 
 
 def _write_u32(scanner, addr: int, value: int) -> None:
@@ -498,3 +513,30 @@ def is_alive(scanner, ent: Entity) -> bool:
     """
     return (_u32(scanner, ent.addr) == VT_ENTITY
             and _u32(scanner, ent.addr + OFF_ID) == ent.eid)
+
+
+# 一次讀到 OFF_ID 就涵蓋 vtable(+0)、座標(+0xBC)、狀態(+0x12C)、實體 ID(+0x1C8)
+LIVE_SPAN = OFF_ID + 4
+
+
+def read_live(scanner, ent: Entity) -> tuple[bool, str, tuple[float, float] | None]:
+    """一次讀回 (物件還在嗎, 動畫狀態, 座標)。
+
+    ★ 挑目標時這三件事本來各發一次系統呼叫（`is_alive` 自己就兩次），
+      一隻怪四次、場上幾十隻，而且每殺一隻就重挑一次。四次併成一次。
+    ★ 三個值變成**同一瞬間**的快照，不會出現「還活著但座標是死前的」。
+    讀不到就退回逐欄位讀，結果跟以前完全一樣。
+    """
+    blob = scanner._read_bytes(ent.addr, LIVE_SPAN)
+    if not blob:
+        return (is_alive(scanner, ent), read_state(scanner, ent.addr),
+                read_pos(scanner, ent.addr))
+    alive = (struct.unpack_from("<I", blob, 0)[0] == VT_ENTITY
+             and struct.unpack_from("<I", blob, OFF_ID)[0] == ent.eid)
+    try:
+        state = blob[OFF_STATE:OFF_STATE + STATE_MAX].split(b"\x00")[0] \
+            .decode("ascii")
+    except UnicodeDecodeError:
+        state = ""
+    vx, vy = struct.unpack_from("<II", blob, OFF_POS_X)
+    return alive, state, ((vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS)

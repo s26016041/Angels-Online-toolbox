@@ -559,95 +559,12 @@ class Mover:
         return [(x / entity.TILE_UNITS, y / entity.TILE_UNITS)
                 for x, y in struct.iter_unpack("<HH", bytes(raw))]
 
-    def walk_to(self, scanner, player_obj: int,
-                tile_x: float, tile_y: float, wait: float = 0.12) -> int:
-        """走到指定的格子座標。**回傳尋路算出的路徑點數**（0 = 走不了）。
-
-        ★ 那個點數就是免費的「有沒有障礙物」指標：
-              1 個點  = 直線過得去，中間沒東西擋
-              多個點  = 要繞，代表我們跟目標之間有地形
-          呼叫端可以拿它決定「是不是該一路走到怪臉上」——
-          隔著牆的話站在原地打是打不到的，距離再近也一樣。
-
-        ★ **會自動切成多個路徑點**，一個指令走完全程。
-          只送一個點的話超過約 19~20 格就會半路停住（實測：送 30 格只走 19.0），
-          症狀是「走到一半卡住」而且不會報錯。遊戲自己也是送多點的
-          （使用者擷取到的移動封包 38 bytes = 3 個點）。
-        """
-        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
-        if not raw:
-            return 0
-        wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
-        cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
-        dx, dy = tile_x - cx, tile_y - cy
-        full = math.hypot(dx, dy)
-        if full < 0.5:
-            return 0
-
-        # ★ 一律走遊戲自己的尋路：它會繞過地形，我們自己只會畫直線。
-        # 尋路有效範圍約 30~40 格，太遠回 0，所以由遠到近試幾個中繼距離；
-        # 走到中繼點後呼叫端再下一次，就能接力走很遠
-        # （實測 85.9 格、8.5 秒到達，全程繞過地形）。
-        this = pathfinder_this(scanner)
-        if not this:
-            return 0
-        # ★ 「算路徑 → 送移動封包」中間不能被插隊：路徑點是寫在**全域**陣列
-        #   0x9B6684 裡的，別人（攻擊封包）中間插一個呼叫倒是不會動到它，
-        #   但我們自己若被切開就可能拿舊路徑去送。整段一起鎖最安全。
-        # ⚠ 但這也常在 UI 執行緒上呼叫，所以只等 wait 秒 —— 等不到就回 0，
-        #   呼叫端過一下會再試一次，總之不要凍住畫面（見 path_to 的說明）。
-        self._wanted += 1                  # 舉手要指令槽，攻擊會讓一拍
-        try:
-            got = self._lock.acquire(timeout=max(wait, SLOT_YIELD))
-        finally:
-            self._wanted -= 1
-        if not got:
-            return 0
-
-        def try_point(px: float, py: float) -> int:
-            tx = int(px * entity.TILE_UNITS) & 0xFFFF
-            ty = int(py * entity.TILE_UNITS) & 0xFFFF
-            # 先問路徑點數：一來確認走得到，二來點數是「有沒有障礙物」的指標。
-            n = self.call_sync(PATHFIND_FN, tx, ty, WAYPOINTS,
-                               ecx=this, timeout=0.15)
-            if n and 0 < n <= MAX_POINTS:
-                # ★ 交給遊戲自己的「走到座標」常式，不要自己送 MOVE_FN ——
-                #   它會重算一次路徑並補做收尾（我們手動那版少了那兩步）。
-                self.call(WALK_FN, this, wx, wy, tx, ty, 0)
-                return n
-            return 0
-
-        try:
-            for hop in (full,) + PATH_TRY:
-                if hop > full:
-                    continue
-                n = try_point(cx + dx / full * hop, cy + dy / full * hop)
-                if n:
-                    return n
-            # 直線方向整條都算不出來 = 那個方向有牆。換角度繞（見 DETOUR_TRY）。
-            # ⚠ 只有在直線全失敗時才做，平常不會多花這些呼叫。
-            # ⚠⚠ **繞路的落點一定要比現在更靠近目標**，否則就是原地打轉：
-            #    實測（黑狐回 195 格外的原點）沒有這條規則時，走到某一格之後
-            #    繞路又把它帶回原處，然後無限來回，看起來一直在動卻永遠到不了。
-            ang = math.atan2(dy, dx)
-            for hop, deg in DETOUR_TRY:
-                if hop > full:
-                    continue
-                a = ang + math.radians(deg)
-                px, py = cx + math.cos(a) * hop, cy + math.sin(a) * hop
-                if math.hypot(tile_x - px, tile_y - py) >= full:
-                    continue                   # 繞過去反而更遠，不要
-                n = try_point(px, py)
-                if n:
-                    return n
-        finally:
-            self._lock.release()
-
-        # ⚠ 連最短的中繼點都算不出路徑 = 那個方向真的不通。
-        # **不要退回直線走** —— 那只會讓角色貼著牆推、原地卡住
-        # （使用者回報的「往那個方向卡住」就是這樣來的）。
-        # 回 0 讓呼叫端自己決定（掛機那邊會由卡住偵測換目標）。
-        return 0
+    # ⛔ walk_to() 已移除（沒有呼叫者）。它是「在直線上取中繼點、
+    #   算不出來就 ±70° 繞路」的舊做法，已經被兩層取代：
+    #     近距離 → walk_route()（對目標本身尋路，沿路徑往回退）
+    #     遠距離 → navigate.Navigator（360° 找中繼點、允許暫時走遠）
+    #   舊做法在凹形地形會死循環（實測 60 秒送 158 次指令、一格都沒動），
+    #   細節見 app/game/navigate.py 的檔頭。
 
     def walk_path(self, scanner, player_obj: int, tiles) -> bool:
         """低階：直接送出指定的路徑點（最後一個是終點）。
@@ -677,15 +594,21 @@ class Mover:
         return self._pm.read_uint(self._block + _DONE) if self._active else 0
 
     def stop(self) -> None:
-        """還原 IAT。**一定要呼叫** —— 不還原就等於在遊戲裡留了一段跳板。"""
+        """還原 IAT。**一定要呼叫** —— 不還原就等於在遊戲裡留了一段跳板。
+
+        ⚠ 要拿鎖：別條執行緒（攻擊、移動）可能正卡在 `call()`／`call_sync()`
+          中間。不拿鎖的話，牠可能在我們清掉旗標之後、還原 IAT 之前又把旗標
+          設起來，等於對一段馬上就要拆掉的跳板下指令。
+        """
         if not self._active:
             return
-        try:
-            from app.core import injector
+        with self._lock:
+            try:
+                from app.core import injector
 
-            self._pm.write_uint(self._block + _FLAG, 0)
-            injector.SendCapture._protect(self._pm, self._iat, 8, 0x40)
-            self._pm.write_uint(self._iat, self._orig)
-        except Exception:               # noqa: BLE001
-            pass
-        self._active = False
+                self._pm.write_uint(self._block + _FLAG, 0)
+                injector.SendCapture._protect(self._pm, self._iat, 8, 0x40)
+                self._pm.write_uint(self._iat, self._orig)
+            except Exception:               # noqa: BLE001
+                pass
+            self._active = False

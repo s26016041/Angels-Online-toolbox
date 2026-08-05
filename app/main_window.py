@@ -138,6 +138,15 @@ class MainWindow(QMainWindow):
             self._updater.stop()
         except Exception:
             traceback.print_exc()
+        # ⚠⚠ 自我監察那條執行緒**一定要等它結束**。它在掃五台分身的記憶體，
+        #   物件被解構時人還在跑的話，Qt 丟「Destroyed while thread is still
+        #   running」→ Windows 0xC0000409 原生當機，crash.log 什麼都不會留
+        #   （health_ui.start() 的說明就是在講這個坑）。
+        try:
+            if self._health is not None:
+                self._health.stop()
+        except Exception:
+            traceback.print_exc()
         for tab in self._loaded_tabs:
             try:
                 tab.on_close()

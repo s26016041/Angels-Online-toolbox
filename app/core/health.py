@@ -60,13 +60,16 @@ class Report:
 
 
 def check_client(sc, hwnd: int, account: str,
-                 deep: bool = False) -> ClientResult:
+                 deep: bool = False, should_stop=None) -> ClientResult:
     """跑完一台分身的所有檢查。純讀取。
 
     deep=True 才做「背包物品陣列」那一項 —— 它要全記憶體掃兩次，
     **一台就要 1.5 秒**（五台 8 秒）。開程式時的背景監察不能這麼慢：
     那條執行緒會一直吃 GIL，主視窗就遲遲畫不出來。
     手動跑 `tools/selfcheck.py` 時才開。
+
+    should_stop: 可選 callable，回傳 True 就盡快收手（關程式時用）。
+        中途收手的報告是不完整的，呼叫端不該拿它下「壞掉了」的結論。
     """
     from app.game import channel, energy, entity, locate, monsters
     from app.game import player, scene
@@ -77,9 +80,14 @@ def check_client(sc, hwnd: int, account: str,
     def put(key, ok, detail=""):
         res.checks[key] = (bool(ok), detail)
 
+    # ⚠ 成功也要記這一項：broken 是拿**同名項目**跨分身聚合的（見 Report.broken），
+    #   成功的分身若沒有這個鍵，只要一台 OpenProcess 失敗（剛關遊戲、正在登入），
+    #   聚合起來就是「所有有這鍵的分身都失敗」→ 誤報壞掉 → 整個程式被關掉。
+    put("讀取記憶體", True)
+
     st = pl = None
     try:
-        st, pl, ents, _r, _e = entity.snapshot(sc)
+        st, pl, ents, _r, _e = entity.snapshot(sc, should_stop=should_stop)
     except Exception as exc:                   # noqa: BLE001
         ents = []
         put("怪物掃描", False, str(exc))
@@ -87,8 +95,8 @@ def check_client(sc, hwnd: int, account: str,
         put("怪物掃描", True, f"{len([e for e in ents if e.is_monster])} 隻")
     put("狀態物件", st is not None, st and hex(st) or "")
     put("玩家物件", pl is not None, pl and hex(pl) or "")
-    put("玩家座標", bool(pl and entity.read_pos(sc, pl)),
-        str(entity.read_pos(sc, pl)) if pl else "")
+    pos = entity.read_pos(sc, pl) if pl else None
+    put("玩家座標", bool(pos), str(pos) if pl else "")
     mons = [e for e in ents if e.is_monster]
     put("怪物死活狀態", all(m.state for m in mons) if mons else True,
         f"{sum(1 for m in mons if m.dead)} 具屍體")
@@ -100,15 +108,24 @@ def check_client(sc, hwnd: int, account: str,
     put("怪物範本表", idx is not None,
         str(monsters.info(sc, mons[0].type_id, idx)) if (mons and idx) else "")
 
-    put("分流資訊",
-        channel.current(hwnd) is not None and channel.count(sc, hwnd) is not None,
-        f"{channel.current(hwnd)} / {channel.count(sc, hwnd)}")
+    if should_stop is not None and should_stop():
+        return res                 # 被叫停：剩下的都是全記憶體掃描，別再開始
+
+    # ⚠ channel.count() 是全記憶體掃描，只做一次（以前條件式和字串各叫一次，
+    #   等於每台分身白掃一輪）。
+    cur_ch = channel.current(hwnd)
+    n_ch = channel.count(sc, hwnd, should_stop=should_stop)
+    put("分流資訊", cur_ch is not None and n_ch is not None,
+        f"{cur_ch} / {n_ch}")
 
     es = energy.read(sc, st) if st else None
     put("能量晶化欄位", es is not None, f"能量 {es.energy}" if es else "")
     put("屬性名稱", len(energy.attr_names(sc)) == energy.ATTR_COUNT)
 
-    base = player.locate(sc)
+    if should_stop is not None and should_stop():
+        return res
+
+    base = player.locate(sc, should_stop=should_stop)
     stats = player.read(sc, base) if base else None
     put("角色屬性", stats is not None,
         f"Lv{stats.level}" if stats else "")
@@ -122,7 +139,8 @@ def check_client(sc, hwnd: int, account: str,
         return res                 # 淺層到此為止（開程式時的背景監察走這條）
     try:
         from app.game import aob, inventory
-        hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096)
+        hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096,
+                        should_stop=should_stop)
         head = inventory.locate(sc, {a - inventory.ITEM_BALL_OFF for a in hits})
         n = sum(1 for _ in inventory._walk(sc, head)) if head else None
     except Exception as exc:                   # noqa: BLE001
@@ -134,8 +152,12 @@ def check_client(sc, hwnd: int, account: str,
     return res
 
 
-def check(deep: bool = False) -> Report:
-    """檢查所有開著的分身。沒有分身時回傳空報告（`skipped` 為 True）。"""
+def check(deep: bool = False, should_stop=None) -> Report:
+    """檢查所有開著的分身。沒有分身時回傳空報告（`skipped` 為 True）。
+
+    should_stop: 可選 callable，回傳 True 就盡快收手（關程式時用）。
+        ⚠ 被叫停的報告不完整，呼叫端要自己丟掉、不要拿去判斷「壞掉了」。
+    """
     from app.game import locate
 
     rep = Report()
@@ -143,11 +165,14 @@ def check(deep: bool = False) -> Report:
     if not wins:
         return rep
     for w in wins:
+        if should_stop is not None and should_stop():
+            break
         acc = charname.account_from_title(w.title) or ""
         sc = MemoryScanner()
         try:
             sc.open(w.pid)
-            got = check_client(sc, w.hwnd, acc, deep=deep)
+            got = check_client(sc, w.hwnd, acc, deep=deep,
+                               should_stop=should_stop)
             got.name = preload.name_of(w.pid, sc, acc)
             rep.clients.append(got)
         except Exception as exc:               # noqa: BLE001

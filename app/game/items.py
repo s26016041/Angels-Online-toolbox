@@ -54,10 +54,6 @@ class BallType:
     min_level: int = 0
     type_id: int | None = None
 
-    @property
-    def known_cap(self) -> bool:
-        return self.cap > 0
-
     def pct(self, value: int) -> float | None:
         """目前累積的百分比；上限未知時回傳 None。"""
         if self.cap <= 0:

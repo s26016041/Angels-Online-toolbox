@@ -23,16 +23,24 @@ from app.core import health
 
 
 class HealthWorker(QThread):
-    """背景跑一次自我監察。壞掉時把項目清單送出來。"""
+    """背景跑一次自我監察。壞掉時把項目清單送出來。
+
+    ⚠ 關視窗時要能**中途收手**：`health.check()` 五台要跑好幾秒，關程式時
+      沒人等它就會出現「QThread: Destroyed while thread is still running」
+      → 0xC0000409 原生當機（見 `start()` 的說明）。所以掃描全程帶
+      `should_stop`，`stop()` 一叫就在下一個記憶體區塊邊界停下來。
+    """
 
     broken = Signal(object)      # list[str]
     ok = Signal(object)          # Report
 
     def run(self) -> None:
         try:
-            rep = health.check()
+            rep = health.check(should_stop=self.isInterruptionRequested)
         except Exception:                      # noqa: BLE001
             return                             # 監察本身出錯 —— 不要嚇使用者
+        if self.isInterruptionRequested():
+            return                             # 中途被叫停 —— 結論不完整，不下判斷
         if rep.skipped:
             return
         bad = rep.broken
@@ -40,6 +48,11 @@ class HealthWorker(QThread):
             self.broken.emit(bad)
         else:
             self.ok.emit(rep)
+
+    def stop(self, wait_ms: int = 8000) -> None:
+        """請它收手並等它結束。關視窗前一定要叫。"""
+        self.requestInterruption()
+        self.wait(wait_ms)
 
 
 def start(parent) -> HealthWorker | None:
