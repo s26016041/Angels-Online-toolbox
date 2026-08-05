@@ -41,15 +41,17 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -61,9 +63,10 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, channel, entity, inventory, locate,
-                      monsters, move, player, scene)
-from app.tabs.base_tab import BaseTab
+from app.game import (aob, attack, channel, entity, inventory, jumpmap,
+                      locate, monsters, move, navigate, player, robot,
+                      scene)
+from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
 # 平常是關的 —— 從外面看不到「為什麼不走」，只能靠這個。
@@ -90,6 +93,11 @@ FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保�
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，不必常看）
+# ★ 交棒給天使精靈跑補給：多久看一次「回到原地圖了沒」、最多等多久就放棄。
+#   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
+SUPPLY_POLL = 5.0               # 使用者指定的間隔
+SUPPLY_MAX_SECS = 600.0
+JUMP_BACK_SECS = 180.0          # ★「用天使趴趴GO回地圖」等多久才傳（使用者指定 3 分鐘）
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
 # 的 MAX_HOP），長距離是靠這裡定期重下、一段一段接力走完的，所以不能太久。
 # ★ 下一次移動指令最少隔多久。**而且角色還在走時一律不下**（見 tick）。
@@ -98,14 +106,26 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，�
 #   我們正好在繞開那一段打斷它 → 回到原處又重算 → 無限來回，
 #   看起來就像根本沒在算路徑。實測不打斷之後，176 格外的原點 42 秒就走回去了。
 WALK_GAP = 0.4
+# ★★ **趕路時**的指令冷卻。角色一停下來（動畫狀態變 'Wait'）就馬上下一段，
+#   長距離才不會一頓一頓 —— 每段之間空等 0.5 秒，走 5 段就多花 2.5 秒。
+# ⚠⚠ 這個值**一定要大於「指令排隊到真的執行」的時間**（實測 107~154ms）。
+#   設 0.12 反而更糟：角色還沒開始動、狀態還是 'Wait'，我們就又送一次，
+#   把上一個指令重置掉 —— 一路互相打斷，實測卡頓變成 0.47~0.51 秒。
+#   0.3 秒留了兩倍餘裕；正常情況根本用不到（停下來的那一拍就直接送了），
+#   它只是「送出去卻沒生效」時的重試間隔。
+WALK_GAP_FAR = 0.30
+# 離目標多遠算「還在趕路」。比這個近就是打鬥中的微調，維持原本 0.4 秒的節奏
+# —— 遊戲自己打怪時也是 1 秒 1 包，微調不需要更密（密了反而搶指令槽）。
+FAR_ENOUGH = 6.0
 # 判斷「有沒有在移動」要隔一段時間再比位置。
 # ⚠ 心跳是 10ms，而角色約 9 格/秒 = 每拍才 0.09 格 —— 拿相鄰兩拍比
 #   幾乎永遠判定「沒在動」（卡住偵測也一起誤判，走路中照樣累積秒數）。
 # 走路的到達容差：距離只超過目標一點點就不要再走了。
 # 沒有它的話角色會在定位附近一直被推一小步（「打一打又往前一格」）。
 WALK_SLACK = 1.5
-MOVE_SAMPLE = 0.3
-MOVE_EPS = 0.5                  # 這段時間內位移超過這個就算在移動
+# ⛔ 舊的「隔 MOVE_SAMPLE 秒比一次位置」已經拿掉 —— 改讀遊戲的動畫狀態
+#    （entity.is_walking）。比位置最久要 0.3 秒才知道走完了，那 0.3 秒
+#    加上指令冷卻就是使用者說的「長距離卡卡的」。
 KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到同一具屍體）
 # 「一直沒給血量」而跳過的冷卻。那只是推測，牠可能還活著，所以比擊殺短。
 # ⚠ 不能設 0：挑目標永遠挑最近的，冷卻 0 的話下一拍又挑到同一具，
@@ -114,7 +134,15 @@ KILL_MEMORY = 60.0              # 打死的實體 ID 記多久（避免又挑到
 #   反覆挑到（從第一次到最後一次**中位相隔 13 秒**、最久 34 秒）——
 #   冷卻 5 秒時 64 段裡有 23 段是重複挑同一具屍體。20 秒才擋得住。
 NOHP_MEMORY = 20.0
-NEAR_HEIGHT = 130               # 「周圍怪物」清單高度；使用者要求小一點
+# 三個清單的**最小**高度。★ 只是下限 —— 有空間時清單會自己長高填滿，
+#   實際大多顯示 200px 以上。
+# ⚠ 不能設太大：主視窗固定 940x700，最小高度加起來超過可視區的話，
+#   整頁就會多一條垂直捲軸（130 時實測需要 599px、只有 556px 可用）。
+NEAR_HEIGHT = 84
+# 清單的上限。⚠ 少了它清單會一路長高，把下面的「手動輸入」欄和
+#   「加入位置」按鈕擠出可視區（要捲才看得到）——
+#   主視窗是固定 940x700，整頁高度就這麼多。
+NEAR_MAX = 108
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒前進這麼久 → 這隻走不過去，換一隻
 # ★★ 卡住偵測用「離錨點的**淨位移**」，不是「每 0.3 秒有沒有動」。
 #   撞牆時角色會小幅抖動（實測約 0.5~0.6 格），剛好跨過舊的 MOVE_EPS(0.5)
@@ -771,9 +799,7 @@ class CharFarmPage(QWidget):
         self._hurt = False         # 這隻有沒有被我們打傷過
         self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
-        self._moving = False       # 角色是不是正在走路（隔 MOVE_SAMPLE 取樣）
-        self._move_ref: tuple[float, float] | None = None
-        self._move_t = 0.0
+        self._moving = False       # 角色是不是正在走路（讀動畫狀態，見 tick）
         self._why = ""             # 沒在攻擊的原因（顯示在狀態列）
         # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
@@ -782,6 +808,15 @@ class CharFarmPage(QWidget):
         self._hp = -1              # 最近讀到的 HP（給狀態列用）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
         self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
+        self._supply = False       # 正在讓天使精靈跑補給（我們完全讓開）
+        self._supply_t = 0.0       # 這一趟補給跑多久了
+        self._supply_poll = 0.0    # 距離上次檢查補給進度過了多久
+        self._supply_scene = None  # 出發時人在哪張地圖（回到它才算補完）
+        self._supply_left = False  # 已經離開過那張地圖了嗎
+        self._supply_pos = None    # 出發時站在哪（挑最近的傳送落點用）
+        self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
+        self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
+        self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
         self._mover: move.Mover | None = None
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）。
@@ -790,7 +825,8 @@ class CharFarmPage(QWidget):
         #   不記地圖就會拿 A 圖的點在 B 圖亂走（使用者要求：不同圖就不要去）。
         self._spots: list[tuple[float, float, int | None]] = []
         self._spot_i = 0           # 現在要去第幾個
-        self._spot_pts = 1         # 上次往巡邏點算出的路徑點數
+        # ★ 走去巡邏點的導航器（會繞路、會判斷到不了），見 navigate.py
+        self._nav = navigate.Navigator()
         # 目前所在地圖。心跳每 SCENE_SAMPLE 秒更新一次（見 _refresh_scene）。
         self._scene: int | None = None
         self._scene_t = SCENE_SAMPLE    # 第一拍就讀
@@ -823,7 +859,21 @@ class CharFarmPage(QWidget):
         # 「走不到」失敗過幾次（每隻怪各自算）—— 冷卻時間照這個翻倍。
         self._unreach_n: dict[int, int] = {}
 
-        root = QVBoxLayout(self)
+        # ★ 內容放進可捲動區。**主視窗是固定 940x700**（見 main_window.py），
+        #   分頁塞不下時 Qt 會硬把控制項壓到比最小尺寸還小 —— 那就是使用者
+        #   看到的「字被切掉一半」。有捲軸就永遠不會壓，頂多要捲一下。
+        #   其他分頁（記憶體掃描、收益監控、封包）本來就是這樣做的。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+        root = QVBoxLayout(body)
+        root.setSpacing(6)
 
         # 通知列（最上面）。★ 每個分身各自一份設定，不共用
         # —— 使用者要求：不同分身可能要通知到不同的地方。
@@ -849,22 +899,41 @@ class CharFarmPage(QWidget):
         nbar.addStretch(1)
         root.addLayout(nbar)
 
+        # ★ 主開關自己一列，放在所有分類方框**上面** —— 它管的是整個頁面，
+        #   塞進任何一個分類裡都不對，而且要一眼就找得到。
+        self.run_cb = QCheckBox("開始掛機")
+        self.run_cb.setStyleSheet("font-weight: bold;")
+        self.run_cb.setToolTip(
+            "勾選後開始：把「選中怪物」裡離自己最近的一隻寫進遊戲的目前目標，"
+            "並持續送技能鍵。\n打死會自動接下一隻。取消勾選立刻停止。")
+        self.run_cb.toggled.connect(self._on_toggle)
+        root.addWidget(self.run_cb)
+
+        # ★ 依分類分組（使用者要求）：原本 5 條平鋪的橫列很難一眼看懂哪個是
+        #   哪個，改成有標題的方框、排成兩欄，垂直空間也省下來給下面的清單。
         # ★ 沒有「掃描周圍怪物」按鈕：分頁一開就會自動持續刷新（見 tick），
         #   所以「周圍怪物」永遠是即時的，也不必先掃過才能開始掛機。
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("技能鍵"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+
+        # ── 攻擊 ────────────────────────────────────────────
+        g_atk = QGroupBox("攻擊")
+        a = QHBoxLayout(g_atk)
+        a.addWidget(QLabel("技能鍵"))
         self.key_box = QComboBox()
         for label, vk in SKILL_KEYS:
             self.key_box.addItem(label, vk)
         self.key_box.setCurrentIndex(
             next(i for i, (_, vk) in enumerate(SKILL_KEYS) if vk == DEFAULT_KEY))
-        self.key_box.setFixedWidth(70)
+        # 照內容自動調寬（F10~F12 比 F2 寬）
+        self.key_box.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.key_box.setToolTip("要一直按的攻擊／技能鍵。")
         self.key_box.currentIndexChanged.connect(
             lambda i: setattr(self._keys, "vk", self.key_box.itemData(i)))
-        bar.addWidget(self.key_box)
-        bar.addSpacing(12)
-        bar.addWidget(QLabel("每隔"))
+        a.addWidget(self.key_box)
+        a.addSpacing(10)
+        a.addWidget(QLabel("每隔"))
         self.interval = QDoubleSpinBox()
         self.interval.setRange(0.02, 5.0)
         self.interval.setSingleStep(0.01)
@@ -873,61 +942,12 @@ class CharFarmPage(QWidget):
         # ⚠ 單位文字一律放在**框外**的 QLabel。用 setSuffix() 會把「秒按一次」
         #   塞進輸入框裡，看起來像可以打字進去的內容 —— 使用者反映「怪怪的，
         #   輸入框應該只有數字」。整個專案統一這個做法。
-        self.interval.setFixedWidth(70)
+        fit_spin(self.interval)
         self.interval.valueChanged.connect(self._keys.set_interval)
         self._keys.set_interval(DEFAULT_INTERVAL)
-        bar.addWidget(self.interval)
-        bar.addWidget(QLabel("秒按一次"))
-        bar.addSpacing(12)
-        # ★ 沒有「封包攻擊」勾選框、也不顯示技能 ID —— 用哪種方式打由
-        #   下面的「攻擊型態」決定（遠程送封包、近戰按鍵），技能 ID 是內部
-        #   自己學的（清零 → 按選定的 Fx → 讀記憶體），使用者不需要看。
-        self.run_cb = QCheckBox("開始掛機")
-        self.run_cb.setToolTip(
-            "勾選後開始：把「選中怪物」裡離自己最近的一隻寫進遊戲的目前目標，"
-            "並持續送技能鍵。\n打死會自動接下一隻。取消勾選立刻停止。")
-        self.run_cb.toggled.connect(self._on_toggle)
-        bar.addWidget(self.run_cb)
-        bar.addStretch(1)
-        root.addLayout(bar)
-
-        # 移動列：走過去遠處的怪、以及回原點
-        mbar = QHBoxLayout()
-        self.move_cb = QCheckBox("自動走過去")
-        self.move_cb.setChecked(True)
-        self.move_cb.setToolTip(
-            "半徑內沒有選中的怪時，主動走到最近那隻旁邊。\n"
-            "⚠ 這項功能需要在遊戲行程裡執行一小段程式碼（掛 PeekMessageA），\n"
-            "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
-        mbar.addWidget(self.move_cb)
-        mbar.addSpacing(12)
-        mbar.addWidget(QLabel("接戰距離"))
-        self.range_spin = QDoubleSpinBox()
-        self.range_spin.setRange(1.0, 15.0)
-        self.range_spin.setSingleStep(0.5)
-        self.range_spin.setDecimals(1)
-        self.range_spin.setValue(WALK_KEEP)
-        self.range_spin.setFixedWidth(70)
-        self.range_spin.setToolTip(
-            "追到怪之後最遠停在幾格 —— 也就是「不用再靠近」的門檻。\n"
-            "\n"
-            "遠程角色：10～12（技能射程實測 12 格）。\n"
-            "近戰角色：調小到 1～2，不然站太遠伺服器不受理施放，\n"
-            "　　　　　症狀是站著不動、怪完全不掉血。\n"
-            "\n"
-            "⚠ 送攻擊封包仍固定在 12 格內，不受這個設定影響。\n"
-            "⚠ 隔著地形時一律貼臉走過去，也不受這個設定影響。")
-        mbar.addWidget(self.range_spin)
-        mbar.addWidget(QLabel("格"))
-        mbar.addSpacing(12)
-        self.patrol_cb = QCheckBox("沒怪時去巡邏點找")
-        self.patrol_cb.setToolTip(
-            "追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
-            "**完全沒有**選中的怪時，才依序走去右邊的巡邏點找。\n"
-            "★ 只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
-            "　 同一張圖的不同分流算同一張，會照走。")
-        mbar.addWidget(self.patrol_cb)
-        mbar.addSpacing(12)
+        a.addWidget(self.interval)
+        a.addWidget(QLabel("秒一次"))
+        a.addSpacing(10)
         # ★ 只打王：勾起來就**完全不看「選中怪物」的名字**，改成看種類 ID
         #   是不是王（見 app/game/monsters.py）。名字比對分不出來 ——
         #   有 20 種怪同名卻一個是王一個不是（哥布林幹部 78 / 663王…）。
@@ -941,107 +961,226 @@ class CharFarmPage(QWidget):
             "\n"
             "⚠ 不分等級：周圍出現的**任何**王都會打。真的很硬的王打不贏時，\n"
             "　 角色一死掛機會自動停下來，但還是留意一下。")
-        mbar.addWidget(self.boss_cb)
-        mbar.addStretch(1)
-        root.addLayout(mbar)
+        a.addWidget(self.boss_cb)
+        a.addStretch(1)
+        grid.addWidget(g_atk, 0, 0)
 
-        # ★ 自動巡迴換頻道：從目前這一頻出發繞一圈再回到原本那一頻。
+        # ── 移動與巡邏 ──────────────────────────────────────
+        g_mov = QGroupBox("移動與巡邏")
+        m = QHBoxLayout(g_mov)
+        self.move_cb = QCheckBox("自動走過去")
+        self.move_cb.setChecked(True)
+        self.move_cb.setToolTip(
+            "半徑內沒有選中的怪時，主動走到最近那隻旁邊。\n"
+            "⚠ 這項功能需要在遊戲行程裡執行一小段程式碼（掛 PeekMessageA），\n"
+            "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
+        m.addWidget(self.move_cb)
+        m.addSpacing(10)
+        m.addWidget(QLabel("接戰距離"))
+        self.range_spin = QDoubleSpinBox()
+        self.range_spin.setRange(1.0, 15.0)
+        self.range_spin.setSingleStep(0.5)
+        self.range_spin.setDecimals(1)
+        self.range_spin.setValue(WALK_KEEP)
+        fit_spin(self.range_spin)
+        self.range_spin.setToolTip(
+            "追到怪之後最遠停在幾格 —— 也就是「不用再靠近」的門檻。\n"
+            "\n"
+            "遠程角色：10～12（技能射程實測 12 格）。\n"
+            "近戰角色：調小到 1～2，不然站太遠伺服器不受理施放，\n"
+            "　　　　　症狀是站著不動、怪完全不掉血。\n"
+            "\n"
+            "⚠ 送攻擊封包仍固定在 12 格內，不受這個設定影響。\n"
+            "⚠ 隔著地形時一律貼臉走過去，也不受這個設定影響。")
+        m.addWidget(self.range_spin)
+        m.addWidget(QLabel("格"))
+        m.addSpacing(10)
+        # ⚠ 字數就是版面寬度：這個勾選框每多一個字，整個右欄就多 13px，
+        #   超過視窗（固定 940）就會被推到水平捲軸外面。完整說明在滑鼠提示。
+        self.patrol_cb = QCheckBox("沒怪去巡邏點")
+        self.patrol_cb.setToolTip(
+            "追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
+            "**完全沒有**選中的怪時，才依序走去右邊的巡邏點找。\n"
+            "★ 只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
+            "　 同一張圖的不同分流算同一張，會照走。")
+        m.addWidget(self.patrol_cb)
+        m.addStretch(1)
+        grid.addWidget(g_mov, 0, 1)
+
+        # ── 坐下休息 ───────────────────────────────────────
+        # ★ 血/魔不足就坐下回復。流程：低於門檻 → **先把手上的怪打完、
+        #   確認沒有怪在打我** → 坐下 → 回到 100% → 起身繼續。
+        #   「要先清乾淨才坐」是使用者明確要求的，理由很實際：
+        #   坐著被怪打會死（這個專案有前科，測試時留著怪沒殺，角色被打死）。
+        g_rest = QGroupBox("坐下休息")
+        s = QHBoxLayout(g_rest)
+        self.rest_hp_cb = QCheckBox("HP 低於")
+        self.rest_hp_cb.setToolTip(
+            "血量低於這個百分比就停下來坐著回血，回到 100% 再繼續。\n"
+            "⚠ 不會馬上坐 —— 會先把手上的怪打完、確認沒有怪在打你。")
+        self.rest_hp_cb.toggled.connect(self._save_settings)
+        s.addWidget(self.rest_hp_cb)
+        self.rest_hp = QSpinBox()
+        self.rest_hp.setRange(1, 99)
+        self.rest_hp.setValue(REST_HP_DEFAULT)
+        fit_spin(self.rest_hp)
+        self.rest_hp.valueChanged.connect(self._save_settings)
+        s.addWidget(self.rest_hp)
+        s.addWidget(QLabel("%"))
+        s.addSpacing(10)
+        self.rest_mp_cb = QCheckBox("MP 低於")
+        self.rest_mp_cb.setToolTip(
+            "魔力低於這個百分比就停下來坐著回魔，回到 100% 再繼續。\n"
+            "⚠ 同樣會先把手上的怪打完才坐。")
+        self.rest_mp_cb.toggled.connect(self._save_settings)
+        s.addWidget(self.rest_mp_cb)
+        self.rest_mp = QSpinBox()
+        self.rest_mp.setRange(1, 99)
+        self.rest_mp.setValue(REST_MP_DEFAULT)
+        fit_spin(self.rest_mp)
+        self.rest_mp.valueChanged.connect(self._save_settings)
+        s.addWidget(self.rest_mp)
+        # ⚠ 這裡曾經寫「%　回滿再繼續」，那五個字讓「坐下休息」要 499px，
+        #   兩欄加起來就超過視窗寬度（固定 940）→ 整個右欄被推到捲軸外面。
+        #   「回滿再繼續」滑鼠提示裡本來就有寫，拿掉不會少資訊。
+        s.addWidget(QLabel("%"))
+        self.rest_lbl = QLabel("")
+        self.rest_lbl.setStyleSheet("color: #9aa2b8;")
+        s.addWidget(self.rest_lbl)
+        s.addStretch(1)
+        grid.addWidget(g_rest, 1, 0)
+
+        # ── 巡迴換頻道 ─────────────────────────────────────
+        # ★ 從目前這一頻出發繞一圈再回到原本那一頻。
         #   在 3 頻就是 3 → 4 → 5 → 1 → 2 → 3。切換靠 app/game/channel.py
         #   （跟選定怪物同一個遊戲函式，只差種類碼）。
-        rbar = QHBoxLayout()
-        self.rot_cb = QCheckBox("自動巡迴換頻道")
+        g_rot = QGroupBox("巡迴換頻道")
+        r = QHBoxLayout(g_rot)
+        self.rot_cb = QCheckBox("自動換頻")
         self.rot_cb.setToolTip(
             "從**目前這一頻**出發，依序換過每一頻再回到原本那一頻。\n"
             "例：現在在 3 頻 → 4 → 5 → 1 → 2 → 3（共 5 次切換）。\n"
             "\n"
             "換頻道期間會暫停打怪幾秒（要等重連＋重新定位），\n"
             "停留那段時間照常掛機。")
-        rbar.addWidget(self.rot_cb)
-        rbar.addWidget(QLabel("每"))
+        r.addWidget(self.rot_cb)
+        r.addWidget(QLabel("每"))
         self.rot_every = QDoubleSpinBox()
         self.rot_every.setRange(1.0, 600.0)
         self.rot_every.setSingleStep(5.0)
         self.rot_every.setDecimals(0)
         self.rot_every.setValue(30.0)
-        self.rot_every.setFixedWidth(70)
+        fit_spin(self.rot_every)
         self.rot_every.setToolTip("隔多久開始新的一輪巡迴（從上一輪開始算）。")
-        rbar.addWidget(self.rot_every)
-        rbar.addWidget(QLabel("分巡一輪"))
-        rbar.addWidget(QLabel("每頻停留"))
+        r.addWidget(self.rot_every)
+        r.addWidget(QLabel("分一輪，每頻"))
         self.rot_stay = QDoubleSpinBox()
         self.rot_stay.setRange(5.0, 3600.0)
         self.rot_stay.setSingleStep(10.0)
         self.rot_stay.setDecimals(0)
         self.rot_stay.setValue(60.0)
-        self.rot_stay.setFixedWidth(70)
+        fit_spin(self.rot_stay)
         self.rot_stay.setToolTip(
             "換到一頻之後待多久才換下一頻。這段時間照常打怪。\n"
             "⚠ 最少 5 秒 —— 客戶端重連要 1~2 秒，太短會一直在換線。")
-        rbar.addWidget(self.rot_stay)
-        rbar.addWidget(QLabel("秒"))
+        r.addWidget(self.rot_stay)
+        r.addWidget(QLabel("秒"))
         self.rot_lbl = QLabel("")
         self.rot_lbl.setStyleSheet("color: #9aa2b8;")
-        rbar.addWidget(self.rot_lbl)
-        rbar.addStretch(1)
-        root.addLayout(rbar)
+        r.addWidget(self.rot_lbl)
+        r.addStretch(1)
+        grid.addWidget(g_rot, 1, 1)
 
-        # ★ 血/魔不足就坐下回復。流程：低於門檻 → **先把手上的怪打完、
-        #   確認沒有怪在打我** → 坐下 → 回到 100% → 起身繼續。
-        #   「要先清乾淨才坐」是使用者明確要求的，理由很實際：
-        #   坐著被怪打會死（這個專案有前科，測試時留著怪沒殺，角色被打死）。
-        sbar = QHBoxLayout()
-        self.rest_hp_cb = QCheckBox("HP 低於")
-        self.rest_hp_cb.setToolTip(
-            "血量低於這個百分比就停下來坐著回血，回到 100% 再繼續。\n"
-            "⚠ 不會馬上坐 —— 會先把手上的怪打完、確認沒有怪在打你。")
-        self.rest_hp_cb.toggled.connect(self._save_settings)
-        sbar.addWidget(self.rest_hp_cb)
-        self.rest_hp = QSpinBox()
-        self.rest_hp.setRange(1, 99)
-        self.rest_hp.setValue(REST_HP_DEFAULT)
-        self.rest_hp.setFixedWidth(60)
-        self.rest_hp.valueChanged.connect(self._save_settings)
-        sbar.addWidget(self.rest_hp)
-        sbar.addWidget(QLabel("%"))
-        sbar.addSpacing(12)
-        self.rest_mp_cb = QCheckBox("MP 低於")
-        self.rest_mp_cb.setToolTip(
-            "魔力低於這個百分比就停下來坐著回魔，回到 100% 再繼續。\n"
-            "⚠ 同樣會先把手上的怪打完才坐。")
-        self.rest_mp_cb.toggled.connect(self._save_settings)
-        sbar.addWidget(self.rest_mp_cb)
-        self.rest_mp = QSpinBox()
-        self.rest_mp.setRange(1, 99)
-        self.rest_mp.setValue(REST_MP_DEFAULT)
-        self.rest_mp.setFixedWidth(60)
-        self.rest_mp.valueChanged.connect(self._save_settings)
-        sbar.addWidget(self.rest_mp)
-        sbar.addWidget(QLabel("% 就坐下休息，回到 100% 再繼續"))
-        self.rest_lbl = QLabel("")
-        self.rest_lbl.setStyleSheet("color: #9aa2b8;")
-        sbar.addWidget(self.rest_lbl)
-        sbar.addStretch(1)
-        root.addLayout(sbar)
+        # ── 回程補給（整列）─────────────────────────────────
+        # ★ 條件到了就交棒給官方的天使守護精靈跑補給（回城→修裝→買水→回戰場），
+        #   補完再自己接回來。打怪還是我們的掛機在做。
+        # ★ 三個獨立的觸發開關。**不看遊戲裡精靈自己的回城勾選**
+        #   （使用者要求），這樣我們的觸發跟官方互相獨立。
+        g_sup = QGroupBox("回程補給")
+        c = QHBoxLayout(g_sup)
+        common = (
+            "\n\n觸發之後：停掉我們的自動戰鬥 → 開精靈 → 回程 →"
+            "\n它修裝買東西 → **回到原本那張地圖**就自動接回自動戰鬥。"
+            f"\n（每 {SUPPLY_POLL:.0f} 秒檢查一次回到原地圖了沒）"
+            "\n★ 開了自動攻擊之後如果發現地圖已經自己變了，代表客戶端"
+            "\n　 已經自己跑回程，我們就不再送一次，避免跟官方打架。")
+        potion = (
+            "\n・藥水是哪一種，讀「天使輔助精靈」那頁你設的，換藥水自動跟著換"
+            "\n・同一組配了好幾格時要**全部**歸零才算（還有一格有貨就不算）"
+            "\n・數量是全背包加總（同一種水散在好幾格會加起來算）"
+            "\n・那格設成技能的話整組跳過 —— 用技能補本來就不吃藥水"
+            "\n⚠ 不看遊戲裡「補HP/MP物品用完自動回城」有沒有勾。"
+            "\n★ 水沒了一定會通知，**沒勾這裡也會通知**，只是不跑補給。")
+        self.sup_gear_cb = QCheckBox("武器壞掉")
+        self.sup_gear_cb.setToolTip("武器耐久歸零就跑回程補給。" + common)
+        self.sup_gear_cb.toggled.connect(self._save_settings)
+        c.addWidget(self.sup_gear_cb)
+        c.addSpacing(10)
+        # ★ HP / MP **分開兩個開關**（使用者要求）：勾 HP 就只看 HP 那一組
+        #   全歸零，MP 有沒有水完全不影響，反之亦然。
+        self.sup_hp_cb = QCheckBox("HP 藥水沒了")
+        self.sup_hp_cb.setToolTip(
+            "「天使輔助精靈」那頁設的 **HP 藥水整組**用完就跑回程補給。"
+            "\n（MP 有沒有水不影響這一項）" + potion + common)
+        self.sup_hp_cb.toggled.connect(self._save_settings)
+        c.addWidget(self.sup_hp_cb)
+        self.sup_mp_cb = QCheckBox("MP 藥水沒了")
+        self.sup_mp_cb.setToolTip(
+            "「天使輔助精靈」那頁設的 **MP 藥水整組**用完就跑回程補給。"
+            "\n（HP 有沒有水不影響這一項）" + potion + common)
+        self.sup_mp_cb.toggled.connect(self._save_settings)
+        c.addWidget(self.sup_mp_cb)
+        c.addSpacing(10)
+        # ★ 不等精靈自己走回來，時間到就用遊戲的「天使趴趴GO」直接傳回去。
+        self.sup_jump_cb = QCheckBox("用天使趴趴GO回地圖")
+        self.sup_jump_cb.setToolTip(
+            f"觸發回程補給之後 **{JUMP_BACK_SECS / 60:.0f} 分鐘**，直接用"
+            "「天使趴趴GO」傳回原本那張地圖，不再等精靈自己走回來。\n"
+            "・傳完就照原本的流程接回自動戰鬥\n"
+            "・同一張地圖有好幾個落點時，挑**離你出發位置最近**的那個\n"
+            "・時間到時如果人已經回到原地圖了就不傳\n"
+            "⚠ 走的是遊戲自己的傳送封包，跟你手動開趴趴GO按下去完全一樣，\n"
+            "　 所以**傳送費用、等級限制**照樣算。\n"
+            "⚠ 那張地圖不在趴趴GO清單裡就不傳（會在狀態列說一聲）。")
+        self.sup_jump_cb.toggled.connect(self._save_settings)
+        c.addWidget(self.sup_jump_cb)
+        c.addStretch(1)
+        grid.addWidget(g_sup, 2, 0, 1, 2)
 
-        # 兩個小區塊：左邊是要打哪些怪（可多選、可手動輸入），右邊是附近有什麼。
+        # ⛔ 不要把兩欄硬拉成一樣寬（setColumnStretch(0,1)+(1,1)）——
+        #    「坐下休息」需要 499px、「攻擊」只要 413px，硬均分會讓前者被切掉
+        #    半個字。讓每一欄照自己的內容決定寬度就好。
+        # 每個方框的上下留白縮一點 —— 主視窗固定 940x700，整頁高度很吃緊，
+        # 預設留白會讓整頁多出一條垂直捲軸。
+        for _lay in (a, m, s, r, c):
+            _lay.setContentsMargins(12, 6, 12, 6)
+        root.addLayout(grid)
+
+        # 三個清單。★ 寬度一律照「內容需要多少」給，不寫死 ——
+        # 使用者要求所有文字都要完整顯示，不能被切掉。
         # 一律只顯示中文名字 —— 比對也是用名字，所以手動打字才會通。
         panes = QHBoxLayout()
 
         left = QGroupBox("選中怪物")
-        left.setFixedWidth(190)
         lv = QVBoxLayout(left)
         self.picked = QListWidget()
-        self.picked.setFixedHeight(NEAR_HEIGHT)
+        self.picked.setMinimumHeight(NEAR_HEIGHT)
+        self.picked.setMaximumHeight(NEAR_MAX)
         self.picked.setSelectionMode(QListWidget.ExtendedSelection)
+        no_elide(self.picked)
         lv.addWidget(self.picked)
         self.manual = QLineEdit()
         self.manual.setPlaceholderText("手動輸入後按 Enter")
         self.manual.returnPressed.connect(self._add_manual)
         lv.addWidget(self.manual)
+        # 「選中怪物」放得下最長的怪物名（實際資料裡最長 8 個字）
+        fit_list(left, self.picked, "曼陀羅怪菇菌絲體")
         panes.addWidget(left)
 
         # 中間的刪除鈕：把「選中怪物」裡選起來的移除
-        mid = QVBoxLayout()
+        midw = QWidget()
+        mid = QVBoxLayout(midw)
+        mid.setContentsMargins(0, 0, 0, 0)
         mid.addStretch(1)
         # 用 ASCII 的 X，不要用 ✕ —— 部分中文字型沒有那個字形，會變成豆腐。
         # ⚠ 還要覆寫 padding：主題給 QPushButton 的是 `padding: 6px 14px`，
@@ -1053,28 +1192,33 @@ class CharFarmPage(QWidget):
         self.del_btn.clicked.connect(self._remove_picked)
         mid.addWidget(self.del_btn)
         mid.addStretch(1)
-        panes.addLayout(mid)
+        panes.addWidget(midw)
 
         right = QGroupBox("周圍怪物")
         rv = QVBoxLayout(right)
         self.near = QListWidget()
-        self.near.setFixedHeight(NEAR_HEIGHT)
+        self.near.setMinimumHeight(NEAR_HEIGHT)
+        self.near.setMaximumHeight(NEAR_MAX)
         self.near.setSelectionMode(QListWidget.ExtendedSelection)
+        no_elide(self.near)
         # ⚠ 用 UserRole 的名字，不要用顯示文字 —— 王的前面有「👑 」字首。
         self.near.itemClicked.connect(
             lambda it: self._add_name(it.data(Qt.UserRole) or it.text()))
         rv.addWidget(self.near)
+        # 「周圍怪物」多一個「【王】」字首
+        fit_list(right, self.near, "【王】曼陀羅怪菇菌絲體")
         panes.addWidget(right, 1)
 
         # 巡邏點：沒怪時依序走過去找怪（取代原本只有一個的「原點」）
         spot = QGroupBox("巡邏點")
-        # 每一列現在是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
-        # （專家級遺落之地／史萊姆晴空牧場）—— 190px 剛好卡邊會被切掉。
-        spot.setFixedWidth(240)
+        # 每一列是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
+        # （專家級遺落之地／史萊姆晴空牧場）—— 太窄會被切掉。
         sv = QVBoxLayout(spot)
         self.spot_list = QListWidget()
-        self.spot_list.setFixedHeight(NEAR_HEIGHT)
+        self.spot_list.setMinimumHeight(NEAR_HEIGHT)
+        self.spot_list.setMaximumHeight(NEAR_MAX)
         self.spot_list.setSelectionMode(QListWidget.ExtendedSelection)
+        no_elide(self.spot_list)
         sv.addWidget(self.spot_list)
         srow = QHBoxLayout()
         # ⚠ 字別太長：主題給按鈕的 padding 是左右各 14px，
@@ -1093,11 +1237,15 @@ class CharFarmPage(QWidget):
         rm_btn.clicked.connect(self._remove_spots)
         srow.addWidget(rm_btn)
         sv.addLayout(srow)
+        # 「巡邏點」每列是「編號. 地圖名 (x, y)」，地圖名最長 7 個字
+        # （專家級遺落之地／史萊姆晴空牧場），座標最多各 3 位數
+        fit_list(spot, self.spot_list, "10. 專家級遺落之地 (242, 178)")
         panes.addWidget(spot)
         root.addLayout(panes)
 
         self.status = QLabel("尚未掃描")
         self.status.setStyleSheet("color: #9aa2b8;")
+        self.status.setWordWrap(True)
         root.addWidget(self.status)
         root.addStretch(1)
 
@@ -1139,6 +1287,16 @@ class CharFarmPage(QWidget):
         self._cur = None
         if not channel.switch(self._mover, n, self._rot_max):
             return False
+        self._drop_cached_addrs()
+        return True
+
+    def _drop_cached_addrs(self) -> None:
+        """傳送／重連之後把所有快取的位址作廢（換頻道、回程都要）。
+
+        ⚠⚠ **這是必要的，不是保險**：斷線重連或換地圖之後，狀態物件／玩家
+          物件／角色屬性／物品陣列全部搬家。舊位址還留著的話，寫入執行緒每
+          20ms 就會往一塊已經是別人的記憶體寫目標 ID —— 那是在亂改遊戲的堆積。
+        """
         self.state = self.player = self.stats = self.inv = None
         self._keys.eid = None
         self._keys.stats = None
@@ -1148,6 +1306,219 @@ class CharFarmPage(QWidget):
         self._scene_obj = None            # 場景物件也會搬家
         self._scene_scanned = False
         self._since_scan = RESCAN_GAP     # 重連完立刻重掃
+
+    def _fire_recall(self) -> None:
+        """觸發的第二段：真的把回程道具用掉，然後排定「關自動攻擊」。
+
+        ★★ 送之前先看**地圖是不是已經自己變了**：開了自動攻擊之後，官方
+          客戶端可能已經按它自己的設定把人傳回城了。那時我們再送一次回程
+          只會多花一個道具、而且跟官方的流程打架 —— 直接跳過就好。
+        """
+        say = self.status.setText
+
+        if not (self._mover is not None and self._mover.active) or not self.inv:
+            say("⚠ 回程沒送出去（跳板或背包位置變了）")
+            return
+        now = scene.current(self.sc, allow_scan=False)
+        here = now.id if now else None
+        if (self._supply_scene is not None and here is not None
+                and here != self._supply_scene):
+            self._supply_left = True        # 已經在外面了，等它回來就好
+            self._drop_cached_addrs()
+            self._schedule_af_off()
+            self._schedule_jump_back()
+            say(f"★ 客戶端已自己回程（現在在 {now}）→ 略過我們的回程")
+            return
+        ok, msg = robot.do_recall(self._mover, self.sc, self.inv)
+        if not ok:
+            self._end_supply(f"⚠ 交棒失敗：{msg}", stop=True)
+            return
+        self._drop_cached_addrs()
+        self._schedule_af_off()
+        self._schedule_jump_back()
+        say("🔧 已交給天使精靈跑補給　" + msg)
+
+    def _schedule_af_off(self) -> None:
+        """**回程送出之後**隔幾秒把「自動攻擊」關回去（見 robot.AF_HOLD_SECS）。
+
+        ★ 這樣使用者的「自動攻擊」幾乎全程都是關的，精靈不會跟我們搶怪，
+          但補給那一趟照樣跑完。
+        ⚠ 太早關會讓精靈只走到城裡就停住（0 秒實測失敗），所以這個秒數
+          是實測調出來的，不要為了「快一點」去縮。
+        """
+        QTimer.singleShot(
+            int(robot.AF_HOLD_SECS * 1000),
+            lambda: (self._mover is not None and self._mover.active
+                     and robot.autofight_off(self._mover, self.sc)))
+
+    def _schedule_jump_back(self) -> None:
+        """勾了「使用天使趴趴GO回地圖」的話，排定幾分鐘後直接傳回原地圖。
+
+        ★ 用計時器而不是掛在補給的輪詢上 —— 補給那段時間輪詢在做別的事，
+          而這件事只跟「觸發之後過了多久」有關，各自算比較單純。
+        ⚠ 補給一趟就一個號碼（_supply_gen）：中途又按一次、或補給提早結束，
+          舊的計時器醒來看到號碼對不上就自己作廢，不會亂傳。
+        """
+        if not self.sup_jump_cb.isChecked():
+            return
+        if self._supply_scene is None:
+            self.status.setText("⚠ 不知道出發地圖，這趟不用趴趴GO傳回去")
+            return
+        gen = self._supply_gen
+        QTimer.singleShot(int(JUMP_BACK_SECS * 1000),
+                          lambda: self._jump_back(gen))
+
+    def _jump_back(self, gen: int) -> None:
+        """時間到，用遊戲的傳送封包回原本那張地圖。"""
+        say = self.status.setText
+        if gen != self._supply_gen or self._supply_scene is None:
+            return                              # 上一趟排的，早就過期了
+        if not (self._mover is not None and self._mover.active):
+            say("⚠ 跳板不在，沒辦法傳回去")
+            return
+        now = scene.current(self.sc, allow_scan=False)
+        if now is not None and now.id == self._supply_scene:
+            return                              # 精靈已經自己走回來了
+        pos = self._supply_pos or (None, None)
+        e = jumpmap.nearest(self._supply_scene, pos[0], pos[1])
+        if e is None:
+            say("⚠ 趴趴GO 沒有回"
+                f"{scene.scene_name(self._supply_scene)}的傳送點")
+            return
+        ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
+        self._drop_cached_addrs()
+        say((f"★ 補給 {JUMP_BACK_SECS / 60:.0f} 分鐘到 → " if ok else "⚠ ")
+            + msg)
+
+    # ------------------------------------------------------------------
+    # -- 回程補給（判斷 → 交棒 → 回到原地圖再接回來）-----------------------
+    def _check_dry(self) -> None:
+        """藥水見底就通知一聲 —— **跟有沒有勾「藥水觸發」無關**（使用者要求）。
+
+        ★ 用門閂（self._dry）：空著的那段期間只叫一次，補到貨才重新武裝。
+          少了它每 GEAR_CHECK_GAP 秒就會吵一次。
+        ★ 只通知不停機：水沒了照樣打得動，血低了本來就有「坐下休息」擋著。
+          武器耐久 0 才是真的打不了，那個維持停機。
+        """
+        if not (self.inv and self._mover is not None and self._mover.active):
+            return
+        try:
+            # 兩組都要看：**通知不看勾選**，勾選只決定要不要跑補給。
+            dry = robot.potions_out(self._mover, self.sc, self.inv, self.pid)
+        except Exception:                              # noqa: BLE001
+            return                                     # 讀不到就當沒事，別擋掛機
+        key = "|".join(w for w, _ in dry)
+        if dry and key != self._dry:
+            on = {"HP": self.sup_hp_cb.isChecked(),
+                  "MP": self.sup_mp_cb.isChecked()}
+            # 見底的那幾組裡，有勾觸發的才會跑補給
+            will = [w for w, _ in dry if on[w]]
+            self.notify(
+                "、".join(d for _, d in dry) + "用完了。"
+                + ("即將跑回程補給。" if will
+                   else "（沒勾這一項的觸發，掛機繼續）"))
+        self._dry = key
+
+    def _start_supply(self, why: str) -> bool:
+        """把控制權交給官方的天使守護精靈。接得起來才回 True。
+
+        ★ 為什麼用官方的：回城→找 NPC→修裝→買東西→走回戰場這一整趟，
+          遊戲本來就會做，而且**細節是使用者在遊戲那一頁設好的**。
+          我們自己重做一份只是多一套要維護的東西。
+          精靈是 Lua 寫的、不送任何封包，所以只能這樣叫（見 app/game/lua.py）。
+        """
+        if not self._ensure_mover():
+            return False
+        miss = robot.missing_supply_settings(self._mover, self.sc)
+        if miss:
+            self._stop_with(f"🔧 {why}，但天使精靈的補給頁還缺："
+                            + "、".join(miss))
+            self.notify(f"{why}，但天使精靈的補給頁沒設好（缺 "
+                        + "、".join(miss) + "），掛機已停止。")
+            return False
+        # 沒有回程道具就別開始，免得把設定改了卻走不了
+        if not robot.has_recall_item(self.sc, self.inv):
+            self._stop_with(f"🔧 {why}，但背包裡沒有回程道具")
+            self.notify(f"{why}，但背包裡沒有回程道具，掛機已停止。")
+            return False
+        # ★ 記下現在這張地圖 —— 回到它才算補給結束（使用者要求）
+        # ⚠⚠ self._scene **本來就是場景編號（int）**，不是 Scene 物件 ——
+        #   寫成 `self._scene.id` 會在真的觸發補給的那一刻才炸
+        #   （AttributeError: 'int' object has no attribute 'id'，使用者實際遇到）。
+        #   會拖這麼久才發現，是因為平常沒有補給條件根本走不到這一行。
+        self._supply_scene = self._scene
+        self._supply_left = False
+        self._supply_pos = self.my_pos()
+        self._supply_gen += 1
+        # ★ 第一段：調好開關 + 設中心點。第二段（回程）隔幾秒才送，
+        #   順序與間隔都不能省（見 robot.do_recall）。
+        notes = robot.begin_supply(self._mover, self.sc)
+        self._robot_ours = True
+        # 我們自己要完全讓開：不送技能鍵、不寫目標
+        self._keys.set_on(False)
+        self._atk.hold_off()
+        self._cur = None
+        self._supply = True
+        self._supply_t = 0.0
+        self._supply_poll = 0.0
+        self.status.setText(
+            f"🔧 {why} → 調整精靈設定："
+            + ("、".join(notes) if notes else "本來就都對")
+            + f"　{robot.SETUP_SETTLE:.0f} 秒後回程…")
+        QTimer.singleShot(int(robot.SETUP_SETTLE * 1000), self._fire_recall)
+        return True
+
+    def _end_supply(self, why: str, stop: bool = False) -> None:
+        """收回控制權。stop=True 代表補給失敗，順便停掉掛機並通知。"""
+        self._supply = False
+        self._supply_gen += 1          # 這趟結束，排著的趴趴GO傳送作廢
+        if self._mover is not None and self._mover.active:
+            robot.end_supply(self._mover, self.sc)   # 只關自動攻擊
+        self._robot_ours = False
+        # 補給跑完一定換過地圖，所有快取位址都要作廢
+        self._drop_cached_addrs()
+        if stop:
+            self._stop_with(why)
+            self.notify(why)
+        else:
+            self.status.setText(why)
+
+    def _supply_tick(self, dt: float) -> bool:
+        """補給進行中回 True（呼叫端要整個讓開）。
+
+        ★ **判完成看「回到原本那張地圖」**（使用者要求）：離開過、又回來了
+          就代表整趟跑完。比看耐久通用 —— 缺水那種觸發修不修裝都一樣。
+        ⚠ 一定要先「離開過」才算，不然剛觸發還沒傳送出去就會被判定完成。
+        """
+        if not self._supply:
+            return False
+        self._supply_t += dt
+        self._supply_poll += dt
+        if self._supply_t >= SUPPLY_MAX_SECS:
+            self._end_supply(
+                f"🔧 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒完成 → 已停止掛機",
+                stop=True)
+            return True
+        if self._supply_poll >= SUPPLY_POLL:
+            self._supply_poll = 0.0
+            if self.inv:
+                d = inventory.durability(self.sc, self.inv)
+                if d is not None:
+                    self._dura = d
+            now = scene.current(self.sc, allow_scan=False)
+            here = now.id if now else None
+            if self._supply_scene is not None and here is not None:
+                if here != self._supply_scene:
+                    self._supply_left = True
+                elif self._supply_left:
+                    self._end_supply(
+                        f"🔧 補給完成，已回到{now}　"
+                        f"耐久 {self._dura[0]}　共花 {_mmss(self._supply_t)}")
+                    return True
+            self.status.setText(
+                f"🔧 天使精靈補給中…（{_mmss(self._supply_t)}）"
+                + (f"　目前在 {now}" if now else "")
+                + ("" if robot.is_run(self.sc) else "　⚠ 精靈已停下"))
         return True
 
     # ------------------------------------------------------------------
@@ -1705,6 +2076,16 @@ class CharFarmPage(QWidget):
             self._keys.eid = None
             self._atk.hold_off()
             self._cur = None
+            # ⚠ 停掛機時如果正在讓精靈跑補給，一定要把精靈也關掉 ——
+            #   不然使用者以為停了，角色卻還在自己跑。
+            # ⚠ 精靈如果是我們開的（自動交棒或測試按鈕），停掛機時一定要把
+            #   自動攻擊關掉 —— 不然使用者以為停了，角色還在自己打。
+            if self._supply or self._robot_ours:
+                self._supply = False
+                self._supply_gen += 1        # 排著的趴趴GO傳送就此作廢
+                if self._mover is not None and self._mover.active:
+                    robot.end_supply(self._mover, self.sc)
+                self._robot_ours = False
             # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
             self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
             return
@@ -1791,19 +2172,35 @@ class CharFarmPage(QWidget):
         if self._rest_tick(dt):
             return
 
-        # ★ 武器壞了（耐久 0）就停下來並通知 —— 壞掉的武器打不動怪，
-        # 繼續掛只是白費時間。耐久掉得很慢，幾秒看一次就夠。
+        # ★ 補給中就整個讓開 —— 那段時間是天使精靈在開車，我們不能同時下指令。
+        if self._supply_tick(dt):
+            return
+
+        # ★ 該不該回去補給。勾了「回程補給」就照精靈自己的設定判斷（耐久、
+        #   採買清單缺貨…）；沒勾就只看耐久 0 並停機通知。幾秒看一次就夠。
         self._gear_t += dt
         if self._gear_t >= GEAR_CHECK_GAP and self.inv:
             self._gear_t = 0.0
             d = inventory.durability(self.sc, self.inv)
             if d is not None:
                 self._dura = d
-                if d[0] <= 0:
-                    self._stop_with(f"🔧 武器已損壞（耐久 0）→ 已自動停止掛機"
-                                    f"（本次擊殺 {self._kills} 隻）")
-                    self.notify("武器已損壞（耐久 0），掛機已自動停止。")
+            gear = self.sup_gear_cb.isChecked()
+            hp_on = self.sup_hp_cb.isChecked()
+            mp_on = self.sup_mp_cb.isChecked()
+            # ★ 水沒了一律通知（使用者要求），跟觸發開關無關。
+            #   放在觸發判斷**之前** —— 勾了觸發的話，這一拍就會接著跑補給，
+            #   通知要先發出去才不會被 return 吃掉。
+            self._check_dry()
+            if (gear or hp_on or mp_on) and self._ensure_mover():
+                why = robot.supply_needed(self._mover, self.sc, self.inv,
+                                          gear, hp_on, mp_on, self.pid)
+                if why and self._start_supply(why):
                     return
+            if d is not None and d[0] <= 0:
+                self._stop_with(f"🔧 武器已損壞（耐久 0）→ 已自動停止掛機"
+                                f"（本次擊殺 {self._kills} 隻）")
+                self.notify("武器已損壞（耐久 0），掛機已自動停止。")
+                return
 
         self._walk_t += dt
         me = self.my_pos()
@@ -1813,17 +2210,22 @@ class CharFarmPage(QWidget):
         self._scene_t += dt
         if self._scene_t >= SCENE_SAMPLE:
             self._scene_t = 0.0
+            was = self._scene
             self._scene = self._read_scene()
+            # ⚠ 換地圖時導航記憶一定要清掉：走過的地方／黑名單都是座標，
+            #   在別張圖上完全沒有意義，留著會讓它一開始就排除掉正確方向。
+            if was != self._scene:
+                self._nav.reset()
 
-        # ★ 「角色正在走路嗎」—— 隔 MOVE_SAMPLE 秒比一次位置（見常數說明）。
-        #   移動中一律不重下移動指令，否則會把多點路徑砍掉、原地來回。
-        self._move_t += dt
-        if self._move_t >= MOVE_SAMPLE:
-            self._move_t = 0.0
-            if me is not None and self._move_ref is not None:
-                self._moving = math.hypot(me[0] - self._move_ref[0],
-                                          me[1] - self._move_ref[1]) > MOVE_EPS
-            self._move_ref = me
+        # ★★ 「角色正在走路嗎」——**直接讀遊戲的動畫狀態**（'Run' / 'Wait'），
+        #   不要再隔 0.3 秒比一次位置。移動中一律不重下移動指令（會把多點路徑
+        #   砍掉、原地來回），所以這個判斷慢多少，每個路段就多空等多少。
+        #   實測同一條來回路線：比位置 28% 的時間站著不動，讀狀態只剩 10%。
+        #   （見 entity.is_walking 的實測數字。）
+        # ⚠ 讀不到玩家物件時保留上一次的判斷，不要當成「停著」——
+        #   那會在掃描空窗期狂送移動指令。
+        if self.player:
+            self._moving = entity.is_walking(self.sc, self.player)
 
         if self._cur is None:
             # ★ 追怪不限距離；「周圍完全沒有選中的怪」時才去巡邏點找（使用者要求）
@@ -1853,24 +2255,40 @@ class CharFarmPage(QWidget):
             if d <= SPOT_SLACK:
                 # 到了這個點還是沒怪 → 換下一個點繼續找（只在這張圖的點裡輪）
                 self._spot_i = here[(here.index(self._spot_i) + 1) % len(here)]
-                self._spot_pts = 1
+                self._nav.reset()
                 self._walk_t = WALK_GAP        # 下一拍就往新的點走
                 self.status.setText(
                     f"巡邏點 {self._spot_i + 1} 沒怪 → 前往下一個"
                     f"（{scene.scene_name(self._scene)} 共 {len(here)} 點）")
                 return
-            # ⚠ 回傳值不能丟掉：走不了（尋路算不出、或指令槽被佔）時什麼都
-            #   不會發生，狀態列卻還寫著「前往」，看起來就像站著發呆。
-            if not self._moving and self._walk_t >= WALK_GAP:
-                self._spot_pts = self._walk_toward(sx, sy, me, 0.0)
+            # ★★ 走巡邏點交給 app/game/navigate.py：算不出直達路徑時會 360 度
+            #   找中繼點繞過去，而且**允許暫時走遠**（凹形地形非這樣不可）。
+            #   舊做法只沿著往目標的直線取點，實測會停在牆前面
+            #   「60 秒送 158 次指令、一格沒動」，而且一直顯示「直線可通」。
+            # ⚠ 它自己會判斷角色在不在走路、要不要重下指令，所以這裡**不要**
+            #   再加 _moving / _walk_t 的節流，會互相打架。
+            if not self._ensure_mover():
+                self.status.setText("⛔ 移動跳板沒裝上 → 不移動")
+                return
+            note = self._nav.step(self.sc, self._mover, self.player, sx, sy)
+            if self._nav.stuck:
+                # ★ 真的到不了就換下一個點（舊版沒有這道，會站到天亮）
+                nxt = here[(here.index(self._spot_i) + 1) % len(here)]
+                stuck_msg = (f"⛔ 走不到巡邏點 {self._spot_i + 1}"
+                             f" ({sx:.0f},{sy:.0f})")
+                self._nav.reset()
+                if nxt == self._spot_i:
+                    self._stop_with(stuck_msg + " → 這張圖只有這一個點，已停止掛機")
+                    self.notify(stuck_msg + "，掛機已停止。")
+                    return
+                self._spot_i = nxt
+                self.status.setText(stuck_msg + f" → 改去巡邏點 {nxt + 1}")
+                return
             self.status.setText(
                 f"周圍沒有選中的怪 → 前往巡邏點 {self._spot_i + 1}"
                 f"（{scene.scene_name(self._scene)} 第 "
                 f"{here.index(self._spot_i) + 1}/{len(here)} 點）"
-                f" ({sx:.0f},{sy:.0f})　還有 {d:.0f} 格"
-                + ("　⛔ 算不出路徑（被地形擋住？）" if self._spot_pts == 0
-                   else f"　⛰ 繞路 {self._spot_pts} 點"
-                   if self._spot_pts > 1 else "　直線可通"))
+                f" ({sx:.0f},{sy:.0f})　還有 {d:.0f} 格　{note}")
             return
 
         m = self._cur
@@ -2008,8 +2426,11 @@ class CharFarmPage(QWidget):
         need_walk = gd is not None and (
             gd > gkeep + WALK_SLACK or (not in_range and gd > gkeep)
             or gd < move.MIN_GAP)
+        # ★ 還在趕路（離目標 > FAR_ENOUGH）就用短冷卻，貼身微調維持 0.4 秒。
+        walk_gap = (WALK_GAP_FAR if (gd is not None and gd > FAR_ENOUGH)
+                    else WALK_GAP)
         if (self.move_cb.isChecked() and me and not self._moving
-                and self._walk_t >= WALK_GAP and need_walk):
+                and self._walk_t >= walk_gap and need_walk):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
             self._walked_ok = self._walk_toward(gx, gy, me, gkeep) > 0
@@ -2086,9 +2507,10 @@ class CharFarmPage(QWidget):
             if dist is not None:
                 self._hit_dist = max(self._hit_dist, dist)
         # ⚠⚠ **用「離錨點的淨位移」判斷有沒有前進**，不要用 self._moving。
-        #   撞牆時角色會抖動約 0.5~0.6 格，剛好跨過 MOVE_EPS(0.5)，
-        #   於是每一拍都被當成在走路，這個計時器永遠歸零 ——
+        #   撞牆時角色會原地抖動（實測約 0.5~0.6 格），而 self._moving 讀的是
+        #   遊戲的動畫狀態 —— 撞著牆它照樣是 'Run'，那個計時器就永遠歸零，
         #   唯讀監控實拍卡了 32 秒都沒觸發（見 STUCK_EPS 的說明）。
+        #   「有沒有真的前進」只能看位移。
         if me and (self._anchor is None
                    or math.hypot(me[0] - self._anchor[0],
                                  me[1] - self._anchor[1]) > STUCK_EPS):
@@ -2167,6 +2589,13 @@ class CharFarmPage(QWidget):
                                          g(self._key("back"), False))))
         self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
         self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
+        self.sup_gear_cb.setChecked(bool(g(self._key("supply_gear"), False)))
+        # 「藥水觸發」拆成 HP／MP 兩個之前存的舊值，兩邊都吃 ——
+        # 不然使用者原本設好的會憑空變成沒勾。
+        old_potion = bool(g(self._key("supply_potion"), False))
+        self.sup_hp_cb.setChecked(bool(g(self._key("supply_hp"), old_potion)))
+        self.sup_mp_cb.setChecked(bool(g(self._key("supply_mp"), old_potion)))
+        self.sup_jump_cb.setChecked(bool(g(self._key("supply_jump"), False)))
         self.rot_every.setValue(float(g(self._key("rot_every"), 30.0)))
         self.rot_stay.setValue(float(g(self._key("rot_stay"), 60.0)))
         self.rest_hp_cb.setChecked(bool(g(self._key("rest_hp_on"), False)))
@@ -2205,6 +2634,10 @@ class CharFarmPage(QWidget):
         s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("boss_only"), self.boss_cb.isChecked())
         s(self._key("rotate"), self.rot_cb.isChecked())
+        s(self._key("supply_gear"), self.sup_gear_cb.isChecked())
+        s(self._key("supply_hp"), self.sup_hp_cb.isChecked())
+        s(self._key("supply_mp"), self.sup_mp_cb.isChecked())
+        s(self._key("supply_jump"), self.sup_jump_cb.isChecked())
         s(self._key("rot_every"), float(self.rot_every.value()))
         s(self._key("rot_stay"), float(self.rot_stay.value()))
         s(self._key("rest_hp_on"), self.rest_hp_cb.isChecked())
@@ -2285,24 +2718,8 @@ class FarmTab(BaseTab):
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
 
-        hint = QLabel(  # noqa: F841 —— 版面用，之後不需要再操作
-            "①「周圍怪物」是即時的 —— 點名字就加進「選中怪物」"
-            "（可加多種，也可自己打字後按 Enter，選起來按 X 可刪除，"
-            "掛機中也能隨時加）→ ② 勾「開始掛機」。\n"
-            "挑**離自己最近**的一隻打，打死立刻接下一隻。"
-            "攻擊型態：遠程送攻擊封包、近戰改成按你選的那個 F 鍵。\n"
-            "想固定範圍就按「加入位置」記幾個巡邏點再勾「沒怪時去巡邏點找」"
-            "—— 周圍完全沒有選中的怪時會依序走過去找。\n"
-            "巡邏點會記下地圖名，**只走目前這張圖的點**；換到別張圖就原地不動，"
-            "不會拿別張圖的座標亂衝（同一張圖的不同分流算同一張）。\n"
-            "勾「只打王」就**不看選中怪物的名字**，改成只打王（清單上標【王】）"
-            "—— 是讀遊戲自己的怪物資料判斷的，不是靠名字猜。\n"
-            "血/魔低於門檻會坐下回復，但**一定先把手上的怪打完、確認沒有怪在打你**"
-            "才坐；坐著被打會立刻起身反擊。\n"
-            "設定會自動記住（每個分身各自一份），只有「開始掛機」每次都是關的。"
-            "不搶視窗焦點、不占用你的鍵盤滑鼠。")
-        hint.setStyleSheet("color: #9aa2b8;")
-        root.addWidget(hint)
+        # ⛔ 這裡原本有一大段說明文字，使用者要求全部拿掉 ——
+        #    每個控制項自己的滑鼠提示已經寫得夠清楚了。
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
