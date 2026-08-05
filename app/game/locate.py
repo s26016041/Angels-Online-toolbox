@@ -76,6 +76,40 @@ SIGS: tuple[Sig, ...] = (
     Sig("attack", "CAST_FN", "fn", None,
         "55 8B EC 83 EC 10 56 8B 75 08 85 F6 7E 3D 6A 12 6A 06 8D 4D F0 E8 ?? ?? ?? ??",
         0x00559EDA),
+    Sig("jumpmap", "BUILD_FN", "fn", None,
+        "55 8B EC 56 8B F1 33 C0 57 8B 7D 0C 57 89 06 89 46 04 89 46 08"
+        " 89 46 0C E8 ?? ?? ?? ?? 8B 4E 04 66 8B 45 08 66 89 01",
+        0x0050DF6E),
+    Sig("jumpmap", "SEND_FN", "fn", None,
+        "55 8B EC 8B 45 08 8B 0C 85 60 60 A1 00 85 C9 74 08 FF 75 0C"
+        " E8 ?? ?? ?? ?? 5D C3",
+        0x00711130),
+    # 連線物件的全域指標。錨在「送傳送包」那幾行（`mov [eax+2],esi` 起）——
+    # 只用 `push [0x9B67D0]` 當特徵不夠獨特。
+    Sig("jumpmap", "CONN_PTR", "data", 5,
+        "89 70 02 FF 35 D0 67 9B 00 E8 ?? ?? ?? ?? 59 59 5E C9 C2 04 00",
+        0x009B67D0),
+    Sig("lua", "GETFIELD_FN", "fn", None,
+        "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
+        " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"
+        " 2B CB 51 52 56 E8 ?? ?? ?? ?? FF 76 08 89 45 F0",
+        0x006A4290),
+    # ⚠ 前 46 bytes 有另一支 Lua 函式（0x6A4DF0）長得**一模一樣**，
+    #   連呼叫目標都相同，只有第二個 call 之後才分歧 —— 特徵一定要蓋過那裡。
+    Sig("lua", "PCALL_FN", "fn", None,
+        "55 8B EC 8B 45 14 83 EC 08 57 8B 7D 08 85 C0 75 04 33 D2 EB 0F"
+        " 50 57 E8 ?? ?? ?? ?? 8B D0 83 C4",
+        0x006A4740),
+    Sig("lua", "CTX_PTR", "data", 2,
+        "8B 0D 10 10 89 00 68 C4 3D 7D 00 8D 49 04 E8 ?? ?? ?? ??",
+        0x00891010),
+    Sig("robot", "RUN_FLAG", "data", 2,
+        "C7 05 A4 FB 9C 00 FF FF FF FF C3 C7 05 A4 FB 9C 00 00 00 00 00 C3",
+        0x009CFBA4),
+    Sig("recall", "USE_ITEM_FN", "fn", None,
+        "55 8B EC 83 EC 10 53 8B 5D 08 85 DB 78 4A 8D 4D F0 81 FB FF 00 00 00"
+        " 7F 17 6A 07 6A 2E E8 ?? ?? ?? ??",
+        0x005DB4E0),
     Sig("move", "MOVE_FN", "fn", None,
         "55 8B EC 83 EC 10 53 8B 5D 10 8D 4D F0 56 8B F3 C1 E6 02 8D 46 09 50 6A 04",
         0x00559F28),
