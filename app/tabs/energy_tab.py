@@ -395,17 +395,24 @@ class EnergyTab(BaseTab):
 
     # ------------------------------------------------------------------
     def _mover(self, pid: int) -> move.Mover | None:
+        """拿這台分身的跳板。
+
+        ⚠⚠ 一定要走 `move.acquire()`，**不要自己 new 一個 Mover** ——
+          同一個遊戲行程只能有一份跳板。以前這裡自己裝一份，掛機分頁正在跑
+          的時候按一下晶化，就會把掛機那份拆掉（它之後每個指令都「排不進去」
+          而且不會自己好）。細節見 `move.acquire()` 的說明。
+        """
         mv = self._movers.get(pid)
-        if mv is not None:
-            return mv if mv.active else None
+        if mv is not None and mv.active:
+            return mv
         try:
-            mv = move.Mover(pid, injector.process_path(pid))
-            mv.start()
+            mv = move.acquire(pid, injector.process_path(pid), self)
         except Exception as exc:                    # noqa: BLE001
             # ⚠ 失敗**不要記進 _movers**：以前記一個 active=False 的空殼進去，
             #   上面那個 `if mv is not None` 就永遠成立 → 這台分身在關掉分頁
             #   之前再也裝不上跳板，使用者按幾次都沒反應（連「重新整理」
             #   也救不回來，因為那不清 _movers）。
+            self._movers.pop(pid, None)
             self.status.setText(f"⚠ 無法安裝跳板：{exc}")
             return None
         self._movers[pid] = mv
@@ -640,9 +647,11 @@ class EnergyTab(BaseTab):
         # ⚠ 更新用的計時器也要停：下面會把 scanner 全部關掉，計時器還在跑的話
         #   會拿已經關閉的控制碼去讀記憶體。
         self._timer.stop()
-        for mv in self._movers.values():
+        # ★ 用 release() 不要直接 stop()：跳板是同一個 PID 共用的，
+        #   掛機分頁可能還在用（見 move.acquire）。
+        for pid in list(self._movers):
             try:
-                mv.stop()
+                move.release(pid, self)
             except Exception:                       # noqa: BLE001
                 pass
         self._movers.clear()

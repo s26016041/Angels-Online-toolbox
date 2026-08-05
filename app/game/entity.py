@@ -456,6 +456,39 @@ def read_target_pair(scanner, state: int) -> tuple[int, int]:
     return struct.unpack("<II", raw)
 
 
+# 從狀態物件開頭一路讀到目標血量 —— 涵蓋 vtable(+0) 與 +0x2D8/+0x2DC
+STATE_SPAN = OFF_TARGET_HP + 4
+
+
+def read_target_checked(scanner, state: int) -> tuple[bool, int, int]:
+    """回傳 (這個位址還是狀態物件嗎, 目標實體 ID, 血量)。
+
+    ⚠⚠⚠ **寫目標之前一定要先問這個。**
+
+    狀態物件會搬家（換地圖、死亡重生、斷線重連、傳送），而寫入執行緒每 20ms
+    就往 `state + 0x2D8` 寫 4 bytes。位址一旦過期，那塊記憶體早就被遊戲拿去
+    放別的東西了 —— 我們就是在**每秒 50 次亂改遊戲的堆積**。
+    症狀正是「掛一段時間之後遊戲自己跳錯誤視窗掛掉」，而且離真正的元凶
+    （某一次換地圖）已經很遠，看起來完全沒關聯。
+
+    ★ 檢查方式是比對物件開頭的 vtable，**跟讀目標同一次系統呼叫**
+      （0 到 0x2DC 一起讀回來），所以這道保險是免費的。
+    ★ vtable 值本身會被 `locate.warm()` 依 AOB 重新定位，改版也跟得上。
+    """
+    if not state:
+        return False, 0, 0
+    raw = scanner._read_bytes(state, STATE_SPAN)
+    if not raw:
+        # 讀不到 ≠ 位址錯了（可能只是這一瞬間讀失敗）。回報「還沒失效」但
+        # 沒有數值，讓呼叫端照原本的邏輯處理讀不到的情形。
+        return True, 0, 0
+    if struct.unpack_from("<I", raw, 0)[0] != VT_STATE:
+        return False, 0, 0
+    return (True,
+            struct.unpack_from("<I", raw, OFF_TARGET)[0],
+            struct.unpack_from("<I", raw, OFF_TARGET_HP)[0])
+
+
 def _write_u32(scanner, addr: int, value: int) -> None:
     """寫入一個無號 32 位元值。
 

@@ -490,6 +490,9 @@ class TargetWorker(_Paced):
     # 所以只短暫跳過、不要封鎖一分鐘。
     died = Signal(object, bool)
     failed = Signal(str)        # 讀寫記憶體失敗
+    # 我們手上的狀態物件位址已經不是狀態物件了（換地圖／重生／重連之後
+    # 物件搬家）。UI 收到就把所有快取位址作廢並重新定位。
+    stale = Signal()
 
     def __init__(self, sc: MemoryScanner) -> None:
         super().__init__(WRITE_INTERVAL)
@@ -530,9 +533,15 @@ class TargetWorker(_Paced):
             # ★ 先讀後判斷、最後才寫 —— 順序不能換。
             # 目標死掉時遊戲會把 +0x2D8 清成 0，那是我們唯一的死亡訊號；
             # 先寫回去就把訊號蓋掉了。
-            # ★ ID 與血量**一次讀**（相鄰欄位）：省一次系統呼叫，而且兩個值
-            #   保證是同一瞬間的，不會出現「舊 ID 配新血量」。
-            cur, self.hp = entity.read_target_pair(self.sc, state)
+            # ★★ 同一次讀取順便確認「這個位址還是狀態物件」（比對 vtable）。
+            #   物件搬家後這裡若不停手，就是每秒 50 次往別人的記憶體寫 4 bytes
+            #   —— 遊戲會在很久以後莫名其妙掛掉。見 entity.read_target_checked。
+            ok, cur, self.hp = entity.read_target_checked(self.sc, state)
+            if not ok:
+                self._job = None
+                self._wrote = False
+                self.stale.emit()          # 叫 UI 那邊重新定位
+                return
             now = time.monotonic()
             # ★★ 最快也最準的死亡訊號：怪自己的動畫狀態變成 'Dead'。
             #   50Hz 就讀得到，不必等 HP_SETTLE(0.5s) 或 CORPSE_SECS(0.8s)。
@@ -799,6 +808,7 @@ class CharFarmPage(QWidget):
         self._keys = keys
         tgt.died.connect(self._on_died)
         tgt.failed.connect(lambda msg: self._stop_with(f"⚠ 記憶體存取失敗：{msg}"))
+        tgt.stale.connect(self._on_state_stale)
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
@@ -837,6 +847,7 @@ class CharFarmPage(QWidget):
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
         self._mover: move.Mover | None = None
+        self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）。
         # 每個點記 (x, y, 場景編號)；場景編號 None = 舊版存的、沒標記地圖。
@@ -1350,6 +1361,18 @@ class CharFarmPage(QWidget):
         self._scene_scanned = False
         self._scene_try = 0.0             # 剛傳送完，允許立刻重新定位一次
         self._since_scan = RESCAN_GAP     # 重連完立刻重掃
+
+    def _on_state_stale(self) -> None:
+        """寫入執行緒發現手上的狀態物件位址已經失效（vtable 對不上）。
+
+        ★ 這是**最後一道防線**：`apply_scan()` 那邊已經會在位址一變就叫它停手，
+          但物件搬家到下一次掃描之間還是有空窗，而寫入執行緒每 20ms 跑一次。
+          它自己驗出來就自己停，這裡只負責把其餘快取一起作廢並馬上重掃。
+        """
+        self._keys.set_on(False)
+        self._cur = None
+        self._drop_cached_addrs()
+        self.status.setText("位址失效（換地圖／重生／重連？）→ 重新定位中…")
 
     def _fire_recall(self) -> None:
         """觸發的第二段：真的把回程道具用掉，然後排定「關自動攻擊」。
@@ -1873,18 +1896,22 @@ class CharFarmPage(QWidget):
         self._save_settings()
 
     def _ensure_mover(self) -> bool:
-        """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。"""
+        """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。
+
+        ⚠ 一定要走 `move.acquire()`：同一個遊戲行程只能有一份跳板，
+          自己 new 一份會把別的分頁（能量晶化）正在用的那份拆掉。
+        """
         if self._mover is not None and self._mover.active:
             return True
-        if self._mover is not None:
+        if self._mover_failed:
             return False                       # 之前裝失敗過，別一直重試
         try:
-            mv = move.Mover(self.pid, injector.process_path(self.pid))
-            mv.start()
-            self._mover = mv
+            self._mover = move.acquire(
+                self.pid, injector.process_path(self.pid), self)
             return True
         except Exception as exc:               # noqa: BLE001
-            self._mover = move.Mover(self.pid, "")   # 佔位，代表試過了
+            self._mover = None
+            self._mover_failed = True
             self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
             return False
 
@@ -1928,6 +1955,19 @@ class CharFarmPage(QWidget):
         return entity.read_pos(self.sc, self.player)
 
     def apply_scan(self, s: Scan) -> None:
+        # ⚠⚠⚠ 狀態物件**換位址或不見了** → 一定要先叫寫入執行緒停手。
+        #   它手上的 `_job` 記著舊位址，而它每 20ms 就往 `舊位址 + 0x2D8`
+        #   寫 4 bytes。物件搬家（換地圖、死亡重生、斷線重連、傳送）之後
+        #   那塊記憶體早就是別人的了 —— 等於每秒 50 次亂改遊戲的堆積，
+        #   遊戲會在很久以後跳「This program will be terminated…」掛掉，
+        #   而且離真正的元凶已經很遠，完全看不出關聯。
+        #   以前只有「我們自己觸發的傳送／換頻」有作廢位址（_drop_cached_addrs），
+        #   角色自己死掉重生、使用者手動換地圖、伺服器重連都沒人管。
+        if s.state != self.state:
+            self._atk.hold_off()
+            self._keys.set_on(False)
+            self._keys.eid = None
+            self._cur = None
         self.state = s.state
         self.player = s.player
         self.stats = s.stats
@@ -2937,9 +2977,12 @@ class FarmTab(BaseTab):
     def _teardown(self) -> None:
         for page in self._pages.values():
             page.run_cb.setChecked(False)
-            # ⚠ 一定要拆掉移動 hook —— 不還原 IAT 就等於在遊戲裡留了一段跳板
+            # ⚠ 一定要還掉移動 hook —— 不還原 IAT 就等於在遊戲裡留了一段跳板。
+            #   ★ 用 release() 不要直接 stop()：跳板是同一個 PID 共用的，
+            #     能量晶化分頁可能還在用（見 move.acquire）。
             if page._mover is not None:
-                page._mover.stop()
+                move.release(page.pid, page)
+                page._mover = None
             # ⚠ 警報也要停：BeepThread／QMediaPlayer 還在響的話，物件被回收
             #   時等於「執行緒還在跑就被解構」，而且聲音會一直放到關掉程式。
             if page._notifier is not None:

@@ -248,6 +248,8 @@ class Mover:
     """
 
     def __init__(self, pid: int, exe_path: str) -> None:
+        # ⚠⚠ **不要自己 new 一個** —— 請用 `move.acquire(pid, exe, 你自己)`。
+        #   同一個遊戲行程只能有一份跳板，兩份會互相拆掉（見 acquire 的說明）。
         self._pid = pid
         self._exe = exe_path
         self._pm = None
@@ -297,6 +299,13 @@ class Mover:
           · IAT 指向的位址**不在任何模組裡**（＝確實被 hook 了）
           · 往前 `_CODE` 當成我們的區塊起點，讀出的 `_ORIG`
             **必須落在 USER32.dll 裡**（那才是真正的 PeekMessageA）
+          · ★ 而且**不能是本行程裡還活著的那一份**（見下面）
+
+        ⚠⚠⚠ 最後那條是 2026-08-06 補的。少了它，「還活著的跳板」跟「孤兒」
+          長得一模一樣（兩個條件都符合），於是第二個分頁安裝時會把第一個
+          分頁**還在用的**跳板拆掉：第一個的 `_active` 仍是 True、旗標永遠
+          不會被清，之後每一個呼叫都回「排不進去」，而且不會自己好。
+          正解是根本不要有第二份 —— 見 `acquire()`；這裡是第二道防線。
         """
         try:
             cur = pm.read_uint(iat)
@@ -308,6 +317,8 @@ class Mover:
             return None
         if any(lo <= cur < hi for lo, hi, _ in mods):
             return None                            # 本來就沒被 hook
+        if _is_live_block(block):
+            return None                            # 那是本行程還在用的，別碰
         for lo, hi, name in mods:
             if lo <= orig < hi and name.startswith("user32"):
                 return orig
@@ -612,3 +623,70 @@ class Mover:
             except Exception:               # noqa: BLE001
                 pass
             self._active = False
+
+
+# ---------------------------------------------------------------------------
+# 一個遊戲行程共用一份跳板
+# ---------------------------------------------------------------------------
+# ⚠⚠⚠ **同一個 PID 絕對不能有兩份 Mover。**
+#
+# 踩過的實際狀況：掛機分頁裝好跳板正在跑，使用者切到能量晶化分頁按了晶化，
+# 那邊又 new 了一份 Mover 並 start()。`start()` 會先叫 `_orphan_orig()` 清掉
+# 「上次沒收乾淨的孤兒跳板」，而**還活著的跳板跟孤兒長得一模一樣**
+# （IAT 指向模組外、區塊裡的 _ORIG 落在 user32），於是它把掛機那份拆掉。
+# 掛機那邊的 `_active` 仍然是 True、旗標永遠不會被清 ——
+# 之後每一次攻擊／移動都回「排不進去」，而且不會自己好，只能重開工具箱。
+#
+# 所以改成註冊制：`acquire()` 拿、`release()` 還，最後一個人還完才真的 stop()。
+# 誰持有用 owner 物件記（分頁自己），同一個 owner 重複 acquire 不會重複計數。
+_shared: dict[int, "Mover"] = {}
+_owners: dict[int, set] = {}
+_shared_lock = threading.Lock()
+
+
+def _is_live_block(block: int) -> bool:
+    """這個區塊是不是本行程裡某個還活著的 Mover 的？（給 _orphan_orig 用）"""
+    with _shared_lock:
+        return any(mv.active and mv._block == block for mv in _shared.values())
+
+
+def acquire(pid: int, exe_path: str, owner) -> "Mover":
+    """拿這個遊戲行程的共用跳板；還沒裝就裝一份。裝不起來會丟例外。
+
+    owner: 隨便一個可雜湊的物件（通常是呼叫的分頁自己），用來記「誰還在用」。
+    ⚠ 用完一定要 `release(pid, owner)`，否則跳板會一直留在遊戲裡。
+    """
+    with _shared_lock:
+        mv = _shared.get(pid)
+        if mv is not None and mv.active:
+            _owners.setdefault(pid, set()).add(owner)
+            return mv
+        # 沒有、或上一份已經被 stop 掉了 → 裝一份新的
+        mv = Mover(pid, exe_path)
+    # ⚠ start() 會讀寫遊戲記憶體、還會 import keystone（第一次要幾百毫秒），
+    #   不要抓著全域鎖做 —— 別的 PID 也在等這把鎖。
+    mv.start()
+    with _shared_lock:
+        cur = _shared.get(pid)
+        if cur is not None and cur.active and cur is not mv:
+            # 極少見：等 start() 的時候別人也裝好了。把自己這份收掉，用他的。
+            mv.stop()
+            _owners.setdefault(pid, set()).add(owner)
+            return cur
+        _shared[pid] = mv
+        _owners.setdefault(pid, set()).add(owner)
+    return mv
+
+
+def release(pid: int, owner) -> None:
+    """還掉。**最後一個人還完才真的還原 IAT。**"""
+    with _shared_lock:
+        owners = _owners.get(pid)
+        if owners is not None:
+            owners.discard(owner)
+            if owners:
+                return                  # 還有別人在用，跳板要留著
+            _owners.pop(pid, None)
+        mv = _shared.pop(pid, None)
+    if mv is not None:
+        mv.stop()                       # ⚠ 在全域鎖外面做：stop() 自己會拿 mover 的鎖
