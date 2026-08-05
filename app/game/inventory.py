@@ -234,6 +234,8 @@ def read_slot(scanner, head: int, index: int) -> tuple[int, int, int] | None:
 
     球值對非球物品沒有意義，呼叫端要自己用種類 ID 判斷。
     """
+    if not head:
+        return None                 # 陣列搬家時呼叫端可能還拿著 None
     p = _dword(scanner, head + index * 4)
     if not p:
         return None
@@ -273,6 +275,11 @@ def scan_slots(scanner, head: int, count: int = 128):
 
 
 HEAD_BACK = 24               # 校正表頭時往前多看幾格
+# ★ 走整條陣列時看多少格。⚠⚠ **這個值太小會變成「假的沒有」**：
+#   實測格號用到 174（白狐 172、嵐狐 174），原本寫 128 就會把放在後面的
+#   藥水判成「用完了」→ 誤觸發回程補給。遊戲本身最大格號 253，取 512 留足餘裕。
+#   成本很低：整段用 `read_pointers()` **一次讀進來**，不是一格發一次系統呼叫。
+FULL_WINDOW = 512
 
 
 def _item_slot(scanner, ptr: int) -> int | None:
@@ -299,6 +306,8 @@ def align_head(scanner, head: int, window: int = HEAD_WINDOW) -> int:
 
     找不到任何物品時回傳原值，不做無謂的更動。
     """
+    if not head:
+        return head
     votes: Counter = Counter()
     for i in range(-HEAD_BACK, window):
         a = head + i * 4
@@ -319,11 +328,86 @@ def find_by_slot(scanner, head: int, slot: int,
       驗證：飾品確實落在 8、9 格，跟既有的 SLOT_ACCESSORY 完全吻合。
     """
     base = align_head(scanner, head, window)
+    if not base:
+        return None                 # 陣列搬家時呼叫端可能還拿著 None
     for i in range(window):
         p = _dword(scanner, base + i * 4)
         if p and _item_slot(scanner, p) == slot:
             return p
     return None
+
+
+def find_by_type(scanner, head: int, type_id: int
+                 ) -> tuple[int, int, int] | None:
+    """挑**一格**這個種類的東西來用；回傳 (格號, 物件位址, 那一格的數量)。
+
+    ⚠⚠ 第三個值是**那一格**的數量，不是總數 —— 可疊物品會散在好幾格。
+      要總數請用 `count_by_type()`（見那裡的黑狐 7667 個實例）。
+    這支的用途是「挑一格來用掉」，例如回程道具要傳格號給遊戲函式。
+
+    ★★ 格號取自**物品自己的 `+0x25`**，不是陣列索引 —— `locate()` 找到的表頭
+      有機會偏格（實測偏過 5 格與 6 格），拿索引去打封包就會用到別的東西。
+      實際踩過：回程道具被讀成「第 48 格的 3966」，其實 3966 在第 54 格，
+      真正的回程道具是 1905。要打封包的格號一律走這裡。
+
+    ⚠ 表頭是 None 就直接回 None —— 陣列會搬家（換地圖、撿東西都會），
+      呼叫端拿到的可能是上一輪的值。
+    """
+    for slot, tid, cnt, p in _walk(scanner, head):
+        if tid == type_id:
+            return slot, p, cnt
+    return None
+
+
+def _walk(scanner, head: int, window: int = FULL_WINDOW):
+    """走整條物品陣列，逐一吐出 (格號, 種類ID, 數量, 物件位址)。
+
+    ★ 指標**一次批次讀進來**（`read_pointers`），所以掃 512 格跟掃 128 格
+      的成本差不多 —— 沒有理由為了省時間去縮範圍。
+    ⚠ 只認「物品自己記得住格號」的（`_item_slot`），過濾掉陣列外圍的殘留指標。
+
+    ⚠⚠ **表頭前面那 24 格可能整段沒有映射**（陣列剛好貼著記憶體區段的開頭）。
+      ReadProcessMemory 對這種範圍是**整批失敗**，不是讀一半 ——
+      而 `read_pointers` 的減半重試救不了「開頭就讀不到」，因為起點沒變。
+      結果是整條陣列讀出來是空的：藥水全變 0、天使之翼也變 0
+      → 「水沒了」+「沒有回程道具」→ 掛機被停掉。
+      使用者實際遇到（黑狐，表頭 0x3ac35008，往前 96 bytes 就是未映射）。
+      所以讀不到就退一步，從表頭本身開始讀。
+    """
+    if not head:
+        return
+    base = align_head(scanner, head)
+    if not base:
+        return
+    start = base - HEAD_BACK * 4
+    ptrs = read_pointers(scanner, start, HEAD_BACK + window)
+    if not ptrs:
+        ptrs = read_pointers(scanner, base, window)
+    for p in ptrs:
+        if not p:
+            continue
+        slot = _item_slot(scanner, p)
+        if slot is None:
+            continue
+        raw = scanner._read_bytes(p, ITEM_COUNT_OFF + 2)
+        if not raw or len(raw) < ITEM_COUNT_OFF + 2:
+            continue
+        yield (slot,
+               struct.unpack_from("<I", raw, ITEM_TYPE_OFF)[0],
+               struct.unpack_from("<H", raw, ITEM_COUNT_OFF)[0],
+               p)
+
+
+def count_by_type(scanner, head: int, type_id: int) -> int:
+    """某個種類**全部加起來**有幾個。
+
+    ⚠⚠ **數量一定要用這支，不要拿 `find_by_type()` 的第三個值。**
+      可疊物品會**散在好幾格**：實測黑狐的補魔藥水（種類 4837）分在
+      第 51/52/53/55/58/70/75/76 格 —— 667 + 1000×7 = 7667，
+      而 `find_by_type()` 只會回第一格的 667。使用者一眼就看出數字不對。
+    """
+    return sum(cnt for _s, tid, cnt, _p in _walk(scanner, head)
+               if tid == type_id)
 
 
 def durability(scanner, head: int) -> tuple[int, int] | None:

@@ -105,6 +105,23 @@ def check_client(sc, hwnd: int, account: str) -> ClientResult:
     stats = player.read(sc, base) if base else None
     put("角色屬性", stats is not None,
         f"Lv{stats.level}" if stats else "")
+
+    # ★ 背包要能「走得完」，不是只找得到表頭。
+    #   踩過的坑：表頭找到了，但物品陣列剛好貼著記憶體區段的開頭，
+    #   `_walk` 往前多讀 24 格就整批失敗 → 所有物品都數成 0
+    #   → 判定「藥水沒了」而且「沒有回程道具」，掛機被停掉（見 inventory._walk）。
+    #   數量會因為找不到表頭而是 None，那是「還沒定位」，不算壞。
+    try:
+        from app.game import aob, inventory
+        hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096)
+        head = inventory.locate(sc, {a - inventory.ITEM_BALL_OFF for a in hits})
+        n = sum(1 for _ in inventory._walk(sc, head)) if head else None
+    except Exception as exc:                   # noqa: BLE001
+        head, n = None, None
+        put("背包物品陣列", False, str(exc))
+    else:
+        put("背包物品陣列", head is None or bool(n),
+            f"{n} 件" if head else "還沒定位")
     return res
 
 
