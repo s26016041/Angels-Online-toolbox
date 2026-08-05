@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import struct
 import os
 import time
 from dataclasses import dataclass, field
@@ -63,9 +64,9 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, channel, entity, inventory, jumpmap,
-                      locate, monsters, move, navigate, player, robot,
-                      scene)
+from app.game import (aob, attack, buff, channel, entity, inventory,
+                      jumpmap, locate, monsters, move, navigate, player,
+                      robot, scene)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -73,7 +74,16 @@ from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 _FARM_LOG = os.environ.get("AO_FARM_LOG") == "1"
 SKILL_KEYS = [(f"F{i}", 0x6F + i) for i in range(1, 13)]   # F1=0x70 … F12=0x7B
 DEFAULT_KEY = 0x71              # F2
-DEFAULT_INTERVAL = 0.05         # 秒；每秒送 20 次技能鍵
+# ★★ 出手間隔（**固定，不給使用者改**，使用者要求）。
+# 為什麼是 0.1 秒：
+#   · 攻擊技能一輪最快就是 0.5 秒（黑狐在用的技能 257：前置 0、後置 500ms；
+#     全部法術裡「前置+後置」最多的一級就是 500ms，共 3223 個）。
+#     再密也沒用，伺服器不收。
+#   · 0.1 秒等於每個 0.5 秒的窗口試 5 下，封包排隊有抖動也不會錯過。
+# ⛔ 不要再調到 0.02（黑狐原本的設定，每秒 50 次）：跳板的**指令槽只有一個**，
+#    攻擊要跟移動、尋路搶，送太密會把移動指令卡在外面。
+ATTACK_GAP = 0.1
+DEFAULT_INTERVAL = ATTACK_GAP   # _Paced 的預設節奏
 WRITE_INTERVAL = 0.02           # 秒；多久重寫一次目標＋檢查它死了沒（50 Hz）
 SEND_TIMEOUT_MS = 60            # 送鍵最多等遊戲多久（正常 3.4ms，卡住就放棄這一拍）
 TICK_MS = 10                    # UI 心跳
@@ -241,6 +251,9 @@ MELEE_RANGE = 2.0
 #   它知道每招的射程，也會自己繞地形。我們只負責把角色帶進這個圈子，
 #   **不要再自己往怪身上推**（兩邊搶著下移動指令會互相打架，實測會卡住）。
 CLIENT_RANGE = 20.0
+# ★ 自動分身按哪個鍵（使用者指定 F12）。技能編號不寫死 ——
+#   按一次讀「角色屬性 −0x50」就知道，再去 skills.py 查持續時間。
+BUFF_KEY = 0x7B                 # VK_F12
 SPOT_SLACK = 3.0                # 走到離巡邏點這麼近就算到了，換下一個
 # 多久讀一次「目前在哪張地圖」。換圖是很少發生的事，而心跳是 10ms 一拍，
 # 每拍都讀等於白花 CPU（雖然一次只要 1.5ms）。
@@ -827,6 +840,9 @@ class CharFarmPage(QWidget):
         self._spot_i = 0           # 現在要去第幾個
         # ★ 走去巡邏點的導航器（會繞路、會判斷到不了），見 navigate.py
         self._nav = navigate.Navigator()
+        # ★ 自動分身：時間到了自動補 F12 的 buff（見 app/game/buff.py）
+        self._buff = buff.AutoBuff(BUFF_KEY)
+        self._buff_note = ""     # 上次顯示過的補 buff 訊息（沒變就不重畫）
         # 目前所在地圖。心跳每 SCENE_SAMPLE 秒更新一次（見 _refresh_scene）。
         self._scene: int | None = None
         self._scene_t = SCENE_SAMPLE    # 第一拍就讀
@@ -878,6 +894,18 @@ class CharFarmPage(QWidget):
         # 通知列（最上面）。★ 每個分身各自一份設定，不共用
         # —— 使用者要求：不同分身可能要通知到不同的地方。
         nbar = QHBoxLayout()
+        # ★ 通知總開關（使用者要求）。關掉之後所有掛機通知都不送 ——
+        #   下面那些「藥水沒了」「武器壞了」「角色死亡」都受它管。
+        self.notify_cb = QCheckBox("啟用通知")
+        self.notify_cb.setChecked(True)
+        self.notify_cb.setToolTip(
+            "掛機的通知總開關。關掉之後這些都不會通知：\n"
+            "・角色死亡、武器耐久 0、藥水用完\n"
+            "・回程補給失敗、走不到巡邏點\n"
+            "★ 只影響通知，掛機該停還是會停（狀態列照樣寫原因）。")
+        self.notify_cb.toggled.connect(self._save_settings)
+        nbar.addWidget(self.notify_cb)
+        nbar.addSpacing(10)
         nbar.addWidget(QLabel("通知方式"))
         self.rb_sound = QRadioButton("音效警報")
         self.rb_tg = QRadioButton("Telegram")
@@ -932,21 +960,9 @@ class CharFarmPage(QWidget):
         self.key_box.currentIndexChanged.connect(
             lambda i: setattr(self._keys, "vk", self.key_box.itemData(i)))
         a.addWidget(self.key_box)
-        a.addSpacing(10)
-        a.addWidget(QLabel("每隔"))
-        self.interval = QDoubleSpinBox()
-        self.interval.setRange(0.02, 5.0)
-        self.interval.setSingleStep(0.01)
-        self.interval.setDecimals(2)
-        self.interval.setValue(DEFAULT_INTERVAL)
-        # ⚠ 單位文字一律放在**框外**的 QLabel。用 setSuffix() 會把「秒按一次」
-        #   塞進輸入框裡，看起來像可以打字進去的內容 —— 使用者反映「怪怪的，
-        #   輸入框應該只有數字」。整個專案統一這個做法。
-        fit_spin(self.interval)
-        self.interval.valueChanged.connect(self._keys.set_interval)
-        self._keys.set_interval(DEFAULT_INTERVAL)
-        a.addWidget(self.interval)
-        a.addWidget(QLabel("秒一次"))
+        # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）——
+        #    見 ATTACK_GAP 的說明，那個值是照技能施法週期算出來的。
+        self._keys.set_interval(ATTACK_GAP)
         a.addSpacing(10)
         # ★ 只打王：勾起來就**完全不看「選中怪物」的名字**，改成看種類 ID
         #   是不是王（見 app/game/monsters.py）。名字比對分不出來 ——
@@ -962,6 +978,27 @@ class CharFarmPage(QWidget):
             "⚠ 不分等級：周圍出現的**任何**王都會打。真的很硬的王打不贏時，\n"
             "　 角色一死掛機會自動停下來，但還是留意一下。")
         a.addWidget(self.boss_cb)
+        a.addSpacing(10)
+        # ★ 自動分身：時間快到了自動補 F12
+        self.buff_cb = QCheckBox("自動分身")
+        self.buff_cb.setToolTip(
+            "⚠⚠ **技能要自己先放到遊戲的 F12**。\n"
+            "　　 這裡只認 F12，放在別的鍵不會動。\n"
+            "⚠　 F12 要放**對象是「自己」**的技能（按了就直接生效）；\n"
+            "　　 對象是「角色」的要先選人，這裡不處理。\n"
+            "⚠　 **要開「開始掛機」才有作用**，單獨勾這個沒有用。\n"
+            "\n"
+            f"時間到就自動補：剩不到 {buff.LEAD:.0f} 秒再放一次。\n"
+            "・每次開始掛機（或打到一半才勾）都會**先無腦放一次**，\n"
+            "　 不去偵測身上還有沒有。\n"
+            "・補的時候送**封包**，不占鍵盤、也不必停下腳步。\n"
+            "・持續時間讀遊戲資源包（黑狐的 F12 是技能 5424，20 分鐘）。\n"
+            "・只有**第一次**要按一下 F12 認技能編號，認到就記住，\n"
+            "　 之後連重開程式都不用再按。\n"
+            "\n"
+            "⚠ 被驅散或施法被打斷我們不會知道，最壞情況是斷到下次補的空窗。")
+        self.buff_cb.toggled.connect(self._save_settings)
+        a.addWidget(self.buff_cb)
         a.addStretch(1)
         grid.addWidget(g_atk, 0, 0)
 
@@ -1855,6 +1892,16 @@ class CharFarmPage(QWidget):
         self._walk_t = 0.0
         return n
 
+    def _my_id(self) -> int:
+        """自己的實體 ID —— 施放封包的「目標」欄位要填它。
+
+        ★ 實測跟使用者攔到的封包完全一致（0x47b403c2）。
+        """
+        if not self.player:
+            return 0
+        raw = self.sc._read_bytes(self.player + entity.OFF_ID, 4)
+        return struct.unpack("<I", bytes(raw))[0] if raw else 0
+
     def my_pos(self) -> tuple[float, float] | None:
         """玩家目前的格子座標（每次都重讀，因為角色會走動）。"""
         if self.player is None:
@@ -2070,6 +2117,9 @@ class CharFarmPage(QWidget):
                 f"「{m.name if m else ''}」倒了（累計 {self._kills} 隻）→ 重新掃描…")
 
     def _on_toggle(self, on: bool) -> None:
+        if on:
+            # ★ 開自動戰鬥就無腦放一次分身（使用者要求，不偵測身上有沒有）
+            self._buff.arm()
         if not on:
             self._keys.set_on(False)
             self._keys.stop_learning()
@@ -2080,6 +2130,8 @@ class CharFarmPage(QWidget):
             #   不然使用者以為停了，角色卻還在自己跑。
             # ⚠ 精靈如果是我們開的（自動交棒或測試按鈕），停掛機時一定要把
             #   自動攻擊關掉 —— 不然使用者以為停了，角色還在自己打。
+            self._buff.reset()
+            self._buff_note = ""
             if self._supply or self._robot_ours:
                 self._supply = False
                 self._supply_gen += 1        # 排著的趴趴GO傳送就此作廢
@@ -2175,6 +2227,27 @@ class CharFarmPage(QWidget):
         # ★ 補給中就整個讓開 —— 那段時間是天使精靈在開車，我們不能同時下指令。
         if self._supply_tick(dt):
             return
+
+        # ★ 自動分身：時間快到了就補一次 F12（見 app/game/buff.py）。
+        # ⚠ 位置刻意放在**休息／補給之後、打怪之前**：
+        #   坐著或交棒給精靈時不要插隊按鍵，但打怪中該補還是要補
+        #   —— buff 斷掉的損失比少打一下大。
+        # ⚠ 它自己會控制節奏（沒到時間就什麼都不做），不必在這裡節流。
+        # ★ 只有開了自動戰鬥才會走到這裡（上面 run_cb 沒勾就 return 了）——
+        #   使用者要求：單獨勾這個沒有用。
+        if self.buff_cb.isChecked():
+            if not self._buff.armed:
+                self._buff.arm()          # 中途才勾的話，下一拍就無腦放一次
+            note = self._buff.step(
+                self.sc, self._mover, self.hwnd, self._keys.pf,
+                self._my_id(), self.stats, win.send_key)
+            if note and self._buff_note != note:
+                self._buff_note = note
+                self.status.setText(f"✨ {note}")
+                if self._buff.skill:      # 學到了就存起來，之後不用再按 F12
+                    self._save_settings()
+        elif self._buff.armed:
+            self._buff.armed = False
 
         # ★ 該不該回去補給。勾了「回程補給」就照精靈自己的設定判斷（耐久、
         #   採買清單缺貨…）；沒勾就只看耐久 0 並停機通知。幾秒看一次就夠。
@@ -2583,11 +2656,15 @@ class CharFarmPage(QWidget):
         i = next((n for n, (_, v) in enumerate(SKILL_KEYS) if v == vk), None)
         if i is not None:
             self.key_box.setCurrentIndex(i)
-        self.interval.setValue(float(g(self._key("interval"), DEFAULT_INTERVAL)))
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
         self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
+        self.notify_cb.setChecked(bool(g(self._key("notify_on"), True)))
+        self.buff_cb.setChecked(bool(g(self._key("auto_buff"), False)))
+        # 學過的分身技能編號 —— 有存就不用再按 F12 學一次
+        self._buff = buff.AutoBuff(
+            BUFF_KEY, int(g(self._key("buff_skill"), 0) or 0))
         self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
         self.sup_gear_cb.setChecked(bool(g(self._key("supply_gear"), False)))
         # 「藥水觸發」拆成 HP／MP 兩個之前存的舊值，兩邊都吃 ——
@@ -2629,10 +2706,12 @@ class CharFarmPage(QWidget):
         s = config.set
         s(self._key("monsters"), self.wanted())
         s(self._key("vk"), self.key_box.currentData())
-        s(self._key("interval"), self.interval.value())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("boss_only"), self.boss_cb.isChecked())
+        s(self._key("notify_on"), self.notify_cb.isChecked())
+        s(self._key("auto_buff"), self.buff_cb.isChecked())
+        s(self._key("buff_skill"), int(self._buff.skill or 0))
         s(self._key("rotate"), self.rot_cb.isChecked())
         s(self._key("supply_gear"), self.sup_gear_cb.isChecked())
         s(self._key("supply_hp"), self.sup_hp_cb.isChecked())
@@ -2655,7 +2734,6 @@ class CharFarmPage(QWidget):
         self.picked.model().rowsInserted.connect(self._save_settings)
         self.picked.model().rowsRemoved.connect(self._save_settings)
         self.key_box.currentIndexChanged.connect(self._save_settings)
-        self.interval.valueChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
         self.boss_cb.toggled.connect(self._save_settings)
@@ -2668,8 +2746,12 @@ class CharFarmPage(QWidget):
 
     # ------------------------------------------------------------------
     def notify(self, msg: str) -> None:
-        """送警報通知。設定是這個分身自己的（通知列在頁面最上面）。"""
-        if self._notifier is None:
+        """送警報通知。設定是這個分身自己的（通知列在頁面最上面）。
+
+        ⚠ 受「啟用通知」總開關管（使用者要求）。關掉只是不送通知，
+          該停的還是會停 —— 停機原因照樣寫在狀態列。
+        """
+        if self._notifier is None or not self.notify_cb.isChecked():
             return
         who = f"{self.account}（{self.char_name}）"
         note = self._notifier.fire(who, msg)
