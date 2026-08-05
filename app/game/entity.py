@@ -291,6 +291,25 @@ def read_state(scanner, addr: int) -> str:
         return ""
 
 
+STATE_RUN = "Run"
+
+
+def is_walking(scanner, player_obj: int) -> bool:
+    """角色現在是不是正在走路。
+
+    ★★ 這是「這一段走完了沒」的**即時**訊號 —— 比隔 0.3 秒比一次位置準太多。
+      實測（黑狐）下了移動指令之後：
+          +0.46 秒 狀態變 'Run'（開始走）
+          +2.45 秒 狀態變 'Wait'（走完，21 格）
+      靠比位置的話，走完之後最久要 0.3 秒才發現，加上指令冷卻 0.4 秒
+      → 每個路段中間空等約 0.5 秒。長距離要走好幾段，看起來就是**一頓一頓的**。
+      實測同一條來回路線：比位置 28% 的時間站著不動（卡頓 11 次），
+      改讀這個欄位之後剩 10%（卡頓 4 次）。
+    ⚠ 讀不到（空字串）回 False —— 不知道就當停著，寧可多下一次指令。
+    """
+    return bool(player_obj) and read_state(scanner, player_obj) == STATE_RUN
+
+
 def is_sitting(scanner, player_obj: int) -> bool:
     """角色現在是不是坐著（遊戲裡按 Insert 切換）。
 

@@ -119,6 +119,17 @@ def _approach_point(here: tuple[float, float],
     if not pts:
         return None
     if len(pts) >= 2:
+        # ★★ **趕路時整段走完**（keep <= 0 = 呼叫端不需要保持距離）。
+        #   遊戲自己點地圖就是這樣：一包最多 5 個路徑點，一段走 67 格
+        #   （使用者攔到的封包解出來的）。一個轉角一個轉角走的話，每個轉角
+        #   都要停下來等指令排隊（實測 107~154ms），30 格有四個轉角就多停
+        #   半秒 —— 那就是「走路卡卡的」。
+        #   實測（黑狐，183 格）：改成整段走完，去程 9 段 35 秒 → 7 段 25 秒，
+        #   回程 32 段 135 秒 → 10 段 49 秒。
+        # ⚠ **打怪的接近不走這條**（keep 一定 > 0）：那邊要控制跟怪的距離，
+        #   規則是調過好幾輪的，不要動。
+        if keep <= 0:
+            return pts[-1]
         return pts[0]              # 照著路徑走下一個轉角
     tx, ty = pts[-1]               # 只剩最後一個點 = 直線可通
     # ★ 不管設定多小，離目標一律留 MIN_GAP —— 太近會被判定卡在怪身體裡。
@@ -180,6 +191,7 @@ _FLAG, _ORIG, _A1, _A2, _CNT, _A4, _DONE, _FN = (
 _A5, _ECX, _RET, _ESP = 0x20, 0x24, 0x28, 0x2C
 _A6 = 0x30                  # 第六個參數（WALK_FN 要六個）
 _CODE = 0x40
+_SCRATCH = 0x800            # 配置的是 0x1000，程式碼用不到 0x100，這之後全空
 
 
 def _stub_asm(block: int) -> str:
@@ -336,6 +348,24 @@ class Mover:
         self._block = block
         self._active = True
 
+    def scratch(self) -> int:
+        """跳板那塊配置頁裡可以自由使用的暫存區位址（沒裝好回 0）。
+
+        版面：變數 0x00~0x33、跳板程式碼從 _CODE(0x40) 起（實測不到 0x100），
+        所以 _SCRATCH 之後整段都是空的。拿來放要傳給遊戲函式的字串
+        —— 例如 Lua 的函式名（見 app/game/lua.py）。
+
+        ★ 這樣別的模組就不必去摸 `_block` / `_pm` 這些私有欄位。
+        """
+        return (self._block + _SCRATCH) if self._active else 0
+
+    def write(self, addr: int, data: bytes) -> bool:
+        """往遊戲行程寫一段位元組（給 scratch 區與 Lua 堆疊用）。"""
+        if not self._active:
+            return False
+        self._pm.write_bytes(addr, bytes(data), len(data))
+        return True
+
     def call(self, fn: int, a1: int = 0, a2: int = 0, a3: int = 0,
              a4: int = 0, a5: int = 0, a6: int = 0, ecx: int = 0) -> bool:
         """請遊戲主執行緒呼叫 fn(a1..a5)；ecx 給 __thiscall 的 this。
@@ -364,7 +394,14 @@ class Mover:
         """呼叫並等它做完，回傳 eax；逾時回 None。
 
         用在「先尋路、拿到點數，再送移動封包」這種有先後relation的兩步。
-        指令槽只有一個，所以一定要等前一個做完才排下一個。
+        指令槽只有一個，所以一定要等前一個做完才等下一個。
+
+        ⚠⚠ **逾時要把旗標清掉**，否則指令槽會永久卡住：遊戲主執行緒只要忙一下
+          （開視窗、等伺服器）就會來不及執行，旗標留在 1，之後**每一個**呼叫都
+          回「排不進去」，而且不會自己好。實際踩過：叫了一次開視窗之後，那個
+          分身的所有呼叫全部失效，只能重開遊戲。
+          清掉是安全的：跳板是「讀到旗標 → 先清掉 → 再執行」，所以我們寫 0
+          最壞情況只是那個指令不執行 —— 那本來就是逾時的意思。
         """
         # ⚠ 鎖要**含等待那段**：只鎖 call() 的話，別人可以在我們等結果時排下一個
         #   呼叫，我們就會讀到別人的 eax。
@@ -376,6 +413,7 @@ class Mover:
                 if not self._pm.read_uint(self._block + _FLAG):
                     return self._pm.read_uint(self._block + _RET)
                 time.sleep(0.005)
+            self._pm.write_uint(self._block + _FLAG, 0)      # 取消這次請求
         return None
 
     def path_to(self, scanner, tile_x: float, tile_y: float,
