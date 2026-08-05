@@ -59,8 +59,15 @@ class Report:
         return out
 
 
-def check_client(sc, hwnd: int, account: str) -> ClientResult:
-    """跑完一台分身的所有檢查。純讀取。"""
+def check_client(sc, hwnd: int, account: str,
+                 deep: bool = False) -> ClientResult:
+    """跑完一台分身的所有檢查。純讀取。
+
+    deep=True 才做「背包物品陣列」那一項 —— 它要全記憶體掃兩次，
+    **一台就要 1.5 秒**（五台 8 秒）。開程式時的背景監察不能這麼慢：
+    那條執行緒會一直吃 GIL，主視窗就遲遲畫不出來。
+    手動跑 `tools/selfcheck.py` 時才開。
+    """
     from app.game import channel, energy, entity, locate, monsters
     from app.game import player, scene
 
@@ -111,6 +118,8 @@ def check_client(sc, hwnd: int, account: str) -> ClientResult:
     #   `_walk` 往前多讀 24 格就整批失敗 → 所有物品都數成 0
     #   → 判定「藥水沒了」而且「沒有回程道具」，掛機被停掉（見 inventory._walk）。
     #   數量會因為找不到表頭而是 None，那是「還沒定位」，不算壞。
+    if not deep:
+        return res                 # 淺層到此為止（開程式時的背景監察走這條）
     try:
         from app.game import aob, inventory
         hits = aob.scan(sc, aob.SKILL_EXP_BALL, limit=4096)
@@ -125,7 +134,7 @@ def check_client(sc, hwnd: int, account: str) -> ClientResult:
     return res
 
 
-def check() -> Report:
+def check(deep: bool = False) -> Report:
     """檢查所有開著的分身。沒有分身時回傳空報告（`skipped` 為 True）。"""
     from app.game import locate
 
@@ -138,7 +147,7 @@ def check() -> Report:
         sc = MemoryScanner()
         try:
             sc.open(w.pid)
-            got = check_client(sc, w.hwnd, acc)
+            got = check_client(sc, w.hwnd, acc, deep=deep)
             got.name = preload.name_of(w.pid, sc, acc)
             rep.clients.append(got)
         except Exception as exc:               # noqa: BLE001

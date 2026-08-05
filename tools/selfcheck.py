@@ -37,7 +37,8 @@ from app.core import health  # noqa: E402
 
 
 def main() -> int:
-    rep = health.check()
+    # 手動跑就做深度檢查（含背包物品陣列，要多花約 8 秒）
+    rep = health.check(deep=True)
     if rep.skipped:
         print("找不到遊戲視窗 —— 先把遊戲開起來。")
         return 1

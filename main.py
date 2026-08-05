@@ -70,13 +70,17 @@ def _build_main_window():
     from app.main_window import MainWindow
     from PySide6.QtWidgets import QApplication
 
+    _trace("建 QApplication…")
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(__app_name__)
+    _trace("QApplication 好了")
 
     from app.theme import apply_theme
     apply_theme(app)
-
-    return app, MainWindow()
+    _trace("主題套好，開始 MainWindow()")
+    w = MainWindow()
+    _trace("MainWindow() 回來了")
+    return app, w
 
 
 def _selftest() -> int:
@@ -95,15 +99,33 @@ def _selftest() -> int:
     return 0
 
 
+def _trace(stage: str) -> None:
+    """啟動階段追蹤。設 AOTB_TRACE=1 才寫，用來定位打包版卡在哪一步。"""
+    if os.environ.get("AOTB_TRACE") != "1":
+        return
+    try:
+        with open(_log_dir() / "startup.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%H:%M:%S.%f} {stage}\n")
+    except OSError:
+        pass
+
+
 def main() -> int:
+    _trace("main 進入")
     _install_excepthook()
+    _trace("例外攔截裝好")
 
     if "--selftest" in sys.argv:
         return _selftest()
 
+    _trace("開始建主視窗")
     app, window = _build_main_window()
+    _trace("主視窗建好")
     window.show()
-    return app.exec()
+    _trace("show() 呼叫完")
+    rc = app.exec()
+    _trace(f"事件迴圈結束 rc={rc}")
+    return rc
 
 
 if __name__ == "__main__":
