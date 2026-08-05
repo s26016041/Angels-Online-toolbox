@@ -126,7 +126,11 @@ QPushButton[primary="true"]:pressed { background-color: #5a78e6; }
 QPushButton[primary="true"]:disabled { background-color: #384168; border-color: #384168; color: #aeb6d6; }
 
 /* ---- 輸入類 ---- */
-QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTextEdit {
+/* ⚠⚠ 一定要寫 QAbstractSpinBox，不能只寫 QSpinBox ——
+   **QDoubleSpinBox 不是 QSpinBox 的子類別**（兩個都直接繼承 QAbstractSpinBox），
+   只寫 QSpinBox 的話小數框完全吃不到樣式：高度只有 19px（整數框是 31px），
+   上下箭頭被壓到剩一半。使用者回報的「數字框框都被砍到一半」就是這個。 */
+QLineEdit, QComboBox, QAbstractSpinBox, QPlainTextEdit, QTextEdit {
     background-color: #1b1f2b;
     color: #e6e8ef;
     border: 1px solid #3a4056;
@@ -135,13 +139,21 @@ QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTextEdit {
     selection-background-color: #6c8cff;
     selection-color: #ffffff;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus,
+QLineEdit:focus, QComboBox:focus, QAbstractSpinBox:focus,
 QPlainTextEdit:focus, QTextEdit:focus {
     border: 1px solid #6c8cff;
 }
-QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled {
     color: #6b7288; background-color: #20242f;
 }
+/* 數字框的左右內距縮小：它右邊還有上下箭頭要佔位置，
+   沿用上面那組的 8px 會讓每個框平白多 8px，一整列就多出幾十 px。
+   上下維持 5px —— 那是把框撐到正常高度（31px）的關鍵。 */
+QAbstractSpinBox { padding: 5px 3px; }
+/* ⛔ 不要去設 ::up-button / ::down-button ——
+   樣式表一碰那兩個子控制項，Qt 就**不再畫預設的上下箭頭**，
+   按鈕會變成一塊空白（試過，只剩一條分隔線）。
+   上面那組基本樣式本來就會留位置給箭頭，讓 Qt 自己畫就好。 */
 QComboBox::drop-down {
     subcontrol-origin: padding; subcontrol-position: right;
     width: 22px; border-left: 1px solid #3a4056;

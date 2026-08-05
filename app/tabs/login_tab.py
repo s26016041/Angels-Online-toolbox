@@ -34,7 +34,9 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import config
-from app.tabs.base_tab import BaseTab
+# fit_spin：數字框寬度照最大值算 —— 寫死的話上下箭頭會把數字擠掉
+# （使用者回報過「框框被砍到一半」）。
+from app.tabs.base_tab import BaseTab, fit_spin
 
 
 class LoginWorker(QThread):
@@ -101,7 +103,7 @@ class LoginTab(BaseTab):
         #   看起來像可以打字進去的內容（使用者反映「輸入框應該只有數字」）。
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 120)
-        self.delay_spin.setFixedWidth(70)
+        fit_spin(self.delay_spin)
         delay_row = QHBoxLayout()
         delay_row.addWidget(self.delay_spin)
         delay_row.addWidget(QLabel("秒"))

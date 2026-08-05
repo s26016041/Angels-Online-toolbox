@@ -108,13 +108,15 @@ class MemoryTab(BaseTab):
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
-        root.addWidget(
-            QLabel(
-                "找出遊戲數值的記憶體位址：選定遊戲程序 → 搜尋目前的值 → "
-                "回遊戲讓值改變 → 再次搜尋篩選，逐步縮小到目標位址。\n"
-                "找到後在「③ 搜尋結果」選一列「加入觀察」，即可持續看即時值、也能寫入。"
-            )
+        # ⚠ 說明文字一定要開自動換行：視窗窄的時候不換行就會被切掉半句
+        #   （使用者要求所有文字都要完整顯示）。
+        hint = QLabel(
+            "找出遊戲數值的記憶體位址：選定遊戲程序 → 搜尋目前的值 → "
+            "回遊戲讓值改變 → 再次搜尋篩選，逐步縮小到目標位址。\n"
+            "找到後在「③ 搜尋結果」選一列「加入觀察」，即可持續看即時值、也能寫入。"
         )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
 
         root.addWidget(self._build_process_group())
         root.addWidget(self._build_scan_group())

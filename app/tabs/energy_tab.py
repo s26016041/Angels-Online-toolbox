@@ -41,7 +41,9 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import energy, entity, locate, move
-from app.tabs.base_tab import BaseTab
+# fit_spin：數字框寬度照最大值算 —— 寫死的話上下箭頭會把數字擠掉
+# （使用者回報過「框框被砍到一半」）。
+from app.tabs.base_tab import BaseTab, fit_spin
 
 # 按下晶化到結果寫進記憶體要多久。實測 106ms（嵐狐按 3 次都一樣），取 3 倍餘裕。
 SETTLE_MS = 300
@@ -77,9 +79,12 @@ class EnergyTab(BaseTab):
         self._logs: dict[int, list[tuple]] = {}
 
         root = QVBoxLayout(self)
-        root.addWidget(QLabel(
+        # ⚠ 說明文字要開自動換行，不然視窗窄的時候會被切掉半句。
+        hint = QLabel(
             "按一下遊戲裡的「能量晶化」或「我要晶能加倍」。跟你手動點那兩顆按鈕"
-            "送出的是同一個封包（呼叫遊戲自己的函式，加解密都由客戶端處理）。"))
+            "送出的是同一個封包（呼叫遊戲自己的函式，加解密都由客戶端處理）。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("分身"))
@@ -156,7 +161,7 @@ class EnergyTab(BaseTab):
         self.interval.setValue(DEFAULT_INTERVAL)
         # ⚠ 單位文字一律放框外的 QLabel，不要用 setSuffix() —— 那會把文字塞進
         #   輸入框裡（使用者反映「輸入框應該只有數字」）。
-        self.interval.setFixedWidth(70)
+        fit_spin(self.interval)
         self.interval.setToolTip(
             f"兩次晶化之間隔多久。最少 {MIN_INTERVAL} 秒 —— 一輪要「晶化 → "
             "等 0.3 秒讀結果 → 可能再送加倍」，\n太密會塞爆指令槽（只有一個），"
@@ -172,7 +177,7 @@ class EnergyTab(BaseTab):
         #     0 就是不跑，見 _auto_tick。要用完全部請勾右邊那個。
         self.limit.setRange(0, DEFAULT_LIMIT)
         self.limit.setValue(DEFAULT_LIMIT)
-        self.limit.setFixedWidth(70)
+        fit_spin(self.limit)
         self.limit.setToolTip(
             "按幾次就自動停。\n"
             "⚠ 最大值會自動跟著目前能量走 —— 打不進比能量還大的數字。\n"

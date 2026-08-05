@@ -6,7 +6,39 @@
 """
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget
+
+
+def fit_spin(spin) -> None:
+    """把數字框調成「**最大的那個值**也放得下」的寬度。
+
+    ★ 使用者要求所有文字都要完整顯示。原本各分頁一律寫死 60~70px，
+      實測不夠 —— 上下箭頭會把數字擠掉（使用者回報「框框被砍到一半」）。
+    ⚠ 不能照**目前的值**算：3600 比 60 寬，用 60 算出來的寬度換到 3600 就切字。
+    ⚠ 一定要在**主題套用之後**呼叫，不然量到的是沒有內距的尺寸。
+    """
+    keep = spin.value()
+    spin.setValue(spin.maximum())
+    need = spin.sizeHint().width()
+    spin.setValue(keep)
+    spin.setFixedWidth(need)
+
+
+def no_elide(lst) -> None:
+    """清單不要把字縮成「曼陀羅怪…」，太長就給水平捲軸讓人捲。"""
+    lst.setTextElideMode(Qt.ElideNone)
+    lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+
+def fit_list(box, lst, sample: str) -> None:
+    """讓清單至少放得下 `sample` 這麼長的一行，寬度用**實際字型**量。
+
+    ★ 原本欄寬是寫死的（190/240），換字型或遇到長名字就會切字。
+    """
+    pad = (lst.frameWidth() * 2 + 26                      # 邊框 + 內距
+           + lst.verticalScrollBar().sizeHint().width())  # 直捲軸佔的位置
+    box.setMinimumWidth(lst.fontMetrics().horizontalAdvance(sample) + pad)
 
 
 class BaseTab(QWidget):
