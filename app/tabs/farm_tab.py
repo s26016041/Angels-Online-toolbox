@@ -248,6 +248,8 @@ LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密�
 # 掛機中多久重讀一次快捷欄（quickbar.Reader）——使用者中途換鍵上的技能，
 # 最慢這麼久就跟上。純讀零副作用，一次只有幾個小讀取（頁碼節點有快取）。
 QB_REFRESH = 2.0
+# 交戰心跳（attack.heartbeat）的間隔。官方掛實攔是 0.4~0.6 秒一發。
+BEAT_GAP = 0.5
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
 #   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
 #   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
@@ -417,6 +419,7 @@ class KeyWorker(_Paced):
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
+        self._next_beat = 0.0       # 下一次交戰心跳（attack.heartbeat）的時間
         self._on = False
         self._learning = False
         self._next_learn = 0.0
@@ -570,6 +573,12 @@ class KeyWorker(_Paced):
                 _send_scan(self.hwnd, vk)
                 if self._learning:
                     self._learn(vk)            # 剛按過鍵，順手讀一下
+            # ◎ 交戰心跳（泛用 (5,0)）：官方掛交戰中每 0.4~0.6 秒一發、
+            #   換目標趕路時會停 —— 照抄它的節奏，有目標才送。
+            #   放在出手之後：心跳晚半拍沒差，出手節奏不能被它拖到。
+            if mover is not None and eid and now >= self._next_beat:
+                self._next_beat = now + BEAT_GAP
+                attack.heartbeat(mover)
             self._rot += 1
         except Exception:                      # noqa: BLE001
             pass

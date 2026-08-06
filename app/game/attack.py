@@ -47,6 +47,11 @@ CAST_FN = 0x00559EDA        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 #   0x559EA0（當時「實跑還是卡」是因為那晚走位邏輯本身還一團亂，錯怪它了）。
 THIRD_FN = 0x00559EA0
 SELECT_CODE = 0x0C          # ②的第一個參數（遊戲自己的程式碼就是推 0xC）
+# 交戰心跳的泛用代碼（0x5D3D97 是泛用送包，見 [[generic-send-fn]]）。
+# 攔包實錄（官方掛戰士）：交戰中每 0.4~0.6 秒送一發 (5, 0)，
+# 去別隻怪的路上會停；參數恆為 0。呼叫點反組譯是一對開關（旗標=1 送 4、
+# 否則送 5），前面有兩道狀態檢查 —— 語意像「戰鬥狀態同步」。
+HEARTBEAT_CODE = 0x05
 # ①的動作碼。⚠⚠ 一定要 1，不能 0 —— 攔包對照：遊戲自己打怪送的是 1
 #   （近戰全程 1、法師第一下 1 之後 2），0 在任何一份攔包裡都沒出現過。
 #   法系（施法動作）不看這個值所以送 0 也打得動，但**物理技能（攻擊動作，
@@ -81,6 +86,16 @@ def _send(mover, calls) -> bool:
             if mover.call_sync(fn, *args, timeout=CALL_TIMEOUT) is None:
                 return False
     return True
+
+
+def heartbeat(mover) -> bool:
+    """交戰心跳：泛用送包 (5, 0)。掛機交戰中每半秒左右補一發。
+
+    官方掛全程都在送這包、我們完全沒送 —— 是攔包對照裡最後一個差異。
+    """
+    if not (mover and mover.active) or _yield_now(mover):
+        return False
+    return _send(mover, ((SELECT_FN, (HEARTBEAT_CODE, 0)),))
 
 
 def select(mover, target_id: int) -> bool:
