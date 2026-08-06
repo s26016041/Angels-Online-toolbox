@@ -263,6 +263,13 @@ ROUND_GAP = 0.10
 STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 # 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
 QUICKKEY_RANGE = 8
+# ★★ 走快捷鍵那條路時，我們只走到這個距離就停手，剩下讓**遊戲自己走過去**
+#   （實測：站 9.8 格只呼叫快捷鍵，角色自走 8.5 格貼到 1.4 格並擊殺）。
+#   取 12 = 我們的「打得到」判定門檻，配上 margin 2 格 → 實際停在 10 格，
+#   正好是使用者要的「一律走到 10 格」。
+HANDOFF_RANGE = 12.0
+# 交棒之後這麼久還沒真的接戰（還在技能射程外、也沒掉過血）就收回來自己走。
+HANDOFF_WAIT = 3.0
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
 #   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
 #   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
@@ -480,6 +487,28 @@ class KeyWorker(_Paced):
                 note.append(f"{key}（{skills.name_of(sid) or sid}）")
         return ("　※ " + "、".join(note) + " 不是攻擊型技能（照樣會放）"
                 if note else "")
+
+    @property
+    def handoff(self) -> bool:
+        """這一輪的技能能不能「交給客戶端自己走過去」。
+
+        ★ 只有走**快捷鍵**那條路的技能可以：呼叫遊戲的 usequickkey 時，
+          遊戲自己會走到射程內再出手（實測站 9.8 格、我們不下移動指令，
+          角色自己走了 8.5 格過去把怪打死）。
+        ⚠ 走封包的（射程 > 8、或對地技能）**不會**有這個行為 —— 那是
+          快捷鍵函式自己做的事，封包只是把「我要放這招」告訴伺服器。
+        ⚠ 只要輪裡有任何一招要走封包，就不能交棒（那招會在遠處空放）。
+        """
+        got = False
+        for vk in self.vks:
+            sid = self.skills.get(vk)
+            if not sid:
+                continue
+            rng = skills.range_of(sid)
+            if skills.is_ground(sid) or (rng is not None and rng > 8):
+                return False
+            got = True
+        return got
 
     @property
     def min_range(self) -> int | None:
@@ -1044,6 +1073,8 @@ class CharFarmPage(QWidget):
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._unreach = 0          # 連續幾次尋路算不出路徑
         self._hurt = False         # 這隻有沒有被我們打傷過
+        self._handoff_fail = False  # 這隻「交棒給客戶端走」失敗過了嗎
+        self._handoff_t = 0.0      # 交棒之後多久沒真的接戰
         self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（讀動畫狀態，見 tick）
@@ -2682,6 +2713,8 @@ class CharFarmPage(QWidget):
         self._way = []
         self._unreach = 0
         self._hurt = False
+        self._handoff_fail = False   # 這一隻的「交棒給客戶端」失敗過了嗎
+        self._handoff_t = 0.0
         self._gone = 0
         self._walked_ok = True
         self._why = ""
@@ -3120,8 +3153,33 @@ class CharFarmPage(QWidget):
         rng = self._keys.min_range
         reach_skill = (ATTACK_PACKET_RANGE if rng is None
                        else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
-        reach = MELEE_RANGE if blocked else reach_skill
+        # ★★★ 「最後一段交給客戶端自己走」（使用者的點子，2026-08-06 實測驗證）
+        #   短射程技能走的是「叫遊戲的快捷鍵」那條路，而**遊戲自己會走過去**：
+        #   實測雪狐站 9.8 格、我們一步移動指令都沒下，只呼叫快捷鍵 ——
+        #   角色自己走了 8.5 格、貼到 1.4 格、把怪打死（血 100→0）。
+        #   所以近戰不必由我們貼到 1.4 格：走到 10 格就停手，剩下讓遊戲走。
+        #   好處是不再跟客戶端搶走位（那正是「卡在 2.2 格」「卡進怪身體」的來源）。
+        # ⚠ memory 有一條「補按技能鍵讓角色接近會打架」——那是**同時還在下
+        #   我們自己的移動指令**時的結論。只讓客戶端走就很順，兩邊一起走才會卡。
+        # ⚠ 交棒只適用於快捷鍵那條路：對地技能與 >8 格的技能走封包，
+        #   封包**不會**讓客戶端走過去（那是快捷鍵函式自己做的事）。
+        handoff = bool(self._keys.handoff and not blocked
+                       and not self._handoff_fail)
+        reach = (MELEE_RANGE if blocked
+                 else HANDOFF_RANGE if handoff else reach_skill)
         in_range = dist is not None and dist <= reach
+        # ⚠ 交棒的保險：交出去之後如果一直沒真的接戰（>3 秒還在技能射程外、
+        #   而且沒掉過血），就收回來自己走 —— 免得客戶端因為地形之類走不到，
+        #   我們卻站在 10 格外一直空按（那又變成使用者最討厭的發呆）。
+        if handoff and dist is not None:
+            if dist <= reach_skill or self._hurt:
+                self._handoff_t = 0.0
+            else:
+                self._handoff_t += dt
+                if self._handoff_t >= HANDOFF_WAIT:
+                    self._handoff_fail = True    # 這一隻改回自己走
+                    self._dbg(f"交棒逾時（{HANDOFF_WAIT:.0f} 秒還在 "
+                              f"{dist:.1f} 格）→ 改由我們自己走過去")
         # ★★ 走到多近：**完全由射程決定**（介面上的「接戰距離」已移除）。
         #   隔著地形就貼臉；否則停在「打得到的距離再往內留餘裕」。
         # ⚠⚠ 餘裕要夠大（使用者指出的）：停在 reach−1（法師 11、射程 12）
