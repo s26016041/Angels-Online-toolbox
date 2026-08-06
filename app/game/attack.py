@@ -108,6 +108,26 @@ def select(mover, target_id: int) -> bool:
     return _send(mover, ((SELECT_FN, (SELECT_CODE, target_id)),))
 
 
+def cast_at(mover, skill_id: int, target_id: int,
+            tile_x: float, tile_y: float) -> bool:
+    """**對地技能專用**：帶著格子座標送施放包（對象＝地面的那 856 個）。
+
+    為什麼這種技能不能用 quickbar.use（按 F2）：遊戲會跳出「選範圍」的游標
+    等使用者點地板，角色就站在那不動 —— 使用者實際遇到（爆彈狙擊、
+    麻痺荊棘、瞬移術都是這類）。封包自己帶位置就不必經過那道 UI。
+
+    ⚠ 座標要跟技能放在**同一發**裡，不要另外多送一發「目標 ID = 0 + 座標」
+      的對地施放（舊實測：多送那一發時怪連續 3.3 秒零傷害）。
+    ⚠ 只送這一包：不送動作包、也不傳 `pf`（玩家物件−8 的裸指標）——
+      少一個會讓遊戲當場崩潰的破口（見 [[game-crash-root-causes]] 第②條）。
+      順移實測就是「施放函式帶格子座標」一包搞定。
+    """
+    if not (mover and mover.active and skill_id) or _yield_now(mover):
+        return False
+    return _send(mover, ((CAST_FN, (skill_id, target_id,
+                                    int(tile_x), int(tile_y), 0)),))
+
+
 def strike(mover, pf_this: int, skill_id: int, target_id: int,
            tile_x: float = 0.0, tile_y: float = 0.0) -> bool:
     """打一下：動作 + 攻擊指令 + 施放。選定之後就一直重複，直到怪死掉。

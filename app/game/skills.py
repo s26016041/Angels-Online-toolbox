@@ -86,6 +86,46 @@ def name_of(skill_id: int) -> str:
 
 
 _ranges: dict[int, int] | None = None
+_targets: dict[int, str] | None = None
+
+GROUND = "地面"          # 對象＝地面：施放要指定位置（見 is_ground）
+
+
+def _load_ranges() -> None:
+    """射程／對象表（id \\t 射程 \\t 對象）。只在第一次用到時載入。"""
+    global _ranges, _targets
+    if _ranges is not None:
+        return
+    rng: dict[int, int] = {}
+    tgt: dict[int, str] = {}
+    try:
+        with gzip.open(resource(RANGE_FILE), "rt", encoding="utf-8") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) >= 2 and p[1]:
+                    rng[int(p[0])] = int(p[1])
+                if len(p) >= 3 and p[2]:
+                    tgt[int(p[0])] = p[2]
+    except Exception:                                      # noqa: BLE001
+        rng, tgt = {}, {}
+    _ranges, _targets = rng, tgt
+
+
+def target_of(skill_id: int) -> str:
+    """技能的「對象」：自己／角色／地面／隊伍／屍體；查不到回空字串。"""
+    _load_ranges()
+    return (_targets or {}).get(int(skill_id or 0), "")
+
+
+def is_ground(skill_id: int) -> bool:
+    """要不要指定地面位置才放得出來（對象＝地面）。
+
+    ★★ 這種技能**不能**用 quickbar.use（＝按 F2）發動：遊戲會跳出選範圍的
+      游標等使用者點地板，角色就站在那不動（使用者實際遇到）。
+      掛機要改送**帶格子座標的施放封包**（attack.cast_at）。
+      例：爆彈狙擊Ⅱ、麻痺荊棘Ⅱ、瞬移術Ⅳ。全表共 856 個。
+    """
+    return target_of(skill_id) == GROUND
 
 
 def range_of(skill_id: int) -> int | None:
@@ -98,16 +138,5 @@ def range_of(skill_id: int) -> int | None:
     ⚠ 這是**遊戲資料表的格數**，不是歐氏距離：斜角相鄰算一格，
       所以實際站位要換算（近戰射程 1 實測 2.0~2.2 格都打得到）。
     """
-    global _ranges
-    if _ranges is None:
-        out: dict[int, int] = {}
-        try:
-            with gzip.open(resource(RANGE_FILE), "rt", encoding="utf-8") as f:
-                for line in f:
-                    sid, _, rng = line.rstrip("\n").partition("\t")
-                    if rng:
-                        out[int(sid)] = int(rng)
-        except Exception:                                  # noqa: BLE001
-            out = {}
-        _ranges = out
-    return _ranges.get(int(skill_id or 0))
+    _load_ranges()
+    return (_ranges or {}).get(int(skill_id or 0))

@@ -458,9 +458,12 @@ class KeyWorker(_Paced):
 
         ★ 取最短的：走到最短射程之內，這一輪裡每一招才都打得到。
           （雪狐 F2 破甲劈擊射程 1；黑狐 F2 電擊術射程 12。）
+        ⚠ **射程 0 的不算**：那是純 buff（對象＝自己、表裡沒有射程也沒有
+          範圍，例如單體分身、歃血狂暴）。它們不需要靠近，把 0 算進來會
+          把攻擊距離壓成 1 格，怪還沒進範圍就不打了。
         """
         out = [r for r in (skills.range_of(self.skills.get(vk) or 0)
-                           for vk in self.vks) if r is not None]
+                           for vk in self.vks) if r]
         return min(out) if out else None
 
     @property
@@ -593,10 +596,19 @@ class KeyWorker(_Paced):
             struck = False
             if now >= self._next_strike:
                 if (mode == MODE_PACKET and packets and skill and eid
-                        and mover is not None
-                        and quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS):
-                    struck = quickbar.use(mover, self.sc,
-                                          vk - quickbar.VK_F1, self._page)
+                        and mover is not None):
+                    # ★★ 依技能的「對象」分流（讀遊戲自己的資料表）：
+                    #   地面（爆彈狙擊、麻痺荊棘、瞬移術…856 個）→ 按鍵會跳出
+                    #     選範圍的游標、角色站著不動，所以**一定要送帶座標的
+                    #     施放封包**（使用者指出的）。
+                    #   其餘（角色／自己／隊伍／屍體）→ 叫遊戲的快捷鍵，
+                    #     技能才會真的放出來（自送封包只打得出普攻，MP 不扣）。
+                    if skills.is_ground(skill):
+                        struck = attack.cast_at(mover, skill, eid, *pos)
+                    elif (quickbar.VK_F1 <= vk
+                            < quickbar.VK_F1 + quickbar.SLOTS):
+                        struck = quickbar.use(mover, self.sc,
+                                              vk - quickbar.VK_F1, self._page)
                 if struck:
                     self._next_strike = now + STRIKE_GAP
             if not struck and now >= self._next_key:
