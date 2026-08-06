@@ -193,6 +193,29 @@ def open_shop(mover, group: int) -> bool:
     return attack._send(mover, ((attack.SELECT_FN, (OPEN_CODE, group)),))
 
 
+def close_window(mover, scanner) -> tuple[bool, str]:
+    """關掉兌換商店視窗（送了開商店那包之後客戶端會自己開起來）。
+
+    叫遊戲自己的 `CreateExchangeWnd` —— 它是**開關**：
+
+        if window.isexist(WND_EXCHANGE) then destroy; WND_EXCHANGE = 0; return
+        else 建一個新的
+
+    ⚠⚠ 所以**一定要先確認 WND_EXCHANGE 不是 0**，不然會反而開出一個空視窗。
+      這裡先用 `lua.get_global` 讀那個全域，是 0 就什麼都不做。
+
+    ⚠ 碰 UI 要小心（[[jumpmap-teleport]] 記過：查那類視窗的清單內容 4/4 卡死）。
+      這支**只叫遊戲自己的開關函式**、不查詢任何清單，等於替使用者按一下
+      那顆按鈕；關不掉也只是視窗留著，不影響已經送出的兌換。
+    """
+    from app.game import lua
+    handle = lua.get_global(mover, scanner, "WND_EXCHANGE")
+    if not handle:
+        return False, "視窗沒開著"
+    ok, val = lua.call(mover, scanner, "CreateExchangeWnd")
+    return (True, "") if ok else (False, str(val))
+
+
 def confirm(mover, scanner, entry_id: int, times: int) -> tuple[bool, str]:
     """送出兌換：`entry_id` 換 `times` 次。回傳 (送出了嗎, 說明)。
 
