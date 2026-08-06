@@ -253,8 +253,11 @@ LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密�
 # 掛機中多久重讀一次快捷欄（quickbar.Reader）——使用者中途換鍵上的技能，
 # 最慢這麼久就跟上。純讀零副作用，一次只有幾個小讀取（頁碼節點有快取）。
 QB_REFRESH = 2.0
-# 交戰心跳（attack.heartbeat）的間隔。官方掛實攔是 0.4~0.6 秒一發。
-BEAT_GAP = 0.5
+# ★★ 出手間隔。出手是叫遊戲自己的「用快捷鍵」（quickbar.use），遊戲本來就有
+#   技能冷卻（破甲劈擊後置 1 秒），叫更密只是白佔跳板 —— 而跳板呼叫越密
+#   越容易踩到「掛久了遊戲當機」那組坑。官方掛實攔也是 0.6~1 秒一次。
+#   0.5 秒：夠即時（冷卻一好就出手），又比舊的封包狂送少 20 倍呼叫。
+STRIKE_GAP = 0.5
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
 #   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
 #   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
@@ -384,11 +387,13 @@ class KeyWorker(_Paced):
     綁在一起的話，任何一次記憶體操作變慢都會拖到節奏（使用者感受到的
     「施放速度卡卡的」）。拆開之後這條執行緒永遠只做一件事：到點就發一次。
 
-    兩種發動方式
-    ------------
-    ① **送技能鍵**（一定做得到，不需要注入）
-    ② **直接送封包**（attack.select 一次 + attack.strike 重複）
-       —— 需要技能 ID 和 Mover
+    ★★★ 出手＝叫遊戲自己的「用快捷鍵」（quickbar.use，等同按 F2）。
+    ⚠⚠ **不要改回自己送施放封包**：那樣只打得出普攻 —— 實測 MP 一格不扣
+      （破甲劈擊Ⅳ 該扣 25），血量掉的量是武器普攻；改叫遊戲那支之後 MP
+      正好扣 25、兩次呼叫就打死一隻。同場 60 秒：封包 9 隻／快捷鍵 18 隻
+      （官方掛 11 隻）。
+    退路：快捷欄叫不動（改版位移／視窗還沒建）就送鍵（_send_scan），
+    一樣是遊戲自己出手。attack.select 仍要送一次，讓伺服器知道我們選了誰。
 
     ★ 技能直接讀快捷欄（app/game/quickbar.py）：使用者勾幾個 F 鍵，這裡把
       每個鍵解析成技能 ID、照 F1→F12 的順序**輪流施放**。空格、放物品的格
@@ -424,7 +429,9 @@ class KeyWorker(_Paced):
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
-        self._next_beat = 0.0       # 下一次交戰心跳（attack.heartbeat）的時間
+        self._next_strike = 0.0     # 下一次可以叫「用快捷鍵」的時間
+        self._next_key = 0.0        # 退路（送鍵）的節流
+        self._page = 0              # 快捷欄目前頁（開始掛機時讀一次）
         self._on = False
         self._learning = False
         self._next_learn = 0.0
@@ -486,6 +493,7 @@ class KeyWorker(_Paced):
         self._learning = False
         try:
             got = self._qb.skills(list(self.vks))
+            self._page = self._qb.page()       # 出手要指名頁＋格
         except Exception:                      # noqa: BLE001
             got = None
         self.qb_ok = got is not None
@@ -543,6 +551,7 @@ class KeyWorker(_Paced):
                 self._next_qb = now + QB_REFRESH
                 try:
                     got = self._qb.skills(vks)
+                    self._page = self._qb.page()   # 使用者中途翻頁也要跟上
                 except Exception:              # noqa: BLE001
                     got = None
                 self.qb_ok = got is not None
@@ -555,19 +564,11 @@ class KeyWorker(_Paced):
                 if not attack.select(mover, eid):
                     return                     # 這一拍先不打，下一拍再試
                 self._sel = eid
-            # ② 攻擊。封包模式送「動作 + 施放」，送不出去（或不是封包模式）
-            #    就退回狂按那個鍵。
-            #
-            # ⚠⚠⚠ `pf`（玩家物件 −8）一定要**當場重算**，不能用掃描時存的。
-            #   它是直接交給遊戲函式當 `this` 用的**裸指標**，遊戲會去解參考它
-            #   （attack.py 開頭就寫著「傳錯會當場讓遊戲崩潰」）。而玩家物件會
-            #   搬家：死亡重生、走傳送點、伺服器重連、官方精靈把人拉回城。
-            #   以前只有 `apply_scan()` 會更新它，而那是 GUI 執行緒的事 ——
-            #   掃描本身要 0.15~0.4 秒，GUI 又可能自己卡住零點幾秒，
-            #   這條執行緒 10Hz 照送，等於**拿已經被釋放的指標去叫遊戲函式好幾次**。
-            #   `pathfinder_this()` 是純讀取而且自己會驗證（沿著遊戲的管理表走，
-            #   再比對物件 ID），算不出來就回 None —— 那時寧可退回送鍵。
-            pf = move.pathfinder_this(self.sc) if mover is not None else None
+            # ② 攻擊：叫遊戲自己的「用快捷鍵」（見下面 quickbar.use 那段）。
+            # ⛔ 這裡以前要先算 `pf`（玩家物件 −8）當裸指標傳給施放函式 ——
+            #   現在整條路都由遊戲自己走，**不再把任何裸指標交給遊戲**，
+            #   那個最容易造成當機的破口（見 [[game-crash-root-causes]] 第②條）
+            #   就此消失。quickbar.use 用的 this 是快捷欄物件，它自己當場重驗。
             # ◎ 這一拍輪到哪個鍵：**只輪有技能的鍵**（空格／物品格不進循環，
             #   使用者指定 —— 也就不會誤按把藥吃掉）。
             #   快捷欄讀得到、但勾的鍵上一個技能都沒有 → 不出手（開始掛機時
@@ -582,19 +583,29 @@ class KeyWorker(_Paced):
             else:
                 vk = vks[self._rot % len(vks)]
                 skill = None
-            struck = (mode == MODE_PACKET and packets and skill
-                      and eid and pf and mover is not None
-                      and attack.strike(mover, pf, skill, eid, *pos))
-            if not struck:
+            # ★★★ 出手＝叫遊戲自己的「用快捷鍵」（quickbar.use，等同按 F2）。
+            #   ⚠⚠ 自己送施放封包**只打得出普攻**：實測 MP 一格不扣（破甲劈擊
+            #     該扣 25），傷害是武器普攻的量；改叫這支之後 MP 正好扣 25、
+            #     2 次呼叫 2 秒打死一隻。射程、冷卻、動作、封包全由遊戲處理。
+            #   ★ 節流到 STRIKE_GAP：遊戲本來就有冷卻，叫更密只是白佔跳板，
+            #     而跳板呼叫越密越容易踩到「掛久了遊戲當機」那組坑
+            #     （見 [[game-crash-root-causes]]）—— 從每秒 30 次降到 2 次。
+            struck = False
+            if now >= self._next_strike:
+                if (mode == MODE_PACKET and packets and skill and eid
+                        and mover is not None
+                        and quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS):
+                    struck = quickbar.use(mover, self.sc,
+                                          vk - quickbar.VK_F1, self._page)
+                if struck:
+                    self._next_strike = now + STRIKE_GAP
+            if not struck and now >= self._next_key:
+                # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵，
+                # 那是舊做法，一樣是遊戲自己出手。
+                self._next_key = now + STRIKE_GAP
                 _send_scan(self.hwnd, vk)
                 if self._learning:
                     self._learn(vk)            # 剛按過鍵，順手讀一下
-            # ◎ 交戰心跳（泛用 (5,0)）：官方掛交戰中每 0.4~0.6 秒一發、
-            #   換目標趕路時會停 —— 照抄它的節奏，有目標才送。
-            #   放在出手之後：心跳晚半拍沒差，出手節奏不能被它拖到。
-            if mover is not None and eid and now >= self._next_beat:
-                self._next_beat = now + BEAT_GAP
-                attack.heartbeat(mover)
             self._rot += 1
         except Exception:                      # noqa: BLE001
             pass

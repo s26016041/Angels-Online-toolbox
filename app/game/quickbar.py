@@ -45,6 +45,18 @@ from app.game import lua
 # ⚠ 遊戲改版會位移；locate.py 有 AOB 特徵（錨在 usequickkey 函式頭）會自動跟上。
 MGR_PTR = 0x009B66AC
 
+# ★★★「用快捷鍵」的本體 —— 等於使用者自己按 F2，遊戲會走完整流程：
+#   檢查射程與冷卻、扣 MP、播動作、送它自己那一整組封包。
+#   __thiscall：this = 快捷欄管理物件 [MGR_PTR]，參數 (格號, 頁, 0)。
+#   出處：Lua 綁定 usequickkey 0x58F2C9 取兩個 Lua 參數之後
+#         `push 0 / push esi(頁) / push eax(格) / call 0x5B87C5`（ecx=[MGR_PTR]）。
+# ⚠⚠ 參數順序是 (格號, 頁)，**不是 (頁, 格號)** —— 反過來實測完全沒反應
+#   （12 次呼叫、零傷害、MP 一格沒扣）。
+# ★ 為什麼要用它而不是自己送施放封包：自送封包**只會打出普攻**
+#   （實測 MP 一格不扣、傷害是武器普攻），而這支一次就扣 25 MP
+#   （破甲劈擊Ⅳ 的耗魔）、2 次呼叫 2 秒打死一隻。
+USE_FN = 0x005B87C5
+
 TABLE_OFF = 0x609C
 ENTRY_SIZE = 9
 PAGES = 4
@@ -141,6 +153,25 @@ def skill_on_vk(scanner, vk: int) -> int | None:
         return None
     cell = page[vk - VK_F1]
     return cell.value if cell is not None and cell.is_skill else None
+
+
+def use(mover, scanner, slot: int, page: int = 0) -> bool:
+    """按下快捷欄的某一格（等同使用者按 F1~F12）。成功排進指令槽回 True。
+
+    slot: 0~11（F1~F12）　page: 0~3
+    ★ 打誰由**遊戲自己**看目前選定的目標決定 —— 我們只要先把目標寫進
+      狀態物件（entity.set_target_id）就好。
+    ⚠ `this` 每次都當場重讀並驗證（[[game-crash-root-causes]] 的鐵則）：
+      快捷欄物件會因為換地圖／重連搬家，拿舊的去呼叫會讓遊戲當場崩潰。
+    ⚠ 遊戲有自己的冷卻，叫太密只是白叫（跟一直按 F2 一樣，不會出事，
+      但每一次呼叫都佔跳板，呼叫端請自己節流）。
+    """
+    if not (mover and mover.active and 0 <= slot < SLOTS and 0 <= page < PAGES):
+        return False
+    mgr = _manager(scanner)
+    if not mgr:
+        return False
+    return mover.call(USE_FN, slot, page, 0, ecx=mgr)
 
 
 def _key_matches(scanner, node_bytes: bytes, want: bytes) -> bool:
