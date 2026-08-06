@@ -35,6 +35,11 @@ RUN_FLAG = 0x009CFBA4        # 0 = 精靈執行中、-1 = 停止
 VAR_MGR_PTR = 0x0096E630
 
 RUN_ON, RUN_OFF = 0, -1
+# ★ `setrobotisrun` 動旗標之前會先看這個 byte（見 set_run 的反組譯筆記）：
+#   [ [ROBOT_MGR_PTR] + ROBOT_READY_OFF ] == 0 → 遊戲自己也不動旗標。
+#   ⚠ 這個管理物件跟快捷欄是同一個（quickbar.MGR_PTR），別各自寫死兩份。
+ROBOT_MGR_PTR = 0x009B66AC
+ROBOT_READY_OFF = 0xF35C
 
 # ---------------------------------------------------------------------------
 # ★★★ 直接從記憶體讀精靈的設定（不必呼叫 Lua）
@@ -233,13 +238,24 @@ def set_run(mover, scanner, on: bool) -> tuple[bool, object]:
       遊戲主執行緒自己的 UI Lua 會插隊，堆疊就此錯位。症狀正是使用者回報的
       「用了我們的自動戰鬥之後，去點精靈面板的勾選框，遊戲就崩潰」。
       `CreateRobotWindow` 更毒：開視窗會自己抽訊息 → 重入跳板。
-    ★ 現在只寫 `RUN_FLAG`（純記憶體）。行為完全一樣 ——
-      `game.setrobotisrun` 本來就只是寫這個旗標（見檔頭的反組譯筆記），
-      而遊戲判斷「精靈在不在跑」看的也是它。
+    ★ 現在只寫 `RUN_FLAG`（純記憶體）。**這跟遊戲自己做的一模一樣** ——
+      反組譯 `setrobotisrun`（0x5976B8）：
+          ecx = [0x9B66AC]
+          al  = *(byte*)(ecx + ROBOT_READY_OFF)      ← 沒準備好就什麼都不做
+          al ? (on ? 0x54D81E : 0x54D813) : 直接 ret
+          0x54D81E: mov [0x9CFBA4], 0     ← RUN_ON
+          0x54D813: mov [0x9CFBA4], -1    ← RUN_OFF
+      也就是說整支函式的作用就是寫這個旗標，沒有別的副作用。
+    ⚠ 那個 guard 我們也照做：它是 0 的時候遊戲自己也不會動旗標，
+      我們硬寫只會讓「開了」變成假象。
     ⚠ 代價：**面板上的勾選框可能顯示成舊的**（那是遊戲自己畫的），
       重開面板就會對。這是刻意的取捨 —— 顯示不同步只是看起來怪，
       去戳它卻會讓遊戲崩潰。
     """
+    mgr = _u32(scanner, ROBOT_MGR_PTR)
+    ready = scanner._read_bytes(mgr + ROBOT_READY_OFF, 1) if mgr else None
+    if not ready or not ready[0]:
+        return False, "精靈子系統還沒準備好（遊戲自己這時也不會動旗標）"
     try:
         scanner.write_value(RUN_FLAG, VALUE_TYPES["int32"],
                             RUN_ON if on else RUN_OFF)
@@ -284,8 +300,15 @@ def _write_var(scanner, data_id: int, want_type: int, value: int) -> bool:
     raw = scanner._read_bytes(rec + _V_TYPE, 4)
     if not raw or raw[0] != want_type:
         return False                       # 型別不對就別亂寫
+    # ⚠⚠ **寬度要跟遊戲一模一樣**（反組譯 setrobotvar_bool → 0x54EEA4）：
+    #   bool 是 `mov byte [rec+0xC], bl` —— **只有 1 個 byte**。
+    #   寫成 4 bytes 會一併蓋掉 +0xD~+0xF，那不是我們的地盤。
+    #   int 的 getter 是 `mov eax,[rec+0xC]`，才是 4 bytes。
+    vt = VALUE_TYPES["int8" if want_type == VAR_T_BOOL else "int32"]
     try:
-        scanner.write_value(rec + _V_VALUE, VALUE_TYPES["int32"], int(value))
+        scanner.write_value(rec + _V_VALUE, vt,
+                            (1 if value else 0) if want_type == VAR_T_BOOL
+                            else int(value))
     except Exception:                                      # noqa: BLE001
         return False
     return _read_var(scanner, data_id, want_type) == (
