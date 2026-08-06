@@ -26,10 +26,111 @@ import time
 
 from app.game import itemname, lua
 
-# ⚠ 這個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
+# ⚠ 這兩個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 RUN_FLAG = 0x009CFBA4        # 0 = 精靈執行中、-1 = 停止
+# 精靈設定的單例（見下面「直接讀記憶體」那一段）
+VAR_MGR_PTR = 0x0096E630
 
 RUN_ON, RUN_OFF = 0, -1
+
+# ---------------------------------------------------------------------------
+# ★★★ 直接從記憶體讀精靈的設定（不必呼叫 Lua）
+# ---------------------------------------------------------------------------
+# 2026-08-06 反組譯 `getrobotvar_int` / `getrobotvar_bool` 得到（工具：
+# `tools/find_robot_vars.py`）。以前每讀一個設定要三趟跳板往返去跑 Lua，
+# 讀 10 個就是 30 趟、零點幾秒，而且全程在畫面執行緒上等 —— 現在是純讀取。
+#
+#   getrobotvar_int(L):
+#       eax = 0x54E068(0)            ← 取設定管理員單例 = [VAR_MGR_PTR]
+#       eax = 0x54E1D4(this=單例, DATAID)   __thiscall, ret 4
+#
+#   0x54E1D4:
+#       lea esi,[ecx+4]              ← 單例 +4 就是那個 map
+#       call 0x54D8E5                ← map.find(&DATAID)
+#       cmp eax,[esi] / je 找不到    ← 跟 [map+0]（頭節點）比 = 沒找到
+#       mov eax,[eax+0x14]           ← 節點 +0x14 = 值記錄的指標
+#       cmp byte [eax+8],1 / jne 0   ← 值記錄 +8 = 型別（1=int）
+#       mov eax,[eax+0xC]            ← 值記錄 +0xC = 值
+#   讀 bool 的 0x54E179 一模一樣，只差型別要 **2**、值取 1 個 byte。
+#
+# 那是一棵 MSVC 的 std::map 紅黑樹，節點版面：
+#       +0x00 左  +0x04 父  +0x08 右  +0x0C 顏色  +0x0D 是不是哨兵
+#       +0x10 鍵(DATAID, int32)      +0x14 值記錄指標
+#   map 物件：+0x00 頭節點(哨兵)、+0x04 筆數。根 = 哨兵的「父」。
+#
+# ✅ 實測（雅典娜-4，116 筆設定）：讀出來的值跟先前用 Lua 讀到的完全一致
+#    —— HP藥水1 = 道具 4836（高效紅藥水(活動)）、MP藥水1 = 道具 4837、
+#    裝備損壞回城 = True、回城後修理裝備 = True。
+VAR_T_INT, VAR_T_BOOL = 1, 2
+_N_LEFT, _N_PARENT, _N_RIGHT = 0x00, 0x04, 0x08
+_N_ISNIL, _N_KEY, _N_VAL = 0x0D, 0x10, 0x14
+_V_TYPE, _V_VALUE = 0x08, 0x0C
+_TREE_MAX_DEPTH = 48         # 116 筆的紅黑樹頂多十幾層，48 是給爛資料的煞車
+
+
+def _u32(scanner, addr: int):
+    raw = scanner._read_bytes(addr, 4)
+    return struct.unpack("<I", raw)[0] if raw else None
+
+
+_MISSING = object()          # 樹讀得到，但裡面沒有這個設定（遊戲會回 0）
+
+
+def _find_var(scanner, data_id: int):
+    """照遊戲自己的做法在紅黑樹裡二分找。
+
+    回傳「值記錄」的位址、`_MISSING`（樹是好的但沒這一筆）、
+    或 `None`（**整條路走不通** —— 位址失效、改版、遊戲還沒載完）。
+    這三者要分清楚：只有 None 才該退回 Lua；`_MISSING` 要跟遊戲一樣回 0。
+    ⚠ 全程只讀不寫。
+    """
+    mgr = _u32(scanner, VAR_MGR_PTR)
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000:
+        return None
+    head = _u32(scanner, mgr + 4)
+    if not head or not 0x10000 < head < 0x7FFF0000:
+        return None
+    node = _u32(scanner, head + _N_PARENT)          # 根 = 哨兵的父
+    if node is None:
+        return None
+    for _ in range(_TREE_MAX_DEPTH):
+        if not 0x10000 < node < 0x7FFF0000:
+            return None
+        # ★ 整個節點一次讀完（0x18 bytes）：左/右/哨兵旗標/鍵/值都在裡面。
+        #   分開讀是每一層三次系統呼叫，這樣是一次。
+        raw = scanner._read_bytes(node, _N_VAL + 4)
+        if not raw:
+            return None
+        if raw[_N_ISNIL]:
+            return _MISSING                         # 走到哨兵 = 沒這個設定
+        key, val = struct.unpack_from("<iI", raw, _N_KEY)
+        if data_id == key:
+            return val if 0x10000 < val < 0x7FFF0000 else _MISSING
+        node = struct.unpack_from(
+            "<I", raw, _N_LEFT if data_id < key else _N_RIGHT)[0]
+    return None                                     # 太深 = 資料不對，別再走
+
+
+def _read_var(scanner, data_id: int, want_type: int):
+    """讀一個設定。**行為跟遊戲的 getrobotvar_* 完全一樣**：
+
+    · 有這一筆而且型別對 → 值
+    · 沒這一筆、或型別不對 → 0 / False（反組譯裡就是 `xor eax,eax`）
+    · **整棵樹讀不到** → None，呼叫端要退回 Lua
+    """
+    rec = _find_var(scanner, data_id)
+    if rec is None:
+        return None
+    zero = False if want_type == VAR_T_BOOL else 0
+    if rec is _MISSING:
+        return zero
+    raw = scanner._read_bytes(rec + _V_TYPE, 8)     # 型別(4) + 值(4)
+    if not raw:
+        return None
+    if raw[0] != want_type:
+        return zero                                 # 型別不對 → 跟遊戲一樣回 0
+    value = struct.unpack("<i", raw[4:8])[0]
+    return bool(value & 0xFF) if want_type == VAR_T_BOOL else value
 
 # ★★ 兩段等待都是使用者實測調出來的，**不要為了「快一點」去縮**。
 #   ⓐ 開關調好之後要**等一下再回程**：太快送回程，精靈那邊還沒進入狀態，
@@ -133,7 +234,14 @@ def set_run(mover, scanner, on: bool) -> tuple[bool, object]:
 
 
 def get_bool(mover, scanner, var_id: int) -> tuple[bool, object]:
-    """讀精靈的一個布林設定。"""
+    """讀精靈的一個布林設定。
+
+    ★ **先直接讀記憶體**（微秒、純讀取）；讀不到才退回 Lua。
+      Lua 那條要三趟跳板往返、在畫面執行緒上等，而且會動遊戲的 Lua 堆疊。
+    """
+    got = _read_var(scanner, var_id, VAR_T_BOOL)
+    if got is not None:
+        return True, got
     return lua.call(mover, scanner, "game.getrobotvar_bool", var_id)
 
 
@@ -193,7 +301,14 @@ def end_supply(mover, scanner) -> None:
 
 
 def get_int(mover, scanner, var_id: int) -> int | None:
-    """讀精靈的一個整數設定。"""
+    """讀精靈的一個整數設定。
+
+    ★ **先直接讀記憶體**（微秒、純讀取）；讀不到才退回 Lua。
+      藥水設定一次要讀 10 個，走 Lua 就是 30 趟跳板往返、零點幾秒的畫面卡頓。
+    """
+    got = _read_var(scanner, var_id, VAR_T_INT)
+    if got is not None:
+        return got
     ok, val = lua.call(mover, scanner, "game.getrobotvar_int", var_id)
     return int(val) if ok and isinstance(val, (int, float)) else None
 
@@ -225,6 +340,20 @@ def potion_slots(mover, scanner, pid: int, force: bool = False) -> dict:
 
     回傳 {DATAID: (型別, 值)}；任何一個讀失敗就整份不快取（下次再試）。
     """
+    # ★★ 先試純記憶體：全部讀到就直接用 —— **連快取都不需要**，
+    #   因為那是 0.3ms 的純讀取。這樣設定改了我們下一拍就知道，
+    #   比以前的「快取 60 秒」還準，而且完全不碰遊戲的 Lua。
+    fast = {}
+    for base in HP_ITEM_SLOTS + MP_ITEM_SLOTS:
+        kind = _read_var(scanner, base, VAR_T_INT)
+        val = _read_var(scanner, base + SKILLITEM_VALUE_DIFF, VAR_T_INT)
+        if kind is None or val is None:
+            fast = None
+            break                        # 樹讀不到 → 退回底下的 Lua 路徑
+        fast[base] = (kind, val)
+    if fast:
+        return fast
+
     now = time.time()
     hit = _slot_cache.get(pid)
     if hit and not force and now - hit[0] < SLOT_CACHE_SECS:

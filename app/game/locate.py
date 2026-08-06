@@ -137,6 +137,13 @@ SIGS: tuple[Sig, ...] = (
     #    項目餵給自我監察。要復活的話特徵是：
     #    "68 88 8E 7D 00 E8 ?? ?? ?? ?? 83 C4 0C C3 FF 71 0C 0F B6 41 08 50 FF 71 04"
     #    imm_at=1、2026-08-04 的值 0x007D8E88。
+    # 精靈設定的單例（那棵 std::map 掛在它 +4）。特徵取自
+    # `0x54E068` 裡「還沒建就 new 一個」那段：`mov eax,[單例] / test / jne /
+    # push 0x50 / call new …`。已驗證在模組內唯一。
+    Sig("robot", "VAR_MGR_PTR", "data", 1,
+        "A1 ?? ?? ?? ?? 85 C0 75 ?? 6A 50 E8 ?? ?? ?? ?? 59 8B C8 89 4D 08 "
+        "33 C0 89 45 FC 85 C9",
+        0x0096E630),
     Sig("player", "VTABLE_RVA", "data", 6,
         "C7 87 68 CB 00 00 1C 3E 7E 00 8D 8F 80 F2 00 00 C6 45 FC 24 E8 ?? ?? ?? ??",
         0x007E3E1C, as_rva=True),
