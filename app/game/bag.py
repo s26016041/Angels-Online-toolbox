@@ -67,10 +67,23 @@ ITEM_DURA = 0x2C            # 耐久現值；0 = 沒耐久這回事，或是壞�
 ITEM_TMPL = 0x58            # 指向這種物品的範本
 ITEM_SPAN = 0x5C            # 一次要讀多少 bytes 才涵蓋上面全部
 
-TMPL_KIND = 0x18            # 分類代號（裝備各部位是 2~14，藥水是 0）
+TMPL_KIND = 0x18            # 分類代號（1:1 對到 item.xml 的「物品類別」，見下）
+TMPL_DURA_MAX = 0xDC        # ★ 耐久上限；> 0 ＝ 這是裝備／武器
 TMPL_PRICE = 0x104          # 售價；<= 0 = 這東西賣不掉
 TMPL_GRADE = 0x130          # ★ 品質（白／藍／橘），見 GRADE_NAMES
 TMPL_SPAN = 0x134
+
+# ★★ 「這是不是裝備／武器」＝ 範本 +0xDC（耐久上限）> 0。
+# ✅ 拿 `setting/base/item*.xml` 的「耐久」欄整張對帳：**32476 筆 100.00% 吻合**
+#   （其他候選欄位最高只有 78%）。
+# ⚠ **不可以用物品自己的 +0x2C（耐久現值）來判斷**：壞掉的裝備現值是 0，
+#   跟藥水分不出來 —— 而壞掉的白裝正是最該賣掉的東西。
+# 實測旁證：技能經驗球(分類 69)、座騎(25)、扭蛋(33)、藥水(0) 的上限都是 0，
+#          頭飾 60、杖 70、背包 40 —— 該進的進、該擋的擋。
+# 分類代號（+0x18）1:1 對到 item.xml 的物品類別，裝備／武器落在：
+#   2 頭飾 3 衣服 4 手套 5 鞋子 6 飾品 7 背包 8 披風
+#   9 劍 10 刀 11 斧 12 錘 13 槍 14 杖 15 弓箭 16 彈弓 17 盾
+# （這裡沒用分類判斷，記著是為了看得懂數字。）
 # ⚠ 遊戲算單價其實有兩條分支（`0x602391` / `0x602457`）：
 #   `0x5533CC` 只有在**分類代號是 26 或 27、而且 +0x14 的 bit 28 有立**時才回真，
 #   那條會把單價乘上「數量 ÷ [0x7D9008 + 分類*4]」（寵物飼料那類）。
@@ -82,6 +95,9 @@ TMPL_SPAN = 0x134
 # 0~11 是身上穿的、12~19 是空的裝備格 —— **都不在這個範圍內，所以不會被賣掉**。
 FIRST_SLOT = 0x14
 LAST_SLOT = 0xA9
+
+GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）
+GOLD_TYPE = 1              # 金幣的種類 ID
 
 _MAX_SLOTS = 4096           # 容器格數的合理上限（實測 743）
 
@@ -123,6 +139,7 @@ class Item:
     kind: int               # 範本的分類代號
     price: int              # 單價；<= 0 = 賣不掉
     grade: int              # 品質，見 GRADE_NAMES
+    dura_max: int           # 耐久上限；> 0 = 這是裝備／武器
 
     @property
     def name(self) -> str:
@@ -139,12 +156,13 @@ class Item:
 
     @property
     def is_gear(self) -> bool:
-        """看起來是裝備（有耐久的東西）。
+        """是不是裝備／武器。看**耐久上限**，不是現值 —— 壞掉的裝備也算。"""
+        return self.dura_max > 0
 
-        ⚠ 只拿來當畫面上的「一鍵勾裝備」用，不當安全條件 ——
-          真正決定賣什麼的是使用者勾了哪幾列。
-        """
-        return self.dura > 0
+    @property
+    def broken(self) -> bool:
+        """裝備但耐久歸零（＝壞了）。"""
+        return self.is_gear and self.dura <= 0
 
 
 def _u32(scanner, addr: int) -> int:
@@ -222,7 +240,7 @@ def items(scanner, first: int = FIRST_SLOT,
         count_ = struct.unpack_from("<H", b, ITEM_COUNT)[0]
         dura = struct.unpack_from("<I", b, ITEM_DURA)[0]
         tmpl = struct.unpack_from("<I", b, ITEM_TMPL)[0]
-        kind, price, grade = tmpl_cache.get(tmpl, (0, 0, 0))
+        kind, price, grade, dmax = tmpl_cache.get(tmpl, (0, 0, 0, 0))
         if tmpl and tmpl not in tmpl_cache:
             traw = scanner._read_bytes(tmpl, TMPL_SPAN)
             if traw:
@@ -230,8 +248,39 @@ def items(scanner, first: int = FIRST_SLOT,
                 kind = struct.unpack_from("<I", tb, TMPL_KIND)[0]
                 price = struct.unpack_from("<i", tb, TMPL_PRICE)[0]
                 grade = struct.unpack_from("<I", tb, TMPL_GRADE)[0]
-            tmpl_cache[tmpl] = (kind, price, grade)
+                dmax = struct.unpack_from("<I", tb, TMPL_DURA_MAX)[0]
+            tmpl_cache[tmpl] = (kind, price, grade, dmax)
         out.append(Item(slot=lo + offset, serial=serial, stamp=stamp,
                         type_id=type_id, count=count_, dura=dura,
-                        kind=kind, price=price, grade=grade))
+                        kind=kind, price=price, grade=grade, dura_max=dmax))
     return out
+
+
+def gold(scanner) -> int | None:
+    """身上的金幣；讀不到回 None。
+
+    ★ 金幣就是**背包第 0 格的那個物品**（種類 1），數量欄 `+0x27` 當 u32 讀 ——
+      這是遊戲自己的做法：`0x508C24` = `ecx += 0x2FC; 取第 0 格; return [它+0x27]`。
+      五台分身跟 `player.read().gold` 逐一對照，完全一致。
+    ⚠ 用這條而不是 `player.locate()`：那支要全記憶體掃描（每台 0.4~1 秒），
+      這條只要兩次讀取，而且背包本來就已經定位好了。
+    """
+    got = head(scanner)
+    if got is None:
+        return None
+    begin, count = got
+    if count < 1:
+        return None
+    raw = scanner._read_bytes(begin, 4)
+    if not raw:
+        return None
+    ptr = struct.unpack("<I", bytes(raw))[0]
+    if not ptr:
+        return 0
+    blob = scanner._read_bytes(ptr, ITEM_SPAN)
+    if not blob:
+        return None
+    b = bytes(blob)
+    if struct.unpack_from("<I", b, ITEM_TYPE)[0] != GOLD_TYPE:
+        return None                      # 第 0 格不是金幣 → 版面變了，不猜
+    return struct.unpack_from("<I", b, ITEM_COUNT)[0]
