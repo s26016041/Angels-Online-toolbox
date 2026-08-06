@@ -188,6 +188,18 @@ STUCK_ENGAGED = 15.0
 # ⚠ 2.0 太小：實拍到角色在 (88.5,40.5) 與 (90.5,42.5) 之間來回，
 #   相距 2.8 格，錨點一直被重設，卡了 35 秒還是沒觸發。
 STUCK_EPS = 4.0
+# ★★ 交戰零傷害快篩（使用者指定 4 秒）：「打得到＋選定已送出」卻從鎖定起
+#   一滴血都沒看牠掉過 → 那個「打得到」是假的，直接換怪，不等 15 秒耐心。
+#   實拍（黑狐 02:10）：隔著地形站 10.8 格，射程 12 判定打得到，
+#   15 秒約 150 發零傷害呆站 —— 尋路的「直線可通」問的是**走路**，
+#   技能被不被地形擋線是伺服器說了算，我們讀不到；唯一可靠的訊號是血。
+# ⚠ 「3 格外才觸發」是雪狐的保命條件：近戰貼身打高 9~11 級的怪，
+#   開場連空揮 4 秒真的會發生（命中率低）；貼身不存在擋線問題，
+#   交給 15 秒的交戰耐心處理就好。
+# ⚠ 冷卻用短的 NOHP_MEMORY：這不是「走不到」，用遞增冷卻 8 秒後
+#   牠又被挑回來，同個位置重演（02:10 那次就被誤記成走不到 ×1）。
+NOHIT_SECS = 4.0
+NOHIT_RANGE = 3.0
 # ★★ 「走不到」的冷卻，**會遞增**。有兩種完全不同的走不到，一個數字擋不住：
 #
 #   · 暫時的 —— 角色站的地方剛好算不出那個方向。換個位置就好了。
@@ -265,8 +277,8 @@ STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 QUICKKEY_RANGE = 8
 # ★★ 走快捷鍵那條路時，我們只走到這個距離就停手，剩下讓**遊戲自己走過去**
 #   （實測：站 9.8 格只呼叫快捷鍵，角色自走 8.5 格貼到 1.4 格並擊殺）。
-#   取 12 = 我們的「打得到」判定門檻，配上 margin 2 格 → 實際停在 10 格，
-#   正好是使用者要的「一律走到 10 格」。
+#   取 12 = 我們的「打得到」判定門檻，配上 margin 3 格 → 實際停在 9 格
+#  （使用者 2026-08-07 從 10 改成 9，配合零傷害快篩一起下的決定）。
 HANDOFF_RANGE = 12.0
 # 交棒之後這麼久還沒真的接戰（還在技能射程外、也沒掉過血）就收回來自己走。
 HANDOFF_WAIT = 3.0
@@ -289,7 +301,7 @@ NO_PATH_NEED = 3.0
 #   （射程 2 → 停 2.0、超過 3.0 才走）再多一格餘裕。
 NEAR_WALK = 4.0
 # ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
-#   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
+#   遠程角色維持原本的判斷（攻擊距離 12、走到 9 格內）。
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
 #   —— 實測雪狐就是這樣完全打不到怪。
 MELEE_RANGE = 2.0
@@ -1073,6 +1085,7 @@ class CharFarmPage(QWidget):
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._unreach = 0          # 連續幾次尋路算不出路徑
         self._hurt = False         # 這隻有沒有被我們打傷過
+        self._nohit_t = 0.0        # 交戰中連續多久零傷害（見 NOHIT_SECS）
         self._handoff_fail = False  # 這隻「交棒給客戶端走」失敗過了嗎
         self._handoff_t = 0.0      # 交棒之後多久沒真的接戰
         self._near_fail = 0        # 近距離直線走連續幾次沒位移（撞牆偵測）
@@ -2416,7 +2429,7 @@ class CharFarmPage(QWidget):
                    or (self._path_pts <= 1 and self._near_fail < 2))
         if gd < NEAR_WALK and near_ok:
             # ⚠⚠ **被貼身時只站開到 1.8 格，不可以退回 keep**。
-            #   法師的 keep 是 10 格 —— 退回去等於放風箏，而且退的途中
+            #   法師的 keep 是 9 格 —— 退回去等於放風箏，而且退的途中
             #   一直在射程邊緣進進出出（使用者回報「超出射程還在放技能」）。
             #   1.8 = MIN_GAP + SLACK，正是遊戲內建掛機維持的 1.4~1.8。
             want = (min(keep, move.MIN_GAP + move.SLACK)
@@ -2734,6 +2747,7 @@ class CharFarmPage(QWidget):
         self._way = []
         self._unreach = 0
         self._hurt = False
+        self._nohit_t = 0.0
         self._handoff_fail = False   # 這一隻的「交棒給客戶端」失敗過了嗎
         self._handoff_t = 0.0
         self._near_fail = 0          # 換目標就重算「近距離直線走」的失敗次數
@@ -3180,7 +3194,7 @@ class CharFarmPage(QWidget):
         #   短射程技能走的是「叫遊戲的快捷鍵」那條路，而**遊戲自己會走過去**：
         #   實測雪狐站 9.8 格、我們一步移動指令都沒下，只呼叫快捷鍵 ——
         #   角色自己走了 8.5 格、貼到 1.4 格、把怪打死（血 100→0）。
-        #   所以近戰不必由我們貼到 1.4 格：走到 10 格就停手，剩下讓遊戲走。
+        #   所以近戰不必由我們貼到 1.4 格：走到 9 格就停手，剩下讓遊戲走。
         #   好處是不再跟客戶端搶走位（那正是「卡在 2.2 格」「卡進怪身體」的來源）。
         # ⚠ memory 有一條「補按技能鍵讓角色接近會打架」——那是**同時還在下
         #   我們自己的移動指令**時的結論。只讓客戶端走就很順，兩邊一起走才會卡。
@@ -3208,9 +3222,11 @@ class CharFarmPage(QWidget):
         # ⚠⚠ 餘裕要夠大（使用者指出的）：停在 reach−1（法師 11、射程 12）
         #   等於**站在射程邊緣**，怪往外走一步就出界 —— 那一瞬間我們還在送
         #   施放，就是「超出射程還在放技能」，而且會一直重走、很卡。
-        #   遠程留 2 格（法師停 10）、近戰留 0.6 格（射程 1 → reach 2.0 → 停 1.4，
+        #   遠程留 3 格（法師停 9，使用者 2026-08-07 從停 10 改的 ——
+        #   實拍 10.8 格被地形擋線呆站，離怪近一格能少踩到「數字上打得到、
+        #   實際被擋」的邊緣）、近戰留 0.6 格（射程 1 → reach 2.0 → 停 1.4，
         #   再多留就進不了近戰射程了）。下限 MIN_GAP：更近會卡進怪的身體。
-        margin = 2.0 if reach >= 6.0 else 0.6
+        margin = 3.0 if reach >= 6.0 else 0.6
         keep = (MELEE_RANGE if blocked
                 else min(max(reach - margin, move.MIN_GAP), reach - 0.5))
 
@@ -3266,7 +3282,7 @@ class CharFarmPage(QWidget):
         #   以 reach−0.5 當界線，怪走到射程邊緣前 0.5 格我們就動身，
         #   才不會出現「已經打不到了卻還站著送封包」（使用者指出的症狀）。
         #   近戰 reach 2.0、停 1.4 → 容差 0.3（超過 1.7 就走）
-        #   法師 reach 12、停 10  → 容差 1.5（超過 11.5 就走，仍在射程內）
+        #   法師 reach 12、停 9  → 容差 1.5（超過 10.5 就走，仍在射程內）
         slack = min(WALK_SLACK, max(0.3, reach - 0.5 - gkeep))
         need_walk = gd is not None and (
             gd > gkeep + slack or (not in_range and gd > gkeep)
@@ -3366,6 +3382,26 @@ class CharFarmPage(QWidget):
         else:
             self._stuck += dt
         self._last_hp = hp
+        # ★★ 零傷害快篩（使用者指定，見 NOHIT_SECS 的說明）。
+        #   放在 15 秒耐心之前：符合條件的話 4 秒就換，不陪它耗。
+        if (in_range and self._keys.selected and not self._hurt
+                and dist is not None and dist > NOHIT_RANGE):
+            self._nohit_t += dt
+        else:
+            self._nohit_t = 0.0
+        if self._nohit_t >= NOHIT_SECS:
+            self._killed[m.eid] = time.monotonic() + NOHP_MEMORY
+            self._atk.hold_off()
+            self._cur = None
+            self._keys.eid = None
+            if not self._pick_next():
+                self._keys.set_on(False)
+                self._since_scan = RESCAN_GAP
+            self.status.setText(
+                f"「{m.name}」{NOHIT_SECS:.0f} 秒零傷害（打不到？）→ 換一隻")
+            self._dbg(f"零傷害放棄「{m.name}」eid={m.eid:#x}：交戰 "
+                      f"{NOHIT_SECS:.0f} 秒血沒掉過（距離 {dist:.1f} 格）")
+            return
         # ★★ 「沒進展」要等多久才放棄，**打得到的時候要有耐心**。
         #   STUCK_SECS(10 秒) 是為「走不過去」設計的；套在交戰上剛好是災難：
         #   等級差得多時命中率低，一隻要打十幾秒才會倒 —— 實測（雪狐 82 級
