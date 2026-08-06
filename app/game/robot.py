@@ -1,6 +1,7 @@
 """官方外掛「天使守護精靈」的開關與設定 —— 全部透過遊戲自己的 Lua 呼叫。
 
     robot.is_run(sc)                    # 天使守護精靈開著嗎
+    robot.apply_prefs(mover, sc, ...)   # 照掛機分頁的勾選把精靈調成該有的樣子
     robot.begin_supply(mover, sc)               # ① 調好開關（等 SETUP_SETTLE 秒）
     robot.do_recall(mover, sc, 背包表頭)         # ② 回程 → 補給開跑
     robot.end_supply(mover, sc)         # 收尾（只關自動攻擊）
@@ -14,7 +15,8 @@
 所以分工是：**打怪是我們的掛機，補給那一趟交給精靈。**
 
 「精靈開著沒」＝ `RUN_FLAG`（0 = 開、-1 = 關），就是 `game.setrobotisrun`
-寫的那個全域。**我們只讀不寫** —— 主開關由使用者自己在遊戲裡開。
+寫的那個全域。**開始自動戰鬥時會自動把主開關開起來**（使用者要求，
+見 `apply_prefs`）；除此之外只讀不寫。
 
 ⚠ 精靈的補給設定（要買什麼、回城道具放哪一格）**要使用者自己在遊戲裡設好**，
   我們只負責在對的時機湊齊觸發條件。
@@ -158,6 +160,19 @@ AS_IS_REPAIR = 1508          # ★ 回城後修理裝備
 AS_USE_RETURN_SCROLL = 1509
 AS_IS_BUY_ITEM = 1511        # 購買物品保持身上數量（⚠ 這**不是**回城觸發條件）
 
+# ★「輔助」頁的陣亡自動復活。DATAID 從遊戲的 Lua 全域常數純讀出來
+#   （DATAID_AUTO_RESURRECTION_CHECK / _MODE），「復活方式」的值意義是把
+#   `ResurrectionSelected` 的 bytecode 反組譯確認的：
+#     settitle(getstring(1955 + 列號)) → setrobotvar_int(2102, 列號)
+#   —— 值就是下拉選單的列號，而三列的字串是 1955 靈魂、1956 回城、1957 原地。
+#   （五台分身實測都設在 2100=True、2102=1，跟畫面顯示「回城」互相印證。）
+AS_AUTO_REVIVE = 2100        # 陣亡時自動復活（bool）
+AS_REVIVE_MODE = 2102        # 復活方式（int，值 = 下拉列號）
+REVIVE_SOUL, REVIVE_RECALL, REVIVE_SPOT = 0, 1, 2   # 靈魂／回城／原地
+# 畫面同步用的勾選框控制項 id（XML 裡的固定值，不是執行期代號）
+SUPPLY_SCROLL_CHECK_ID = 10073   # 補給頁「使用標記傳送捲軸回練功點」
+REVIVE_CHECK_ID = 14100          # 輔助頁「陣亡時自動復活」
+
 # ★★ 補血／補魔藥水設在「天使輔助精靈」那一頁，用 DATAID 存（也是 robot var）。
 #   每一格是一對：`DATAID` 放**型別**、`DATAID + 10` 放**值**。
 #     型別 1 = 技能（用技能補，不吃藥水）　型別 2 = 道具（值就是種類 ID）
@@ -253,6 +268,73 @@ def set_bool(mover, scanner, var_id: int, value: bool) -> tuple[bool, object]:
     """
     return lua.call(mover, scanner, "game.setrobotvar_bool", var_id,
                     bool(value))
+
+
+def set_int(mover, scanner, var_id: int, value: int) -> tuple[bool, object]:
+    """改精靈的一個整數設定。注意事項同 `set_bool`：平常不要用。"""
+    return lua.call(mover, scanner, "game.setrobotvar_int", var_id, int(value))
+
+
+def _sync_check(mover, scanner, wnd_name: str, cid: int, on: bool) -> None:
+    """精靈面板那一頁開著的話，把畫面上的勾選框跟著改。
+
+    只動畫面，行為由 setrobotvar_* 決定 —— 少了這步使用者打開面板會看到
+    勾選跟實際行為對不上（跟 `set_run` 遇到的是同一件事）。頁面沒開就不動。
+    """
+    wnd = _wnd(mover, scanner, wnd_name)
+    if not wnd:
+        return
+    ok, exists = lua.call(mover, scanner, "window.isexist", wnd, cid)
+    if ok and exists is True:
+        lua.call(mover, scanner, "window.setcheck", wnd, cid, bool(on))
+
+
+def apply_prefs(mover, scanner, *, main_switch: bool = False,
+                jump_back: bool = False,
+                revive_recall: bool = False) -> list[str]:
+    """照掛機分頁的勾選把精靈調成該有的樣子。回傳實際動了哪些（給人看）。
+
+    ★ 只「往要的方向推」：每一項都先純記憶體讀，已經是對的就完全不碰 Lua。
+      使用者取消勾選我們也**不會**把遊戲裡的設定改回去 —— 那是他的設定。
+
+    · main_switch    開始自動戰鬥 → 主開關「開啟天使守護精靈」一律開起來
+    · jump_back      勾了「用天使趴趴GO回地圖」→ 關補給頁「使用標記傳送捲軸
+                     回練功點」：回地圖已經由趴趴GO負責，精靈再燒一張捲軸
+                     只是白花道具
+    · revive_recall  勾了「死亡自己回練功區」→ 輔助頁「陣亡時自動復活」開、
+                     「復活方式」選「回城」
+    """
+    notes: list[str] = []
+
+    if main_switch and not is_run(scanner):
+        ok, why = set_run(mover, scanner, True)
+        notes.append("開了天使守護精靈"
+                     if ok else f"⚠ 天使守護精靈開不起來（{why}）")
+
+    if jump_back:
+        ok, cur = get_bool(mover, scanner, AS_USE_RETURN_SCROLL)
+        if ok and cur is not False:
+            set_bool(mover, scanner, AS_USE_RETURN_SCROLL, False)
+            _sync_check(mover, scanner, "WND_AUTOSUPPLY",
+                        SUPPLY_SCROLL_CHECK_ID, False)
+            notes.append("關了「標記傳送捲軸回練功點」")
+
+    if revive_recall:
+        ok, cur = get_bool(mover, scanner, AS_AUTO_REVIVE)
+        if ok and cur is not True:
+            set_bool(mover, scanner, AS_AUTO_REVIVE, True)
+            _sync_check(mover, scanner, "WND_AUTOASSIST",
+                        REVIVE_CHECK_ID, True)
+            notes.append("開了「陣亡時自動復活」")
+        cur = get_int(mover, scanner, AS_REVIVE_MODE)
+        if cur is not None and cur != REVIVE_RECALL:
+            set_int(mover, scanner, AS_REVIVE_MODE, REVIVE_RECALL)
+            # ⚠ 下拉選單按鈕上的**文字**這裡沒辦法跟著改（settitle 要傳字串，
+            #   跳板只支援數字/布林參數）。行為以設定值為準；使用者重新點一次
+            #   下拉選單就會顯示對。
+            notes.append("復活方式改成「回城」")
+
+    return notes
 
 
 def begin_supply(mover, scanner) -> list[str]:
@@ -579,13 +661,7 @@ def set_autofight(mover, scanner, on: bool) -> None:
     ⚠ 這裡**不叫** `OnCheckAutoFight` —— 那是舊版路徑（會去註冊一個計時器），
       而且被 `[0x8909BA]` 擋著。真正決定行為的是變數 `AF_BOL_ISAUTOFIGHT`。
     """
-    wnd = _wnd(mover, scanner, "WND_AUTOFIGHT")
-    if wnd:
-        ok, exists = lua.call(mover, scanner, "window.isexist", wnd,
-                              AUTOFIGHT_CHECK_ID)
-        if ok and exists is True:
-            lua.call(mover, scanner, "window.setcheck", wnd,
-                     AUTOFIGHT_CHECK_ID, bool(on))
+    _sync_check(mover, scanner, "WND_AUTOFIGHT", AUTOFIGHT_CHECK_ID, bool(on))
     set_bool(mover, scanner, AF_IS_AUTO_FIGHT, bool(on))
 
 

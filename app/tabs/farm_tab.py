@@ -964,7 +964,9 @@ class CharFarmPage(QWidget):
         self.run_cb.setStyleSheet("font-weight: bold;")
         self.run_cb.setToolTip(
             "勾選後開始：把「選中怪物」裡離自己最近的一隻寫進遊戲的目前目標，"
-            "並持續送技能鍵。\n打死會自動接下一隻。取消勾選立刻停止。")
+            "並持續送技能鍵。\n打死會自動接下一隻。取消勾選立刻停止。\n"
+            "★ 開始的當下會自動把天使精靈的主開關「開啟天使守護精靈」打開\n"
+            "　 （本來就開著就不動它；停止掛機也不會幫你關）。")
         self.run_cb.toggled.connect(self._on_toggle)
         root.addWidget(self.run_cb)
 
@@ -1209,9 +1211,31 @@ class CharFarmPage(QWidget):
             "・時間到時如果人已經回到原地圖了就不傳\n"
             "⚠ 走的是遊戲自己的傳送封包，跟你手動開趴趴GO按下去完全一樣，\n"
             "　 所以**傳送費用、等級限制**照樣算。\n"
-            "⚠ 那張地圖不在趴趴GO清單裡就不傳（會在狀態列說一聲）。")
-        self.sup_jump_cb.toggled.connect(self._save_settings)
+            "⚠ 那張地圖不在趴趴GO清單裡就不傳（會在狀態列說一聲）。\n"
+            "★ 勾了這個，開始掛機／觸發補給時會自動把精靈補給頁的\n"
+            "　 「使用標記傳送捲軸回練功點」**取消**掉 —— 回地圖已經由\n"
+            "　 趴趴GO負責，精靈再燒一張捲軸只是浪費道具。\n"
+            "　 （取消勾選不會幫你把遊戲裡的設定勾回去）")
+        self.sup_jump_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_jump_cb)
+        c.addSpacing(10)
+        # ★ 死亡自己回練功區：把精靈「輔助」頁調成 陣亡自動復活＋回城。
+        #   DATAID 與「回城 = 1」的由來見 app/game/robot.py 的 AS_AUTO_REVIVE。
+        self.sup_revive_cb = QCheckBox("死亡自己回練功區")
+        self.sup_revive_cb.setToolTip(
+            "勾了之後，開始掛機時自動把天使精靈「輔助」頁調好：\n"
+            "・「陣亡時自動復活」勾起來\n"
+            "・「復活方式」選成「回城」\n"
+            "角色死掉就會自動復活回城，不會一直躺在原地。\n"
+            "\n"
+            "・掛機中才勾也會立刻生效\n"
+            "・只往「開」的方向調：取消勾選不會幫你把遊戲裡的設定改回來\n"
+            "⚠ 角色死亡時掛機照樣自動停止並通知 —— 這裡只管「人不要躺著」。\n"
+            "⚠ 復活方式三個選項是 靈魂／回城／原地，這裡固定選「回城」；\n"
+            "　 精靈面板開著的話，下拉選單上的**文字**可能沒立刻跟上，\n"
+            "　 重新點一次下拉選單就會顯示對，實際行為一律以設定值為準。")
+        self.sup_revive_cb.toggled.connect(self._on_robot_pref)
+        c.addWidget(self.sup_revive_cb)
         c.addStretch(1)
         grid.addWidget(g_sup, 2, 0, 1, 2)
 
@@ -1540,6 +1564,11 @@ class CharFarmPage(QWidget):
         self._supply_left = False
         self._supply_pos = self.my_pos()
         self._supply_gen += 1
+        # ★ 勾了趴趴GO回地圖 → 這趟補給別讓精靈用「標記傳送捲軸」回練功點
+        #   （回地圖由趴趴GO負責）。開始掛機時關過一次，這裡再驗一次 ——
+        #   使用者可能中途又在遊戲裡勾回去。已經是關的就一次 Lua 都不花。
+        robot.apply_prefs(self._mover, self.sc,
+                          jump_back=self.sup_jump_cb.isChecked())
         # ★ 第一段：調好開關 + 設中心點。第二段（回程）隔幾秒才送，
         #   順序與間隔都不能省（見 robot.do_recall）。
         notes = robot.begin_supply(self._mover, self.sc)
@@ -2237,9 +2266,19 @@ class CharFarmPage(QWidget):
         self._ensure_mover()               # 選怪／移動都要用它的跳板
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
+        # ★ 開始自動戰鬥就把精靈調好：主開關一律開（使用者要求）；勾了
+        #   趴趴GO回地圖／死亡回程的話，把對應的精靈設定一起調到位。
+        #   每一項都先讀再動，平常（都已經是對的）只花幾次純記憶體讀取。
+        notes = []
+        if self._mover is not None and self._mover.active:
+            notes = robot.apply_prefs(
+                self._mover, self.sc, main_switch=True,
+                jump_back=self.sup_jump_cb.isChecked(),
+                revive_recall=self.sup_revive_cb.isChecked())
         self.status.setText(
-            "掛機中：只打「" + "、".join(want) + "」" if want
-            else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
+            ("掛機中：只打「" + "、".join(want) + "」" if want
+             else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
+            + ("　精靈：" + "、".join(notes) if notes else ""))
 
     def tick(self, dt: float) -> None:
         """UI 側的心跳：只做「挑目標、卡住偵測、更新狀態列」。
@@ -2757,6 +2796,8 @@ class CharFarmPage(QWidget):
         self.sup_hp_cb.setChecked(bool(g(self._key("supply_hp"), old_potion)))
         self.sup_mp_cb.setChecked(bool(g(self._key("supply_mp"), old_potion)))
         self.sup_jump_cb.setChecked(bool(g(self._key("supply_jump"), False)))
+        self.sup_revive_cb.setChecked(
+            bool(g(self._key("supply_revive"), False)))
         self.rot_every.setValue(float(g(self._key("rot_every"), 30.0)))
         self.rot_stay.setValue(float(g(self._key("rot_stay"), 60.0)))
         self.rest_hp_cb.setChecked(bool(g(self._key("rest_hp_on"), False)))
@@ -2784,6 +2825,24 @@ class CharFarmPage(QWidget):
             self.rb_tg.setChecked(True)
         self.tg_id.setText(str(g(self._key("tg_id"), "") or ""))
 
+    def _on_robot_pref(self, _on: bool) -> None:
+        """「用天使趴趴GO回地圖」／「死亡自己回練功區」勾選變動。
+
+        一改就存；**掛機中**勾上還會立刻把精靈設定調到位，不必重開掛機。
+        取消勾選只代表「我們不再管」—— 不會把遊戲裡的設定改回去。
+        """
+        self._save_settings()
+        if self._loading or not self.run_cb.isChecked():
+            return
+        if not (self._mover is not None and self._mover.active):
+            return
+        notes = robot.apply_prefs(
+            self._mover, self.sc,
+            jump_back=self.sup_jump_cb.isChecked(),
+            revive_recall=self.sup_revive_cb.isChecked())
+        if notes:
+            self.status.setText("精靈設定：" + "、".join(notes))
+
     def _save_settings(self) -> None:
         if self._loading:
             return
@@ -2801,6 +2860,7 @@ class CharFarmPage(QWidget):
         s(self._key("supply_hp"), self.sup_hp_cb.isChecked())
         s(self._key("supply_mp"), self.sup_mp_cb.isChecked())
         s(self._key("supply_jump"), self.sup_jump_cb.isChecked())
+        s(self._key("supply_revive"), self.sup_revive_cb.isChecked())
         s(self._key("rot_every"), float(self.rot_every.value()))
         s(self._key("rot_stay"), float(self.rot_stay.value()))
         s(self._key("rest_hp_on"), self.rest_hp_cb.isChecked())

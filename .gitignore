@@ -26,6 +26,9 @@ dist/
 # 逆向 / 分析用的臨時腳本，不進版控
 scratchpad/
 
+# 分析工具的傾印輸出（tools/dump_lua_globals.py 等），可隨時重生
+reports/
+
 # 丟在根目錄用來回報問題的截圖（aaaa.png、153.png…）。
 # 只擋根目錄，assets/ 底下的圖不受影響。留著它們會讓 release.py 以為有未提交變更。
 /*.png
