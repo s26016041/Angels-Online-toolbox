@@ -4,7 +4,8 @@
 
   · 領取在線獎勵     —— 6 格全送（`0x5D3D97(0x48, 獎勵編號)`）
   · 全部換取翔宇聖翼 —— 身上有幾張「勤奮在線獎勵卷」就換幾次
-                        （先 `0x5D3D97(0x49, 群組)` 開商店，再送封包 0x148）
+                        （先 `0x5D3D97(0x49, 群組)` 開商店，再送封包 0x148，
+                         換完叫遊戲自己的開關函式把商店視窗關掉）
 
 背後是 `app/game/dailygift.py` 與 `app/game/exchange.py`，
 兩邊都是呼叫遊戲自己的函式組包、送出，加解密由客戶端處理。
@@ -58,11 +59,6 @@ TOKEN_ITEM = 5346         # 勤奮在線獎勵卷(1天) —— 在線獎勵發�
 # 只掃一台就夠（掃一次 ~0.8 秒，之後都是瞬間）。
 _entry: exchange.Entry | None = None
 
-# 這個伺服器「兌換之前一定要先開商店嗎」。None = 還不知道（第一台會實際試一次：
-# 先直接送兌換，背包沒變才退回去開商店）。★ 直接送就成功的話**完全不會跳出
-# 兌換視窗**，也就不必去關它。試出來的答案記住，後面幾台不必再試。
-_need_open: bool | None = None
-
 
 class DailyTab(BaseTab):
     TAB_TITLE = "領取每日"
@@ -99,8 +95,8 @@ class DailyTab(BaseTab):
             "券有幾張就換幾次；一張都沒有的分身會直接跳過。\n"
             "⚠ 券是在線獎勵發的，放著會過期（1 天），所以是「全部換掉」。\n"
             "\n"
-            "會先試著「不開商店直接送兌換」——伺服器接受的話全程不會跳出視窗。\n"
-            "不接受才退回去開商店（那時遊戲會跳出兌換視窗），換完自動幫你關掉。")
+            "過程中遊戲會跳出兌換商店視窗（伺服器不先開店就不受理兌換），\n"
+            "換完會自動幫你關掉。")
         self.ex_btn.clicked.connect(self._start_exchange)
         bar.addWidget(self.ex_btn)
         bar.addStretch(1)
@@ -330,11 +326,11 @@ class DailyTab(BaseTab):
                 sum(it.count for it in items if it.type_id == WING_ITEM))
 
     def _ex_begin(self, pid: int, label: str) -> int:
-        """數券、決定走哪條路。沒有券就直接跳過這台。
+        """數券 → 開兌換商店。沒有券就跳過這台（連商店都不開）。
 
-        ★ 預設**先直接送兌換、不開商店**（`_need_open` 還不知道時）——
-          伺服器接受的話就完全不會跳出視窗。沒反應才退回「開商店再送」。
-          第一台試出來的結果會記住，後面幾台不必再試一次。
+        ⚠⚠ **一定要先開商店**：2026-08-07 使用者實測，不開商店直接送兌換封包
+          伺服器完全不理（背包沒變）。曾經做過「先試直送、不行才開商店」的
+          自動判斷，既然答案已經確定就拿掉了 —— 白送一包還多等 0.9 秒。
         """
         if _entry is None:
             return 0
@@ -342,100 +338,62 @@ class DailyTab(BaseTab):
         if sc is None:
             self._log(label, "換翔宇聖翼", "⚠ 讀不到記憶體")
             return 0
-        have, wings = self._count(sc)
+        have, _wings = self._count(sc)
         times = _entry.times_for(have)
         if times <= 0:
             self._log(label, "換翔宇聖翼", f"沒有{self._name(TOKEN_ITEM)}")
             return 0
-        if self._mover(pid) is None:
+        mv = self._mover(pid)
+        if mv is None:
             self._log(label, "換翔宇聖翼", "⚠ 無法安裝跳板（視窗關了？）")
-            return 0
-        self.status.setText(f"{label}：{have} 張券 → 換 {times} 次")
-        if _need_open:                      # 已經知道非開不可，就別白試一次
-            return self._ex_open(pid, label, have, wings)
-        return self._ex_send(pid, label, times, have, wings, opened=False)
-
-    def _ex_send(self, pid: int, label: str, times: int, have: int,
-                 wings: int, opened: bool) -> int:
-        """送出兌換封包，排下一步去看背包有沒有變。"""
-        sc, mv = self._scanners.get(pid), self._movers.get(pid)
-        if sc is None or mv is None or _entry is None:
-            return 0
-        ok, why = exchange.confirm(mv, sc, _entry.id, times)
-        if not ok:
-            self._log(label, "換翔宇聖翼", f"⚠ {why}")
-            return 0
-        self._steps.insert(0, lambda: self._ex_check(
-            pid, label, have, wings, opened))
-        return SETTLE_MS
-
-    def _ex_open(self, pid: int, label: str, have: int, wings: int) -> int:
-        """開兌換商店，等伺服器回清單之後再送一次。"""
-        mv = self._movers.get(pid)
-        if mv is None or _entry is None:
             return 0
         if not exchange.open_shop(mv, _entry.group):
             self._log(label, "換翔宇聖翼", "⚠ 開兌換商店排不進去，再按一次")
             return 0
-        self._steps.insert(0, lambda: self._ex_after_open(pid, label, wings))
+        self.status.setText(f"{label}：{have} 張券 → 換 {times} 次")
+        self._steps.insert(0, lambda: self._ex_confirm(pid, label))
         return OPEN_WAIT_MS
 
-    def _ex_after_open(self, pid: int, label: str, wings: int) -> int:
-        """商店開好了再送一次。
+    def _ex_confirm(self, pid: int, label: str) -> int:
+        """商店開好了才送兌換。
 
-        ⚠ 券的數量**重新數過**再算次數，不沿用開商店之前那個數字 ——
-          萬一剛才那包其實有生效（只是慢了一點），這裡就會算出 0 次而不送，
-          不會重複花掉券。
+        ⚠ 券在這裡**重新數一次**，不沿用開商店之前那個數字 —— 中間隔了 0.9 秒，
+          用最新的才不會送出比手上還多的次數。
         """
-        sc = self._scanners.get(pid)
-        if sc is None or _entry is None:
+        sc, mv = self._scanners.get(pid), self._movers.get(pid)
+        if sc is None or mv is None or _entry is None:
             return 0
-        have, wings_now = self._count(sc)
+        have, wings = self._count(sc)
         times = _entry.times_for(have)
         if times <= 0:
-            # 券在這段期間沒了 → 其實是剛才直接送那包生效了
-            self._ex_verdict(False)
-            self._done += 1
-            self._log(label, "換翔宇聖翼",
-                      f"★ 換到 {wings_now - wings} 個{self._name(WING_ITEM)}"
-                      "（直接送就成功，只是慢了一點）")
-            return 0
-        return self._ex_send(pid, label, times, have, wings_now, opened=True)
-
-    def _ex_check(self, pid: int, label: str, have: int, wings: int,
-                  opened: bool) -> int:
-        """回頭讀背包，報告真的換到幾個 —— 只說「送出了」看不出有沒有成功。"""
-        sc = self._scanners.get(pid)
-        if sc is None:
-            return 0
-        now_tok, now_wing = self._count(sc)
-        used, got = have - now_tok, now_wing - wings
-        if got > 0:
-            self._ex_verdict(opened)
-            self._done += 1
-            self._log(label, "換翔宇聖翼",
-                      f"★ 換到 {got} 個{self._name(WING_ITEM)}"
-                      f"（用掉 {used} 張券，還剩 {now_tok} 張）"
-                      + ("" if opened else "　※ 沒開商店，直接送就成功"))
-            # 開過商店的才要關 —— 沒開就沒有視窗跳出來
-            if opened:
-                self._steps.insert(0, lambda: self._ex_close(pid, label))
-            return 0
-        if not opened:
-            # 直接送沒反應 → 伺服器要先開商店。退回去走完整流程
-            self._ex_verdict(True)
-            self.status.setText(f"{label}：直接送沒反應，改成先開兌換商店…")
-            return self._ex_open(pid, label, have, wings)
-        self._log(label, "換翔宇聖翼",
-                  f"⚠ 背包沒變多（券還有 {now_tok} 張）—— 伺服器沒接受")
+            self._log(label, "換翔宇聖翼", f"沒有{self._name(TOKEN_ITEM)}")
+        else:
+            ok, why = exchange.confirm(mv, sc, _entry.id, times)
+            if ok:
+                self._steps.insert(0, lambda: self._ex_check(
+                    pid, label, have, wings))
+                return SETTLE_MS
+            self._log(label, "換翔宇聖翼", f"⚠ {why}")
+        # 沒送成也要把剛才開起來的商店視窗關掉
         self._steps.insert(0, lambda: self._ex_close(pid, label))
         return 0
 
-    @staticmethod
-    def _ex_verdict(need_open: bool) -> None:
-        """記住「這個伺服器到底要不要先開商店」，後面幾台就不必再試。"""
-        global _need_open
-        _need_open = need_open
+    def _ex_check(self, pid: int, label: str, have: int, wings: int) -> int:
+        """回頭讀背包，報告真的換到幾個 —— 只說「送出了」看不出有沒有成功。"""
+        sc = self._scanners.get(pid)
+        if sc is not None:
+            now_tok, now_wing = self._count(sc)
+            used, got = have - now_tok, now_wing - wings
+            if got > 0:
+                self._done += 1
+                self._log(label, "換翔宇聖翼",
+                          f"★ 換到 {got} 個{self._name(WING_ITEM)}"
+                          f"（用掉 {used} 張券，還剩 {now_tok} 張）")
+            else:
+                self._log(label, "換翔宇聖翼",
+                          f"⚠ 背包沒變多（券還有 {now_tok} 張）—— 伺服器沒接受")
+        self._steps.insert(0, lambda: self._ex_close(pid, label))
+        return 0
 
     def _ex_close(self, pid: int, label: str) -> int:
         """把跳出來的兌換商店視窗關掉（叫遊戲自己的開關函式）。"""
