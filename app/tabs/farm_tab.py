@@ -1430,6 +1430,15 @@ class CharFarmPage(QWidget):
         self.sup_revive_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_revive_cb)
         c.addStretch(1)
+        # ★ 趴趴GO 的倒數（使用者要求放在這一列**最右邊**）：補給觸發之後
+        #   還有多久會傳回原地圖；死亡回程時也用同一個位置顯示。
+        #   平常是空的，不佔視覺；每個心跳更新，但只在字串真的變了才寫
+        #   （setText 會觸發重繪，10ms 一拍全寫等於一直重畫）。
+        self.jump_lbl = QLabel("")
+        self.jump_lbl.setToolTip(
+            "「用天使趴趴GO回地圖」還有多久觸發。\n"
+            "從觸發回程補給那一刻開始算；時間到時人已經回到原地圖就不傳。")
+        c.addWidget(self.jump_lbl)
         grid.addWidget(g_sup, 2, 0, 1, 2)
 
         # ⛔ 不要把兩欄硬拉成一樣寬（setColumnStretch(0,1)+(1,1)）——
@@ -1896,6 +1905,27 @@ class CharFarmPage(QWidget):
             self.notify(why)
         else:
             self.status.setText(why)
+
+    def _update_jump_countdown(self) -> None:
+        """「回程補給」那列最右邊的趴趴GO倒數（使用者要求）。
+
+        補給中就倒數到傳送；死亡回程時同一格顯示那邊的倒數。
+        其餘時間留白。⚠ 只在字串真的變了才 setText —— 心跳是 10ms 一拍。
+        """
+        txt = ""
+        if self._supply and self.sup_jump_cb.isChecked():
+            if self._supply_scene is None:
+                txt = "趴趴GO：不知道出發地圖"
+            else:
+                left = max(0.0, JUMP_BACK_SECS - self._supply_t)
+                txt = (f"趴趴GO 倒數 {_mmss(left)}" if left > 0
+                       else "趴趴GO 傳送中…")
+        elif self._death:
+            left = max(0.0, DEATH_JUMP_SECS - self._death_t)
+            txt = (f"死亡回程 倒數 {_mmss(left)}" if left > 0
+                   else "死亡回程 傳送中…")
+        if self.jump_lbl.text() != txt:
+            self.jump_lbl.setText(txt)
 
     def _supply_tick(self, dt: float) -> bool:
         """補給進行中回 True（呼叫端要整個讓開）。
@@ -2739,6 +2769,11 @@ class CharFarmPage(QWidget):
                 self._ask_full("沒目標，全掃當保險")
             full, self._want_full = self._want_full, False
             self._on_scan(self.pid, full)
+
+        # 趴趴GO 倒數（顯示在「回程補給」那列最右邊）。
+        # ⚠ 要放在所有 return 之前 —— 補給／死亡回程那兩段都會直接 return，
+        #   放後面就永遠不會更新。
+        self._update_jump_countdown()
 
         if not self.run_cb.isChecked():
             return
