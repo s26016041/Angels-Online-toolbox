@@ -2233,7 +2233,25 @@ class CharFarmPage(QWidget):
         """
         if not self._ensure_mover():
             return 0
-        if math.hypot(gx - me[0], gy - me[1]) <= keep:
+        gd = math.hypot(gx - me[0], gy - me[1])
+        # ★★ 卡進怪身體（gd < MIN_GAP，通常是怪自己走到我們腳下）→
+        #   站回 MIN_GAP+SLACK＝1.8 格，跟遊戲內建掛機一樣（它全程維持
+        #   1.4~1.8，見 move._approach_point 那段）。
+        # ⚠ 這裡以前寫 `gd <= keep 就 return 0`，把太近的情況也擋掉了 ——
+        #   move._approach_point 的「太近就退到 1.8」根本輪不到執行，
+        #   於是貼進怪身體就永遠調不出來（使用者回報「卡在怪裡面」）。
+        # ⚠ 不能對怪尋路再退：從怪腳下對牠尋路一定回 0（NO_PATH_NEED 的
+        #   老坑）。要**直接對「站出去的那個點」尋路** —— 那個點離我們
+        #   不到 2 格、方向就是「從怪指向我」，多半直線可走。
+        if gd < move.MIN_GAP:
+            want = move.MIN_GAP + move.SLACK
+            ux, uy = (((me[0] - gx) / gd, (me[1] - gy) / gd) if gd >= 0.05
+                      else (1.0, 0.0))   # 完全重疊算不出方向，隨便挑一邊
+            n = self._mover.walk_route(self.sc, self.player,
+                                       gx + ux * want, gy + uy * want)
+            self._walk_t = 0.0
+            return n
+        if gd <= keep:
             return 0
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
                                    stop_short=keep)
