@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from app.paths import resource
 
 DATA_FILE = "assets/skills.tsv.gz"
+# 名稱另外一張表（tools/build_skill_names.py，全部 19310 筆都有）——
+# 主表只收 buff 類，攻擊技能查名字不能靠它。
+NAMES_FILE = "assets/skill_names.tsv.gz"
 SELF_ONLY = "自己"          # 對象＝自己 的技能按了就對自己放，不用先選人
 
 
@@ -53,3 +56,27 @@ def _load() -> dict[int, Skill]:
 def of(skill_id: int) -> Skill | None:
     """查一個技能；沒有持續時間（不是 buff）或查不到就回 None。"""
     return _load().get(int(skill_id or 0))
+
+
+_names: dict[int, str] | None = None
+
+
+def name_of(skill_id: int) -> str:
+    """技能的中文名（例如 743 → '幻影刺殺Ⅳ'）；查不到回空字串。
+
+    跟 itemname.of 同一套做法：第一次用到才載入、之後整支程式共用；
+    查不到就讓呼叫端自己退回顯示編號，絕不假裝知道。
+    """
+    global _names
+    if _names is None:
+        out: dict[int, str] = {}
+        try:
+            with gzip.open(resource(NAMES_FILE), "rt", encoding="utf-8") as f:
+                for line in f:
+                    sid, _, name = line.rstrip("\n").partition("\t")
+                    if name:
+                        out[int(sid)] = name
+        except Exception:                                  # noqa: BLE001
+            out = {}          # 檔案缺了就退化成顯示編號，不要爆掉
+        _names = out
+    return _names.get(int(skill_id or 0), "")

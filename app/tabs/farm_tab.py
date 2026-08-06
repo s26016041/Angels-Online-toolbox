@@ -67,8 +67,8 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, buff, channel, entity, inventory,
-                      jumpmap, locate, monsters, move, navigate, player,
-                      quickbar, robot, scene)
+                      itemname, jumpmap, locate, monsters, move, navigate,
+                      player, quickbar, robot, scene, skills)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -1136,6 +1136,10 @@ class CharFarmPage(QWidget):
         #   它用到的 run_cb 等元件都還沒生出來。
         for cb, _, _ in self._key_cbs:
             cb.toggled.connect(self._keys_changed)
+        # 點開選單的當下把每個鍵標上「現在放什麼」：F1（電擊術Ⅳ）。
+        # GUI 執行緒自己開一個 Reader，不跟攻擊執行緒共用（省得搶快取）。
+        self._qb_ui = quickbar.Reader(self.sc)
+        km.aboutToShow.connect(self._refresh_key_menu)
         self.key_btn.setMenu(km)
         self._sync_key_btn()
         a.addWidget(self.key_btn)
@@ -3245,6 +3249,31 @@ class CharFarmPage(QWidget):
     def _sel_vks(self) -> list[int]:
         """勾選的技能鍵（照 F1→F12 順序）。"""
         return [vk for cb, vk, _ in self._key_cbs if cb.isChecked()]
+
+    def _refresh_key_menu(self) -> None:
+        """點開技能鍵選單時，把每個鍵標上快捷欄現在放什麼。
+
+        技能格 → F1（電擊術Ⅳ）、物品格 → F5（物品：高效紅藥水）、
+        空格 → F7（空）。讀不到快捷欄（還沒進遊戲／改版位移）就維持
+        素的 F1~F12，不亂標。純讀取，開著掛機點開也沒差。
+        """
+        try:
+            cells = quickbar.read_page(self.sc, self._qb_ui.page())
+        except Exception:                      # noqa: BLE001
+            cells = None
+        for i, (cb, _, label) in enumerate(self._key_cbs):
+            text = label
+            if cells is not None:
+                c = cells[i]
+                if c is None:
+                    text = f"{label}（空）"
+                elif c.is_skill:
+                    nm = skills.name_of(c.value) or f"技能{c.value}"
+                    text = f"{label}（{nm}）"
+                elif c.is_item:
+                    nm = itemname.of(c.value)
+                    text = f"{label}（物品：{nm}）" if nm else f"{label}（物品）"
+            cb.setText(text)
 
     def _sync_key_btn(self) -> None:
         """按鈕字樣＝勾了哪些鍵；勾太多就縮寫，別把整條列撐爆。"""
