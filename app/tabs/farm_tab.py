@@ -1075,6 +1075,8 @@ class CharFarmPage(QWidget):
         self._hurt = False         # 這隻有沒有被我們打傷過
         self._handoff_fail = False  # 這隻「交棒給客戶端走」失敗過了嗎
         self._handoff_t = 0.0      # 交棒之後多久沒真的接戰
+        self._near_fail = 0        # 近距離直線走連續幾次沒位移（撞牆偵測）
+        self._near_from = None     # 上一次直線走出發時的位置
         self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（讀動畫狀態，見 tick）
@@ -2402,16 +2404,35 @@ class CharFarmPage(QWidget):
         #   中繼點又都比實際距離遠，整趟回 0、一步沒動。這就是使用者說的
         #   「發呆一段時間然後又開始打」（等到怪自己走過來才恢復）。
         #   走位本來就只差一兩格，用不著尋路，交給 walk_near 直接走。
-        if gd < NEAR_WALK:
+        # ⚠⚠ **不尋路只適用於「確定沒地形」的情況**（使用者指出的疑點）：
+        #   walk_near 是直線走，中間有障礙就會撞牆原地不動。判斷依據有兩個，
+        #   都要顧到：
+        #     ① 上一次尋路說要繞路（_path_pts > 1）→ 直接走 walk_route
+        #     ② 尋路只在 dist > NO_PATH_NEED 時才更新，**3 格以內那個判斷是舊的**
+        #        → 所以再加一道實測保險：連續走了兩次都沒真的位移，就改用尋路
+        # ⚠ 「卡進怪身體裡」要站開時**一律用直線**：那不是地形問題，
+        #   而且從怪腳下對牠尋路一定回 0（老坑），走 walk_route 反而動不了。
+        near_ok = (gd < move.MIN_GAP
+                   or (self._path_pts <= 1 and self._near_fail < 2))
+        if gd < NEAR_WALK and near_ok:
             # ⚠⚠ **被貼身時只站開到 1.8 格，不可以退回 keep**。
             #   法師的 keep 是 10 格 —— 退回去等於放風箏，而且退的途中
             #   一直在射程邊緣進進出出（使用者回報「超出射程還在放技能」）。
             #   1.8 = MIN_GAP + SLACK，正是遊戲內建掛機維持的 1.4~1.8。
             want = (min(keep, move.MIN_GAP + move.SLACK)
                     if gd < move.MIN_GAP else keep)
+            # 上一次 walk_near 之後到底有沒有動？沒動就記一次失敗。
+            if self._near_from is not None and me:
+                if math.hypot(me[0] - self._near_from[0],
+                              me[1] - self._near_from[1]) < 0.3:
+                    self._near_fail += 1
+                else:
+                    self._near_fail = 0
+            self._near_from = me
             ok = self._mover.walk_near(self.sc, self.player, gx, gy, want)
             self._walk_t = 0.0
             return 1 if ok else 0
+        self._near_from = None
         if gd <= keep:
             return 0
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
@@ -2715,6 +2736,8 @@ class CharFarmPage(QWidget):
         self._hurt = False
         self._handoff_fail = False   # 這一隻的「交棒給客戶端」失敗過了嗎
         self._handoff_t = 0.0
+        self._near_fail = 0          # 換目標就重算「近距離直線走」的失敗次數
+        self._near_from = None
         self._gone = 0
         self._walked_ok = True
         self._why = ""
