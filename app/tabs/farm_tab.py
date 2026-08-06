@@ -437,6 +437,9 @@ class KeyWorker(_Paced):
         self.eid = None             # 現在要打誰
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
+        # ★ 出手前自己再驗一次距離用的（見 step()）：玩家物件位址與打得到的距離。
+        self.player = None
+        self.reach = 0.0
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
         self._next_strike = 0.0     # 下一次可以叫「用快捷鍵」的時間
         self._next_key = 0.0        # 退路（送鍵）的節流
@@ -631,8 +634,19 @@ class KeyWorker(_Paced):
             #     （衝鋒Ⅰ~Ⅲ、末日反噬…），所以這道覆寫不能省。
             # ★ 節奏：每 STRIKE_GAP 秒放一招，照 F1→F12 的順序輪流；
             #   空格／物品格／沒學到的鍵**不進循環**（usable 已經濾掉）。
+            # ★★ **出手前自己再量一次距離**，不要只信 UI 執行緒設的 `_on`。
+            #   `_on` 是 UI 每一拍算好推過來的，但 UI 會被尋路（單次最久等
+            #   0.15 秒）和掃描結果處理卡住，那段期間怪已經跑出射程、旗標卻
+            #   還是舊的 —— 就會出現「超出射程還在放技能」（使用者指出的）。
+            #   這裡只多讀一次玩家座標（微秒級），目標座標用 UI 上一拍給的。
+            in_reach = True
+            if self.reach and self.player and pos != (0.0, 0.0):
+                me_now = entity.read_pos(self.sc, self.player)
+                if me_now:
+                    in_reach = math.hypot(pos[0] - me_now[0],
+                                          pos[1] - me_now[1]) <= self.reach
             struck = False
-            if now >= self._next_strike:
+            if now >= self._next_strike and in_reach:
                 if (mode == MODE_PACKET and packets and skill and eid
                         and mover is not None):
                     rng = skills.range_of(skill)
@@ -647,7 +661,7 @@ class KeyWorker(_Paced):
                 if struck:
                     self._next_strike = now + STRIKE_GAP
                     self._rot += 1             # 放出去了才輪下一個鍵
-            if not struck and now >= self._next_key:
+            if not struck and in_reach and now >= self._next_key:
                 # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵，
                 # 那是舊做法，一樣是遊戲自己出手。
                 self._next_key = now + STRIKE_GAP
@@ -2351,7 +2365,13 @@ class CharFarmPage(QWidget):
         #   「發呆一段時間然後又開始打」（等到怪自己走過來才恢復）。
         #   走位本來就只差一兩格，用不著尋路，交給 walk_near 直接走。
         if gd < NEAR_WALK:
-            ok = self._mover.walk_near(self.sc, self.player, gx, gy, keep)
+            # ⚠⚠ **被貼身時只站開到 1.8 格，不可以退回 keep**。
+            #   法師的 keep 是 10 格 —— 退回去等於放風箏，而且退的途中
+            #   一直在射程邊緣進進出出（使用者回報「超出射程還在放技能」）。
+            #   1.8 = MIN_GAP + SLACK，正是遊戲內建掛機維持的 1.4~1.8。
+            want = (min(keep, move.MIN_GAP + move.SLACK)
+                    if gd < move.MIN_GAP else keep)
+            ok = self._mover.walk_near(self.sc, self.player, gx, gy, want)
             self._walk_t = 0.0
             return 1 if ok else 0
         if gd <= keep:
@@ -3096,13 +3116,15 @@ class CharFarmPage(QWidget):
         reach = MELEE_RANGE if blocked else reach_skill
         in_range = dist is not None and dist <= reach
         # ★★ 走到多近：**完全由射程決定**（介面上的「接戰距離」已移除）。
-        #   隔著地形就貼臉；否則停在「打得到的距離再往內一格」——
-        #   留 1 格餘裕給怪走動，怪一動就出界的話會一直重走（很卡）。
-        #   下限 MIN_GAP：再近會被判定卡進怪的身體裡，攻擊被忽略。
-        #   算出來的值：近戰（射程 1 → reach 2.0）停 1.4；
-        #                法師（射程 12 → reach 12）停 11.0 —— 跟舊的預設一樣。
+        #   隔著地形就貼臉；否則停在「打得到的距離再往內留餘裕」。
+        # ⚠⚠ 餘裕要夠大（使用者指出的）：停在 reach−1（法師 11、射程 12）
+        #   等於**站在射程邊緣**，怪往外走一步就出界 —— 那一瞬間我們還在送
+        #   施放，就是「超出射程還在放技能」，而且會一直重走、很卡。
+        #   遠程留 2 格（法師停 10）、近戰留 0.6 格（射程 1 → reach 2.0 → 停 1.4，
+        #   再多留就進不了近戰射程了）。下限 MIN_GAP：更近會卡進怪的身體。
+        margin = 2.0 if reach >= 6.0 else 0.6
         keep = (MELEE_RANGE if blocked
-                else min(max(reach - 1.0, move.MIN_GAP), reach - 0.5))
+                else min(max(reach - margin, move.MIN_GAP), reach - 0.5))
 
         # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
         #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
@@ -3152,10 +3174,12 @@ class CharFarmPage(QWidget):
         #   我們原本走一次就不管了，怪自己貼上來就再也調不回去，
         #   然後卡在牠身體裡打不動 —— 而遠程停在 10 格永遠不會發生，
         #   所以同一份程式碼黑狐正常、雪狐會卡。
-        # ⚠ 容差不能大於「打得到的餘裕」：近戰 reach 只有 2 格，用 1.5 格容差
-        #   等於允許站在 2.9 格不動 —— 那裡一滴血都打不掉（實測 7 格以上
-        #   101 次出手零傷害，2.2 格 3 秒打死）。遠程 reach 12 不受影響。
-        slack = min(WALK_SLACK, max(0.3, reach - gkeep))
+        # ⚠⚠ 容差的上限是「**還沒出射程**就要開始重新靠近」：
+        #   以 reach−0.5 當界線，怪走到射程邊緣前 0.5 格我們就動身，
+        #   才不會出現「已經打不到了卻還站著送封包」（使用者指出的症狀）。
+        #   近戰 reach 2.0、停 1.4 → 容差 0.3（超過 1.7 就走）
+        #   法師 reach 12、停 10  → 容差 1.5（超過 11.5 就走，仍在射程內）
+        slack = min(WALK_SLACK, max(0.3, reach - 0.5 - gkeep))
         need_walk = gd is not None and (
             gd > gkeep + slack or (not in_range and gd > gkeep)
             or gd < move.MIN_GAP)
@@ -3177,6 +3201,9 @@ class CharFarmPage(QWidget):
                                  and self._keys.mover is not None)
         # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
         self._atk.engaged = self._keys.selected
+        # 出手執行緒自己也會用這兩個再驗一次距離（見 KeyWorker.step）
+        self._keys.player = self.player
+        self._keys.reach = reach
         self._keys.set_on(in_range)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
