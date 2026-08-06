@@ -253,13 +253,13 @@ LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密�
 # 掛機中多久重讀一次快捷欄（quickbar.Reader）——使用者中途換鍵上的技能，
 # 最慢這麼久就跟上。純讀零副作用，一次只有幾個小讀取（頁碼節點有快取）。
 QB_REFRESH = 2.0
-# ★★ 出手間隔（使用者指定 0.15 秒）：勾了幾個技能鍵就照 F1→F12 的順序
-#   每 0.15 秒放一招輪一次。空格／物品格／學不到技能的鍵不進循環。
+# ★★ 出手間隔（使用者指定 **0.1 秒**）：勾了幾個技能鍵就照 F1→F12 的順序
+#   每 0.1 秒放一招輪一次。空格／物品格／學不到技能的鍵不進循環。
 #   遊戲自己有冷卻，還沒好的那一招送出去也只是不生效，不會出事。
-# ⚠ 執行緒節拍（ATTACK_GAP）必須比這個細，否則實際間隔會被量化成節拍的倍數
-#   —— 所以 KeyWorker 用 STRIKE_TICK。
-STRIKE_GAP = 0.15
-STRIKE_TICK = 0.05              # KeyWorker 的節拍：要能切出 0.15 秒
+# ⚠ 執行緒節拍必須比這個細，否則實際間隔會被量化成節拍的倍數
+#   —— 所以 KeyWorker 用 STRIKE_TICK（0.025 秒，剛好切得出 0.1）。
+STRIKE_GAP = 0.10
+STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 # 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
 QUICKKEY_RANGE = 8
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
@@ -417,7 +417,7 @@ class KeyWorker(_Paced):
     """
 
     def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
-        super().__init__(STRIKE_TICK)          # 要切得出 0.15 秒的出手間隔
+        super().__init__(STRIKE_TICK)          # 要切得出 0.1 秒的出手間隔
         self.hwnd = hwnd
         self.sc = sc
         self.vks: list[int] = [DEFAULT_KEY]   # 使用者勾的技能鍵（輪流用）
@@ -1241,7 +1241,7 @@ class CharFarmPage(QWidget):
         self._sync_key_btn()
         a.addWidget(self.key_btn)
         # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）。
-        #    出手節奏是 STRIKE_GAP（0.15 秒輪一招），這裡設的是執行緒節拍，
+        #    出手節奏是 STRIKE_GAP（0.1 秒輪一招），這裡設的是執行緒節拍，
         #    要比它細才切得出來。
         self._keys.set_interval(STRIKE_TICK)
         a.addSpacing(10)
