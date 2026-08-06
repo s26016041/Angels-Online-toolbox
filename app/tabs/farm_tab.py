@@ -993,8 +993,9 @@ class CharFarmPage(QWidget):
         nbar.addStretch(1)
         root.addLayout(nbar)
 
-        # ★ 主開關自己一列，放在所有分類方框**上面** —— 它管的是整個頁面，
+        # ★ 主開關一列放在所有分類方框**上面** —— 它管的是整個頁面，
         #   塞進任何一個分類裡都不對，而且要一眼就找得到。
+        #   同一列右邊掛「已擊殺 N 隻」＋小歸零鈕（使用者要求）。
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setStyleSheet("font-weight: bold;")
         self.run_cb.setToolTip(
@@ -1003,7 +1004,21 @@ class CharFarmPage(QWidget):
             "★ 開始的當下會自動把天使精靈的主開關「開啟天使守護精靈」打開\n"
             "　 （本來就開著就不動它；停止掛機也不會幫你關）。")
         self.run_cb.toggled.connect(self._on_toggle)
-        root.addWidget(self.run_cb)
+        run_bar = QHBoxLayout()
+        run_bar.addWidget(self.run_cb)
+        # ★ 擊殺數放在主開關旁邊（使用者要求）。**不存設定** —— 開程式
+        #   歸零；停止／再開始掛機**不**歸零，只有旁邊的小按鈕會歸零。
+        self.kills_lbl = QLabel("已擊殺 0 隻")
+        run_bar.addSpacing(16)
+        run_bar.addWidget(self.kills_lbl)
+        self.kills_reset_btn = QPushButton("歸零")
+        self.kills_reset_btn.setToolTip("把擊殺數歸零（不影響掛機）。")
+        self.kills_reset_btn.setFixedSize(44, 22)   # 小顆就好（使用者要求）
+        self.kills_reset_btn.clicked.connect(self._reset_kills)
+        run_bar.addSpacing(4)
+        run_bar.addWidget(self.kills_reset_btn)
+        run_bar.addStretch(1)
+        root.addLayout(run_bar)
 
         # ★ 依分類分組（使用者要求）：原本 5 條平鋪的橫列很難一眼看懂哪個是
         #   哪個，改成有標題的方框、排成兩欄，垂直空間也省下來給下面的清單。
@@ -2440,6 +2455,15 @@ class CharFarmPage(QWidget):
             + f"　距離 {d:.1f} 格　累計擊殺 {self._kills}")
         return True
 
+    def _bump_kills(self) -> None:
+        self._kills += 1
+        self.kills_lbl.setText(f"已擊殺 {self._kills} 隻")
+
+    def _reset_kills(self) -> None:
+        """歸零鈕。擊殺數不存設定：開程式從 0 起算，重開始也不歸零。"""
+        self._kills = 0
+        self.kills_lbl.setText("已擊殺 0 隻")
+
     def _on_died(self, eid: int, confirmed: bool = True) -> None:
         """攻擊執行緒回報目標沒了 —— 立刻從既有清單接下一隻。
 
@@ -2451,7 +2475,7 @@ class CharFarmPage(QWidget):
         """
         m = self._cur
         if confirmed:
-            self._kills += 1
+            self._bump_kills()
         # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
         self._killed[eid] = time.monotonic() + (
             KILL_MEMORY if confirmed else NOHP_MEMORY)
@@ -2493,13 +2517,14 @@ class CharFarmPage(QWidget):
                     robot.end_supply(self._mover, self.sc)
                 self._robot_ours = False
             # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
-            self.status.setText(f"已停止（本次擊殺 {self._kills} 隻）")
+            self.status.setText(f"已停止（累計擊殺 {self._kills} 隻）")
             return
         # ★ 不再擋「還沒掃描」或「還沒選怪」：掃描本來就一直在背景跑，
         #   選中怪物也可以邊掛邊加。沒選到怪就只是不打而已 ——
         #   不需要用彈窗擋住使用者。
         want = self.wanted()
-        self._kills = 0
+        # ⛔ 這裡以前會把 _kills 歸零 —— 拿掉了（使用者要求）：擊殺數顯示在
+        #   主開關旁邊，只有旁邊的「歸零」鈕和重開程式會歸零。
         self._killed.clear()
         self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
         self._cur = None
@@ -2594,7 +2619,7 @@ class CharFarmPage(QWidget):
                         else:
                             self._stop_with(
                                 f"☠ 角色死亡 → 已自動停止掛機"
-                                f"（本次擊殺 {self._kills} 隻）")
+                                f"（累計擊殺 {self._kills} 隻）")
                         return
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
@@ -2657,7 +2682,7 @@ class CharFarmPage(QWidget):
                     return
             if d is not None and d[0] <= 0:
                 self._stop_with(f"🔧 武器已損壞（耐久 0）→ 已自動停止掛機"
-                                f"（本次擊殺 {self._kills} 隻）")
+                                f"（累計擊殺 {self._kills} 隻）")
                 self.notify("武器已損壞（耐久 0），掛機已自動停止。")
                 return
 
