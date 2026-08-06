@@ -638,6 +638,57 @@ class Mover:
         finally:
             self._lock.release()
 
+    def walk_near(self, scanner, player_obj: int, tile_x: float,
+                  tile_y: float, keep: float) -> bool:
+        """**近距離微調**：不尋路，直接走到「離目標 keep 格、在我這一側」的點。
+
+        為什麼要有它（2026-08-06 實拍）：唯讀跟拍抓到雪狐**站在 2.2 格、
+        怪滿血、沒在走、卡 8.2 秒**。近戰打得到 2.0 格，2.2 就差那麼一點，
+        照理該再走近 —— 但走不了：`walk_route()` 一開頭要對怪尋路，而
+        **尋路到貼身的目標一定回 0**（等於算路徑到自己腳下那一格），
+        接力用的中繼點又都比實際距離遠，於是整趟回 0、一步都沒動。
+        角色就這樣杵著，直到怪自己走過來或卡住偵測逾時 —— 使用者說的
+        「發呆一段時間然後又開始打」。
+
+        ⚠ 這裡**故意不尋路**：短短一兩格用不著，而且尋路正是壞掉的那一步。
+        ⚠ 目的地一律在「怪 → 我」這條線上、離怪 keep 格 —— 不會落在怪自己
+          的格子上（那會被伺服器整段退回，見 [[walk-to-monster-rules]] 規則①）。
+        ⚠ 一樣走 `WALK_FN`，不是 `MOVE_FN`（規則②：少了收尾攻擊會被忽略）。
+        ⚠ 只給**短距離**用（呼叫端自己判斷）：長距離、隔著地形還是要
+          `walk_route()` 讓遊戲算路。
+        """
+        if not self._active or not player_obj:
+            return False
+        this = pathfinder_this(scanner)
+        if not this:
+            return False
+        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
+        if not raw:
+            return False
+        wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
+        cx, cy = wx / entity.TILE_UNITS, wy / entity.TILE_UNITS
+        dx, dy = cx - tile_x, cy - tile_y
+        d = math.hypot(dx, dy)
+        keep = max(keep, MIN_GAP)
+        if d < 0.05:                       # 完全重疊，方向算不出來 → 隨便挑一邊
+            dx, dy, d = 1.0, 0.0, 1.0
+        gx, gy = tile_x + dx / d * keep, tile_y + dy / d * keep
+        with self._wanted_lock:            # 跟 walk_route 一樣要舉手搶指令槽
+            self._wanted += 1
+        try:
+            got = self._lock.acquire(timeout=SLOT_YIELD)
+        finally:
+            with self._wanted_lock:
+                self._wanted -= 1
+        if not got:
+            return False
+        try:
+            return self.call(WALK_FN, this, wx, wy,
+                             int(gx * entity.TILE_UNITS) & 0xFFFF,
+                             int(gy * entity.TILE_UNITS) & 0xFFFF, 0)
+        finally:
+            self._lock.release()
+
     @staticmethod
     def read_path(scanner, count: int) -> list[tuple[float, float]]:
         """讀出剛才 path_to() 算好的路徑點（格子座標）。

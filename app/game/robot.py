@@ -26,6 +26,7 @@ from __future__ import annotations
 import struct
 import time
 
+from app.core.memory import VALUE_TYPES
 from app.game import itemname, lua
 
 # ⚠ 這兩個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
@@ -225,26 +226,26 @@ def _res_id(mover, scanner, name: str, fallback: int) -> int:
 def set_run(mover, scanner, on: bool) -> tuple[bool, object]:
     """開／關天使守護精靈。回傳 (旗標最後是不是想要的值, 說明)。
 
-    ⚠⚠ **光叫 `game.setrobotisrun` 不夠**：那只寫內部旗標，畫面上
-      「開啟天使守護精靈」那個勾選框**不會跟著變** —— 使用者看起來就是沒開。
-      那個勾選框掛在精靈面板底下，面板沒建立時 `WND_AUTOROBOT` 是 0、
-      根本碰不到，所以必要時要先 `CreateRobotWindow()` 把面板開出來。
+    ⚠⚠⚠ **不要再去動畫面上那個勾選框**（2026-08-06 使用者實際踩到）。
+      以前這裡會叫 `CreateRobotWindow` / `window.setcheck` /
+      `OnClickOpenCloseRobot` 讓勾選框跟著變 —— 那些都是 Lua，而從外部呼叫
+      Lua 有一個**還沒根治**的破口：我們「讀 top → 寫參數 → 寫 top」的中間，
+      遊戲主執行緒自己的 UI Lua 會插隊，堆疊就此錯位。症狀正是使用者回報的
+      「用了我們的自動戰鬥之後，去點精靈面板的勾選框，遊戲就崩潰」。
+      `CreateRobotWindow` 更毒：開視窗會自己抽訊息 → 重入跳板。
+    ★ 現在只寫 `RUN_FLAG`（純記憶體）。行為完全一樣 ——
+      `game.setrobotisrun` 本來就只是寫這個旗標（見檔頭的反組譯筆記），
+      而遊戲判斷「精靈在不在跑」看的也是它。
+    ⚠ 代價：**面板上的勾選框可能顯示成舊的**（那是遊戲自己畫的），
+      重開面板就會對。這是刻意的取捨 —— 顯示不同步只是看起來怪，
+      去戳它卻會讓遊戲崩潰。
     """
-    cid = _res_id(mover, scanner, "AUTOROBOT_CHECK_RES_ID", 14219)
-    wnd = _wnd(mover, scanner, "WND_AUTOROBOT")
-    if not wnd:
-        lua.call(mover, scanner, "CreateRobotWindow")
-        wnd = _wnd(mover, scanner, "WND_AUTOROBOT")
-    if wnd:
-        lua.call(mover, scanner, "window.setcheck", wnd, cid, bool(on))
-        lua.call(mover, scanner, "OnClickOpenCloseRobot", cid)
-    lua.call(mover, scanner, "game.setrobotisrun", bool(on))
-
+    try:
+        scanner.write_value(RUN_FLAG, VALUE_TYPES["int32"],
+                            RUN_ON if on else RUN_OFF)
+    except Exception as exc:                               # noqa: BLE001
+        return False, f"寫不進旗標（{exc}）"
     good = is_run(scanner) == bool(on)
-    checked = lua.call(mover, scanner, "window.ischeck", wnd, cid)[1] if wnd \
-        else None
-    if good and checked is not None and checked is not bool(on):
-        return False, f"旗標對了但勾選框還是 {checked}"
     return good, ("" if good else "旗標沒變成想要的值")
 
 
@@ -260,34 +261,61 @@ def get_bool(mover, scanner, var_id: int) -> tuple[bool, object]:
     return lua.call(mover, scanner, "game.getrobotvar_bool", var_id)
 
 
+def _write_var(scanner, data_id: int, want_type: int, value: int) -> bool:
+    """★★★ 直接把設定寫進記憶體（**完全不碰 Lua**）。
+
+    版面跟 `_read_var` 同一份（值記錄 +8 型別、+0xC 值），所以寫之前
+    一定會先確認「這一筆存在而且型別對」—— 型別不符就不寫，回 False
+    讓呼叫端退回 Lua。
+
+    ⚠⚠ **為什麼要有這支**：以前改設定走 `game.setrobotvar_*`（Lua）。
+      從外部呼叫 Lua 有一個**還沒根治**的破口 —— 我們「讀 top → 寫參數 →
+      寫 top」的中間，遊戲主執行緒自己的 UI Lua 會插隊，堆疊就此錯位；
+      症狀是**過一陣子之後**去點精靈面板上的勾選框，遊戲當場崩潰
+      （使用者實際遇到）。純記憶體寫入沒有這個問題。
+      （見 [[game-crash-root-causes]] 的「還沒修」那一節。）
+    ⚠ 畫面上的勾選框不會跟著動（那是遊戲自己畫的）——**我們也不再去動它**：
+      要改畫面就得呼叫 Lua 的 window.setcheck，那正是會出事的那條路。
+      面板重開一次就會顯示正確的值。
+    """
+    rec = _find_var(scanner, data_id)
+    if rec is None or rec is _MISSING:
+        return False
+    raw = scanner._read_bytes(rec + _V_TYPE, 4)
+    if not raw or raw[0] != want_type:
+        return False                       # 型別不對就別亂寫
+    try:
+        scanner.write_value(rec + _V_VALUE, VALUE_TYPES["int32"], int(value))
+    except Exception:                                      # noqa: BLE001
+        return False
+    return _read_var(scanner, data_id, want_type) == (
+        bool(value) if want_type == VAR_T_BOOL else int(value))
+
+
 def set_bool(mover, scanner, var_id: int, value: bool) -> tuple[bool, object]:
-    """改精靈的一個布林設定。
+    """改精靈的一個布林設定。**先用純記憶體寫**，寫不了才退回 Lua。
 
     ⚠ 平常不要用 —— 那是使用者在遊戲裡設好的東西，我們不該偷改。
       留著是為了「缺哪一項就補哪一項」這種明確的情境。
     """
+    if _write_var(scanner, var_id, VAR_T_BOOL, 1 if value else 0):
+        return True, bool(value)
     return lua.call(mover, scanner, "game.setrobotvar_bool", var_id,
                     bool(value))
 
 
 def set_int(mover, scanner, var_id: int, value: int) -> tuple[bool, object]:
     """改精靈的一個整數設定。注意事項同 `set_bool`：平常不要用。"""
+    if _write_var(scanner, var_id, VAR_T_INT, int(value)):
+        return True, int(value)
     return lua.call(mover, scanner, "game.setrobotvar_int", var_id, int(value))
 
 
-def _sync_check(mover, scanner, wnd_name: str, cid: int, on: bool) -> None:
-    """精靈面板那一頁開著的話，把畫面上的勾選框跟著改。
-
-    只動畫面，行為由 setrobotvar_* 決定 —— 少了這步使用者打開面板會看到
-    勾選跟實際行為對不上（跟 `set_run` 遇到的是同一件事）。頁面沒開就不動。
-    """
-    wnd = _wnd(mover, scanner, wnd_name)
-    if not wnd:
-        return
-    ok, exists = lua.call(mover, scanner, "window.isexist", wnd, cid)
-    if ok and exists is True:
-        lua.call(mover, scanner, "window.setcheck", wnd, cid, bool(on))
-
+# ⛔ `_sync_check()`（用 Lua 的 window.setcheck 讓畫面勾選框跟著變）**已移除**。
+#   它是「使用了我們的自動戰鬥之後，去點精靈面板的勾選框，遊戲就崩潰」的
+#   來源：從外部呼叫 Lua 會跟遊戲主執行緒自己的 UI Lua 搶堆疊（那個破口
+#   還沒根治，見 [[game-crash-root-causes]] 的「還沒修」）。
+#   取捨：畫面顯示可能跟實際設定不同步（重開面板就會對），但不會把遊戲弄崩。
 
 def apply_prefs(mover, scanner, *, main_switch: bool = False,
                 jump_back: bool = False,
@@ -315,16 +343,12 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
         ok, cur = get_bool(mover, scanner, AS_USE_RETURN_SCROLL)
         if ok and cur is not False:
             set_bool(mover, scanner, AS_USE_RETURN_SCROLL, False)
-            _sync_check(mover, scanner, "WND_AUTOSUPPLY",
-                        SUPPLY_SCROLL_CHECK_ID, False)
             notes.append("關了「標記傳送捲軸回練功點」")
 
     if revive_recall:
         ok, cur = get_bool(mover, scanner, AS_AUTO_REVIVE)
         if ok and cur is not True:
             set_bool(mover, scanner, AS_AUTO_REVIVE, True)
-            _sync_check(mover, scanner, "WND_AUTOASSIST",
-                        REVIVE_CHECK_ID, True)
             notes.append("開了「陣亡時自動復活」")
         cur = get_int(mover, scanner, AS_REVIVE_MODE)
         if cur is not None and cur != REVIVE_RECALL:
@@ -656,12 +680,15 @@ AUTOFIGHT_CHECK_ID = 960          # 面板上「自動攻擊」勾選框（XML �
 
 
 def set_autofight(mover, scanner, on: bool) -> None:
-    """開／關「自動攻擊」。面板開著的話連勾選框一起動，畫面才不會對不上。
+    """開／關「自動攻擊」。
 
     ⚠ 這裡**不叫** `OnCheckAutoFight` —— 那是舊版路徑（會去註冊一個計時器），
       而且被 `[0x8909BA]` 擋著。真正決定行為的是變數 `AF_BOL_ISAUTOFIGHT`。
+    ⚠⚠ 也**不再同步畫面上的勾選框**：那要走 Lua 的 window.setcheck，而從
+      外部呼叫 Lua 會跟遊戲自己的 UI Lua 搶堆疊 —— 使用者實際踩到的症狀是
+      「之後去點精靈面板的勾選框，遊戲當場崩潰」。顯示不同步只是看起來怪，
+      重開面板就會對；把遊戲弄崩才是大事。見 set_run 的說明。
     """
-    _sync_check(mover, scanner, "WND_AUTOFIGHT", AUTOFIGHT_CHECK_ID, bool(on))
     set_bool(mover, scanner, AF_IS_AUTO_FIGHT, bool(on))
 
 
