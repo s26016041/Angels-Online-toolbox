@@ -88,7 +88,10 @@ def _send_batch(mover, scanner, batch) -> tuple[bool, str]:
         if not 0x10000 < data < 0x7FFF0000:
             return False, "封包資料指標不合理"
         # 代號已經由建構函式寫在 +0，我們從 +2 接著寫件數與各件明細。
-        mover.write(data + 2, payload)
+        # 長度剛好填滿：2(代號) + 4(件數) + 12×件數 = 內文長度，不會寫過頭。
+        # ⚠ 寫失敗就**不要送** —— 半成品送出去等於叫伺服器解讀垃圾。
+        if not mover.write(data + 2, payload):
+            return False, "寫封包內容失敗"
         # ⚠⚠ 連線與封包指標送出去之前先擋掉 0：重連／載地圖時 [conn] 會是 0，
         #   而送出函式是拿它去算位址之後才檢查 NULL 的（跟 jumpmap 同一個坑）。
         conn, pkt = _u32(scanner, conn_ptr), _u32(scanner, buf + 0xC)
