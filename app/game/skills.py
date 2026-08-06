@@ -87,17 +87,19 @@ def name_of(skill_id: int) -> str:
 
 _ranges: dict[int, int] | None = None
 _targets: dict[int, str] | None = None
+_attacks: set[int] | None = None
 
 GROUND = "地面"          # 對象＝地面：施放要指定位置（見 is_ground）
 
 
 def _load_ranges() -> None:
-    """射程／對象表（id \\t 射程 \\t 對象）。只在第一次用到時載入。"""
-    global _ranges, _targets
+    """射程／對象／攻擊型表（id \\t 射程 \\t 對象 \\t 攻擊型）。第一次用到才載入。"""
+    global _ranges, _targets, _attacks
     if _ranges is not None:
         return
     rng: dict[int, int] = {}
     tgt: dict[int, str] = {}
+    atk: set[int] = set()
     try:
         with gzip.open(resource(RANGE_FILE), "rt", encoding="utf-8") as f:
             for line in f:
@@ -106,9 +108,29 @@ def _load_ranges() -> None:
                     rng[int(p[0])] = int(p[1])
                 if len(p) >= 3 and p[2]:
                     tgt[int(p[0])] = p[2]
+                if len(p) >= 4 and p[3] == "1":
+                    atk.add(int(p[0]))
     except Exception:                                      # noqa: BLE001
-        rng, tgt = {}, {}
-    _ranges, _targets = rng, tgt
+        rng, tgt, atk = {}, {}, set()
+    _ranges, _targets, _attacks = rng, tgt, atk
+
+
+def is_attack(skill_id: int) -> bool:
+    """這招打不打得死怪（遊戲資料的「攻擊型」）。
+
+    ★★ 掛機的攻擊循環**只收攻擊型**。實際踩到的坑：黑狐把技能鍵勾成
+      F3 瞬移術Ⅳ —— 那是位移技能，我們照樣每 0.15 秒送一次帶座標的施放，
+      等於**不停往怪的位置瞬移**，距離在 0.4~24 格之間亂跳、一次都沒交戰，
+      然後「10 秒沒進展 → 換一隻」無限循環（使用者回報的卡住）。
+    ⚠ **只有表裡明確說「不是攻擊型」才擋**。整張表壞掉、或改版後出現表裡
+      沒有的新技能，一律當成攻擊技能放出去 —— 寧可多放一招，也不要讓使用者
+      的技能鍵被靜默跳過（那種故障最難查）。
+    """
+    _load_ranges()
+    sid = int(skill_id or 0)
+    if not _attacks or sid not in (_ranges or {}):
+        return True                       # 表壞了／表裡沒這一筆：不要因此癱瘓
+    return sid in _attacks
 
 
 def target_of(skill_id: int) -> str:
