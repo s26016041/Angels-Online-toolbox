@@ -77,6 +77,15 @@ SIGS: tuple[Sig, ...] = (
     Sig("attack", "CAST_FN", "fn", None,
         "55 8B EC 83 EC 10 56 8B 75 08 85 F6 7E 3D 6A 12 6A 06 8D 4D F0 E8 ?? ?? ?? ??",
         0x00559EDA),
+    # 攻擊指令包（近戰物理技能的關鍵，見 attack.THIRD_FN）。錨在
+    # push 8/push 5（封包長 8、代號 5）＋把目標寫進封包與全域那幾行；
+    # 兩個 call 的 rel32 與兩個全域位址放萬用。known 是 2026-08-06 的位址
+    # （= 8/3 的 0x559FBE 改版搬家後的位置）。
+    Sig("attack", "THIRD_FN", "fn", None,
+        "55 8B EC 83 EC 10 6A 08 6A 05 8D 4D F0 E8 ?? ?? ?? ?? 8B 4D F4"
+        " 8B 45 08 FF 75 FC 89 41 02 A3 ?? ?? ?? ?? 66 8B 45 0C 66 89 41 06"
+        " FF 35 ?? ?? ?? ?? E8",
+        0x00559EA0),
     Sig("jumpmap", "BUILD_FN", "fn", None,
         "55 8B EC 56 8B F1 33 C0 57 8B 7D 0C 57 89 06 89 46 04 89 46 08"
         " 89 46 0C E8 ?? ?? ?? ?? 8B 4E 04 66 8B 45 08 66 89 01",
