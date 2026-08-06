@@ -75,6 +75,28 @@ HIST_MAX = 800              # 只留最近這麼多列，掛整晚也不會吃�
 # 佈景是深色的（app/theme.py BG = #1e2230），這兩個亮色在上面都很清楚。
 GRADE_FG = {bag.GRADE_FINE: QColor("#00F7FF"), bag.GRADE_TOP: QColor("#FFCE10")}
 
+def _refill(table, stretch_col: int, fill) -> None:
+    """整批重填表格 —— 填的期間把表頭的自動欄寬關掉。
+
+    ⚠⚠ 表頭是 ResizeToContents 時，**每一次 setItem 都會同步重量整欄**
+      （把該欄每一列都量一遍）。整張重畫就是 O(格數 × 列數)：
+      歷史表 800 列 × 5 欄 = 4000 次 setItem、每次掃 800 列，
+      一次重畫要燒幾十秒 CPU —— 賣到歷史滿 800 列之後，重畫比結算
+      間隔還慢，介面就永久凍住（實際發生：賣了 1000 多件之後整支
+      程式未回應；py-spy 抓到主執行緒卡在 setItem，記憶體平穩）。
+    做法：填之前切成 Fixed（setItem 變 O(1)），填完切回
+      ResizeToContents —— 切回去那一下才做**一次**整欄重量，
+      結果一樣、工作量少四千倍。
+    """
+    hh = table.horizontalHeader()
+    hh.setSectionResizeMode(QHeaderView.Fixed)
+    try:
+        fill()
+    finally:
+        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(stretch_col, QHeaderView.Stretch)
+
+
 REFRESH_MS = 1000           # 背包即時更新的間隔（純讀，一次幾毫秒）
 AUTO_MS = 3000              # 自動賣出的間隔 —— 使用者指定 3 秒
 # 送出到「背包少一件、金幣變多」反映出來要多久。用回程道具實測是 1.5 秒才換地圖，
@@ -300,6 +322,13 @@ class SellTab(BaseTab):
         keep = keep or set()
         self._rows = rows
         self.table.blockSignals(True)
+        # ⚠ 一定要包 _refill：這張表每秒都可能整批重畫（撿東西、賣東西
+        #   背包就變），不包的話每格 setItem 都重量欄寬，介面會越用越卡。
+        _refill(self.table, COL_NAME, lambda: self._fill_rows(rows, keep))
+        self.table.blockSignals(False)
+        self._update_sum()
+
+    def _fill_rows(self, rows: list[bag.Item], keep: set) -> None:
         self.table.setRowCount(len(rows))
         for r, it in enumerate(rows):
             chk = QTableWidgetItem()
@@ -333,8 +362,6 @@ class SellTab(BaseTab):
                 if fg is not None and c in (COL_NAME, COL_GRADE):
                     cell.setForeground(fg)
                 self.table.setItem(r, c, cell)
-        self.table.blockSignals(False)
-        self._update_sum()
 
     # ------------------------------------------------------------------
     def _checked(self) -> list[bag.Item]:
@@ -523,19 +550,9 @@ class SellTab(BaseTab):
     def _refresh_stats(self) -> None:
         pid, sc = self._cur()
         log = self._hist.get(pid, []) if pid is not None else []
-        self.hist.setRowCount(len(log))
-        for r, (t, name, grade_name, count, money, grade) in enumerate(log):
-            fg = GRADE_FG.get(grade)
-            for c, text, right in ((0, t, False), (1, name, False),
-                                   (2, grade_name, True),
-                                   (3, f"{count:,}", True),
-                                   (4, f"{money:,}", True)):
-                cell = QTableWidgetItem(text)
-                if right:
-                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if fg is not None and c in (1, 2):
-                    cell.setForeground(fg)
-                self.hist.setItem(r, c, cell)
+        # ⚠ 一定要包 _refill：這張表滿載 800 列、每次結算都整張重畫，
+        #   就是「賣了一千多件之後整支程式凍死」的那顆地雷（見 _refill）。
+        _refill(self.hist, 1, lambda: self._fill_hist(log))
         if log:
             self.hist.scrollToBottom()
         if sc is not None:
@@ -550,6 +567,21 @@ class SellTab(BaseTab):
         extra = "" if earned == listed else f"（價目表算是 {listed:,}）"
         self.total_lbl.setText(
             f"共賣出 {len(log)} 件　實際入帳 {earned:,} 金幣{extra}")
+
+    def _fill_hist(self, log: list[tuple]) -> None:
+        self.hist.setRowCount(len(log))
+        for r, (t, name, grade_name, count, money, grade) in enumerate(log):
+            fg = GRADE_FG.get(grade)
+            for c, text, right in ((0, t, False), (1, name, False),
+                                   (2, grade_name, True),
+                                   (3, f"{count:,}", True),
+                                   (4, f"{money:,}", True)):
+                cell = QTableWidgetItem(text)
+                if right:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if fg is not None and c in (1, 2):
+                    cell.setForeground(fg)
+                self.hist.setItem(r, c, cell)
 
     def _clear_hist(self) -> None:
         pid, _sc = self._cur()
