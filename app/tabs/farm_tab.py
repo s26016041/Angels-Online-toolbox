@@ -1013,11 +1013,12 @@ class CharFarmPage(QWidget):
         run_bar.addWidget(self.kills_lbl)
         self.kills_reset_btn = QPushButton("歸零")
         self.kills_reset_btn.setToolTip("把擊殺數歸零（不影響掛機）。")
-        # 小顆就好（使用者要求），但要照字型量寬高 —— 寫死 44x22 在
-        # 這個字型下「歸零」兩個字會被砍半（使用者實際看到）。
+        # 小顆就好（使用者要求），但要照字型量寬高 —— 寫死 44x22 會把字
+        # 砍半。⚠ 內距 +20 實測還是被切（Windows 原生按鈕左右各吃 ~10px
+        # 邊框＋焦點框），使用者要求再加長一點 → +32。
         fm = self.kills_reset_btn.fontMetrics()
         self.kills_reset_btn.setFixedSize(
-            fm.horizontalAdvance("歸零") + 20, fm.height() + 8)
+            fm.horizontalAdvance("歸零") + 32, fm.height() + 8)
         self.kills_reset_btn.clicked.connect(self._reset_kills)
         run_bar.addSpacing(4)
         run_bar.addWidget(self.kills_reset_btn)
