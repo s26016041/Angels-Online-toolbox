@@ -104,8 +104,10 @@ class AutoBuff:
             return self.note
 
         # ② 時間還夠 → 什麼都不做
+        #   ⛔ 這裡不要回「分身還有 X.X 分」的倒數 —— 那個字每 6 秒變一次，
+        #     狀態列會被它一直蓋掉（使用者明講不要在下面看到倒數）。
+        #     狀態列只留事件：放了／補了／失敗。
         if self._cast_at and self.left() > LEAD:
-            self.note = f"分身還有 {self.left() / 60:.1f} 分"
             return self.note
         if now - self._sent_at < RETRY and self._sent_at:
             return self.note                    # 剛失敗過，先等等
