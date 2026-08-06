@@ -36,6 +36,10 @@
 送出封包不代表賣掉了（伺服器可能不收）。所以每一輪送完之後會**等 0.9 秒再對一次
 背包**：真的從背包消失的才記進歷史；金額用**金幣的實際變化量**，不是用價目表估的。
 兩個數字都會顯示，對不上時一眼就看得出來。
+
+紀錄的壽命（使用者指定）：只算「這次開程式」，不存檔，關掉就歸零。
+表格只留最近 500 筆；**件數與金額的總計另外累加**，不受表格上限影響
+（不然賣超過上限之後「共賣出」就卡住不動）。
 """
 from __future__ import annotations
 
@@ -68,7 +72,8 @@ COLS = ("賣", "格", "名稱", "品質", "數量", "耐久", "單價", "小計"
 
 HIST_COLS = ("時間", "物品", "品質", "數量", "表定金額")
 HIST_HEIGHT = 140
-HIST_MAX = 800              # 只留最近這麼多列，掛整晚也不會吃掉記憶體
+HIST_MAX = 500              # 表格只留最近這麼多筆（使用者指定）；
+                            # 件數／金額的**總計另外累加**，不受這個上限影響
 
 # 名稱與品質欄的字色，**直接用遊戲自己那三個顏色**（見 app/game/bag.py）：
 # 普通不上色（跟著佈景走＝白）、優質 #00F7FF 青藍、頂級 #FFCE10 橘金。
@@ -114,8 +119,13 @@ class SellTab(BaseTab):
         self._movers: dict[int, move.Mover] = {}
         self._rows: list[bag.Item] = []      # 跟表格列一一對應
         self._sig = None                     # 背包內容的指紋，變了才重畫
-        # pid -> [(時間, 名稱, 品質, 數量, 表定金額)]
+        # pid -> [(時間, 名稱, 品質, 數量, 表定金額, 品質代號)]
+        # ⚠ 只記在記憶體，關掉程式就歸零 —— 使用者指定紀錄只算「這次」。
         self._hist: dict[int, list[tuple]] = {}
+        # 總計跟表格分開記（使用者指定）：表格只留 HIST_MAX 筆，
+        # 但件數與金額要一直累加下去，不能被表格上限吃掉。
+        self._sold_n: dict[int, int] = {}    # pid -> 總共賣掉幾件
+        self._listed: dict[int, int] = {}    # pid -> 表定金額總和
         self._earned: dict[int, int] = {}    # pid -> 金幣實際增加的總和
         self._auto: frozenset[int] | None = None   # 自動賣哪些品質；None = 沒在跑
         self._pending = None                 # (pid, {鍵: 物品}, 賣之前的金幣)
@@ -206,7 +216,8 @@ class SellTab(BaseTab):
         root.addLayout(auto)
 
         # --- 歷史統計 ----------------------------------------------------
-        box = QGroupBox("賣出紀錄")
+        box = QGroupBox(
+            f"賣出紀錄（表格只留最近 {HIST_MAX} 筆，總計會一直累加；關掉程式全部歸零）")
         bl = QVBoxLayout(box)
         self.hist = QTableWidget(0, len(HIST_COLS))
         self.hist.setHorizontalHeaderLabels(HIST_COLS)
@@ -224,6 +235,7 @@ class SellTab(BaseTab):
         refresh_btn.clicked.connect(self._refresh_stats)
         hb.addWidget(refresh_btn)
         clear_btn = QPushButton("清空紀錄")
+        clear_btn.setToolTip("清掉這個分身的紀錄表和總計。關掉程式也會自動歸零。")
         clear_btn.clicked.connect(self._clear_hist)
         hb.addWidget(clear_btn)
         hb.addStretch(1)
@@ -537,6 +549,9 @@ class SellTab(BaseTab):
             log.append((now, it.name, it.grade_name, it.count,
                         it.price * it.count, it.grade))
         del log[:-HIST_MAX]
+        self._sold_n[pid] = self._sold_n.get(pid, 0) + len(sold)
+        self._listed[pid] = (self._listed.get(pid, 0)
+                             + sum(it.price * it.count for it in sold))
         self._earned[pid] = self._earned.get(pid, 0) + gained
         self.status.setText(
             f"✔ 賣掉 {len(sold)} 件，金幣 +{gained:,}")
@@ -559,14 +574,18 @@ class SellTab(BaseTab):
             money = bag.gold(sc)
             self.gold_lbl.setText(
                 f"金幣 {money:,}" if money is not None else "金幣 —")
-        if not log:
+        # ★ 總計用另外累加的數字，不用表格算 —— 表格砍到 HIST_MAX 筆之後
+        #   還拿它算的話，「共賣出」就會卡在上限不動（實際發生過：賣了
+        #   1000 多件、顯示停在 800）。
+        n = self._sold_n.get(pid, 0) if pid is not None else 0
+        if not n:
             self.total_lbl.setText("這個分身還沒賣過東西")
             return
-        listed = sum(row[4] for row in log)
+        listed = self._listed.get(pid, 0)
         earned = self._earned.get(pid, 0)
         extra = "" if earned == listed else f"（價目表算是 {listed:,}）"
         self.total_lbl.setText(
-            f"共賣出 {len(log)} 件　實際入帳 {earned:,} 金幣{extra}")
+            f"共賣出 {n:,} 件　實際入帳 {earned:,} 金幣{extra}")
 
     def _fill_hist(self, log: list[tuple]) -> None:
         self.hist.setRowCount(len(log))
@@ -588,6 +607,8 @@ class SellTab(BaseTab):
         if pid is None:
             return
         self._hist.pop(pid, None)
+        self._sold_n.pop(pid, None)
+        self._listed.pop(pid, None)
         self._earned.pop(pid, None)
         self._refresh_stats()
 
