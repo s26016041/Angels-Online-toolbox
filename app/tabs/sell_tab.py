@@ -18,10 +18,17 @@
 ⚠ 只列遊戲認定的背包格（0x14~0xA9）。**身上穿著的裝備不在裡面**，
   所以這個分頁不可能把你正在穿的東西賣掉。
 ⚠ 售價 <= 0 的東西遊戲自己就不讓賣，這裡也一樣列成「賣不掉」且不能勾。
+
+品質（普通白／優質藍／頂級橘）
+------------------------------
+**不是看名字認的**，是讀遊戲畫名字顏色時用的那個欄位（範本 +0x130），
+拿 `setting/base/item*.xml` 的 `顏色=` 欄整張對帳過 —— 32476 筆 100% 吻合。
+細節見 `app/game/bag.py`。所以「只勾普通白裝」可以安心按：藍的橘的不會被勾到。
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -40,8 +47,14 @@ from app.core.memory import MemoryScanner
 from app.game import bag, locate, move, sell
 from app.tabs.base_tab import BaseTab
 
-COLS = ("賣", "格", "名稱", "數量", "耐久", "單價", "小計")
-COL_CHECK, COL_SLOT, COL_NAME, COL_COUNT, COL_DURA, COL_PRICE, COL_TOTAL = range(7)
+COLS = ("賣", "格", "名稱", "品質", "數量", "耐久", "單價", "小計")
+(COL_CHECK, COL_SLOT, COL_NAME, COL_GRADE, COL_COUNT, COL_DURA,
+ COL_PRICE, COL_TOTAL) = range(8)
+
+# 名稱與品質欄的字色，**直接用遊戲自己那三個顏色**（見 app/game/bag.py）：
+# 普通不上色（跟著佈景走＝白）、優質 #00F7FF 青藍、頂級 #FFCE10 橘金。
+# 佈景是深色的（app/theme.py BG = #1e2230），這兩個亮色在上面都很清楚。
+GRADE_FG = {bag.GRADE_FINE: QColor("#00F7FF"), bag.GRADE_TOP: QColor("#FFCE10")}
 
 
 class SellTab(BaseTab):
@@ -91,12 +104,19 @@ class SellTab(BaseTab):
         root.addWidget(self.table, 1)
 
         foot = QHBoxLayout()
+        white_btn = QPushButton("只勾普通白裝")
+        white_btn.setToolTip(
+            "只勾起「有耐久且品質是普通」的裝備 —— 優質(藍)、頂級(橘) 不會被勾到。")
+        white_btn.clicked.connect(
+            lambda: self._check(lambda it: it.is_gear
+                                and it.grade == bag.GRADE_NORMAL))
+        foot.addWidget(white_btn)
         gear_btn = QPushButton("勾選所有裝備")
-        gear_btn.setToolTip("勾起背包裡所有「有耐久」的東西（武器防具那類）。")
-        gear_btn.clicked.connect(lambda: self._check_all(gear_only=True))
+        gear_btn.setToolTip("勾起背包裡所有「有耐久」的東西（武器防具那類），不分品質。")
+        gear_btn.clicked.connect(lambda: self._check(lambda it: it.is_gear))
         foot.addWidget(gear_btn)
         none_btn = QPushButton("全部取消")
-        none_btn.clicked.connect(lambda: self._check_all(clear=True))
+        none_btn.clicked.connect(lambda: self._check(lambda it: False))
         foot.addWidget(none_btn)
         foot.addStretch(1)
         self.sum_lbl = QLabel("已勾 0 件")
@@ -188,15 +208,19 @@ class SellTab(BaseTab):
             cells = {
                 COL_SLOT: str(it.slot),
                 COL_NAME: it.name,
+                COL_GRADE: it.grade_name,
                 COL_COUNT: f"{it.count:,}",
                 COL_DURA: str(it.dura) if it.dura else "—",
                 COL_PRICE: f"{it.price:,}" if it.sellable else "賣不掉",
                 COL_TOTAL: f"{it.price * it.count:,}" if it.sellable else "—",
             }
+            fg = GRADE_FG.get(it.grade)
             for c, text in cells.items():
                 cell = QTableWidgetItem(text)
                 if c != COL_NAME:
                     cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if fg is not None and c in (COL_NAME, COL_GRADE):
+                    cell.setForeground(fg)
                 self.table.setItem(r, c, cell)
         self.table.blockSignals(False)
         self._update_sum()
@@ -210,14 +234,14 @@ class SellTab(BaseTab):
                 out.append(it)
         return out
 
-    def _check_all(self, gear_only: bool = False, clear: bool = False) -> None:
+    def _check(self, want) -> None:
+        """照 want(物品) 重新設定每一列的勾選（賣不掉的一律不勾）。"""
         self.table.blockSignals(True)
         for r, it in enumerate(self._rows):
             cell = self.table.item(r, COL_CHECK)
             if cell is None or not it.sellable:
                 continue
-            want = (not clear) and (it.is_gear or not gear_only)
-            cell.setCheckState(Qt.Checked if want else Qt.Unchecked)
+            cell.setCheckState(Qt.Checked if want(it) else Qt.Unchecked)
         self.table.blockSignals(False)
         self._update_sum()
 
@@ -227,7 +251,17 @@ class SellTab(BaseTab):
     def _update_sum(self) -> None:
         picked = self._checked()
         money = sum(it.price * it.count for it in picked)
-        self.sum_lbl.setText(f"已勾 {len(picked)} 件　約 {money:,} 金幣")
+        # ★ 勾到優質／頂級就明講。賣掉好裝備是不可逆的，數字要主動送到眼前。
+        good = [it for it in picked
+                if it.is_gear and it.grade != bag.GRADE_NORMAL]
+        warn = ""
+        if good:
+            n_fine = sum(1 for it in good if it.grade == bag.GRADE_FINE)
+            n_top = len(good) - n_fine
+            parts = ([f"優質(藍) {n_fine} 件"] if n_fine else []) + \
+                    ([f"頂級(橘) {n_top} 件"] if n_top else [])
+            warn = "　⚠ 含 " + "、".join(parts)
+        self.sum_lbl.setText(f"已勾 {len(picked)} 件　約 {money:,} 金幣{warn}")
 
     # ------------------------------------------------------------------
     def _mover(self, pid: int) -> move.Mover | None:

@@ -69,7 +69,8 @@ ITEM_SPAN = 0x5C            # 一次要讀多少 bytes 才涵蓋上面全部
 
 TMPL_KIND = 0x18            # 分類代號（裝備各部位是 2~14，藥水是 0）
 TMPL_PRICE = 0x104          # 售價；<= 0 = 這東西賣不掉
-TMPL_SPAN = 0x108
+TMPL_GRADE = 0x130          # ★ 品質（白／藍／橘），見 GRADE_NAMES
+TMPL_SPAN = 0x134
 # ⚠ 遊戲算單價其實有兩條分支（`0x602391` / `0x602457`）：
 #   `0x5533CC` 只有在**分類代號是 26 或 27、而且 +0x14 的 bit 28 有立**時才回真，
 #   那條會把單價乘上「數量 ÷ [0x7D9008 + 分類*4]」（寵物飼料那類）。
@@ -84,6 +85,30 @@ LAST_SLOT = 0xA9
 
 _MAX_SLOTS = 4096           # 容器格數的合理上限（實測 743）
 
+# ★★ 品質（普通白／優質藍／頂級橘）—— **不是靠名字認的**。
+#
+# 遊戲畫提示框時是這樣挑名字顏色的（`0x5F358A`，物品名稱那一行）：
+#
+#     mov eax,[物品+0x58]        ; 範本
+#     mov eax,[範本+0x130]       ; ← 就是這個欄位
+#     1 → "/c#888888%s/c*"       灰
+#     2 → "/c$3%s/c*"            **橘金**　┐ `$N` 是調色盤，`0x51CD4F` 查
+#     3 → "/c#00F7FF%s/c*"       **青藍**　│ `[0x8494D8 + 字元*4]`，存的是
+#     其他(含 0) → "%s"          不上色＝白 ┘ RGB565：$3 = 0xFE62 = RGB(255,206,16)
+#
+# ✅ 拿 `setting/base/item*.xml` 的 `顏色=` 欄整張對帳，**32476 筆 100% 吻合**：
+#     顏色（無）→ 0 (23738 筆)　顏色白 → 0 (457)　顏色紅 → 0 (1)
+#     顏色黃   → 2 ( 5440 筆)　顏色藍 → 3 (2840)
+#   四大裝備類（衣服／頭飾／手套／鞋子）只出現「（無）／藍／黃」三種，
+#   所以裝備的三階就是 0 / 3 / 2，沒有第四種。
+# ⚠ 記憶體分不出「顏色=白」與「沒有顏色欄」（都是 0）—— 但那 457 筆白色沒有
+#   一件是裝備類，對「賣裝備」不影響。
+# ⚠ 值 1（灰）在遊戲載進來的表裡一次都沒出現過，所以沒給它名字。
+GRADE_NORMAL = 0            # 普通（白）
+GRADE_TOP = 2               # 頂級（橘／資料表寫「黃」）
+GRADE_FINE = 3              # 優質（藍）
+GRADE_NAMES = {GRADE_NORMAL: "普通", GRADE_TOP: "頂級", GRADE_FINE: "優質"}
+
 
 @dataclass(frozen=True)
 class Item:
@@ -97,10 +122,16 @@ class Item:
     dura: int
     kind: int               # 範本的分類代號
     price: int              # 單價；<= 0 = 賣不掉
+    grade: int              # 品質，見 GRADE_NAMES
 
     @property
     def name(self) -> str:
         return itemname.of(self.type_id) or f"物品 {self.type_id}"
+
+    @property
+    def grade_name(self) -> str:
+        """'普通' / '優質' / '頂級'；認不得的值就照實顯示編號，不猜。"""
+        return GRADE_NAMES.get(self.grade, f"品質{self.grade}")
 
     @property
     def sellable(self) -> bool:
@@ -178,7 +209,7 @@ def items(scanner, first: int = FIRST_SLOT,
         return []
     ptrs = struct.unpack(f"<{hi - lo + 1}I", bytes(raw))
 
-    tmpl_cache: dict[int, tuple[int, int]] = {}
+    tmpl_cache: dict[int, tuple[int, int, int]] = {}
     out: list[Item] = []
     for offset, ptr in enumerate(ptrs):
         if not ptr:
@@ -191,15 +222,16 @@ def items(scanner, first: int = FIRST_SLOT,
         count_ = struct.unpack_from("<H", b, ITEM_COUNT)[0]
         dura = struct.unpack_from("<I", b, ITEM_DURA)[0]
         tmpl = struct.unpack_from("<I", b, ITEM_TMPL)[0]
-        kind, price = tmpl_cache.get(tmpl, (0, 0))
+        kind, price, grade = tmpl_cache.get(tmpl, (0, 0, 0))
         if tmpl and tmpl not in tmpl_cache:
             traw = scanner._read_bytes(tmpl, TMPL_SPAN)
             if traw:
                 tb = bytes(traw)
                 kind = struct.unpack_from("<I", tb, TMPL_KIND)[0]
                 price = struct.unpack_from("<i", tb, TMPL_PRICE)[0]
-            tmpl_cache[tmpl] = (kind, price)
+                grade = struct.unpack_from("<I", tb, TMPL_GRADE)[0]
+            tmpl_cache[tmpl] = (kind, price, grade)
         out.append(Item(slot=lo + offset, serial=serial, stamp=stamp,
                         type_id=type_id, count=count_, dura=dura,
-                        kind=kind, price=price))
+                        kind=kind, price=price, grade=grade))
     return out
