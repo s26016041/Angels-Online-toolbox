@@ -462,21 +462,21 @@ class KeyWorker(_Paced):
         return None
 
     def skip_note(self) -> str:
-        """勾了但**不會放**的鍵，說清楚原因（給狀態列）。
+        """勾到的鍵裡有非攻擊技能就提一下（**只是提醒，照樣會放**）。
 
-        使用者最容易踩的是「勾到不是攻擊技能的鍵」（位移／補血／buff），
-        那種放出去只會幫倒忙，循環會跳過 —— 不講的話看起來就像壞掉。
+        位移／補血／buff 這類放進攻擊循環通常沒有意義，但要不要放是使用者的
+        決定 —— 我們只負責講清楚，不替他過濾（使用者明確要求）。
         """
-        bad = []
+        note = []
         for vk in self.vks:
             sid = self.skills.get(vk)
             if sid and not skills.is_attack(sid):
                 key = (f"F{vk - quickbar.VK_F1 + 1}"
                        if quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS
                        else f"鍵{vk:#x}")
-                bad.append(f"{key}（{skills.name_of(sid) or sid}）")
-        return ("　⚠ " + "、".join(bad) + " 不是攻擊技能 → 循環中已跳過"
-                if bad else "")
+                note.append(f"{key}（{skills.name_of(sid) or sid}）")
+        return ("　※ " + "、".join(note) + " 不是攻擊型技能（照樣會放）"
+                if note else "")
 
     @property
     def min_range(self) -> int | None:
@@ -606,14 +606,11 @@ class KeyWorker(_Paced):
             #   快捷欄讀得到、但勾的鍵上一個技能都沒有 → 不出手（開始掛機時
             #   狀態列會提示）。整個讀不到（改版位移）→ 退回把勾的鍵輪流按，
             #   放什麼遊戲自己決定。
-            # ★★ 循環**只收攻擊技能**（遊戲資料的「攻擊型」）。
-            #   使用者勾到位移／輔助技能時，照送只會幫倒忙 —— 實際踩到：
-            #   黑狐勾了 F3 瞬移術，我們每 0.15 秒往怪的位置瞬移一次，
-            #   距離在 0.4~24 格之間亂跳、一次都沒交戰，然後
-            #   「10 秒沒進展 → 換一隻」無限循環。
-            #   跳過的鍵會在開始掛機時於狀態列點名（見 skip_note）。
-            usable = [k for k in vks
-                      if bykey.get(k) and skills.is_attack(bykey[k])]
+            # ◎ 使用者勾了哪些鍵就放哪些鍵 —— **不要自作主張過濾**。
+            #   ⛔ 曾經加過「只收攻擊型技能」，被使用者否決：瞬移術那類
+            #     位移技能他要能正常用。非攻擊技能只在選單與狀態列標示
+            #     （skills.is_attack），要不要放由使用者決定。
+            usable = [k for k in vks if bykey.get(k)]
             if usable:
                 vk = usable[self._rot % len(usable)]
                 skill = bykey[vk]
@@ -2777,10 +2774,7 @@ class CharFarmPage(QWidget):
                           if not self._keys.qb_ok else
                           "　⚠ 勾的技能鍵上沒有技能（空格／物品會略過）")
         else:
-            # 勾到位移／輔助技能時一定要講 —— 循環會跳過它，不講就像壞掉
-            skill_note = self._keys.skip_note()
-            if skill_note and not self._keys.min_range:
-                skill_note += "（目前沒有任何可用的攻擊技能）"
+            skill_note = self._keys.skip_note()   # 只是提醒，不會過濾
         self.status.setText(
             ("掛機中：只打「" + "、".join(want) + "」" if want
              else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
