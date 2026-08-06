@@ -21,6 +21,9 @@ DATA_FILE = "assets/skills.tsv.gz"
 # 名稱另外一張表（tools/build_skill_names.py，全部 19310 筆都有）——
 # 主表只收 buff 類，攻擊技能查名字不能靠它。
 NAMES_FILE = "assets/skill_names.tsv.gz"
+# 射程另一張表（tools/build_skill_range.py，全部 19312 筆）——
+# 主表只收 buff 類，攻擊技能查射程不能靠它。見 range_of()。
+RANGE_FILE = "assets/skill_range.tsv.gz"
 SELF_ONLY = "自己"          # 對象＝自己 的技能按了就對自己放，不用先選人
 
 
@@ -80,3 +83,31 @@ def name_of(skill_id: int) -> str:
             out = {}          # 檔案缺了就退化成顯示編號，不要爆掉
         _names = out
     return _names.get(int(skill_id or 0), "")
+
+
+_ranges: dict[int, int] | None = None
+
+
+def range_of(skill_id: int) -> int | None:
+    """技能射程（格）；查不到回 None（呼叫端要自己有退路）。
+
+    ★ 為什麼不能用主表：`skills.of()` 只收**有持續時間**的 buff，
+      攻擊技能一個都不在裡面 —— 而掛機要的正是攻擊技能能打多遠。
+      所以另外一張 skill_range.tsv.gz（tools/build_skill_range.py）。
+
+    ⚠ 這是**遊戲資料表的格數**，不是歐氏距離：斜角相鄰算一格，
+      所以實際站位要換算（近戰射程 1 實測 2.0~2.2 格都打得到）。
+    """
+    global _ranges
+    if _ranges is None:
+        out: dict[int, int] = {}
+        try:
+            with gzip.open(resource(RANGE_FILE), "rt", encoding="utf-8") as f:
+                for line in f:
+                    sid, _, rng = line.rstrip("\n").partition("\t")
+                    if rng:
+                        out[int(sid)] = int(rng)
+        except Exception:                                  # noqa: BLE001
+            out = {}
+        _ranges = out
+    return _ranges.get(int(skill_id or 0))

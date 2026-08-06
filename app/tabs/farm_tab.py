@@ -446,6 +446,17 @@ class KeyWorker(_Paced):
         return None
 
     @property
+    def min_range(self) -> int | None:
+        """輪流施放的技能裡**最短**的射程（格）；一個都查不到回 None。
+
+        ★ 取最短的：走到最短射程之內，這一輪裡每一招才都打得到。
+          （雪狐 F2 破甲劈擊射程 1；黑狐 F2 電擊術射程 12。）
+        """
+        out = [r for r in (skills.range_of(self.skills.get(vk) or 0)
+                           for vk in self.vks) if r is not None]
+        return min(out) if out else None
+
+    @property
     def selected(self) -> bool:
         """「選定」封包已經替現在這個目標送出去了嗎？
 
@@ -2988,8 +2999,20 @@ class CharFarmPage(QWidget):
         self._keys.mode = self.mode
         want = float(self.range_spin.value())
         blocked = self._path_pts > 1
-        # 送不送攻擊：**固定 12 格**，不跟著設定走。
-        reach = MELEE_RANGE if blocked else ATTACK_PACKET_RANGE
+        # ★★★ 攻擊距離**跟著現在那招的射程走**（讀遊戲自己的技能表）。
+        #   ⚠⚠ 這是「雪狐卡住」的真正根因：以前一律用 ATTACK_PACKET_RANGE
+        #     (12 格) —— 那是在**法師**身上量的（電擊術射程 12）。近戰的
+        #     破甲劈擊射程只有 1，站 3~11 格照樣被判 in_range，於是站著空打
+        #     到 10 秒逾時，換一隻再空打（使用者看到的「卡住」）。
+        #   實測（雪狐 82 級、關掉官方精靈、判準是怪自己的血量）：
+        #       站 2.0 / 2.2 格 → 3 秒打死（100%）
+        #       站 7.4 / 8.7 / 11.4 格 → 12~20 秒、101~168 次出手，**零傷害**
+        #   換算：有效歐氏距離 ≈ 射程 + 1（斜角相鄰算一格）。
+        #   查不到射程（改版新技能、快捷欄讀不到）就退回舊的 12 格。
+        rng = self._keys.min_range
+        reach_skill = (ATTACK_PACKET_RANGE if rng is None
+                       else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
+        reach = MELEE_RANGE if blocked else reach_skill
         in_range = dist is not None and dist <= reach
         # 走到多近：隔著地形就貼臉；否則走到「看過掉血的距離」，最多 want。
         # ⚠ 還沒看過掉血時（_hit_dist = 0）要用 want，**不能用 2 格** ——
@@ -3000,6 +3023,10 @@ class CharFarmPage(QWidget):
         keep = (MELEE_RANGE if blocked
                 else want if self._hit_dist <= 0
                 else max(min(MELEE_RANGE, want), min(want, self._hit_dist)))
+        # ★★ 停下來的距離**絕不能超過打得到的距離** —— 使用者把「接戰距離」
+        #   留在遠程的預設值（11）而角色是近戰時，就會停在 11 格外空打。
+        #   留 0.5 格餘裕給怪走動，下限是 MIN_GAP（再近會卡進身體）。
+        keep = min(keep, max(move.MIN_GAP, reach - 0.5))
 
         # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
         #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
@@ -3049,8 +3076,12 @@ class CharFarmPage(QWidget):
         #   我們原本走一次就不管了，怪自己貼上來就再也調不回去，
         #   然後卡在牠身體裡打不動 —— 而遠程停在 10 格永遠不會發生，
         #   所以同一份程式碼黑狐正常、雪狐會卡。
+        # ⚠ 容差不能大於「打得到的餘裕」：近戰 reach 只有 2 格，用 1.5 格容差
+        #   等於允許站在 2.9 格不動 —— 那裡一滴血都打不掉（實測 7 格以上
+        #   101 次出手零傷害，2.2 格 3 秒打死）。遠程 reach 12 不受影響。
+        slack = min(WALK_SLACK, max(0.3, reach - gkeep))
         need_walk = gd is not None and (
-            gd > gkeep + WALK_SLACK or (not in_range and gd > gkeep)
+            gd > gkeep + slack or (not in_range and gd > gkeep)
             or gd < move.MIN_GAP)
         # ★ 還在趕路（離目標 > FAR_ENOUGH）就用短冷卻，貼身微調維持 0.4 秒。
         walk_gap = (WALK_GAP_FAR if (gd is not None and gd > FAR_ENOUGH)
