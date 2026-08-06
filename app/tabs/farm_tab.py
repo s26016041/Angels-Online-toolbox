@@ -1013,7 +1013,11 @@ class CharFarmPage(QWidget):
         run_bar.addWidget(self.kills_lbl)
         self.kills_reset_btn = QPushButton("歸零")
         self.kills_reset_btn.setToolTip("把擊殺數歸零（不影響掛機）。")
-        self.kills_reset_btn.setFixedSize(44, 22)   # 小顆就好（使用者要求）
+        # 小顆就好（使用者要求），但要照字型量寬高 —— 寫死 44x22 在
+        # 這個字型下「歸零」兩個字會被砍半（使用者實際看到）。
+        fm = self.kills_reset_btn.fontMetrics()
+        self.kills_reset_btn.setFixedSize(
+            fm.horizontalAdvance("歸零") + 20, fm.height() + 8)
         self.kills_reset_btn.clicked.connect(self._reset_kills)
         run_bar.addSpacing(4)
         run_bar.addWidget(self.kills_reset_btn)
