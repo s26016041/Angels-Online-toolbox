@@ -277,8 +277,8 @@ STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 QUICKKEY_RANGE = 8
 # ★★ 走快捷鍵那條路時，我們只走到這個距離就停手，剩下讓**遊戲自己走過去**
 #   （實測：站 9.8 格只呼叫快捷鍵，角色自走 8.5 格貼到 1.4 格並擊殺）。
-#   取 12 = 我們的「打得到」判定門檻，配上 margin 3 格 → 實際停在 9 格
-#  （使用者 2026-08-07 從 10 改成 9，配合零傷害快篩一起下的決定）。
+#   取 12 = 我們的「打得到」判定門檻，配上 margin 2 格 → 實際停在 10 格
+#  （2026-08-07 試過 9，同晚使用者又改回 10）。
 HANDOFF_RANGE = 12.0
 # 交棒之後這麼久還沒真的接戰（還在技能射程外、也沒掉過血）就收回來自己走。
 HANDOFF_WAIT = 3.0
@@ -301,7 +301,7 @@ NO_PATH_NEED = 3.0
 #   （射程 2 → 停 2.0、超過 3.0 才走）再多一格餘裕。
 NEAR_WALK = 4.0
 # ★ 近戰模式：走到 2 格以內才送攻擊封包（使用者指定）。
-#   遠程角色維持原本的判斷（攻擊距離 12、走到 9 格內）。
+#   遠程角色維持原本的判斷（攻擊距離 12、走到 10 格內）。
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
 #   —— 實測雪狐就是這樣完全打不到怪。
 MELEE_RANGE = 2.0
@@ -2401,16 +2401,13 @@ class CharFarmPage(QWidget):
         if not self._ensure_mover():
             return 0
         gd = math.hypot(gx - me[0], gy - me[1])
-        # ★★ 卡進怪身體（gd < MIN_GAP，通常是怪自己走到我們腳下）→
-        #   站回 MIN_GAP+SLACK＝1.8 格，跟遊戲內建掛機一樣（它全程維持
-        #   1.4~1.8，見 move._approach_point 那段）。
-        # ⚠ 這裡以前寫 `gd <= keep 就 return 0`，把太近的情況也擋掉了 ——
-        #   move._approach_point 的「太近就退到 1.8」根本輪不到執行，
-        #   於是貼進怪身體就永遠調不出來（使用者回報「卡在怪裡面」）。
-        # ⚠ 不能對怪尋路再退：從怪腳下對牠尋路一定回 0（NO_PATH_NEED 的
-        #   老坑）。要**直接對「站出去的那個點」尋路** —— 那個點離我們
-        #   不到 2 格、方向就是「從怪指向我」，多半直線可走。
-        # ★★★ **近距離（含卡進身體）一律不尋路**，直接朝目標微調位置。
+        # ⛔ 「太近就後退站位」（卡進怪身體站開到 1.8）拿掉了 ——
+        #   使用者 2026-08-07 指定：走位交棒給客戶端（停 10 格）之後
+        #   基本上不會再卡進怪身體，被貼身就站著打、不後退
+        #   （「退開一步」這類動作使用者本來就否決過）。太近一律不動。
+        if gd <= keep:
+            return 0
+        # ★★★ **近距離一律不尋路**，直接朝目標微調位置。
         #   2026-08-06 實拍：雪狐站 2.2 格、怪滿血、沒在走，**卡 8.2 秒**。
         #   近戰打得到 2.0，只差 0.2 格卻走不過去 —— 因為 walk_route() 要先
         #   對怪尋路，而**尋路到貼身的目標一定回 0**（＝算路徑到自己腳下），
@@ -2423,17 +2420,7 @@ class CharFarmPage(QWidget):
         #     ① 上一次尋路說要繞路（_path_pts > 1）→ 直接走 walk_route
         #     ② 尋路只在 dist > NO_PATH_NEED 時才更新，**3 格以內那個判斷是舊的**
         #        → 所以再加一道實測保險：連續走了兩次都沒真的位移，就改用尋路
-        # ⚠ 「卡進怪身體裡」要站開時**一律用直線**：那不是地形問題，
-        #   而且從怪腳下對牠尋路一定回 0（老坑），走 walk_route 反而動不了。
-        near_ok = (gd < move.MIN_GAP
-                   or (self._path_pts <= 1 and self._near_fail < 2))
-        if gd < NEAR_WALK and near_ok:
-            # ⚠⚠ **被貼身時只站開到 1.8 格，不可以退回 keep**。
-            #   法師的 keep 是 9 格 —— 退回去等於放風箏，而且退的途中
-            #   一直在射程邊緣進進出出（使用者回報「超出射程還在放技能」）。
-            #   1.8 = MIN_GAP + SLACK，正是遊戲內建掛機維持的 1.4~1.8。
-            want = (min(keep, move.MIN_GAP + move.SLACK)
-                    if gd < move.MIN_GAP else keep)
+        if gd < NEAR_WALK and self._path_pts <= 1 and self._near_fail < 2:
             # 上一次 walk_near 之後到底有沒有動？沒動就記一次失敗。
             if self._near_from is not None and me:
                 if math.hypot(me[0] - self._near_from[0],
@@ -2442,12 +2429,10 @@ class CharFarmPage(QWidget):
                 else:
                     self._near_fail = 0
             self._near_from = me
-            ok = self._mover.walk_near(self.sc, self.player, gx, gy, want)
+            ok = self._mover.walk_near(self.sc, self.player, gx, gy, keep)
             self._walk_t = 0.0
             return 1 if ok else 0
         self._near_from = None
-        if gd <= keep:
-            return 0
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
                                    stop_short=keep)
         self._walk_t = 0.0
@@ -3194,7 +3179,7 @@ class CharFarmPage(QWidget):
         #   短射程技能走的是「叫遊戲的快捷鍵」那條路，而**遊戲自己會走過去**：
         #   實測雪狐站 9.8 格、我們一步移動指令都沒下，只呼叫快捷鍵 ——
         #   角色自己走了 8.5 格、貼到 1.4 格、把怪打死（血 100→0）。
-        #   所以近戰不必由我們貼到 1.4 格：走到 9 格就停手，剩下讓遊戲走。
+        #   所以近戰不必由我們貼到 1.4 格：走到 10 格就停手，剩下讓遊戲走。
         #   好處是不再跟客戶端搶走位（那正是「卡在 2.2 格」「卡進怪身體」的來源）。
         # ⚠ memory 有一條「補按技能鍵讓角色接近會打架」——那是**同時還在下
         #   我們自己的移動指令**時的結論。只讓客戶端走就很順，兩邊一起走才會卡。
@@ -3222,11 +3207,11 @@ class CharFarmPage(QWidget):
         # ⚠⚠ 餘裕要夠大（使用者指出的）：停在 reach−1（法師 11、射程 12）
         #   等於**站在射程邊緣**，怪往外走一步就出界 —— 那一瞬間我們還在送
         #   施放，就是「超出射程還在放技能」，而且會一直重走、很卡。
-        #   遠程留 3 格（法師停 9，使用者 2026-08-07 從停 10 改的 ——
-        #   實拍 10.8 格被地形擋線呆站，離怪近一格能少踩到「數字上打得到、
-        #   實際被擋」的邊緣）、近戰留 0.6 格（射程 1 → reach 2.0 → 停 1.4，
+        #   遠程留 2 格（法師停 10；2026-08-07 試過留 3 停 9，同晚使用者又
+        #   改回 10 —— 地形擋線的呆站已由零傷害快篩 NOHIT_SECS 接手，
+        #   不必犧牲一格距離）、近戰留 0.6 格（射程 1 → reach 2.0 → 停 1.4，
         #   再多留就進不了近戰射程了）。下限 MIN_GAP：更近會卡進怪的身體。
-        margin = 3.0 if reach >= 6.0 else 0.6
+        margin = 2.0 if reach >= 6.0 else 0.6
         keep = (MELEE_RANGE if blocked
                 else min(max(reach - margin, move.MIN_GAP), reach - 0.5))
 
@@ -3272,21 +3257,16 @@ class CharFarmPage(QWidget):
         #   攻擊範圍 12 格、走路門檻 11+1.5=12.5 格 → 怪停在 12.3 格時
         #   既不打也不走，就是「朝一個方向發呆」（監控抓到 3 次，
         #   距離全是 12.3~12.4）。
-        # ★★ **太近也要下移動指令** —— 到位之後持續微調，攻擊穿插移動，
-        #   這是遊戲自己的做法（內建自動打怪 45 秒送了 45 包移動、
-        #   每包點數 1，全程把距離維持在 1.4~1.8 格）。
-        #   我們原本走一次就不管了，怪自己貼上來就再也調不回去，
-        #   然後卡在牠身體裡打不動 —— 而遠程停在 10 格永遠不會發生，
-        #   所以同一份程式碼黑狐正常、雪狐會卡。
+        # ⛔ 「太近也要下移動指令」（貼身持續微調／後退站位）拿掉了 ——
+        #   使用者 2026-08-07 指定：貼身走位交棒給客戶端，被貼上來就站著打。
         # ⚠⚠ 容差的上限是「**還沒出射程**就要開始重新靠近」：
         #   以 reach−0.5 當界線，怪走到射程邊緣前 0.5 格我們就動身，
         #   才不會出現「已經打不到了卻還站著送封包」（使用者指出的症狀）。
         #   近戰 reach 2.0、停 1.4 → 容差 0.3（超過 1.7 就走）
-        #   法師 reach 12、停 9  → 容差 1.5（超過 10.5 就走，仍在射程內）
+        #   法師 reach 12、停 10  → 容差 1.5（超過 11.5 就走，仍在射程內）
         slack = min(WALK_SLACK, max(0.3, reach - 0.5 - gkeep))
         need_walk = gd is not None and (
-            gd > gkeep + slack or (not in_range and gd > gkeep)
-            or gd < move.MIN_GAP)
+            gd > gkeep + slack or (not in_range and gd > gkeep))
         # ★ 還在趕路（離目標 > FAR_ENOUGH）就用短冷卻，貼身微調維持 0.4 秒。
         walk_gap = (WALK_GAP_FAR if (gd is not None and gd > FAR_ENOUGH)
                     else WALK_GAP)
