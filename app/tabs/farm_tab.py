@@ -40,7 +40,6 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -50,13 +49,16 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QRadioButton,
     QScrollArea,
     QSpinBox,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from app.config import config
@@ -243,6 +245,9 @@ CORPSE_SECS = 0.8
 # 學技能 ID：送一次鍵、隔 LEARN_GAP 讀一次，正常一次就拿到。
 # 只有「這個角色登入後還沒放過任何技能」（欄位是 0）才會多試幾次。
 LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密只是白讀
+# 掛機中多久重讀一次快捷欄（quickbar.Reader）——使用者中途換鍵上的技能，
+# 最慢這麼久就跟上。純讀零副作用，一次只有幾個小讀取（頁碼節點有快取）。
+QB_REFRESH = 2.0
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
 #   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
 #   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
@@ -378,10 +383,13 @@ class KeyWorker(_Paced):
     ② **直接送封包**（attack.select 一次 + attack.strike 重複）
        —— 需要技能 ID 和 Mover
 
-    ★ 技能 ID 直接讀快捷欄（app/game/quickbar.py）：F 鍵對到目前頁的哪一格、
-      格子裡放哪個技能，記憶體裡有現成的表，開始掛機時讀一次就有。
-      讀不到（非 F 鍵、那格放的是物品、改版位移）才退回舊法 ——
-      按幾下鍵、讀「最近使用的技能 ID」（player.read_last_skill）。
+    ★ 技能直接讀快捷欄（app/game/quickbar.py）：使用者勾幾個 F 鍵，這裡把
+      每個鍵解析成技能 ID、照 F1→F12 的順序**輪流施放**。空格、放物品的格
+      **不進循環**（使用者指定 —— 也就不會誤按把藥吃掉）。掛機中每
+      QB_REFRESH 秒重讀一次，中途換快捷欄上的技能會自動跟上、每台分身
+      各讀各的。快捷欄整個讀不到（改版位移）才退回按鍵：單鍵時還能用
+      「清零→按鍵→讀殘留」學回技能 ID（player.read_last_skill），
+      多鍵就純輪流按 ——「最近使用」認不出是哪個鍵按出來的。
 
     ⚠ 送鍵一定是**一次次按放**。曾經想改成「只送 KEYDOWN 模擬按住」，
       方向是錯的 —— 使用者實測這個遊戲按住不放並不會一直放技能。
@@ -391,7 +399,12 @@ class KeyWorker(_Paced):
         super().__init__(DEFAULT_INTERVAL)
         self.hwnd = hwnd
         self.sc = sc
-        self.vk = DEFAULT_KEY
+        self.vks: list[int] = [DEFAULT_KEY]   # 使用者勾的技能鍵（輪流用）
+        self.skills: dict[int, int] = {}      # 鍵碼 → 快捷欄解析出的技能 ID
+        self.qb_ok = False          # 上一次快捷欄讀取有沒有成功（UI 提示用）
+        self._rot = 0               # 輪到循環裡的第幾個
+        self._qb = quickbar.Reader(sc)
+        self._next_qb = 0.0
         self.mode = MODE_PACKET     # 這個分頁用哪種攻擊方式
         self.packets = True         # 使用者要不要用封包攻擊（封包模式才有意義）
         self.stats = None           # 角色屬性基準（學技能 ID 用）
@@ -404,13 +417,25 @@ class KeyWorker(_Paced):
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
-        self.skill = None           # 學到的技能 ID
         self._on = False
         self._learning = False
         self._next_learn = 0.0
 
     def set_on(self, on: bool) -> None:
         self._on = on
+
+    @property
+    def skill(self) -> int | None:
+        """循環裡第一個解析到的技能；一個都沒有就 None。
+
+        舊介面：tick 那邊拿它判斷「封包模式到底打不打得出去」
+        （self._atk.packets 的條件之一），別的地方不要再用。
+        """
+        for vk in self.vks:
+            sid = self.skills.get(vk)
+            if sid:
+                return sid
+        return None
 
     @property
     def selected(self) -> bool:
@@ -424,29 +449,34 @@ class KeyWorker(_Paced):
         return bool(self.eid) and self._sel == self.eid
 
     def begin_learning(self) -> None:
-        """學技能 ID：**先直讀快捷欄**，讀不到才退回「清零→按鍵→讀殘留」。
+        """把「勾選的技能鍵」各自解析成技能 ID —— 直讀快捷欄（quickbar.py）。
 
-        ① 快捷欄直讀（quickbar.py）：F 鍵 → 目前頁的那一格 → 技能 ID。
-           純讀零副作用，當場拿到，不必真的放技能。五台驗過與攔封包一致。
+        純讀零副作用，當場拿到，不必真的放技能。只收技能格：空格、放物品
+        的格**不進攻擊循環**（使用者指定）。掛機中 step() 每 QB_REFRESH 秒
+        會重讀，所以這裡只是把第一次讀提前到按下「開始」的當下。
 
-        ② 舊法保底（那格放的是物品、不是 F 鍵、或改版位移讀不到時）：
-           這裡先清零，後面在 step() 裡按鍵＋每 LEARN_GAP 讀一次。
+        ② 舊法保底（快捷欄整個讀不到，例如改版位移）：只有單鍵能用 ——
+           這裡先清零，後面在 step() 裡按鍵＋每 LEARN_GAP 讀一次殘留。
 
         ⚠⚠ 舊法**一定要先清零**。單次按鍵不保證會寫入（冷卻／間隔；黑狐在
           沒有目標時甚至完全不寫），不清零就會讀到**上一次殘留的技能 ID** ——
           雪狐就是這樣把 F3 的 0x2E1 當成 F2 的技能，結果完全打不動怪。
-
-        兩條都學不到就一直是 None，攻擊自然留在按鍵那條（本來就有效）。
         """
+        self._rot = 0
+        self._next_qb = 0.0
+        self._learning = False
         try:
-            sid = quickbar.skill_on_vk(self.sc, self.vk)
+            got = self._qb.skills(list(self.vks))
         except Exception:                      # noqa: BLE001
-            sid = None
-        if sid:
-            self.skill = sid
-            self._learning = False
+            got = None
+        self.qb_ok = got is not None
+        self.skills = got or {}
+        if got is not None:
+            return      # 快捷欄讀得到：結果就是答案（沒技能＝不出手）
+        # 快捷欄整個讀不到 —— 單鍵才能用舊法：「最近使用的技能」認不出
+        # 是哪個鍵按出來的，多鍵輪按會張冠李戴（學到別鍵的技能更糟）。
+        if len(self.vks) != 1:
             return
-        self.skill = None
         self._learning = True
         self._next_learn = 0.0
         try:
@@ -458,8 +488,8 @@ class KeyWorker(_Paced):
     def stop_learning(self) -> None:
         self._learning = False
 
-    def _learn(self) -> None:
-        """第三步：讀記憶體。欄位已清零，所以非零值就是這個鍵的技能。"""
+    def _learn(self, vk: int) -> None:
+        """舊法第三步：讀記憶體。欄位已清零，所以非零值就是剛按的鍵的技能。"""
         now = time.perf_counter()
         if now < self._next_learn:
             return                             # 按鍵到寫入要隔一幀，別讀太密
@@ -468,7 +498,7 @@ class KeyWorker(_Paced):
             return
         sid = player.read_last_skill(self.sc, self.stats)
         if sid:
-            self.skill = sid
+            self.skills = {**self.skills, vk: sid}
             self._learning = False
 
     def step(self) -> None:
@@ -478,13 +508,28 @@ class KeyWorker(_Paced):
         #   記成「已選定」，可是那一包從來沒送出去。接著 `selected` 回 True →
         #   屍體計時開始跑 → 遊戲永遠不會替這隻填血量 → 0.8 秒後把一隻活怪
         #   當屍體丟掉。每殺一隻換一次目標，這個窗口每一輪都存在。
-        eid, mover, vk = self.eid, self.mover, self.vk
-        mode, packets, skill, pos = self.mode, self.packets, self.skill, self.pos
+        eid, mover = self.eid, self.mover
+        mode, packets, pos = self.mode, self.packets, self.pos
+        vks = list(self.vks) or [DEFAULT_KEY]
         try:
             if eid is None:
                 self._sel = None       # 沒目標了，下一隻要重新送「選定」
             if not self._on:
                 return
+            # ◎ 每 QB_REFRESH 秒重讀快捷欄：使用者中途換鍵上的技能會自動
+            #   跟上（純讀零副作用）。讀失敗**保留舊結果**——改版位移那種
+            #   持續性失敗有 qb_ok 記著，暫時性讀失敗不該把打法歸零。
+            now = time.perf_counter()
+            if now >= self._next_qb:
+                self._next_qb = now + QB_REFRESH
+                try:
+                    got = self._qb.skills(vks)
+                except Exception:              # noqa: BLE001
+                    got = None
+                self.qb_ok = got is not None
+                if got is not None:
+                    self.skills = got
+            skills = self.skills               # 快照（GUI 執行緒也會換掉它）
             # ① 換目標才送一次「選定」封包 —— 我們是直接寫記憶體選怪的，
             #    遊戲不會自己送這一包。兩種模式都要送。
             if mover is not None and eid and self._sel != eid:
@@ -504,13 +549,28 @@ class KeyWorker(_Paced):
             #   `pathfinder_this()` 是純讀取而且自己會驗證（沿著遊戲的管理表走，
             #   再比對物件 ID），算不出來就回 None —— 那時寧可退回送鍵。
             pf = move.pathfinder_this(self.sc) if mover is not None else None
+            # ◎ 這一拍輪到哪個鍵：**只輪有技能的鍵**（空格／物品格不進循環，
+            #   使用者指定 —— 也就不會誤按把藥吃掉）。
+            #   快捷欄讀得到、但勾的鍵上一個技能都沒有 → 不出手（開始掛機時
+            #   狀態列會提示）。整個讀不到（改版位移）→ 退回把勾的鍵輪流按，
+            #   放什麼遊戲自己決定。
+            usable = [k for k in vks if skills.get(k)]
+            if usable:
+                vk = usable[self._rot % len(usable)]
+                skill = skills[vk]
+            elif self.qb_ok:
+                return
+            else:
+                vk = vks[self._rot % len(vks)]
+                skill = None
             struck = (mode == MODE_PACKET and packets and skill
                       and eid and pf and mover is not None
                       and attack.strike(mover, pf, skill, eid, *pos))
             if not struck:
                 _send_scan(self.hwnd, vk)
                 if self._learning:
-                    self._learn()              # 剛按過鍵，順手讀一下
+                    self._learn(vk)            # 剛按過鍵，順手讀一下
+            self._rot += 1
         except Exception:                      # noqa: BLE001
             pass
 
@@ -1047,17 +1107,38 @@ class CharFarmPage(QWidget):
         g_atk = QGroupBox("攻擊")
         a = QHBoxLayout(g_atk)
         a.addWidget(QLabel("技能鍵"))
-        self.key_box = QComboBox()
+        # ★ 可多選（使用者要求）：勾幾個 F 鍵，攻擊照 F1→F12 順序輪流放。
+        #   鍵上放什麼是直讀快捷欄的（quickbar.py）：空格／物品格自動略過
+        #   不進循環、掛機中換技能幾秒內跟上。
+        #   用按鈕＋下拉選單裝 12 個勾選框 —— 一整排 12 個會把這條列撐爆
+        #   （主視窗固定 940 寬）。
+        #   ⚠ 勾選框要包在 QWidgetAction 裡：點了選單不會關，才能一次勾多個。
+        self.key_btn = QToolButton()
+        self.key_btn.setPopupMode(QToolButton.InstantPopup)
+        self.key_btn.setToolTip(
+            "要輪流使用的技能鍵（可勾多個）。\n"
+            "・攻擊時照 F1→F12 的順序輪流施放勾選的鍵。\n"
+            "・鍵上放什麼直接讀遊戲快捷欄：空的格、放物品的格自動略過，\n"
+            "　不會按下去（所以不會誤吃藥）。\n"
+            "・掛機中把快捷欄上的技能換掉，幾秒內自動跟上，不用重開掛機。\n"
+            "・一個都不勾＝用預設 F2；讀不到快捷欄（遊戲改版）就退回純按鍵。")
+        km = QMenu(self.key_btn)
+        self._key_cbs: list[tuple[QCheckBox, int, str]] = []
         for label, vk in SKILL_KEYS:
-            self.key_box.addItem(label, vk)
-        self.key_box.setCurrentIndex(
-            next(i for i, (_, vk) in enumerate(SKILL_KEYS) if vk == DEFAULT_KEY))
-        # 照內容自動調寬（F10~F12 比 F2 寬）
-        self.key_box.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.key_box.setToolTip("要一直按的攻擊／技能鍵。")
-        self.key_box.currentIndexChanged.connect(
-            lambda i: setattr(self._keys, "vk", self.key_box.itemData(i)))
-        a.addWidget(self.key_box)
+            cb = QCheckBox(label)
+            cb.setChecked(vk == DEFAULT_KEY)
+            cb.setStyleSheet("padding: 4px 10px;")
+            act = QWidgetAction(km)
+            act.setDefaultWidget(cb)
+            km.addAction(act)
+            self._key_cbs.append((cb, vk, label))
+        # ⚠ 先設好初始勾選、再接訊號 —— 建構期間就觸發 _keys_changed 的話，
+        #   它用到的 run_cb 等元件都還沒生出來。
+        for cb, _, _ in self._key_cbs:
+            cb.toggled.connect(self._keys_changed)
+        self.key_btn.setMenu(km)
+        self._sync_key_btn()
+        a.addWidget(self.key_btn)
         # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）——
         #    見 ATTACK_GAP 的說明，那個值是照技能施法週期算出來的。
         self._keys.set_interval(ATTACK_GAP)
@@ -2560,10 +2641,18 @@ class CharFarmPage(QWidget):
                 self._mover, self.sc, main_switch=True,
                 jump_back=self.sup_jump_cb.isChecked(),
                 revive_recall=self.sup_revive_cb.isChecked())
+        # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
+        # 不講的話使用者只會看到「走過去不打」。
+        skill_note = ""
+        if not self._keys.skills:
+            skill_note = ("　⚠ 快捷欄讀不到，技能鍵改用純按鍵"
+                          if not self._keys.qb_ok else
+                          "　⚠ 勾的技能鍵上沒有技能（空格／物品會略過）")
         self.status.setText(
             ("掛機中：只打「" + "、".join(want) + "」" if want
              else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
-            + ("　精靈：" + "、".join(notes) if notes else ""))
+            + ("　精靈：" + "、".join(notes) if notes else "")
+            + skill_note)
 
     def tick(self, dt: float) -> None:
         """UI 側的心跳：只做「挑目標、卡住偵測、更新狀態列」。
@@ -3081,10 +3170,14 @@ class CharFarmPage(QWidget):
         g = config.get
         for name in g(self._key("monsters"), []) or []:
             self._add_name(str(name))
-        vk = g(self._key("vk"), DEFAULT_KEY)
-        i = next((n for n, (_, v) in enumerate(SKILL_KEYS) if v == vk), None)
-        if i is not None:
-            self.key_box.setCurrentIndex(i)
+        # 技能鍵：新格式是清單（"vks"）；沒有就吃舊的單鍵設定（"vk"）——
+        # 使用者原本選好的鍵不能憑空變回預設。
+        vks = g(self._key("vks"), None)
+        if not vks:
+            vks = [g(self._key("vk"), DEFAULT_KEY)]
+        picked = {int(v) for v in vks}
+        for cb, vk, _ in self._key_cbs:
+            cb.setChecked(vk in picked)
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
@@ -3149,12 +3242,36 @@ class CharFarmPage(QWidget):
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 
+    def _sel_vks(self) -> list[int]:
+        """勾選的技能鍵（照 F1→F12 順序）。"""
+        return [vk for cb, vk, _ in self._key_cbs if cb.isChecked()]
+
+    def _sync_key_btn(self) -> None:
+        """按鈕字樣＝勾了哪些鍵；勾太多就縮寫，別把整條列撐爆。"""
+        labels = [lab for cb, _, lab in self._key_cbs if cb.isChecked()]
+        if not labels:
+            self.key_btn.setText("選技能鍵")
+        elif len(labels) <= 4:
+            self.key_btn.setText("、".join(labels))
+        else:
+            self.key_btn.setText(f"{labels[0]} 等 {len(labels)} 鍵")
+
+    def _keys_changed(self) -> None:
+        """勾選變了：更新按鈕字樣、推給攻擊執行緒；掛機中就立刻重讀快捷欄。"""
+        vks = self._sel_vks()
+        self._sync_key_btn()
+        self._keys.vks = vks or [DEFAULT_KEY]   # 全不勾＝退回預設 F2
+        if self.run_cb.isChecked():
+            self._keys.stats = self.stats
+            self._keys.begin_learning()
+        self._save_settings()
+
     def _save_settings(self) -> None:
         if self._loading:
             return
         s = config.set
         s(self._key("monsters"), self.wanted())
-        s(self._key("vk"), self.key_box.currentData())
+        s(self._key("vks"), self._sel_vks())
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("boss_only"), self.boss_cb.isChecked())
@@ -3180,10 +3297,12 @@ class CharFarmPage(QWidget):
         config.save()
 
     def _wire_saving(self) -> None:
-        """所有設定一改就存 —— 不要讓使用者每次都重設一遍。"""
+        """所有設定一改就存 —— 不要讓使用者每次都重設一遍。
+
+        （技能鍵不在這裡：勾選框接的是 _keys_changed，那裡自己會存。）
+        """
         self.picked.model().rowsInserted.connect(self._save_settings)
         self.picked.model().rowsRemoved.connect(self._save_settings)
-        self.key_box.currentIndexChanged.connect(self._save_settings)
         self.move_cb.toggled.connect(self._save_settings)
         self.patrol_cb.toggled.connect(self._save_settings)
         self.boss_cb.toggled.connect(self._save_settings)

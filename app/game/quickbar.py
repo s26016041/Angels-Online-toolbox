@@ -143,8 +143,42 @@ def skill_on_vk(scanner, vk: int) -> int | None:
     return cell.value if cell is not None and cell.is_skill else None
 
 
-def _lua_number_global(scanner, name: str) -> float | None:
-    """純讀取撈一個數字型 Lua 全域；拿不到（還沒進場）回 None。"""
+def _key_matches(scanner, node_bytes: bytes, want: bytes) -> bool:
+    """這個全域表節點（32B）的鍵是不是這個名字的字串。"""
+    if struct.unpack_from("<I", node_bytes, 24)[0] != lua.T_STRING:
+        return False
+    ts = struct.unpack_from("<I", node_bytes, 16)[0]
+    head = scanner._read_bytes(ts + lua.OFF_TSTRING_LEN, 4 + len(want))
+    if not head or len(head) < 4 + len(want):
+        return False
+    head = bytes(head)
+    return (struct.unpack_from("<I", head, 0)[0] == len(want)
+            and head[4:4 + len(want)] == want)
+
+
+def _node_number(scanner, node_addr: int, name: str) -> float | None:
+    """讀一個（先前找到的）節點的數字值。
+
+    每次都重驗鍵名 —— 全域表 rehash 之後節點會搬家，位址被別的鍵接手時
+    這裡要擋下來（回 None 讓呼叫端重新走訪），不能把別人的值當頁碼。
+    """
+    raw = scanner._read_bytes(node_addr, 32)
+    if not raw or len(raw) < 32:
+        return None
+    b = bytes(raw)
+    if not _key_matches(scanner, b, name.encode("ascii")):
+        return None
+    if struct.unpack_from("<I", b, 8)[0] != lua.T_NUMBER:
+        return None
+    return struct.unpack_from("<d", b, 0)[0]
+
+
+def _find_global_node(scanner, name: str) -> int | None:
+    """走訪整張 Lua 全域表，找這個名字的節點位址；拿不到回 None。
+
+    走訪要讀上千個小字串（一次約 10~20ms），所以值得把結果快取起來 ——
+    見 Reader。純讀取，不呼叫 Lua。
+    """
     ctx = _u32(scanner, lua.CTX_PTR)
     L = _u32(scanner, ctx + 8) if ctx else None
     if not L:
@@ -163,19 +197,56 @@ def _lua_number_global(scanner, name: str) -> float | None:
     b = bytes(blob)
     for off in range(0, len(b) - 31, 32):
         # Node = 32B：值 TValue(16) + 鍵(TString* 8 + tt 4 + next 4)
-        if struct.unpack_from("<I", b, off + 24)[0] != lua.T_STRING:
-            continue
-        ts = struct.unpack_from("<I", b, off + 16)[0]
-        head = scanner._read_bytes(ts + lua.OFF_TSTRING_LEN,
-                                   4 + len(want) + 1)
-        if not head or len(head) < 4 + len(want):
-            continue
-        head = bytes(head)
-        if struct.unpack_from("<I", head, 0)[0] != len(want):
-            continue
-        if head[4:4 + len(want)] != want:
-            continue
-        if struct.unpack_from("<I", b, off + 8)[0] != lua.T_NUMBER:
-            return None
-        return struct.unpack_from("<d", b, off)[0]
+        if _key_matches(scanner, b[off:off + 32], want):
+            return node + off
     return None
+
+
+def _lua_number_global(scanner, name: str) -> float | None:
+    """純讀取撈一個數字型 Lua 全域；拿不到（還沒進場）回 None。"""
+    node = _find_global_node(scanner, name)
+    return _node_number(scanner, node, name) if node else None
+
+
+class Reader:
+    """綁一個 scanner 的快捷欄讀取器 —— 給「每隔幾秒重讀一次」的地方用。
+
+    唯一的狀態是 QUICK_COMMAND_PAGE 節點位址的快取：第一次要走訪整張
+    Lua 全域表（10~20ms），之後每次只剩三、四個小讀取（微秒級）。
+    節點會因為表 rehash 搬家，所以每次讀都重驗鍵名，不對就重新走訪。
+    """
+
+    def __init__(self, scanner) -> None:
+        self._sc = scanner
+        self._page_node: int | None = None
+
+    def page(self) -> int:
+        """目前顯示（＝F 鍵作用）的頁碼 0~3；讀不到就當第 0 頁。"""
+        if self._page_node is not None:
+            v = _node_number(self._sc, self._page_node, "QUICK_COMMAND_PAGE")
+            if v is not None:
+                return int(v) if 0 <= v < PAGES else 0
+        self._page_node = _find_global_node(self._sc, "QUICK_COMMAND_PAGE")
+        if self._page_node is None:
+            return 0
+        v = _node_number(self._sc, self._page_node, "QUICK_COMMAND_PAGE")
+        return int(v) if v is not None and 0 <= v < PAGES else 0
+
+    def skills(self, vks) -> dict[int, int] | None:
+        """這些（F 鍵）鍵碼各對到目前頁上的哪個技能 → {鍵碼: 技能 ID}。
+
+        **只收技能格** —— 空格、物品格、非 F 鍵都不會出現在結果裡
+        （使用者指定：非技能不進攻擊循環）。
+        整頁讀不到（沒進遊戲／改版位移）回 None，跟「頁上沒技能」的
+        空 dict 區分開，呼叫端才知道該不該退回按鍵舊法。
+        """
+        cells = read_page(self._sc, self.page())
+        if cells is None:
+            return None
+        out: dict[int, int] = {}
+        for vk in vks:
+            if VK_F1 <= vk < VK_F1 + SLOTS:
+                c = cells[vk - VK_F1]
+                if c is not None and c.is_skill:
+                    out[vk] = c.value
+        return out
