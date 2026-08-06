@@ -105,6 +105,14 @@ SIGS: tuple[Sig, ...] = (
     Sig("jumpmap", "CONN_PTR", "data", 5,
         "89 70 02 FF 35 D0 67 9B 00 E8 ?? ?? ?? ?? 59 59 5E C9 C2 04 00",
         0x009B67D0),
+    # 賣東西前那包「對話動作」（UI 指令表裡的 talkaction）。跟 attack.ACTION_FN
+    # 長得幾乎一樣，只差 push 的代號（0x0B vs 0x07）—— 特徵一定要蓋到那兩個
+    # push，不然兩支會互相命中。已驗過在模組內唯一。
+    Sig("sell", "TALK_FN", "fn", None,
+        "55 8B EC 83 EC 10 6A 03 6A 0B 8D 4D F0 E8 ?? ?? ?? ?? 8B 45 F4"
+        " 8A 4D 08 FF 75 FC 88 48 02 FF 35 ?? ?? ?? ?? E8 ?? ?? ?? ??"
+        " 59 59 C9 C2 04 00",
+        0x005DA91E),
     Sig("lua", "GETFIELD_FN", "fn", None,
         "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
         " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"
