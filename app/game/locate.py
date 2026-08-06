@@ -162,6 +162,13 @@ SIGS: tuple[Sig, ...] = (
     Sig("move", "MGR_PTR", "data", 1,
         "35 38 E6 96 00 8B CE FF B6 90 2A 00 00 E8 ?? ?? ?? ?? 85 C0 74 2F FF 75 08",
         0x0096E638),
+    # 快捷欄管理物件的全域指標。錨在 usequickkey（Lua 綁定）的函式頭 ——
+    # 表就掛在它 +0x609C（見 quickbar.py）。
+    Sig("quickbar", "MGR_PTR", "data", 40,
+        "55 8B EC 51 51 8B 45 08 8D 4D F8 56 6A 01 89 45 FC C6 45 F8 00"
+        " E8 ?? ?? ?? ?? 6A 02 8D 4D F8 8B F0 E8 ?? ?? ?? ?? 8B 0D AC 66 9B 00"
+        " 6A 00 56 50",
+        0x009B66AC),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。

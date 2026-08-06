@@ -66,7 +66,7 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, buff, channel, entity, inventory,
                       jumpmap, locate, monsters, move, navigate, player,
-                      robot, scene)
+                      quickbar, robot, scene)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -378,10 +378,10 @@ class KeyWorker(_Paced):
     ② **直接送封包**（attack.select 一次 + attack.strike 重複）
        —— 需要技能 ID 和 Mover
 
-    ★ 技能 ID 是自己學來的：送出技能鍵之後，遊戲會把剛放的技能 ID 寫進
-      「角色屬性基準 −0x50」（見 app/game/player.py 的 read_last_skill）。
-      所以流程是「先按鍵打第一下 → 學到 ID → 之後改送封包」，
-      使用者不必自己去攔封包。
+    ★ 技能 ID 直接讀快捷欄（app/game/quickbar.py）：F 鍵對到目前頁的哪一格、
+      格子裡放哪個技能，記憶體裡有現成的表，開始掛機時讀一次就有。
+      讀不到（非 F 鍵、那格放的是物品、改版位移）才退回舊法 ——
+      按幾下鍵、讀「最近使用的技能 ID」（player.read_last_skill）。
 
     ⚠ 送鍵一定是**一次次按放**。曾經想改成「只送 KEYDOWN 模擬按住」，
       方向是錯的 —— 使用者實測這個遊戲按住不放並不會一直放技能。
@@ -424,18 +424,28 @@ class KeyWorker(_Paced):
         return bool(self.eid) and self._sel == self.eid
 
     def begin_learning(self) -> None:
-        """開始學技能 ID —— 只有三步：**清零 → 按選定的 Fx → 讀記憶體**。
+        """學技能 ID：**先直讀快捷欄**，讀不到才退回「清零→按鍵→讀殘留」。
 
-        這裡做第一步（清零），後面兩步在 step() 裡：攻擊本來就會按那個鍵，
-        每 LEARN_GAP 讀一次，讀到非零值就結束。
+        ① 快捷欄直讀（quickbar.py）：F 鍵 → 目前頁的那一格 → 技能 ID。
+           純讀零副作用，當場拿到，不必真的放技能。五台驗過與攔封包一致。
 
-        ⚠⚠ **一定要先清零**。單次按鍵不保證會寫入（冷卻／間隔；黑狐在沒有
-          目標時甚至完全不寫），不清零就會讀到**上一次殘留的技能 ID** ——
+        ② 舊法保底（那格放的是物品、不是 F 鍵、或改版位移讀不到時）：
+           這裡先清零，後面在 step() 裡按鍵＋每 LEARN_GAP 讀一次。
+
+        ⚠⚠ 舊法**一定要先清零**。單次按鍵不保證會寫入（冷卻／間隔；黑狐在
+          沒有目標時甚至完全不寫），不清零就會讀到**上一次殘留的技能 ID** ——
           雪狐就是這樣把 F3 的 0x2E1 當成 F2 的技能，結果完全打不動怪。
-          清零之後，讀到任何非零值就一定是這個鍵按出來的。
 
-        學不到就一直是 None，攻擊自然留在按鍵那條（本來就有效）。
+        兩條都學不到就一直是 None，攻擊自然留在按鍵那條（本來就有效）。
         """
+        try:
+            sid = quickbar.skill_on_vk(self.sc, self.vk)
+        except Exception:                      # noqa: BLE001
+            sid = None
+        if sid:
+            self.skill = sid
+            self._learning = False
+            return
         self.skill = None
         self._learning = True
         self._next_learn = 0.0
@@ -2534,8 +2544,8 @@ class CharFarmPage(QWidget):
         self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
         self._cur = None
         # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
-        #   學法：先把欄位清成 0，再按那個鍵，讀回來的非零值就是答案。
-        #   學到之前用按鍵攻擊（本來就有效），所以不會空等。
+        #   學法：直讀快捷欄那格（quickbar.py），通常當場拿到；讀不到才退回
+        #   「清零→按鍵→讀殘留」。學到之前用按鍵攻擊（本來就有效），不會空等。
         self._keys.stats = self.stats          # 清零要用，先確保是最新的
         self._keys.begin_learning()
         self._ensure_mover()               # 選怪／移動都要用它的跳板
