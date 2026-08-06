@@ -253,11 +253,15 @@ LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密�
 # 掛機中多久重讀一次快捷欄（quickbar.Reader）——使用者中途換鍵上的技能，
 # 最慢這麼久就跟上。純讀零副作用，一次只有幾個小讀取（頁碼節點有快取）。
 QB_REFRESH = 2.0
-# ★★ 出手間隔。出手是叫遊戲自己的「用快捷鍵」（quickbar.use），遊戲本來就有
-#   技能冷卻（破甲劈擊後置 1 秒），叫更密只是白佔跳板 —— 而跳板呼叫越密
-#   越容易踩到「掛久了遊戲當機」那組坑。官方掛實攔也是 0.6~1 秒一次。
-#   0.5 秒：夠即時（冷卻一好就出手），又比舊的封包狂送少 20 倍呼叫。
-STRIKE_GAP = 0.5
+# ★★ 出手間隔（使用者指定 0.15 秒）：勾了幾個技能鍵就照 F1→F12 的順序
+#   每 0.15 秒放一招輪一次。空格／物品格／學不到技能的鍵不進循環。
+#   遊戲自己有冷卻，還沒好的那一招送出去也只是不生效，不會出事。
+# ⚠ 執行緒節拍（ATTACK_GAP）必須比這個細，否則實際間隔會被量化成節拍的倍數
+#   —— 所以 KeyWorker 用 STRIKE_TICK。
+STRIKE_GAP = 0.15
+STRIKE_TICK = 0.05              # KeyWorker 的節拍：要能切出 0.15 秒
+# 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
+QUICKKEY_RANGE = 8
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
 #   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
 #   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
@@ -408,7 +412,7 @@ class KeyWorker(_Paced):
     """
 
     def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
-        super().__init__(DEFAULT_INTERVAL)
+        super().__init__(STRIKE_TICK)          # 要切得出 0.15 秒的出手間隔
         self.hwnd = hwnd
         self.sc = sc
         self.vks: list[int] = [DEFAULT_KEY]   # 使用者勾的技能鍵（輪流用）
@@ -560,7 +564,10 @@ class KeyWorker(_Paced):
                 self.qb_ok = got is not None
                 if got is not None:
                     self.skills = got
-            skills = self.skills               # 快照（GUI 執行緒也會換掉它）
+            # ⚠ 這份快照**不可以**叫 `skills` —— 那會把 app.game.skills 模組
+            #   遮住，底下 `skills.is_ground()` 之類就會丟 AttributeError，
+            #   而整個 step() 被 try 包著、例外被吞掉 = 完全不出手也沒訊息。
+            bykey = self.skills                # 快照（GUI 執行緒也會換掉它）
             # ① 換目標才送一次「選定」封包 —— 我們是直接寫記憶體選怪的，
             #    遊戲不會自己送這一包。兩種模式都要送。
             if mover is not None and eid and self._sel != eid:
@@ -577,33 +584,35 @@ class KeyWorker(_Paced):
             #   快捷欄讀得到、但勾的鍵上一個技能都沒有 → 不出手（開始掛機時
             #   狀態列會提示）。整個讀不到（改版位移）→ 退回把勾的鍵輪流按，
             #   放什麼遊戲自己決定。
-            usable = [k for k in vks if skills.get(k)]
+            usable = [k for k in vks if bykey.get(k)]
             if usable:
                 vk = usable[self._rot % len(usable)]
-                skill = skills[vk]
+                skill = bykey[vk]
             elif self.qb_ok:
                 return
             else:
                 vk = vks[self._rot % len(vks)]
                 skill = None
-            # ★★★ 出手＝叫遊戲自己的「用快捷鍵」（quickbar.use，等同按 F2）。
-            #   ⚠⚠ 自己送施放封包**只打得出普攻**：實測 MP 一格不扣（破甲劈擊
-            #     該扣 25），傷害是武器普攻的量；改叫這支之後 MP 正好扣 25、
-            #     2 次呼叫 2 秒打死一隻。射程、冷卻、動作、封包全由遊戲處理。
-            #   ★ 節流到 STRIKE_GAP：遊戲本來就有冷卻，叫更密只是白佔跳板，
-            #     而跳板呼叫越密越容易踩到「掛久了遊戲當機」那組坑
-            #     （見 [[game-crash-root-causes]]）—— 從每秒 30 次降到 2 次。
+            # ★★★ 出手方式**依射程分流**（使用者定的）：
+            #   射程 ≤ QUICKKEY_RANGE(8) → 叫遊戲的快捷鍵（quickbar.use，
+            #     等同按 F2）。⚠⚠ 自己送施放封包**只打得出普攻**：實測 MP
+            #     一格不扣（破甲劈擊該扣 25）；改叫這支之後 MP 正好扣 25、
+            #     兩次呼叫就打死一隻。射程、冷卻、動作、封包全由遊戲處理。
+            #   射程 > 8 → 送帶「目標 ID + 格子座標」的施放封包（attack.cast_at）。
+            #   ⚠ **對地技能（對象＝地面）一律走封包**，跟射程無關 ——
+            #     按鍵會跳出「選範圍」的游標等人點地板，角色就站著不動
+            #     （使用者實際遇到）。射程 8 以內的對地技能有 74 個
+            #     （衝鋒Ⅰ~Ⅲ、末日反噬…），所以這道覆寫不能省。
+            # ★ 節奏：每 STRIKE_GAP 秒放一招，照 F1→F12 的順序輪流；
+            #   空格／物品格／沒學到的鍵**不進循環**（usable 已經濾掉）。
             struck = False
             if now >= self._next_strike:
                 if (mode == MODE_PACKET and packets and skill and eid
                         and mover is not None):
-                    # ★★ 依技能的「對象」分流（讀遊戲自己的資料表）：
-                    #   地面（爆彈狙擊、麻痺荊棘、瞬移術…856 個）→ 按鍵會跳出
-                    #     選範圍的游標、角色站著不動，所以**一定要送帶座標的
-                    #     施放封包**（使用者指出的）。
-                    #   其餘（角色／自己／隊伍／屍體）→ 叫遊戲的快捷鍵，
-                    #     技能才會真的放出來（自送封包只打得出普攻，MP 不扣）。
-                    if skills.is_ground(skill):
+                    rng = skills.range_of(skill)
+                    by_packet = (skills.is_ground(skill)
+                                 or (rng is not None and rng > QUICKKEY_RANGE))
+                    if by_packet:
                         struck = attack.cast_at(mover, skill, eid, *pos)
                     elif (quickbar.VK_F1 <= vk
                             < quickbar.VK_F1 + quickbar.SLOTS):
@@ -611,14 +620,15 @@ class KeyWorker(_Paced):
                                               vk - quickbar.VK_F1, self._page)
                 if struck:
                     self._next_strike = now + STRIKE_GAP
+                    self._rot += 1             # 放出去了才輪下一個鍵
             if not struck and now >= self._next_key:
                 # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵，
                 # 那是舊做法，一樣是遊戲自己出手。
                 self._next_key = now + STRIKE_GAP
                 _send_scan(self.hwnd, vk)
+                self._rot += 1
                 if self._learning:
                     self._learn(vk)            # 剛按過鍵，順手讀一下
-            self._rot += 1
         except Exception:                      # noqa: BLE001
             pass
 
@@ -1191,9 +1201,10 @@ class CharFarmPage(QWidget):
         self.key_btn.setMenu(km)
         self._sync_key_btn()
         a.addWidget(self.key_btn)
-        # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）——
-        #    見 ATTACK_GAP 的說明，那個值是照技能施法週期算出來的。
-        self._keys.set_interval(ATTACK_GAP)
+        # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）。
+        #    出手節奏是 STRIKE_GAP（0.15 秒輪一招），這裡設的是執行緒節拍，
+        #    要比它細才切得出來。
+        self._keys.set_interval(STRIKE_TICK)
         a.addSpacing(10)
         # ★ 只打王：勾起來就**完全不看「選中怪物」的名字**，改成看種類 ID
         #   是不是王（見 app/game/monsters.py）。名字比對分不出來 ——
