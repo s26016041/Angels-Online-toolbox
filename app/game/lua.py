@@ -44,6 +44,12 @@ CTX_PTR = 0x00891010         # [CTX_PTR] + 8 = lua_State
 GLOBALSINDEX = 0xFFFFD8EE    # -10002
 TOPINDEX = 0xFFFFFFFF        # -1（堆疊頂）
 OFF_TOP = 0x08               # lua_State 裡的 top
+# Lua 5.1 的 lua_State：CommonHeader(6)+status(1)+對齊 → top 0x08、base 0x0C、
+# l_G 0x10、ci 0x14、savedpc 0x18、**stack_last 0x1C**、stack 0x20。
+# ⚠ 這個偏移是照 Lua 5.1 原始碼推的，**沒有像 OFF_TOP 那樣被實測驗證過**，
+#   所以 `_room_for()` 只在讀出來的值「看起來合理」時才採用，
+#   對不上就當作沒這道檢查（維持原本行為，不會因為推錯而讓功能失效）。
+OFF_STACK_LAST = 0x1C
 OFF_L_GT = 0x48              # lua_State 裡的全域表（拿來驗證版面）
 TVALUE = 16
 
@@ -85,6 +91,49 @@ def state(scanner) -> int | None:
     if _u32(scanner, L + OFF_L_GT + 8) != T_TABLE:
         return None
     return L
+
+
+def _room_for(scanner, L: int, top: int, n: int) -> bool:
+    """從 top 再推 n 個 TValue 還在堆疊裡面嗎？
+
+    ⚠ 我們是直接把 TValue 寫進遊戲的 Lua 堆疊陣列，正常應該先叫
+      `lua_checkstack`。沒得叫的話至少要自己看一下 `stack_last`，
+      不然堆疊剛好很滿的時候就是**寫爆遊戲的堆積**。
+
+    ★ `stack_last` 的偏移是推的（見 OFF_STACK_LAST），所以先做合理性檢查：
+      它必須在 top 之上、而且距離不能大得離譜。看起來不對就回 True
+      （＝不擋），維持跟以前一樣的行為 —— 寧可不擋，也不要因為偏移推錯
+      而讓整個 Lua 功能失效。
+    """
+    last = _u32(scanner, L + OFF_STACK_LAST)
+    if not (top < last < top + 0x100000):
+        return True                       # 值不合理 → 這道檢查不算數
+    return top + n * TVALUE <= last
+
+
+def _restore_top(mover, scanner, L: int, base_top: int) -> None:
+    """把 Lua 堆疊還原到我們動手之前的高度 —— ★★ **只降不升**。
+
+    ⚠⚠⚠ 以前是無條件 `write(L+top, base_top)`，那是**延遲當機的來源**。
+
+    `base_top` 是我們開始那一刻抄下來的，而中間每一次跳板呼叫回到遊戲的
+    訊息迴圈時，**遊戲自己的 UI Lua 也在跑同一個 L**（計時器、視窗回呼）。
+    所以還原的時候，遊戲的 top 可能已經比 base_top **低**了（它自己的框架
+    跑完收掉了）。這時把 top 寫回較高的 base_top，等於**把堆疊頂拉高、
+    蓋住一堆已經沒人維護的舊 TValue**。
+
+    Lua 5.1 的 GC 標記階段會把 `L->stack` 到 `L->top` 之間**每一格**都當成
+    活的物件去掃 —— 那些舊格子裡的型別標記說「我是可回收物件」，指標卻指向
+    早就被釋放的 GCObject。於是 GC 在**不知道多久以後**的某一輪掃到它，
+    直接讀爛記憶體。這正是「掛很久之後才當、而且完全看不出跟什麼有關」。
+
+    只降不升就沒有這個問題：
+      · top 比我們高 → 那是我們留下的東西，降回去（跟以前一樣）
+      · top 比我們低 → 那是遊戲自己收掉的，**不要碰**
+    """
+    now = _u32(scanner, L + OFF_TOP)
+    if now > base_top:
+        mover.write(L + OFF_TOP, struct.pack("<I", base_top))
 
 
 def _tvalue(v) -> bytes:
@@ -143,7 +192,7 @@ def get_global(mover, scanner, name: str):
             top = _u32(scanner, L + OFF_TOP)
             return _read_value(scanner, top - TVALUE) if top > base_top else None
         finally:
-            mover.write(L + OFF_TOP, struct.pack("<I", base_top))
+            _restore_top(mover, scanner, L, base_top)
 
 
 def call(mover, scanner, path: str, *args) -> tuple[bool, object]:
@@ -180,6 +229,8 @@ def call(mover, scanner, path: str, *args) -> tuple[bool, object]:
             if tt != T_FUNCTION:
                 return False, f"{path} 不是函式（型別 {tt}）"
 
+            if not _room_for(scanner, L, top, len(args)):
+                return False, "Lua 堆疊快滿了，這次不推參數"
             for v in args:
                 mover.write(top, _tvalue(v))
                 top += TVALUE
@@ -193,4 +244,5 @@ def call(mover, scanner, path: str, *args) -> tuple[bool, object]:
             return (rc == 0), val
         finally:
             # ★ 不管成功失敗都把堆疊還原 —— 留東西在上面會慢慢漲爆
-            mover.write(L + OFF_TOP, struct.pack("<I", base_top))
+            #   ⚠ 只降不升，理由見 _restore_top（這是延遲當機的來源）
+            _restore_top(mover, scanner, L, base_top)

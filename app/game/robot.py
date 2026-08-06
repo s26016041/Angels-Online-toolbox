@@ -198,23 +198,36 @@ def get_int(mover, scanner, var_id: int) -> int | None:
     return int(val) if ok and isinstance(val, (int, float)) else None
 
 
-SLOT_CACHE_SECS = 60.0        # 藥水設定多久重讀一次（見 potion_slots）
+# 藥水設定多久重讀一次（見 potion_slots）。
+# ⚠⚠ 這個值直接決定「純打怪時我們戳遊戲 Lua 的頻率」——
+#   `_check_dry()` 每 3 秒跑一次而且**跟有沒有勾補給無關**，所以掛機全程都在
+#   走這條。60 秒時是每分鐘 10 次 Lua 呼叫，五台就是每分鐘 50 次。
+#   每一次 Lua 呼叫都要動遊戲的 Lua 堆疊，是目前風險最高的動作
+#   （見 lua.py `_restore_top` 與 `_sync` 的說明；使用者實測過呼叫太密會把
+#   客戶端的訊息迴圈弄卡死）。
+#   ★ 這是**設定值**，使用者偶爾才改一次 —— 拉長到 5 分鐘等於風險降到 1/5，
+#     而且真的要「宣告藥水見底」之前會強制重讀確認（見 potions_out），
+#     所以判斷結果跟以前一模一樣，不會因為快取變舊而誤報。
+SLOT_CACHE_SECS = 300.0
 _slot_cache: dict[int, tuple[float, dict]] = {}
 
 
-def potion_slots(mover, scanner, pid: int) -> dict:
-    """讀「輔助精靈」那幾格藥水設成什麼，**結果快取 60 秒**。
+def potion_slots(mover, scanner, pid: int, force: bool = False) -> dict:
+    """讀「輔助精靈」那幾格藥水設成什麼，**結果快取 `SLOT_CACHE_SECS` 秒**。
 
     ⚠⚠ **一定要快取**：每次判斷要讀 10 個設定，每個都是一次 Lua 呼叫。
       掛機每 3 秒判斷一次就是每分鐘 200 次 —— 實測連打十幾輪就會把客戶端的
-      訊息迴圈弄卡死（白狐）。設定是使用者偶爾才改的東西，60 秒重讀綽綽有餘。
+      訊息迴圈弄卡死（白狐）。設定是使用者偶爾才改的東西。
     ★ 背包數量**不快取** —— 那是純記憶體讀取，不經過 Lua，成本趨近於零。
+
+    force=True：忽略快取重讀。**只有在要真的下判斷之前才用**
+    （見 `potions_out`），平常呼叫一律走快取。
 
     回傳 {DATAID: (型別, 值)}；任何一個讀失敗就整份不快取（下次再試）。
     """
     now = time.time()
     hit = _slot_cache.get(pid)
-    if hit and now - hit[0] < SLOT_CACHE_SECS:
+    if hit and not force and now - hit[0] < SLOT_CACHE_SECS:
         return hit[1]
     out, ok = {}, True
     for base in HP_ITEM_SLOTS + MP_ITEM_SLOTS:
@@ -273,13 +286,29 @@ def potions_out(mover, scanner, inv_head: int, pid: int = 0,
            ([(MP_ITEM_SLOTS, "MP")] if mp else [])
     if not want:
         return []
+
+    def scan(info) -> list[tuple[str, str]]:
+        out = []
+        for slots, what in want:
+            gone = _potion_out(info, scanner, inv_head, slots)
+            if gone:
+                names = "、".join(itemname.label(t) for t in gone)
+                out.append((what, f"{what}藥水（{names}）"))
+        return out
+
     info = potion_slots(mover, scanner, pid)
-    out = []
-    for slots, what in want:
-        gone = _potion_out(info, scanner, inv_head, slots)
-        if gone:
-            names = "、".join(itemname.label(t) for t in gone)
-            out.append((what, f"{what}藥水（{names}）"))
+    out = scan(info)
+    # ★★ 平常一律吃快取（純記憶體數數，不碰 Lua）；**只有在要宣告「見底」
+    #   之前才強制重讀設定確認一次**。
+    #   為什麼要確認：使用者如果中途把藥水換成別種，快取裡還是舊的種類 ID，
+    #   數舊的當然數到 0 —— 那會變成誤報，還可能誤觸發回程補給。
+    #   為什麼這樣就夠：有水的時候（99.9% 的時間）完全不需要碰 Lua；
+    #   真的數到 0 才多花一次確認，而那本來就是要做決定的時刻。
+    #   設定沒變就直接用原本的結果，連重算都省。
+    if out:
+        fresh = potion_slots(mover, scanner, pid, force=True)
+        if fresh != info:
+            out = scan(fresh)
     return out
 
 
