@@ -253,12 +253,13 @@ LEARN_GAP = 0.25                # 按鍵到遊戲寫入要隔一幀，讀太密�
 # 掛機中多久重讀一次快捷欄（quickbar.Reader）——使用者中途換鍵上的技能，
 # 最慢這麼久就跟上。純讀零副作用，一次只有幾個小讀取（頁碼節點有快取）。
 QB_REFRESH = 2.0
-# ★★ 出手間隔（使用者指定 **0.1 秒**）：勾了幾個技能鍵就照 F1→F12 的順序
-#   每 0.1 秒放一招輪一次。空格／物品格／學不到技能的鍵不進循環。
+# ★★ 一輪之間隔多久（使用者指定 **0.1 秒**）。
+#   一輪 = 勾選的技能鍵**依序各放一次**（F1→F12），放完隔 ROUND_GAP 再下一輪。
+#   一輪之內是逐一等它做完再放下一招（跳板只有一個指令槽，連丟會被擋掉），
+#   所以一輪本身要花「招數 × 一幀(約 16ms)」。
 #   遊戲自己有冷卻，還沒好的那一招送出去也只是不生效，不會出事。
-# ⚠ 執行緒節拍必須比這個細，否則實際間隔會被量化成節拍的倍數
-#   —— 所以 KeyWorker 用 STRIKE_TICK（0.025 秒，剛好切得出 0.1）。
-STRIKE_GAP = 0.10
+# ⚠ 執行緒節拍要比這個細，否則實際間隔會被量化成節拍的倍數。
+ROUND_GAP = 0.10
 STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 # 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
 QUICKKEY_RANGE = 8
@@ -417,7 +418,7 @@ class KeyWorker(_Paced):
     """
 
     def __init__(self, hwnd: int, sc: MemoryScanner) -> None:
-        super().__init__(STRIKE_TICK)          # 要切得出 0.1 秒的出手間隔
+        super().__init__(STRIKE_TICK)          # 要切得出 0.1 秒的輪間隔
         self.hwnd = hwnd
         self.sc = sc
         self.vks: list[int] = [DEFAULT_KEY]   # 使用者勾的技能鍵（輪流用）
@@ -441,8 +442,7 @@ class KeyWorker(_Paced):
         self.player = None
         self.reach = 0.0
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
-        self._next_strike = 0.0     # 下一次可以叫「用快捷鍵」的時間
-        self._next_key = 0.0        # 退路（送鍵）的節流
+        self._next_round = 0.0      # 下一輪可以開始的時間
         self._page = 0              # 快捷欄目前頁（開始掛機時讀一次）
         self._on = False
         self._learning = False
@@ -614,14 +614,8 @@ class KeyWorker(_Paced):
             #     位移技能他要能正常用。非攻擊技能只在選單與狀態列標示
             #     （skills.is_attack），要不要放由使用者決定。
             usable = [k for k in vks if bykey.get(k)]
-            if usable:
-                vk = usable[self._rot % len(usable)]
-                skill = bykey[vk]
-            elif self.qb_ok:
-                return
-            else:
-                vk = vks[self._rot % len(vks)]
-                skill = None
+            if not usable and self.qb_ok:
+                return                    # 快捷欄讀得到、但勾的鍵上沒技能
             # ★★★ 出手方式**依射程分流**（使用者定的）：
             #   射程 ≤ QUICKKEY_RANGE(8) → 叫遊戲的快捷鍵（quickbar.use，
             #     等同按 F2）。⚠⚠ 自己送施放封包**只打得出普攻**：實測 MP
@@ -632,8 +626,12 @@ class KeyWorker(_Paced):
             #     按鍵會跳出「選範圍」的游標等人點地板，角色就站著不動
             #     （使用者實際遇到）。射程 8 以內的對地技能有 74 個
             #     （衝鋒Ⅰ~Ⅲ、末日反噬…），所以這道覆寫不能省。
-            # ★ 節奏：每 STRIKE_GAP 秒放一招，照 F1→F12 的順序輪流；
-            #   空格／物品格／沒學到的鍵**不進循環**（usable 已經濾掉）。
+            # ★★ 節奏（使用者指定）：**一輪＝勾選的技能鍵依序各放一次**，
+            #   放完整輪之後隔 ROUND_GAP 秒再放下一輪。
+            #   空格／物品格／沒學到的鍵不進循環（usable 已經濾掉）。
+            #   ⚠ 一輪之內是**逐一等它做完**再放下一個（call_sync）：跳板只有
+            #     一個指令槽，連續丟只有第一個進得去，後面全被擋掉 ——
+            #     那就變成「一輪只放到第一招」。
             # ★★ **出手前自己再量一次距離**，不要只信 UI 執行緒設的 `_on`。
             #   `_on` 是 UI 每一拍算好推過來的，但 UI 會被尋路（單次最久等
             #   0.15 秒）和掃描結果處理卡住，那段期間怪已經跑出射程、旗標卻
@@ -645,26 +643,35 @@ class KeyWorker(_Paced):
                 if me_now:
                     in_reach = math.hypot(pos[0] - me_now[0],
                                           pos[1] - me_now[1]) <= self.reach
+            if not (in_reach and now >= self._next_round):
+                return
+            # ⚠ 先排下一輪再開始放：中間任何一招失敗都不影響節奏，
+            #   也不會因為某次例外就再也不出手。
+            self._next_round = now + ROUND_GAP
             struck = False
-            if now >= self._next_strike and in_reach:
-                if (mode == MODE_PACKET and packets and skill and eid
-                        and mover is not None):
-                    rng = skills.range_of(skill)
-                    by_packet = (skills.is_ground(skill)
+            if mode == MODE_PACKET and packets and eid and mover is not None:
+                for k in usable:
+                    sid = bykey.get(k)
+                    if not sid:
+                        continue
+                    # 依射程分流（使用者定的）：≤ QUICKKEY_RANGE 叫遊戲的
+                    # 快捷鍵，超過就送帶 ID＋座標的施放封包；對地技能一律封包。
+                    rng = skills.range_of(sid)
+                    by_packet = (skills.is_ground(sid)
                                  or (rng is not None and rng > QUICKKEY_RANGE))
                     if by_packet:
-                        struck = attack.cast_at(mover, skill, eid, *pos)
-                    elif (quickbar.VK_F1 <= vk
+                        ok = attack.cast_at(mover, sid, eid, *pos)
+                    elif (quickbar.VK_F1 <= k
                             < quickbar.VK_F1 + quickbar.SLOTS):
-                        struck = quickbar.use(mover, self.sc,
-                                              vk - quickbar.VK_F1, self._page)
-                if struck:
-                    self._next_strike = now + STRIKE_GAP
-                    self._rot += 1             # 放出去了才輪下一個鍵
-            if not struck and in_reach and now >= self._next_key:
-                # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵，
-                # 那是舊做法，一樣是遊戲自己出手。
-                self._next_key = now + STRIKE_GAP
+                        ok = quickbar.use(mover, self.sc,
+                                          k - quickbar.VK_F1, self._page)
+                    else:
+                        ok = False
+                    struck = struck or ok
+            if not struck:
+                # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵。
+                # ⚠ 送鍵一次要按住 40ms，一輪送一個就好（見 [[key-send-hold]]）。
+                vk = (usable or vks)[self._rot % len(usable or vks)]
                 _send_scan(self.hwnd, vk)
                 self._rot += 1
                 if self._learning:
@@ -1241,7 +1248,7 @@ class CharFarmPage(QWidget):
         self._sync_key_btn()
         a.addWidget(self.key_btn)
         # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）。
-        #    出手節奏是 STRIKE_GAP（0.1 秒輪一招），這裡設的是執行緒節拍，
+        #    出手節奏是 ROUND_GAP（一輪放完隔 0.1 秒），這裡設的是執行緒節拍，
         #    要比它細才切得出來。
         self._keys.set_interval(STRIKE_TICK)
         a.addSpacing(10)

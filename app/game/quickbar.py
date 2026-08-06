@@ -155,12 +155,18 @@ def skill_on_vk(scanner, vk: int) -> int | None:
     return cell.value if cell is not None and cell.is_skill else None
 
 
-def use(mover, scanner, slot: int, page: int = 0) -> bool:
-    """按下快捷欄的某一格（等同使用者按 F1~F12）。成功排進指令槽回 True。
+CALL_TIMEOUT = 0.12          # 等遊戲主執行緒做完一次呼叫的上限（一幀約 16ms）
+
+
+def use(mover, scanner, slot: int, page: int = 0, wait: bool = True) -> bool:
+    """按下快捷欄的某一格（等同使用者按 F1~F12）。有做到回 True。
 
     slot: 0~11（F1~F12）　page: 0~3
     ★ 打誰由**遊戲自己**看目前選定的目標決定 —— 我們只要先把目標寫進
       狀態物件（entity.set_target_id）就好。
+    ⚠⚠ `wait=True` 是**連續放好幾招時的必要條件**：跳板只有一個指令槽，
+      連續丟只有第一個排得進去，後面全被擋掉（回 False）—— 那就變成
+      「一輪只放到第一招」。等它做完（一幀，約 16ms）再放下一招才會全中。
     ⚠ `this` 每次都當場重讀並驗證（[[game-crash-root-causes]] 的鐵則）：
       快捷欄物件會因為換地圖／重連搬家，拿舊的去呼叫會讓遊戲當場崩潰。
     ⚠ 遊戲有自己的冷卻，叫太密只是白叫（跟一直按 F2 一樣，不會出事，
@@ -171,7 +177,10 @@ def use(mover, scanner, slot: int, page: int = 0) -> bool:
     mgr = _manager(scanner)
     if not mgr:
         return False
-    return mover.call(USE_FN, slot, page, 0, ecx=mgr)
+    if not wait:
+        return mover.call(USE_FN, slot, page, 0, ecx=mgr)
+    return mover.call_sync(USE_FN, slot, page, 0, ecx=mgr,
+                           timeout=CALL_TIMEOUT) is not None
 
 
 def _key_matches(scanner, node_bytes: bytes, want: bytes) -> bool:
