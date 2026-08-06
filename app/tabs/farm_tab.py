@@ -108,6 +108,13 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，�
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
 SUPPLY_MAX_SECS = 600.0
 JUMP_BACK_SECS = 180.0          # ★「用天使趴趴GO回地圖」等多久才傳（使用者指定 3 分鐘）
+# ★「死亡自己回練功區」：死了倒數幾秒後用趴趴GO傳回去（使用者指定 10 秒）。
+#   這 10 秒也是留給精靈的「陣亡自動復活」把人復活回城的時間。
+DEATH_JUMP_SECS = 10.0
+DEATH_POLL = 1.0                # 死亡回程模式下多久檢查一次（復活了沒、到了沒）
+# 復活＋傳送＋回到地圖整趟最多等多久。超過就當流程斷了：停機並通知，
+# 不要讓角色掛在城裡空等（使用者是掛網離開的，要叫得動他）。
+DEATH_WAIT_MAX = 90.0
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
 # 的 MAX_HOP），長距離是靠這裡定期重下、一段一段接力走完的，所以不能太久。
 # ★ 下一次移動指令最少隔多久。**而且角色還在走時一律不下**（見 tick）。
@@ -860,6 +867,13 @@ class CharFarmPage(QWidget):
         self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
+        # 死亡回程模式（勾了「死亡自己回練功區」，角色死掉才會進，見 _death_tick）
+        self._death = False        # 進行中（我們完全讓開，等復活＋傳送）
+        self._death_t = 0.0        # 死了多久（倒數 DEATH_JUMP_SECS、超時判斷共用）
+        self._death_poll = 0.0     # 距離上次檢查過了多久
+        self._death_scene = None   # 死在哪張地圖（趴趴GO要傳回去的目的地）
+        self._death_pos = None     # 死在哪（同圖多落點時挑最近的）
+        self._death_jumped = False # 傳送已送出，接下來只等回到地圖
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
@@ -1212,10 +1226,10 @@ class CharFarmPage(QWidget):
             "⚠ 走的是遊戲自己的傳送封包，跟你手動開趴趴GO按下去完全一樣，\n"
             "　 所以**傳送費用、等級限制**照樣算。\n"
             "⚠ 那張地圖不在趴趴GO清單裡就不傳（會在狀態列說一聲）。\n"
-            "★ 勾了這個，開始掛機／觸發補給時會自動把精靈補給頁的\n"
+            "★ 勾了這個，**開始掛機時**會自動把精靈補給頁的\n"
             "　 「使用標記傳送捲軸回練功點」**取消**掉 —— 回地圖已經由\n"
             "　 趴趴GO負責，精靈再燒一張捲軸只是浪費道具。\n"
-            "　 （取消勾選不會幫你把遊戲裡的設定勾回去）")
+            "　 之後你在遊戲裡改回去我們就不再管；取消勾選也不會幫你勾回去。")
         self.sup_jump_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_jump_cb)
         c.addSpacing(10)
@@ -1223,17 +1237,19 @@ class CharFarmPage(QWidget):
         #   DATAID 與「回城 = 1」的由來見 app/game/robot.py 的 AS_AUTO_REVIVE。
         self.sup_revive_cb = QCheckBox("死亡自己回練功區")
         self.sup_revive_cb.setToolTip(
-            "勾了之後，開始掛機時自動把天使精靈「輔助」頁調好：\n"
-            "・「陣亡時自動復活」勾起來\n"
-            "・「復活方式」選成「回城」\n"
-            "角色死掉就會自動復活回城，不會一直躺在原地。\n"
+            "角色死掉也不停止掛機，自動回來繼續打：\n"
+            "・開始掛機時自動把天使精靈「輔助」頁調好 ——\n"
+            "　「陣亡時自動復活」勾起來、「復活方式」選成「回城」\n"
+            f"・死亡 **{DEATH_JUMP_SECS:.0f} 秒後**（等精靈把人復活回城）\n"
+            "　 用天使趴趴GO傳回死掉時那張地圖，回到就自動接回自動戰鬥\n"
+            "・沒勾的話維持原樣：角色死亡就自動停止掛機\n"
             "\n"
-            "・掛機中才勾也會立刻生效\n"
-            "・只往「開」的方向調：取消勾選不會幫你把遊戲裡的設定改回來\n"
-            "⚠ 角色死亡時掛機照樣自動停止並通知 —— 這裡只管「人不要躺著」。\n"
-            "⚠ 復活方式三個選項是 靈魂／回城／原地，這裡固定選「回城」；\n"
-            "　 精靈面板開著的話，下拉選單上的**文字**可能沒立刻跟上，\n"
-            "　 重新點一次下拉選單就會顯示對，實際行為一律以設定值為準。")
+            "・掛機中才勾也會立刻把精靈設定調好\n"
+            "・取消勾選不會幫你把遊戲裡的精靈設定改回來\n"
+            "⚠ 趴趴GO的**傳送費用**照算；那張地圖不在趴趴GO清單裡、\n"
+            "　 或復活／傳送一直沒完成，就停止掛機並發通知。\n"
+            "⚠ 精靈面板開著的話「復活方式」下拉的**文字**可能沒立刻跟上，\n"
+            "　 重點一次就會顯示對，實際行為一律以設定值為準。")
         self.sup_revive_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_revive_cb)
         c.addStretch(1)
@@ -1501,6 +1517,111 @@ class CharFarmPage(QWidget):
             + msg)
 
     # ------------------------------------------------------------------
+    # -- 死亡回程（勾了「死亡自己回練功區」才會進）-------------------------
+    def _start_death_return(self) -> None:
+        """角色死了、而且勾了「死亡自己回練功區」→ 進死亡回程模式。
+
+        分工：**復活是精靈的事**（開始掛機時已把「陣亡自動復活＋回城」調好，
+        見 robot.apply_prefs），我們只負責等角色活過來、死亡滿
+        `DEATH_JUMP_SECS` 秒後用趴趴GO把人傳回死掉時那張地圖，
+        回到地圖就接回自動戰鬥。
+        """
+        self._death = True
+        self._death_t = 0.0
+        self._death_poll = 0.0
+        self._death_scene = self._scene
+        self._death_pos = self.my_pos()      # 屍體的位置還讀得到，拿來挑落點
+        self._death_jumped = False
+        # 我們自己完全讓開（跟交棒補給時一樣）：不送技能鍵、不寫目標
+        self._keys.set_on(False)
+        self._atk.hold_off()
+        self._cur = None
+        # 極罕見：補給跑到一半死掉 → 補給那趟作廢，讓死亡回程接管。
+        #（排著的趴趴GO/關自動攻擊計時器會因 gen 對不上自己作廢。）
+        if self._supply:
+            self._supply = False
+            self._supply_gen += 1
+        self.status.setText(f"☠ 角色死亡 → 等精靈復活，"
+                            f"{DEATH_JUMP_SECS:.0f} 秒後用趴趴GO傳回練功區…")
+
+    def _death_fail(self, why: str) -> None:
+        """死亡回程走不下去 → 停機＋通知（使用者掛網離開，要叫得動他）。"""
+        self._death = False
+        self._stop_with(f"☠ {why} → 已停止掛機")
+        self.notify(f"{why}，掛機已停止。")
+
+    def _death_tick(self, dt: float) -> bool:
+        """死亡回程模式。進行中回 True（呼叫端整個 tick 都要讓開）。
+
+        流程：等復活（精靈代勞）→ 死亡滿 `DEATH_JUMP_SECS` 秒且人活著
+        → 趴趴GO傳回 `_death_scene` → 回到那張地圖就接回自動戰鬥。
+        ★ 人在死亡那張圖上活過來（原地復活、或使用者自己處理了）就直接
+          接回來，不傳送。
+        """
+        if not self._death:
+            return False
+        self._death_t += dt
+        self._death_poll += dt
+        if self._death_t >= DEATH_WAIT_MAX:
+            self._death_fail(f"死亡回程超過 {DEATH_WAIT_MAX:.0f} 秒沒完成"
+                             "（復活或傳送卡住了）")
+            return True
+        if self._death_poll < DEATH_POLL:
+            return True
+        self._death_poll = 0.0
+
+        # 活過來了沒。stats 在復活／傳送時會搬家，讀不到就當「還沒」，
+        # 等掃描重新定位（超時有 DEATH_WAIT_MAX 兜底）。
+        alive = False
+        if self.stats:
+            st = player.read(self.sc, self.stats)
+            alive = st is not None and st.hp > 0
+        now = scene.current(self.sc, allow_scan=False)
+        here = now.id if now else None
+        back = (alive and here is not None and self._death_scene is not None
+                and here == self._death_scene)
+
+        if back:
+            self._death = False
+            self._since_scan = RESCAN_GAP        # 立刻重掃，馬上接回打怪
+            self.status.setText("★ 回到練功地圖 → 接回自動戰鬥"
+                                if self._death_jumped else
+                                "★ 原地活過來了 → 接回自動戰鬥")
+            return True
+        if self._death_jumped:
+            return True                          # 傳送送出去了，等著陸
+
+        if self._death_t < DEATH_JUMP_SECS or not alive:
+            left = max(DEATH_JUMP_SECS - self._death_t, 0.0)
+            self.status.setText(
+                "☠ 角色死亡 → " + ("等精靈復活" if not alive else "復活了")
+                + (f"，{left:.0f} 秒後" if left > 0 else "，")
+                + "用趴趴GO傳回練功區…")
+            return True
+
+        # 倒數到了、人也活了 → 傳回去
+        if self._death_scene is None:
+            self._death_fail("死亡時不知道人在哪張地圖，沒辦法傳回去")
+            return True
+        if not self._ensure_mover():
+            self._death_fail("跳板裝不起來，沒辦法用趴趴GO傳回去")
+            return True
+        pos = self._death_pos or (None, None)
+        e = jumpmap.nearest(self._death_scene, pos[0], pos[1])
+        if e is None:
+            self._death_fail(f"{scene.scene_name(self._death_scene)}"
+                             "不在趴趴GO清單裡，沒辦法傳回去")
+            return True
+        ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
+        self._drop_cached_addrs()                # 傳送必換地圖，位址全作廢
+        if not ok:
+            self._death_fail(f"趴趴GO傳送失敗（{msg}）")
+            return True
+        self._death_jumped = True
+        self.status.setText("☠ 復活了 → 已用趴趴GO傳回練功區，等著陸…")
+        return True
+
+    # ------------------------------------------------------------------
     # -- 回程補給（判斷 → 交棒 → 回到原地圖再接回來）-----------------------
     def _check_dry(self) -> list | None:
         """藥水見底就通知一聲 —— **跟有沒有勾「藥水觸發」無關**（使用者要求）。
@@ -1564,11 +1685,8 @@ class CharFarmPage(QWidget):
         self._supply_left = False
         self._supply_pos = self.my_pos()
         self._supply_gen += 1
-        # ★ 勾了趴趴GO回地圖 → 這趟補給別讓精靈用「標記傳送捲軸」回練功點
-        #   （回地圖由趴趴GO負責）。開始掛機時關過一次，這裡再驗一次 ——
-        #   使用者可能中途又在遊戲裡勾回去。已經是關的就一次 Lua 都不花。
-        robot.apply_prefs(self._mover, self.sc,
-                          jump_back=self.sup_jump_cb.isChecked())
+        # ⚠ 這裡刻意**不**重驗「標記傳送捲軸」的設定 —— 開始掛機時關過一次
+        #   就夠了，之後使用者在遊戲裡改回去是他自己的決定（使用者明講）。
         # ★ 第一段：調好開關 + 設中心點。第二段（回程）隔幾秒才送，
         #   順序與間隔都不能省（見 robot.do_recall）。
         notes = robot.begin_supply(self._mover, self.sc)
@@ -2235,6 +2353,7 @@ class CharFarmPage(QWidget):
             self._keys.eid = None
             self._atk.hold_off()
             self._cur = None
+            self._death = False        # 死亡回程等到一半就作廢，別再傳送
             # ⚠ 停掛機時如果正在讓精靈跑補給，一定要把精靈也關掉 ——
             #   不然使用者以為停了，角色卻還在自己跑。
             # ⚠ 精靈如果是我們開的（自動交棒或測試按鈕），停掛機時一定要把
@@ -2300,6 +2419,11 @@ class CharFarmPage(QWidget):
         if not self.run_cb.isChecked():
             return
 
+        # ★ 死亡回程要在最前面：死亡／復活／傳送期間 state 常常是 None、
+        #   也絕不能讓巡迴換頻道插進來，所以整個 tick 都讓給它。
+        if self._death_tick(dt):
+            return
+
         # ★ 巡迴換頻道要在「state is None」的檢查**之前** —— 換頻道會斷線重連，
         #   那幾秒 state 本來就是 None，放後面的話狀態機會停在半路。
         if self._tick_rotation(dt):
@@ -2330,9 +2454,15 @@ class CharFarmPage(QWidget):
                     self._mp_pct = (st.mp / st.max_mp * 100
                                     if st.max_mp else 100.0)
                     if st.hp <= 0:
-                        self._stop_with(
-                            f"☠ 角色死亡 → 已自動停止掛機"
-                            f"（本次擊殺 {self._kills} 隻）")
+                        # ★ 勾了「死亡自己回練功區」→ 不停機，交給死亡回程
+                        #   模式（等精靈復活回城 → 趴趴GO傳回來 → 接著打）。
+                        #   沒勾就維持原樣：自動停止掛機。
+                        if self.sup_revive_cb.isChecked():
+                            self._start_death_return()
+                        else:
+                            self._stop_with(
+                                f"☠ 角色死亡 → 已自動停止掛機"
+                                f"（本次擊殺 {self._kills} 隻）")
                         return
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
