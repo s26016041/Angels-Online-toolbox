@@ -172,6 +172,11 @@ NEAR_HEIGHT = 84
 #   主視窗是固定 940x700，整頁高度就這麼多。
 NEAR_MAX = 108
 STUCK_SECS = 10.0               # 沒掉血、玩家也沒前進這麼久 → 這隻走不過去，換一隻
+# ★★ **打得到的時候**要等多久才放棄（見 tick 裡的說明）。
+#   等級差得多時命中率低、一隻要打十幾秒 —— 實測擊殺耗時 9.7/9.8/10.8 秒，
+#   用 10 秒等於在快贏的前一刻放棄。45 秒足夠打完一隻，真的完全打不中
+#   （例如等級差太多）也不會卡太久。
+STUCK_ENGAGED = 45.0
 # ★★ 卡住偵測用「離錨點的**淨位移**」，不是「每 0.3 秒有沒有動」。
 #   撞牆時角色會小幅抖動（實測約 0.5~0.6 格），剛好跨過舊的 MOVE_EPS(0.5)
 #   門檻，於是每一拍都被當成「正在走路」，_stuck 永遠被歸零 ——
@@ -3142,8 +3147,21 @@ class CharFarmPage(QWidget):
         else:
             self._stuck += dt
         self._last_hp = hp
-        if self._stuck >= STUCK_SECS:
-            self._cool_unreach(m.eid)      # 走不過去，一樣用遞增冷卻
+        # ★★ 「沒進展」要等多久才放棄，**打得到的時候要有耐心**。
+        #   STUCK_SECS(10 秒) 是為「走不過去」設計的；套在交戰上剛好是災難：
+        #   等級差得多時命中率低，一隻要打十幾秒才會倒 —— 實測（雪狐 82 級
+        #   打 91/93 級）擊殺耗時 9.7 / 9.8 / 10.8 秒，**門檻正好卡在中位數**，
+        #   於是快贏的前一刻自己放棄，還把那隻丟進 8→120 秒的遞增冷卻。
+        #   同場同怪 60 秒對照：官方掛（85 級）鎖 6 殺 6，我們鎖 6 只殺 2。
+        # ⚠ 冷卻也要換成短的（NOHP_MEMORY）：這不是「走不到」，用遞增冷卻
+        #   會把整片打得到的怪一隻隻凍起來，越打越沒得打。
+        engaged = bool(in_range and self._keys.selected)
+        limit = STUCK_ENGAGED if engaged else STUCK_SECS
+        if self._stuck >= limit:
+            if engaged:
+                self._killed[m.eid] = time.monotonic() + NOHP_MEMORY
+            else:
+                self._cool_unreach(m.eid)  # 走不過去，用遞增冷卻
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
@@ -3151,8 +3169,10 @@ class CharFarmPage(QWidget):
                 self._keys.set_on(False)
                 self._since_scan = RESCAN_GAP
             self.status.setText(
-                f"「{m.name}」{STUCK_SECS:.0f} 秒沒進展（走不過去？）→ 換一隻")
-            self._dbg(f"放棄「{m.name}」eid={m.eid:#x}：{STUCK_SECS:.0f} 秒沒進展"
+                f"「{m.name}」{limit:.0f} 秒沒進展"
+                + ("（打不中？）" if engaged else "（走不過去？）") + " → 換一隻")
+            self._dbg(f"放棄「{m.name}」eid={m.eid:#x}：{limit:.0f} 秒沒進展"
+                      + ("（交戰中）" if engaged else "")
                       + (f"（距離 {dist:.1f} 格）" if dist is not None else ""))
             return
 
