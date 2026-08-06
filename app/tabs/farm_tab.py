@@ -100,6 +100,15 @@ IDLE_SCAN_GAP = 1.5             # 沒在掛機時也持續刷新「周圍怪物�
 # 約 23% 的時間在掃，它跑在 LowPriority 不會影響畫面。
 REFRESH_GAP = 0.15
 FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保險
+# ★ 「補救全掃」的節流。這是**保險**，不是常態修補 —— 唯讀實測
+#   （5 台 × 300 秒，v2/v3 兩輪）：活怪從清單消失幾乎都是遊戲自己回收
+#   物件（視野剔除，523 件裡只有 1 件是掃描端漏讀），而新出現的怪 0 件
+#   落在熱區外（新物件會重用既有的堆積區塊，熱掃當拍就看得到）。
+#   所以補救全掃只在三種「事情不對勁」時要求：目標掃不到但物件還在、
+#   整批活怪消失但物件還在、掛機中一直挑不到目標 —— 前兩種罕見，
+#   第三種是等重生時順便當保險。全掃一次 0.35 秒、五台共用一條掃描
+#   執行緒，同一台最快隔這麼久才准再要求一次。
+FULL_HUNT_GAP = 3.0
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，不必常看）
@@ -688,6 +697,15 @@ class ScanWorker(QThread):
         if not any(p == pid for p, _ in self._queue):
             self._queue.append((pid, sc))
 
+    def force_full(self, pid: int) -> None:
+        """下一次掃這台時做全掃。
+
+        熱區清單只在全掃時重建，堆積一變（怪重生＝新配置）就可能整塊漏掉；
+        呼叫端發現「掃不到但物件還在」或「沒目標可挑」時用這個補救。
+        呼叫端要自己節流（FULL_HUNT_GAP）—— 這裡照單全收。
+        """
+        self._full_at[pid] = 0.0
+
     def run(self) -> None:
         while self._running:
             if not self._queue:
@@ -843,6 +861,9 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
         self._dbg_t = 0.0          # 診斷紀錄的計時（見 _FARM_LOG）
+        self._dbg_empty_t = 0.0    # 「挑不到目標」紀錄的節流（見 _pick_next）
+        self._want_full = False    # 下一次掃描要求全掃（見 _ask_full）
+        self._full_req_t = 0.0     # 補救全掃的節流（FULL_HUNT_GAP）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
@@ -2138,6 +2159,18 @@ class CharFarmPage(QWidget):
         self.player = s.player
         self.stats = s.stats
         self.inv = s.inv
+        # ★ 掃描端漏怪的保險：上一拍還在的活怪這一拍不見了，物件卻還在
+        #   原位址 → 掃描漏了那一塊（唯讀實測這很罕見，1/523 —— 消失多半
+        #   是遊戲自己回收物件，那種 read_live 會失敗，不會誤觸發）。
+        #   抽驗最多 3 隻，只是要決定「要不要補一次全掃」。
+        if not s.err and self.mons:
+            cur_eids = {m.eid for m in (s.mons or [])}
+            lost = [m for m in self.mons if m.eid not in cur_eids]
+            for m in lost[:3]:
+                alive, st, _p = entity.read_live(self.sc, m)
+                if alive and st != "Dead":
+                    self._ask_full(f"{len(lost)} 隻怪從掃描消失但物件還在")
+                    break
         self.mons = s.mons or []
         # 送鍵執行緒要的兩樣東西，跟著掃描一起更新（物件會搬家）：
         #   stats —— 學技能 ID 用（角色屬性基準 −0x50）
@@ -2183,10 +2216,22 @@ class CharFarmPage(QWidget):
         #   結果一路結仇被打死」）。
         if (self.run_cb.isChecked() and self._cur is not None
                 and not any(m.eid == self._cur.eid for m in self.mons)):
-            self._gone += 1
-            if self._gone >= GONE_SCANS:
-                self._on_died(self._cur.eid)
-                return
+            # ★ 判死之前**先去舊位址驗一次物件**。「掃不到」≠「死了」。
+            #   唯讀實測（5 台 × 300 秒）：活怪從清單消失又帶著同一個 eid
+            #   回來的事件有 15~104 件／台（中位 6~22 秒）——多半是遊戲自己
+            #   回收物件（視野剔除），但也拍到過物件還在、純粹掃描漏掉的
+            #   （1/523）。物件還在而且不是屍體 → 一定是掃描端漏了：照打
+            #   （攻擊執行緒拿的是位址，不受清單影響），並補一次全掃。
+            #   物件沒了才走原本的兩拍判死。
+            alive, st, _p = entity.read_live(self.sc, self._cur)
+            if alive and st != "Dead":
+                self._gone = 0
+                self._ask_full(f"目標「{self._cur.name}」被掃描漏掉（物件還在）")
+            else:
+                self._gone += 1
+                if self._gone >= GONE_SCANS:
+                    self._on_died(self._cur.eid)
+                    return
         else:
             self._gone = 0
 
@@ -2202,6 +2247,35 @@ class CharFarmPage(QWidget):
         if self.status.text() != msg:
             self.status.setText(msg)
 
+    def _dbg(self, msg: str) -> None:
+        """事件型的診斷紀錄（AO_FARM_LOG=1 才寫），跟每秒的決策行同一個檔。
+
+        ★ 使用者回報「沒優先打最近的」「10 秒沒反應」時，每秒一行的決策
+          看不出**挑目標當下**發生什麼事 —— 挑中誰、跳過了誰、為什麼跳過，
+          只有在 _pick_next 裡當場記下來才對得回去。
+        """
+        if not _FARM_LOG:
+            return
+        try:
+            with open(f"farm_debug_{self.account}.log", "a",
+                      encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except OSError:
+            pass
+
+    def _ask_full(self, why: str = "") -> None:
+        """請下一次掃描做全掃（有節流，最快 FULL_HUNT_GAP 一次）。
+
+        熱區掃描漏掉整塊時的補救 —— 見 FULL_HUNT_GAP 的說明。
+        """
+        now = time.monotonic()
+        if now - self._full_req_t < FULL_HUNT_GAP:
+            return
+        self._full_req_t = now
+        self._want_full = True
+        if why:
+            self._dbg(f"要求全掃：{why}")
+
     def _cool_unreach(self, eid: int) -> None:
         """把「走不到」的怪冷凍起來，**時間隨失敗次數翻倍**。
 
@@ -2213,6 +2287,8 @@ class CharFarmPage(QWidget):
         self._unreach_n[eid] = n + 1
         wait = min(UNREACH_MEMORY * (2 ** n), UNREACH_MAX)
         self._killed[eid] = time.monotonic() + wait
+        self._dbg(f"冷卻（走不到 ×{n + 1}）eid={eid:#x} {wait:.0f} 秒"
+                  + (f"　{self._why}" if self._why else ""))
 
     def _pick_next(self) -> bool:
         """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打；挑不到回傳 False。
@@ -2248,9 +2324,37 @@ class CharFarmPage(QWidget):
             if now > until:
                 del self._killed[eid]
         pool = []
+        # 診斷用：被跳過的怪（距離, 名字, 原因）。平常是 None，完全不花錢。
+        skipped: list[tuple[float, str, str]] | None = [] if _FARM_LOG else None
         for m in self.mons:
-            if m.eid in self._killed:
+            # ★ eid=0 的實體絕不能挑（唯讀實測：場上真的會出現，多半是屍體
+            #   但也拍到過活狀態 —— 剛生成還沒填 ID／回收中被清掉 ID）。
+            #   挑到它整條攻擊鏈都會空轉：KeyWorker 對 eid=0 不送「選定」
+            #   也不送攻擊（0 = 沒目標），屍體偵測因為 selected 恆為 False
+            #   也不會啟動 —— 就是站著發呆到 10 秒逾時換一隻（使用者回報的
+            #   「看著一隻掛不動，10 秒沒反應」）。
+            if not m.eid:
                 continue
+            if m.eid in self._killed:
+                # ★★ 冷卻中的怪**正在打我**就立刻解禁。冷卻的用途是別浪費
+                #   時間在屍體／走不到的怪身上 —— 但打得到我的怪，我一定
+                #   打得到牠，冷卻的理由不成立。實際案例（使用者的第 3 個
+                #   回報）：被判走不到而冷凍 → 牠追過來咬人 → 挑目標永遠
+                #   跳過牠 → 打別隻打到被咬死。
+                #   ⚠ 只解「打我的」；不動其他冷卻、也不改「純粹挑最近的」
+                #   規則（貼身的怪距離最近，排序自然輪到牠）。
+                alive_k, st_k, _pk = entity.read_live(self.sc, m)
+                if (alive_k and st_k != "Dead" and self.player
+                        and entity.attacking(self.sc, m, self.player)):
+                    del self._killed[m.eid]
+                    self._unreach_n.pop(m.eid, None)
+                    self._dbg(f"解除冷卻：「{m.name}」eid={m.eid:#x} 正在打我")
+                else:
+                    if skipped is not None and me and m.name in want:
+                        skipped.append((math.hypot(m.x - me[0], m.y - me[1]),
+                                        m.name, "冷卻中還剩 "
+                                        f"{self._killed[m.eid] - now:.0f} 秒"))
+                    continue
             # 休息中／收尾中：只打正在打我的那幾隻，把牠們清掉才坐得下去。
             # ⚠ 這裡**不看「選中怪物」也不看只打王** —— 打我的怪不管是什麼
             #   都得處理掉，不然就是站在那裡挨打。
@@ -2268,6 +2372,9 @@ class CharFarmPage(QWidget):
             #   以前是四次系統呼叫，場上幾十隻怪、每殺一隻重挑一次。
             alive, st, p = entity.read_live(self.sc, m)
             if not alive:
+                if skipped is not None and me:
+                    skipped.append((math.hypot(m.x - me[0], m.y - me[1]),
+                                    m.name, "物件沒了"))
                 continue
             # ★★ 屍體直接跳過（別人先殺掉的）。動畫狀態當場重讀 ——
             #   掃描到現在可能已經過了 0.3 秒，牠剛好是在那之間倒下的。
@@ -2277,6 +2384,9 @@ class CharFarmPage(QWidget):
             #     CORPSE_SECS 才發現不對 —— 每次白花快一秒。
             #   ⚠ is_alive() 擋不掉：它只比對 vtable + 實體 ID，分不出屍體。
             if st == "Dead":
+                if skipped is not None and p and me:
+                    skipped.append((math.hypot(p[0] - me[0], p[1] - me[1]),
+                                    m.name, "屍體"))
                 continue
             # 座標也是當場讀的（跟上面同一次讀取）：怪會走、角色也在走，
             # 掃描時記的早就過期了。
@@ -2293,6 +2403,13 @@ class CharFarmPage(QWidget):
             pool.append((d, m))
         pool.sort(key=lambda t: t[0])
         if not pool:
+            # 挑不到時每 0.3 秒就會再試一次，照實寫會灌爆檔案 —— 節流 5 秒。
+            if skipped and now - self._dbg_empty_t >= 5.0:
+                self._dbg_empty_t = now
+                dd, name, why = min(skipped)
+                self._dbg(f"挑不到目標：清單 {len(self.mons)} 隻、"
+                          f"被跳過 {len(skipped)} 隻；"
+                          f"最近的是 {name} {dd:.1f} 格（{why}）")
             return False
         d, self._cur = pool[0]           # 純粹挑最近的
         self._stuck = 0.0
@@ -2309,6 +2426,12 @@ class CharFarmPage(QWidget):
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
         self._keys.eid = self._cur.eid            # 送封包時要指名打誰
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
+        if skipped is not None:
+            near = sorted(s for s in skipped if s[0] < d)[:5]
+            if near:
+                self._dbg(f"挑中「{self._cur.name}」{d:.1f} 格；跳過更近的："
+                          + "、".join(f"{n} {dd:.1f}格（{r}）"
+                                      for dd, n, r in near))
         info = monsters.info(self.sc, self._cur.type_id, idx) if boss_only else None
         self.status.setText(
             ("【只打王】　" if boss_only else "")
@@ -2332,6 +2455,9 @@ class CharFarmPage(QWidget):
         # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
         self._killed[eid] = time.monotonic() + (
             KILL_MEMORY if confirmed else NOHP_MEMORY)
+        self._dbg(f"「{m.name if m else '?'}」eid={eid:#x} "
+                  + ("確認死亡" if confirmed else "一直沒給血量（推測屍體）")
+                  + f" → 冷卻 {KILL_MEMORY if confirmed else NOHP_MEMORY:.0f} 秒")
         self._cur = None
         self._keys.eid = None                  # 別再對著屍體送封包
         if not self.run_cb.isChecked():
@@ -2414,7 +2540,13 @@ class CharFarmPage(QWidget):
         if self._since_scan >= gap and not self._waiting:
             self._since_scan = 0.0
             self._waiting = True
-            self._on_scan(self.pid)
+            # ★ 掛機中卻沒目標 → 定期（FULL_HUNT_GAP）要求全掃當保險。
+            #   唯讀實測熱掃幾乎都能當拍看到新怪（v3：新出現 0 件落在熱區
+            #   外），這只是「等重生」期間順便讓熱區清單保持新鮮。
+            if self.run_cb.isChecked() and self._cur is None:
+                self._ask_full("沒目標，全掃當保險")
+            full, self._want_full = self._want_full, False
+            self._on_scan(self.pid, full)
 
         if not self.run_cb.isChecked():
             return
@@ -2724,6 +2856,8 @@ class CharFarmPage(QWidget):
                 self._keys.set_on(False)
                 self._since_scan = RESCAN_GAP
             self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
+            self._dbg(f"放棄「{m.name}」eid={m.eid:#x}：尋路連續 "
+                      f"{UNREACH_HITS} 次算不出（{dist:.1f} 格）")
             return
         # ★★ 走路目標**一律就是怪本身**，繞路完全交給 walk_route()：
         #   它會對怪尋路，然後照 _approach_point() 的規則決定這一趟走到哪
@@ -2858,6 +2992,8 @@ class CharFarmPage(QWidget):
                 self._since_scan = RESCAN_GAP
             self.status.setText(
                 f"「{m.name}」{STUCK_SECS:.0f} 秒沒進展（走不過去？）→ 換一隻")
+            self._dbg(f"放棄「{m.name}」eid={m.eid:#x}：{STUCK_SECS:.0f} 秒沒進展"
+                      + (f"（距離 {dist:.1f} 格）" if dist is not None else ""))
             return
 
         # ⛔ 這裡不再每 0.2 秒重寫一次「掛機中：…」——
@@ -3154,10 +3290,12 @@ class FarmTab(BaseTab):
             self.tabs.addTab(page, nm)
         self.found.setText(f"偵測到 {len(insts)} 個分身")
 
-    def _request_scan(self, pid: int) -> None:
+    def _request_scan(self, pid: int, full: bool = False) -> None:
         page = self._pages.get(pid)
         if page is None or self._worker is None:
             return
+        if full:
+            self._worker.force_full(pid)
         self._worker.request(pid, page.sc)
 
     def _on_scan_done(self, s: Scan) -> None:
