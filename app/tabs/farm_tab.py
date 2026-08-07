@@ -1099,6 +1099,10 @@ class CharFarmPage(QWidget):
         self._want_full = False    # 下一次掃描要求全掃（見 _ask_full）
         self._full_req_t = 0.0     # 補救全掃的節流（FULL_HUNT_GAP）
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
+        # ★ 「地形圖**這一拍親口說**跟目標之間直線可通」。只有它是 True 才敢
+        #   把「走直線到目標」當成自己算好的路徑交給遊戲（見 _walk_toward）。
+        #   讀不到地形圖時永遠是 False → 退回讓遊戲自己尋路。
+        self._line_clear = False
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._unreach = 0          # 連續幾次尋路算不出路徑
@@ -2519,13 +2523,19 @@ class CharFarmPage(QWidget):
             self._walk_t = 0.0
             return 1 if ok else 0
         self._near_from = None
-        # ★ 隔著地形時，這一拍剛用地形圖算好的繞路點直接交給遊戲走 ——
-        #   不必再請它尋一次路（省 5~6ms，而且不佔指令槽）。
-        #   ⚠ 只有「這一拍算的、而且真的是繞路」才給：直線可通時 _way 是空的，
-        #     那就照原本的走法讓 walk_route 自己處理留距離（stop_short）。
+        # ★★ 路徑一律用**我們自己算的**交給遊戲走，不再請它尋一次路
+        #   （省 5~6ms，而且不佔指令槽 —— 那個槽攻擊也要用）。
+        #     · 隔著地形 → 這一拍地形圖算好的繞路點（_way）
+        #     · 直線可通 → 就是目標那一格（格子中心，跟遊戲的單點路徑一樣）
+        #   ⚠ 只有「地形圖這一拍親口說直線可通」（_line_clear）才敢走直線。
+        #     讀不到地形圖時 _line_clear 是 False，就退回讓 walk_route 自己
+        #     問遊戲尋路 —— 拿一個可能過期的判斷去走直線會直接撞牆。
+        # ⚠ 終點用**格子中心**不要用怪的浮點座標：踩到怪自己那一格時
+        #   伺服器不給站，整段移動會被退回（見 move.walk_route 的說明）。
+        pts = self._way or ([(int(gx) + 0.5, int(gy) + 0.5)]
+                            if self._line_clear else None)
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
-                                   stop_short=keep,
-                                   points=self._way or None)
+                                   stop_short=keep, points=pts)
         self._walk_t = 0.0
         return n
 
@@ -2829,6 +2839,7 @@ class CharFarmPage(QWidget):
         self._stuck = 0.0
         self._anchor = me                # 換目標 → 卡住偵測從這裡重新算
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
+        self._line_clear = False                  # 還沒問過地形圖，先別走直線
         self._path_t = PATH_GAP                   # 下一拍就問
         self._way = []
         self._unreach = 0
@@ -3278,6 +3289,7 @@ class CharFarmPage(QWidget):
         self._path_t += dt
         if dist is not None and dist <= NO_PATH_NEED:
             self._path_pts, self._way, self._unreach = 1, [], 0
+            self._line_clear = True
         elif (self._path_t >= PATH_GAP and mp is not None and me
                 and dist is not None):
             self._path_t = 0.0
@@ -3289,7 +3301,9 @@ class CharFarmPage(QWidget):
             ttile = (int(mp[0]), int(mp[1]))
             if grid is not None and grid.clear_line(mtile, ttile):
                 self._path_pts, self._way, self._unreach = 1, [], 0
+                self._line_clear = True
             elif grid is not None:
+                self._line_clear = False
                 # 直線被擋 → 算一條繞過去的路。**上限是直線距離的 3 倍**：
                 # 繞這麼遠還到不了的怪本來就不該追，而且這道上限同時把
                 # 「走不到的目標」最壞的展開成本壓住（見 terrain.route）。
@@ -3307,9 +3321,12 @@ class CharFarmPage(QWidget):
                     #   把那隻怪丟掉並加黑名單。症狀是一直換目標、跑來跑去
                     #   卻沒進帳（實測 3 分鐘裡 39% 的時間在空轉）。
                     self._unreach += 1
-            elif (dist > NO_PATH_NEED and self._mover is not None
-                    and self._mover.active):
-                # 讀不到地形圖（改版位移／還沒進場）→ 退回問遊戲的尋路。
+            elif dist > NO_PATH_NEED:
+                # 讀不到地形圖（改版位移／還沒進場）→ 退回問遊戲的尋路，
+                # 而且**不敢自己走直線**（沒有可信的擋線判斷）。
+                self._line_clear = False
+            if grid is None and dist is not None and dist > NO_PATH_NEED and (
+                    self._mover is not None and self._mover.active):
                 n = self._mover.path_to(self.sc, mp[0], mp[1])
                 if n >= 0:             # -1 = 這次沒問到，保留上一次的判斷
                     self._path_pts = n
