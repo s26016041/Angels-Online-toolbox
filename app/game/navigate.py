@@ -120,9 +120,11 @@ class Navigator:
     換下一個目標（別再耗下去）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, maps: "terrain.Cache | None" = None) -> None:
         # 地形圖（可走格）—— 有它就直接算最短路，不必再靠探索。見 terrain.py
-        self._maps = terrain.Cache()
+        # ★ 呼叫端可以把自己那份快取傳進來共用：一張圖 54000 格，
+        #   打怪那邊也要查同一份，各存一份只是白佔記憶體又要各讀一次。
+        self._maps = maps if maps is not None else terrain.Cache()
         self.reset()
 
     def reset(self, goal: tuple[float, float] | None = None) -> None:
@@ -347,8 +349,11 @@ class Navigator:
                         self._from_grid = False
                         self.note = "記住的路線走不通 → 改回現場探路"
                         return self.note
+                # ★ 最短路的每一段本來就保證直線可通 → 直接把終點交給遊戲的
+                #   走路常式，不必再請它尋一次路（省一次呼叫、不佔指令槽）。
                 mover.walk_route(scanner, player_obj, pt[0], pt[1],
-                                 stop_short=0.0)
+                                 stop_short=0.0,
+                                 points=[pt] if self._from_grid else None)
                 self._sent = time.monotonic()
                 self._go_now = False
                 self.note = (f"走最短路（{self._ri + 1}/{len(self._route)}）"

@@ -556,7 +556,7 @@ class Mover:
 
     def walk_route(self, scanner, player_obj: int,
                    tile_x: float, tile_y: float, stop_short: float = 0.0,
-                   wait: float = 0.12) -> int:
+                   wait: float = 0.12, points: list | None = None) -> int:
         """★ 對**目標本身**尋路，走它算出來的那條路，停在離終點 stop_short 格。
 
         回傳路徑點數（0 = 算不出路徑）。
@@ -580,6 +580,13 @@ class Mover:
         ⚠ 終點只用遊戲算出來的路徑點或那些點之間的內插，**不要自己捏座標**：
           落在目標自己的格子上時伺服器不給站，整段移動會被退回
           （症狀是「往前走然後縮回原點」）。
+
+        points: 呼叫端**已經自己算好的路徑點**（格子座標，最後一個是終點）。
+          給了就不再問遊戲的尋路，直接照這條路走 —— 省下一次 5~6ms 的呼叫，
+          更重要的是不必跟攻擊搶指令槽。現在掛機與巡邏都是從地形圖
+          （app/game/terrain.py）算好再傳進來的。
+          ⚠ 那些點必須是**真的可走的格子**（地形圖算出來的就是），
+            自己捏的座標會被伺服器退回。
         """
         if not self._active or not player_obj:
             return 0
@@ -602,6 +609,15 @@ class Mover:
         if not got:
             return 0
         try:
+            # ★ 呼叫端已經算好路了（地形圖）→ 完全不必問遊戲的尋路。
+            if points:
+                pts = [(float(x), float(y)) for x, y in points]
+                gx, gy = _approach_point((cx, cy), pts, stop_short) or pts[-1]
+                self.call(WALK_FN, this, wx, wy,
+                          int(gx * entity.TILE_UNITS) & 0xFFFF,
+                          int(gy * entity.TILE_UNITS) & 0xFFFF, 0)
+                return len(pts)
+
             def path(px: float, py: float) -> int:
                 v = self.call_sync(
                     PATHFIND_FN,

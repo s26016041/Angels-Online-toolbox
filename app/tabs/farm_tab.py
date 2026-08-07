@@ -1144,8 +1144,15 @@ class CharFarmPage(QWidget):
         #   不記地圖就會拿 A 圖的點在 B 圖亂走（使用者要求：不同圖就不要去）。
         self._spots: list[tuple[float, float, int | None]] = []
         self._spot_i = 0           # 現在要去第幾個
+        # ★★★ 地形圖（整張地圖的可走格，直接讀遊戲載的資料）。見 terrain.py
+        #   走路與打怪的判斷都查它，**不再問遊戲的尋路**：
+        #     · 直線檢查 0.003ms、近距離 A* 0.2~0.8ms（遊戲的尋路 5~6ms）
+        #     · 而且**不必搶指令槽** —— 尋路要跟攻擊搶那個唯一的槽，
+        #       搶不到時回 -1，我們就只能沿用上一次的舊答案（怪早就走掉了）。
+        #   一份快取給導航與打怪共用。
+        self._maps = terrain.Cache()
         # ★ 走去巡邏點的導航器（會繞路、會判斷到不了），見 navigate.py
-        self._nav = navigate.Navigator()
+        self._nav = navigate.Navigator(self._maps)
         # ★★ 走通過的巡邏路線（(地圖, 從哪點, 到哪點) → 去彎後的路線）。
         #   探索一次之後同一段路直接重播 —— 實測 142 格的腿探索走了 429 格
         #   （來回乒乓 6 次，「卡很久、牆邊蠕動」的來源），重播就是直達。
@@ -2512,8 +2519,13 @@ class CharFarmPage(QWidget):
             self._walk_t = 0.0
             return 1 if ok else 0
         self._near_from = None
+        # ★ 隔著地形時，這一拍剛用地形圖算好的繞路點直接交給遊戲走 ——
+        #   不必再請它尋一次路（省 5~6ms，而且不佔指令槽）。
+        #   ⚠ 只有「這一拍算的、而且真的是繞路」才給：直線可通時 _way 是空的，
+        #     那就照原本的走法讓 walk_route 自己處理留距離（stop_short）。
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
-                                   stop_short=keep)
+                                   stop_short=keep,
+                                   points=self._way or None)
         self._walk_t = 0.0
         return n
 
@@ -3243,57 +3255,67 @@ class CharFarmPage(QWidget):
         # ⚠ 讀不到座標（dist is None）算「不在範圍內」—— 位置不明就別亂送封包，
         #   那多半是怪的物件已經被回收了。
         #
-        # ★ 有沒有障礙物**直接問遊戲的尋路函式**（只算不走，實測 5～6ms）：
-        #   回 1 點就是直線通、多點就是要繞。挑到新目標時算一次即可，
-        #   不必先走一步再看 —— 否則近距離隔著牆的怪會被當成「在範圍內」空打。
-        # ⚠ 搶不到指令槽時會回 -1（攻擊執行緒正在送封包）。**絕不阻塞等待**，
-        #   那是在 UI 執行緒上，一等畫面就凍住（使用者回報的「打一打卡住」）。
-        #   維持 -1 = 還不知道，隔 PATH_GAP 再問一次就好。
+        # ★★★ 「跟這隻怪之間有沒有地形」「走不走得到」**查我們自己讀的地形圖**
+        #   （app/game/terrain.py），不再問遊戲的尋路。
+        #
+        #   為什麼換掉（不是因為遊戲算錯 —— 實測 80 個「怪站得住的格子」，
+        #   遊戲的答案跟地形圖 100% 一致）：問題出在**問不到**與**貴**。
+        #     · 尋路要跟攻擊搶那個唯一的指令槽，搶不到就回 -1，我們只能
+        #       沿用上一次的答案 —— 而攻擊執行緒實測可以把槽佔到 82%。
+        #       怪一直在走，0.2 秒前的答案本來就過期了。
+        #     · 一次 5~6ms，五台一起跑就是持續佔著槽不放。
+        #   地形圖：直線檢查 0.003ms、近距離 A* 0.2~0.8ms、**永遠問得到**，
+        #   而且完全不佔指令槽（純記憶體查表）。
         #
         # ⚠⚠ **只有這裡可以寫 _path_pts**。以前 _walk_toward() 的回傳值也會寫進來，
         #   但那是「走到某個中繼點」的路徑點數，跟「我跟這隻怪之間有沒有地形」
         #   根本是兩回事 —— 只要走過一次要繞路的路徑（點數 > 1），就會被當成
         #   隔著地形，攻擊距離縮成 2 格，於是 3~10 格的怪既不打、也走不到，
         #   一路卡到 10 秒逾時（監控實際抓到的距離 3.6 / 5.4 / 9.6 / 10.2）。
-        # 怪會走動，所以每 PATH_GAP 重問一次，不是只在「還不知道」時問。
-        # ⚠⚠⚠ **貼在身上的怪不要問尋路** —— 尋路到「自己腳下那一格」本來
-        #   就會回 0，而 0 在這裡是「走不過去」的意思。
-        #   近戰每打一隻就會貼上去，於是每隻都被判定走不到、丟進冷卻，
-        #   然後跑去鎖 3~16 格外的怪 —— 唯讀監控實拍（雪狐）：
-        #       目標 16.0 格，而周圍 1.2 / 2.7 格就有怪
-        #   使用者的症狀是「沒打幾隻就卡，手動按 F2 也沒用」
-        #   （目標欄位裡是那隻遠的，按 F2 打的是打不到的那隻）。
-        #   遠程停在 10~12 格所以完全看不出這個問題。
+        # 怪會走動，所以每 PATH_GAP 重算一次，不是只在「還不知道」時算。
+        # ⚠ 貼身（≤3 格）一律當直線可通：那個距離不存在擋線問題，
+        #   而舊的「要繞路」判定殘留下來會把攻擊距離壓成 2 格（實錄過）。
         self._path_t += dt
-        if dist is not None and dist <= NO_PATH_NEED and self._path_pts > 1:
-            # ★★ 貼身（≤3 格）不重問尋路（問了必回 0），但**舊的「要繞路」
-            #   判定也要跟著作廢** —— 殘留的話下面還當作隔著地形。
-            #   實錄（黑狐 2026-08-07）：追到 2.0 格後 blocked 一直是舊值、
-            #   攻擊距離被壓成 2、站著 9.5 秒一發沒放，最後被當「走不到」
-            #   冰起來換怪。貼身本來就不存在擋線問題。
-            self._path_pts = 1
-            self._way = []
-        if (self._path_t >= PATH_GAP and mp is not None and me
-                and dist is not None and dist > NO_PATH_NEED
-                and self._mover is not None and self._mover.active):
+        if dist is not None and dist <= NO_PATH_NEED:
+            self._path_pts, self._way, self._unreach = 1, [], 0
+        elif (self._path_t >= PATH_GAP and mp is not None and me
+                and dist is not None):
             self._path_t = 0.0
-            n = self._mover.path_to(self.sc, mp[0], mp[1])
-            if n >= 0:                 # -1 = 這次沒問到，保留上一次的判斷
-                self._path_pts = n
-                # ★★ 「連續幾次算不出路徑」**只能在這裡數** —— 這裡才是
-                #   真的問到一次新結果。以前放在下面每一拍都跑的地方，
-                #   而 _path_pts 每 PATH_GAP(0.2s) 才更新一次，於是
-                #   「連續 3 次」實際變成「連續 3 個心跳」= **30 毫秒**：
-                #   尋路只要失敗一次，30ms 後就把那隻怪丟掉並加黑名單 60 秒。
-                #   症狀是一直換目標、跑來跑去卻沒進帳（實測 3 分鐘裡
-                #   39% 的時間在空轉，每秒目標都不一樣）。
-                self._unreach = (self._unreach + 1) if n == 0 else 0
-                # ★ 緊接著把路徑點讀下來（下一次尋路就會覆蓋掉）。
-                #   要繞路時就走去**倒數第二個點** —— 那個點到怪之間一定是
-                #   直線（中間若有地形，尋路會再插一個轉折點），
-                #   走到那裡就能無阻礙地打，不必一路擠到牠臉上。
-                self._way = (self._mover.read_path(self.sc, n)
-                             if n > 1 else [])
+            # ⚠ 地圖快取的身分檢查放在這裡、不要放在每一拍：它要讀列指標
+            #   陣列（約 720 bytes）＋場景編號，一次約 0.07ms —— 心跳是
+            #   10ms 一拍、五台分身，每拍都問等於每秒白花 35ms。
+            grid = self._maps.get(self.sc)
+            mtile = (int(me[0]), int(me[1]))
+            ttile = (int(mp[0]), int(mp[1]))
+            if grid is not None and grid.clear_line(mtile, ttile):
+                self._path_pts, self._way, self._unreach = 1, [], 0
+            elif grid is not None:
+                # 直線被擋 → 算一條繞過去的路。**上限是直線距離的 3 倍**：
+                # 繞這麼遠還到不了的怪本來就不該追，而且這道上限同時把
+                # 「走不到的目標」最壞的展開成本壓住（見 terrain.route）。
+                wp = grid.waypoints(mtile, ttile, max_cost=max(dist * 3.0, 30.0))
+                if wp:
+                    self._path_pts = max(2, len(wp))
+                    self._way = [(x + 0.5, y + 0.5) for x, y in wp]
+                    self._unreach = 0
+                else:
+                    self._path_pts, self._way = 0, []
+                    # ★★ 「連續幾次算不出路徑」**只能在這裡數** —— 這裡才是
+                    #   真的重算了一次。以前放在每一拍都跑的地方，而判定每
+                    #   PATH_GAP(0.2s) 才更新，於是「連續 3 次」實際變成
+                    #   「連續 3 個心跳」= 30 毫秒：只要失敗一次，30ms 後就
+                    #   把那隻怪丟掉並加黑名單。症狀是一直換目標、跑來跑去
+                    #   卻沒進帳（實測 3 分鐘裡 39% 的時間在空轉）。
+                    self._unreach += 1
+            elif (dist > NO_PATH_NEED and self._mover is not None
+                    and self._mover.active):
+                # 讀不到地形圖（改版位移／還沒進場）→ 退回問遊戲的尋路。
+                n = self._mover.path_to(self.sc, mp[0], mp[1])
+                if n >= 0:             # -1 = 這次沒問到，保留上一次的判斷
+                    self._path_pts = n
+                    self._unreach = (self._unreach + 1) if n == 0 else 0
+                    self._way = (self._mover.read_path(self.sc, n)
+                                 if n > 1 else [])
         # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，

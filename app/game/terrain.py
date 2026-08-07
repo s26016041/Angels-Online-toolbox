@@ -123,11 +123,18 @@ class Grid:
         return None
 
     # -- 最短路 -------------------------------------------------------
-    def route(self, start, goal, relax: int = GOAL_RELAX):
+    def route(self, start, goal, relax: int = GOAL_RELAX,
+              max_cost: float | None = None):
         """A* 最短路，回傳每一格的座標；走不到回 None。
 
         ⚠ 起點也可能落在牆上（角色站在只有一格寬的縫裡、或剛傳送完），
           所以起點同樣要放寬 —— 不然明明走得動卻回「走不到」。
+
+        max_cost: 路徑長度上限（格）。超過就當走不到 ——
+          ★ **走不到的目標最貴**：A* 要把整片走得通的地方都展開完才敢說 None
+            （整張圖最壞約 20ms）。打怪時每 0.2 秒問一次、五台一起跑，
+            這個上限就是把最壞情況壓下來的閘門，順便也符合語意：
+            繞了直線距離好幾倍還到不了的怪，本來就不該追。
         """
         s = self.nearest_open(int(start[0]), int(start[1]), relax)
         g = self.nearest_open(int(goal[0]), int(goal[1]), relax)
@@ -149,6 +156,8 @@ class Grid:
         push, pop = heapq.heappush, heapq.heappop
         while openq:
             _f, g0, x, y = pop(openq)
+            if max_cost is not None and g0 > max_cost:
+                return None            # 已經繞太遠了，當作走不到
             if x == gx and y == gy:
                 path = [(x, y)]
                 while (x, y) in came:
@@ -174,13 +183,14 @@ class Grid:
                     push(openq, (ng + hf(nx, ny), ng, nx, ny))
         return None
 
-    def waypoints(self, start, goal, relax: int = GOAL_RELAX):
+    def waypoints(self, start, goal, relax: int = GOAL_RELAX,
+                  max_cost: float | None = None):
         """最短路 → **轉折點**（每段之間直線可通、且不超過 MAX_SEG 格）。
 
         直接把 A* 的每一格都當路徑點沒有意義（一段 180 格就是 180 個點）；
         拉直之後通常只剩幾個點，每一段交給遊戲的走路常式一次走完。
         """
-        path = self.route(start, goal, relax)
+        path = self.route(start, goal, relax, max_cost)
         if not path:
             return None
         out = []
