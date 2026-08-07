@@ -2405,6 +2405,19 @@ class CharFarmPage(QWidget):
                    "舊版存的點，沒有記地圖 —— 在任何地圖都會走，"
                    "想要地圖比對請刪掉重加。"))
 
+    def _forget_routes(self) -> None:
+        """巡邏點清單一動，記住的路線就全部作廢。
+
+        ⚠⚠ 路線是用**點的編號**當 key 的（地圖, 從第幾點, 到第幾點）。
+          中間插一個點或刪掉一個點，後面所有點的編號就整個位移 ——
+          舊路線會被套到**另一對點**上，角色就往完全不相干的方向走。
+          （現在走路優先用地形最短路，這份記憶只是讀不到地圖時的退路，
+          但錯的退路比沒有退路更糟。）
+        """
+        self._routes.clear()
+        self._leg_from = None
+        self._nav.reset()
+
     def _add_spot(self) -> None:
         p = self.my_pos()
         if p is None:
@@ -2412,6 +2425,7 @@ class CharFarmPage(QWidget):
             return
         sid = self.cur_scene()
         self._spots.append((p[0], p[1], sid))
+        self._forget_routes()
         self._refresh_spots()
         self._save_settings()
         where = scene.scene_name(sid) if sid is not None else "未知地圖"
@@ -2425,6 +2439,7 @@ class CharFarmPage(QWidget):
                           reverse=True):
             del self._spots[row]
         self._spot_i = 0
+        self._forget_routes()          # 編號整個位移了，舊路線全部作廢
         self._refresh_spots()
         self._save_settings()
 

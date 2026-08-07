@@ -44,6 +44,7 @@ from __future__ import annotations
 import heapq
 import math
 import struct
+import zlib
 
 # ⚠ 這個位址會被 locate.warm() 依 AOB 重新定位，不要在別處複製一份。
 MAP_PTR = 0x009B5F64
@@ -238,23 +239,54 @@ def load(scanner) -> Grid | None:
 class Cache:
     """一個角色一份。地圖沒換就重用，換了自動重讀。
 
-    「換了沒」只看**地圖物件的位址**（換地圖／重連會搬家），一次 4-byte 讀取。
+    ⚠⚠ 「換了沒」**不能只看地圖物件的位址**。實測兩張完全不同的地圖
+      （惡礁峽谷 96、人馬崗哨 123）**寬高都是 300x180**，物件大小一樣 ——
+      換圖時配置器很可能把同一塊記憶體發回來，位址與寬高就都一樣了。
+      那樣快取會拿**上一張圖的牆**去算這張圖的路：明明走得過去卻說到不了，
+      或往牆裡走。頻繁換地圖的人一定會踩到。
+    ★ 所以身分＝(物件位址, 寬, 高, **場景編號**, 列指標陣列的檢查碼)：
+      · 場景編號是遊戲自己的地圖身分，最直接
+      · 列指標陣列是每張圖各自配置的，當作場景編號讀不到時的保險
+      成本是幾次小讀取（列陣列 h*4 ≈ 720 bytes），而且只在要規劃路線時問。
     """
 
-    __slots__ = ("_grid", "_sc")
+    __slots__ = ("_grid", "_key")
 
     def __init__(self) -> None:
         self._grid: Grid | None = None
+        self._key = None
+
+    @staticmethod
+    def _identity(scanner):
+        """(物件, 寬, 高, 場景編號, 列指標檢查碼)；讀不到回 None。"""
+        obj = _u32(scanner, MAP_PTR)
+        if not obj or not 0x10000 < obj < 0x7FFF0000:
+            return None
+        w = _u32(scanner, obj + OFF_W)
+        h = _u32(scanner, obj + OFF_H)
+        rows = _u32(scanner, obj + OFF_ROWS)
+        if not w or not h or not rows or w > MAX_DIM or h > MAX_DIM:
+            return None
+        raw = scanner._read_bytes(rows, h * 4)
+        if not raw:
+            return None
+        from app.game import scene              # 這裡才 import：避免循環相依
+        try:
+            sid = scene.current_id(scanner, allow_scan=False)
+        except Exception:                        # noqa: BLE001
+            sid = None
+        return obj, w, h, sid, zlib.crc32(bytes(raw))
 
     def get(self, scanner) -> Grid | None:
-        obj = _u32(scanner, MAP_PTR)
-        if not obj:
-            self._grid = None
+        key = self._identity(scanner)
+        if key is None:
+            self._grid, self._key = None, None
             return None
-        if self._grid is not None and self._grid.obj == obj:
+        if self._grid is not None and self._key == key:
             return self._grid
         self._grid = load(scanner)
+        self._key = key if self._grid is not None else None
         return self._grid
 
     def drop(self) -> None:
-        self._grid = None
+        self._grid, self._key = None, None
