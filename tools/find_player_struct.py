@@ -193,6 +193,7 @@ def scan_rare(sc: MemoryScanner, anchors: list[Anchor], writable_only: bool):
     for i, (base, size) in enumerate(regions):
         raw = sc._read_region(base, size)
         if raw:
+            raw = bytes(raw)      # _read_region 回 memoryview，沒有 .find
             scanned_mb += len(raw) / (1024 * 1024)
             for a in rare:
                 if a.label in dropped:

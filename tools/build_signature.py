@@ -32,6 +32,7 @@ def masked_search(sc, sig, mask, anchor_off, anchor_len):
         raw = sc._read_region(base, size)
         if not raw:
             continue
+        raw = bytes(raw)          # _read_region 回 memoryview，沒有 .find
         s = 0
         while True:
             i = raw.find(anchor, s)

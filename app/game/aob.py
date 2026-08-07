@@ -80,6 +80,9 @@ def scan(scanner, aob: AOBSignature, writable_only: bool = True, limit: int = 64
         raw = scanner._read_region(base, size)
         if not raw:
             continue
+        # memoryview 沒有 .find（見 _read_region）。複製一次的成本跟以前
+        # 一模一樣 —— 以前那份複製是在 _read_region 裡面做的。
+        raw = bytes(raw)
         s = 0
         while len(hits) < limit:
             i = raw.find(anchor, s)

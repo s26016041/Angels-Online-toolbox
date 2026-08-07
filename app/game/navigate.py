@@ -169,8 +169,17 @@ class Navigator:
             for _ in range(SCAN_PER_STEP):
                 if not self._scan or self._found is not None:
                     break
-                c = self._scan.pop(0)
-                if mover.path_to(scanner, c[0], c[1]) > 0:
+                # ⚠⚠ 先看再拿：`path_to` 的 -1 是「指令槽被攻擊執行緒佔著、
+                #   這次沒問到」，**不是**「走不到」（那是 0）。以前直接 pop
+                #   再比 > 0，等於把還沒問過的方向永久丟掉 —— 攻擊忙的時候
+                #   繞路會少試好幾個方向，更容易誤判「四面八方都走不到」。
+                #   farm_tab.tick 對同一個回傳值本來就有 `if n >= 0` 的正確處理。
+                c = self._scan[0]
+                n = mover.path_to(scanner, c[0], c[1])
+                if n < 0:
+                    break                            # 留著，下一拍再問
+                self._scan.pop(0)
+                if n > 0:
                     self._found = (_d(c, goal), c)   # 排序過 → 第一個就是最好的
             if self._scan and self._found is None:
                 self.note = f"繞路計算中…（剩 {len(self._scan)} 個方向）"
@@ -228,6 +237,12 @@ class Navigator:
 
         # ── 沒有中繼點：先問直達，不行才開始掃 ────────────────
         n = mover.path_to(scanner, gx, gy)
+        if n < 0:
+            # ⚠⚠ 同上：-1 是「這次沒問到」。以前會直接掉到下面當成
+            #   「算不出直達路徑」→ 白啟動一整輪 96 個方向的繞路掃描
+            #   （0.5 秒），而且把 here 記進 visited 縮小了之後的候選範圍。
+            #   什麼都不做、下一拍再問才對。
+            return self.note
         if n > 0:
             self.sub = goal
             self._best = _d(here, goal)

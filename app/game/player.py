@@ -208,9 +208,13 @@ def read(scanner, base: int) -> PlayerStats | None:
     raw = scanner._read_bytes(base, STRUCT_BYTES)
     if not raw or len(raw) < STRUCT_BYTES:
         return None
-    vals = [struct.unpack_from("<i", raw, o)[0] for o in
-            (OFF_LEVEL, OFF_HP, OFF_MAX_HP, OFF_MP, OFF_MAX_MP,
-             OFF_EXP_LO, OFF_EXP_HI, OFF_EXP, OFF_GOLD)]
+    # ⚠ 金幣／經驗要用**無號**讀（bag.gold() 也是 <I）：破 2^31 會顯示成負數。
+    #   HP/MP/等級維持有號 —— 死亡偵測要能讀到 0，且數值不會超出範圍。
+    vals = [struct.unpack_from(fmt, raw, o)[0] for fmt, o in
+            (("<i", OFF_LEVEL), ("<i", OFF_HP), ("<i", OFF_MAX_HP),
+             ("<i", OFF_MP), ("<i", OFF_MAX_MP),
+             ("<I", OFF_EXP_LO), ("<I", OFF_EXP_HI), ("<I", OFF_EXP),
+             ("<I", OFF_GOLD))]
     level, hp, max_hp, mp, max_mp, lo, hi, exp, gold = vals
     return PlayerStats(level=level, hp=hp, max_hp=max_hp, mp=mp, max_mp=max_mp,
                        exp=exp, exp_lo=lo, exp_hi=hi, gold=gold)

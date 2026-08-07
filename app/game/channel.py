@@ -49,8 +49,16 @@ from __future__ import annotations
 import ctypes
 import re
 import struct
+from ctypes import wintypes
 
 from app.game import attack
+
+# ⚠ HWND 在 x64 是 8-byte：不宣告 argtypes 會被 ctypes 當 32-bit int 推。
+#   目前沒炸只是因為 Windows 保證視窗控制代碼有效位在 32 位內（injector.py 檔頭
+#   有同一段警語），不是設計如此 —— 這裡把型別補齊。
+ctypes.windll.user32.GetWindowTextW.argtypes = [
+    wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+ctypes.windll.user32.GetWindowTextW.restype = ctypes.c_int
 
 # 泛用送包函式的「切換分流」種類碼。函式本身沿用 attack.SELECT_FN。
 SWITCH_CODE = 0x47

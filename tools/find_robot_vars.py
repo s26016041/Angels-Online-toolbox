@@ -86,6 +86,7 @@ def find_string(sc, text: str) -> list[int]:
         raw = sc._read_region(base, size)
         if not raw:
             continue
+        raw = bytes(raw)          # _read_region 回 memoryview，沒有 .find
         i = raw.find(pat)
         while i >= 0:
             # 前一個 byte 必須不是字母，否則是別的字串的尾巴
@@ -105,6 +106,7 @@ def find_pointers_to(sc, target: int) -> list[int]:
         raw = sc._read_region(base, size)
         if not raw:
             continue
+        raw = bytes(raw)          # _read_region 回 memoryview，沒有 .find
         i = raw.find(want)
         while i >= 0:
             if (base + i) % 4 == 0:        # 指令表是對齊的

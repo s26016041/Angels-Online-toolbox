@@ -124,37 +124,6 @@ def read_page(scanner, page: int) -> list[QuickSlot | None] | None:
     return out
 
 
-def read_all(scanner) -> list[list[QuickSlot | None]] | None:
-    """四頁全讀（頁 0~3）。任何一頁失敗就整個回 None，不給半套資料。"""
-    pages = [read_page(scanner, p) for p in range(PAGES)]
-    return None if any(p is None for p in pages) else pages   # type: ignore[return-value]
-
-
-def current_page(scanner) -> int:
-    """目前顯示（＝F 鍵作用）的頁碼 0~3；讀不到就當第 0 頁。
-
-    頁碼在 Lua 全域 QUICK_COMMAND_PAGE —— 純讀走全域表的雜湊節點，
-    不呼叫 Lua（跟 tools/dump_lua_globals.py 同一套版面）。
-    只在使用者開始掛機時讀一次，一次幾毫秒無所謂。
-    """
-    v = _lua_number_global(scanner, "QUICK_COMMAND_PAGE")
-    return int(v) if v is not None and 0 <= v < PAGES else 0
-
-
-def skill_on_vk(scanner, vk: int) -> int | None:
-    """使用者選的按鍵（虛擬鍵碼）目前對到的技能 ID；不是技能格就回 None。
-
-    只認 F1~F12 —— 其他鍵不在快捷欄上，回 None 讓呼叫端走舊的學法。
-    """
-    if not VK_F1 <= vk < VK_F1 + SLOTS:
-        return None
-    page = read_page(scanner, current_page(scanner))
-    if page is None:
-        return None
-    cell = page[vk - VK_F1]
-    return cell.value if cell is not None and cell.is_skill else None
-
-
 CALL_TIMEOUT = 0.12          # 等遊戲主執行緒做完一次呼叫的上限（一幀約 16ms）
 
 
@@ -240,12 +209,6 @@ def _find_global_node(scanner, name: str) -> int | None:
         if _key_matches(scanner, b[off:off + 32], want):
             return node + off
     return None
-
-
-def _lua_number_global(scanner, name: str) -> float | None:
-    """純讀取撈一個數字型 Lua 全域；拿不到（還沒進場）回 None。"""
-    node = _find_global_node(scanner, name)
-    return _node_number(scanner, node, name) if node else None
 
 
 class Reader:

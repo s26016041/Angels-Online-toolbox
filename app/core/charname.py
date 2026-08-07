@@ -36,10 +36,17 @@ def channel_from_title(title: str) -> str:
 
 
 def _iter_raw(sc):
+    """一段一段吐出區段內容（bytes）。
+
+    ⚠ `_read_region` 回的是指向共用緩衝的 memoryview（下一輪就被蓋掉），
+      而且沒有 `.find`／`.count`／`.decode`。這裡的兩個消費者都要用那些
+      方法，所以當場轉成 bytes —— 成本跟以前一樣（以前那份複製是在
+      `_read_region` 裡面做的）。
+    """
     for base, size in sc._iter_regions(writable_only=False):
         raw = sc._read_region(base, size)
         if raw:
-            yield raw
+            yield bytes(raw)
 
 
 def read_character_name(sc, account: str) -> str | None:

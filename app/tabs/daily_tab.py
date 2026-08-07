@@ -149,6 +149,7 @@ class DailyTab(BaseTab):
             sc.open(pid)
             locate.warm(sc)               # 改版位移自動校正（全域只做一次）
         except Exception:                              # noqa: BLE001
+            sc.close()   # open() 成功但 warm() 炸掉時要收回 handle，不然每一拍洩一個
             return None
         self._scanners[pid] = sc
         return sc

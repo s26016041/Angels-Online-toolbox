@@ -146,10 +146,13 @@ def attr_names(scanner) -> tuple[str, ...]:
             raw = scanner._read_region(base, size)
             if not raw:
                 continue
-            i = bytes(raw).find(anchor)
+            # ⚠ 只轉一次（以前寫了兩次 bytes(raw)，那時對 bytes 是免費的，
+            #   現在 _read_region 回 memoryview，每次都是真的整段複製）。
+            raw = bytes(raw)
+            i = raw.find(anchor)
             if i < 0:
                 continue
-            blob = bytes(raw)[i:i + 0x200].split(b"\x00")
+            blob = raw[i:i + 0x200].split(b"\x00")
             out = []
             for part in blob:
                 if not part:

@@ -36,9 +36,12 @@ VAR_MGR_PTR = 0x0096E630
 
 RUN_ON, RUN_OFF = 0, -1
 # ★ `setrobotisrun` 動旗標之前會先看這個 byte（見 set_run 的反組譯筆記）：
-#   [ [ROBOT_MGR_PTR] + ROBOT_READY_OFF ] == 0 → 遊戲自己也不動旗標。
-#   ⚠ 這個管理物件跟快捷欄是同一個（quickbar.MGR_PTR），別各自寫死兩份。
-ROBOT_MGR_PTR = 0x009B66AC
+#   [ [quickbar.MGR_PTR] + ROBOT_READY_OFF ] == 0 → 遊戲自己也不動旗標。
+#   ⚠ 這個管理物件跟快捷欄是同一個 —— 直接用 quickbar.MGR_PTR（那份有
+#     AOB 自動定位蓋著），**不要在這裡再寫死一份**：以前這裡有第二份
+#     0x009B66AC，改版位移後 quickbar 那份會跟上、這份不會，而且它不在
+#     SIGS 裡，failed() 永遠不會提醒。取用要在函式內（quickbar.MGR_PTR
+#     是 locate.warm() 之後才變成新值的模組屬性，import 時抄一份會凍住舊值）。
 ROBOT_READY_OFF = 0xF35C
 
 # ---------------------------------------------------------------------------
@@ -222,12 +225,6 @@ def _wnd(mover, scanner, name: str) -> int:
     return int(v) if isinstance(v, (int, float)) else 0
 
 
-def _res_id(mover, scanner, name: str, fallback: int) -> int:
-    """控制項 id（這種才是真常數）；讀不到就用備援值。"""
-    v = lua.get_global(mover, scanner, name)
-    return int(v) if isinstance(v, (int, float)) and v else fallback
-
-
 def set_run(mover, scanner, on: bool) -> tuple[bool, object]:
     """開／關天使守護精靈。回傳 (旗標最後是不是想要的值, 說明)。
 
@@ -252,7 +249,8 @@ def set_run(mover, scanner, on: bool) -> tuple[bool, object]:
       重開面板就會對。這是刻意的取捨 —— 顯示不同步只是看起來怪，
       去戳它卻會讓遊戲崩潰。
     """
-    mgr = _u32(scanner, ROBOT_MGR_PTR)
+    from app.game import quickbar          # 取最新值，見檔頭 ROBOT_READY_OFF 註記
+    mgr = _u32(scanner, quickbar.MGR_PTR)
     ready = scanner._read_bytes(mgr + ROBOT_READY_OFF, 1) if mgr else None
     if not ready or not ready[0]:
         return False, "精靈子系統還沒準備好（遊戲自己這時也不會動旗標）"
@@ -523,8 +521,14 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
         items.append(tid)
     if not items:
         return None                        # 一格都沒設
-    # ⚠ 一定要用 count_by_type：藥水會散成好幾疊（黑狐的 4837 分在 8 格）
-    if any(inventory.count_by_type(scanner, inv_head, t) > 0 for t in items):
+    # ⚠ 判定跟 count_by_type 一樣是「同種類全部加總」：藥水會散成好幾疊
+    #   （黑狐的 4837 分在 8 格）。差別是**一趟走完**同時累加所有種類 ——
+    #   以前每種各走一整條陣列（各 300~400 次系統呼叫），而這裡在 GUI 執行緒。
+    total = dict.fromkeys(items, 0)
+    for _s, tid, cnt, _p in inventory._walk(scanner, inv_head):
+        if tid in total:
+            total[tid] += cnt
+    if any(v > 0 for v in total.values()):
         return None                        # 還有一格有貨就不算用完
     return items
 

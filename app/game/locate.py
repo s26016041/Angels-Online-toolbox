@@ -18,9 +18,17 @@
 
 ★ 一次就夠，五台共用：多開的分身載的是**同一份 angel.dat、同一個基底**
   （這遊戲無 ASLR，固定 0x400000），所以位址對每個分身都一樣。
+  快取掛在**映像身分**（基底＋PE 表頭的 CRC）上 —— 遊戲更新後重開，
+  表頭一定變，會自動重掃；工具箱一直開著也不會拿舊位址用在新版遊戲上。
 
-★ 失敗不會讓功能消失：找不到或命中多筆就**保留原本寫死的值**，
-  行為跟沒有這支模組時完全一樣。`warm()` 會回報哪些變了、哪些失敗。
+★ 定位失敗的處理分兩種（2026-08-07 起）：
+  * `data` 找不到／多命中 → 保留舊值。讀取側都有 vtable／範圍驗證，
+    值錯了只會「讀不到、掃不到」，不會炸。
+  * `fn` 找不到／多命中 → **清成 0**。改版後舊的函式位址多半是別支函式
+    的中段，跳板 call 進去＝在遊戲主執行緒上當場崩潰 ——「交給遊戲的位址
+    一律當場重驗」這條鐵則在這裡的落實就是：驗不過就不給用。
+    `Mover.call()` 開頭會把 fn=0 擋下來，功能**大聲停用**（`failed()`
+    列得出來、分頁的定位警示看得到），而不是亂呼叫。
 
 ## 兩種目標
 
@@ -32,10 +40,16 @@
 ## 遮罩規則（決定改版後還準不準）
 
 * `call`/`jmp` 的 rel32 一律遮掉 —— 呼叫點與目標的位移量不一定相同，rel32 會變。
-* **指向模組內資料的絕對位址保留** —— 那次改版全域位址一個都沒動，是很好的錨
-  （例如 `move.WALK_FN` 的特徵裡就有 `A1 64 5F 9B 00` = `mov eax,[0x9B5F64]`）。
+* **內嵌的絕對位址（落在模組範圍內的立即值）也一律遮掉** —— 由 `_auto_mask()`
+  在掃描前自動處理，pattern 原文保留當年的位元組當文件。
+  ⚠⚠ 這是 2026-08-07 的方向修正：舊規則「模組內位址保留當錨」看似聰明，
+  實際等於**把答案寫死在特徵裡** —— .data 只要位移（多一個全域變數就會），
+  這些特徵整批不命中、整批安靜保留舊值。之前「模擬改版 17/17 救回」的測法
+  是把 Python 常數打歪、遊戲映像沒動，所以測不到這件事。
+  遮掉之後靠**指令骨架**（opcode＋暫存器＋結構偏移）當錨；data 類再加一道
+  交叉驗證：同一段裡出現多次的目標位址，命中後必須全部指向**同一個**新值。
 
-特徵是用 `scratchpad/sigbuild.py` 產的，每一段都驗過**在整個模組裡唯一**。
+每一段的唯一性用 `tools/verify_sigs.py` 對真遊戲驗證（純讀，開著遊戲就能跑）。
 
 純讀記憶體，不寫入、不注入。
 """
@@ -43,6 +57,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+import zlib
 from dataclasses import dataclass
 
 GAME_MODULE = "angel.dat"
@@ -65,6 +80,7 @@ class Sig:
     pattern: str
     known: int
     as_rva: bool = False
+    keep_imm: bool = False   # 例外：只有位址本身能區分這一段，見 monsters
 
 
 SIGS: tuple[Sig, ...] = (
@@ -176,9 +192,21 @@ SIGS: tuple[Sig, ...] = (
     Sig("scene", "SCENE_PTR_RVA", "data", 1,
         "0D 48 09 89 00 8B 75 FC 8B 45 0C 03 C3 8B 11 FF 76 20 50 FF 52 18 8B 0D 48 09 89 00",
         0x00890948, as_rva=True),
-    Sig("monsters", "INDEX_PTR_RVA", "data", 1,
-        "A1 88 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF C6 85 FC FD FF FF 00",
-        0x0098BC88, as_rva=True),
+    # ⚠⚠⚠ **全專案唯一保留 tautology 的一段**（keep_imm=True），原因是實測出來的：
+    #   模組裡有 **28 支一模一樣**的「依 ID 查表」存取函式 —— 同樣的邊界檢查
+    #   （`cmp ecx,0x88B7`）、同樣的錯誤訊息編號（`push 0x88B9`）、同樣的
+    #   「push 0x1FF ／清 512 bytes 緩衝」慣用碼，是同一個樣板產生的，
+    #   **彼此只差表位址**，也就是我們要解出來的那個值本身。
+    #   把位址遮掉 → 28 個命中（模糊）；往前往後延伸都試過，區分不出來。
+    #   所以這段的取捨是：位址留在特徵裡當錨。
+    #   後果（已知、可接受）：.data 位移時這段會**定位失敗而不是抓錯**，
+    #   failed() 會列出來、分頁警示會亮，monsters 退化成讀不到王／等級／滿血，
+    #   不會崩潰。要根治得改用「找 28 個候選再讀表內容驗證哪個是怪物表」。
+    Sig("monsters", "INDEX_PTR_RVA", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 B7 88 00 00 77 0A"
+        " A1 88 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 B9 88 00 00 56",
+        0x0098BC88, as_rva=True, keep_imm=True),
     Sig("move", "WAYPOINTS", "data", 1,
         "68 84 66 9B 00 FF 75 0C 8B C8 FF 75 08 E8 ?? ?? ?? ?? 33 C9 85 C0 0F 9F C1",
         0x009B6684),
@@ -195,7 +223,11 @@ SIGS: tuple[Sig, ...] = (
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。
-_done = False
+# ⚠ 快取 key 是「映像身分」（基底＋PE 表頭 4KB 的 CRC），不是單純的 bool ——
+#   工具箱常常一直開著，遊戲更新後重開的話表頭一定不同，要自動重掃；
+#   以前是永久快取，改版＋重開遊戲會整批沿用舊位址（最危險的安靜壞掉）。
+_ran = False
+_img_key: tuple[int, int] | None = None
 _report: list[tuple[str, int, int | None]] = []
 # ⚠ warm() 會被三個地方呼叫：GUI 執行緒（分頁接上分身）、預讀執行緒、
 #   自我監察執行緒。沒有鎖的話兩邊可以同時通過 `_done` 檢查，各自把
@@ -230,6 +262,60 @@ def _seed(sig: bytes, mask: bytes) -> tuple[bytes, int]:
     return sig[best_i:best_i + best_n], best_i
 
 
+def _auto_mask(sig: bytes, mask: bytes, known: int,
+               lo: int, hi: int) -> tuple[bytes, bytes, tuple[int, ...]]:
+    """算出兩層遮罩：把 pattern 裡「內嵌的絕對位址」換成萬用字元。
+
+    判定方式：固定位元組區裡任何一個 4-byte 視窗，小端解碼後落在
+    [lo, hi)（＝模組映像範圍，跳過表頭）就當成內嵌位址，整組遮掉，
+    並跳到視窗後面繼續掃（位址不會互相重疊）。
+
+    回傳 (全遮, 只遮目標, targets)：
+    * **全遮** —— 所有內嵌位址都放萬用。最抗改版，但有些段遮完只剩
+      編譯器慣用碼（清 512 bytes 緩衝、跳表），會變成模糊命中。
+    * **只遮目標** —— 只遮「原值等於 known」的視窗，也就是我們要解出來的
+      那個位址；其餘內嵌位址留著當錨。退路用。
+    ⚠ 目標視窗**一定要遮**，兩層都是 —— 不遮的話 pattern 等於把答案寫死在
+      特徵裡（found 恆等於 known），改版位移必定整段不命中，`moved()` 對
+      data 類也永遠是空的。這是 2026-08-07 稽核抓到的主要缺陷。
+
+    targets 給交叉驗證用：同一段裡出現多次的目標位址（例如 RUN_FLAG 的
+    開／關兩行寫的是同一個全域），命中後**必須全部指向同一個新值**，
+    對不齊就是抓錯段，寧可不採用。
+    """
+    full = bytearray(mask)
+    only = bytearray(mask)
+    targets: list[int] = []
+    i, n = 0, len(sig)
+    while i + 4 <= n:
+        if full[i] and full[i + 1] and full[i + 2] and full[i + 3]:
+            v = int.from_bytes(sig[i:i + 4], "little")
+            if lo <= v < hi:
+                full[i:i + 4] = b"\x00\x00\x00\x00"
+                if v == known:
+                    only[i:i + 4] = b"\x00\x00\x00\x00"
+                    targets.append(i)
+                i += 4
+                continue
+        i += 1
+    return bytes(full), bytes(only), tuple(targets)
+
+
+def _image_key(scanner) -> tuple[int, int] | None:
+    """映像身分：(基底, PE 表頭 4KB 的 CRC)。讀不到（遊戲剛關）回 None。
+
+    表頭裡有 TimeDateStamp / SizeOfImage / 各節表 —— 改版必變，
+    同版重開必同。一次 4KB 讀取，微秒級，每次 warm() 都付得起。
+    """
+    base = scanner.module_base(GAME_MODULE)
+    if not base:
+        return None
+    head = scanner._read_bytes(base, 0x1000)
+    if not head:
+        return None
+    return (base, zlib.crc32(bytes(head)))
+
+
 def _find_unique(img: bytes, sig: bytes, mask: bytes) -> int | None:
     """回傳唯一命中的位移；找不到或不只一個都回 None（寧可保留舊值）。"""
     seed, at = _seed(sig, mask)
@@ -252,14 +338,17 @@ def _find_unique(img: bytes, sig: bytes, mask: bytes) -> int | None:
 def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
     """掃一次並把結果寫回各模組。回傳 [(名稱, 舊值, 新值或 None)]。
 
-    新值 None = 這一項定位失敗，**保留原本寫死的值**（功能不會因此消失）。
+    新值 None = 這一項定位失敗：`data` 保留原本寫死的值；`fn` 清成 0、
+    由 `Mover.call()` 擋下（理由見檔頭「定位失敗的處理」）。
+    同一份映像只掃一次；映像換了（遊戲更新後重開）會自動重掃。
     """
-    global _done
-    if _done and not force:
+    global _ran, _img_key
+    key = _image_key(scanner)
+    if _ran and not force and key is not None and key == _img_key:
         return _report
     with _lock:
         # 進到鎖裡再確認一次：等鎖的期間別人可能已經掃完了。
-        if _done and not force:
+        if _ran and not force and key is not None and key == _img_key:
             return _report
         base = scanner.module_base(GAME_MODULE)
         if not base:
@@ -275,7 +364,18 @@ def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
         out: list[tuple[str, int, int | None]] = []
         for s in SIGS:
             sig, mask = _parse(s.pattern)
-            off = _find_unique(img, sig, mask)
+            m_full, m_only, targets = _auto_mask(
+                sig, mask, s.known, base + 0x1000, base + info.size)
+            if s.keep_imm:
+                # 例外段：位址本身就是唯一的區分點（見 monsters 的說明）。
+                off, targets = _find_unique(img, sig, mask), ()
+            else:
+                # ★ 先用全遮（最抗改版）；那樣不唯一才退回「只遮目標」，
+                #   讓其他內嵌位址當錨把它區分開來（見 _auto_mask）。
+                #   兩層都要求**唯一命中** —— 模糊命中一律當定位失敗。
+                off = _find_unique(img, sig, m_full)
+                if off is None:
+                    off = _find_unique(img, sig, m_only)
             found = None
             if off is not None:
                 if s.kind == "fn":
@@ -284,14 +384,27 @@ def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
                     k = off + (s.imm_at or 0)
                     if k + 4 <= len(img):
                         v = int.from_bytes(img[k:k + 4], "little")
+                        # ★ 交叉驗證：pattern 裡每個「當年等於 known」的視窗，
+                        #   現在也必須全部等於同一個新值 —— 對不齊＝抓錯段。
+                        same = all(
+                            off + t + 4 <= len(img)
+                            and int.from_bytes(
+                                img[off + t:off + t + 4], "little") == v
+                            for t in targets)
                         # 資料位址一定落在模組內，不然就是抓錯了
-                        if base <= v < base + info.size:
+                        if same and base <= v < base + info.size:
                             found = v
+            mod = importlib.import_module(f"app.game.{s.module}")
             if found is not None:
-                mod = importlib.import_module(f"app.game.{s.module}")
                 setattr(mod, s.attr, found - base if s.as_rva else found)
+            elif s.kind == "fn":
+                # ⚠⚠ 函式位址驗不過就不給用（清 0 → Mover.call 擋下）。
+                #   沿用舊值的話，改版後那裡是別支函式的中段，call 進去
+                #   ＝在遊戲主執行緒上當場崩潰。
+                setattr(mod, s.attr, 0)
             out.append((f"{s.module}.{s.attr}", s.known, found))
-        _done = True
+        _ran = True
+        _img_key = key
         _report[:] = out
         return out
 
@@ -304,6 +417,13 @@ def moved(report=None) -> list[tuple[str, int, int]]:
 
 
 def failed(report=None) -> list[str]:
-    """定位失敗的項目（保留了寫死的值）。"""
+    """定位失敗的項目（data 保留了寫死的值；fn 已被清 0 停用）。
+
+    ⚠ 「還沒掃過」跟「全部正常」以前對外長得一模一樣（都回空清單）——
+      warm() 拿不到模組、讀不到映像時提早 return，自我監察就誤判沒問題。
+      現在沒真的掃完過就回一個明確的項目，讓警示亮起來。
+    """
+    if report is None and not _ran:
+        return ["（定位還沒執行過 —— 讀不到遊戲模組，全部位址未經驗證）"]
     rep = _report if report is None else report
     return [n for n, _, new in rep if new is None]

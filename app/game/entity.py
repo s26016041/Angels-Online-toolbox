@@ -439,24 +439,8 @@ def read_target_hp(scanner, state: int) -> int:
     return _u32(scanner, state + OFF_TARGET_HP)
 
 
-def read_target_pair(scanner, state: int) -> tuple[int, int]:
-    """一次讀回 (目標實體 ID, 血量百分比)。
-
-    ★ 這兩個欄位是**相鄰的**（+0x2D8、+0x2DC），一次讀 8 bytes 就有 ——
-      分開讀是兩次系統呼叫，而這是 50Hz 的迴圈。
-    ★ 更重要的是**兩個值變成同一瞬間的**：分開讀的話，遊戲可能在兩次讀取
-      之間把 ID 清掉，於是拿到「舊的 ID 配新的血量」這種不存在的組合。
-    讀不到就回 (0, 0)，跟舊的兩支各自讀失敗時一致。
-    """
-    if OFF_TARGET_HP != OFF_TARGET + 4:      # 版面哪天變了就退回分開讀
-        return read_target(scanner, state), read_target_hp(scanner, state)
-    raw = scanner._read_bytes(state + OFF_TARGET, 8)
-    if not raw:
-        return 0, 0
-    return struct.unpack("<II", raw)
-
-
 # 從狀態物件開頭一路讀到目標血量 —— 涵蓋 vtable(+0) 與 +0x2D8/+0x2DC
+# （一次整塊讀，兩個值才是同一瞬間的：分開讀會拿到「舊 ID 配新血量」的組合）
 STATE_SPAN = OFF_TARGET_HP + 4
 
 

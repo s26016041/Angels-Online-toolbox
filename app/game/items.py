@@ -25,7 +25,6 @@ ID 從哪裡來
 """
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 
 # 種類 ID 相對「球值位址」的偏移（球值位址 = AOB 命中 + 0x80，見 app/game/aob.py）
@@ -148,18 +147,6 @@ def is_ball(type_id: int | None) -> bool:
     return ball_type(type_id) is not None
 
 
-def read_type_id(scanner, ball_addr: int) -> int | None:
-    """讀某顆球的種類 ID（純讀，4 bytes）。讀不到回傳 None。
-
-    ⚠ 每輪都要重讀，不能快取 —— 玩家換飾品時遊戲會把那塊記憶體挪去放別的物品，
-    位址還在、值也還讀得到，但已經是另一顆球了。
-    """
-    raw = scanner._read_bytes(ball_addr + TYPE_OFFSET, 4)
-    if not raw or len(raw) < 4:
-        return None
-    return struct.unpack("<i", raw)[0]
-
-
-def missing_ids() -> list[str]:
-    """還沒填 ID（因此認不出來）的球名。給開發時檢查用。"""
-    return [b.name for b in ALL_BALLS if b.type_id is None]
+# ⚠ 球的種類 ID 每輪都要重讀，不能快取 —— 玩家換飾品時遊戲會把那塊記憶體挪去
+#   放別的物品，位址還在、值也還讀得到，但已經是另一顆球了（現由
+#   inventory.scan_slots 統一讀取）。

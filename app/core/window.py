@@ -40,6 +40,11 @@ windll.user32.SendMessageTimeoutW.argtypes = [
 windll.user32.SendMessageTimeoutW.restype = wintypes.LPARAM
 windll.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 windll.user32.MapVirtualKeyW.restype = wintypes.UINT
+# ⚠ HDC 在 x64 是 8-byte 控制代碼：不宣告 argtypes 會被 ctypes 當 32-bit int 推，
+#   GetSafeHdc() 一旦超過 2^31 就 ArgumentError（或截斷成別的 DC → 抓到全黑圖，
+#   而全黑剛好被 is_mostly_black() 判成「不支援擷取」，故障會被靜默吞掉）。
+windll.user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+windll.user32.PrintWindow.restype = wintypes.BOOL
 
 
 @dataclass

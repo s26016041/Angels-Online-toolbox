@@ -784,7 +784,10 @@ class TargetWorker(_Paced):
             #   —— 遊戲會在很久以後莫名其妙掛掉。見 entity.read_target_checked。
             ok, cur, self.hp = entity.read_target_checked(self.sc, state)
             if not ok:
-                self._job = None
+                # ⚠ 只清「自己這一步的」job —— GUI 執行緒可能在本步進行中
+                #   剛派了新目標（attack()），無條件清會把新目標丟掉。下同。
+                if self._job is job:
+                    self._job = None
                 self._wrote = False
                 self.stale.emit()          # 叫 UI 那邊重新定位
                 return
@@ -800,7 +803,8 @@ class TargetWorker(_Paced):
             #   下面的 is_alive 又兩次，這是 50Hz 的迴圈。
             alive, st, _p = entity.read_live(self.sc, ent)
             if st == "Dead":
-                self._job = None
+                if self._job is job:
+                    self._job = None
                 self._wrote = False
                 self.died.emit(ent.eid, self._saw_hp)
                 return
@@ -835,7 +839,8 @@ class TargetWorker(_Paced):
             corpse = (packets and not self._saw_hp
                       and now - self._since >= CORPSE_SECS)
             if self._wrote and (cur == 0 or dead_by_hp or corpse or not alive):
-                self._job = None
+                if self._job is job:
+                    self._job = None
                 self._wrote = False
                 self.died.emit(ent.eid, not corpse)
                 return
@@ -851,7 +856,8 @@ class TargetWorker(_Paced):
                 entity.set_target(self.sc, state, ent.eid)
             self._wrote = True
         except Exception as exc:               # noqa: BLE001
-            self._job = None
+            if self._job is job:
+                self._job = None
             self.failed.emit(str(exc))
 
 
@@ -2263,10 +2269,13 @@ class CharFarmPage(QWidget):
             self._rot_say(f"　下一輪巡迴還有 {_mmss(left)}")
             return False
         here = channel.current(self.hwnd)
-        # ★ 分流數讀遊戲自己的 server.xml（不是寫死、也不是記憶體位址），
-        #   所以改版增減分流會自動跟上。讀不到就整輪跳過 ——
+        # ★ 分流數讀遊戲載進記憶體的伺服器清單，改版增減分流會自動跟上。
+        #   ⚠ channel.count() 是**全記憶體掃描**（一次 0.3~1 秒）而這裡跑在
+        #   GUI 執行緒 —— 所以只有第一次（_rot_max 還是 0）才掃，之後重用：
+        #   分流數一個 session 內不會變，重新偵測分身時分頁整個重建、
+        #   快取自然歸零。讀不到就整輪跳過 ——
         #   寧可不換，也不要拿猜的數字去送。
-        n = channel.count(self.sc, self.hwnd)
+        n = self._rot_max or channel.count(self.sc, self.hwnd)
         if here is None or not n:
             self._rot_t = 0.0
             self._rot_say(
@@ -2502,9 +2511,11 @@ class CharFarmPage(QWidget):
         #   ⚠ 不要用 👑：中文字型沒有那個字形，會變豆腐方塊（離屏截圖實拍到）。
         idx = monsters.index_base(self.sc)
         seen: list[tuple[str, str]] = []          # (顯示文字, 真正的名字)
+        names: set[str] = set()      # 去重用（150 隻怪 × 每秒刷新，線性掃太貴）
         for m in self.mons:
-            if any(n == m.name for _, n in seen):
+            if m.name in names:
                 continue
+            names.add(m.name)
             crown = "【王】" if monsters.is_boss(self.sc, m.type_id, idx) else ""
             seen.append((crown + m.name, m.name))
         if [t for t, _ in seen] != [self.near.item(i).text()
@@ -2777,6 +2788,14 @@ class CharFarmPage(QWidget):
         清單裡真的沒得打了，才由 tick() 去排重掃。
         """
         m = self._cur
+        # ⚠ 競態防護：died 是 queued signal，攻擊執行緒回報「上一隻」死掉的
+        #   訊號可能在 GUI 已換好新目標**之後**才送到（GUI 放棄 A → 選好 B，
+        #   worker 正在跑 A 的最後半步）。遲到的回報只記屍體冷卻就好 ——
+        #   不能把剛選好的新目標打掉，也不能灌進擊殺數。
+        if m is not None and eid != m.eid:
+            self._killed[eid] = time.monotonic() + (
+                KILL_MEMORY if confirmed else NOHP_MEMORY)
+            return
         if confirmed:
             self._bump_kills()
         # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
@@ -3693,8 +3712,10 @@ class FarmTab(BaseTab):
         """把 AOB 自動定位的結果顯示出來（沒事就不顯示）。"""
         moved, failed = locate.moved(), locate.failed()
         if failed:
+            # ⚠ 函式位址驗不過會被清成 0＝該功能停用（不是沿用舊值），
+            #   資料位址才是沿用舊值。見 app/game/locate.py 檔頭。
             self.locate_lbl.setText(
-                f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（沿用舊值）："
+                f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（相關功能已停用）："
                 + "、".join(failed[:3]))
             self.locate_lbl.setStyleSheet("color: #e0b040;")
         elif moved:

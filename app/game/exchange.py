@@ -143,6 +143,10 @@ def finder(scanner, reward: int, material: int, budget_ms: float = 25.0):
             continue
         raw = scanner._read_region(base, size)
         if raw:
+            # ⚠⚠ 這行 bytes() **不能拿掉來省複製**：這是產生器，下面的
+            #   `yield` 會把控制權交回 GUI 執行緒，期間別人會再讀記憶體 ——
+            #   而 _read_region 回的是共用緩衝的視圖，會被蓋掉。
+            #   （順帶：memoryview 也沒有 .find。）
             raw = bytes(raw)
             i = raw.find(pat)
             while i >= 0:

@@ -41,7 +41,6 @@
 from __future__ import annotations
 
 import math
-import random
 import struct
 import threading
 import time
@@ -431,6 +430,11 @@ class Mover:
         """
         if not self._active:
             return False
+        if not fn:
+            # ⚠ fn=0 是 locate.warm()「函式位址定位失敗」的記號（改版後
+            #   特徵對不上）。這裡是所有遊戲函式呼叫的唯一閘口 —— 擋下來
+            #   ＝該功能大聲停用，絕不拿沒驗證過的位址叫遊戲執行。
+            return False
         pm = self._pm
         with self._lock:                       # ⚠ 見類別說明：不能兩邊交錯寫
             if pm.read_uint(self._block + _FLAG):
@@ -711,32 +715,10 @@ class Mover:
     #   舊做法在凹形地形會死循環（實測 60 秒送 158 次指令、一格都沒動），
     #   細節見 app/game/navigate.py 的檔頭。
 
-    def walk_path(self, scanner, player_obj: int, tiles) -> bool:
-        """低階：直接送出指定的路徑點（最後一個是終點）。
-
-        ⚠ **不會尋路**，遊戲就照你給的點走直線 —— 撞到地形會卡住。
-        一般移動請用 walk_to()，它會先叫遊戲算路徑。
-        這個留給「已經有現成路徑」的情況（例如測試）。
-        """
-        if not self._active or not player_obj or not tiles:
-            return False
-        pts = list(tiles)[:MAX_POINTS]
-        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
-        if not raw:
-            return False
-        # 起點要用**當下**的世界座標，遊戲會拿它跟路徑點算路線
-        wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
-        buf = b"".join(
-            struct.pack("<HH",
-                        int(x * entity.TILE_UNITS) & 0xFFFF,
-                        int(y * entity.TILE_UNITS) & 0xFFFF)
-            for x, y in pts)
-        self._pm.write_bytes(WAYPOINTS, buf, len(buf))
-        return self.call(MOVE_FN, wx, wy, len(pts), random.randint(1, 0xFFFF))
-
-    def calls_done(self) -> int:
-        """stub 總共替我們呼叫了幾次（診斷用）。"""
-        return self._pm.read_uint(self._block + _DONE) if self._active else 0
+    # ⛔ walk_path() / calls_done() 已移除（零呼叫者，2026-08-07 清理）。
+    #   walk_path 是「自己把路徑點寫進 WAYPOINTS 再叫 MOVE_FN」的低階入口，
+    #   docstring 指的 walk_to() 早已拆掉；手寫路徑點的封包版面見 git 紀錄
+    #   與 memory 的 move-packet-function。
 
     def stop(self) -> None:
         """還原 IAT。**一定要呼叫** —— 不還原就等於在遊戲裡留了一段跳板。

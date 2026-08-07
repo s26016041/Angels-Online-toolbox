@@ -29,6 +29,7 @@ import bisect
 import ctypes
 import os
 import struct
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
@@ -80,6 +81,32 @@ _COMPACT_THRESHOLD = 100_000
 
 # 一次讀取的最大分塊，避免超大區段一次配置過多記憶體。
 _READ_CHUNK = 16 * 1024 * 1024
+
+# --- _read_region 的重用緩衝 -------------------------------------------------
+# 每次讀區段都新配一塊「跟區段一樣大」的 ctypes 緩衝，配置＋歸零就吃掉整段
+# 時間的一半以上（實測 4MB：整段 2.0ms，其中 RPM 本身只有 0.3ms）。
+# 這裡改成重用：只在第一次或不夠大時才重新配置。
+# ⚠⚠ 一定要 threading.local —— 同一顆 MemoryScanner 會被掃描/攻擊/按鍵/GUI
+#   多條執行緒同時呼叫 _read_region，共用一塊緩衝會互相蓋掉對方讀到的內容
+#   （症狀：拿到別的位址的資料 → 用錯的怪物 ID 去寫記憶體）。
+_scratch = threading.local()
+_SCRATCH_MAX = 32 * 1024 * 1024   # 超過就照舊當場配置，不長期佔住記憶體
+
+
+def _region_buffer(size: int):
+    """拿一塊至少 size bytes 的 ctypes 緩衝（本執行緒專用、跨呼叫重用）。
+
+    回傳的緩衝**可能比 size 大且含上一次的殘留資料** —— 呼叫端只能用
+    自己這次實際讀到的前段（_read_region 正是如此：迴圈以 size 為界、
+    回傳時只切 buf[:off]）。
+    """
+    if size > _SCRATCH_MAX:
+        return (ctypes.c_char * size)()
+    buf = getattr(_scratch, "buf", None)
+    if buf is None or len(buf) < size:
+        buf = (ctypes.c_char * max(size, 1 << 20))()
+        _scratch.buf = buf
+    return buf
 
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
@@ -332,7 +359,16 @@ def working_set_mb(pid: int) -> float | None:
 
 
 class MemoryScanner:
-    """對單一程序做數值搜尋與讀寫。非執行緒安全，請在同一執行緒使用。"""
+    """對單一程序做數值搜尋與讀寫。
+
+    執行緒安全的界線（掛機分頁實際就是 4~5 條執行緒共用同一顆）：
+    ★ 純讀寫路徑（_read_bytes / _read_region / write_value）可以跨執行緒
+      共用 —— 它們只讀 self._handle，其餘全是區域變數（重用緩衝也是
+      threading.local，見 _region_buffer）。
+    ⚠ 搜尋／指標掃描狀態（first_scan / next_scan / build_pointer_map /
+      refresh_modules 會動 _regions/_addrs/_values/_mods_sorted…）**不可**
+      跨執行緒併用 —— 要加共用快取之前先想這一段。
+    """
 
     def __init__(self) -> None:
         self._handle: int | None = None
@@ -510,6 +546,10 @@ class MemoryScanner:
         for i, (base, size) in enumerate(regions):
             raw = self._read_region(base, size)
             if raw:
+                # `_read_region` 回的是 memoryview（沒有 .find）。這是冷路徑
+                # （使用者按一下才跑），複製一次的成本跟以前完全一樣 ——
+                # 以前那一份複製是在 _read_region 裡面做的。
+                raw = bytes(raw)
                 for key, pat in patterns:
                     start = 0
                     while True:
@@ -621,10 +661,33 @@ class MemoryScanner:
             addr = base + region_size
         return regions
 
-    def _read_region(self, base: int, size: int) -> bytes | None:
-        """讀取整個區段的位元組；部分可讀時回傳已成功讀到的前段。"""
+    def _read_region(self, base: int, size: int) -> memoryview | None:
+        """讀取整個區段；部分可讀時回傳已成功讀到的前段。
+
+        ⚠⚠⚠ **回傳的是指向共用緩衝的 memoryview（零複製），不是 bytes。**
+          規則只有兩條，違反了會靜默拿到錯的資料：
+
+          1. **用完就丟，不可跨呼叫持有。** 同一條執行緒下一次 `_read_region`
+             就會把內容蓋掉。要留著（存進 self、append 進 list、跨 yield／
+             跨 signal 傳出去）一律先 `bytes(raw)` 或 numpy `.copy()`。
+          2. **要用 bytes 的方法就先 `bytes(raw)`。** memoryview 沒有
+             `.find/.count/.split/.decode/.startswith`。
+
+          可以直接用的：`len()`、`if not raw`、切片、整數索引、切片與 bytes
+          比較、`np.frombuffer()`、`struct.unpack_from()`、`re` 模組。
+
+        ★ 為什麼值得：配置＋複製本來佔整段時間的 8 成以上（實測讀 17MB
+          9.2ms，其中 ReadProcessMemory 本身只有 2ms）。掃描執行緒每秒
+          要讀好幾十 MB，這是全專案最熱的一條路。
+        ★ `.cast("B")` 不能省 —— ctypes 的 c_char 陣列 format 是 `<c`，
+          那種 memoryview 整數索引會 NotImplementedError，而且
+          **切片跟 bytes 比較永遠是 False（不報錯，靜默錯）**。
+        ★ `.toreadonly()` 不能省 —— 讓 `np.frombuffer()` 產生的陣列維持
+          唯讀（跟以前餵 bytes 時一樣）。誤寫會當場 ValueError，
+          而不是安靜汙染共用緩衝。
+        """
         handle = self._require_handle()
-        buf = (ctypes.c_char * size)()
+        buf = _region_buffer(size)
         read = ctypes.c_size_t(0)
         off = 0
         while off < size:
@@ -649,9 +712,15 @@ class MemoryScanner:
             off += read.value
         if off == 0:
             return None
-        return bytes(buf[:off])
+        return memoryview(buf).cast("B")[:off].toreadonly()
 
     def _region_values(self, base: int, size: int) -> np.ndarray | None:
+        """區段內容當成數值陣列。
+
+        ⚠ 回傳的是**指向共用緩衝的視圖**（唯讀），下一次 `_read_region`
+          就會被蓋掉 —— 呼叫端要留著就得先 `.copy()`（目前三個呼叫端
+          都有做：first_scan 的 dense／sparse 分支與 _next_scan_dense）。
+        """
         raw = self._read_region(base, size)
         if raw is None:
             return None
@@ -829,23 +898,25 @@ class MemoryScanner:
             if hi <= lo:
                 continue
             raw = self._read_region(base, size)
+            # ⚠ progress 移到「raw 用完之後」才叫（以前夾在讀取與使用之間）。
+            #   raw 現在是指向共用緩衝的視圖，回呼若哪天塞了會讀記憶體的東西
+            #   進來，就會在我們用它之前把緩衝蓋掉。順序對了就不必擔心。
+            if raw:
+                rl = len(raw)
+                nval = rl // itemsize
+                if nval:
+                    arr = np.frombuffer(raw, dtype=self._vt.dtype, count=nval)
+                    offs = saddr[lo:hi] - np.uint64(base)
+                    ok = (offs + itemsize <= rl) & (offs % itemsize == 0)
+                    vidx = (offs // itemsize).astype(np.int64)
+                    sel = order[lo:hi]
+                    good = np.nonzero(ok)[0]
+                    if len(good):
+                        # fancy index → 新陣列（複製），不是視圖
+                        out[sel[good]] = arr[vidx[good]]
+                        valid[sel[good]] = True
             if progress:
                 progress(min(1.0, hi / n))
-            if not raw:
-                continue
-            rl = len(raw)
-            nval = rl // itemsize
-            if nval == 0:
-                continue
-            arr = np.frombuffer(raw, dtype=self._vt.dtype, count=nval)
-            offs = saddr[lo:hi] - np.uint64(base)
-            ok = (offs + itemsize <= rl) & (offs % itemsize == 0)
-            vidx = (offs // itemsize).astype(np.int64)
-            sel = order[lo:hi]
-            good = np.nonzero(ok)[0]
-            if len(good):
-                out[sel[good]] = arr[vidx[good]]
-                valid[sel[good]] = True
         if progress:
             progress(1.0)
         return out, valid

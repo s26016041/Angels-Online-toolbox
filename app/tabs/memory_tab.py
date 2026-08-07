@@ -45,6 +45,7 @@ from app.core.memory import (
     VALUE_REQUIRED,
     VALUE_TYPES,
     MemoryScanner,
+    ScanCancelled,
     working_set_mb,
 )
 from app.tabs.base_tab import BaseTab
@@ -75,6 +76,12 @@ class ScanWorker(QThread):
     def __init__(self, fn) -> None:
         super().__init__()
         self._fn = fn
+        self._cancel = False
+
+    def cancel(self) -> None:
+        """請掃描盡快收工（下一個區塊回呼時生效）。跨執行緒呼叫安全：
+        只寫一個 bool，最壞多掃一個區塊。"""
+        self._cancel = True
 
     def run(self) -> None:
         # ⚠ 回呼是**每個記憶體區塊**呼叫一次（大目標有好幾千塊），而進度條
@@ -84,6 +91,11 @@ class ScanWorker(QThread):
 
         def on_progress(f: float) -> None:
             nonlocal last
+            # ⚠ 取消要在這裡查：回呼每個區塊都會被叫到，丟例外就中斷整趟掃描。
+            #   少了這條，關程式時 wait(5000) 等不到 → QThread 在還在跑時被
+            #   解構 → 0xC0000409 原生當機（preload_ui / health_ui 都踩過同類）。
+            if self._cancel:
+                raise ScanCancelled()
             pct = int(f * 100)
             if pct != last:
                 last = pct
@@ -92,6 +104,8 @@ class ScanWorker(QThread):
         try:
             count = self._fn(on_progress)
             self.done.emit(int(count))
+        except ScanCancelled:
+            pass                     # 使用者收工，不算失敗、安靜結束就好
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -351,6 +365,13 @@ class MemoryTab(BaseTab):
         self.scan_status.setText(f"找到 {len(self._windows)} 個視窗")
 
     def attach_selected(self) -> None:
+        # ⚠ 掃描進行中不准換程序（按鈕跟雙擊清單都會走到這裡）：
+        #   scanner.open() 會先 close() 舊 handle —— 在掃描執行緒腳下抽走，
+        #   而 Windows 常把同一個 handle 值配給緊接著的 OpenProcess，
+        #   掃描後半段就靜默讀到**另一個程序**的記憶體，結果表混成一團。
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "掃描進行中，請等它結束再切換程序。")
+            return
         rows = self.proc_table.selectionModel().selectedRows()
         if not rows:
             QMessageBox.information(self, "提示", "請先在清單中選一個視窗。")
@@ -788,8 +809,15 @@ class MemoryTab(BaseTab):
     # ------------------------------------------------------------------
     def on_close(self) -> None:
         self._watch_timer.stop()
-        if self._worker and self._worker.isRunning():
-            self._worker.wait(5000)
+        w = self._worker
+        if w is not None and w.isRunning():
+            w.cancel()               # 下一個區塊回呼就會丟 ScanCancelled 收工
+            w.wait(5000)
+            if w.isRunning():
+                # 逾時＝執行緒還卡在 ReadProcessMemory 裡。這時**不能**關
+                # handle（在它腳下抽走），只能把回收交給行程收尾 ——
+                # 比照 farm_tab 的「執行緒沒收乾淨就不關 handle」。
+                return
         self._scanner.close()
 
 

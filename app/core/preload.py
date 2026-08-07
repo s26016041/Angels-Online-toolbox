@@ -114,11 +114,25 @@ def forget_state(pid: int) -> None:
     _states.pop(pid, None)
 
 
+def _warm_libs() -> None:
+    """把「第一次 import 要幾百毫秒」的第三方庫先載起來（keystone 組譯器 DLL）。
+
+    不預熱的話，第一次按「開始掛機」裝跳板時會在 GUI 執行緒卡 0.3~1 秒
+    （move.start() 檔內自己有註記）。這裡跑在預載的背景執行緒，卡也看不見。
+    只 import、不裝任何東西；沒裝 keystone 也無妨，move.start() 會自己報錯。
+    """
+    try:
+        import keystone                        # noqa: F401
+    except Exception:                          # noqa: BLE001
+        pass
+
+
 def refresh(progress=None) -> list[Client]:
     """重新掃一遍所有分身並更新快取。
 
     progress: 可選的回呼 `f(已完成, 總數, 現在在做誰)` —— 給進度視窗用。
     """
+    _warm_libs()
     wins = windows()
     out: list[Client] = []
     for i, w in enumerate(wins):
