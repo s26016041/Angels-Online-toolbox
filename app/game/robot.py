@@ -169,6 +169,29 @@ AS_IS_REPAIR = 1508          # ★ 回城後修理裝備
 AS_USE_RETURN_SCROLL = 1509
 AS_IS_BUY_ITEM = 1511        # 購買物品保持身上數量（⚠ 這**不是**回城觸發條件）
 
+# ★★ 補給頁的「購買清單」（勾了 AS_IS_BUY_ITEM 進城會照這張表補貨）。
+#   兩個 DATAID 是**平行陣列**：TOBUY_ID[i] 放種類 ID、TOBUY_NUM[i] 放
+#   「要保持的數量」，同一列共用索引 i。
+#   （39556 實機對照：ID 清單第 14 格=1905 天使之翼、NUM 清單第 14 格=50，
+#     跟補給頁畫面一致 —— 平行索引就是這樣確認的。）
+AS_TOBUY_ID = 1512           # AS_INTLIST_TOBUYID
+AS_TOBUY_NUM = 1517          # AS_INTLIST_TOBUYNUM
+# 清單型設定在同一棵樹裡，型別碼 4（字串清單是 6）。記錄版面
+# （反組譯 0x54DF4C append／0x54E2C0 get_at／0x54F297 set_at，
+#   全量在 reports/intlist_probe*.txt）：
+#     +0x08 型別(4)　+0x0C 筆數　+0x10 起內嵌 int32 元素
+# ★ 記錄一次配足 0x1F50 bytes、容量寫死 0x7CF=1999 筆 ——
+#   **內嵌陣列、永不搬家**，所以從外面照遊戲的步驟寫是安全的：
+#   append＝先寫元素、再把筆數 +1（0x54DF4C 就是這兩步）。
+VAR_T_INTLIST = 4
+_L_COUNT, _L_ELEMS, _L_CAP = 0x0C, 0x10, 0x7CF
+# 清單類編輯完，遊戲的 add/set/remove 收尾都會把管理員單例 +0x4C 的
+# 髒 byte 設 1（0x54EDEF 整支就這一行）—— 我們編輯完也照做，
+# 遊戲才知道設定變了。⚠ 只有 1 個 byte。
+_MGR_DIRTY_OFF = 0x4C
+# 回程補給要幫使用者保持的天使之翼數量（使用者定的）。
+BUY_KEEP_WINGS = 50
+
 # ★「輔助」頁的陣亡自動復活。DATAID 從遊戲的 Lua 全域常數純讀出來
 #   （DATAID_AUTO_RESURRECTION_CHECK / _MODE），「復活方式」的值意義是把
 #   `ResurrectionSelected` 的 bytecode 反組譯確認的：
@@ -334,6 +357,119 @@ def set_int(mover, scanner, var_id: int, value: int) -> tuple[bool, object]:
     return lua.call(mover, scanner, "game.setrobotvar_int", var_id, int(value))
 
 
+def _read_list(scanner, rec: int) -> list[int] | None:
+    """讀一個**清單型**記錄的全部元素。型別／筆數對不上回 None。"""
+    head = scanner._read_bytes(rec, _L_ELEMS)
+    if not head or head[_V_TYPE] != VAR_T_INTLIST:
+        return None
+    n = struct.unpack_from("<i", bytes(head), _L_COUNT)[0]
+    if not 0 <= n <= _L_CAP:
+        return None
+    if n == 0:
+        return []
+    raw = scanner._read_bytes(rec + _L_ELEMS, n * 4)
+    return list(struct.unpack(f"<{n}i", bytes(raw))) if raw else None
+
+
+def _list_append(scanner, rec: int, count: int, value: int) -> bool:
+    """照遊戲 append 的步驟（0x54DF4C）：**先寫元素、再把筆數 +1** ——
+    這個順序讓遊戲那邊不管什麼時候來讀都讀不到半套。
+
+    ⚠ 寫筆數之前再驗一次它還是我們讀到的值：使用者剛好在補給頁按
+      「加入」的話筆數會變，硬寫會把他剛加的那筆蓋掉 —— 那就整個放棄，
+      下一次 apply 再來。
+    """
+    if not 0 <= count < _L_CAP:
+        return False
+    try:
+        scanner.write_value(rec + _L_ELEMS + count * 4,
+                            VALUE_TYPES["int32"], int(value))
+        raw = scanner._read_bytes(rec + _L_COUNT, 4)
+        if not raw or struct.unpack("<i", bytes(raw))[0] != count:
+            return False
+        scanner.write_value(rec + _L_COUNT, VALUE_TYPES["int32"], count + 1)
+    except Exception:                                      # noqa: BLE001
+        return False
+    return True
+
+
+def _mark_lists_dirty(scanner) -> None:
+    """清單編輯完把管理員單例 +0x4C 的髒 byte 設 1。
+
+    遊戲自己的 robotvar_add/set/remove_intlist 收尾都會做這一步
+    （0x54EDEF），跟著做遊戲才會把「設定變了」當一回事。
+    ⚠ 反組譯裡就是 `mov byte [mgr+0x4C], al` —— 只能寫 1 個 byte。
+    """
+    mgr = _u32(scanner, VAR_MGR_PTR)
+    if mgr and 0x10000 < mgr < 0x7FFF0000:
+        try:
+            scanner.write_value(mgr + _MGR_DIRTY_OFF, VALUE_TYPES["int8"], 1)
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+def ensure_buy_item(mover, scanner, item_id: int, keep: int) -> str | None:
+    """購買清單裡**保證有** `item_id` 而且數量至少 `keep`。
+
+    回傳做了什麼（給人看）；本來就設好、或任何一步對不上而放棄 → None。
+
+    ★ **只加不動別人**（使用者要求）：他原本設的每一列都不碰；
+      這一項他已經設得比 `keep` 高也不改小 —— 那是他的設定。
+    ★ 純記憶體優先。任何一步對不上（樹讀不到、型別不對、兩張表筆數
+      不同步、筆數剛好被改）就整個放棄 —— 寧可這一輪沒設到，
+      也不要把使用者的清單弄壞；反正每次開始掛機都會再試。
+    """
+    rec_i = _find_var(scanner, AS_TOBUY_ID)
+    rec_n = _find_var(scanner, AS_TOBUY_NUM)
+    if rec_i is _MISSING and rec_n is _MISSING:
+        # 全新角色、清單根本還沒建 —— 建記錄要 malloc＋插紅黑樹，
+        # 那不是我們能從外面做的：退回 Lua 讓遊戲自己建
+        # （game.robotvar_add_intlist 就是補給頁「加入」按的那支）。
+        ok1, _ = lua.call(mover, scanner, "game.robotvar_add_intlist",
+                          AS_TOBUY_ID, int(item_id))
+        ok2, _ = lua.call(mover, scanner, "game.robotvar_add_intlist",
+                          AS_TOBUY_NUM, int(keep))
+        if ok1 and ok2:
+            return f"購買清單加了{itemname.label(item_id)}×{keep}"
+        return None
+    if not isinstance(rec_i, int) or not isinstance(rec_n, int):
+        return None                        # 樹讀不到／只缺一張（不同步）
+    ids = _read_list(scanner, rec_i)
+    nums = _read_list(scanner, rec_n)
+    if ids is None or nums is None:
+        return None
+
+    if item_id in ids:
+        i = ids.index(item_id)
+        if i >= len(nums):
+            return None                    # 兩張表不同步，不敢動
+        if nums[i] >= keep:
+            return None                    # 已經設好（或設更多），完全不碰
+        try:
+            scanner.write_value(rec_n + _L_ELEMS + i * 4,
+                                VALUE_TYPES["int32"], int(keep))
+        except Exception:                                  # noqa: BLE001
+            return None
+        _mark_lists_dirty(scanner)
+        return f"購買清單的{itemname.label(item_id)}補到 {keep} 個"
+
+    if len(ids) != len(nums):
+        return None                        # 平行陣列不同步，append 會錯位
+    if not _list_append(scanner, rec_i, len(ids), item_id):
+        return None
+    if not _list_append(scanner, rec_n, len(nums), keep):
+        # ID 進了、數量沒進 → 兩張表會差一格錯位。把 ID 的筆數退回去
+        # （元素留在界外，遊戲讀不到，無害）。
+        try:
+            scanner.write_value(rec_i + _L_COUNT,
+                                VALUE_TYPES["int32"], len(ids))
+        except Exception:                                  # noqa: BLE001
+            pass
+        return None
+    _mark_lists_dirty(scanner)
+    return f"購買清單加了{itemname.label(item_id)}×{keep}"
+
+
 # ⛔ `_sync_check()`（用 Lua 的 window.setcheck 讓畫面勾選框跟著變）**已移除**。
 #   它是「使用了我們的自動戰鬥之後，去點精靈面板的勾選框，遊戲就崩潰」的
 #   來源：從外部呼叫 Lua 會跟遊戲主執行緒自己的 UI Lua 搶堆疊（那個破口
@@ -342,7 +478,8 @@ def set_int(mover, scanner, var_id: int, value: int) -> tuple[bool, object]:
 
 def apply_prefs(mover, scanner, *, main_switch: bool = False,
                 jump_back: bool = False,
-                revive_mark: bool = False) -> list[str]:
+                revive_mark: bool = False,
+                supply: bool = False) -> list[str]:
     """照掛機分頁的勾選把精靈調成該有的樣子。回傳實際動了哪些（給人看）。
 
     ★ 只「往要的方向推」：每一項都先純記憶體讀，已經是對的就完全不碰 Lua。
@@ -357,6 +494,13 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
                      （app/game/revive.py），精靈搶先把人復活回城反而壞事。
                      ⚠ 只關不開 —— 以前這裡是「開＋復活方式選回城」，
                      使用者 2026-08-07 要求反過來。
+    · supply         勾了**任何一個**回程補給觸發（壞裝／HP水／MP水）→
+                     把補給那一趟「進了城要做的事」推到位（使用者要求）：
+                     開「裝備損壞回城」「修理裝備」「購買物品保持身上數量」，
+                     再把天使之翼補進購買清單保持 `BUY_KEEP_WINGS` 個 ——
+                     免得補給跑了裝沒修、翼用完了下一趟連回程都回不去。
+                     ★ 購買清單**只加翼這一項**，他原本設的都不動；
+                       翼已經設更多也不改小（見 `ensure_buy_item`）。
     """
     notes: list[str] = []
 
@@ -378,6 +522,20 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
             # ⚠ 精靈面板開著的話勾選框的**顯示**不會跟著變（那是遊戲自己
             #   畫的，我們不去戳它 —— 見 set_run 檔頭）。重開面板就會對。
             notes.append("關了「陣亡時自動復活」")
+
+    if supply:
+        from app.game import recall                   # 避免循環相依
+        for var_id, label in ((AS_BACK_BROKEN_EQ, "裝備損壞回城"),
+                              (AS_IS_REPAIR, "修理裝備"),
+                              (AS_IS_BUY_ITEM, "購買物品保持身上數量")):
+            ok, cur = get_bool(mover, scanner, var_id)
+            if ok and cur is not True:
+                set_bool(mover, scanner, var_id, True)
+                notes.append(f"開了「{label}」")
+        note = ensure_buy_item(mover, scanner, recall.RECALL_ITEM,
+                               BUY_KEEP_WINGS)
+        if note:
+            notes.append(note)
 
     return notes
 

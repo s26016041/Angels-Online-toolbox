@@ -1506,7 +1506,13 @@ class CharFarmPage(QWidget):
             "\n它修裝買東西 → **回到原本那張地圖**就自動接回自動戰鬥。"
             f"\n（每 {SUPPLY_POLL:.0f} 秒檢查一次回到原地圖了沒）"
             "\n★ 開了自動攻擊之後如果發現地圖已經自己變了，代表客戶端"
-            "\n　 已經自己跑回程，我們就不再送一次，避免跟官方打架。")
+            "\n　 已經自己跑回程，我們就不再送一次，避免跟官方打架。"
+            "\n★ 勾了**任何一個**觸發，開始掛機時會自動把精靈補給頁的"
+            "\n　 「裝備損壞回城」「修理裝備」「購買物品保持身上數量」打開，"
+            "\n　 並把**天使之翼**加進購買清單、保持 50 個 ——"
+            "\n　 只加翼這一項，你原本設的購買都不動；"
+            "\n　 翼已經設得比 50 多也不會幫你改少。"
+            "\n　 掛機中才勾也會立刻調好；取消勾選不會幫你改回去。")
         potion = (
             "\n・藥水是哪一種，讀「天使輔助精靈」那頁你設的，換藥水自動跟著換"
             "\n・同一組配了好幾格時要**全部**歸零才算（還有一格有貨就不算）"
@@ -1519,7 +1525,10 @@ class CharFarmPage(QWidget):
             "身上穿的裝備**任何一件**耐久歸零就跑回程補給。\n"
             "・看的是全身穿著的（0~11 格），背包裡的東西不算\n"
             "・是不是裝備看範本的耐久上限，藥水那種不會被誤判" + common)
-        self.sup_gear_cb.toggled.connect(self._save_settings)
+        # ★ 三個觸發開關走 _on_robot_pref（不是單純 _save_settings）——
+        #   勾了任何一個就要把精靈補給頁的設定推到位（見 robot.apply_prefs
+        #   的 supply），掛機中才勾也要立刻生效。
+        self.sup_gear_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_gear_cb)
         c.addSpacing(10)
         # ★ HP / MP **分開兩個開關**（使用者要求）：勾 HP 就只看 HP 那一組
@@ -1528,13 +1537,13 @@ class CharFarmPage(QWidget):
         self.sup_hp_cb.setToolTip(
             "「天使輔助精靈」那頁設的 **HP 藥水整組**用完就跑回程補給。"
             "\n（MP 有沒有水不影響這一項）" + potion + common)
-        self.sup_hp_cb.toggled.connect(self._save_settings)
+        self.sup_hp_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_hp_cb)
         self.sup_mp_cb = QCheckBox("MP 藥水沒了")
         self.sup_mp_cb.setToolTip(
             "「天使輔助精靈」那頁設的 **MP 藥水整組**用完就跑回程補給。"
             "\n（HP 有沒有水不影響這一項）" + potion + common)
-        self.sup_mp_cb.toggled.connect(self._save_settings)
+        self.sup_mp_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_mp_cb)
         c.addSpacing(10)
         # ★ 不等精靈自己走回來，時間到就用遊戲的「天使趴趴GO」直接傳回去。
@@ -3023,7 +3032,8 @@ class CharFarmPage(QWidget):
             notes = robot.apply_prefs(
                 self._mover, self.sc, main_switch=True,
                 jump_back=self.sup_jump_cb.isChecked(),
-                revive_mark=self.sup_revive_cb.isChecked())
+                revive_mark=self.sup_revive_cb.isChecked(),
+                supply=self._supply_checked())
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
@@ -3752,8 +3762,14 @@ class CharFarmPage(QWidget):
             self.rb_tg.setChecked(True)
         self.tg_id.setText(str(g(self._key("tg_id"), "") or ""))
 
+    def _supply_checked(self) -> bool:
+        """有勾**任何一個**回程補給觸發嗎？（壞裝／HP水／MP水）"""
+        return (self.sup_gear_cb.isChecked() or self.sup_hp_cb.isChecked()
+                or self.sup_mp_cb.isChecked())
+
     def _on_robot_pref(self, _on: bool) -> None:
-        """「用天使趴趴GO回地圖」／「死亡自己回練功區」勾選變動。
+        """會連動精靈設定的勾選變動（趴趴GO回地圖／死亡回練功區／
+        三個回程補給觸發）。
 
         一改就存；**掛機中**勾上還會立刻把精靈設定調到位，不必重開掛機。
         取消勾選只代表「我們不再管」—— 不會把遊戲裡的設定改回去。
@@ -3766,7 +3782,8 @@ class CharFarmPage(QWidget):
         notes = robot.apply_prefs(
             self._mover, self.sc,
             jump_back=self.sup_jump_cb.isChecked(),
-            revive_mark=self.sup_revive_cb.isChecked())
+            revive_mark=self.sup_revive_cb.isChecked(),
+            supply=self._supply_checked())
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 
