@@ -117,6 +117,12 @@ def _approach_point(here: tuple[float, float],
     """
     if not pts:
         return None
+    # ★ 首個轉折點就在腳下時要跳過：尋路的第一個點常常是「目前所在的格子」，
+    #   走去它＝原地踏步（2026-08-07 黑狐實錄：站 11.7 格重覆下指令 4.4 秒
+    #   一步沒動，就是一直走去 pts[0]＝自己腳下）。
+    while len(pts) >= 2 and math.hypot(pts[0][0] - here[0],
+                                       pts[0][1] - here[1]) < 1.0:
+        pts = pts[1:]
     if len(pts) >= 2:
         # ★★ **趕路時整段走完**（keep <= 0 = 呼叫端不需要保持距離）。
         #   遊戲自己點地圖就是這樣：一包最多 5 個路徑點，一段走 67 格

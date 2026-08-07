@@ -79,12 +79,18 @@ OFF_NAME = 0x1D4          # 名字，內嵌 UTF-8
 #   比「種類 ID != 0」準得多 —— 那個只排得掉玩家，NPC、寵物、召喚物都排不掉。
 OFF_KIND = 0x2E4
 KIND_MONSTER = 7
-# ★ 「這隻怪正在跟誰交戰」—— 存的是**指向對方角色物件的指標**（不是實體 ID）。
-#   實測搜怪的物件 0x600 bytes：實體 ID 一次都沒出現，但玩家物件的指標
-#   出現在 +0x4D8 / +0x4E0 / +0x4E8，命中率約 5%
-#   （同時只有少數幾隻在打我，比例合理）。
-#   用途：挑目標時**優先打正在打我的那幾隻**，免得一路結仇被圍毆。
+# ★ 「這隻怪跟誰交戰過」—— 存的是**指向對方角色物件的指標**（不是實體 ID），
+#   出現在 +0x4D8 / +0x4E0 / +0x4E8 三個槽。
+# ⚠⚠ **這是弱訊號，不是即時的「正在打誰」**（2026-08-07 黑狐 423 秒唯讀跟拍）：
+#   · 怪出手的當下（動畫 'Att'、我方同拍掉血）三個槽**全部是空的**（17/17）
+#   · 玩家指標反而殘留在發呆中、甚至**屍體**身上（Dead＋三槽全滿 47 筆）
+#   · 只看 +0x4D8 一個槽，在有標記的觀測裡還會漏 25%（僅 +0x4E0 有 65 筆）
+#   所以「正在打我」一律要用聯集判定：attacking()（三槽任一）**或**
+#   「動畫是 ATT_STATES 且離我很近」——見 farm_tab 的 _fighting_me()。
 OFF_FOE = 0x4D8
+FOE_SPAN = 0x4E8 + 4 - OFF_FOE      # 三個槽一次讀回來（+0x4D8 ~ +0x4E8）
+# 攻擊型動畫狀態（出手的那幾拍）。搭配距離就是「正在打我」的另一半訊號。
+ATT_STATES = ("Att", "Att2", "Cast")
 # ★★ 動畫狀態的 ASCII（不是指標，字串直接內嵌在物件裡）。
 #   實測 90 秒、98 隻怪、7,626 次觀測只出現五種值
 #   （'Wait' 5579、'Dead' 1483、'Run' 317、'Att' 129、'Att2' 118），
@@ -107,10 +113,19 @@ STATE_MAX = 8             # 讀幾 bytes；最長的是 'Att2'
 
 
 def attacking(scanner, ent, player_obj: int) -> bool:
-    """這隻怪是不是正在跟我交戰。"""
+    """交戰槽（三個都看）裡有沒有我。
+
+    ⚠ 這只是「跟我交戰過」的**弱訊號**：怪出手的當下三個槽反而是空的
+      （見 OFF_FOE 的實測）。要判「正在打我」請再聯集動畫狀態＋距離
+      （farm_tab._fighting_me），單獨用這個一定漏。
+    """
     if not player_obj:
         return False
-    return _u32(scanner, ent.addr + OFF_FOE) == player_obj
+    raw = scanner._read_bytes(ent.addr + OFF_FOE, FOE_SPAN)
+    if not raw:
+        return False
+    vals = struct.unpack("<5I", bytes(raw))     # +0x4D8/+0x4DC/…/+0x4E8
+    return player_obj in (vals[0], vals[2], vals[4])
 
 # 位置是 16.16 定點數：高 16 位是世界單位，一格 = 32 個世界單位。
 # （怪站定時值恆為 tile*32+16，也就是格子中心；移動中才會出現小數。）

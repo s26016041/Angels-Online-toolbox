@@ -200,6 +200,18 @@ STUCK_EPS = 4.0
 #   牠又被挑回來，同個位置重演（02:10 那次就被誤記成走不到 ×1）。
 NOHIT_SECS = 4.0
 NOHIT_RANGE = 3.0
+# ★★★ 「正在打我」的聯集判定（2026-08-07 唯讀跟拍實錘，見 _fighting_me）：
+#   交戰槽在怪**出手的當下**反而是空的（17/17），單靠 entity.attacking()
+#   會漏掉正在咬人的怪 —— 解禁／坐下／收尾三道保險全部失靈，這就是
+#   「被選中的怪咬死、水還有」的根因。所以再聯集「動畫是攻擊中＋離我很近」。
+FOE_NEAR = 3.0
+# ★★ 不靠任何欄位的硬保險：**自己的 HP 在掉＝一定有怪在打我**。
+#   最近這麼久內掉過血就當作交戰中（讀 HP 每 0.5 秒一拍，怪的攻擊間隔
+#   約 2 秒，3 秒能跨過兩次攻擊的空檔不誤斷）。
+UNDER_ATTACK_SECS = 3.0
+# HP 在掉的期間，這個距離內的「冷卻中活怪」全部解禁 —— 咬人的怪常常就是
+# 先前被記成「走不到」冰起來的那隻（貼身滿血也可能被冰，見零傷害快篩）。
+UNFREEZE_NEAR = 4.0
 # ★★ 「走不到」的冷卻，**會遞增**。有兩種完全不同的走不到，一個數字擋不住：
 #
 #   · 暫時的 —— 角色站的地方剛好算不出那個方向。換個位置就好了。
@@ -1103,6 +1115,8 @@ class CharFarmPage(QWidget):
         # 看過「怪在幾格外掉血」的最大值 = 這個角色真正打得到的距離。
         # 0 = 還沒看過任何一次掉血 → 先走到貼臉（近戰唯一打得到的距離）。
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
+        self._hp_prev = -1         # 上一拍的 HP（偵測「正在被打」用）
+        self._hp_drop_t = -1e9     # 上次觀測到 HP 下降的時刻（見 _under_attack）
         self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
         self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
         self._supply = False       # 正在讓天使精靈跑補給（我們完全讓開）
@@ -1132,6 +1146,12 @@ class CharFarmPage(QWidget):
         self._spot_i = 0           # 現在要去第幾個
         # ★ 走去巡邏點的導航器（會繞路、會判斷到不了），見 navigate.py
         self._nav = navigate.Navigator()
+        # ★★ 走通過的巡邏路線（(地圖, 從哪點, 到哪點) → 去彎後的路線）。
+        #   探索一次之後同一段路直接重播 —— 實測 142 格的腿探索走了 429 格
+        #   （來回乒乓 6 次，「卡很久、牆邊蠕動」的來源），重播就是直達。
+        #   反方向自動用倒過來的路線。只留在記憶體：重開程式再學一次即可。
+        self._routes: dict[tuple, list] = {}
+        self._leg_from: int | None = None    # 這一段是從哪個巡邏點出發的
         # ★ 自動分身：時間到了自動補 F12 的 buff（見 app/game/buff.py）
         self._buff = buff.AutoBuff(BUFF_KEY)
         self._buff_note = ""     # 上次顯示過的補 buff 訊息（沒變就不重畫）
@@ -2069,16 +2089,44 @@ class CharFarmPage(QWidget):
 
     # ------------------------------------------------------------------
     # -- 血/魔不足時坐下回復 ---------------------------------------------
-    def _foes(self) -> list:
-        """現在有哪些怪正在打我（用實體的「交戰對象」欄位，見 entity.OFF_FOE）。
+    def _fighting_me(self, m, st: str, p, me) -> bool:
+        """這隻怪是不是「正在打我」——**聯集**兩個訊號，缺一不可靠：
 
-        ⚠ 屍體要排掉：怪死了物件不會馬上回收，交戰欄位還留著舊值。
+        ① 交戰槽（三個都看，entity.attacking）——
+           ⚠ 唯讀跟拍實錘：怪出手的當下三個槽**全是空的**（17/17），
+           指標反而殘留在發呆中／屍體上。只能當「跟我交戰過」的弱訊號。
+        ② 動畫是攻擊中（Att/Att2/Cast）**而且**離我 FOE_NEAR 格內 ——
+           出手那幾拍一定抓得到；距離擋掉「在打別人」的怪。
+        呼叫端自己先排掉屍體（st == "Dead"）。
+        """
+        if entity.attacking(self.sc, m, self.player):
+            return True
+        return (st in entity.ATT_STATES and p is not None and me is not None
+                and math.hypot(p[0] - me[0], p[1] - me[1]) <= FOE_NEAR)
+
+    def _under_attack(self) -> bool:
+        """最近 UNDER_ATTACK_SECS 內自己的 HP 掉過 → 一定有怪在打我。
+
+        ★ 這是**不靠任何交戰欄位**的硬保險（欄位會失靈，見 _fighting_me）。
+        HP 只會被怪打掉 —— 喝水、坐下、被動回復都只會往上。
+        """
+        return time.monotonic() - self._hp_drop_t <= UNDER_ATTACK_SECS
+
+    def _foes(self) -> list:
+        """現在有哪些怪正在打我。
+
+        ⚠ 屍體要排掉：怪死了物件不會馬上回收，交戰欄位還留著舊值
+        （實錄 Dead＋三槽全滿 47 筆）。
         """
         if not self.player:
             return []
-        return [m for m in self.mons
-                if entity.read_state(self.sc, m.addr) != "Dead"
-                and entity.attacking(self.sc, m, self.player)]
+        me = self.my_pos()
+        out = []
+        for m in self.mons:
+            alive, st, p = entity.read_live(self.sc, m)
+            if alive and st != "Dead" and self._fighting_me(m, st, p, me):
+                out.append(m)
+        return out
 
     def _sit_down(self, dt: float) -> bool:
         """確保角色坐著。回傳現在是不是已經坐著了。
@@ -2161,7 +2209,10 @@ class CharFarmPage(QWidget):
 
         if self._rest == "sit":
             foes = self._foes()
-            if foes:
+            # ★ 除了交戰判定，**HP 在掉也一律起身**（_under_attack）——
+            #   交戰欄位在怪出手當下會是空的（實錘），單靠 _foes() 會坐著
+            #   被咬到死（「掛機死掉、水還有」的死法之一）。
+            if foes or self._under_attack():
                 # ⚠ 坐著被打會死，要起身反擊 —— 但**只回到收尾階段**
                 #   （只打那幾隻），不是回到完整掛機。
                 #   第一版是直接結束休息，結果它跑去打新怪、把魔力又花掉，
@@ -2169,7 +2220,8 @@ class CharFarmPage(QWidget):
                 #   86~93% 上上下下）。
                 self._stand_up()               # 起身不用按鍵，打下去就站起來
                 self._rest = "finish"
-                self._rest_why = f"{len(foes)} 隻怪在打我"
+                self._rest_why = (f"{len(foes)} 隻怪在打我" if foes
+                                  else "坐著還在掉血（有怪在打我）")
                 return False
             if self._rest_full():
                 self._end_rest(f"HP {self._hp_pct:.0f}% MP {self._mp_pct:.0f}%")
@@ -2190,11 +2242,14 @@ class CharFarmPage(QWidget):
                 self.rest_lbl.setText("")
                 return False
             foes = self._foes()
-            if self._cur is not None or foes:
+            # ★ HP 還在掉就不准坐（有怪在打我，交戰欄位靠不住 —— 見 sit 那段）
+            if self._cur is not None or foes or self._under_attack():
                 self.rest_lbl.setText(
                     f"　{self._rest_why} → 收尾中"
                     + ("（手上還有一隻）" if self._cur is not None else "")
-                    + (f"（{len(foes)} 隻怪在打我）" if foes else ""))
+                    + (f"（{len(foes)} 隻怪在打我）" if foes else "")
+                    + ("（還在掉血）" if not foes and self._under_attack()
+                       else ""))
                 return False                   # ← 繼續打，把牠們解決掉
             self._sit_down(dt)
             self._rest = "sit"
@@ -2659,6 +2714,12 @@ class CharFarmPage(QWidget):
             #   「看著一隻掛不動，10 秒沒反應」）。
             if not m.eid:
                 continue
+            # ★ 死活、動畫狀態、座標**一次讀回來**（相鄰欄位，見 read_live）。
+            #   底下每個判斷（解禁、收尾、屍體、距離）都用同一份快照。
+            #   座標當場讀（怪會走、角色也在走，掃描時記的早就過期了）。
+            alive, st, p = entity.read_live(self.sc, m)
+            d = (math.hypot(p[0] - me[0], p[1] - me[1])
+                 if p and me else float("inf"))
             if m.eid in self._killed:
                 # ★★ 冷卻中的怪**正在打我**就立刻解禁。冷卻的用途是別浪費
                 #   時間在屍體／走不到的怪身上 —— 但打得到我的怪，我一定
@@ -2667,23 +2728,34 @@ class CharFarmPage(QWidget):
                 #   跳過牠 → 打別隻打到被咬死。
                 #   ⚠ 只解「打我的」；不動其他冷卻、也不改「純粹挑最近的」
                 #   規則（貼身的怪距離最近，排序自然輪到牠）。
-                alive_k, st_k, _pk = entity.read_live(self.sc, m)
-                if (alive_k and st_k != "Dead" and self.player
-                        and entity.attacking(self.sc, m, self.player)):
+                # ★★ 判定用聯集 _fighting_me（單看交戰槽會漏，實錘），
+                #   再加一道保底：**自己 HP 在掉**時 UNFREEZE_NEAR 格內的
+                #   冷卻活怪一律解禁 —— 咬人的怪常常正是被記成「走不到」
+                #   冰起來的那隻，而牠出手當下欄位是空的、動畫又只有幾拍，
+                #   掉血＋距離是唯一一定抓得到的組合。
+                fighting = (alive and st != "Dead" and self.player
+                            and self._fighting_me(m, st, p, me))
+                if fighting or (alive and st != "Dead"
+                                and self._under_attack()
+                                and d <= UNFREEZE_NEAR):
                     del self._killed[m.eid]
                     self._unreach_n.pop(m.eid, None)
-                    self._dbg(f"解除冷卻：「{m.name}」eid={m.eid:#x} 正在打我")
+                    self._dbg(f"解除冷卻：「{m.name}」eid={m.eid:#x} "
+                              + ("正在打我" if fighting
+                                 else f"我在掉血且牠在 {d:.1f} 格內"))
                 else:
                     if skipped is not None and me and m.name in want:
-                        skipped.append((math.hypot(m.x - me[0], m.y - me[1]),
-                                        m.name, "冷卻中還剩 "
+                        skipped.append((d, m.name, "冷卻中還剩 "
                                         f"{self._killed[m.eid] - now:.0f} 秒"))
                     continue
             # 休息中／收尾中：只打正在打我的那幾隻，把牠們清掉才坐得下去。
             # ⚠ 這裡**不看「選中怪物」也不看只打王** —— 打我的怪不管是什麼
             #   都得處理掉，不然就是站在那裡挨打。
+            # ★ HP 在掉卻抓不到「誰」在打我時，放寬成近距離的活怪都算 ——
+            #   否則收尾階段永遠挑不到目標，站著流血（欄位失靈的保底）。
             if only_foes:
-                if not entity.attacking(self.sc, m, self.player):
+                if not (self._fighting_me(m, st, p, me)
+                        or (self._under_attack() and d <= UNFREEZE_NEAR)):
                     continue
             elif boss_only:
                 # ⚠ is_boss 回 None 代表「查不到」（改版位移之類）——
@@ -2692,13 +2764,9 @@ class CharFarmPage(QWidget):
                     continue
             elif m.name not in want:
                 continue
-            # ★ 死活、動畫狀態、座標**一次讀回來**（相鄰欄位，見 read_live）。
-            #   以前是四次系統呼叫，場上幾十隻怪、每殺一隻重挑一次。
-            alive, st, p = entity.read_live(self.sc, m)
             if not alive:
                 if skipped is not None and me:
-                    skipped.append((math.hypot(m.x - me[0], m.y - me[1]),
-                                    m.name, "物件沒了"))
+                    skipped.append((d, m.name, "物件沒了"))
                 continue
             # ★★ 屍體直接跳過（別人先殺掉的）。動畫狀態當場重讀 ——
             #   掃描到現在可能已經過了 0.3 秒，牠剛好是在那之間倒下的。
@@ -2709,15 +2777,10 @@ class CharFarmPage(QWidget):
             #   ⚠ is_alive() 擋不掉：它只比對 vtable + 實體 ID，分不出屍體。
             if st == "Dead":
                 if skipped is not None and p and me:
-                    skipped.append((math.hypot(p[0] - me[0], p[1] - me[1]),
-                                    m.name, "屍體"))
+                    skipped.append((d, m.name, "屍體"))
                 continue
-            # 座標也是當場讀的（跟上面同一次讀取）：怪會走、角色也在走，
-            # 掃描時記的早就過期了。
             # ★ 不限距離：多遠的怪都收進來（使用者要求「想打多遠都可以」），
             #   排序後自然會先打最近的，遠的靠移動封包導航過去。
-            d = (math.hypot(p[0] - me[0], p[1] - me[1])
-                 if p and me else float("inf"))
             # ⛔ 這裡曾經有「正在打我的排最前面」（entity.attacking）——
             #   **拿掉了**。沒有距離限制的話，20 格外的仇人會贏過 13 格的
             #   正常目標（唯讀監控實拍：目標 20.3 格，周圍就有 13.1/13.3 格），
@@ -2923,9 +2986,6 @@ class CharFarmPage(QWidget):
         if self._tick_rotation(dt):
             return
 
-        if self.state is None:
-            return
-
         # ★ 角色死了就自動停：不然會對著空氣一直送技能鍵。
         # HP 走 app/game/player.py（跨 5 台驗證過的定位）。
         # ⚠ 它的 read() 刻意不做數值檢查，HP 歸零照樣讀得到 —— 早期版本把
@@ -2935,6 +2995,9 @@ class CharFarmPage(QWidget):
         #   （_rest_tick 回 True → tick 直接 return），血魔百分比就再也不會更新
         #   → 永遠等不到「回滿」→ 坐著不動。實際發生過（使用者回報
         #   「血魔 100 了也不會開始打」，現場看到黑狐 100%/100% 還坐著）。
+        # ⚠⚠ 也**必須在 `state is None` 的提早 return 之前**：死亡偵測用的是
+        #   stats（角色屬性物件），跟狀態物件是兩回事。以前放在後面，掃描
+        #   抓不到狀態物件的那段期間**連死了都不知道**（不停機、不通知）。
         self._hp_t += dt
         if self._hp_t >= HP_CHECK_GAP:
             self._hp_t = 0.0
@@ -2947,19 +3010,31 @@ class CharFarmPage(QWidget):
                                     if st.max_hp else 100.0)
                     self._mp_pct = (st.mp / st.max_mp * 100
                                     if st.max_mp else 100.0)
+                    # ★ HP 比上一拍低 → 有怪在打我（_under_attack 的來源）。
+                    #   坐下休息與挑目標都靠這個硬保險，交戰欄位會失靈。
+                    if 0 < st.hp < self._hp_prev:
+                        self._hp_drop_t = time.monotonic()
+                    self._hp_prev = st.hp
                     if st.hp <= 0:
                         # ★ 勾了「死亡自己回練功區」→ 不停機，交給死亡回程
                         #   模式（等精靈復活回城 → 趴趴GO傳回來 → 接著打）。
                         #   沒勾就維持原樣：自動停止掛機。
+                        # ★ 兩種都要**通知**（受總開關管）：使用者掛網離開，
+                        #   以前沒勾回程時死掉完全無聲，人回來才發現屍體。
                         if self.sup_revive_cb.isChecked():
                             self._start_death_return()
+                            self.notify("角色死亡，正在自動復活並傳回練功區。")
                         else:
                             self._stop_with(
                                 f"☠ 角色死亡 → 已自動停止掛機"
                                 f"（累計擊殺 {self._kills} 隻）")
+                            self.notify("角色死亡，掛機已自動停止。")
                         return
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
+
+        if self.state is None:
+            return
 
         # ★ 休息（血/魔不足坐下）。收尾階段會回 False 讓它繼續打，
         #   只有真的坐下時才接管。放在讀完血魔之後（見上面那段的警告）。
@@ -3037,6 +3112,7 @@ class CharFarmPage(QWidget):
             #   在別張圖上完全沒有意義，留著會讓它一開始就排除掉正確方向。
             if was != self._scene:
                 self._nav.reset()
+                self._leg_from = None   # 換圖了，出發點跟路線都對不上了
 
         # ★★ 「角色正在走路嗎」——**直接讀遊戲的動畫狀態**（'Run' / 'Wait'），
         #   不要再隔 0.3 秒比一次位置。移動中一律不重下移動指令（會把多點路徑
@@ -3074,6 +3150,15 @@ class CharFarmPage(QWidget):
             sx, sy, _sid = self._spots[self._spot_i]
             d = math.hypot(me[0] - sx, me[1] - sy)
             if d <= SPOT_SLACK:
+                # ★ 這一段走通了 → 把實際路線（去彎後）記下來，下次直接重播。
+                #   ⚠ 要在 reset() 之前拿（reset 會清掉軌跡）；重播那趟拿到的
+                #   是空清單，**不能**拿去覆蓋原本學到的路線。
+                rt = self._nav.learned()
+                if (rt and self._leg_from is not None
+                        and self._leg_from != self._spot_i):
+                    self._routes[(scene.map_key(self._scene),
+                                  self._leg_from, self._spot_i)] = rt
+                self._leg_from = self._spot_i
                 # 到了這個點還是沒怪 → 換下一個點繼續找（只在這張圖的點裡輪）
                 self._spot_i = here[(here.index(self._spot_i) + 1) % len(here)]
                 self._nav.reset()
@@ -3091,7 +3176,18 @@ class CharFarmPage(QWidget):
             if not self._ensure_mover():
                 self.status.setText("⛔ 移動跳板沒裝上 → 不移動")
                 return
-            note = self._nav.step(self.sc, self._mover, self.player, sx, sy)
+            # ★ 這一段走通過就重播上次的路線（反方向自動倒過來用）。
+            #   從半路接上也行 —— Navigator 會從離自己最近的路線點開始走。
+            route = None
+            if self._leg_from is not None and self._leg_from != self._spot_i:
+                mk = scene.map_key(self._scene)
+                route = self._routes.get((mk, self._leg_from, self._spot_i))
+                if route is None:
+                    rev = self._routes.get((mk, self._spot_i, self._leg_from))
+                    if rev:
+                        route = list(reversed(rev))
+            note = self._nav.step(self.sc, self._mover, self.player, sx, sy,
+                                  route=route)
             if self._nav.stuck:
                 # ★ 真的到不了就換下一個點（舊版沒有這道，會站到天亮）
                 nxt = here[(here.index(self._spot_i) + 1) % len(here)]
@@ -3154,6 +3250,14 @@ class CharFarmPage(QWidget):
         #   （目標欄位裡是那隻遠的，按 F2 打的是打不到的那隻）。
         #   遠程停在 10~12 格所以完全看不出這個問題。
         self._path_t += dt
+        if dist is not None and dist <= NO_PATH_NEED and self._path_pts > 1:
+            # ★★ 貼身（≤3 格）不重問尋路（問了必回 0），但**舊的「要繞路」
+            #   判定也要跟著作廢** —— 殘留的話下面還當作隔著地形。
+            #   實錄（黑狐 2026-08-07）：追到 2.0 格後 blocked 一直是舊值、
+            #   攻擊距離被壓成 2、站著 9.5 秒一發沒放，最後被當「走不到」
+            #   冰起來換怪。貼身本來就不存在擋線問題。
+            self._path_pts = 1
+            self._way = []
         if (self._path_t >= PATH_GAP and mp is not None and me
                 and dist is not None and dist > NO_PATH_NEED
                 and self._mover is not None and self._mover.active):
@@ -3206,8 +3310,15 @@ class CharFarmPage(QWidget):
         #   封包**不會**讓客戶端走過去（那是快捷鍵函式自己做的事）。
         handoff = bool(self._keys.handoff and not blocked
                        and not self._handoff_fail)
-        reach = (MELEE_RANGE if blocked
-                 else HANDOFF_RANGE if handoff else reach_skill)
+        # ★★★ 攻擊距離**永遠照技能射程** ——「隔著地形」只決定走多近（keep），
+        #   **不再**把射程壓成近戰 2 格。
+        #   ⚠⚠ 舊寫法 `MELEE_RANGE if blocked` 是遠程「盯怪幾秒不出手」的
+        #   根因（2026-08-07 黑狐實錄兩段）：沙漠這種小凸起多的地形尋路很常
+        #   回多點，但「路徑要繞」跟「技能被擋線」是兩回事 —— 射程 12 的
+        #   黑狐被判「打不到」，只走路不出手，追到 2 格又卡進 [2,3) 死區呆
+        #   10 秒。現在：一邊走近一邊照打；真的被牆擋線（零傷害）交給
+        #   NOHIT_SECS 快篩換怪 —— 打不打得到只有目標的血知道（實錘）。
+        reach = HANDOFF_RANGE if handoff else reach_skill
         in_range = dist is not None and dist <= reach
         # ⚠ 交棒的保險：交出去之後如果一直沒真的接戰（>3 秒還在技能射程外、
         #   而且沒掉過血），就收回來自己走 —— 免得客戶端因為地形之類走不到，
