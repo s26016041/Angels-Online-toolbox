@@ -1139,8 +1139,10 @@ class CharFarmPage(QWidget):
         self._death_t = 0.0        # 死了多久（倒數 DEATH_REVIVE_SECS、超時判斷共用）
         self._death_poll = 0.0     # 距離上次檢查過了多久
         self._death_scene = None   # 死在哪張地圖（活回這張圖才接回自動戰鬥）
+        self._death_pos = None     # 死在哪（同圖多落點時挑最近的）
         self._death_try = 0.0      # 死亡滿幾秒才（再）送「回標記點」
         self._death_sent = False   # 至少送出去過一次了（狀態列顯示用）
+        self._death_jumped = False # 復活後的趴趴GO已送出，接下來只等著陸
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
@@ -1552,8 +1554,9 @@ class CharFarmPage(QWidget):
         self.sup_jump_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_jump_cb)
         c.addSpacing(10)
-        # ★ 死亡自己回練功區：死了等 3 秒直接送「回標記點」封包復活
-        #   （app/game/revive.py，跟手點死亡視窗那顆按鈕完全一樣），並在
+        # ★ 死亡自己回練功區：死了等 3 秒送「回標記點」封包復活
+        #   （app/game/revive.py，跟手點死亡視窗那顆按鈕完全一樣）→
+        #   復活在標記點（城裡）→ 趴趴GO傳回死掉那張地圖 → 接回打怪。
         #   開始掛機時把精靈「陣亡時自動復活」**關掉** —— 精靈搶先把人
         #   復活回城的話，「回標記點」就沒得點了。
         self.sup_revive_cb = QCheckBox("死亡自己回練功區")
@@ -1561,8 +1564,9 @@ class CharFarmPage(QWidget):
             "角色死掉也不停止掛機，自動回來繼續打：\n"
             f"・死亡 **{DEATH_REVIVE_SECS:.0f} 秒後**直接送遊戲的"
             "「回標記點」封包復活\n"
-            "　（跟你在死亡視窗點「回標記點」完全一樣），"
-            "活過來就接回自動戰鬥\n"
+            "　（跟你在死亡視窗點「回標記點」完全一樣）\n"
+            "・復活後人在標記點（通常在城裡）→ 自動用**天使趴趴GO**\n"
+            "　 傳回死掉時那張地圖，回到就接回自動戰鬥\n"
             "・開始掛機時自動把天使精靈「輔助」頁的\n"
             "　「陣亡時自動復活」**關掉** —— 免得精靈搶先把人復活回城\n"
             "・沒勾的話維持原樣：角色死亡就自動停止掛機\n"
@@ -1575,6 +1579,20 @@ class CharFarmPage(QWidget):
             "　 重開面板就會顯示對，實際行為一律以設定值為準。")
         self.sup_revive_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_revive_cb)
+        # ★ 測試鈕（使用者自己按）：**死著的時候**按一下，當場送一包
+        #   「回標記點」並把每個環節的結果寫在狀態列。
+        #   用途是把「封包內容不對」跟「根本沒送出去」分開 —— 這是
+        #   2026-08-07 第一版死亡回程失敗時唯一沒被純讀取驗證到的環節。
+        self.revive_test_btn = QPushButton("測試回標記點")
+        self.revive_test_btn.setToolTip(
+            "**角色死著、死亡選擇視窗開著的時候**按這顆：\n"
+            "立刻送一包「回標記點」，狀態列會寫：\n"
+            "・跳板裝了沒、送包函式位址、指令槽排不排得進去\n"
+            "★ 按了會復活代表封包沒問題，是掛機的流程有 bug；\n"
+            "　 按了沒反應代表這包本身不足以復活，要再查。\n"
+            "⚠ 這是診斷用的，平常不用按。")
+        self.revive_test_btn.clicked.connect(self._test_revive)
+        c.addWidget(self.revive_test_btn)
         c.addStretch(1)
         # ★ 趴趴GO 的倒數（使用者要求放在這一列**最右邊**）：補給觸發之後
         #   還有多久會傳回原地圖；死亡回程時也用同一個位置顯示。
@@ -1863,8 +1881,10 @@ class CharFarmPage(QWidget):
         self._death_t = 0.0
         self._death_poll = 0.0
         self._death_scene = self._scene
+        self._death_pos = self.my_pos()      # 屍體的位置還讀得到，拿來挑落點
         self._death_try = DEATH_REVIVE_SECS
         self._death_sent = False
+        self._death_jumped = False
         # 我們自己完全讓開（跟交棒補給時一樣）：不送技能鍵、不寫目標
         self._keys.set_on(False)
         self._atk.hold_off()
@@ -1876,6 +1896,29 @@ class CharFarmPage(QWidget):
             self._supply_gen += 1
         self.status.setText(f"☠ 角色死亡 → {DEATH_REVIVE_SECS:.0f} 秒後"
                             "送「回標記點」復活…")
+
+    def _test_revive(self) -> None:
+        """測試鈕：當場送一包「回標記點」，把每個環節的結果寫在狀態列。
+
+        ★ 存在的理由：`0x5D3D97(2, 0)` 的**內容**已經三重驗證過
+          （攔包、`OnOkDeadWnd` 的 Lua bytecode、`netcommand` 的組合語言），
+          但「我們的跳板到底有沒有把這一包送出去」沒有純讀取的驗法。
+          這顆鈕把那一步變成看得見的。
+        """
+        if not self._ensure_mover():
+            self.status.setText("測試回標記點：✘ 跳板裝不起來，什麼都沒送")
+            return
+        mv = self._mover
+        fn = attack.SELECT_FN
+        if not fn:
+            self.status.setText("測試回標記點：✘ 送包函式定位失敗（0）→ 遊戲改版？")
+            return
+        st = player.read(self.sc, self.stats) if self.stats else None
+        hp = f"{st.hp}" if st else "讀不到"
+        ok = revive.to_mark(mv)
+        self.status.setText(
+            f"測試回標記點：{'✔ 已排進指令槽' if ok else '✘ 沒排進去（指令槽忙）'}"
+            f"　函式 0x{fn:X}　跳板 {'ok' if mv.active else '沒裝'}　按之前 HP={hp}")
 
     def _death_fail(self, why: str) -> None:
         """死亡回程走不下去 → 停機＋通知。
@@ -1891,13 +1934,13 @@ class CharFarmPage(QWidget):
     def _death_tick(self, dt: float) -> bool:
         """死亡回程模式。進行中回 True（呼叫端整個 tick 都要讓開）。
 
-        流程：死亡滿 `DEATH_REVIVE_SECS` 秒 → 送「回標記點」封包 →
-        人活回死掉那張地圖就接回自動戰鬥。
-        ★ 還沒送就先活過來（使用者自己點了）也一樣直接接回，不再送。
+        流程：死亡滿 `DEATH_REVIVE_SECS` 秒 → 送「回標記點」封包 → 復活
+        → **人不在死掉那張圖就用趴趴GO傳回去** → 回到就接回自動戰鬥。
+        ★ 還沒送就先活過來（使用者自己點了）也一樣接回，不再送封包。
         ★ 送了還一直沒活：每 `REVIVE_RETRY` 秒重送一次（暫時性失敗
           自動重試），`DEATH_WAIT_MAX` 兜底 —— 超過就停機＋通知。
-        ⚠ 活著但場景對不上（標記點在別張圖？）不接回 —— 巡邏點是
-          死掉那張圖的，走錯圖只會亂走；讓超時把它停下來。
+        ★★ 復活後那段趴趴GO**不能省**（使用者 2026-08-07 回報）：標記點
+          通常在城裡，不傳回去人就一直站在城中央，掛機等於停擺。
         """
         if not self._death:
             return False
@@ -1926,10 +1969,35 @@ class CharFarmPage(QWidget):
         if back:
             self._death = False
             self._since_scan = RESCAN_GAP        # 立刻重掃，馬上接回打怪
-            self.status.setText("★ 復活了 → 接回自動戰鬥")
+            self.status.setText("★ 已回到練功地圖 → 接回自動戰鬥"
+                                if self._death_jumped else
+                                "★ 復活了 → 接回自動戰鬥")
             return True
+
         if alive:
-            return True                  # 活了但場景還沒對上（見檔頭 ⚠）
+            # 復活了、但人在標記點那張圖（通常是城裡）→ 趴趴GO傳回練功區
+            if self._death_jumped:
+                return True                      # 傳送送出去了，等著陸
+            if self._death_scene is None:
+                self._death_fail("死亡時不知道人在哪張地圖，沒辦法傳回去")
+                return True
+            if not self._ensure_mover():
+                self._death_fail("跳板裝不起來，沒辦法用趴趴GO傳回去")
+                return True
+            pos = self._death_pos or (None, None)
+            e = jumpmap.nearest(self._death_scene, pos[0], pos[1])
+            if e is None:
+                self._death_fail(f"{scene.scene_name(self._death_scene)}"
+                                 "不在趴趴GO清單裡，沒辦法傳回去")
+                return True
+            ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
+            self._drop_cached_addrs()            # 傳送必換地圖，位址全作廢
+            if not ok:
+                self._death_fail(f"趴趴GO傳送失敗（{msg}）")
+                return True
+            self._death_jumped = True
+            self.status.setText("★ 復活了 → 已用趴趴GO傳回練功區，等著陸…")
+            return True
 
         if self._death_t < self._death_try:
             if not self._death_sent:
