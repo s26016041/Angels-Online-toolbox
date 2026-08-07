@@ -68,7 +68,7 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
-                      player, quickbar, robot, scene, skills)
+                      player, quickbar, robot, scene, skills, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
