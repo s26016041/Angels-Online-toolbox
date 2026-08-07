@@ -36,7 +36,7 @@ import os
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -67,9 +67,13 @@ from app.tabs.base_tab import BaseTab
 CHAR_SLOT = 0
 MAX_CLIENTS = 5               # 使用者指定：天使之戀最多開 5 台
 
-COL_DEL, COL_PICK, COL_ACCT, COL_PWD, COL_NOTE, COL_SRV, COL_CHAN = range(7)
-ACCT_COLS = ("", "選擇", "帳號", "密碼", "備註", "伺服器", "頻道")
+(COL_DEL, COL_PICK, COL_ACCT, COL_PWD, COL_PROT,
+ COL_NOTE, COL_SRV, COL_CHAN) = range(8)
+ACCT_COLS = ("", "選擇", "帳號", "密碼", "保護密碼", "備註", "伺服器", "頻道")
 ACCT_ROWS_SHOWN = 5           # 使用者指定：清單至少看得到 5 列
+# ⚠ 列高要比預設高一點：那兩個下拉（伺服器／頻道）塞進儲存格之後，
+#   用預設列高會把字上下切掉（使用者回報）。加的量用字高算，不寫死像素。
+ROW_PAD = 10
 
 STEP_MS = 400                 # 等待時每一拍的間隔
 LOGIN_SETTLE_MS = 1500        # 送出帳密 → 等分流清單送到（實測登入來回 < 1 秒）
@@ -83,7 +87,8 @@ class LoginTab(BaseTab):
     ORDER = 10
 
     def build_ui(self) -> None:
-        # 每筆 {"account","password"(混淆),"selected","note","server","channel"}
+        # 每筆 {"account","password","protect"(都混淆),"selected",
+        #       "note","server","channel"}
         self._accounts: list[dict] = []
         self._loading_table = False
         self._movers: dict[int, move.Mover] = {}
@@ -98,6 +103,7 @@ class LoginTab(BaseTab):
         game_form = QFormLayout(game_box)
         self.exe_edit = QLineEdit()
         self.exe_edit.setPlaceholderText(r"例如 D:\AngelsOnline\Angels Online Global\start.exe")
+        self.exe_edit.setText(config.get("login.exe_path", ""))
         self.exe_edit.setToolTip(
             "只用來找出遊戲資料夾（開遊戲、讀伺服器清單都在那個資料夾）。\n"
             "填 start.exe 或 angel.dat 都可以。")
@@ -118,6 +124,9 @@ class LoginTab(BaseTab):
         # ⚠ 使用者指定密碼不要遮起來。
         self.password_edit = QLineEdit()
         form.addRow("密碼：", self.password_edit)
+        self.protect_edit = QLineEdit()
+        self.protect_edit.setPlaceholderText("進遊戲最後一步要輸入的；沒設定就留空")
+        form.addRow("保護密碼：", self.protect_edit)
         self.note_edit = QLineEdit()
         self.note_edit.setPlaceholderText("自己看的，例如「主帳」「練功號」")
         form.addRow("備註：", self.note_edit)
@@ -132,7 +141,8 @@ class LoginTab(BaseTab):
 
         cred_lay.addWidget(self._wrap(QLabel(
             "勾「選擇」的帳號會被一鍵登入處理（可以勾很多個）。"
-            "備註、伺服器、頻道點一下就能改，改完立刻存。最前面的 ✕ 是刪除這一列。")))
+            "密碼、保護密碼、備註、伺服器、頻道點兩下就能改，改完立刻存。"
+            "最前面的 ✕ 點一下就刪掉那一列。")))
         self.acct_table = QTableWidget(0, len(ACCT_COLS))
         self.acct_table.setHorizontalHeaderLabels(list(ACCT_COLS))
         self.acct_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -142,15 +152,26 @@ class LoginTab(BaseTab):
         hh = self.acct_table.horizontalHeader()
         hh.setSectionResizeMode(COL_ACCT, QHeaderView.Stretch)
         hh.setSectionResizeMode(COL_NOTE, QHeaderView.Stretch)
-        self.acct_table.setColumnWidth(COL_DEL, 34)
-        self.acct_table.setColumnWidth(COL_PICK, 46)
-        self.acct_table.setColumnWidth(COL_SRV, 130)
-        self.acct_table.setColumnWidth(COL_CHAN, 70)
-        # ⚠ 高度用「列高 × 列數」算，不要寫死像素 —— 換字型／DPI 會走鐘。
-        rh = self.acct_table.verticalHeader().defaultSectionSize()
+        # ⚠ 欄寬用**實際字型**量，不要寫死像素 —— 寫死的話換字型／DPI／
+        #   伺服器改名就會把字切掉（使用者回報伺服器與頻道被切）。
+        fm = self.acct_table.fontMetrics()
+        self.acct_table.setColumnWidth(COL_DEL, fm.horizontalAdvance("✕") + 16)
+        self.acct_table.setColumnWidth(COL_PICK, fm.horizontalAdvance("選擇") + 24)
+        self.acct_table.setColumnWidth(COL_PROT, fm.horizontalAdvance("保護密碼") + 24)
+        # 下拉要留出「最長的選項 + 下拉箭頭 + 內距」
+        widest = max([fm.horizontalAdvance(n) for n, _ in self._server_list()]
+                     or [fm.horizontalAdvance("邱比特(NEW)")])
+        self.acct_table.setColumnWidth(COL_SRV, widest + 56)
+        self.acct_table.setColumnWidth(COL_CHAN, fm.horizontalAdvance("頻道") + 56)
+        # ⚠ 列高也要加高：儲存格裡塞了下拉之後，用預設列高會把字上下切掉。
+        vh = self.acct_table.verticalHeader()
+        vh.setDefaultSectionSize(max(vh.defaultSectionSize(), fm.height() + ROW_PAD * 2))
+        rh = vh.defaultSectionSize()
         self.acct_table.setMinimumHeight(rh * (ACCT_ROWS_SHOWN + 2))
         self.acct_table.itemChanged.connect(self._on_item_changed)
         self.acct_table.itemSelectionChanged.connect(self._on_row_selected)
+        # ✕ 是純文字不是按鈕（使用者不要那個框），所以點擊由這裡接。
+        self.acct_table.cellClicked.connect(self._on_cell_clicked)
         cred_lay.addWidget(self.acct_table)
         root.addWidget(cred_box)
 
@@ -181,7 +202,6 @@ class LoginTab(BaseTab):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._tick)
 
-        self.exe_edit.setText(config.get("login.exe_path", ""))
         self._load_accounts()
         self._rebuild_table()
 
@@ -208,6 +228,7 @@ class LoginTab(BaseTab):
                     # 免得使用者升級之後勾選全部不見。
                     "selected": bool(item.get("selected",
                                               item.get("monitor", False))),
+                    "protect": str(item.get("protect", "")),
                     "note": str(item.get("note", "")),
                     "server": str(item.get("server", "")),
                     "channel": int(item.get("channel", 1) or 1),
@@ -241,11 +262,14 @@ class LoginTab(BaseTab):
         srv = self._server_list()
         self.acct_table.setRowCount(len(self._accounts))
         for r, a in enumerate(self._accounts):
-            btn = QPushButton("✕")
-            btn.setFixedWidth(26)
-            btn.setToolTip("刪掉這一列")
-            btn.clicked.connect(lambda _=False, acct=a["account"]: self._delete(acct))
-            self.acct_table.setCellWidget(r, COL_DEL, btn)
+            # ⚠ 用純文字不要用 QPushButton —— 按鈕會畫出一個框，使用者說「不用
+            #   太大現在是一個框框」。點擊由 cellClicked 接（見 _on_cell_clicked）。
+            x = QTableWidgetItem("✕")
+            x.setFlags(Qt.ItemIsEnabled)          # 不可選取、不可編輯
+            x.setTextAlignment(Qt.AlignCenter)
+            x.setForeground(QColor("#d06a6a"))
+            x.setToolTip("刪掉這一列")
+            self.acct_table.setItem(r, COL_DEL, x)
 
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -258,6 +282,9 @@ class LoginTab(BaseTab):
             # ⚠ 使用者指定密碼明文顯示。
             self.acct_table.setItem(
                 r, COL_PWD, QTableWidgetItem(config.deobfuscate(a["password"])))
+            prot = QTableWidgetItem(config.deobfuscate(a["protect"]))
+            prot.setToolTip("進遊戲最後一步要輸入的保護密碼；沒設定就留空")
+            self.acct_table.setItem(r, COL_PROT, prot)
             self.acct_table.setItem(r, COL_NOTE, QTableWidgetItem(a["note"]))
 
             srv_combo = QComboBox()
@@ -294,6 +321,7 @@ class LoginTab(BaseTab):
     def _add_account(self) -> None:
         acct = self.account_edit.text().strip()
         pwd = self.password_edit.text()
+        prot = self.protect_edit.text()
         note = self.note_edit.text().strip()
         if not acct or not pwd:
             QMessageBox.warning(self, "缺少帳密", "請先在上方輸入帳號與密碼。")
@@ -301,6 +329,7 @@ class LoginTab(BaseTab):
         for a in self._accounts:
             if a["account"] == acct:
                 a["password"] = config.obfuscate(pwd)   # 同帳號 → 更新
+                a["protect"] = config.obfuscate(prot)
                 if note:
                     a["note"] = note
                 self._save_accounts()
@@ -310,14 +339,21 @@ class LoginTab(BaseTab):
         srv = self._server_list()
         self._accounts.append({
             "account": acct, "password": config.obfuscate(pwd), "selected": True,
-            "note": note, "server": srv[0][0] if srv else "", "channel": 1,
+            "protect": config.obfuscate(prot), "note": note,
+            "server": srv[0][0] if srv else "", "channel": 1,
         })
         self._save_accounts()
         self._rebuild_table()
         self.account_edit.clear()
         self.password_edit.clear()
+        self.protect_edit.clear()
         self.note_edit.clear()
         self._set_status(f"已新增帳號 {acct}")
+
+    def _on_cell_clicked(self, row: int, col: int) -> None:
+        """點到最前面那個 ✕ 就刪掉那一列。"""
+        if col == COL_DEL and 0 <= row < len(self._accounts):
+            self._delete(self._accounts[row]["account"])
 
     def _delete(self, account: str) -> None:
         """✕ 按鈕：刪掉這個帳號。用帳號而不是列號 —— 列號會因為重建而過期。"""
@@ -336,6 +372,8 @@ class LoginTab(BaseTab):
             self._accounts[r]["selected"] = item.checkState() == Qt.Checked
         elif c == COL_PWD:
             self._accounts[r]["password"] = config.obfuscate(item.text())
+        elif c == COL_PROT:
+            self._accounts[r]["protect"] = config.obfuscate(item.text())
         elif c == COL_NOTE:
             self._accounts[r]["note"] = item.text()
         else:
@@ -372,6 +410,7 @@ class LoginTab(BaseTab):
         a = self._accounts[i]
         self.account_edit.setText(a["account"])
         self.password_edit.setText(config.deobfuscate(a["password"]))
+        self.protect_edit.setText(config.deobfuscate(a["protect"]))
         self.note_edit.setText(a["note"])
 
     # ------------------------------------------------------------------
@@ -600,7 +639,8 @@ class LoginTab(BaseTab):
         if step == "enter":
             a = job["cur"]
             self._set_status(f"{a['account']}：進入遊戲（{job.get('char', '')}）…")
-            err = login.enter_game(job["mv"], job["sc"], CHAR_SLOT, a["channel"])
+            err = login.enter_game(job["mv"], job["sc"], CHAR_SLOT, a["channel"],
+                                   protect=config.deobfuscate(a["protect"]))
             if err:
                 self._fail_current(err)
                 return

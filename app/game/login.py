@@ -65,7 +65,17 @@ auto-login-findings）。舊做法用 pyautogui 打字，那會搶走使用者�
 
     [封包+2] = 角色格號（byte，參數帶進來的）
     [封包+3] = [0x890810]      ← ★ **頻道（分流），0 起算**
-    [封包+4] = 0x890814 起 0x20 bytes（連線用的識別字串）
+    [封包+4] = 0x890814 起 0x20 bytes ← ★ **保護密碼的 MD5**（十六進位小寫）
+
+★★ 保護密碼**沒有自己的封包**：使用者提供「輸入保護密碼→按勾勾→登入完成」的
+完整擷取，5 包全部是原本就知道的那組，一包都沒多。它是混在這一包裡的那 32 bytes。
+證據：使用者的保護密碼是 `7777777`，而那 32 bytes 讀到
+`dc0fa7df3d07904a09288bd2d2bb5f40` ＝ `md5("7777777")`。
+程式碼也對得上：收到角色清單的處理常式（`0x50E58C` 附近）是「讀輸入框 →
+strlen → `0x6C1A10`（MD5）→ 抄進 0x890814」，最後才 `call 0x5103E8`（進入遊戲）。
+
+⚠ 這也是「送了進入遊戲卻沒反應」的真正原因之一：新開的分身那 32 bytes 是空的，
+  伺服器當然不受理。有設保護密碼的帳號一定要先寫進去。
 
 ★★ **選頻道不是獨立的一包**，就是上面那個位元組 —— 所以「選頻道」對我們來說
 只是**寫一個 byte**，不必碰那個頻道選擇畫面。三處交叉印證：
@@ -111,6 +121,7 @@ auto-login-findings）。舊做法用 pyautogui 打字，那會搶走使用者�
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import struct
@@ -135,6 +146,8 @@ FLAG_TOKEN = 0x008909B9     # ≠0 → 用 0x890FCC 的 token（啟動器社群�
 CHAR_SLOT = 0x00890BE8      # 選中的角色格號（0 起算）
 CONN_ID = 0x0089097C        # 登入連線編號；0 = 還沒連上
 CHANNEL = 0x00890810        # 頻道／分流，**1 byte、0 起算**
+PROTECT_HASH = 0x00890814   # 保護密碼的 MD5，32 個十六進位小寫字（不補 NUL）
+PROTECT_LEN = 32            # ENTER_FN 就是從這裡 strncpy 0x20 bytes 進封包
 APP_PTR = 0x0089096C        # 應用程式主物件；伺服器陣列掛在它 +0x500/+0x504
 SERVER_INDEX = 0x00890CA8   # 登入時選中的伺服器索引（進陣列用）
 EULA_OK = 0x00890FFC        # 「授權合約已同意」旗標，1 byte
@@ -188,6 +201,20 @@ PASSWORD_LEN = 32           # strncpy 0x20
 # 登入那一下要建 socket、關舊連線、動 UI，比純送包的函式重得多。
 CALL_TIMEOUT = 1.0
 ENTER_TIMEOUT = 0.3
+
+
+def protect_hash(password: str) -> bytes:
+    """保護密碼 → 遊戲放進封包的那 32 bytes（MD5 的十六進位小寫字串）。
+
+    ★ 不是猜的：使用者提供保護密碼是 `7777777`，而遊戲記憶體那 32 bytes 讀到
+      `dc0fa7df3d07904a09288bd2d2bb5f40`，正好等於 `md5("7777777")`。
+      程式碼那邊也對得上 —— 收到角色清單的處理常式（`0x50E58C` 附近）是
+      「讀輸入框 → strlen → 0x6C1A10（MD5）→ 把結果抄進 0x890814」。
+
+    ⚠ 剛好 32 bytes，**不補結尾 NUL**：遊戲是 `strncpy(封包+4, 這裡, 0x20)`，
+      抄滿 32 個字，補 NUL 反而會把最後一個字元擠掉。
+    """
+    return hashlib.md5(password.encode("utf-8")).hexdigest().encode("ascii")
 
 
 def _pad(text: str, size: int) -> bytes:
@@ -560,14 +587,15 @@ def _check_channel(scanner, channel: int) -> str:
     return ""
 
 
-def enter_game(mover, scanner, slot: int, channel: int) -> str:
-    """選頻道 + 進入遊戲，一包送出。成功回空字串，失敗回原因。
+def enter_game(mover, scanner, slot: int, channel: int,
+               protect: str = "") -> str:
+    """選頻道 + 保護密碼 + 進入遊戲，一包送出。成功回空字串，失敗回原因。
 
     slot:    角色格號，**0 起算**（畫面上第 1 個角色 = 0）
     channel: 頻道／分流，**1 起算**（畫面上的「雅典娜-3」就填 3）
+    protect: 保護密碼**明文**；沒設定就留空
 
-    ⚠ 頻道不是另一包 —— 它是這一包裡的一個位元組（見檔頭）。所以不必去點
-      那個頻道選擇畫面，寫下去再送就好。
+    ⚠ 頻道與保護密碼都不是另一包 —— 都是這一包裡的欄位（見檔頭）。
     """
     if not (mover and mover.active):
         return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
@@ -587,6 +615,10 @@ def enter_game(mover, scanner, slot: int, channel: int) -> str:
     #   寫 4 bytes 會把它一起清掉。
     if not mover.write(CHANNEL, bytes([channel - 1])):
         return "寫入頻道失敗。"
+    # ⚠ 沒填保護密碼就**完全不動**這個欄位 —— 沒設保護密碼的帳號，遊戲根本不會
+    #   跳那個輸入框、也不會寫這裡，寫個 MD5("") 進去反而是我們自己發明的值。
+    if protect and not mover.write(PROTECT_HASH, protect_hash(protect)):
+        return "寫入保護密碼失敗。"
     # ⚠ 先寫全域再送包，跟遊戲自己的呼叫端（0x51041F）同一個順序：
     #   下一包「進遊戲伺服器」是讀這個全域，不是讀封包。
     if not mover.write(CHAR_SLOT, struct.pack("<I", slot)):
