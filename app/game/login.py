@@ -114,11 +114,17 @@ from __future__ import annotations
 import os
 import re
 import struct
+import subprocess
+
+from app.core.memory import VALUE_TYPES
+
+GAME_EXE = "angel.dat"      # 遊戲本體（副檔名不是 exe，但就是個一般執行檔）
 
 # --- 函式（locate.warm() 會重新定位；定位失敗會被清成 0，Mover.call 擋下）---
 LOGIN_FN = 0x00538959       # thiscall(this)：登入按鈕的完整動作
 PICK_CHANNEL_FN = 0x00537353  # thiscall(this)：確定分流，畫面推進到選角色
 ENTER_FN = 0x0050F880       # stdcall(角色格號)：進入遊戲
+GETWIDGET_FN = 0x00624D17   # stdcall(視窗id, 控制項id)，ecx=UI管理者：取控制項
 
 # --- 資料位址（定位失敗會保留下面寫死的值，讀錯只會「做不到」不會崩潰）---
 VT_LOGIN = 0x007D6C94       # 登入畫面／登入連線物件的主 vtable
@@ -131,6 +137,21 @@ CONN_ID = 0x0089097C        # 登入連線編號；0 = 還沒連上
 CHANNEL = 0x00890810        # 頻道／分流，**1 byte、0 起算**
 APP_PTR = 0x0089096C        # 應用程式主物件；伺服器陣列掛在它 +0x500/+0x504
 SERVER_INDEX = 0x00890CA8   # 登入時選中的伺服器索引（進陣列用）
+EULA_OK = 0x00890FFC        # 「授權合約已同意」旗標，1 byte
+
+# 登入畫面物件上的欄位
+OBJ_UI_MGR = 0x0C           # UI 管理者（取控制項時當 this）
+OBJ_WIN_ID = 0x1064         # 這個畫面的視窗 id（取控制項的第一個參數）
+
+# 伺服器清單控制項。⚠ 這是 UI 定義檔給的編號、不是程式碼位址，沒得 AOB 定位；
+# 改版動 UI 才會變，屆時 pick_server() 會「找不到控制項」而不是選錯。
+SERVER_LIST_ID = 0xA92
+ITEM_VEC_BEGIN = 0x150      # 控制項的項目向量（begin/end）
+ITEM_VEC_END = 0x154
+ITEM_SELECTED = 6           # 項目物件 +6：非 0 = 被選中
+#   ↑ 遊戲自己的「取選取索引」就是掃這個向量、回傳第一個 +6 非 0 的索引
+#     （0x624F9D）。實機驗證：三個項目只有索引 2 是 1，跟 SERVER_INDEX 讀到的
+#     2（雅典娜）完全吻合。
 
 # 伺服器記錄的版面（見檔頭）
 SRV_BEGIN = 0x500
@@ -216,38 +237,23 @@ def server_info(scanner) -> tuple[str, int] | None:
     return name, sub_a
 
 
-def subset_count(scanner, game_dir: str = "") -> int:
-    """這台伺服器有幾個分流。記憶體優先，讀不到才退回遊戲資料夾的 server.xml。
+def subset_count(scanner, game_dir: str = "", server_index: int | None = None) -> int:
+    """某個伺服器有幾個分流。記憶體優先，讀不到才退回遊戲資料夾的 server.xml。
 
     ★ 使用者指定：「請不要用猜的，要用讀出來的」。所以兩條路都是實際去讀 ——
       記憶體那條連改版增減分流都會自動跟上；檔案那條是給「工具箱開著但遊戲
       還沒開」的情況（那時根本沒有記憶體可讀）。兩條都失敗才回 MAX_SUBSET。
+
+    server_index: 要問哪一個伺服器（0 起算）；不給就用目前選中的那個。
     """
-    if scanner is not None:
-        info = server_info(scanner)
-        if info is not None:
-            return info[1]
-    if game_dir:
-        got = _subset_from_xml(os.path.join(game_dir, "server.xml"))
-        if got:
-            return got
+    got = servers(scanner, game_dir)
+    if got:
+        if server_index is None:
+            info = server_info(scanner) if scanner is not None else None
+            return info[1] if info else got[0][1]
+        if 0 <= server_index < len(got):
+            return got[server_index][1]
     return MAX_SUBSET
-
-
-def _subset_from_xml(path: str) -> int | None:
-    """server.xml 裡各伺服器的「分流」欄；取最大值。讀不到／格式不對回 None。
-
-    ⚠ 只在讀不到記憶體時才會走到這裡（見 subset_count）。檔案長這樣：
-        <伺服器 名稱="1" … port="18111" 分流="5" …/>
-    """
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            raw = f.read()
-    except OSError:
-        return None
-    got = [int(n) for n in re.findall(r'分流="(\d+)"', raw)]
-    got = [n for n in got if 1 <= n <= MAX_SUBSET]
-    return max(got) if got else None
 
 
 def character(scanner, slot: int) -> str | None:
@@ -269,6 +275,170 @@ def character(scanner, slot: int) -> str | None:
         return None
     name = bytes(raw).split(b"\x00")[0].decode("utf-8", "replace")
     return name or f"第 {slot + 1} 個角色"
+
+
+def servers(scanner, game_dir: str = "") -> list[tuple[str, int]]:
+    """全部伺服器 [(名稱, 分流數), …]，照遊戲陣列的順序（索引就是選伺服器要用的）。
+
+    記憶體優先；遊戲沒開就退回遊戲資料夾的 server.xml。兩條都失敗回空清單。
+    """
+    out: list[tuple[str, int]] = []
+    if scanner is not None:
+        app = _u32(scanner, APP_PTR)
+        beg = _u32(scanner, app + SRV_BEGIN) if app else None
+        end = _u32(scanner, app + SRV_END) if app else None
+        if beg and end and end > beg:
+            count = (end - beg) // SRV_STRIDE
+            if 1 <= count <= MAX_SERVERS:
+                for i in range(count):
+                    got = _read_server(scanner, beg + i * SRV_STRIDE)
+                    if got is None:
+                        out = []
+                        break
+                    out.append(got)
+    if not out and game_dir:
+        out = _servers_from_xml(os.path.join(game_dir, "server.xml"))
+    return out
+
+
+def _read_server(scanner, rec: int) -> tuple[str, int] | None:
+    """一筆伺服器記錄；不像伺服器記錄就回 None（條件全是結構性的）。"""
+    raw = scanner._read_bytes(rec, 0x60)
+    if not raw:
+        return None
+    raw = bytes(raw)
+    port, sub_a, _sid, sub_b = struct.unpack_from("<IIII", raw, SRV_PORT)
+    if not (1024 <= port <= 65535):
+        return None
+    if sub_a != sub_b or not (1 <= sub_a <= MAX_SUBSET):
+        return None
+    name = raw[SRV_NAME:0x40].split(b"\x00")[0].decode("utf-8", "replace")
+    return (name or f"伺服器 {_sid}", sub_a)
+
+
+def _servers_from_xml(path: str) -> list[tuple[str, int]]:
+    """server.xml 的退路。
+
+    ⚠ 檔案裡 `<伺服器 名稱="3" … 分流="5">` 的「名稱」是**編號**，真正的字要去
+      `<名稱 編號="3" 繁="邱比特(NEW)">` 那幾行查。順序也照檔案裡的順序 ——
+      實機比對過，跟記憶體陣列的順序一致（邱比特、維納斯、雅典娜）。
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    names = {n: t for n, t in re.findall(
+        r'<名稱\s+編號="(\d+)"\s+繁="([^"]*)"', raw)}
+    out = []
+    for sid, subset in re.findall(r'<伺服器\s+名稱="(\d+)"[^>]*?分流="(\d+)"', raw):
+        n = int(subset)
+        if 1 <= n <= MAX_SUBSET:
+            out.append((names.get(sid, f"伺服器 {sid}"), n))
+    return out
+
+
+def pick_server(mover, scanner, index: int) -> str:
+    """在登入畫面把伺服器選成第 index 個（**0 起算**，就是 servers() 的索引）。
+
+    成功回空字串，失敗回原因。已經選在那個伺服器就直接回成功（不重寫）。
+
+    做法是改伺服器清單控制項的「哪一項被選中」——遊戲的登入動作就是去問這個
+    （`0x624F9D`：掃項目向量，回傳第一個「+6 非 0」的索引）。所以：
+
+        取控制項 → 讀項目向量 → 目標那項 +6 寫 1、其餘寫 0 → **讀回來重算一次**
+
+    ⚠⚠ 最後那道讀回來不是多餘的：選錯伺服器會登進完全不同的世界。
+      驗不過就回錯誤、讓呼叫端停下來，**絕不**「寫了就當成功」。
+    """
+    if not (mover and mover.active):
+        return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
+    if not GETWIDGET_FN:
+        return "取控制項的函式定位失敗（遊戲可能改版了）。"
+    obj = find_screen(scanner)
+    if obj is None:
+        return "現在不在登入畫面。"
+    mgr, win_id = _u32(scanner, obj + OBJ_UI_MGR), _u32(scanner, obj + OBJ_WIN_ID)
+    if not mgr or not win_id:
+        return "讀不到登入畫面的介面資料。"
+    with mover.lock:
+        widget = mover.call_sync(GETWIDGET_FN, win_id, SERVER_LIST_ID,
+                                 ecx=mgr, timeout=CALL_TIMEOUT)
+    if not widget:
+        return "找不到伺服器清單（遊戲可能改版了）。"
+    items = _list_items(scanner, widget)
+    if not items:
+        return "伺服器清單是空的。"
+    if not (0 <= index < len(items)):
+        return f"伺服器清單只有 {len(items)} 個，選不到第 {index + 1} 個。"
+    if _selected_index(scanner, items) == index:
+        return ""                       # 已經是它了，不必動
+    for i, item in enumerate(items):
+        if not mover.write(item + ITEM_SELECTED, bytes([1 if i == index else 0])):
+            return "寫入伺服器選取狀態失敗。"
+    got = _selected_index(scanner, items)
+    if got != index:
+        return f"伺服器沒切過去（想選第 {index + 1} 個，讀回來是 {got}）。"
+    return ""
+
+
+def _list_items(scanner, widget: int) -> list[int]:
+    """清單控制項的項目物件位址；讀不到或數量不合理回空清單。"""
+    beg = _u32(scanner, widget + ITEM_VEC_BEGIN)
+    end = _u32(scanner, widget + ITEM_VEC_END)
+    if not beg or not end or end < beg:
+        return []
+    n = (end - beg) // 4
+    if not (1 <= n <= MAX_SERVERS):
+        return []
+    out = []
+    for i in range(n):
+        p = _u32(scanner, beg + i * 4)
+        if not p:
+            return []
+        out.append(p)
+    return out
+
+
+def _selected_index(scanner, items: list[int]) -> int:
+    """照遊戲自己的算法：第一個「+6 非 0」的索引；都沒有回 -1。"""
+    for i, item in enumerate(items):
+        raw = scanner._read_bytes(item + ITEM_SELECTED, 1)
+        if raw and bytes(raw)[0]:
+            return i
+    return -1
+
+
+def skip_eula(scanner) -> bool:
+    """把「授權合約已同意」旗標寫起來，讓遊戲不要跳授權合約視窗。
+
+    ★ 自己開 angel.dat（不經過登入機）時會多跳一次授權合約，而遊戲**不吃背景
+      滑鼠點擊**，跳出來就沒辦法自己按掉。所以要趕在它檢查之前寫進去 ——
+      實測遊戲啟動後約 13 秒才會檢查，第 1 秒就寫得進去，非常寬裕。
+
+    ⚠ 只有一個 byte，而且遊戲自己看完合約也是寫同一個值，重複寫沒有副作用。
+    """
+    if not EULA_OK:
+        return False
+    try:
+        scanner.write_value(EULA_OK, VALUE_TYPES["int8"], 1)
+    except Exception:                                      # noqa: BLE001
+        return False
+    return True
+
+
+def launch(game_dir: str):
+    """自己把遊戲叫起來，**不經過登入機**。回傳 Popen 物件。
+
+    ★ 登入機（start.exe）做完更新檢查之後，也只是用 `./angel.dat` 這個命令列
+      把遊戲叫起來而已（五台執行中的分身命令列一模一樣）。而登入機那排
+      START／EXIT 按鈕是它自己畫的、沒有視窗控制代碼，**背景點擊完全無效**
+      （實測），要按到只能佔用使用者的實體滑鼠 —— 那是使用者明令禁止的。
+      所以這裡直接開遊戲，命令列也照抄成 `./angel.dat`。
+    ⚠ 代價：不會跑登入機的版本更新檢查。官方改版時要自己開一次登入機更新。
+    """
+    exe = os.path.join(game_dir, GAME_EXE)
+    return subprocess.Popen(f"./{GAME_EXE}", executable=exe, cwd=game_dir)
 
 
 def read_channel(scanner) -> int | None:
@@ -307,7 +477,8 @@ def find_screen(scanner) -> int | None:
     return None
 
 
-def sign_in(mover, scanner, account: str, password: str) -> str:
+def sign_in(mover, scanner, account: str, password: str,
+            server_index: int | None = None) -> str:
     """帳密登入。成功回空字串，失敗回一句「為什麼不行」。
 
     mover:   已 start() 的 move.Mover（借它的跳板讓遊戲主執行緒替我們呼叫）
@@ -323,6 +494,12 @@ def sign_in(mover, scanner, account: str, password: str) -> str:
     obj = find_screen(scanner)
     if obj is None:
         return "找不到登入畫面 —— 這台分身可能已經進遊戲了。"
+    # ⚠ 切伺服器一定要在登入動作**之前**：登入動作當場去問伺服器清單選了哪一個，
+    #   選錯就會登進完全不同的世界。切不過去就整個停下來，不要硬登。
+    if server_index is not None:
+        err = pick_server(mover, scanner, server_index)
+        if err:
+            return f"切伺服器失敗：{err}"
 
     if not mover.write(ACCOUNT, _pad(account, ACCOUNT_LEN)):
         return "寫入帳號失敗。"
