@@ -46,3 +46,40 @@ def to_mark(mover) -> bool:
         return False
     return attack._send(
         mover, ((attack.SELECT_FN, (REVIVE_CODE, MARK_PARAM)),))
+
+
+def close_window(mover, scanner) -> tuple[bool, str]:
+    """關掉死亡選擇視窗。復活之後才叫 —— 還死著就別關，人要自己選。
+
+    ## 為什麼要另外做這件事
+
+    `OnOkDeadWnd` 是**送包＋關窗**兩件事，我們只送了包，所以視窗會留在
+    畫面上（使用者 2026-08-07 回報：「功能正常但彈出視窗還是沒有不見」）。
+
+    ## 為什麼是叫 `CloseDeadWnd`
+
+    遊戲自己就有這支 Lua，而且**不用參數、自帶防呆**（bytecode 純讀倒出來）：
+
+        function CloseDeadWnd()
+          if WND_DEAD_OPTION ~= 0 then
+            window.destroy(WND_DEAD_OPTION); WND_DEAD_OPTION = 0
+          end
+        end
+
+    比自己 `destroy(parent(find(…)))` 安全得多：沒有參數可以傳錯，視窗
+    已經關了再叫也只是空轉。`ShowDeadOptionWindow` 也確認
+    `WND_DEAD_OPTION = window.create(380, …)` 就是那個視窗本身，
+    不會誤殺別的介面。
+
+    ⚠ 從外部呼叫 Lua 有堆疊競爭的破口（見 [[game-crash-root-causes]]），
+      所以**一次死亡只叫一次**，而且失敗就算了 —— 關不掉只是視窗留著，
+      不影響已經復活的角色。同樣的取捨見 `exchange.close_window()`。
+    """
+    from app.game import lua                    # 避免循環相依
+
+    if not (mover and mover.active):
+        return False, "跳板沒裝好"
+    if not lua.get_global(mover, scanner, "WND_DEAD_OPTION"):
+        return False, "死亡視窗沒開著"          # 已經關了，不必叫
+    ok, val = lua.call(mover, scanner, "CloseDeadWnd")
+    return (True, "") if ok else (False, str(val))
