@@ -111,6 +111,8 @@ auto-login-findings）。舊做法用 pyautogui 打字，那會搶走使用者�
 """
 from __future__ import annotations
 
+import os
+import re
 import struct
 
 # --- 函式（locate.warm() 會重新定位；定位失敗會被清成 0，Mover.call 擋下）---
@@ -141,6 +143,18 @@ SRV_ID = 0x58
 SRV_SUBSET_B = 0x5C
 MAX_SUBSET = 8              # 上限跟遊戲一致：0x591B03 的 `cmp ecx, 8`
 MAX_SERVERS = 64            # 合理性上限，避免版面變了就跑一個天文數字的迴圈
+
+# --- 角色清單 ---------------------------------------------------------------
+# 一格 0xB7 bytes。CHAR_HAS 是遊戲自己拿來判斷「這一格有沒有角色」的欄位
+# （`0x5103FB: cmp dword [格號*0xB7 + 0x8909DF], 0`），另外兩個欄位跟它固定相對：
+#     −0x10  旗標，bit 0x40000000 立起來代表這格不能進（遊戲也是這樣擋）
+#     +0x04  角色名（UTF-8，內嵌）★ 實機讀到「白狐」「Foxsw」對上畫面
+CHAR_HAS = 0x008909DF
+CHAR_STRIDE = 0xB7
+CHAR_FLAG_OFF = -0x10
+CHAR_NAME_OFF = 0x04
+CHAR_BLOCKED = 0x40000000
+MAX_SLOTS = 8
 
 # 掃到 VT_LOGIN 之後還要對上的副 vtable（建構函式 0x5363A0 一口氣寫的那組）。
 # ⚠ 只取建構函式**不會再改寫**的四個：+0x30/+0x34 後面會被覆蓋成別的值。
@@ -200,6 +214,61 @@ def server_info(scanner) -> tuple[str, int] | None:
         return None
     name = raw[SRV_NAME:0x40].split(b"\x00")[0].decode("utf-8", "replace")
     return name, sub_a
+
+
+def subset_count(scanner, game_dir: str = "") -> int:
+    """這台伺服器有幾個分流。記憶體優先，讀不到才退回遊戲資料夾的 server.xml。
+
+    ★ 使用者指定：「請不要用猜的，要用讀出來的」。所以兩條路都是實際去讀 ——
+      記憶體那條連改版增減分流都會自動跟上；檔案那條是給「工具箱開著但遊戲
+      還沒開」的情況（那時根本沒有記憶體可讀）。兩條都失敗才回 MAX_SUBSET。
+    """
+    if scanner is not None:
+        info = server_info(scanner)
+        if info is not None:
+            return info[1]
+    if game_dir:
+        got = _subset_from_xml(os.path.join(game_dir, "server.xml"))
+        if got:
+            return got
+    return MAX_SUBSET
+
+
+def _subset_from_xml(path: str) -> int | None:
+    """server.xml 裡各伺服器的「分流」欄；取最大值。讀不到／格式不對回 None。
+
+    ⚠ 只在讀不到記憶體時才會走到這裡（見 subset_count）。檔案長這樣：
+        <伺服器 名稱="1" … port="18111" 分流="5" …/>
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    got = [int(n) for n in re.findall(r'分流="(\d+)"', raw)]
+    got = [n for n in got if 1 <= n <= MAX_SUBSET]
+    return max(got) if got else None
+
+
+def character(scanner, slot: int) -> str | None:
+    """第 slot 格（**0 起算**）的角色名；那一格沒角色／不能進就回 None。
+
+    ⚠⚠ 這道檢查**不是裝飾**：遊戲自己的「進入遊戲」按鈕（`0x5103E8`）送包前
+      就是先問這兩個欄位，不合格根本不送。我們少了它，使用者選到空的角色格
+      時會把不存在的格號送給伺服器 —— **伺服器直接把連線切斷**（實際發生過）。
+    """
+    if not (0 <= slot < MAX_SLOTS) or not CHAR_HAS:
+        return None
+    base = CHAR_HAS + slot * CHAR_STRIDE
+    has = _u32(scanner, base)
+    flag = _u32(scanner, base + CHAR_FLAG_OFF)
+    if not has or flag is None or (flag & CHAR_BLOCKED):
+        return None
+    raw = scanner._read_bytes(base + CHAR_NAME_OFF, 0x20)
+    if not raw:
+        return None
+    name = bytes(raw).split(b"\x00")[0].decode("utf-8", "replace")
+    return name or f"第 {slot + 1} 個角色"
 
 
 def read_channel(scanner) -> int | None:
@@ -332,6 +401,11 @@ def enter_game(mover, scanner, slot: int, channel: int) -> str:
         return err
     if not _u32(scanner, CONN_ID):
         return "還沒連上登入伺服器 —— 請先「帳密登入」。"
+    # ⚠⚠ 這道**一定要在送包之前**：送一個沒有角色的格號給伺服器，
+    #   伺服器會直接把連線切斷（使用者實際踩到）。遊戲自己的按鈕也是先問這個。
+    if character(scanner, slot) is None:
+        return (f"第 {slot + 1} 格沒有角色（或還不能進）——"
+                "角色清單可能還沒送到，等一下再試。")
     # ⚠⚠ 只寫 **1 個 byte**：0x890811 是別的東西（實測五台都是 1），
     #   寫 4 bytes 會把它一起清掉。
     if not mover.write(CHANNEL, bytes([channel - 1])):
