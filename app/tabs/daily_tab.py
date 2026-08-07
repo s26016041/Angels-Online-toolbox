@@ -21,6 +21,14 @@
 打包 exe 時背景 QThread 沒無頭防護會原生當機，見 memory 的
 packaging-and-release）。找兌換編號那個全記憶體掃描也切成小塊夾在步驟裡跑，
 所以整個過程畫面都不會凍住。
+
+暫時性失敗自己扛，不丟回給使用者
+--------------------------------
+「排不進指令槽」（掛機正在用槽）、「背包沒變多」（伺服器忙、開店包沒被受理）
+都是**等一下重來就會好**的事，以前直接寫進記錄叫使用者再按一次 ——
+使用者明確要求：工具自己等、自己重試，重試上限用完才回報。
+重送都是安全的：領獎＝連點兩下按鈕（伺服器忽略重複）、開店＝再點一次 NPC、
+兌換每次送之前都**重新數券**（次數照最新張數算，前一發真的有送到也不會多換）。
 """
 from __future__ import annotations
 
@@ -46,6 +54,15 @@ from app.tabs.base_tab import BaseTab
 TICK_MS = 200             # 領獎：一拍送一包（6 格 × 5 台 ≈ 6 秒，不急）
 OPEN_WAIT_MS = 900        # 開兌換商店 → 等伺服器回清單
 SETTLE_MS = 900           # 送出兌換 → 等結果寫進背包
+RETRY_MS = 250            # 排不進指令槽 → 等這麼久再試。掛機的攻擊迴圈約 50ms
+                          #   一拍、拍與拍之間會放開槽，250ms 幾乎一定輪得到。
+SLOT_TRIES = 12           # 指令槽重試上限（約 3 秒）。還進不去就不是「忙」而是
+                          #   卡住（遊戲凍結／跳板壞了），再等也不會好。
+CHECK_TRIES = 4           # 兌換後背包沒變 → 先多看幾拍（每拍隔 SETTLE_MS）——
+                          #   伺服器忙的時候只是回得慢，急著重送等於多繞一整輪。
+EX_ROUNDS = 3             # 「開店→兌換→驗背包」整輪重來的上限。背包沒變最常見
+                          #   的原因是開店那包沒被受理（不開店兌換伺服器完全不理，
+                          #   見 _ex_begin），所以重來要從開店做起。
 LOG_COLS = ("時間", "分身", "動作", "結果")
 LOG_MAX = 200
 
@@ -177,7 +194,9 @@ class DailyTab(BaseTab):
         row = (time.strftime("%H:%M:%S"), who, action, result)
         self.log.insertRow(0)
         for c, cell in enumerate(row):
-            self.log.setItem(0, c, QTableWidgetItem(cell))
+            it = QTableWidgetItem(cell)
+            it.setToolTip(cell)   # 欄位塞不下被截掉時，滑鼠移上去看得到全文
+            self.log.setItem(0, c, it)
         # 只留最近 LOG_MAX 列，放著跑一整晚也不會吃掉記憶體
         while self.log.rowCount() > LOG_MAX:
             self.log.removeRow(self.log.rowCount() - 1)
@@ -234,7 +253,7 @@ class DailyTab(BaseTab):
         self._begin(steps)
 
     def _claim_one(self, pid: int, label: str, rid: int,
-                   k: int, n: int) -> int:
+                   k: int, n: int, tries: int = 0) -> int:
         # 跳板裝不上（多半是那台剛關掉）—— 記進 _dead，這台剩下的格子直接跳過，
         # 不然會連跳 6 拍、每拍再失敗一次。
         if pid in self._dead:
@@ -246,13 +265,22 @@ class DailyTab(BaseTab):
             return 0
         if dailygift.claim(mv, rid):
             self._sent[pid] = self._sent.get(pid, 0) + 1
+        elif tries + 1 < SLOT_TRIES:
+            # 排不進指令槽（多半是掛機正在用）→ 自己等、自己重試同一格。
+            # 重送安全：跟連點兩下同一格一樣，伺服器自己會擋。
+            self.status.setText(
+                f"領取中… {label}　第 {k + 1}/{n} 格（指令槽忙，等它空出來）")
+            self._steps.insert(
+                0, lambda: self._claim_one(pid, label, rid, k, n, tries + 1))
+            return RETRY_MS
         if k == n - 1:                                 # 這台的最後一格
             got = self._sent.get(pid, 0)
             self._done += 1
             self._log(label, "領取在線獎勵",
                       f"已送出 {got}/{n} 格"
                       + ("" if got == n else
-                         "（其餘排不進指令槽，再按一次就好）"))
+                         f"（重試 {SLOT_TRIES} 次仍送不出去 —— "
+                         "遊戲卡住了？稍後再按一次）"))
         self.status.setText(f"領取中… {label}　第 {k + 1}/{n} 格")
         return TICK_MS
 
@@ -326,12 +354,16 @@ class DailyTab(BaseTab):
         return (sum(it.count for it in items if it.type_id == TOKEN_ITEM),
                 sum(it.count for it in items if it.type_id == WING_ITEM))
 
-    def _ex_begin(self, pid: int, label: str) -> int:
+    def _ex_begin(self, pid: int, label: str, cycle: int = 0,
+                  tries: int = 0) -> int:
         """數券 → 開兌換商店。沒有券就跳過這台（連商店都不開）。
 
         ⚠⚠ **一定要先開商店**：2026-08-07 使用者實測，不開商店直接送兌換封包
           伺服器完全不理（背包沒變）。曾經做過「先試直送、不行才開商店」的
           自動判斷，既然答案已經確定就拿掉了 —— 白送一包還多等 0.9 秒。
+
+        cycle 是「開店→兌換→驗背包」第幾輪重來（見 _ex_check），
+        tries 是這一輪裡開店包排不進指令槽重試了幾次。
         """
         if _entry is None:
             return 0
@@ -339,7 +371,7 @@ class DailyTab(BaseTab):
         if sc is None:
             self._log(label, "換翔宇聖翼", "⚠ 讀不到記憶體")
             return 0
-        have, _wings = self._count(sc)
+        have, wings = self._count(sc)
         times = _entry.times_for(have)
         if times <= 0:
             self._log(label, "換翔宇聖翼", f"沒有{self._name(TOKEN_ITEM)}")
@@ -349,17 +381,28 @@ class DailyTab(BaseTab):
             self._log(label, "換翔宇聖翼", "⚠ 無法安裝跳板（視窗關了？）")
             return 0
         if not exchange.open_shop(mv, _entry.group):
-            self._log(label, "換翔宇聖翼", "⚠ 開兌換商店排不進去，再按一次")
+            if tries + 1 < SLOT_TRIES:
+                # 指令槽忙 → 自己等、自己重試。重送＝再點一次 NPC，安全。
+                self.status.setText(
+                    f"{label}：開兌換商店（指令槽忙，等它空出來）")
+                self._steps.insert(
+                    0, lambda: self._ex_begin(pid, label, cycle, tries + 1))
+                return RETRY_MS
+            self._log(label, "換翔宇聖翼",
+                      "⚠ 開兌換商店一直送不出去 —— 遊戲卡住了？稍後再按一次")
             return 0
         self.status.setText(f"{label}：{have} 張券 → 換 {times} 次")
-        self._steps.insert(0, lambda: self._ex_confirm(pid, label))
+        self._steps.insert(
+            0, lambda: self._ex_confirm(pid, label, cycle, have, wings))
         return OPEN_WAIT_MS
 
-    def _ex_confirm(self, pid: int, label: str) -> int:
+    def _ex_confirm(self, pid: int, label: str, cycle: int,
+                    have0: int, wings0: int, tries: int = 0) -> int:
         """商店開好了才送兌換。
 
         ⚠ 券在這裡**重新數一次**，不沿用開商店之前那個數字 —— 中間隔了 0.9 秒，
-          用最新的才不會送出比手上還多的次數。
+          用最新的才不會送出比手上還多的次數。重試時也一樣重數，所以就算
+          前一發其實有送到、券已被扣走，這裡會自動變 0 次，不會多換。
         """
         sc, mv = self._scanners.get(pid), self._movers.get(pid)
         if sc is None or mv is None or _entry is None:
@@ -367,32 +410,66 @@ class DailyTab(BaseTab):
         have, wings = self._count(sc)
         times = _entry.times_for(have)
         if times <= 0:
-            self._log(label, "換翔宇聖翼", f"沒有{self._name(TOKEN_ITEM)}")
-        else:
-            ok, why = exchange.confirm(mv, sc, _entry.id, times)
-            if ok:
-                self._steps.insert(0, lambda: self._ex_check(
-                    pid, label, have, wings))
-                return SETTLE_MS
-            self._log(label, "換翔宇聖翼", f"⚠ {why}")
+            # 開店時還有券、現在沒了 —— 幾乎一定是前一發其實成功了
+            # （逾時≠沒送出）。交給驗背包那步對帳，翅膀有變多就算成功。
+            self._steps.insert(0, lambda: self._ex_check(
+                pid, label, have0, wings0, cycle, CHECK_TRIES - 1))
+            return 0
+        ok, why = exchange.confirm(mv, sc, _entry.id, times)
+        if ok:
+            self._steps.insert(0, lambda: self._ex_check(
+                pid, label, have, wings, cycle))
+            return SETTLE_MS
+        if tries + 1 < SLOT_TRIES:
+            # 排不進指令槽／正在重連之類的暫時狀況 → 等一下再送
+            self.status.setText(f"{label}：兌換（{why}，自動重試中）")
+            self._steps.insert(
+                0, lambda: self._ex_confirm(
+                    pid, label, cycle, have0, wings0, tries + 1))
+            return RETRY_MS
+        self._log(label, "換翔宇聖翼", f"⚠ 重試多次仍失敗：{why}")
         # 沒送成也要把剛才開起來的商店視窗關掉
         self._steps.insert(0, lambda: self._ex_close(pid, label))
         return 0
 
-    def _ex_check(self, pid: int, label: str, have: int, wings: int) -> int:
-        """回頭讀背包，報告真的換到幾個 —— 只說「送出了」看不出有沒有成功。"""
+    def _ex_check(self, pid: int, label: str, have: int, wings: int,
+                  cycle: int, probes: int = 0) -> int:
+        """回頭讀背包，報告真的換到幾個 —— 只說「送出了」看不出有沒有成功。
+
+        背包沒變不急著判死刑：
+          1. 先多看幾拍（CHECK_TRIES）—— 伺服器忙的時候只是回得慢，
+             急著重送等於白繞一整輪。
+          2. 還是沒動靜才整輪重來（EX_ROUNDS）—— 從**重新開店**做起，
+             因為「背包沒變」最常見的原因就是開店那包沒被伺服器受理。
+             重來時 _ex_confirm 會重新數券，所以不會多換。
+        """
         sc = self._scanners.get(pid)
-        if sc is not None:
-            now_tok, now_wing = self._count(sc)
-            used, got = have - now_tok, now_wing - wings
-            if got > 0:
-                self._done += 1
-                self._log(label, "換翔宇聖翼",
-                          f"★ 換到 {got} 個{self._name(WING_ITEM)}"
-                          f"（用掉 {used} 張券，還剩 {now_tok} 張）")
-            else:
-                self._log(label, "換翔宇聖翼",
-                          f"⚠ 背包沒變多（券還有 {now_tok} 張）—— 伺服器沒接受")
+        if sc is None:
+            self._steps.insert(0, lambda: self._ex_close(pid, label))
+            return 0
+        now_tok, now_wing = self._count(sc)
+        used, got = have - now_tok, now_wing - wings
+        if got > 0:
+            self._done += 1
+            self._log(label, "換翔宇聖翼",
+                      f"★ 換到 {got} 個{self._name(WING_ITEM)}"
+                      f"（用掉 {used} 張券，還剩 {now_tok} 張）")
+        elif probes + 1 < CHECK_TRIES:
+            self.status.setText(
+                f"{label}：等伺服器結算…（{probes + 2}/{CHECK_TRIES}）")
+            self._steps.insert(0, lambda: self._ex_check(
+                pid, label, have, wings, cycle, probes + 1))
+            return SETTLE_MS
+        elif cycle + 1 < EX_ROUNDS:
+            self.status.setText(
+                f"{label}：伺服器沒接受，重新開店再換一次"
+                f"（第 {cycle + 2}/{EX_ROUNDS} 輪）")
+            self._steps.insert(0, lambda: self._ex_begin(pid, label, cycle + 1))
+            return TICK_MS
+        else:
+            self._log(label, "換翔宇聖翼",
+                      f"⚠ 重試 {EX_ROUNDS} 輪伺服器都沒接受"
+                      f"（券還有 {now_tok} 張）—— 等一下再按一次")
         self._steps.insert(0, lambda: self._ex_close(pid, label))
         return 0
 
