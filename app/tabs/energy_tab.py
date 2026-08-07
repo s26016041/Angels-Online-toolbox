@@ -104,7 +104,10 @@ class EnergyTab(BaseTab):
         bar.addWidget(self.who)
         refresh = QPushButton("重新整理")
         refresh.setToolTip("重新列出目前開著的遊戲分身。")
-        refresh.clicked.connect(self.reload_instances)
+        # ★ 按鈕要 force_names=True：同一台登出換角色 pid 不變，
+        #   不強制重掃的話下拉選單永遠是舊角色名。
+        refresh.clicked.connect(
+            lambda: self.reload_instances(force_names=True))
         bar.addWidget(refresh)
         bar.addSpacing(16)
         self.energy_lbl = QLabel("能量 —")
@@ -246,7 +249,8 @@ class EnergyTab(BaseTab):
         if not self._scanners:
             self.reload_instances()
 
-    def reload_instances(self) -> None:
+    def reload_instances(self, force_names: bool = False) -> None:
+        # force_names：只有按「重新整理」才 True，on_show 自動載入走快取。
         self.who.blockSignals(True)
         self.who.clear()
         for sc in self._scanners.values():
@@ -272,7 +276,7 @@ class EnergyTab(BaseTab):
             # ⚠ 用預讀的快取，**不要叫 charname.read_character_name()** ——
             #   那是全記憶體掃字串，一台 1.1~1.8 秒，五台就讓分頁卡七、八秒
             #   （使用者回報的「切過去卡一下」）。見 app/core/preload.py。
-            nm = preload.name_of(w.pid, sc, acc)
+            nm = preload.name_of(w.pid, sc, acc, force=force_names)
             self._scanners[w.pid] = sc
             self.who.addItem(f"{nm}（{acc}）", w.pid)
         self.who.blockSignals(False)

@@ -3686,7 +3686,10 @@ class FarmTab(BaseTab):
 
         bar = QHBoxLayout()
         self.rescan_btn = QPushButton("重新偵測分身")
-        self.rescan_btn.clicked.connect(self.reload_instances)
+        # ★ 按鈕要 force_names=True：同一台登出換角色 pid 不變，
+        #   不強制重掃的話分頁標籤永遠是舊角色名。
+        self.rescan_btn.clicked.connect(
+            lambda: self.reload_instances(force_names=True))
         bar.addWidget(self.rescan_btn)
         self.found = QLabel("尚未偵測")
         self.found.setStyleSheet("color: #9aa2b8;")
@@ -3730,7 +3733,9 @@ class FarmTab(BaseTab):
         if not self._pages:
             self.reload_instances()
 
-    def reload_instances(self) -> None:
+    def reload_instances(self, force_names: bool = False) -> None:
+        # force_names：只有按「重新偵測分身」才 True。on_show 的自動載入
+        # 走快取，不然第一次切分頁又會卡好幾秒（preload 就是為此而生）。
         self._teardown()
         insts = []
         seen = set()
@@ -3773,7 +3778,7 @@ class FarmTab(BaseTab):
             # ⚠ 用預讀的快取，**不要叫 charname.read_character_name()** ——
             #   那是全記憶體掃字串，一台 1.1~1.8 秒、五台就是七、八秒的凍結
             #   （使用者回報「第一次切過去會卡一下」）。見 app/core/preload.py。
-            nm = preload.name_of(pid, sc, acct)
+            nm = preload.name_of(pid, sc, acct, force=force_names)
             # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
             page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
                                 tgt, keys, None, acct, nm,

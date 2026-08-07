@@ -147,7 +147,10 @@ class SellTab(BaseTab):
         bar.addWidget(self.who)
         reload_btn = QPushButton("重新整理")
         reload_btn.setToolTip("重新列出目前開著的遊戲分身。")
-        reload_btn.clicked.connect(self.reload_instances)
+        # ★ 按鈕要 force_names=True：同一台登出換角色 pid 不變，
+        #   不強制重掃的話下拉選單永遠是舊角色名。
+        reload_btn.clicked.connect(
+            lambda: self.reload_instances(force_names=True))
         bar.addWidget(reload_btn)
         bar.addStretch(1)
         self.gold_lbl = QLabel("金幣 —")
@@ -261,7 +264,8 @@ class SellTab(BaseTab):
         if not self._scanners:
             self.reload_instances()
 
-    def reload_instances(self) -> None:
+    def reload_instances(self, force_names: bool = False) -> None:
+        # force_names：只有按「重新整理」才 True，on_show 自動載入走快取。
         self._stop_auto()
         self.who.blockSignals(True)
         self.who.clear()
@@ -285,7 +289,9 @@ class SellTab(BaseTab):
             acc = charname.account_from_title(w.title)
             # ⚠ 用預讀快取，不要現掃角色名（一台 1~2 秒，五台就整個卡住）。
             self._scanners[w.pid] = sc
-            self.who.addItem(f"{preload.name_of(w.pid, sc, acc)}（{acc}）", w.pid)
+            self.who.addItem(
+                f"{preload.name_of(w.pid, sc, acc, force=force_names)}"
+                f"（{acc}）", w.pid)
         self.who.blockSignals(False)
         if not self._scanners:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")

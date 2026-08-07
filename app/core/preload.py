@@ -21,6 +21,8 @@
 
 * 快取的是 **pid → 角色名**。玩家關掉某台重開會換 pid，那台就會重算
   （見 [[memory-re-pitfalls]] 第 10 條：pid 是快照，不能當永久身分）。
+  ⚠ 反過來說：同一台**登出換角色**時 pid 不變，快取會一直回舊角色名 ——
+  所以「重新偵測分身／重新整理」這類明確動作要用 `name_of(force=True)` 重掃。
 * `refresh()` 可以重跑（分頁上的「重新整理」會用到）。
 * 純讀記憶體。
 """
@@ -156,10 +158,15 @@ def refresh(progress=None) -> list[Client]:
     return out
 
 
-def name_of(pid: int, scanner=None, account: str = "") -> str:
-    """拿角色名。已經預讀過就是瞬間；沒有的話現場算一次並記起來。"""
+def name_of(pid: int, scanner=None, account: str = "",
+            force: bool = False) -> str:
+    """拿角色名。已經預讀過就是瞬間；沒有的話現場算一次並記起來。
+
+    force=True 丟掉快取重掃 —— 同一台客戶端登出換角色時 pid 不變，
+    不強制重掃就永遠是舊角色名。沒帶 scanner 時 force 無效（沒東西可掃）。
+    """
     got = _names.get(pid)
-    if got:
+    if got and not (force and scanner is not None):
         return got
     if scanner is not None:
         got = _scan_client(scanner, pid, account)
