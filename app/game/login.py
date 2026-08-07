@@ -45,7 +45,20 @@ auto-login-findings）。舊做法用 pyautogui 打字，那會搶走使用者�
 再交叉驗證 +0x10/+0x14/+0x18/+0x2C 四個副 vtable —— 五個指標同時對上，
 不會誤認。進遊戲之後這個物件會被釋放，掃不到就是「現在不在登入畫面」。
 
-## 二、進入遊戲（含選頻道）
+## 二、選頻道（分流）—— 不能省的一步
+
+登入成功後畫面會停在「請選擇分流遊戲世界」。⚠⚠ 點那一列**做的是兩件事**：
+
+    ① `[0x890810] = 該列編號`（控制項 id 0x9E3，選取變更的訊息）
+    ② `0x537353(登入畫面物件)`（同一個 id、**另一種訊息**，`0x539E40` 那個 call）
+       → 跳出「與伺服器連線中」，跟伺服器要角色清單，畫面推進到選角色
+
+只做 ① 的話畫面會一直停在分流清單，接著送「進入遊戲」就卡在「與伺服器連線中」
+—— 這正是使用者回報的症狀。2026-08-07 在使用者開放的測試分身上實跑：
+寫 `[0x890810]=2` 再 `0x537353(obj)` → 1.5 秒後截圖已是選角色畫面（白狐 LV80），
+登入畫面物件隨即被釋放。
+
+## 三、進入遊戲（頻道值也在這一包裡）
 
 角色選好之後按「進入遊戲」送的是 `0x50F880(角色格號)`（stdcall，代號 6、
 內文 0x25），走**登入連線**。它組包的內容是：
@@ -102,6 +115,7 @@ import struct
 
 # --- 函式（locate.warm() 會重新定位；定位失敗會被清成 0，Mover.call 擋下）---
 LOGIN_FN = 0x00538959       # thiscall(this)：登入按鈕的完整動作
+PICK_CHANNEL_FN = 0x00537353  # thiscall(this)：確定分流，畫面推進到選角色
 ENTER_FN = 0x0050F880       # stdcall(角色格號)：進入遊戲
 
 # --- 資料位址（定位失敗會保留下面寫死的值，讀錯只會「做不到」不會崩潰）---
@@ -260,6 +274,46 @@ def sign_in(mover, scanner, account: str, password: str) -> str:
     return ""
 
 
+def pick_channel(mover, scanner, channel: int) -> str:
+    """在「請選擇分流遊戲世界」那一頁確定分流，把畫面推進到選角色。
+
+    channel: 頻道／分流，**1 起算**。
+
+    ⚠⚠ **這一步不能省**（2026-08-07 實機確認）：點分流清單那一列其實做**兩件事**
+      —— 寫頻道位元組，以及叫 `0x537353` 跟伺服器要角色清單。只寫位元組的話
+      畫面會一直停在分流清單，接著送「進入遊戲」就卡在「與伺服器連線中」。
+
+    實測：寫 `[0x890810]=2` 再 `0x537353(登入畫面物件)` → 1.5 秒後畫面就到
+    選角色（截圖確認），登入畫面物件隨即被釋放（`find_screen()` 回 None）。
+    """
+    if not (mover and mover.active):
+        return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
+    err = _check_channel(scanner, channel)
+    if err:
+        return err
+    obj = find_screen(scanner)
+    if obj is None:
+        return "現在不在分流選擇畫面（可能已經到選角色了，直接按「進入遊戲」）。"
+    # ⚠ 順序照使用者點那一列時的兩個動作：先寫頻道，再確定。
+    if not mover.write(CHANNEL, bytes([channel - 1])):
+        return "寫入頻道失敗。"
+    if mover.call_sync(PICK_CHANNEL_FN, ecx=obj, timeout=CALL_TIMEOUT) is None:
+        return "指令槽排不進去或逾時（遊戲主執行緒正忙），等一下再按。"
+    return ""
+
+
+def _check_channel(scanner, channel: int) -> str:
+    """頻道合理性；沒問題回空字串。"""
+    if not (1 <= channel <= MAX_SUBSET):
+        return f"頻道要在 1~{MAX_SUBSET} 之間。"
+    # ⚠ 上限**照這台伺服器實際的分流數**再檢一次；讀不到就只用上面那道
+    #   （寧可放行也不要因為讀不到就整個功能不能用）。
+    info = server_info(scanner)
+    if info is not None and channel > info[1]:
+        return f"{info[0]} 只有 {info[1]} 個分流，選不到第 {channel} 個。"
+    return ""
+
+
 def enter_game(mover, scanner, slot: int, channel: int) -> str:
     """選頻道 + 進入遊戲，一包送出。成功回空字串，失敗回原因。
 
@@ -273,13 +327,9 @@ def enter_game(mover, scanner, slot: int, channel: int) -> str:
         return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
     if slot < 0:
         return "角色格號不對。"
-    if not (1 <= channel <= MAX_SUBSET):
-        return f"頻道要在 1~{MAX_SUBSET} 之間。"
-    # ⚠ 上限**照這台伺服器實際的分流數**再檢一次；讀不到就只用上面那道
-    #   （寧可放行也不要因為讀不到就整個功能不能用）。
-    info = server_info(scanner)
-    if info is not None and channel > info[1]:
-        return f"{info[0]} 只有 {info[1]} 個分流，選不到第 {channel} 個。"
+    err = _check_channel(scanner, channel)
+    if err:
+        return err
     if not _u32(scanner, CONN_ID):
         return "還沒連上登入伺服器 —— 請先「帳密登入」。"
     # ⚠⚠ 只寫 **1 個 byte**：0x890811 是別的東西（實測五台都是 1），

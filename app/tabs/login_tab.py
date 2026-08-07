@@ -127,9 +127,10 @@ class LoginTab(BaseTab):
         act_box = QGroupBox("對分身下指令（背景執行，不會動到你的鍵盤滑鼠）")
         act_lay = QVBoxLayout(act_box)
         act_hint = QLabel(
-            "送出的跟你自己在遊戲裡點按鈕是同一個封包。"
-            "「帳密登入」要遊戲停在登入畫面（伺服器已選好，預設就選好第一個）；"
-            "「進入遊戲」要已經到選角色畫面。")
+            "照遊戲本來的三個步驟：帳密登入 → 選頻道 → 進入遊戲。"
+            "每一步中間都要等伺服器回話（約 1~2 秒），所以是三顆按鈕不是一顆。"
+            "送出的跟你自己在遊戲裡點是同一件事，不會動到鍵盤滑鼠。"
+            "下面的頻道與角色會記起來，隨時可以改。")
         act_hint.setWordWrap(True)
         act_lay.addWidget(act_hint)
 
@@ -157,26 +158,32 @@ class LoginTab(BaseTab):
         self.signin_btn.clicked.connect(self._do_sign_in)
         run_row.addWidget(self.signin_btn)
 
-        run_row.addWidget(QLabel("第"))
-        self.slot_spin = QSpinBox()
-        self.slot_spin.setRange(1, 8)      # 這遊戲的角色欄位最多 8 格
-        self.slot_spin.setValue(1)
-        fit_spin(self.slot_spin)
-        run_row.addWidget(self.slot_spin)
-        run_row.addWidget(QLabel("個角色，頻道"))
+        run_row.addWidget(QLabel("頻道"))
         # ⚠ 上限先給遊戲的硬上限，接上分身之後改成**那台伺服器實際的分流數**
         #   （見 _sync_channel_range）—— 分流數是遊戲隨時會調的東西，不寫死。
         self.chan_spin = QSpinBox()
         self.chan_spin.setRange(1, login.MAX_SUBSET)
-        self.chan_spin.setValue(1)
         fit_spin(self.chan_spin)
         run_row.addWidget(self.chan_spin)
+        self.chan_btn = QPushButton("選頻道")
+        self.chan_btn.setToolTip(
+            "在「請選擇分流遊戲世界」那一頁確定分流，畫面會推進到選角色。\n"
+            "⚠ 這一步不能跳過 —— 遊戲要靠它跟伺服器要角色清單，\n"
+            "少了它直接按「進入遊戲」會卡在「與伺服器連線中」。")
+        self.chan_btn.clicked.connect(self._do_pick_channel)
+        run_row.addWidget(self.chan_btn)
+
+        run_row.addSpacing(16)
+        run_row.addWidget(QLabel("第"))
+        self.slot_spin = QSpinBox()
+        self.slot_spin.setRange(1, 8)      # 這遊戲的角色欄位最多 8 格
+        fit_spin(self.slot_spin)
+        run_row.addWidget(self.slot_spin)
+        run_row.addWidget(QLabel("個角色"))
         self.enter_btn = QPushButton("進入遊戲")
         self.enter_btn.setToolTip(
             "送出「選這個角色、這個頻道，進遊戲」那一包。\n"
-            "格號照選角色畫面由左到右數，第 1 個就是 1。\n"
-            "頻道就是「雅典娜-3」的那個 3 —— 不必自己去點頻道選擇畫面，\n"
-            "頻道本來就是這一包裡的一個欄位。")
+            "格號照選角色畫面由左到右數，第 1 個就是 1。")
         self.enter_btn.clicked.connect(self._do_enter_game)
         run_row.addWidget(self.enter_btn)
         run_row.addStretch(1)
@@ -196,18 +203,39 @@ class LoginTab(BaseTab):
         root.addWidget(self.status_label)
         root.addStretch(1)
 
-        self._load_settings()
+        # ⚠ 順序有意義：_load_settings() 要靠帳號清單才能把上次用的帳密填回去。
         self._load_accounts()
         self._rebuild_acct_table()
+        self._load_settings()
+        # 改了就存 —— 使用者要的是「記住上次的選擇，但隨時可切」。
+        self.chan_spin.valueChanged.connect(self._save_settings)
+        self.slot_spin.valueChanged.connect(self._save_settings)
 
     # ------------------------------------------------------------------
     # 遊戲設定讀寫
     # ------------------------------------------------------------------
     def _load_settings(self) -> None:
+        """把上次的選擇讀回來。**隨時可以改**，改了就存（見 _save_settings）。"""
         self.exe_edit.setText(config.get("login.exe_path", ""))
+        self.chan_spin.setValue(
+            max(1, min(login.MAX_SUBSET, int(config.get("login.channel", 1)))))
+        self.slot_spin.setValue(
+            max(1, min(8, int(config.get("login.char_slot", 1)))))
+        # 上次用哪個帳號登入的 → 從帳號清單把帳密填回去，不必每次雙擊。
+        last = str(config.get("login.last_account", ""))
+        for a in self._accounts:
+            if a["account"] == last:
+                self.account_edit.setText(a["account"])
+                self.password_edit.setText(config.deobfuscate(a["password"]))
+                break
 
     def _save_settings(self) -> None:
         config.set("login.exe_path", self.exe_edit.text().strip())
+        config.set("login.channel", self.chan_spin.value())
+        config.set("login.char_slot", self.slot_spin.value())
+        acct = self.account_edit.text().strip()
+        if acct:
+            config.set("login.last_account", acct)
         config.save()
 
     # ------------------------------------------------------------------
@@ -412,10 +440,14 @@ class LoginTab(BaseTab):
         return pid, sc, mv
 
     def _sync_channel_range(self) -> None:
-        """把頻道上限改成「這台伺服器實際有幾個分流」，並跟上它目前的頻道。
+        """把頻道上限改成「這台伺服器實際有幾個分流」，並顯示它目前在第幾頻。
 
         讀不到就維持遊戲的硬上限 —— 讀不到只代表現在還沒接上（例如遊戲剛開），
         不該因此讓使用者連填都不能填。
+
+        ⚠ **只動上限，不動使用者填的值** —— 使用者要的是「記住我的選擇」，
+          切分身時把欄位改成那台目前的頻道就等於把他的設定洗掉了。
+          那台現在在第幾頻改成寫在右邊的說明文字裡。
         """
         if self._loading_clients:
             return
@@ -426,15 +458,14 @@ class LoginTab(BaseTab):
         if sc is None:
             return
         info = login.server_info(sc)
-        if info is not None:
-            name, subsets = info
-            self.chan_spin.setMaximum(subsets)
-            self.server_label.setText(f"伺服器：{name}（{subsets} 個分流）")
-        else:
+        if info is None:
             self.server_label.setText("伺服器：讀不到（還沒接上遊戲）")
+            return
+        name, subsets = info
+        self.chan_spin.setMaximum(subsets)
         now = login.read_channel(sc)
-        if now is not None and now <= self.chan_spin.maximum():
-            self.chan_spin.setValue(now)
+        tail = f"｜這台目前在 {now} 頻" if now is not None else ""
+        self.server_label.setText(f"伺服器：{name}（{subsets} 個分流）{tail}")
 
     # ------------------------------------------------------------------
     # 兩顆動作按鈕
@@ -463,7 +494,27 @@ class LoginTab(BaseTab):
             self._set_status(f"帳密登入失敗：{err}")
             QMessageBox.warning(self, "帳密登入失敗", err)
             return
-        self._set_status(f"已送出帳密登入（{account}）—— 接下來遊戲會自己連線、選角色畫面。")
+        self._save_settings()      # 記住這次用的帳號
+        self._set_status(
+            f"已送出帳密登入（{account}）—— 等分流清單出來後按「選頻道」。")
+
+    def _do_pick_channel(self) -> None:
+        got = self._target()
+        if got is None:
+            return
+        _, sc, mv = got
+        chan = self.chan_spin.value()
+        self._busy("確定分流…")
+        try:
+            err = login.pick_channel(mv, sc, chan)
+        finally:
+            self._idle()
+        if err:
+            self._set_status(f"選頻道失敗：{err}")
+            QMessageBox.warning(self, "選頻道失敗", err)
+            return
+        self._set_status(
+            f"已確定分流 {chan} —— 等選角色畫面出來後按「進入遊戲」。")
 
     def _do_enter_game(self) -> None:
         got = self._target()
@@ -486,10 +537,13 @@ class LoginTab(BaseTab):
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
+    def _buttons(self):
+        return (self.signin_btn, self.chan_btn, self.enter_btn)
+
     def _busy(self, text: str) -> None:
         """按鈕鎖住 + 沙漏 + 先把狀態文字畫出來（動作是同步的，會頓一下）。"""
-        self.signin_btn.setEnabled(False)
-        self.enter_btn.setEnabled(False)
+        for b in self._buttons():
+            b.setEnabled(False)
         self._set_status(text)
         QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         # ⚠ 不呼叫這行的話，狀態文字要等整件事做完才會出現 —— 使用者看到的
@@ -498,8 +552,8 @@ class LoginTab(BaseTab):
 
     def _idle(self) -> None:
         QGuiApplication.restoreOverrideCursor()
-        self.signin_btn.setEnabled(True)
-        self.enter_btn.setEnabled(True)
+        for b in self._buttons():
+            b.setEnabled(True)
 
     def on_show(self) -> None:
         # ⚠ 不在 build_ui() 就列 —— 開機時列會多跑一次列舉視窗，
