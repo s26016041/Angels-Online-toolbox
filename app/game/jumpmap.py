@@ -81,8 +81,16 @@ def entries() -> list[Entry]:
 
 
 def by_scene(scene_id: int) -> list[Entry]:
-    """某張地圖的所有傳送點（入口／重生點／副本進入點可能有好幾個）。"""
-    return [e for e in entries() if e.scene_id == scene_id]
+    """某張地圖的所有傳送點（入口／重生點／副本進入點可能有好幾個）。
+
+    ★ 用 map_key 比對，不是編號 —— 表裡**只有本流編號**（120 筆全查過，
+      141/241 那些分流編號一筆都沒有）。在分流上掛機的人拿自己的場景
+      編號直接查一定落空 →「沒有回○○的傳送點」，補給／死亡回程就把人
+      留在城裡。分流地形一樣、落點座標互通（見 scene.map_key）。
+    """
+    from app.game import scene                        # 避免循環相依
+    key = scene.map_key(scene_id)
+    return [e for e in entries() if scene.map_key(e.scene_id) == key]
 
 
 def nearest(scene_id: int, x: float | None = None,

@@ -270,6 +270,10 @@ HEAD_BACK = 24               # 校正表頭時往前多看幾格
 #   藥水判成「用完了」→ 誤觸發回程補給。遊戲本身最大格號 253，取 512 留足餘裕。
 #   成本很低：整段用 `read_pointers()` **一次讀進來**，不是一格發一次系統呼叫。
 FULL_WINDOW = 512
+# ★ 遊戲本身的最大格號是 253，所以「這條陣列我看完了」的最低標準就是
+#   覆蓋到表頭後 254 格。低於這個數的讀取結果只能拿來「找東西」，
+#   **不能拿來下「沒有／歸零」的結論**（見 _array_ptrs 與 count_by_types）。
+SLOT_CEILING = 254
 
 
 def _item_slot(scanner, ptr: int) -> int | None:
@@ -392,12 +396,9 @@ def find_by_type(scanner, head: int, type_id: int
     return None
 
 
-def _walk(scanner, head: int, window: int = FULL_WINDOW):
-    """走整條物品陣列，逐一吐出 (格號, 種類ID, 數量, 物件位址)。
-
-    ★ 指標**一次批次讀進來**（`read_pointers`），所以掃 512 格跟掃 128 格
-      的成本差不多 —— 沒有理由為了省時間去縮範圍。
-    ⚠ 只認「物品自己記得住格號」的（`_item_slot`），過濾掉陣列外圍的殘留指標。
+def _array_ptrs(scanner, base: int, window: int = FULL_WINDOW
+                ) -> tuple[list[int], int]:
+    """讀整條指標陣列，回傳 (指標清單, 覆蓋到表頭後第幾格)。
 
     ⚠⚠ **表頭前面那 24 格可能整段沒有映射**（陣列剛好貼著記憶體區段的開頭）。
       ReadProcessMemory 對這種範圍是**整批失敗**，不是讀一半 ——
@@ -406,16 +407,39 @@ def _walk(scanner, head: int, window: int = FULL_WINDOW):
       → 「水沒了」+「沒有回程道具」→ 掛機被停掉。
       使用者實際遇到（黑狐，表頭 0x3ac35008，往前 96 bytes 就是未映射）。
       所以讀不到就退一步，從表頭本身開始讀。
+    ⚠⚠ 反過來**尾端貼著區段結尾**時，減半重試會「成功但被截斷」——
+      只剩前面一小段、後面的格子整批看不見，而且沒有任何錯誤。
+      所以把「覆蓋到第幾格」一起回報：不足 SLOT_CEILING 就代表這次
+      沒看完整條，「沒數到」不能當「沒有」（見 count_by_types）。
+      這正是當年 FULL_WINDOW=128 太小 → 假的沒有 那個 bug 的動態翻版，
+      陣列搬家搬到貼區段尾端的位置就會發作。
+    """
+    start = base - HEAD_BACK * 4
+    ptrs = read_pointers(scanner, start, HEAD_BACK + window)
+    covered = len(ptrs) - HEAD_BACK
+    if len(ptrs) < HEAD_BACK + window and covered < SLOT_CEILING:
+        # 讀不齊而且覆蓋不夠 → 從表頭本身重讀一次，哪邊看得遠用哪邊
+        alt = read_pointers(scanner, base, window)
+        if len(alt) > covered:
+            return alt, len(alt)
+    return ptrs, covered
+
+
+def _walk(scanner, head: int, window: int = FULL_WINDOW):
+    """走整條物品陣列，逐一吐出 (格號, 種類ID, 數量, 物件位址)。
+
+    ★ 指標**一次批次讀進來**（`read_pointers`），所以掃 512 格跟掃 128 格
+      的成本差不多 —— 沒有理由為了省時間去縮範圍。
+    ⚠ 只認「物品自己記得住格號」的（`_item_slot`），過濾掉陣列外圍的殘留指標。
+    ⚠ 讀取被截斷時這裡**照樣吐出**讀得到的那段（拿來找東西沒問題）——
+      要下「沒有／歸零」結論的請改用 `count_by_types()`，它會回報完整性。
     """
     if not head:
         return
     base = align_head(scanner, head)
     if not base:
         return
-    start = base - HEAD_BACK * 4
-    ptrs = read_pointers(scanner, start, HEAD_BACK + window)
-    if not ptrs:
-        ptrs = read_pointers(scanner, base, window)
+    ptrs, _covered = _array_ptrs(scanner, base, window)
     for p in ptrs:
         if not p:
             continue
@@ -436,6 +460,32 @@ def count_by_type(scanner, head: int, type_id: int) -> int:
     """
     return sum(cnt for _s, tid, cnt, _p in _walk(scanner, head)
                if tid == type_id)
+
+
+def count_by_types(scanner, head: int, type_ids
+                   ) -> tuple[dict[int, int], bool]:
+    """好幾種一起數總數，回傳 ({種類: 總數}, 整條走完了嗎)。
+
+    ⚠⚠ 要下「歸零／沒有」結論的一定要用這支、**而且要看第二個值** ——
+      `_walk()` 對截斷（陣列尾端貼著區段結尾，見 _array_ptrs）不吭聲，
+      加總出來的 0 可能只是「後面那段沒看到」。實測藥水疊到第 174 格、
+      遊戲最大格號 253，覆蓋不到 SLOT_CEILING 格就不能說東西不在。
+    ★ 有數到的部分（>0）照樣可信 —— 截斷只會少看，不會多看。
+    """
+    total = dict.fromkeys(type_ids, 0)
+    if not head:
+        return total, False
+    base = align_head(scanner, head)
+    if not base:
+        return total, False
+    ptrs, covered = _array_ptrs(scanner, base)
+    for p in ptrs:
+        if not p:
+            continue
+        got = _item_row(scanner, p)
+        if got is not None and got[1] in total:
+            total[got[1]] += got[2]
+    return total, covered >= SLOT_CEILING
 
 
 def durability(scanner, head: int) -> tuple[int, int] | None:

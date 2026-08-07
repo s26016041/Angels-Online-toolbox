@@ -682,12 +682,18 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
     # ⚠ 判定跟 count_by_type 一樣是「同種類全部加總」：藥水會散成好幾疊
     #   （黑狐的 4837 分在 8 格）。差別是**一趟走完**同時累加所有種類 ——
     #   以前每種各走一整條陣列（各 300~400 次系統呼叫），而這裡在 GUI 執行緒。
-    total = dict.fromkeys(items, 0)
-    for _s, tid, cnt, _p in inventory._walk(scanner, inv_head):
-        if tid in total:
-            total[tid] += cnt
+    total, complete = inventory.count_by_types(scanner, inv_head, items)
     if any(v > 0 for v in total.values()):
         return None                        # 還有一格有貨就不算用完
+    # ★★ 數到「全部歸零」才需要嚴格把關 —— 這個結論會觸發通知／回程補給：
+    #   ① 沒走完整條（截斷）→「沒看到」不是「用完了」；
+    #   ② 表頭重驗不過 → 陣列剛搬家（換地圖、物品增減都可能重配置），
+    #     剛剛數的是死掉的舊副本（實測舊副本還殘留幾個像物品的指標）。
+    #   掃描執行緒雖然每輪都 is_valid，但那跟這裡隔了最多零點幾秒 ——
+    #   使用者實際遇過「藥水明明很多卻突然報用完」。
+    #   跟 potions_out「宣告前強制重讀設定」同一個精神：要做決定才多花檢查。
+    if not complete or not inventory.is_valid(scanner, inv_head):
+        return None
     return items
 
 
@@ -787,22 +793,36 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
     return None
 
 
-def has_recall_item(scanner, inv_head: int) -> tuple[int, int] | None:
-    """背包裡的回程道具 (格號, 剩幾個)；沒有回 None。"""
+def has_recall_item(scanner, inv_head: int) -> tuple | None:
+    """背包裡的回程道具 (格號, 剩幾個)；**確定沒有**回 ()；讀不到回 None。
+
+    ⚠ None 跟 () 是兩回事（同 bag.worn_broken 的 None／[] 慣例）：
+      None = 陣列走不完（截斷）／表頭剛死 → 無法判斷，呼叫端**先不要動作**；
+      ()   = 整條走完了、真的一個都沒有 → 才輪到「沒有回程道具」的處置。
+      以前兩種都回 None，表頭剛搬家的那一拍會被判成「沒有」→ 誤停機
+      （跟藥水誤報歸零同一類，見 _potion_out 的把關）。
+    """
     from app.game import inventory, recall            # 避免循環相依
 
     if not inv_head:
         return None
-    got = inventory.find_by_type(scanner, inv_head, recall.RECALL_ITEM)
-    if not got:
-        return None
-    # ⚠ 數量要用總數，不是那一格的（可疊物品會散成好幾疊）
-    return got[0], inventory.count_by_type(scanner, inv_head,
-                                           recall.RECALL_ITEM)
+    total, complete = inventory.count_by_types(scanner, inv_head,
+                                               [recall.RECALL_ITEM])
+    n = total.get(recall.RECALL_ITEM, 0)
+    if n > 0:
+        # ⚠ 格號要用物品自己記的（find_by_type），數量要用總數（可疊物品
+        #   會散成好幾疊）。剛剛數得到、轉頭卻找不到格號 = 陣列正在動，
+        #   當「讀不到」處理。
+        got = inventory.find_by_type(scanner, inv_head, recall.RECALL_ITEM)
+        return (got[0], n) if got else None
+    if not complete or not inventory.is_valid(scanner, inv_head):
+        return None                        # 沒看完整條 →「沒數到」≠「沒有」
+    return ()
 
 
-def do_recall(mover, scanner, inv_head: int) -> tuple[bool, str]:
+def do_recall(mover, scanner, inv_head: int) -> tuple[bool | None, str]:
     """觸發的**第二段**：用掉回程道具。第一段是 `begin_supply()`。
+    回傳 (成功嗎, 說明)；第一個值 **None = 暫時性失敗，過幾秒重試就好**。
 
     ## 為什麼要分兩段
 
@@ -832,6 +852,10 @@ def do_recall(mover, scanner, inv_head: int) -> tuple[bool, str]:
     from app.game import recall                       # 避免循環相依
 
     got = has_recall_item(scanner, inv_head)
+    if got is None:
+        # ★ 暫時性失敗（陣列剛搬家／被截斷）—— 回 None 讓呼叫端重試，
+        #   別跟「確定沒有」混在一起停機（見 has_recall_item 的三態）。
+        return None, "背包暫時讀不到（物品陣列剛搬家？）"
     if not got:
         return False, f"背包裡沒有{itemname.label(recall.RECALL_ITEM)}"
     slot, count = got

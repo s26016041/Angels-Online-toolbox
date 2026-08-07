@@ -118,6 +118,15 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，�
 #   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
 SUPPLY_MAX_SECS = 600.0
+# ★ 回程第二段（用道具）暫時送不出去時的重試（跳板重掛／背包表頭剛搬家，
+#   InvWorker 幾秒內就會把表頭找回來：AOB 全掃約 2 秒、失效後最多隔
+#   INV_RELOCATE_GAP 秒重試）。以前不重試，直接放著吊到 10 分鐘超時。
+RECALL_RETRY_SECS = 4.0
+RECALL_RETRIES = 4
+# ★ 趴趴GO傳送暫時送不出去時的重試（重連中連線是 0、跳板不在…）。
+#   以前是一次性計時器，失敗就沒有然後了 —— 人留在城裡等 10 分鐘超時停機。
+JUMP_RETRY_SECS = 20.0
+JUMP_RETRIES = 3
 JUMP_BACK_SECS = 180.0          # ★「用天使趴趴GO回地圖」等多久才傳（使用者指定 3 分鐘）
 # ★「死亡自己回練功區」：死了倒數幾秒後送「回標記點」封包復活（使用者指定
 #   3 秒；等死亡視窗出來就好，不再靠精靈復活＋趴趴GO傳送那條舊路）。
@@ -1133,6 +1142,8 @@ class CharFarmPage(QWidget):
         self._supply_pos = None    # 出發時站在哪（挑最近的傳送落點用）
         self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
+        self._recall_try = 0       # 回程第二段重試了幾次（見 _retry_recall）
+        self._jump_try = 0         # 趴趴GO重試了幾次（見 _retry_jump）
         self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
         # 死亡回程模式（勾了「死亡自己回練功區」，角色死掉才會進，見 _death_tick）
         self._death = False        # 進行中（我們完全讓開，等復活）
@@ -1790,12 +1801,17 @@ class CharFarmPage(QWidget):
         say = self.status.setText
 
         if not (self._mover is not None and self._mover.active) or not self.inv:
-            say("⚠ 回程沒送出去（跳板或背包位置變了）")
+            # ★ 跳板重掛中／背包表頭剛搬家都是幾秒內會好的事 → 重試，
+            #   別像以前一樣放著不管（補給會吊到 10 分鐘超時才停）。
+            if self._retry_recall("⚠ 回程暫時送不出去（跳板或背包位置變了）"):
+                return
+            self._end_supply("⚠ 回程送不出去（跳板或背包位置一直讀不到）",
+                             stop=True)
             return
         now = scene.current(self.sc, allow_scan=False)
         here = now.id if now else None
         if (self._supply_scene is not None and here is not None
-                and here != self._supply_scene):
+                and not scene.same_map(here, self._supply_scene)):
             self._supply_left = True        # 已經在外面了，等它回來就好
             self._drop_cached_addrs()
             self._schedule_af_off()
@@ -1803,6 +1819,8 @@ class CharFarmPage(QWidget):
             say(f"★ 客戶端已自己回程（現在在 {now}）→ 略過我們的回程")
             return
         ok, msg = robot.do_recall(self._mover, self.sc, self.inv)
+        if ok is None and self._retry_recall(f"⚠ {msg}"):
+            return                          # 暫時性失敗 → 已排重試
         if not ok:
             self._end_supply(f"⚠ 交棒失敗：{msg}", stop=True)
             return
@@ -1810,6 +1828,24 @@ class CharFarmPage(QWidget):
         self._schedule_af_off()
         self._schedule_jump_back()
         say("🔧 已交給天使精靈跑補給　" + msg)
+
+    def _retry_recall(self, note: str) -> bool:
+        """回程第二段暫時送不出去 → 過幾秒再試一次；重試額度用完回 False。
+
+        ★ 這一類是暫時性失敗（使用者要求：暫時性失敗自動重試）：
+          InvWorker 幾秒內就會把搬家的表頭找回來、跳板重掛也只要幾秒。
+        ⚠ 計時器帶著這一趟的號碼（_supply_gen），補給提早結束就自己作廢。
+        """
+        if self._recall_try >= RECALL_RETRIES:
+            return False
+        self._recall_try += 1
+        gen = self._supply_gen
+        QTimer.singleShot(
+            int(RECALL_RETRY_SECS * 1000),
+            lambda: gen == self._supply_gen and self._fire_recall())
+        self.status.setText(f"{note}　→ {RECALL_RETRY_SECS:.0f} 秒後重試"
+                            f"（第 {self._recall_try}/{RECALL_RETRIES} 次）")
+        return True
 
     def _schedule_af_off(self) -> None:
         """**回程送出之後**隔幾秒把「自動攻擊」關回去（見 robot.AF_HOLD_SECS）。
@@ -1842,26 +1878,51 @@ class CharFarmPage(QWidget):
                           lambda: self._jump_back(gen))
 
     def _jump_back(self, gen: int) -> None:
-        """時間到，用遊戲的傳送封包回原本那張地圖。"""
+        """時間到，用遊戲的傳送封包回原本那張地圖。
+
+        ⚠ 「回來了沒」一律用 same_map 比對 —— 分流的場景編號不一樣
+          （天使學園 41/141/241），趴趴GO 的落點都在本流，拿編號硬比
+          會把「已經站在同一張圖」看成「還沒回去」。
+        """
         say = self.status.setText
         if gen != self._supply_gen or self._supply_scene is None:
             return                              # 上一趟排的，早就過期了
-        if not (self._mover is not None and self._mover.active):
-            say("⚠ 跳板不在，沒辦法傳回去")
-            return
         now = scene.current(self.sc, allow_scan=False)
-        if now is not None and now.id == self._supply_scene:
+        if now is not None and scene.same_map(now.id, self._supply_scene):
             return                              # 精靈已經自己走回來了
+        if not (self._mover is not None and self._mover.active):
+            if not self._retry_jump(gen, "跳板不在，沒辦法傳回去"):
+                say("⚠ 跳板一直不在，趴趴GO放棄（等精靈自己走回來）")
+            return
         pos = self._supply_pos or (None, None)
         e = jumpmap.nearest(self._supply_scene, pos[0], pos[1])
         if e is None:
+            # 表裡真的沒這張圖 → 重試也不會變出來，讓精靈自己走回來，
+            # SUPPLY_MAX_SECS 當兜底。
             say("⚠ 趴趴GO 沒有回"
                 f"{scene.scene_name(self._supply_scene)}的傳送點")
             return
         ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
         self._drop_cached_addrs()
+        if not ok and self._retry_jump(gen, msg):
+            return                              # 暫時性失敗 → 已排重試
         say((f"★ 補給 {JUMP_BACK_SECS / 60:.0f} 分鐘到 → " if ok else "⚠ ")
             + msg)
+
+    def _retry_jump(self, gen: int, note: str) -> bool:
+        """趴趴GO暫時送不出去（重連中連線是 0、跳板重掛中…）→ 過幾秒再試。
+
+        重試醒來會先看「已經回來了沒」再決定要不要送（見 _jump_back 開頭），
+        所以就算精靈在這段時間自己走回來了也不會多傳一次。
+        """
+        if self._jump_try >= JUMP_RETRIES:
+            return False
+        self._jump_try += 1
+        QTimer.singleShot(int(JUMP_RETRY_SECS * 1000),
+                          lambda: self._jump_back(gen))
+        self.status.setText(f"⚠ {note}　→ {JUMP_RETRY_SECS:.0f} 秒後再試趴趴GO"
+                            f"（第 {self._jump_try}/{JUMP_RETRIES} 次）")
+        return True
 
     # ------------------------------------------------------------------
     # -- 死亡回程（勾了「死亡自己回練功區」才會進）-------------------------
@@ -1938,8 +1999,10 @@ class CharFarmPage(QWidget):
             alive = st is not None and st.hp > 0
         now = scene.current(self.sc, allow_scan=False)
         here = now.id if now else None
+        # ⚠ same_map：分流編號不一樣（41/141/241），趴趴GO落點在本流，
+        #   拿編號硬比會判成「一直沒回去」→ 白等到 DEATH_WAIT_MAX 停機。
         back = (alive and here is not None and self._death_scene is not None
-                and here == self._death_scene)
+                and scene.same_map(here, self._death_scene))
 
         # ★ 活過來了 → 順手把死亡選擇視窗關掉。遊戲自己的確定鈕是
         #   **送包＋關窗**兩件事，我們只送了包，視窗就會一直留在畫面上
@@ -2055,7 +2118,14 @@ class CharFarmPage(QWidget):
                         + "、".join(miss) + "），掛機已停止。")
             return False
         # 沒有回程道具就別開始，免得把設定改了卻走不了
-        if not robot.has_recall_item(self.sc, self.inv):
+        # ⚠ None 跟 () 是兩回事（見 robot.has_recall_item）：None = 陣列剛
+        #   搬家／被截斷，「讀不到」≠「沒有」—— 這一拍先不出發，觸發條件
+        #   還在，3 秒後的下一輪檢查會自己再試。以前混在一起會誤停機。
+        have = robot.has_recall_item(self.sc, self.inv)
+        if have is None:
+            self.status.setText(f"🔧 {why} → 背包暫時讀不到，下一輪再試回程補給")
+            return False
+        if not have:
             self._stop_with(f"🔧 {why}，但背包裡沒有回程道具")
             self.notify(f"{why}，但背包裡沒有回程道具，掛機已停止。")
             return False
@@ -2068,6 +2138,8 @@ class CharFarmPage(QWidget):
         self._supply_left = False
         self._supply_pos = self.my_pos()
         self._supply_gen += 1
+        self._recall_try = 0
+        self._jump_try = 0
         # ⚠ 這裡刻意**不**重驗「標記傳送捲軸」的設定 —— 開始掛機時關過一次
         #   就夠了，之後使用者在遊戲裡改回去是他自己的決定（使用者明講）。
         # ★ 第一段：調好開關 + 設中心點。第二段（回程）隔幾秒才送，
@@ -2144,8 +2216,11 @@ class CharFarmPage(QWidget):
             self._supply_poll = 0.0
             now = scene.current(self.sc, allow_scan=False)
             here = now.id if now else None
+            # ⚠ 「離開／回來」都用 same_map 比對：趴趴GO 的落點在本流，
+            #   在分流（141/241…）掛機的人跳回來編號會對不上，拿編號硬比
+            #   會判成「一直沒回來」→ 白等 10 分鐘超時停機。
             if self._supply_scene is not None and here is not None:
-                if here != self._supply_scene:
+                if not scene.same_map(here, self._supply_scene):
                     self._supply_left = True
                 elif self._supply_left:
                     # 回來了 → 順便報一下裝備修好了沒（讀不到就不提）
