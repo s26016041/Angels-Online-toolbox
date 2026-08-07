@@ -1,23 +1,36 @@
 """自動登入分頁。
 
 功能：
-1. 設定遊戲執行檔與啟動等待秒數。
+1. 設定遊戲執行檔。
 2. 管理「帳號清單」：新增 / 刪除帳號密碼（存進設定檔），並可勾選「監控」——
    勾選的帳號會被「監控數值」分頁拿去對應同名的天使之戀分身來監控。
-3. 啟動遊戲並（以上方帳密）自動輸入登入。
+3. 對選定的分身「帳密登入」與「進入遊戲」——**純寫記憶體＋呼叫遊戲自己的
+   函式**，不占鍵盤滑鼠，遊戲視窗在背景也照做。實作在 app/game/login.py。
 
 安全提醒：密碼以 base64 混淆後存進設定檔，這不是真正的加密，拿到設定檔的人可還原。
 
-自動輸入按鍵使用 pyautogui，採延遲載入：即使沒安裝，本分頁與整個程式仍可正常開啟。
+## 2026-08-07 改動：拿掉 pyautogui 那條路
+
+原本的「啟動並自動登入」是等 N 秒之後用 pyautogui 打字。兩個問題：
+
+  · **會搶走使用者當下的鍵盤** —— 它打字進的是「當時剛好有焦點的視窗」，
+    使用者明確要求自動登入全程背景、完全不可占用實體鍵鼠
+    （見 memory 的 auto-login-findings）。
+  · 「啟動後等待」那個秒數只是在賭遊戲多久開得起來，賭錯就打進別的地方。
+
+所以整條（等待秒數 + LoginWorker + pyautogui）一起移除，換成新的兩顆按鈕。
 """
 from __future__ import annotations
 
 import os
 import subprocess
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -34,64 +47,13 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import config
+from app.core import charname, injector, preload
+from app.core import window as win
+from app.core.memory import MemoryScanner
+from app.game import locate, login, move
 # fit_spin：數字框寬度照最大值算 —— 寫死的話上下箭頭會把數字擠掉
 # （使用者回報過「框框被砍到一半」）。
 from app.tabs.base_tab import BaseTab, fit_spin
-
-
-class LoginWorker(QThread):
-    """在背景執行「等待 + 自動填入帳密」，避免卡住介面。
-
-    ⚠⚠ 這條執行緒**沒有事件迴圈**（run() 就是一個倒數迴圈），所以
-      `quit()` 對它完全無效 —— 那只是往一個不存在的事件迴圈丟訊息。
-      以前關程式時就是這樣：等待秒數最長 120 秒，`wait(2000)` 一定逾時，
-      程式帶著一條活執行緒退出（原生當機的老坑），而且它還會繼續
-      對「當時剛好有焦點的視窗」打字。改用 requestInterruption()。
-    """
-
-    status = Signal(str)
-    finished_ok = Signal()
-    failed = Signal(str)
-
-    def __init__(self, account: str, password: str, delay_sec: int, parent=None) -> None:
-        super().__init__(parent)
-        self._account = account
-        self._password = password
-        self._delay = delay_sec
-
-    def run(self) -> None:
-        try:
-            import pyautogui  # 延遲載入
-        except ImportError:
-            self.failed.emit(
-                "尚未安裝 pyautogui，無法自動輸入帳密。\n"
-                "請執行：py -m pip install pyautogui"
-            )
-            return
-        try:
-            for remaining in range(self._delay, 0, -1):
-                if self.isInterruptionRequested():
-                    return
-                self.status.emit(f"等待登入視窗… {remaining} 秒後開始輸入")
-                # ⚠ 拆成 10 段睡：整秒睡的話最久要等 1 秒才理會中止要求。
-                for _ in range(10):
-                    if self.isInterruptionRequested():
-                        return
-                    self.msleep(100)
-            # ⚠ 打字之前再確認一次：關程式的瞬間送出去的字會打進別人的視窗。
-            if self.isInterruptionRequested():
-                return
-            self.status.emit("輸入帳號…")
-            pyautogui.typewrite(self._account, interval=0.05)
-            pyautogui.press("tab")
-            if self.isInterruptionRequested():
-                return
-            self.status.emit("輸入密碼…")
-            pyautogui.typewrite(self._password, interval=0.05)
-            pyautogui.press("enter")
-            self.finished_ok.emit()
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"自動輸入時發生錯誤：{exc}")
 
 
 class LoginTab(BaseTab):
@@ -99,10 +61,11 @@ class LoginTab(BaseTab):
     ORDER = 10
 
     def build_ui(self) -> None:
-        self._worker: LoginWorker | None = None
         # 帳號清單：每筆 {"account": str, "password": obfuscated, "monitor": bool}
         self._accounts: list[dict] = []
         self._loading_table = False
+        self._movers: dict[int, move.Mover] = {}
+        self._scanners: dict[int, MemoryScanner] = {}
 
         root = QVBoxLayout(self)
 
@@ -117,16 +80,6 @@ class LoginTab(BaseTab):
         exe_row.addWidget(self.exe_edit)
         exe_row.addWidget(browse_btn)
         game_form.addRow("遊戲執行檔：", exe_row)
-        # ⚠ 單位文字放框外，不要用 setSuffix() —— 那會把「秒」塞進輸入框裡，
-        #   看起來像可以打字進去的內容（使用者反映「輸入框應該只有數字」）。
-        self.delay_spin = QSpinBox()
-        self.delay_spin.setRange(0, 120)
-        fit_spin(self.delay_spin)
-        delay_row = QHBoxLayout()
-        delay_row.addWidget(self.delay_spin)
-        delay_row.addWidget(QLabel("秒"))
-        delay_row.addStretch(1)
-        game_form.addRow("啟動後等待：", delay_row)
         root.addWidget(game_box)
 
         # --- 帳號 ---
@@ -169,15 +122,59 @@ class LoginTab(BaseTab):
         cred_lay.addLayout(acct_btns)
         root.addWidget(cred_box)
 
+        # --- 對分身下指令 ---
+        act_box = QGroupBox("對分身下指令（背景執行，不會動到你的鍵盤滑鼠）")
+        act_lay = QVBoxLayout(act_box)
+        act_hint = QLabel(
+            "送出的跟你自己在遊戲裡點按鈕是同一個封包。"
+            "「帳密登入」要遊戲停在登入畫面（伺服器已選好，預設就選好第一個）；"
+            "「進入遊戲」要已經到選角色畫面。")
+        act_hint.setWordWrap(True)
+        act_lay.addWidget(act_hint)
+
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("分身："))
+        self.client_combo = QComboBox()
+        self.client_combo.setMinimumWidth(260)
+        pick_row.addWidget(self.client_combo)
+        refresh_btn = QPushButton("重新整理")
+        refresh_btn.clicked.connect(self._refresh_clients)
+        pick_row.addWidget(refresh_btn)
+        pick_row.addStretch(1)
+        act_lay.addLayout(pick_row)
+
+        run_row = QHBoxLayout()
+        self.signin_btn = QPushButton("帳密登入")
+        self.signin_btn.setProperty("primary", True)  # 主要動作 → 主色（見 app/theme.py）
+        self.signin_btn.setToolTip(
+            "把上方的帳號密碼寫進遊戲的帳密緩衝區，再叫遊戲自己執行「按下登入鈕」。\n"
+            "帳密不會經過鍵盤，也不必把遊戲視窗切到前景。")
+        self.signin_btn.clicked.connect(self._do_sign_in)
+        run_row.addWidget(self.signin_btn)
+
+        run_row.addWidget(QLabel("第"))
+        self.slot_spin = QSpinBox()
+        self.slot_spin.setRange(1, 8)      # 這遊戲的角色欄位最多 8 格
+        self.slot_spin.setValue(1)
+        fit_spin(self.slot_spin)
+        run_row.addWidget(self.slot_spin)
+        run_row.addWidget(QLabel("個角色"))
+        self.enter_btn = QPushButton("進入遊戲")
+        self.enter_btn.setToolTip(
+            "送出「選這個角色進遊戲」那一包。\n"
+            "格號照選角色畫面由左到右數，第 1 個就是 1。")
+        self.enter_btn.clicked.connect(self._do_enter_game)
+        run_row.addWidget(self.enter_btn)
+        run_row.addStretch(1)
+        act_lay.addLayout(run_row)
+        root.addWidget(act_box)
+
         # --- 按鈕 ---
         btn_row = QHBoxLayout()
         self.launch_btn = QPushButton("啟動遊戲")
         self.launch_btn.clicked.connect(self._launch_game)
-        self.login_btn = QPushButton("啟動並自動登入（用上方帳密）")
-        self.login_btn.setProperty("primary", True)  # 主要動作 → 主色（見 app/theme.py）
-        self.login_btn.clicked.connect(self._launch_and_login)
         btn_row.addWidget(self.launch_btn)
-        btn_row.addWidget(self.login_btn)
+        btn_row.addStretch(1)
         root.addLayout(btn_row)
 
         self.status_label = QLabel("就緒")
@@ -194,11 +191,9 @@ class LoginTab(BaseTab):
     # ------------------------------------------------------------------
     def _load_settings(self) -> None:
         self.exe_edit.setText(config.get("login.exe_path", ""))
-        self.delay_spin.setValue(int(config.get("login.delay_sec", 8)))
 
     def _save_settings(self) -> None:
         config.set("login.exe_path", self.exe_edit.text().strip())
-        config.set("login.delay_sec", self.delay_spin.value())
         config.save()
 
     # ------------------------------------------------------------------
@@ -310,38 +305,171 @@ class LoginTab(BaseTab):
         self._set_status("已啟動遊戲")
         return True
 
-    def _launch_and_login(self) -> None:
-        self._save_settings()
+    # ------------------------------------------------------------------
+    # 分身：清單、掃描器、跳板
+    # ------------------------------------------------------------------
+    def _refresh_clients(self) -> None:
+        """重新列出開著的分身。**還停在登入畫面的也要列出來**。
+
+        ⚠ 不能像別的分頁那樣只認得出角色名 —— 登入畫面根本還沒有角色，
+          `preload.name_of()` 會回空字串。這裡退回顯示視窗標題裡的帳號，
+          再退回 PID。
+        """
+        keep = self.client_combo.currentData()
+        self.client_combo.clear()
+        seen: set[int] = set()
+        for w in win.enumerate_windows(title_contains="Angels Online"):
+            if "_MIDAGEONL_" not in w.class_name or w.pid in seen:
+                continue
+            seen.add(w.pid)
+            # ⚠ 還沒登入時標題就只有「Angels Online Global」，沒有「 - 帳號」那段。
+            #   `account_from_title()` 對這種標題會**把整個標題當帳號回傳**
+            #   （別的分頁都只處理已登入的分身，所以從來沒撞到），
+            #   所以這裡先自己確認有沒有那個分隔號。
+            acc = charname.account_from_title(w.title) if " - " in w.title else ""
+            nm = preload.name_of(w.pid)          # 不帶 scanner ＝ 絕不現場掃描
+            if nm and acc:
+                label = f"{nm}（{acc}）"
+            else:
+                label = acc or f"尚未登入（PID {w.pid}）"
+            self.client_combo.addItem(label, w.pid)
+        if not seen:
+            self._set_status("找不到開著的遊戲分身。")
+            return
+        i = self.client_combo.findData(keep)
+        self.client_combo.setCurrentIndex(max(i, 0))
+
+    def _scanner(self, pid: int) -> MemoryScanner | None:
+        sc = self._scanners.get(pid)
+        if sc is not None:
+            return sc
+        sc = MemoryScanner()
+        try:
+            sc.open(pid)
+            locate.warm(sc)               # 改版位移自動校正（全域只做一次）
+        except Exception:                              # noqa: BLE001
+            sc.close()   # open() 成功但 warm() 炸掉時要收回 handle，不然每按一次洩一個
+            return None
+        self._scanners[pid] = sc
+        return sc
+
+    def _mover(self, pid: int) -> move.Mover | None:
+        """拿這台分身的跳板。
+
+        ⚠⚠ 一定要走 `move.acquire()`，**不要自己 new 一個 Mover** ——
+          同一個遊戲行程只能有一份跳板，自己裝會把掛機分頁那份拆掉
+          （見 move.acquire 的說明）。
+        """
+        mv = self._movers.get(pid)
+        if mv is not None and mv.active:
+            return mv
+        try:
+            mv = move.acquire(pid, injector.process_path(pid), self)
+        except Exception:                              # noqa: BLE001
+            self._movers.pop(pid, None)
+            return None
+        self._movers[pid] = mv
+        return mv
+
+    def _target(self) -> tuple[int, MemoryScanner, move.Mover] | None:
+        """選中的分身 + 它的掃描器與跳板；缺任何一樣就跳訊息回 None。"""
+        pid = self.client_combo.currentData()
+        if not pid:
+            QMessageBox.information(self, "沒有分身", "請先按「重新整理」選一台分身。")
+            return None
+        sc = self._scanner(pid)
+        if sc is None:
+            QMessageBox.warning(self, "接不上", f"讀不到 PID {pid} 的記憶體（它可能剛關掉）。")
+            return None
+        mv = self._mover(pid)
+        if mv is None or not mv.active:
+            QMessageBox.warning(
+                self, "跳板沒裝上",
+                "裝不上呼叫遊戲函式用的跳板。遊戲剛啟動時再等幾秒，"
+                "或確認工具箱是以系統管理員身分執行。")
+            return None
+        return pid, sc, mv
+
+    # ------------------------------------------------------------------
+    # 兩顆動作按鈕
+    # ------------------------------------------------------------------
+    def _do_sign_in(self) -> None:
         account = self.account_edit.text().strip()
         password = self.password_edit.text()
         if not account or not password:
             QMessageBox.warning(self, "缺少帳密", "請在上方輸入（或雙擊清單載入）帳號與密碼。")
             return
-        if not self._launch_game():
+        got = self._target()
+        if got is None:
             return
-        self.login_btn.setEnabled(False)
-        self._worker = LoginWorker(account, password, self.delay_spin.value())
-        self._worker.status.connect(self._set_status)
-        self._worker.finished_ok.connect(self._on_login_done)
-        self._worker.failed.connect(self._on_login_failed)
-        self._worker.start()
+        _, sc, mv = got
+        # ⚠ 這一步裡有一次全記憶體掃描（找登入畫面物件，約 0.6 秒），
+        #   跑在 GUI 執行緒上 —— 畫面會頓一下。**不要改成背景 QThread**：
+        #   打包成 exe 之後背景執行緒沒無頭防護會原生當機
+        #   （見 memory 的 packaging-and-release）。改成給個沙漏 + 先寫狀態，
+        #   讓使用者知道不是當掉了。
+        self._busy("正在找登入畫面…")
+        try:
+            err = login.sign_in(mv, sc, account, password)
+        finally:
+            self._idle()
+        if err:
+            self._set_status(f"帳密登入失敗：{err}")
+            QMessageBox.warning(self, "帳密登入失敗", err)
+            return
+        self._set_status(f"已送出帳密登入（{account}）—— 接下來遊戲會自己連線、選角色畫面。")
 
-    def _on_login_done(self) -> None:
-        self._set_status("自動登入完成")
-        self.login_btn.setEnabled(True)
-
-    def _on_login_failed(self, msg: str) -> None:
-        self._set_status("自動登入失敗")
-        self.login_btn.setEnabled(True)
-        QMessageBox.warning(self, "自動登入失敗", msg)
+    def _do_enter_game(self) -> None:
+        got = self._target()
+        if got is None:
+            return
+        _, sc, mv = got
+        slot = self.slot_spin.value() - 1        # 畫面上 1 起算，遊戲裡 0 起算
+        self._busy("送出進入遊戲…")
+        try:
+            err = login.enter_game(mv, sc, slot)
+        finally:
+            self._idle()
+        if err:
+            self._set_status(f"進入遊戲失敗：{err}")
+            QMessageBox.warning(self, "進入遊戲失敗", err)
+            return
+        self._set_status(f"已送出「進入遊戲」（第 {slot + 1} 個角色）。")
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
+    def _busy(self, text: str) -> None:
+        """按鈕鎖住 + 沙漏 + 先把狀態文字畫出來（動作是同步的，會頓一下）。"""
+        self.signin_btn.setEnabled(False)
+        self.enter_btn.setEnabled(False)
+        self._set_status(text)
+        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
+        # ⚠ 不呼叫這行的話，狀態文字要等整件事做完才會出現 —— 使用者看到的
+        #   就是「按了沒反應然後畫面卡住」。
+        QApplication.processEvents()
+
+    def _idle(self) -> None:
+        QGuiApplication.restoreOverrideCursor()
+        self.signin_btn.setEnabled(True)
+        self.enter_btn.setEnabled(True)
+
+    def on_show(self) -> None:
+        # ⚠ 不在 build_ui() 就列 —— 開機時列會多跑一次列舉視窗，
+        #   打包成 exe 之後「開機掃描不能太重」（見 memory 的 packaging-and-release）。
+        if self.client_combo.count() == 0:
+            self._refresh_clients()
+
     def on_close(self) -> None:
         self._save_settings()
-        if self._worker and self._worker.isRunning():
-            # ⚠ 不能用 quit()：那條執行緒沒有事件迴圈，quit() 是空包彈
-            #   （見 LoginWorker 的說明）。
-            self._worker.requestInterruption()
-            self._worker.wait(2000)
+        # ★ 用 release() 不要直接 stop()：跳板是同一個 PID 共用的，
+        #   掛機分頁可能還在用（見 move.acquire）。
+        for pid in list(self._movers):
+            try:
+                move.release(pid, self)
+            except Exception:                          # noqa: BLE001
+                pass
+        self._movers.clear()
+        for sc in self._scanners.values():
+            sc.close()
+        self._scanners.clear()
