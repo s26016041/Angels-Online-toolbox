@@ -45,11 +45,41 @@ auto-login-findings）。舊做法用 pyautogui 打字，那會搶走使用者�
 再交叉驗證 +0x10/+0x14/+0x18/+0x2C 四個副 vtable —— 五個指標同時對上，
 不會誤認。進遊戲之後這個物件會被釋放，掃不到就是「現在不在登入畫面」。
 
-## 二、進入遊戲
+## 二、進入遊戲（含選頻道）
 
 角色選好之後按「進入遊戲」送的是 `0x50F880(角色格號)`（stdcall，代號 6、
-內文 0x25），走**登入連線**。呼叫端在送之前會先寫 `[0x890BE8] = 角色格號`，
-我們照做 —— 因為接下來那包「進遊戲伺服器」(`0x5D5FB7`) 是讀這個全域的。
+內文 0x25），走**登入連線**。它組包的內容是：
+
+    [封包+2] = 角色格號（byte，參數帶進來的）
+    [封包+3] = [0x890810]      ← ★ **頻道（分流），0 起算**
+    [封包+4] = 0x890814 起 0x20 bytes（連線用的識別字串）
+
+★★ **選頻道不是獨立的一包**，就是上面那個位元組 —— 所以「選頻道」對我們來說
+只是**寫一個 byte**，不必碰那個頻道選擇畫面。三處交叉印證：
+
+  1. 五台分身實測對照：雅典娜-2 → `1`、雅典娜-3 → `2`、雅典娜-5 → `4`。
+  2. `0x591B0B`（Lua 的換頻道函式）拿 `[0x890810]` 當「目前頻道」比對，
+     而且前面 `cmp ecx, 8` 把上限框在 8。
+  3. 跟遊戲中換分流 `0x5D3D97(0x47, 分流−1)` 同樣是 0 起算（見 [[channel-switch]]）。
+
+⚠ 使用者原本以為卡住的是「選伺服器」，實測是**選頻道 1~5**。伺服器
+（雅典娜／維納斯／邱比特）在登入畫面就選好了，`0x538959` 用的是那個
+下拉選單的選取值，我們沒有碰。
+
+呼叫端在送之前還會先寫 `[0x890BE8] = 角色格號`，我們照做 —— 因為接下來那包
+「進遊戲伺服器」(`0x5D5FB7`) 是讀這個全域的。
+
+## 伺服器清單怎麼讀（純讀，不讀檔案）
+
+`[[0x89096C]+0x500]` ~ `+0x504` 是一個等距陣列，記錄 0x178 bytes：
+
+    +0x00 名稱（UTF-8 內嵌）   +0x40 ip 字串   +0x50 port
+    +0x54 分流數   +0x58 伺服器編號   +0x5C 分流數（同一個值，兩格）
+
+跟 [[channel-switch]] 的 `channel.count()` 讀的是同一份表，但那邊是**全記憶體
+掃描**（0.3~1 秒）而且要靠視窗標題的伺服器名 —— 登入畫面根本還沒有標題，
+所以這裡改成直接從陣列邊界走訪，微秒級而且登入畫面也讀得到。
+`[0x890CA8]` 是登入時選中的伺服器索引（實測 2 = 雅典娜）。
 
 ★ 使用者擷取的「進入遊戲」有 5 包，但**我們只需要送第 1 包**：
     ① 0x50F880(格號)   代號 6    ← 只有這包是「按鈕按下去」送的
@@ -82,6 +112,21 @@ FLAG_BLOB = 0x00890997      # ≠0 → 用 0x890D30 的 512-byte 憑證
 FLAG_TOKEN = 0x008909B9     # ≠0 → 用 0x890FCC 的 token（啟動器社群登入）
 CHAR_SLOT = 0x00890BE8      # 選中的角色格號（0 起算）
 CONN_ID = 0x0089097C        # 登入連線編號；0 = 還沒連上
+CHANNEL = 0x00890810        # 頻道／分流，**1 byte、0 起算**
+APP_PTR = 0x0089096C        # 應用程式主物件；伺服器陣列掛在它 +0x500/+0x504
+SERVER_INDEX = 0x00890CA8   # 登入時選中的伺服器索引（進陣列用）
+
+# 伺服器記錄的版面（見檔頭）
+SRV_BEGIN = 0x500
+SRV_END = 0x504
+SRV_STRIDE = 0x178
+SRV_NAME = 0x00
+SRV_PORT = 0x50
+SRV_SUBSET_A = 0x54
+SRV_ID = 0x58
+SRV_SUBSET_B = 0x5C
+MAX_SUBSET = 8              # 上限跟遊戲一致：0x591B03 的 `cmp ecx, 8`
+MAX_SERVERS = 64            # 合理性上限，避免版面變了就跑一個天文數字的迴圈
 
 # 掃到 VT_LOGIN 之後還要對上的副 vtable（建構函式 0x5363A0 一口氣寫的那組）。
 # ⚠ 只取建構函式**不會再改寫**的四個：+0x30/+0x34 後面會被覆蓋成別的值。
@@ -100,6 +145,56 @@ def _pad(text: str, size: int) -> bytes:
     """把字串補成固定長度的 C 字串；太長就截掉（遊戲自己也是 strncpy）。"""
     raw = text.encode("ascii", errors="ignore")[:size - 1]
     return raw + b"\x00" * (size - len(raw))
+
+
+def _u32(scanner, addr: int) -> int | None:
+    raw = scanner._read_bytes(addr, 4)
+    return struct.unpack("<I", bytes(raw))[0] if raw else None
+
+
+def server_info(scanner) -> tuple[str, int] | None:
+    """(目前選中的伺服器名, 它有幾個分流)；讀不到／版面對不上回 None。
+
+    ★ 純讀、微秒級，登入畫面與遊戲中都讀得到 —— 陣列邊界在主物件裡，
+      不必像 [[channel-switch]] 的 `channel.count()` 那樣全記憶體掃描，
+      也不必靠視窗標題（登入畫面還沒有標題）。
+
+    ⚠ 合理性條件全部是**結構性的**（不看特定數值），所以改版增減伺服器、
+      改分流數都照樣成立：兩格分流數要一致且在範圍內、port 要像 port。
+      對不上就回 None，讓呼叫端退回安全的預設，而不是拿一個錯的數字用。
+    """
+    app = _u32(scanner, APP_PTR)
+    if not app:
+        return None
+    beg, end = _u32(scanner, app + SRV_BEGIN), _u32(scanner, app + SRV_END)
+    if not beg or not end or end <= beg:
+        return None
+    count = (end - beg) // SRV_STRIDE
+    if not (1 <= count <= MAX_SERVERS):
+        return None
+    idx = _u32(scanner, SERVER_INDEX)
+    if idx is None or not (0 <= idx < count):
+        return None
+    raw = scanner._read_bytes(beg + idx * SRV_STRIDE, 0x60)
+    if not raw:
+        return None
+    raw = bytes(raw)
+    port, sub_a, _sid, sub_b = struct.unpack_from("<IIII", raw, SRV_PORT)
+    if not (1024 <= port <= 65535):
+        return None
+    if sub_a != sub_b or not (1 <= sub_a <= MAX_SUBSET):
+        return None
+    name = raw[SRV_NAME:0x40].split(b"\x00")[0].decode("utf-8", "replace")
+    return name, sub_a
+
+
+def read_channel(scanner) -> int | None:
+    """目前的頻道（**1 起算**，給介面顯示用）；讀不到回 None。"""
+    raw = scanner._read_bytes(CHANNEL, 1)
+    if not raw:
+        return None
+    got = bytes(raw)[0] + 1
+    return got if 1 <= got <= MAX_SUBSET else None
 
 
 def find_screen(scanner) -> int | None:
@@ -165,18 +260,32 @@ def sign_in(mover, scanner, account: str, password: str) -> str:
     return ""
 
 
-def enter_game(mover, scanner, slot: int) -> str:
-    """進入遊戲（送「選這個角色」那一包）。成功回空字串，失敗回原因。
+def enter_game(mover, scanner, slot: int, channel: int) -> str:
+    """選頻道 + 進入遊戲，一包送出。成功回空字串，失敗回原因。
 
-    slot: 角色格號，**0 起算**（畫面上第 1 個角色 = 0）。
+    slot:    角色格號，**0 起算**（畫面上第 1 個角色 = 0）
+    channel: 頻道／分流，**1 起算**（畫面上的「雅典娜-3」就填 3）
+
+    ⚠ 頻道不是另一包 —— 它是這一包裡的一個位元組（見檔頭）。所以不必去點
+      那個頻道選擇畫面，寫下去再送就好。
     """
     if not (mover and mover.active):
         return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
     if slot < 0:
         return "角色格號不對。"
-    raw = scanner._read_bytes(CONN_ID, 4)
-    if not raw or struct.unpack("<I", bytes(raw))[0] == 0:
-        return "還沒連上登入伺服器 —— 請先「帳密登入」並選好角色。"
+    if not (1 <= channel <= MAX_SUBSET):
+        return f"頻道要在 1~{MAX_SUBSET} 之間。"
+    # ⚠ 上限**照這台伺服器實際的分流數**再檢一次；讀不到就只用上面那道
+    #   （寧可放行也不要因為讀不到就整個功能不能用）。
+    info = server_info(scanner)
+    if info is not None and channel > info[1]:
+        return f"{info[0]} 只有 {info[1]} 個分流，選不到第 {channel} 個。"
+    if not _u32(scanner, CONN_ID):
+        return "還沒連上登入伺服器 —— 請先「帳密登入」。"
+    # ⚠⚠ 只寫 **1 個 byte**：0x890811 是別的東西（實測五台都是 1），
+    #   寫 4 bytes 會把它一起清掉。
+    if not mover.write(CHANNEL, bytes([channel - 1])):
+        return "寫入頻道失敗。"
     # ⚠ 先寫全域再送包，跟遊戲自己的呼叫端（0x51041F）同一個順序：
     #   下一包「進遊戲伺服器」是讀這個全域，不是讀封包。
     if not mover.write(CHAR_SLOT, struct.pack("<I", slot)):

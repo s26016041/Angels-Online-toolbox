@@ -64,6 +64,7 @@ class LoginTab(BaseTab):
         # 帳號清單：每筆 {"account": str, "password": obfuscated, "monitor": bool}
         self._accounts: list[dict] = []
         self._loading_table = False
+        self._loading_clients = False
         self._movers: dict[int, move.Mover] = {}
         self._scanners: dict[int, MemoryScanner] = {}
 
@@ -136,10 +137,14 @@ class LoginTab(BaseTab):
         pick_row.addWidget(QLabel("分身："))
         self.client_combo = QComboBox()
         self.client_combo.setMinimumWidth(260)
+        self.client_combo.currentIndexChanged.connect(self._sync_channel_range)
         pick_row.addWidget(self.client_combo)
         refresh_btn = QPushButton("重新整理")
         refresh_btn.clicked.connect(self._refresh_clients)
         pick_row.addWidget(refresh_btn)
+        self.server_label = QLabel("")
+        self.server_label.setStyleSheet("color: #9aa2b8;")
+        pick_row.addWidget(self.server_label)
         pick_row.addStretch(1)
         act_lay.addLayout(pick_row)
 
@@ -158,11 +163,20 @@ class LoginTab(BaseTab):
         self.slot_spin.setValue(1)
         fit_spin(self.slot_spin)
         run_row.addWidget(self.slot_spin)
-        run_row.addWidget(QLabel("個角色"))
+        run_row.addWidget(QLabel("個角色，頻道"))
+        # ⚠ 上限先給遊戲的硬上限，接上分身之後改成**那台伺服器實際的分流數**
+        #   （見 _sync_channel_range）—— 分流數是遊戲隨時會調的東西，不寫死。
+        self.chan_spin = QSpinBox()
+        self.chan_spin.setRange(1, login.MAX_SUBSET)
+        self.chan_spin.setValue(1)
+        fit_spin(self.chan_spin)
+        run_row.addWidget(self.chan_spin)
         self.enter_btn = QPushButton("進入遊戲")
         self.enter_btn.setToolTip(
-            "送出「選這個角色進遊戲」那一包。\n"
-            "格號照選角色畫面由左到右數，第 1 個就是 1。")
+            "送出「選這個角色、這個頻道，進遊戲」那一包。\n"
+            "格號照選角色畫面由左到右數，第 1 個就是 1。\n"
+            "頻道就是「雅典娜-3」的那個 3 —— 不必自己去點頻道選擇畫面，\n"
+            "頻道本來就是這一包裡的一個欄位。")
         self.enter_btn.clicked.connect(self._do_enter_game)
         run_row.addWidget(self.enter_btn)
         run_row.addStretch(1)
@@ -316,6 +330,9 @@ class LoginTab(BaseTab):
           再退回 PID。
         """
         keep = self.client_combo.currentData()
+        # ⚠ clear()/addItem() 都會觸發 currentIndexChanged —— 不擋的話重整一次
+        #   會對「清單建到一半的中間狀態」開好幾次記憶體控制代碼。
+        self._loading_clients = True
         self.client_combo.clear()
         seen: set[int] = set()
         for w in win.enumerate_windows(title_contains="Angels Online"):
@@ -334,10 +351,14 @@ class LoginTab(BaseTab):
                 label = acc or f"尚未登入（PID {w.pid}）"
             self.client_combo.addItem(label, w.pid)
         if not seen:
+            self._loading_clients = False
+            self.server_label.setText("")
             self._set_status("找不到開著的遊戲分身。")
             return
         i = self.client_combo.findData(keep)
         self.client_combo.setCurrentIndex(max(i, 0))
+        self._loading_clients = False
+        self._sync_channel_range()
 
     def _scanner(self, pid: int) -> MemoryScanner | None:
         sc = self._scanners.get(pid)
@@ -390,6 +411,31 @@ class LoginTab(BaseTab):
             return None
         return pid, sc, mv
 
+    def _sync_channel_range(self) -> None:
+        """把頻道上限改成「這台伺服器實際有幾個分流」，並跟上它目前的頻道。
+
+        讀不到就維持遊戲的硬上限 —— 讀不到只代表現在還沒接上（例如遊戲剛開），
+        不該因此讓使用者連填都不能填。
+        """
+        if self._loading_clients:
+            return
+        pid = self.client_combo.currentData()
+        if not pid:
+            return
+        sc = self._scanner(pid)
+        if sc is None:
+            return
+        info = login.server_info(sc)
+        if info is not None:
+            name, subsets = info
+            self.chan_spin.setMaximum(subsets)
+            self.server_label.setText(f"伺服器：{name}（{subsets} 個分流）")
+        else:
+            self.server_label.setText("伺服器：讀不到（還沒接上遊戲）")
+        now = login.read_channel(sc)
+        if now is not None and now <= self.chan_spin.maximum():
+            self.chan_spin.setValue(now)
+
     # ------------------------------------------------------------------
     # 兩顆動作按鈕
     # ------------------------------------------------------------------
@@ -425,16 +471,17 @@ class LoginTab(BaseTab):
             return
         _, sc, mv = got
         slot = self.slot_spin.value() - 1        # 畫面上 1 起算，遊戲裡 0 起算
+        chan = self.chan_spin.value()            # 頻道兩邊都是 1 起算
         self._busy("送出進入遊戲…")
         try:
-            err = login.enter_game(mv, sc, slot)
+            err = login.enter_game(mv, sc, slot, chan)
         finally:
             self._idle()
         if err:
             self._set_status(f"進入遊戲失敗：{err}")
             QMessageBox.warning(self, "進入遊戲失敗", err)
             return
-        self._set_status(f"已送出「進入遊戲」（第 {slot + 1} 個角色）。")
+        self._set_status(f"已送出「進入遊戲」（第 {slot + 1} 個角色、頻道 {chan}）。")
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
