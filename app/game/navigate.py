@@ -50,7 +50,7 @@ from __future__ import annotations
 import math
 import time
 
-from app.game import entity
+from app.game import entity, terrain
 
 # ⚠⚠ 送出移動指令到角色真的開始動，實測 107~154ms。這段期間動畫狀態還是
 #   'Wait'，如果照 10ms 的心跳一直重送，會**把上一個指令重置掉**，角色就在
@@ -87,6 +87,8 @@ GIVE_UP_HOPS = 12
 ROUTE_PRUNE = 12.0
 # 重播時最多往後試幾個點能不能直接走到（見「抄近路」）。
 SKIP_AHEAD = 4
+# 走最短路時被擋住（怪／別的玩家站在路上）最多重算幾次就放棄，改回探索。
+REPLAN_MAX = 3
 # 問尋路之前先擋掉太遠的點：一次算得出的範圍實測約 30~40 格，超過必回 0
 # —— 那是白花一次 6ms 的呼叫，還會跟攻擊搶指令槽。
 PATH_MAX = 28.0
@@ -119,6 +121,8 @@ class Navigator:
     """
 
     def __init__(self) -> None:
+        # 地形圖（可走格）—— 有它就直接算最短路，不必再靠探索。見 terrain.py
+        self._maps = terrain.Cache()
         self.reset()
 
     def reset(self, goal: tuple[float, float] | None = None) -> None:
@@ -141,6 +145,9 @@ class Navigator:
         self._ri = 0
         self._route_dead = False            # 重播失敗過 → 這一趟不再採用
         self._skip_done = False             # 這個路線點的「抄近路」試過了嗎
+        self._from_grid = False             # 目前這條路線是地形圖算的（最短路）
+        self._replans = 0                   # 地形圖重算過幾次（防無限重算）
+        self._grid_fail = 0                 # 地形圖連續算不出幾次（見 _plan_from_grid）
         # ★ 段尾不停頓：剛走到一個轉折點／路線點時設 True，讓下一拍**不等
         #   角色停下**就直接規劃並送出下一段 —— 官方就是邊走邊送（攔包實錄
         #   一段接一段、全程不停）。只在「換點」的那一拍舉旗，不會連發。
@@ -167,6 +174,39 @@ class Navigator:
     def _usable(self, c) -> bool:
         return (not any(_d(c, v) < VISIT_R for v in self.visited)
                 and not any(_d(c, f) < FAIL_R for f in self.failed))
+
+    def _plan_from_grid(self, scanner, here, goal) -> bool:
+        """讀地形圖算最短路，成功就把轉折點放進 `_route`。
+
+        算不出來（讀不到圖、或那個目標真的被牆圍住）回 False，
+        呼叫端會退回舊的探索做法。
+        """
+        grid = self._maps.get(scanner)
+        if grid is None:
+            return False
+        wp = grid.waypoints(here, goal)
+        if not wp:
+            # 地形圖說「真的走不到」——這比舊做法的 96 次試探可信得多
+            # （驗證過：我們說可走、遊戲說走不到，一次都沒發生）。
+            # ⚠ 但**要連續兩次才算數**：剛傳送完／換圖那一瞬間，圖跟座標可能
+            #   還對不起來，一次就判死會把好好的巡邏點誤判成到不了。
+            #   第一次先把圖丟掉重讀，下一拍再問一次。
+            self._grid_fail += 1
+            if self._grid_fail < 2:
+                self._maps.drop()
+                self.note = "地形圖算不出路徑，重讀一次再試"
+                return False
+            self.stuck = True
+            self.note = "⛔ 地形圖顯示到不了那裡"
+            return False
+        self._grid_fail = 0
+        self._route = [(float(x) + 0.5, float(y) + 0.5) for x, y in wp]
+        self._ri = 0
+        self._from_grid = True
+        self._best = None
+        self._stall = 0
+        self._skip_done = True      # 最短路不需要抄近路，省下問尋路的呼叫
+        return True
 
     def _start_scan(self, here, goal) -> None:
         """排出候選，**每一圈先照「離目標多近」排序**。
@@ -214,8 +254,22 @@ class Navigator:
             self.note = "到了"
             return self.note
 
-        # ★ 有上次走通的路線就直接重播（只採用一次；失敗過就這趟不再試）。
-        #   從離自己最近的點接上 —— 被打怪打斷、從半路恢復也接得回去。
+        # ★★★ 第一優先：**讀地形圖自己算最短路**（見 terrain.py）。
+        #   整張圖 5ms 讀完、A* 12~19ms 算完，而且是真正的最短路 ——
+        #   實測同一段（惡礁峽谷 142 格直線）：
+        #       探索      429 格 / 49.6 秒
+        #       記路線    194~205 格 / 20 秒
+        #       地形最短路 175 格
+        #   ⚠ 純讀記憶體、完全不呼叫遊戲，所以沒有崩潰風險。
+        #   讀不到（改版位移／還沒進場）就自動退回下面的舊做法。
+        if self._route is None and self.sub is None and self._scan is None:
+            self._plan_from_grid(scanner, here, goal)
+            if self.stuck:
+                return self.note        # 地形圖確定到不了 → 呼叫端換目標
+
+        # ★ 沒有地形圖時的次選：上次走通的路線直接重播（只採用一次；
+        #   失敗過就這趟不再試）。從離自己最近的點接上 —— 被打怪打斷、
+        #   從半路恢復也接得回去。
         if (route and self._route is None and not self._route_dead
                 and self.sub is None and self._scan is None):
             self._route = list(route)
@@ -244,9 +298,10 @@ class Navigator:
                 self._ri += 1           #   走過的點」，路線每跑一趟就自己變短
                 self._go_now = True     # 到點了 → 下一拍立刻送下一段
                 self._best = None
-                self._skip_done = False
+                self._skip_done = self._from_grid   # 最短路不必抄近路
             if self._ri >= len(self._route):
                 self._route = None      # 路線走完，收尾交回一般導航（可直達）
+                self._from_grid = False
             else:
                 # ★★ 抄近路：探索學來的路線裡常留著死路探測（實測那段
                 #   西→東→西的來回還在裡面）。每到一個點就問尋路「後面幾個
@@ -278,15 +333,27 @@ class Navigator:
                 else:
                     self._stall += 1
                     if self._stall >= STALL_TRIES:
+                        if self._from_grid and self._replans < REPLAN_MAX:
+                            # 最短路走不動（多半是被怪／別的玩家擋住）——
+                            # 從現在的位置重算一次就好，不必放棄整條路。
+                            self._replans += 1
+                            self._route = None
+                            self._maps.drop()      # 順便重讀圖（可能換圖了）
+                            self._plan_from_grid(scanner, here, goal)
+                            self.note = f"路上被擋住 → 重算最短路（第 {self._replans} 次）"
+                            return self.note
                         # 地形變了？（多半是被怪卡住）重播失敗 → 回現場探路
                         self._route, self._route_dead = None, True
+                        self._from_grid = False
                         self.note = "記住的路線走不通 → 改回現場探路"
                         return self.note
                 mover.walk_route(scanner, player_obj, pt[0], pt[1],
                                  stop_short=0.0)
                 self._sent = time.monotonic()
                 self._go_now = False
-                self.note = f"沿上次的路線走（{self._ri + 1}/{len(self._route)}）"
+                self.note = (f"走最短路（{self._ri + 1}/{len(self._route)}）"
+                             if self._from_grid else
+                             f"沿上次的路線走（{self._ri + 1}/{len(self._route)}）")
                 return self.note
 
         # ── 掃描中：每一拍只試幾個，別把畫面凍住 ──────────────
