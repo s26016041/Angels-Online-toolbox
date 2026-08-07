@@ -176,6 +176,8 @@ AS_IS_BUY_ITEM = 1511        # 購買物品保持身上數量（⚠ 這**不是*
 #   —— 值就是下拉選單的列號，而三列的字串是 1955 靈魂、1956 回城、1957 原地。
 #   （五台分身實測都設在 2100=True、2102=1，跟畫面顯示「回城」互相印證。）
 AS_AUTO_REVIVE = 2100        # 陣亡時自動復活（bool）
+# ⚠ 下面兩行現在**沒有人寫**（apply_prefs 只會把 2100 關掉 —— 死亡回程改成
+#   自己送「回標記點」封包，見 app/game/revive.py）。留著當逆向文件。
 AS_REVIVE_MODE = 2102        # 復活方式（int，值 = 下拉列號）
 REVIVE_SOUL, REVIVE_RECALL, REVIVE_SPOT = 0, 1, 2   # 靈魂／回城／原地
 # 畫面同步用的勾選框控制項 id（XML 裡的固定值，不是執行期代號）
@@ -340,7 +342,7 @@ def set_int(mover, scanner, var_id: int, value: int) -> tuple[bool, object]:
 
 def apply_prefs(mover, scanner, *, main_switch: bool = False,
                 jump_back: bool = False,
-                revive_recall: bool = False) -> list[str]:
+                revive_mark: bool = False) -> list[str]:
     """照掛機分頁的勾選把精靈調成該有的樣子。回傳實際動了哪些（給人看）。
 
     ★ 只「往要的方向推」：每一項都先純記憶體讀，已經是對的就完全不碰 Lua。
@@ -350,8 +352,11 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
     · jump_back      勾了「用天使趴趴GO回地圖」→ 關補給頁「使用標記傳送捲軸
                      回練功點」：回地圖已經由趴趴GO負責，精靈再燒一張捲軸
                      只是白花道具
-    · revive_recall  勾了「死亡自己回練功區」→ 輔助頁「陣亡時自動復活」開、
-                     「復活方式」選「回城」
+    · revive_mark    勾了「死亡自己回練功區」→ 輔助頁「陣亡時自動復活」
+                     **關掉**：死亡回程改成我們自己送「回標記點」封包
+                     （app/game/revive.py），精靈搶先把人復活回城反而壞事。
+                     ⚠ 只關不開 —— 以前這裡是「開＋復活方式選回城」，
+                     使用者 2026-08-07 要求反過來。
     """
     notes: list[str] = []
 
@@ -366,18 +371,13 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
             set_bool(mover, scanner, AS_USE_RETURN_SCROLL, False)
             notes.append("關了「標記傳送捲軸回練功點」")
 
-    if revive_recall:
+    if revive_mark:
         ok, cur = get_bool(mover, scanner, AS_AUTO_REVIVE)
-        if ok and cur is not True:
-            set_bool(mover, scanner, AS_AUTO_REVIVE, True)
-            notes.append("開了「陣亡時自動復活」")
-        cur = get_int(mover, scanner, AS_REVIVE_MODE)
-        if cur is not None and cur != REVIVE_RECALL:
-            set_int(mover, scanner, AS_REVIVE_MODE, REVIVE_RECALL)
-            # ⚠ 下拉選單按鈕上的**文字**這裡沒辦法跟著改（settitle 要傳字串，
-            #   跳板只支援數字/布林參數）。行為以設定值為準；使用者重新點一次
-            #   下拉選單就會顯示對。
-            notes.append("復活方式改成「回城」")
+        if ok and cur is not False:
+            set_bool(mover, scanner, AS_AUTO_REVIVE, False)
+            # ⚠ 精靈面板開著的話勾選框的**顯示**不會跟著變（那是遊戲自己
+            #   畫的，我們不去戳它 —— 見 set_run 檔頭）。重開面板就會對。
+            notes.append("關了「陣亡時自動復活」")
 
     return notes
 
@@ -579,13 +579,13 @@ _UNSET = object()      # 「這個參數沒給」——用來跟「給了但值�
 
 def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
                   on_hp: bool, on_mp: bool, pid: int = 0,
-                  dura=_UNSET, dry=None) -> str | None:
+                  broken=_UNSET, dry=None) -> str | None:
     """**該回去補給了嗎？** 是的話回傳原因（可直接顯示），否則 None。
 
-    dura / dry: 呼叫端**同一拍剛算過**的耐久與見底清單，給了就不重算。
+    broken / dry: 呼叫端**同一拍剛算過**的壞裝清單與見底清單，給了就不重算。
         ⚠ 兩者都要是「這一拍」的值，不能是上一輪留下來的。
-        掛機的裝備檢查本來就會先算耐久、再叫 `potions_out()` 通知，
-        接著這裡又各算一次 —— 走一趟物品陣列要上百次記憶體讀取，
+        掛機的裝備檢查本來就會先算壞裝、再叫 `potions_out()` 通知，
+        接著這裡又各算一次 —— 各要走一趟容器，上百次記憶體讀取，
         而且是在 GUI 執行緒上，五台同時做就是看得見的頓一下。
         `dry` 是**兩組都算過**的完整清單，這裡只挑有勾的那幾組
         （`_potion_out` 各組獨立計算，挑出來跟重算完全一樣）。
@@ -594,7 +594,8 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
       （使用者要求：「不要管他遊戲裡面有沒有設定」）。這樣我們的觸發跟
       官方的觸發互相獨立，不會因為他在遊戲裡沒勾就變成不動。
 
-    · `on_broken` → 武器耐久 0
+    · `on_broken` → **身上穿的裝備**任何一件耐久 0（`bag.worn_broken()`；
+      使用者 2026-08-07 要求：以前只看武器，改成全身、不含背包）
     · `on_hp` → **HP 藥水那一組**全部歸零（見 `_potion_out`）
     · `on_mp` → **MP 藥水那一組**全部歸零
       ★ 兩組各判各的：勾 HP 就只看 HP 那三格，MP 有沒有水完全不影響。
@@ -606,16 +607,17 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
     ⛔ 還沒支援背包滿 —— `game.getbagsize()` 回 30，但物品陣列裡有 60 幾件，
       對不起來，還沒確定背包格的範圍。
     """
-    from app.game import inventory                    # 避免循環相依
+    from app.game import bag                          # 避免循環相依
+
+    if on_broken:
+        # ★ 壞裝走 bag.py（遊戲自己的容器路徑），**不吃 inv_head** ——
+        #   物品陣列表頭還沒定位到也照樣判得出來。None = 讀不到 = 不觸發。
+        bad = (bag.worn_broken(scanner) if broken is _UNSET else broken)
+        if bad:
+            return "裝備損壞（" + "、".join(it.name for it in bad) + "）"
 
     if not inv_head:
         return None
-
-    if on_broken:
-        d = (inventory.durability(scanner, inv_head) if dura is _UNSET
-             else dura)
-        if d is not None and d[0] <= 0:
-            return "武器損壞"
 
     if dry is None:
         dry = potions_out(mover, scanner, inv_head, pid, on_hp, on_mp)

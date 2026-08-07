@@ -96,6 +96,10 @@ TMPL_SPAN = 0x134
 FIRST_SLOT = 0x14
 LAST_SLOT = 0xA9
 
+# 身上穿的裝備格（掛機「裝備壞掉」看的就是這一段，不含背包）
+WORN_FIRST = 0
+WORN_LAST = 11
+
 GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）
 GOLD_TYPE = 1              # 金幣的種類 ID
 
@@ -254,6 +258,21 @@ def items(scanner, first: int = FIRST_SLOT,
                         type_id=type_id, count=count_, dura=dura,
                         kind=kind, price=price, grade=grade, dura_max=dmax))
     return out
+
+
+def worn_broken(scanner) -> list[Item] | None:
+    """身上穿的裝備裡**壞掉的那些**（耐久 0）；讀不到容器回 **None**。
+
+    ★ 「裝備壞掉」看全身（0~11 格），不是只看武器（使用者 2026-08-07 要求）。
+      背包裡的東西不算 —— 壞的白裝躺在背包裡本來就正常。
+    ★ 是不是裝備看**範本的耐久上限**（`is_gear`），藥水那種現值 0 的
+      不會被誤判（見 TMPL_DURA_MAX 那段的對帳）。
+    ⚠ **None 跟空清單是兩回事**：None = 還沒進場／換地圖中，什麼都別做；
+      [] = 讀得到而且沒有一件壞。呼叫端拿 None 去觸發停機就是誤殺。
+    """
+    if head(scanner) is None:
+        return None
+    return [it for it in items(scanner, WORN_FIRST, WORN_LAST) if it.broken]
 
 
 def gold(scanner) -> int | None:

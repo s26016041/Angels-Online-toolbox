@@ -66,9 +66,9 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, buff, channel, entity, inventory,
+from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
-                      player, quickbar, robot, scene, skills, terrain)
+                      player, quickbar, revive, robot, scene, skills, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -113,18 +113,21 @@ FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保�
 FULL_HUNT_GAP = 3.0
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
-GEAR_CHECK_GAP = 3.0            # 多久看一次武器耐久（掉得很慢，不必常看）
+GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，不必常看）
 # ★ 交棒給天使精靈跑補給：多久看一次「回到原地圖了沒」、最多等多久就放棄。
 #   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
 SUPPLY_MAX_SECS = 600.0
 JUMP_BACK_SECS = 180.0          # ★「用天使趴趴GO回地圖」等多久才傳（使用者指定 3 分鐘）
-# ★「死亡自己回練功區」：死了倒數幾秒後用趴趴GO傳回去（使用者指定 10 秒）。
-#   這 10 秒也是留給精靈的「陣亡自動復活」把人復活回城的時間。
-DEATH_JUMP_SECS = 10.0
-DEATH_POLL = 1.0                # 死亡回程模式下多久檢查一次（復活了沒、到了沒）
-# 復活＋傳送＋回到地圖整趟最多等多久。超過就當流程斷了：停機並通知，
-# 不要讓角色掛在城裡空等（使用者是掛網離開的，要叫得動他）。
+# ★「死亡自己回練功區」：死了倒數幾秒後送「回標記點」封包復活（使用者指定
+#   3 秒；等死亡視窗出來就好，不再靠精靈復活＋趴趴GO傳送那條舊路）。
+DEATH_REVIVE_SECS = 3.0
+DEATH_POLL = 1.0                # 死亡回程模式下多久檢查一次（復活了沒）
+# 送了「回標記點」還沒活過來時，隔多久再送一次（暫時性失敗自動重試 ——
+# 封包偶爾會排不進去或掉掉，不准叫使用者「再按一次」）。
+REVIVE_RETRY = 5.0
+# 復活整趟最多等多久。超過就當流程斷了（標記點沒設？封包沒生效？）：
+# 停機並通知 —— 使用者是掛網離開的，要叫得動他。
 DEATH_WAIT_MAX = 90.0
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
 # 的 MAX_HOP），長距離是靠這裡定期重下、一段一段接力走完的，所以不能太久。
@@ -881,7 +884,7 @@ class Scan:
     state: int | None = None      # 狀態物件（寫目標用）
     player: int | None = None     # 玩家實體物件（讀自己的座標用）
     stats: int | None = None      # 角色屬性基準（讀 HP 用；見 app/game/player.py）
-    inv: int | None = None        # 物品指標陣列表頭（讀武器耐久用）
+    inv: int | None = None        # 物品指標陣列表頭（數藥水／找回程道具用）
     mons: list = field(default_factory=list)
     err: str = ""
 
@@ -995,7 +998,7 @@ class ScanWorker(QThread):
 
 
 class InvWorker(QThread):
-    """專門找「物品指標陣列表頭」的執行緒（讀武器耐久要用）。
+    """專門找「物品指標陣列表頭」的執行緒（數藥水、找回程道具要用）。
 
     ★ 為什麼要獨立一條：找表頭要跑 AOB 全記憶體掃描，實測 **1.7～2.1 秒／台**。
       放在怪物清單那條執行緒上，五台排隊就是十秒的空窗 —— 使用者回報的
@@ -1085,7 +1088,7 @@ class CharFarmPage(QWidget):
         self.state: int | None = None
         self.player: int | None = None           # 玩家物件位址（拿來讀自己的座標）
         self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
-        self.inv: int | None = None              # 物品陣列表頭（拿來讀武器耐久）
+        self.inv: int | None = None              # 物品陣列表頭（藥水／回程道具用）
         self.mons: list[entity.Entity] = []
         self._on_scan = on_scan
         self._cur: entity.Entity | None = None   # 正在打的那隻
@@ -1121,8 +1124,7 @@ class CharFarmPage(QWidget):
         self._hp_t = 0.0           # 距離上次檢查自己的 HP 過了多久
         self._hp_prev = -1         # 上一拍的 HP（偵測「正在被打」用）
         self._hp_drop_t = -1e9     # 上次觀測到 HP 下降的時刻（見 _under_attack）
-        self._gear_t = 0.0         # 距離上次檢查武器耐久過了多久
-        self._dura = (-1, -1)      # 最近讀到的 (耐久, 上限)
+        self._gear_t = 0.0         # 距離上次檢查裝備耐久過了多久
         self._supply = False       # 正在讓天使精靈跑補給（我們完全讓開）
         self._supply_t = 0.0       # 這一趟補給跑多久了
         self._supply_poll = 0.0    # 距離上次檢查補給進度過了多久
@@ -1133,12 +1135,12 @@ class CharFarmPage(QWidget):
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
         # 死亡回程模式（勾了「死亡自己回練功區」，角色死掉才會進，見 _death_tick）
-        self._death = False        # 進行中（我們完全讓開，等復活＋傳送）
-        self._death_t = 0.0        # 死了多久（倒數 DEATH_JUMP_SECS、超時判斷共用）
+        self._death = False        # 進行中（我們完全讓開，等復活）
+        self._death_t = 0.0        # 死了多久（倒數 DEATH_REVIVE_SECS、超時判斷共用）
         self._death_poll = 0.0     # 距離上次檢查過了多久
-        self._death_scene = None   # 死在哪張地圖（趴趴GO要傳回去的目的地）
-        self._death_pos = None     # 死在哪（同圖多落點時挑最近的）
-        self._death_jumped = False # 傳送已送出，接下來只等回到地圖
+        self._death_scene = None   # 死在哪張地圖（活回這張圖才接回自動戰鬥）
+        self._death_try = 0.0      # 死亡滿幾秒才（再）送「回標記點」
+        self._death_sent = False   # 至少送出去過一次了（狀態列顯示用）
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
@@ -1218,14 +1220,18 @@ class CharFarmPage(QWidget):
         # —— 使用者要求：不同分身可能要通知到不同的地方。
         nbar = QHBoxLayout()
         # ★ 通知總開關（使用者要求）。關掉之後所有掛機通知都不送 ——
-        #   下面那些「藥水沒了」「武器壞了」「角色死亡」都受它管。
+        #   下面那些「藥水沒了」「裝備壞了」都受它管。
+        # ⚠ 角色死亡本身**不通知**（使用者 2026-08-07 要求：這頁只通知
+        #   藥水用完和裝備壞掉；死亡回程卡住停機那種「掛機停了」才通知）。
         self.notify_cb = QCheckBox("啟用通知")
         self.notify_cb.setChecked(True)
         self.notify_cb.setToolTip(
             "掛機的通知總開關。關掉之後這些都不會通知：\n"
-            "・角色死亡、武器耐久 0、藥水用完\n"
-            "・回程補給失敗、走不到巡邏點\n"
-            "★ 只影響通知，掛機該停還是會停（狀態列照樣寫原因）。")
+            "・裝備壞掉（耐久 0）、藥水用完\n"
+            "・回程補給失敗、走不到巡邏點、死亡回程卡住\n"
+            "★ 只影響通知，掛機該停還是會停（狀態列照樣寫原因）。\n"
+            "★ 角色死亡本身不通知 —— 勾了「死亡自己回練功區」會自己"
+            "復活接回，沒勾就只停機（狀態列寫原因）。")
         self.notify_cb.toggled.connect(self._save_settings)
         nbar.addWidget(self.notify_cb)
         nbar.addSpacing(10)
@@ -1505,8 +1511,11 @@ class CharFarmPage(QWidget):
             "\n・那格設成技能的話整組跳過 —— 用技能補本來就不吃藥水"
             "\n⚠ 不看遊戲裡「補HP/MP物品用完自動回城」有沒有勾。"
             "\n★ 水沒了一定會通知，**沒勾這裡也會通知**，只是不跑補給。")
-        self.sup_gear_cb = QCheckBox("武器壞掉")
-        self.sup_gear_cb.setToolTip("武器耐久歸零就跑回程補給。" + common)
+        self.sup_gear_cb = QCheckBox("裝備壞掉")
+        self.sup_gear_cb.setToolTip(
+            "身上穿的裝備**任何一件**耐久歸零就跑回程補給。\n"
+            "・看的是全身穿著的（0~11 格），背包裡的東西不算\n"
+            "・是不是裝備看範本的耐久上限，藥水那種不會被誤判" + common)
         self.sup_gear_cb.toggled.connect(self._save_settings)
         c.addWidget(self.sup_gear_cb)
         c.addSpacing(10)
@@ -1543,23 +1552,27 @@ class CharFarmPage(QWidget):
         self.sup_jump_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_jump_cb)
         c.addSpacing(10)
-        # ★ 死亡自己回練功區：把精靈「輔助」頁調成 陣亡自動復活＋回城。
-        #   DATAID 與「回城 = 1」的由來見 app/game/robot.py 的 AS_AUTO_REVIVE。
+        # ★ 死亡自己回練功區：死了等 3 秒直接送「回標記點」封包復活
+        #   （app/game/revive.py，跟手點死亡視窗那顆按鈕完全一樣），並在
+        #   開始掛機時把精靈「陣亡時自動復活」**關掉** —— 精靈搶先把人
+        #   復活回城的話，「回標記點」就沒得點了。
         self.sup_revive_cb = QCheckBox("死亡自己回練功區")
         self.sup_revive_cb.setToolTip(
             "角色死掉也不停止掛機，自動回來繼續打：\n"
-            "・開始掛機時自動把天使精靈「輔助」頁調好 ——\n"
-            "　「陣亡時自動復活」勾起來、「復活方式」選成「回城」\n"
-            f"・死亡 **{DEATH_JUMP_SECS:.0f} 秒後**（等精靈把人復活回城）\n"
-            "　 用天使趴趴GO傳回死掉時那張地圖，回到就自動接回自動戰鬥\n"
+            f"・死亡 **{DEATH_REVIVE_SECS:.0f} 秒後**直接送遊戲的"
+            "「回標記點」封包復活\n"
+            "　（跟你在死亡視窗點「回標記點」完全一樣），"
+            "活過來就接回自動戰鬥\n"
+            "・開始掛機時自動把天使精靈「輔助」頁的\n"
+            "　「陣亡時自動復活」**關掉** —— 免得精靈搶先把人復活回城\n"
             "・沒勾的話維持原樣：角色死亡就自動停止掛機\n"
             "\n"
             "・掛機中才勾也會立刻把精靈設定調好\n"
             "・取消勾選不會幫你把遊戲裡的精靈設定改回來\n"
-            "⚠ 趴趴GO的**傳送費用**照算；那張地圖不在趴趴GO清單裡、\n"
-            "　 或復活／傳送一直沒完成，就停止掛機並發通知。\n"
-            "⚠ 精靈面板開著的話「復活方式」下拉的**文字**可能沒立刻跟上，\n"
-            "　 重點一次就會顯示對，實際行為一律以設定值為準。")
+            "⚠ 角色死亡**不會另外通知**；只有復活一直沒完成（逾時）\n"
+            "　 停機那一種才通知。\n"
+            "⚠ 精靈面板開著的話勾選框的**顯示**可能沒立刻跟上，\n"
+            "　 重開面板就會顯示對，實際行為一律以設定值為準。")
         self.sup_revive_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_revive_cb)
         c.addStretch(1)
@@ -1840,17 +1853,18 @@ class CharFarmPage(QWidget):
     def _start_death_return(self) -> None:
         """角色死了、而且勾了「死亡自己回練功區」→ 進死亡回程模式。
 
-        分工：**復活是精靈的事**（開始掛機時已把「陣亡自動復活＋回城」調好，
-        見 robot.apply_prefs），我們只負責等角色活過來、死亡滿
-        `DEATH_JUMP_SECS` 秒後用趴趴GO把人傳回死掉時那張地圖，
-        回到地圖就接回自動戰鬥。
+        流程很短：等 `DEATH_REVIVE_SECS` 秒（讓死亡視窗出來）→ 送
+        「回標記點」封包（revive.to_mark，跟手點那顆按鈕完全一樣）→
+        人活回死掉那張地圖就接回自動戰鬥。
+        精靈的「陣亡時自動復活」在開始掛機時已經被**關掉**
+        （見 robot.apply_prefs）—— 它搶先把人復活回城反而壞事。
         """
         self._death = True
         self._death_t = 0.0
         self._death_poll = 0.0
         self._death_scene = self._scene
-        self._death_pos = self.my_pos()      # 屍體的位置還讀得到，拿來挑落點
-        self._death_jumped = False
+        self._death_try = DEATH_REVIVE_SECS
+        self._death_sent = False
         # 我們自己完全讓開（跟交棒補給時一樣）：不送技能鍵、不寫目標
         self._keys.set_on(False)
         self._atk.hold_off()
@@ -1860,11 +1874,16 @@ class CharFarmPage(QWidget):
         if self._supply:
             self._supply = False
             self._supply_gen += 1
-        self.status.setText(f"☠ 角色死亡 → 等精靈復活，"
-                            f"{DEATH_JUMP_SECS:.0f} 秒後用趴趴GO傳回練功區…")
+        self.status.setText(f"☠ 角色死亡 → {DEATH_REVIVE_SECS:.0f} 秒後"
+                            "送「回標記點」復活…")
 
     def _death_fail(self, why: str) -> None:
-        """死亡回程走不下去 → 停機＋通知（使用者掛網離開，要叫得動他）。"""
+        """死亡回程走不下去 → 停機＋通知。
+
+        ⚠ 「角色死亡」本身不通知（使用者要求），但**這裡照樣通知** ——
+          這是「掛機停了、人還躺著」，跟裝備壞掉停機同一類：
+          使用者掛網離開，要叫得動他。
+        """
         self._death = False
         self._stop_with(f"☠ {why} → 已停止掛機")
         self.notify(f"{why}，掛機已停止。")
@@ -1872,24 +1891,28 @@ class CharFarmPage(QWidget):
     def _death_tick(self, dt: float) -> bool:
         """死亡回程模式。進行中回 True（呼叫端整個 tick 都要讓開）。
 
-        流程：等復活（精靈代勞）→ 死亡滿 `DEATH_JUMP_SECS` 秒且人活著
-        → 趴趴GO傳回 `_death_scene` → 回到那張地圖就接回自動戰鬥。
-        ★ 人在死亡那張圖上活過來（原地復活、或使用者自己處理了）就直接
-          接回來，不傳送。
+        流程：死亡滿 `DEATH_REVIVE_SECS` 秒 → 送「回標記點」封包 →
+        人活回死掉那張地圖就接回自動戰鬥。
+        ★ 還沒送就先活過來（使用者自己點了）也一樣直接接回，不再送。
+        ★ 送了還一直沒活：每 `REVIVE_RETRY` 秒重送一次（暫時性失敗
+          自動重試），`DEATH_WAIT_MAX` 兜底 —— 超過就停機＋通知。
+        ⚠ 活著但場景對不上（標記點在別張圖？）不接回 —— 巡邏點是
+          死掉那張圖的，走錯圖只會亂走；讓超時把它停下來。
         """
         if not self._death:
             return False
         self._death_t += dt
         self._death_poll += dt
         if self._death_t >= DEATH_WAIT_MAX:
-            self._death_fail(f"死亡回程超過 {DEATH_WAIT_MAX:.0f} 秒沒完成"
-                             "（復活或傳送卡住了）")
+            self._death_fail(
+                f"死亡回程超過 {DEATH_WAIT_MAX:.0f} 秒沒完成"
+                "（「回標記點」沒生效？標記點沒設或在別張地圖？）")
             return True
         if self._death_poll < DEATH_POLL:
             return True
         self._death_poll = 0.0
 
-        # 活過來了沒。stats 在復活／傳送時會搬家，讀不到就當「還沒」，
+        # 活過來了沒。stats 在復活時可能搬家，讀不到就當「還沒」，
         # 等掃描重新定位（超時有 DEATH_WAIT_MAX 兜底）。
         alive = False
         if self.stats:
@@ -1903,41 +1926,29 @@ class CharFarmPage(QWidget):
         if back:
             self._death = False
             self._since_scan = RESCAN_GAP        # 立刻重掃，馬上接回打怪
-            self.status.setText("★ 回到練功地圖 → 接回自動戰鬥"
-                                if self._death_jumped else
-                                "★ 原地活過來了 → 接回自動戰鬥")
+            self.status.setText("★ 復活了 → 接回自動戰鬥")
             return True
-        if self._death_jumped:
-            return True                          # 傳送送出去了，等著陸
+        if alive:
+            return True                  # 活了但場景還沒對上（見檔頭 ⚠）
 
-        if self._death_t < DEATH_JUMP_SECS or not alive:
-            left = max(DEATH_JUMP_SECS - self._death_t, 0.0)
-            self.status.setText(
-                "☠ 角色死亡 → " + ("等精靈復活" if not alive else "復活了")
-                + (f"，{left:.0f} 秒後" if left > 0 else "，")
-                + "用趴趴GO傳回練功區…")
+        if self._death_t < self._death_try:
+            if not self._death_sent:
+                left = max(self._death_try - self._death_t, 0.0)
+                self.status.setText(f"☠ 角色死亡 → {left:.0f} 秒後"
+                                    "送「回標記點」復活…")
             return True
 
-        # 倒數到了、人也活了 → 傳回去
-        if self._death_scene is None:
-            self._death_fail("死亡時不知道人在哪張地圖，沒辦法傳回去")
-            return True
+        # 倒數到了、人還死著 → 點「回標記點」（跟手點死亡視窗那顆按鈕一樣）
         if not self._ensure_mover():
-            self._death_fail("跳板裝不起來，沒辦法用趴趴GO傳回去")
+            self._death_fail("跳板裝不起來，送不了「回標記點」")
             return True
-        pos = self._death_pos or (None, None)
-        e = jumpmap.nearest(self._death_scene, pos[0], pos[1])
-        if e is None:
-            self._death_fail(f"{scene.scene_name(self._death_scene)}"
-                             "不在趴趴GO清單裡，沒辦法傳回去")
-            return True
-        ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
-        self._drop_cached_addrs()                # 傳送必換地圖，位址全作廢
-        if not ok:
-            self._death_fail(f"趴趴GO傳送失敗（{msg}）")
-            return True
-        self._death_jumped = True
-        self.status.setText("☠ 復活了 → 已用趴趴GO傳回練功區，等著陸…")
+        if revive.to_mark(self._mover):
+            self._death_sent = True
+            self._death_try = self._death_t + REVIVE_RETRY
+            self.status.setText("☠ 已送「回標記點」→ 等復活…")
+        else:
+            # 指令槽正忙 —— 下一拍再試，不算失敗
+            self._death_try = self._death_t + DEATH_POLL
         return True
 
     # ------------------------------------------------------------------
@@ -1948,7 +1959,7 @@ class CharFarmPage(QWidget):
         ★ 用門閂（self._dry）：空著的那段期間只叫一次，補到貨才重新武裝。
           少了它每 GEAR_CHECK_GAP 秒就會吵一次。
         ★ 只通知不停機：水沒了照樣打得動，血低了本來就有「坐下休息」擋著。
-          武器耐久 0 才是真的打不了，那個維持停機。
+          裝備壞掉才是真的打不下去，那個維持停機。
 
         回傳算出來的見底清單（兩組都算），讓同一拍的補給判斷直接拿去用，
         不必再走一次物品陣列；沒算成就回 None。
@@ -2054,9 +2065,9 @@ class CharFarmPage(QWidget):
                 txt = (f"趴趴GO 倒數 {_mmss(left)}" if left > 0
                        else "趴趴GO 傳送中…")
         elif self._death:
-            left = max(0.0, DEATH_JUMP_SECS - self._death_t)
+            left = max(0.0, DEATH_REVIVE_SECS - self._death_t)
             txt = (f"死亡回程 倒數 {_mmss(left)}" if left > 0
-                   else "死亡回程 傳送中…")
+                   else "死亡回程 等復活…")
         if self.jump_lbl.text() != txt:
             self.jump_lbl.setText(txt)
 
@@ -2078,19 +2089,20 @@ class CharFarmPage(QWidget):
             return True
         if self._supply_poll >= SUPPLY_POLL:
             self._supply_poll = 0.0
-            if self.inv:
-                d = inventory.durability(self.sc, self.inv)
-                if d is not None:
-                    self._dura = d
             now = scene.current(self.sc, allow_scan=False)
             here = now.id if now else None
             if self._supply_scene is not None and here is not None:
                 if here != self._supply_scene:
                     self._supply_left = True
                 elif self._supply_left:
+                    # 回來了 → 順便報一下裝備修好了沒（讀不到就不提）
+                    bad = bag.worn_broken(self.sc)
+                    note = ("　⚠ 還有裝備壞著（"
+                            + "、".join(it.name for it in bad) + "）" if bad
+                            else "　裝備完好" if bad == [] else "")
                     self._end_supply(
-                        f"🔧 補給完成，已回到{now}　"
-                        f"耐久 {self._dura[0]}　共花 {_mmss(self._supply_t)}")
+                        f"🔧 補給完成，已回到{now}{note}　"
+                        f"共花 {_mmss(self._supply_t)}")
                     return True
             self.status.setText(
                 f"🔧 天使精靈補給中…（{_mmss(self._supply_t)}）"
@@ -2967,7 +2979,7 @@ class CharFarmPage(QWidget):
             notes = robot.apply_prefs(
                 self._mover, self.sc, main_switch=True,
                 jump_back=self.sup_jump_cb.isChecked(),
-                revive_recall=self.sup_revive_cb.isChecked())
+                revive_mark=self.sup_revive_cb.isChecked())
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
@@ -3055,18 +3067,17 @@ class CharFarmPage(QWidget):
                     self._hp_prev = st.hp
                     if st.hp <= 0:
                         # ★ 勾了「死亡自己回練功區」→ 不停機，交給死亡回程
-                        #   模式（等精靈復活回城 → 趴趴GO傳回來 → 接著打）。
+                        #   模式（3 秒後送「回標記點」封包 → 活了接著打）。
                         #   沒勾就維持原樣：自動停止掛機。
-                        # ★ 兩種都要**通知**（受總開關管）：使用者掛網離開，
-                        #   以前沒勾回程時死掉完全無聲，人回來才發現屍體。
+                        # ★ 兩種都**不通知**（使用者 2026-08-07 要求：這頁
+                        #   只通知藥水用完和裝備壞掉）。只有死亡回程卡住
+                        #   （_death_fail）那種「掛機停了」才通知。
                         if self.sup_revive_cb.isChecked():
                             self._start_death_return()
-                            self.notify("角色死亡，正在自動復活並傳回練功區。")
                         else:
                             self._stop_with(
                                 f"☠ 角色死亡 → 已自動停止掛機"
                                 f"（累計擊殺 {self._kills} 隻）")
-                            self.notify("角色死亡，掛機已自動停止。")
                         return
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
@@ -3107,14 +3118,16 @@ class CharFarmPage(QWidget):
         elif self._buff.armed:
             self._buff.armed = False
 
-        # ★ 該不該回去補給。勾了「回程補給」就照精靈自己的設定判斷（耐久、
-        #   採買清單缺貨…）；沒勾就只看耐久 0 並停機通知。幾秒看一次就夠。
+        # ★ 該不該回去補給。勾了「回程補給」就照觸發開關判斷（壞裝、藥水
+        #   見底）；沒勾就只看裝備壞掉並停機通知。幾秒看一次就夠。
+        # ★ 裝備壞掉看**全身穿著的**（0~11 格，不含背包）：任何一件耐久 0
+        #   就算（使用者 2026-08-07 要求，以前只看武器）。走 bag.py 那條
+        #   遊戲自己的容器路徑，**不需要 self.inv**（那是藥水/回程在用的）。
         self._gear_t += dt
-        if self._gear_t >= GEAR_CHECK_GAP and self.inv:
+        if self._gear_t >= GEAR_CHECK_GAP:
             self._gear_t = 0.0
-            d = inventory.durability(self.sc, self.inv)
-            if d is not None:
-                self._dura = d
+            # None = 讀不到容器（換地圖中…）→ 不觸發也不解除，下次再看
+            broken = bag.worn_broken(self.sc)
             gear = self.sup_gear_cb.isChecked()
             hp_on = self.sup_hp_cb.isChecked()
             mp_on = self.sup_mp_cb.isChecked()
@@ -3123,17 +3136,18 @@ class CharFarmPage(QWidget):
             #   通知要先發出去才不會被 return 吃掉。
             dry = self._check_dry()
             if (gear or hp_on or mp_on) and self._ensure_mover():
-                # ★ 耐久與見底清單都是這一拍剛算好的，直接傳進去別再算一次
-                #   （各要走一趟物品陣列，上百次記憶體讀取）。
+                # ★ 壞裝與見底清單都是這一拍剛算好的，直接傳進去別再算一次
+                #   （各要走一趟容器，上百次記憶體讀取）。
                 why = robot.supply_needed(self._mover, self.sc, self.inv,
                                           gear, hp_on, mp_on, self.pid,
-                                          dura=d, dry=dry)
+                                          broken=broken, dry=dry)
                 if why and self._start_supply(why):
                     return
-            if d is not None and d[0] <= 0:
-                self._stop_with(f"🔧 武器已損壞（耐久 0）→ 已自動停止掛機"
+            if broken:
+                names = "、".join(it.name for it in broken)
+                self._stop_with(f"🔧 裝備已損壞（{names}）→ 已自動停止掛機"
                                 f"（累計擊殺 {self._kills} 隻）")
-                self.notify("武器已損壞（耐久 0），掛機已自動停止。")
+                self.notify(f"裝備已損壞（{names}），掛機已自動停止。")
                 return
 
         self._walk_t += dt
@@ -3708,7 +3722,7 @@ class CharFarmPage(QWidget):
         notes = robot.apply_prefs(
             self._mover, self.sc,
             jump_back=self.sup_jump_cb.isChecked(),
-            revive_recall=self.sup_revive_cb.isChecked())
+            revive_mark=self.sup_revive_cb.isChecked())
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 
