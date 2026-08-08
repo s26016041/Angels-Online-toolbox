@@ -280,8 +280,59 @@ def player_entity(scanner) -> int | None:
     return ent
 
 
+HEAD_TRIES = 3               # 表頭讀失敗時重讀幾次（見 head）
+
+
+def _read_ptrs(scanner, addr: int, n: int) -> tuple[list[int], bool]:
+    """讀 n 個指標，回 (指標, **整段都讀到了嗎**)。讀不到的那格填 0。
+
+    ⚠⚠ 不可以寫成「一次讀 n*4 bytes，失敗就回空」——`_read_bytes` 是
+      **全有全無**的（`ReadProcessMemory` 少讀一個 byte 就回 None）。743 格
+      ≈ 3KB，陣列搬家搬到貼著記憶體區段結尾時，只有最後一小塊讀不到，
+      卻會讓**整個背包看起來是空的** → 「藥水用完」「你沒有券」那類誤報。
+      （[[bag-false-empty-guards]] 當年只修了 inventory.py 這條，漏了這裡。）
+
+    所以失敗就對半切，把讀得到的部分撿回來；切到剩一格還失敗才認賠那一格。
+    正常情況第一發就成功，不會多花任何時間。
+    """
+    out = [0] * n
+    complete = True
+    todo = [(0, n)]
+    while todo:
+        start, length = todo.pop()
+        if length <= 0:
+            continue
+        raw = scanner._read_bytes(addr + start * 4, length * 4)
+        if raw:
+            out[start:start + length] = struct.unpack(
+                f"<{length}I", bytes(raw))
+            continue
+        if length == 1:
+            complete = False          # 這一格真的讀不到 → 當空格，但標不完整
+            continue
+        half = length // 2
+        todo.append((start, half))
+        todo.append((start + half, length - half))
+    return out, complete
+
+
 def head(scanner) -> tuple[int, int] | None:
-    """物品容器的 (表頭, 格數)；還沒進場之類的情況回 None。"""
+    """物品容器的 (表頭, 格數)；還沒進場之類的情況回 None。
+
+    ★ 讀失敗會重讀 HEAD_TRIES 次：這條路上有 6 次 4-byte 讀取，中間只要有
+      一拍撞上遊戲正在搬東西（換地圖、實體表重建）就會失敗，而失敗的代價是
+      呼叫端看到「背包空的」。重讀幾乎一定救得回來，成本只有幾十微秒。
+      ⚠ 重讀救不回來的是**真的沒進場**（登入畫面／選角／讀取中）——那本來
+      就沒有背包可讀，只能由呼叫端說清楚，不能假裝讀到。
+    """
+    for _ in range(HEAD_TRIES):
+        got = _head_once(scanner)
+        if got is not None:
+            return got
+    return None
+
+
+def _head_once(scanner) -> tuple[int, int] | None:
     ent = player_entity(scanner)
     if ent is None:
         return None
@@ -326,18 +377,18 @@ def scan(scanner, first: int = FIRST_SLOT,
     if lo > hi:
         # 容器比 first 還短 —— 這段本來就不存在，不是讀不到
         return [], True
-    raw = scanner._read_bytes(begin + lo * 4, (hi - lo + 1) * 4)
-    if not raw:
-        return [], False
-    ptrs = struct.unpack(f"<{hi - lo + 1}I", bytes(raw))
+    # ★ 讀不到的格子只會壞那一格，不會讓整個背包變空（見 _read_ptrs）
+    ptrs, complete = _read_ptrs(scanner, begin + lo * 4, hi - lo + 1)
 
-    complete = True
     tmpl_cache: dict[int, tuple[int, int, int, int, int]] = {}
     out: list[Item] = []
     for offset, ptr in enumerate(ptrs):
         if not ptr:
             continue
         blob = scanner._read_bytes(ptr, ITEM_SPAN)
+        if not blob:
+            # 物件剛好在這一拍被回收／搬走 —— 再讀一次多半就有了
+            blob = scanner._read_bytes(ptr, ITEM_SPAN)
         if not blob:
             complete = False       # 有格子但讀不到內容 → 這段不完整
             continue

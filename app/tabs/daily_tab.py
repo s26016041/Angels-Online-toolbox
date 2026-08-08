@@ -430,16 +430,30 @@ class DailyTab(BaseTab):
                 sum(it.count for it in items if it.type_id == WING_ITEM),
                 len(items))
 
-    def _unreadable(self, label: str, reads: int, again) -> int:
-        """背包讀不到時的共同處理：先重試幾次，試完大聲說讀不到。"""
+    def _unreadable(self, sc, label: str, reads: int, again) -> int:
+        """背包讀不到時的共同處理：先重試幾次，試完大聲說讀不到。
+
+        ★ 最後那句話分兩種講，因為要做的事完全不同：
+          · **沒進遊戲**（登入畫面／選角／讀取中／斷線重連）—— 這時候背包
+            物件根本還不存在，讀不到很正常，不是壞掉。
+          · **進遊戲了卻讀不到** —— 這才是真的有問題（位址失效那類），
+            要去跑 `tools\\selfcheck.py`。
+          實測在遊戲裡連讀 1500 次 0 失敗（2026-08-08，五台各 300 次），
+          所以第二種訊息一旦出現，就是真的要查，不是運氣不好。
+        """
         if reads < READ_TRIES:
             self.status.setText(
                 f"{label}：讀不到背包，等一下再看…"
                 f"（{reads + 1}/{READ_TRIES}）")
             self._steps.insert(0, again)
             return RETRY_MS
-        self._log(label, "換翔宇聖翼",
-                  "⚠ 讀不到背包 —— 這台沒換（還在登入／讀取畫面？換地圖中？）")
+        if bag.player_entity(sc) is None:
+            self._log(label, "換翔宇聖翼",
+                      "這台還沒進遊戲（登入畫面／選角／讀取中？）—— 跳過")
+        else:
+            self._log(label, "換翔宇聖翼",
+                      "⚠ 進遊戲了卻讀不到背包 —— 這台沒換，"
+                      "請跑 tools\\selfcheck.py 看是不是位址失效")
         return 0
 
     def _ex_begin(self, pid: int, label: str, cycle: int = 0,
@@ -462,7 +476,7 @@ class DailyTab(BaseTab):
         got = self._count(sc)
         if got is None:
             return self._unreadable(
-                label, reads,
+                sc, label, reads,
                 lambda: self._ex_begin(pid, label, cycle, tries, reads + 1))
         have, wings, seen = got
         times = _entry.times_for(have)
@@ -507,7 +521,7 @@ class DailyTab(BaseTab):
             # ⚠ 讀不到就**不准送** —— 次數是照張數算的，猜一個送出去就是
             #   拿垃圾值給伺服器。等一下再看，試完把視窗關掉收工。
             delay = self._unreadable(
-                label, reads,
+                sc, label, reads,
                 lambda: self._ex_confirm(pid, label, cycle, have0, wings0,
                                          tries, reads + 1))
             if reads >= READ_TRIES:       # 放棄了 → 順手把商店視窗關掉
@@ -554,7 +568,7 @@ class DailyTab(BaseTab):
         if counted is None:
             # 讀不到就不能說「沒換到」（那會害它整輪重來、白換一次）。
             delay = self._unreadable(
-                label, reads,
+                sc, label, reads,
                 lambda: self._ex_check(pid, label, have, wings, cycle,
                                        probes, reads + 1))
             if reads >= READ_TRIES:       # 放棄了 → 順手把商店視窗關掉
