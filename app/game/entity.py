@@ -254,11 +254,42 @@ def _scan_vtable(scanner, vt: int, should_stop=None) -> list[int]:
 
 
 def read_pos(scanner, addr: int) -> tuple[float, float] | None:
-    """讀出格子座標；讀不到回傳 None。實體與玩家物件通用。"""
+    """讀出格子座標；讀不到回傳 None。實體與玩家物件通用。
+
+    ⚠ 這支**不驗身分** —— 呼叫端要自己確定 addr 這一拍還是那個物件
+      （怪走 `read_live()`，那支連 vtable＋實體 ID 一起驗）。
+      要讀「我自己」的座標請用 `player_pos()`。
+    """
     raw = scanner._read_bytes(addr + OFF_POS_X, 8)
     if not raw:
         return None
     vx, vy = struct.unpack("<II", raw)
+    return (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS
+
+
+# 從玩家物件開頭一路讀到座標 —— 涵蓋 vtable(+0) 與 +0xBC/+0xC0
+POS_SPAN = OFF_POS_Y + 4
+
+
+def player_pos(scanner, player_obj: int) -> tuple[float, float] | None:
+    """**我自己**的格子座標；位址已失效或讀不到都回 None。
+
+    ⚠⚠⚠ **一定要驗身分**。玩家物件會搬家（換地圖、重生、斷線重連、傳送），
+      而舊位址那塊記憶體照樣讀得到 —— 讀出來的是別人的資料，卻長得像一組
+      合法座標。座標是**會留下後果**的東西：走路的目的地、巡邏點、補給／
+      死亡回程要挑的傳送落點都靠它，錯了就是安靜地走到一個不相干的地方
+      （CLAUDE.md 明令禁止的「安靜地做錯事」）。
+    ★ vtable 在 +0、座標在 +0xBC，一次整塊讀就同時拿到，等於免費。
+    """
+    if not player_obj:
+        return None
+    raw = scanner._read_bytes(player_obj, POS_SPAN)
+    if not raw:
+        return None
+    b = bytes(raw)
+    if struct.unpack_from("<I", b, 0)[0] != VT_PLAYER:
+        return None                       # 搬家了 —— 不准拿別人的座標當我的
+    vx, vy = struct.unpack_from("<II", b, OFF_POS_X)
     return (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS
 
 
@@ -444,15 +475,29 @@ def snapshot(scanner, should_stop=None, regions=None,
 #    ⛔ 使用者已否決「問客戶端射程」這條路（見 [[skill-range]]）。
 
 
-def read_target(scanner, state: int) -> int:
-    """目前選定的目標實體 ID；沒有選定時是 0。"""
-    return _u32(scanner, state + OFF_TARGET)
+def state_ok(scanner, state: int) -> bool:
+    """這個位址**現在**還是狀態物件嗎（比對物件開頭的 vtable）。
+
+    ⚠⚠⚠ **任何「上一拍記下來的狀態物件位址」拿來用之前都要先問這一句。**
+      物件會搬家（換地圖、死亡重生、斷線重連、傳送），而搬家之後那塊記憶體
+      多半**照樣讀得到** —— 遊戲拿去放別的東西了。所以「讀得到」完全不代表
+      「還是它」：不驗就是安靜地拿垃圾值當答案（讀），或安靜地亂改遊戲的
+      堆積（寫，見 read_target_checked 的說明）。
+    ★ 一次 4-byte 讀取，微秒級。要連著讀欄位的話請改用一次整塊讀＋自己比對
+      （`read_target_checked` / `energy.read` 就是那樣做的，等於免費）。
+    ⛔ 讀不到（`None`）一律回 False —— 這支的用途是「敢不敢拿它去用」，
+      不確定就是不敢。想區分「讀不到」與「換人了」的呼叫端請用
+      `read_target_checked`。
+    """
+    if not state:
+        return False
+    raw = scanner._read_bytes(state, 4)
+    return bool(raw) and struct.unpack("<I", bytes(raw))[0] == VT_STATE
 
 
-def read_target_hp(scanner, state: int) -> int:
-    """目標的血量百分比（0~100）。目標死亡或沒有目標時是 0。"""
-    return _u32(scanner, state + OFF_TARGET_HP)
-
+# ⛔ `read_target()` / `read_target_hp()`（不驗身分的裸讀）已刪除，零呼叫者。
+#    留著只會被將來的人誤用 —— 要讀這兩個欄位一律走 `read_target_checked()`，
+#    它把 vtable 比對併在同一次系統呼叫裡，不多花錢。
 
 # 從狀態物件開頭一路讀到目標血量 —— 涵蓋 vtable(+0) 與 +0x2D8/+0x2DC
 # （一次整塊讀，兩個值才是同一瞬間的：分開讀會拿到「舊 ID 配新血量」的組合）

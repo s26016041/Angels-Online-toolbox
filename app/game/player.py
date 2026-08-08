@@ -174,18 +174,42 @@ def clear_last_skill(scanner, base: int) -> None:
 
     這是純資料欄位，遊戲下次放技能就會自己覆蓋回去。
     實測寫 0 之後遊戲一切正常（HP/MP 不變、不當機）。
+
+    ⚠⚠⚠ **寫之前一定要確認 base 現在還是角色屬性物件**（`base_ok`）。
+      這支的 `base` 是 KeyWorker 快取起來的位址，只有掃描回來時才會更新；
+      換地圖／重連／重生之後物件早就搬家，而舊位址那塊記憶體**照樣寫得進去**
+      —— 那就是在亂改遊戲的堆積，症狀是「掛久了遊戲莫名其妙掛掉」，而且離
+      真正的元凶已經很遠（見 memory 的 game-crash-root-causes）。
+      CLAUDE.md 的鐵則：交給遊戲的位址，動手前當場重驗。
     """
-    if base:
+    if base_ok(scanner, base):
         scanner.write_value(base + OFF_LAST_SKILL, VALUE_TYPES["int32"], 0)
 
 
+def base_ok(scanner, base: int) -> bool:
+    """這個位址**現在**還是角色屬性物件嗎（比對 vtable 特徵）。
+
+    ★ `read()` 本來就會驗；這支是給「只碰 ±0x50 那個欄位、不讀整份屬性」
+      的呼叫端用的同一道驗證，成本是一次 4-byte 讀取。
+    """
+    if not base:
+        return False
+    vtable = _vtable_value(scanner)
+    return vtable is not None and _signature_ok(scanner, base + OFF_VTABLE,
+                                                vtable)
+
+
 def read_last_skill(scanner, base: int) -> int | None:
-    """最近放出的技能 ID；讀不到或還沒放過技能回傳 None。
+    """最近放出的技能 ID；讀不到／位址已失效／還沒放過技能回傳 None。
 
     用法：送一次技能鍵之後馬上讀，就知道那個鍵上是哪個技能。
     （攻擊封包 0x559FF8 的第一個參數就是這個值，兩邊實測一致。）
+
+    ⚠⚠ **一定要先驗身分**。位址過期時舊記憶體照樣讀得到，`0 < sid < 0x10000`
+      這種範圍檢查擋不住別人的資料 —— 學到一個錯的技能 ID，之後就一直對怪
+      施放打不到的招，症狀正是這個檔案上面警告過的「完全無法打怪」。
     """
-    if not base:
+    if not base_ok(scanner, base):
         return None
     raw = scanner._read_bytes(base + OFF_LAST_SKILL, 4)
     if not raw:

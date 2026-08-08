@@ -2852,10 +2852,22 @@ class CharFarmPage(QWidget):
         return struct.unpack("<I", bytes(raw))[0] if raw else 0
 
     def my_pos(self) -> tuple[float, float] | None:
-        """玩家目前的格子座標（每次都重讀，因為角色會走動）。"""
+        """玩家目前的格子座標（每次都重讀，因為角色會走動）。
+
+        ⚠⚠ 走 `entity.player_pos()`：它會**順便驗玩家物件還是不是玩家物件**
+          （同一次讀取，免費）。物件搬家之後舊位址照樣讀得到，讀出來是別人的
+          資料卻長得像一組合法座標 —— 而座標會留下後果（走路目的地、巡邏點、
+          回程落點）。驗不過就回 None 並把快取作廢，下一次掃描自己重新定位。
+        """
         if self.player is None:
             return None
-        return entity.read_pos(self.sc, self.player)
+        pos = entity.player_pos(self.sc, self.player)
+        if pos is None:
+            # 位址過期（或這一瞬間讀不到）→ 作廢＋催一次全掃，別再拿它算路。
+            # 呼叫端本來就全部處理 None（「讀不到就不要動」）。
+            self.player = None
+            self._ask_full("玩家物件搬家了（座標驗不過）")
+        return pos
 
     def apply_scan(self, s: Scan) -> None:
         """外殼：**不管中間出什麼事，`_waiting` 一定要放掉**。

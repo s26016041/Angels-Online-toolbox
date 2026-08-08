@@ -96,15 +96,28 @@ def _scan_client(scanner, pid: int, account: str) -> str:
     return account
 
 
-def state_of(pid: int, scanner=None):
-    """狀態物件位址。預讀過就是瞬間；沒有的話現場找一次並記起來。"""
-    got = _states.get(pid)
-    if got:
-        return got
-    if scanner is None:
-        return None
+def state_of(pid: int, scanner=None, allow_scan: bool = True):
+    """狀態物件位址。預讀過就是瞬間；沒有的話現場找一次並記起來。
+
+    ⚠⚠⚠ **給了 scanner 就一定會先驗快取還是不是狀態物件**（一次 4-byte 讀取）。
+      物件會搬家（換地圖、死亡重生、斷線重連、傳送），而舊位址那塊記憶體
+      **照樣讀得到** —— 遊戲拿去放別的東西了。不驗就會把別人的堆積當成
+      狀態物件交出去，呼叫端讀到的是垃圾值，而且因為「讀到了」永遠不會
+      判定要重新定位。驗不過就當場丟掉快取，這一趟自然會重找。
+
+    allow_scan=False：只用（驗過的）快取，**絕不做全記憶體掃描**。
+      GUI 執行緒上每輪都要問的地方用這個，重找交給有節流的那條路。
+    """
     from app.game import entity
 
+    got = _states.get(pid)
+    if got and scanner is not None and not entity.state_ok(scanner, got):
+        _states.pop(pid, None)             # 搬家了 → 快取作廢，重新找
+        got = None
+    if got:
+        return got
+    if scanner is None or not allow_scan:
+        return None
     got = entity.locate_state(scanner)
     if got:
         _states[pid] = got

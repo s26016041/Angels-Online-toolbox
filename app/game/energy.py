@@ -55,7 +55,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from app.game import attack
+from app.game import attack, entity
 
 # --- 狀態物件裡的能量晶化欄位（用 entity.locate_state() 拿基準） ---------
 #
@@ -101,16 +101,31 @@ class EnergyState:
 
 
 def read(scanner, state: int) -> EnergyState | None:
-    """從狀態物件讀出能量晶化的所有欄位；讀不到回 None。"""
+    """從狀態物件讀出能量晶化的所有欄位；讀不到／位址已失效回 None。
+
+    ⚠⚠⚠ **從物件開頭一起讀，順便比對 vtable —— 這道驗證不能省。**
+      狀態物件會搬家（換地圖、死亡重生、斷線重連、傳送），而搬家之後舊位址
+      那塊記憶體**照樣讀得到**（遊戲拿去放別的東西了）。以前這裡只檢查
+      `if not state`，所以位址一過期就會安靜地把別人的堆積當成能量欄位讀出來：
+      畫面上的能量、抽到的屬性、12 格點數全是垃圾值，而且因為「讀到了」，
+      呼叫端永遠不會判定要重新定位 —— 錯下去不會自己好。
+      （CLAUDE.md 的鐵則：讀取端一律做合理性驗證，驗不過就退安全預設。）
+    ★ vtable 在 +0、能量在 +0xB8，一次整塊讀回來就同時拿到，等於免費；
+      而且所有欄位是**同一瞬間**的快照。vtable 值本身由 locate.warm() 依 AOB
+      重新定位，改版也跟得上。
+    ★ 回 None 的意思統一是「這份資料不可信」，呼叫端照原本的路重新定位
+      （energy_tab 的 `_read()` 就會 forget_state → 下一輪重找）。
+    """
     if not state:
         return None
-    raw = scanner._read_bytes(state + OFF_ENERGY,
-                              (OFF_POINTS - OFF_ENERGY) + ATTR_COUNT * 4)
+    raw = scanner._read_bytes(state, OFF_POINTS + ATTR_COUNT * 4)
     if not raw:
         return None
     b = bytes(raw)
-    energy, result, per = struct.unpack_from("<III", b, 0)
-    pts = struct.unpack_from(f"<{ATTR_COUNT}I", b, OFF_POINTS - OFF_ENERGY)
+    if struct.unpack_from("<I", b, 0)[0] != entity.VT_STATE:
+        return None                       # 位址過期了 —— 不准拿垃圾值當答案
+    energy, result, per = struct.unpack_from("<III", b, OFF_ENERGY)
+    pts = struct.unpack_from(f"<{ATTR_COUNT}I", b, OFF_POINTS)
     return EnergyState(
         energy=energy,
         result=None if result >= ATTR_COUNT else result,

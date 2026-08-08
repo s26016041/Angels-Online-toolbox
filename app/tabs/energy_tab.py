@@ -94,7 +94,11 @@ class EnergyTab(BaseTab):
     def build_ui(self) -> None:
         self._movers: dict[int, move.Mover] = {}
         self._scanners: dict[int, MemoryScanner] = {}
-        self._state: dict[int, int] = {}          # pid -> 狀態物件
+        # ⛔ 這裡以前另外存一份 `self._state`（pid -> 狀態物件）——**已刪除**。
+        #    那是「同一個位址在第二個地方再存一次」：preload 那份會驗身分、
+        #    這份不會，物件搬家之後這份就把過期位址交出去（畫面上的能量／
+        #    屬性／點數整片垃圾值）。狀態物件現在只有 preload 一份，
+        #    而且每次取用都當場驗（見 preload.state_of）。
         # pid -> 上次「全掃找狀態物件」的時間（見 STATE_RELOCATE_GAP）
         self._state_try: dict[int, float] = {}
         self._names = energy.FALLBACK_NAMES
@@ -348,7 +352,6 @@ class EnergyTab(BaseTab):
         for sc in self._scanners.values():
             sc.close()
         self._scanners.clear()
-        self._state.clear()
         self._state_try.clear()      # 重新整理＝使用者要求重試，節流也一併歸零
         seen = set()
         for w in win.enumerate_windows(title_contains="Angels Online"):
@@ -399,16 +402,18 @@ class EnergyTab(BaseTab):
         # ★ 用預讀好的狀態物件（開程式時跟角色名一起掃出來的）。
         #   自己再找一次要 ~320ms，那就是「第一次切過來還會卡」的原因。
         pid = int(pid)
-        # ⚠ 先問「不帶 scanner」的版本：那只查快取，絕對不會掃描。
-        st = self._state.get(pid) or preload.state_of(pid)
+        # ⚠ allow_scan=False：只查快取、絕對不掃描，但**會先驗那份快取現在
+        #   還是不是狀態物件**（一次 4-byte 讀取，微秒級）。
+        #   以前這裡是 `self._state.get(pid) or preload.state_of(pid)` ——
+        #   兩份都是沒驗過的舊位址，物件搬家之後照樣交出去，畫面上的能量／
+        #   屬性／點數就整片是垃圾值，而且不會自己重新定位（見 energy.read）。
+        st = preload.state_of(pid, sc, allow_scan=False)
         if not st:
             # 真的沒有 → 才需要全掃，而且要節流（見 STATE_RELOCATE_GAP）。
             now = time.monotonic()
             if now - self._state_try.get(pid, 0.0) >= STATE_RELOCATE_GAP:
                 self._state_try[pid] = now
                 st = preload.state_of(pid, sc)
-        if st:
-            self._state[pid] = st
         return pid, sc, st
 
     def _read(self):
@@ -417,8 +422,7 @@ class EnergyTab(BaseTab):
             return None
         got = energy.read(sc, st)
         if got is None:                            # 物件搬家了，下次重新定位
-            self._state.pop(pid, None)
-            preload.forget_state(pid)              # 預讀的那份也作廢
+            preload.forget_state(pid)
         return got
 
     def _clamp_limit(self, energy_now: int) -> None:
