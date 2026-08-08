@@ -8,6 +8,10 @@
 背後都是 `app/game/energy.py`：呼叫遊戲自己的泛用送包函式
 `0x5D3D97(0x38, 1)` / `0x5D3D97(0x39, -1)`，欄位讀狀態物件 +0xB8 起那一段。
 
+⚠ 晶化資料是「用到才同步」：剛上線那段記憶體全 0，要等客戶端送過
+  `0x5D3D97(0x3F, 0)`（＝遊戲裡打開晶能視窗）伺服器才會把數字給下來。
+  「同步資料」按鈕就是替使用者送這一包。
+
 為什麼要選分身
 --------------
 多開時「按一下」一定要指名對誰按。只開一個分身時會自動選好。
@@ -109,6 +113,14 @@ class EnergyTab(BaseTab):
         refresh.clicked.connect(
             lambda: self.reload_instances(force_names=True))
         bar.addWidget(refresh)
+        sync = QPushButton("同步資料")
+        sync.setToolTip(
+            "跟伺服器要一次晶化資料（＝遊戲裡打開晶能視窗時送的那包）。\n"
+            "剛上線時伺服器還沒把資料同步下來，這裡讀到的全是 0 ——\n"
+            "按這顆就不用進遊戲開視窗，約半秒後數字自己出現。\n"
+            "⚠ 遊戲裡可能會跳出晶能視窗，直接關掉即可。")
+        sync.clicked.connect(self._sync)
+        bar.addWidget(sync)
         bar.addSpacing(16)
         self.energy_lbl = QLabel("能量 —")
         self.energy_lbl.setStyleSheet("font-weight: bold;")
@@ -389,7 +401,14 @@ class EnergyTab(BaseTab):
             self._set_buttons(None)
             return
         self._set_buttons(got.energy)
-        self.energy_lbl.setText(f"能量 {got.energy}（還能按 {got.energy} 次）")
+        # ★ 「全部是 0」幾乎一定是還沒同步（同步過的人 per_roll 至少是 10）——
+        #   晶化資料是「用到才同步」，剛上線時伺服器根本還沒給。提示他按同步，
+        #   不要讓他以為能量真的是 0。
+        if not got.energy and not got.per_roll and not any(got.points):
+            self.energy_lbl.setText("能量 0（還沒同步？按「同步資料」）")
+        else:
+            self.energy_lbl.setText(
+                f"能量 {got.energy}（還能按 {got.energy} 次）")
         self._clamp_limit(got.energy)
         self.cur_lbl.setText(
             f"目前選中 {got.result_name(self._names)}"
@@ -462,6 +481,10 @@ class EnergyTab(BaseTab):
         for r, cells in enumerate(rows):
             for c, text in enumerate(cells):
                 self.log.setItem(r, c, QTableWidgetItem(text))
+
+    def _sync(self) -> bool:
+        """跟伺服器要一次晶化資料。回包後由每 0.5 秒的更新自己撿到。"""
+        return self._do("同步資料", energy.sync)
 
     def _roll(self) -> bool:
         before = self._read()

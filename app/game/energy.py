@@ -8,6 +8,7 @@
     0x5D3D97(0x47, 分流編號)      ← 切換分流（channel.switch）
     0x5D3D97(0x38, 1)             ← 能量晶化      ★
     0x5D3D97(0x39, -1)            ← 我要晶能加倍  ★
+    0x5D3D97(0x3F, 0)             ← 開晶能視窗＝跟伺服器要晶化資料  ★
 
 `0x5D3D97` 就是 `attack.SELECT_FN`（會被 `locate.warm()` 自動重新定位）。
 cdecl、兩個整數、**沒有 this**，加解密與送出都由客戶端自己做。
@@ -186,6 +187,14 @@ DOUBLE_CODE = 0x39
 # ⚠ 是 -1（擷取到的是 0xFFFFFFFF），**不是 1**。跳板寫入時會 & 0xFFFFFFFF，
 #   所以這裡放 Python 的 -1 就好。
 DOUBLE_ARG = -1
+# ★「開晶能視窗」的請求包（2026-08-08 使用者擷取，0x589B65 那層 = (0x3F, 0)）。
+#   晶化資料是「用到才同步」：剛上線時伺服器不會推，狀態物件 +0xB8 那段全 0，
+#   遊戲裡打開晶能視窗那一刻客戶端才送這包去要，回包後欄位才有數字。
+#   跟兌換的 0x49 開商店同一種設計（見 exchange.open_shop）。
+#   ⚠ 送這包之後客戶端可能會自己把晶能視窗開出來（兌換那邊就是這樣），
+#     使用者關掉即可，資料已經寫進記憶體不受影響。
+SYNC_CODE = 0x3F
+SYNC_ARG = 0
 
 
 def _send(mover, code: int, arg: int) -> bool:
@@ -205,3 +214,11 @@ def roll(mover) -> bool:
 def double(mover) -> bool:
     """送一次「我要晶能加倍」。排不進指令槽時回 False。"""
     return _send(mover, DOUBLE_CODE, DOUBLE_ARG)
+
+
+def sync(mover) -> bool:
+    """跟伺服器要一次晶化資料（＝遊戲裡打開晶能視窗送的那包）。
+
+    送出後伺服器要一點時間回包，資料不會立刻出現 —— 讀取端照常輪詢即可。
+    """
+    return _send(mover, SYNC_CODE, SYNC_ARG)
