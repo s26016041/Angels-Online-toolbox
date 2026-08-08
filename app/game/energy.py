@@ -259,3 +259,29 @@ def decompose(mover, scanner, slot: int) -> tuple[bool, str]:
     if not _send(mover, DECOMP_CODE, int(slot)):
         return False, "指令槽忙碌"
     return True, ""
+
+
+# 一拍最多拆幾顆。批次是連續 call_sync、整段抓著跳板的鎖（每顆正常一幀
+# ~16ms、最壞 CALL_TIMEOUT 0.12s），設上限免得同一台的掛機指令被卡太久。
+# 拆不完的下一拍（3 秒後）接著拆。前例：領在線獎勵 0x48 六格一次全送沒問題。
+MAX_PER_TICK = 30
+
+
+def decompose_batch(mover, scanner, slots) -> tuple[list[int], bool]:
+    """一口氣拆解多格。回 (通過重驗、真的排送的格號, 整批都排進去了嗎)。
+
+    ⚠⚠ 跟單發一樣，送包前**重讀背包**逐格重驗 —— 不在白名單就整格跳過，
+      呼叫端塞錯格號也送不出去。
+    ⚠ 半路排不進去（指令槽忙碌）時**前面幾格已經送出了** —— 所以成敗
+      不能看這裡的回傳，一律以「序號從背包消失」對帳。
+    """
+    from app.game import bag
+    if not (mover and mover.active):
+        return [], False
+    fresh = {it.slot: it.type_id for it in bag.items(scanner)}
+    good = [int(s) for s in slots
+            if fresh.get(int(s)) in DECOMP_ITEMS][:MAX_PER_TICK]
+    if not good:
+        return [], True
+    calls = tuple((attack.SELECT_FN, (DECOMP_CODE, s)) for s in good)
+    return good, attack._send(mover, calls)
