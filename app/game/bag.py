@@ -283,8 +283,12 @@ def player_entity(scanner) -> int | None:
 HEAD_TRIES = 3               # 表頭讀失敗時重讀幾次（見 head）
 
 
-def _read_ptrs(scanner, addr: int, n: int) -> tuple[list[int], bool]:
+def read_ptrs(scanner, addr: int, n: int) -> tuple[list[int], bool]:
     """讀 n 個指標，回 (指標, **整段都讀到了嗎**)。讀不到的那格填 0。
+
+    ★★ **全專案讀物品指標陣列只有這一支**（`bag.scan()` 與 `inventory` 那條
+      AOB 路都用它）—— 以前兩邊各有一套減半重試，行為還不一樣：
+      inventory 那套「成功但被截斷」會安靜地少看後半段，bag 這套則是整袋變空。
 
     ⚠⚠ 不可以寫成「一次讀 n*4 bytes，失敗就回空」——`_read_bytes` 是
       **全有全無**的（`ReadProcessMemory` 少讀一個 byte 就回 None）。743 格
@@ -377,8 +381,8 @@ def scan(scanner, first: int = FIRST_SLOT,
     if lo > hi:
         # 容器比 first 還短 —— 這段本來就不存在，不是讀不到
         return [], True
-    # ★ 讀不到的格子只會壞那一格，不會讓整個背包變空（見 _read_ptrs）
-    ptrs, complete = _read_ptrs(scanner, begin + lo * 4, hi - lo + 1)
+    # ★ 讀不到的格子只會壞那一格，不會讓整個背包變空（見 read_ptrs）
+    ptrs, complete = read_ptrs(scanner, begin + lo * 4, hi - lo + 1)
 
     tmpl_cache: dict[int, tuple[int, int, int, int, int]] = {}
     out: list[Item] = []

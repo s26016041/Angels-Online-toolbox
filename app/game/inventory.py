@@ -188,7 +188,7 @@ def _pick_head(scanner, slot: int) -> int | None:
 def _looks_like_inventory(scanner, head: int) -> bool:
     """真的物品陣列前 64 格會塞滿有效指標；巧合命中的只有零星一兩個。"""
     n = 0
-    for p in read_pointers(scanner, head, HEAD_WINDOW):
+    for p in bag.read_ptrs(scanner, head, HEAD_WINDOW)[0]:
         if p and item_type(scanner, p) is not None:
             n += 1
             if n >= HEAD_MIN_ITEMS:
@@ -227,23 +227,12 @@ def locate(scanner, item_structs) -> int | None:
     return None
 
 
-def read_pointers(scanner, head: int, count: int = 128) -> list[int]:
-    """一次把整條指標陣列讀進來。
-
-    以前是「每格各發一次 ReadProcessMemory」，128 格 × 5 台 × 每 0.7 秒 —— 光這裡
-    每輪就上千次系統呼叫。整條一次讀只要 1 次，其餘工作完全一樣。
-
-    要求的範圍只要有一段沒對應到記憶體，ReadProcessMemory 就是整批失敗（不是讀一半），
-    所以讀不到時逐次減半重試 —— 表尾剛好貼著區塊邊界時，至少前半段照樣讀得到，
-    行為跟以前「逐格讀、讀不到就停」一致。
-    """
-    n = count
-    while n:
-        raw = scanner._read_bytes(head, n * 4)
-        if raw:
-            return list(struct.unpack(f"<{n}I", raw))
-        n //= 2
-    return []
+# ⛔ 這裡以前有一支自己的 `read_pointers()`：讀不到就把長度**減半重試**，
+#   結果是「成功但被截斷」—— 尾端貼著區段結尾時後面的格子整批看不見，
+#   而且開頭讀不到的話（起點沒變）連減半都救不了。
+#   2026-08-08 全部改用 `bag.read_ptrs()`：對半切之後**兩半都試**，
+#   所以只有真的讀不到的那一格會變 0，其餘照收，並回報整段完不完整。
+#   ★ 全專案讀指標陣列只剩那一支，兩邊行為不會再各走各的。
 
 
 def ball_value(scanner, ptr: int) -> int:
@@ -325,26 +314,18 @@ def align_head(scanner, head: int, window: int = HEAD_WINDOW) -> int:
 
     ★ 指標**一次批次讀進來**：以前是 88 格各發一次 ReadProcessMemory，
       而這支被 `_walk()`／`find_by_slot()` 每次呼叫都會用到，掛機每 3 秒的
-      裝備檢查光這裡就上千次系統呼叫。整段讀不齊時（表頭貼著區段邊界）
-      **原封不動退回舊的逐格讀法**，結果完全一樣。
+      裝備檢查光這裡就上千次系統呼叫。
+      ⚠ 表頭貼著區段邊界時讀不到的**只有那幾格**（`bag.read_ptrs` 會對半切
+        把讀得到的撿回來，讀不到的填 0），投票照樣進行 —— 以前那條「整段
+        讀不齊就退回逐格讀」的備援因此不必存在了（那正是它在做的事）。
     """
     if not head:
         return head
     start = head - HEAD_BACK * 4
     total = HEAD_BACK + window
-    ptrs = read_pointers(scanner, start, total)
-    if len(ptrs) != total:
-        # 整段讀不齊 —— 退回逐格讀，跟以前一字不差（含中間有洞的情形）
-        votes: Counter = Counter()
-        for i in range(-HEAD_BACK, window):
-            a = head + i * 4
-            p = _dword(scanner, a)
-            slot = _item_slot(scanner, p) if p else None
-            if slot is not None:
-                votes[a - slot * 4] += 1
-        return votes.most_common(1)[0][0] if votes else head
+    ptrs, _complete = bag.read_ptrs(scanner, start, total)
 
-    votes = Counter()
+    votes: Counter = Counter()
     for k, p in enumerate(ptrs):
         if not p:
             continue
@@ -399,25 +380,26 @@ def _resolve(scanner, head: int) -> tuple[int, int | None] | None:
       （實體 +0x2FC 的 vector，+0x04 頭 +0x08 尾），所以表頭與格數都是遊戲記的。
       ✅ 2026-08-08 五台實測：AOB 反查 + `align_head()` 的結果跟它**完全一致**。
 
-    ⚠ 對不上就回 None（**安全退化**，呼叫端會走「還沒定位／沒看完」那條保守路）。
-      對不上只有兩種可能：這個表頭已經失效（陣列搬家，呼叫端下一拍會重新定位），
-      或它根本不是物品陣列 —— 兩種都不該繼續算，拿別人的陣列算出來的是
-      「很有自信的錯」（送錯格、藥水數錯），本專案一律當 bug。
+    ★★ 2026-08-08 改：問得到遊戲的容器就**直接用它**，不再拿呼叫端的表頭
+      去比對、比不過就整個放棄。理由是專案鐵則的第一條 —— 遊戲自己載進記憶體
+      的資料優先於我們推出來的：`bag.head()` 是這一拍現讀的（實體 +0x2FC 的
+      vector，頭與格數都是遊戲記的），呼叫端那個表頭則可能是好幾秒前定位的。
+      兩邊不一致＝呼叫端的過期了，這時候正確答案是**用新的**，
+      不是「什麼都不做」（舊行為：陣列一搬家就整段空窗，藥水／回程道具
+      判斷全部放棄，看起來就是「明明讀得到卻說找不到」）。
+      ✅ 五台實測兩邊本來就完全一致（見 align_head 的對帳）。
 
-    ⚠ 問不到容器（還沒進場、換地圖中、MGR_PTR 定位失敗）時**不退化**：
-      照舊用呼叫端的表頭與固定窗口，行為跟以前一樣。
+    ⚠ 問不到容器（還沒進場、換地圖中、MGR_PTR 定位失敗）才退回呼叫端的表頭
+      ＋保守窗口 —— 這是 AOB 那條獨立的路，兩條同時斷才會真的讀不到。
     """
-    base = align_head(scanner, head) if head else 0
-    if not base:
-        return None
     try:
         got = bag.head(scanner)
     except Exception:                                        # noqa: BLE001
         got = None
-    if got is None:
-        return base, None            # 問不到 → 照舊（保守窗口）
-    begin, count = got
-    return (base, count) if begin == base else None
+    if got is not None:
+        return got                   # (表頭, 格數) 都是遊戲自己說的
+    base = align_head(scanner, head) if head else 0
+    return (base, None) if base else None
 
 
 def _array_ptrs(scanner, base: int, total: int | None,
@@ -427,8 +409,8 @@ def _array_ptrs(scanner, base: int, total: int | None,
     ⚠⚠ 以前是從「表頭前 24 格」開始讀，那 24 格**不屬於這條陣列**，兩種病都出過：
 
       · 表頭剛好貼著記憶體區段的開頭時，前面那 24 格沒有映射，
-        ReadProcessMemory 對這種範圍是**整批失敗**（不是讀一半），而
-        `read_pointers` 的減半重試救不了「開頭就讀不到」（起點沒變）。
+        ReadProcessMemory 對這種範圍是**整批失敗**（不是讀一半），而當年那套
+        減半重試救不了「開頭就讀不到」（起點沒變）。
         結果整條陣列讀出來是空的：藥水全變 0、天使之翼也變 0 →
         「水沒了」＋「沒有回程道具」→ 掛機被停掉（黑狐，表頭 0x3ac35008，
         往前 96 bytes 就是未映射）。
@@ -446,16 +428,18 @@ def _array_ptrs(scanner, base: int, total: int | None,
       都自稱**第 0 格**＝金幣格，其中一筆還重複兩次）。所以格數是**遊戲自己說的**
       （`total`，由 `_resolve()` 問來），有就照它收手。
 
-    ⚠⚠ 尾端貼著區段結尾時，`read_pointers` 的減半重試會「成功但被截斷」——
-      只剩前面一小段、後面的格子整批看不見，而且沒有任何錯誤。所以第二個回傳值
-      是「整條看完了嗎」：沒看完的話「沒數到」不能當「沒有」（見 count_by_types）。
+    ⚠⚠ 尾端貼著區段結尾時，讀不到的那幾格會是 0 而不是報錯（`bag.read_ptrs`
+      已經把讀得到的都撿回來了）。所以第二個回傳值是「整條看完了嗎」：
+      沒看完的話「沒數到」不能當「沒有」（見 count_by_types）。
       這正是當年 FULL_WINDOW=128 太小 → 假的沒有 那個 bug 的動態翻版。
     """
-    ptrs = read_pointers(scanner, base, window if total is None
-                         else min(window, total))
-    # 問到格數 → 「看完」就是真的看完整條；問不到 → 退回「至少蓋到可疊消耗品
-    # 待得住的最後一格」這個保守標準（見 SLOT_CEILING）。
-    return ptrs, len(ptrs) >= (total if total is not None else SLOT_CEILING)
+    n = window if total is None else min(window, total)
+    ptrs, complete = bag.read_ptrs(scanner, base, n)
+    # 「看完」要兩個條件同時成立：① 每一格都真的讀到了（complete）
+    # ② 範圍蓋得夠遠 —— 問到格數就照遊戲說的整條，問不到就退回「可疊消耗品
+    #    待得住的最後一格」這個保守標準（見 SLOT_CEILING）。
+    return ptrs, complete and n >= (total if total is not None
+                                    else SLOT_CEILING)
 
 
 def _walk(scanner, head: int, window: int = FULL_WINDOW):
@@ -538,5 +522,16 @@ def is_valid(scanner, head: int) -> bool:
     「左邊整格不見、右邊非經驗球」。嚴格門檻對同一塊記憶體回傳 False，正確。
 
     成本本來就不高：整條指標一次讀進來，數到 12 個就提早收工。
+
+    ★★ 2026-08-08：**遊戲自己的容器讀得到時直接算有效** —— 這支是拿來判斷
+      「等一下走陣列走得成嗎」，而 `_walk()` 在那種情況下走的根本是遊戲的容器
+      （見 `_resolve`），跟呼叫端這個表頭新不新無關。以前不分這一層，
+      呼叫端的表頭一過期就算「無效」→ 掛機那邊的「藥水歸零／有沒有回程道具」
+      直接放棄判斷（安全但不做事）。現在讀得到就照走，找得到就是找得到。
     """
+    try:
+        if bag.head(scanner) is not None:
+            return True
+    except Exception:                                        # noqa: BLE001
+        pass
     return bool(head) and _looks_like_inventory(scanner, head)
