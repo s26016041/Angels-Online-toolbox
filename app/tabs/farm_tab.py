@@ -113,6 +113,20 @@ FULL_EVERY = 30.0               # 多久強制做一次全記憶體掃描當保�
 #   第三種是等重生時順便當保險。全掃一次 0.35 秒、五台共用一條掃描
 #   執行緒，同一台最快隔這麼久才准再要求一次。
 FULL_HUNT_GAP = 3.0
+# ★★★ 掃描看門狗：送出掃描請求之後這麼久還沒拿到結果，就當那一次請求掉了。
+#   ⚠⚠ 這是「掃周圍怪物突然壞掉、然後一直找不到怪物」的**根治**：
+#     `_waiting` 是個閂 —— 送出請求時舉起、拿到結果時放下。只要有一次沒放下
+#     （套用結果的途中丟例外被 Qt 訊號槽默默吞掉、工作執行緒剛好不在、
+#     請求被丟掉…），那台分身就**再也不會發出下一次掃描請求**，
+#     怪物清單從此定格在那一拍，重開分頁才會好。
+#   ★ 有了這個，任何原因造成的「掃描停了」最多卡這麼久就自己回來，
+#     而且會在狀態列說一聲（不准安靜地壞著）。
+#   ⚠ 要**明顯大於最壞情況的排隊時間**：全掃一台 0.35 秒，五台排隊約 2 秒，
+#     再讓爛電腦有幾倍餘裕。誤觸發的代價只是多要一次全掃，但別讓它常發生。
+SCAN_STUCK_SECS = 8.0
+# 掃描結果不可信時（掃描失敗／狀態物件掃到 0 個或多個），最多連續幾拍沿用
+# 上一拍的怪物清單 —— 「這一拍掃壞了」≠「周圍沒有怪」。見 apply_scan。
+SCAN_KEEP_BAD = 10
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，不必常看）
@@ -1178,6 +1192,10 @@ class CharFarmPage(QWidget):
         self._cur: entity.Entity | None = None   # 正在打的那隻
         self._kills = 0
         self._waiting = False      # 正在等重新掃描的結果
+        self._wait_t = 0.0         # 等了多久（看門狗用，見 SCAN_STUCK_SECS）
+        self._scan_lost = 0        # 掃描結果沒回來、被看門狗救回來幾次
+        self._scan_err = 0         # 套用掃描結果時丟例外幾次
+        self._bad_scans = 0        # 連續幾拍掃描結果不可信（見 apply_scan）
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
@@ -2840,6 +2858,30 @@ class CharFarmPage(QWidget):
         return entity.read_pos(self.sc, self.player)
 
     def apply_scan(self, s: Scan) -> None:
+        """外殼：**不管中間出什麼事，`_waiting` 一定要放掉**。
+
+        ⚠⚠⚠ 這支底下跑十幾次記憶體讀取（read_live／index_base／is_boss／
+          pathfinder_this）再加上重建 Qt 清單，任何一步丟例外都會讓
+          `_waiting` 永遠停在 True —— 那台分身的掃描就**再也不會發出下一次
+          請求**，怪物清單從此定格（使用者 2026-08-09 回報「掃周圍怪物跑掉，
+          然後一直找不到怪物」）。而且例外是在 Qt 訊號槽裡丟的，PySide6
+          只會把 traceback 印到 stderr —— 打包成 exe 之後根本沒有人看得到，
+          症狀就是「安靜地壞掉」。
+        ★ 所以：try/finally 保證放閂，例外寫進狀態列讓它**大聲**。
+        """
+        try:
+            self._apply_scan(s)
+        except Exception as exc:                   # noqa: BLE001
+            self._scan_err += 1
+            self._dbg(f"套用掃描結果時出錯：{exc!r}")
+            self.status.setText(
+                f"⚠ 套用掃描結果時出錯（第 {self._scan_err} 次）：{exc}"
+                "　—— 掃描會繼續，這一拍的結果丟掉")
+        finally:
+            self._waiting = False
+            self._wait_t = 0.0
+
+    def _apply_scan(self, s: Scan) -> None:
         # ⚠⚠⚠ 狀態物件**換位址或不見了** → 一定要先叫寫入執行緒停手。
         #   它手上的 `_job` 記著舊位址，而它每 20ms 就往 `舊位址 + 0x2D8`
         #   寫 4 bytes。物件搬家（換地圖、死亡重生、斷線重連、傳送）之後
@@ -2857,19 +2899,31 @@ class CharFarmPage(QWidget):
         self.player = s.player
         self.stats = s.stats
         self.inv = s.inv
-        # ★ 掃描端漏怪的保險：上一拍還在的活怪這一拍不見了，物件卻還在
-        #   原位址 → 掃描漏了那一塊（唯讀實測這很罕見，1/523 —— 消失多半
-        #   是遊戲自己回收物件，那種 read_live 會失敗，不會誤觸發）。
-        #   抽驗最多 3 隻，只是要決定「要不要補一次全掃」。
-        if not s.err and self.mons:
-            cur_eids = {m.eid for m in (s.mons or [])}
-            lost = [m for m in self.mons if m.eid not in cur_eids]
-            for m in lost[:3]:
-                alive, st, _p = entity.read_live(self.sc, m)
-                if alive and st != "Dead":
-                    self._ask_full(f"{len(lost)} 隻怪從掃描消失但物件還在")
-                    break
-        self.mons = s.mons or []
+        # ⚠⚠ **「這一拍掃壞了」≠「周圍沒有怪」**（跟背包那條「讀不到 ≠ 沒有」
+        #   是同一個病，見 memory 的 bag-false-empty-guards）。
+        #   s.err 有東西＝掃描失敗，或狀態／玩家物件掃到 0 個或多個 ——
+        #   那一拍的清單根本不可信，拿它覆蓋會讓「周圍怪物」瞬間清空、
+        #   掛機當場沒目標（使用者回報的「掃周圍怪物跑掉」）。
+        # ★ 保留上一拍的清單，最多撐 SCAN_KEEP_BAD 拍（之後寧可清空，
+        #   免得換地圖後一直拿舊圖的怪）。留著是安全的：挑目標時每一隻都會
+        #   當場重讀驗證（_pick_next 的 read_live，物件沒了就跳過）。
+        self._bad_scans = self._bad_scans + 1 if s.err else 0
+        if s.err and self.mons and self._bad_scans <= SCAN_KEEP_BAD:
+            self._ask_full(f"掃描不可信（{s.err}）")
+        else:
+            # ★ 掃描端漏怪的保險：上一拍還在的活怪這一拍不見了，物件卻還在
+            #   原位址 → 掃描漏了那一塊（唯讀實測這很罕見，1/523 —— 消失多半
+            #   是遊戲自己回收物件，那種 read_live 會失敗，不會誤觸發）。
+            #   抽驗最多 3 隻，只是要決定「要不要補一次全掃」。
+            if not s.err and self.mons:
+                cur_eids = {m.eid for m in (s.mons or [])}
+                lost = [m for m in self.mons if m.eid not in cur_eids]
+                for m in lost[:3]:
+                    alive, st, _p = entity.read_live(self.sc, m)
+                    if alive and st != "Dead":
+                        self._ask_full(f"{len(lost)} 隻怪從掃描消失但物件還在")
+                        break
+            self.mons = s.mons or []
         # 送鍵執行緒要的兩樣東西，跟著掃描一起更新（物件會搬家）：
         #   stats —— 學技能 ID 用（角色屬性基準 −0x50）
         #   pf    —— 三連包第①包的參數，**玩家物件 −8**（純讀取算得出來）
@@ -2901,10 +2955,12 @@ class CharFarmPage(QWidget):
                 it = QListWidgetItem(text)
                 it.setData(Qt.UserRole, name)
                 self.near.addItem(it)
-        self._waiting = False
 
         if err:
-            self.status.setText(f"⚠ {err}")
+            self.status.setText(
+                f"⚠ {err}"
+                + (f"（連續 {self._bad_scans} 拍，先沿用上一拍的怪物清單）"
+                   if self._bad_scans and self.mons else ""))
             return
 
         # ★ 正在打的那隻已經不在掃描結果裡 → 牠死了（或離開視野）。
@@ -3302,19 +3358,40 @@ class CharFarmPage(QWidget):
         # ★ 掃描**一直都在跑**，不管有沒有在掛機 ——
         #   這樣「周圍怪物」永遠是即時的，使用者隨時可以把名字加進來，
         #   也不必先按什麼按鈕才能開始（掃描只掃熱區，很便宜）。
+        # ★★★ 掃描看門狗（見 SCAN_STUCK_SECS）：請求送出去之後結果一直沒回來，
+        #   就當那一次掉了 —— 把閂放掉、要求一次全掃、重新開始。
+        #   沒有這一段的話，只要漏放一次閂，那台分身的怪物清單就永遠定格。
+        if self._waiting:
+            self._wait_t += dt
+            if self._wait_t >= SCAN_STUCK_SECS:
+                self._wait_t = 0.0
+                self._waiting = False
+                self._scan_lost += 1
+                self._ask_full("掃描結果沒回來")
+                self.status.setText(
+                    f"⚠ 掃描結果 {SCAN_STUCK_SECS:.0f} 秒沒回來 → 重新要求"
+                    f"（累計 {self._scan_lost} 次）")
+        else:
+            self._wait_t = 0.0
+
         self._since_scan += dt
         gap = (IDLE_SCAN_GAP if not self.run_cb.isChecked()
                else RESCAN_GAP if self._cur is None else REFRESH_GAP)
         if self._since_scan >= gap and not self._waiting:
             self._since_scan = 0.0
             self._waiting = True
+            self._wait_t = 0.0
             # ★ 掛機中卻沒目標 → 定期（FULL_HUNT_GAP）要求全掃當保險。
             #   唯讀實測熱掃幾乎都能當拍看到新怪（v3：新出現 0 件落在熱區
             #   外），這只是「等重生」期間順便讓熱區清單保持新鮮。
             if self.run_cb.isChecked() and self._cur is None:
                 self._ask_full("沒目標，全掃當保險")
             full, self._want_full = self._want_full, False
-            self._on_scan(self.pid, full)
+            # ⚠ 請求沒被接下（工作執行緒還沒建好／分頁重載中）就**當場把閂放掉**
+            #   —— 不然沒有人會來放，掃描就此停擺（看門狗雖然也擋得住，
+            #   但那要白等 5 秒）。
+            if self._on_scan(self.pid, full) is False:
+                self._waiting = False
 
         # 趴趴GO 倒數（顯示在「回程補給」那列最右邊）。
         # ⚠ 要放在所有 return 之前 —— 補給／死亡回程那兩段都會直接 return，
@@ -4300,13 +4377,19 @@ class FarmTab(BaseTab):
             self.tabs.addTab(page, nm)
         self.found.setText(f"偵測到 {len(insts)} 個分身")
 
-    def _request_scan(self, pid: int, full: bool = False) -> None:
+    def _request_scan(self, pid: int, full: bool = False) -> bool:
+        """把掃描請求排進工作執行緒。**回傳有沒有真的排進去**。
+
+        ⚠ 回 False 時呼叫端要自己把「正在等結果」放掉 —— 沒排進去就不會有
+          結果回來，等下去等於那台分身的掃描永遠停在這裡（見 tick 的看門狗）。
+        """
         page = self._pages.get(pid)
         if page is None or self._worker is None:
-            return
+            return False
         if full:
             self._worker.force_full(pid)
         self._worker.request(pid, page.sc)
+        return True
 
     def _on_scan_done(self, s: Scan) -> None:
         page = self._pages.get(s.pid)
