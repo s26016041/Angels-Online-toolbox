@@ -9,6 +9,7 @@
     0x5D3D97(0x38, 1)             ← 能量晶化      ★
     0x5D3D97(0x39, -1)            ← 我要晶能加倍  ★
     0x5D3D97(0x3F, 0)             ← 開晶能視窗＝跟伺服器要晶化資料  ★
+    0x5D3D97(0x37, 背包格號)      ← 拆解（把充能小背包分解成晶能）★
 
 `0x5D3D97` 就是 `attack.SELECT_FN`（會被 `locate.warm()` 自動重新定位）。
 cdecl、兩個整數、**沒有 this**，加解密與送出都由客戶端自己做。
@@ -195,6 +196,23 @@ DOUBLE_ARG = -1
 #     使用者關掉即可，資料已經寫進記憶體不受影響。
 SYNC_CODE = 0x3F
 SYNC_ARG = 0
+# ★「拆解」＝把充能小背包分解成晶能（2026-08-08，兩條證據互相印證）：
+#   1. 使用者擷取：0x589B65 那層 = (0x37, 0x32) —— 0x32 是當時那顆的格號。
+#   2. OnClickDecomp 的 Lua bytecode：
+#        game.netcommand(55, game.finditemslot(gPDCompData.item))
+#      55 = 0x37，第二個參數就是**背包格號**（跟 bag.Item.slot 同一套索引，
+#      getcharitem/0x508B9A 都是取實體+0x2FC 那個 vector 的第 n 格）。
+#   遊戲自己的檢查（OnSetPDItem）：gettype()==ITEMOBJ_TYPE_DOLL、
+#   getparam2()>0（分解值）、沒時限、不在穿戴格 —— 我們用更嚴的白名單。
+DECOMP_CODE = 0x37
+# ⚠⚠ 只准分解這兩種（使用者明令「只能分解這兩個，不要分解錯東西」）。
+#   鍵＝種類 ID（itemname 同一套），值＝分解值（拆一顆拿到幾點晶能，
+#   寫在物品說明「可以提供 N 點分解值」）。
+#   87381「充能-小背包(10)(活動)」**刻意不在名單** —— 使用者只點名這兩個。
+DECOMP_ITEMS = {
+    87138: 30,      # 充能-小背包(30)
+    87139: 20,      # 充能-小背包(20)
+}
 
 
 def _send(mover, code: int, arg: int) -> bool:
@@ -222,3 +240,22 @@ def sync(mover) -> bool:
     送出後伺服器要一點時間回包，資料不會立刻出現 —— 讀取端照常輪詢即可。
     """
     return _send(mover, SYNC_CODE, SYNC_ARG)
+
+
+def decompose(mover, scanner, slot: int) -> tuple[bool, str]:
+    """拆解背包第 `slot` 格的充能小背包（＝遊戲「拆解」鈕）。回 (送出了嗎, 原因)。
+
+    ⚠⚠ 送包前**當場重讀那一格**，不在 DECOMP_ITEMS 白名單裡就拒送 ——
+      格號是照先前讀到的背包挑的，背包若在這中間變動（撿東西、手動整理），
+      同一個格號可能已經換成別的東西。把關放在最底層，呼叫端想錯用也錯不了。
+      （鐵則出處見 memory 的 game-crash-root-causes：交給遊戲的東西當場重驗。）
+    """
+    from app.game import bag
+    got = bag.items(scanner, slot, slot)
+    if not got:
+        return False, "那一格是空的（已經拆掉了？）"
+    if got[0].type_id not in DECOMP_ITEMS:
+        return False, f"那一格不是充能小背包（{got[0].name}），拒送"
+    if not _send(mover, DECOMP_CODE, int(slot)):
+        return False, "指令槽忙碌"
+    return True, ""

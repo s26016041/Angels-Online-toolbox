@@ -1,9 +1,11 @@
 """能量晶化分頁。
 
-做三件事：
+做四件事：
   1. 顯示還剩多少能量（＝還能按幾次）與各屬性目前累積的點數
   2. 12 個屬性可以勾選
   3. 按「能量晶化」之後讀出這次抽到什麼；**抽到勾選的就自動按一次「我要晶能加倍」**
+  4. 自動分解小背包：每 3 秒把背包裡一顆「充能-小背包(20)/(30)」拆成晶能，
+     **只認這兩種**（energy.DECOMP_ITEMS 白名單＋送包前當場重驗那一格）
 
 背後都是 `app/game/energy.py`：呼叫遊戲自己的泛用送包函式
 `0x5D3D97(0x38, 1)` / `0x5D3D97(0x39, -1)`，欄位讀狀態物件 +0xB8 起那一段。
@@ -44,7 +46,7 @@ from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import energy, locate, move
+from app.game import bag, energy, itemname, locate, move
 # fit_spin：數字框寬度照最大值算 —— 寫死的話上下箭頭會把數字擠掉
 # （使用者回報過「框框被砍到一半」）。
 from app.tabs.base_tab import BaseTab, fit_spin
@@ -62,6 +64,8 @@ DEFAULT_LIMIT = 10
 LOG_COLS = ("時間", "動作", "結果", "實際入帳", "剩餘能量")
 LOG_HEIGHT = 150
 LOG_MAX = 500             # 只留最近這麼多列，跑一整晚也不會吃掉記憶體
+# 自動分解小背包的節奏：使用者定的「每三秒拆一顆」。
+DECOMP_MS = 3000
 # ⚠⚠ 狀態物件定位失敗後，隔多久才准再全掃一次。
 #   沒有這道節流的話：`_read()` 讀失敗會把快取丟掉，下一次 0.5 秒的更新就又
 #   叫一次 `entity.locate_state()`（**全記憶體掃描，0.4~1 秒，而且是在 GUI
@@ -130,6 +134,28 @@ class EnergyTab(BaseTab):
         bar.addWidget(self.cur_lbl)
         bar.addStretch(1)
         root.addLayout(bar)
+
+        # --- 自動分解小背包（使用者指定：放在分身列與屬性之間） ---------
+        drow = QHBoxLayout()
+        self.decomp_btn = QPushButton("自動分解小背包")
+        self.decomp_btn.setToolTip(
+            "每 3 秒把背包裡的一顆「充能-小背包(20)/(30)」拆解成晶能\n"
+            "（＝遊戲分解分頁那顆「拆解」鈕），拆到一顆不剩自動停。\n"
+            "⚠⚠ **只認這兩種**，其他東西一律不碰 —— 送包前還會當場重讀\n"
+            "　 那一格再驗一次。\n"
+            "⚠ 進行中請不要手動搬動背包物品。")
+        self.decomp_btn.clicked.connect(self._start_decomp)
+        drow.addWidget(self.decomp_btn)
+        self.pause_btn = QPushButton("暫停")
+        self.pause_btn.setToolTip("停下自動分解。已送出的那一顆不會收回。")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(lambda: self._stop_decomp("手動暫停"))
+        drow.addWidget(self.pause_btn)
+        self.decomp_lbl = QLabel("")
+        self.decomp_lbl.setStyleSheet("color: #9aa2b8;")
+        drow.addWidget(self.decomp_lbl)
+        drow.addStretch(1)
+        root.addLayout(drow)
 
         # --- 12 個屬性 -------------------------------------------------
         box = QGroupBox("屬性（勾起來的：抽到就自動按一次「我要晶能加倍」）")
@@ -251,6 +277,13 @@ class EnergyTab(BaseTab):
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_tick)
 
+        # 自動分解的狀態：上一拍送出的那顆（序號, 種類ID, 格號）＋累計
+        self._decomp_last: tuple[int, int, int] | None = None
+        self._decomp_n = 0
+        self._decomp_gain = 0
+        self._decomp_timer = QTimer(self)
+        self._decomp_timer.timeout.connect(self._decomp_tick)
+
         self._load()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -367,6 +400,9 @@ class EnergyTab(BaseTab):
     def _on_who_changed(self) -> None:
         if self.auto_roll_cb.isChecked():
             self._stop_auto("換了分身")
+        # ⚠ 自動分解也一樣：不停的話會拿「新選那台」的背包格號繼續送。
+        if self._decomp_timer.isActive():
+            self._stop_decomp("換了分身")
         # ⚠ 換分身時把「按之前的狀態」丟掉：那是上一台的，拿來算入帳會算到
         #   別人頭上。
         self._pre = None
@@ -485,6 +521,91 @@ class EnergyTab(BaseTab):
     def _sync(self) -> bool:
         """跟伺服器要一次晶化資料。回包後由每 0.5 秒的更新自己撿到。"""
         return self._do("同步資料", energy.sync)
+
+    # ------------------------------------------------------------------
+    # -- 自動分解小背包 -------------------------------------------------
+    def _start_decomp(self) -> None:
+        _pid, sc, _st = self._cur()
+        if sc is None:
+            self.status.setText("請先選一個分身")
+            return
+        n = sum(1 for it in bag.items(sc)
+                if it.type_id in energy.DECOMP_ITEMS)
+        if not n:
+            self.status.setText("背包裡沒有「充能-小背包(20)/(30)」")
+            return
+        self._decomp_last = None
+        self._decomp_n = 0
+        self._decomp_gain = 0
+        self.decomp_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.decomp_lbl.setText(f"　背包裡有 {n} 顆，開拆")
+        self._decomp_timer.start(DECOMP_MS)
+        self._decomp_tick()                    # 立刻拆第一顆，不空等一拍
+
+    def _stop_decomp(self, why: str) -> None:
+        self._decomp_timer.stop()
+        self.decomp_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.decomp_lbl.setText(
+            f"　已停止：{why}"
+            f"（共拆 {self._decomp_n} 顆、＋{self._decomp_gain} 晶能）")
+
+    def _decomp_tick(self) -> None:
+        """自動分解的一拍：先對帳上一顆，再挑下一顆送。
+
+        ★ 拆成功的唯一訊號＝**那顆的序號從背包消失**（背包對帳當真相，
+          不信送出成功）。失敗（槽忙、背包沒變）就下一拍重來，不設上限 ——
+          「暫停」鈕是出口（使用者定的規矩，見 transient-failure-auto-retry）。
+        """
+        pid, sc, _st = self._cur()
+        if sc is None:
+            self._stop_decomp("讀不到分身")
+            return
+        if bag.head(sc) is None:
+            # 換地圖／還沒進場，背包暫時讀不到 —— 不停，等它回來。
+            self.decomp_lbl.setText("　讀不到背包（換地圖中？），下一拍再試")
+            return
+        items = bag.items(sc)
+        # 上一拍送的那顆：序號不見了＝伺服器收走＝拆成功，晶能入帳
+        retry = False
+        if self._decomp_last is not None:
+            serial, tid, _slot = self._decomp_last
+            if any(it.serial == serial for it in items):
+                retry = True                   # 還在 → 下面挑同一顆重送
+            else:
+                gain = energy.DECOMP_ITEMS[tid]
+                self._decomp_n += 1
+                self._decomp_gain += gain
+                got = self._read()
+                self._log("分解", itemname.label(tid), f"晶能 +{gain}",
+                          got.energy if got else "")
+                self._decomp_last = None
+        matches = [it for it in items if it.type_id in energy.DECOMP_ITEMS]
+        if not matches:
+            self._log("分解", "完畢：背包裡已沒有充能小背包",
+                      f"共 +{self._decomp_gain} 晶能")
+            self._stop_decomp("分解完畢")
+            return
+        # 重送認**序號**不認格號 —— 拆掉前面的東西後格號會位移
+        target = None
+        if retry:
+            serial = self._decomp_last[0]
+            target = next((it for it in matches if it.serial == serial), None)
+        if target is None:
+            target = matches[0]
+        mv = self._mover(pid)
+        if mv is None:
+            return                             # status 已寫原因，下一拍再試
+        ok, why = energy.decompose(mv, sc, target.slot)
+        if not ok:
+            self.decomp_lbl.setText(f"　⚠ {why}，下一拍再試")
+            return
+        self._decomp_last = (target.serial, target.type_id, target.slot)
+        self.decomp_lbl.setText(
+            f"　自動分解中：已拆 {self._decomp_n} 顆"
+            f"（＋{self._decomp_gain} 晶能），剩 {len(matches)} 顆"
+            + ("　⚠ 上一顆背包沒變，重送" if retry else ""))
 
     def _roll(self) -> bool:
         before = self._read()
@@ -671,6 +792,7 @@ class EnergyTab(BaseTab):
 
     def on_close(self) -> None:
         self._auto_timer.stop()
+        self._decomp_timer.stop()
         # ⚠ 更新用的計時器也要停：下面會把 scanner 全部關掉，計時器還在跑的話
         #   會拿已經關閉的控制碼去讀記憶體。
         self._timer.stop()
