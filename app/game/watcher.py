@@ -9,7 +9,9 @@
   位址因換地圖 / 重連而失效時 `player.read()` 會回 None，這裡自動重新定位。
 
 * 經驗球 —— 直接讀**物品指標陣列的飾品欄兩格**（見 app/game/inventory.py）。
-  陣列表頭要先用 AOB 特徵找到任一個物品當錨點反查一次，之後每輪只讀幾個指標。
+  陣列表頭要先用 AOB 特徵找到任一個物品當錨點反查一次，之後每輪把整條陣列
+  批次走一遍（~1ms）。★ 格號認**物品自己記的 +0x25**，不信陣列索引 ——
+  表頭在少數機台會偏 5～6 格，拿索引讀會把裝備中的球誤判成放在背包。
 
 ★ 為什麼沒有「一顆球多久沒動就不算裝備中」這種東西 ★
 -----------------------------------------------------
@@ -210,32 +212,34 @@ class StatsWorker(QThread):
             return None
 
         now = time.monotonic()
-        # 飾品欄兩格 —— 每輪都讀，總共只要幾次讀取。
-        # 這兩格「一定顯示」，就算對照表裡沒有那個種類 ID：使用者要看到
+        # 一趟走完整條陣列，格號**認物品自己記的 +0x25**，不信陣列索引：
+        # locate() 挑的表頭在少數機台會偏 5～6 格（inventory 模組說明第 4 點），
+        # 拿索引讀第 8、9 格會把裝備中的球讀丟、反把它數進背包 ——
+        # 使用者實機遇過「明明裝備著技能球，卻偵測成放在背包」。
+        # _walk() 每輪先用 align_head() 校正表頭再逐件認格號，兩份欄位交叉印證；
+        # 每輪都做（成本 ~1ms），一降頻反而是畫面每隔幾秒跳一次，看起來像在閃。
+        #
+        # 飾品欄兩格「一定顯示」，就算對照表裡沒有那個種類 ID：使用者要看到
         # 「飾品欄左裝了個我不認識的東西」，而不是那一格憑空消失。
-        equipped = []
+        # 背包只算確定是球的，否則會把所有雜物都數進去。
+        # ⚠ 不做「同格號去重」：_walk() 會連表頭前 24 格一起看（截斷防護），
+        #   萬一外圍殘留指標也自稱第 8/9 格，挑哪個都可能安靜選錯 ——
+        #   寧可兩筆都顯示（看得見的怪），也不要挑錯（看不見的錯）。
+        equipped, bag = [], []
         try:
-            for idx in inventory.SLOT_ACCESSORY:
-                got = inventory.read_slot(sc, head, idx)
-                if not got:
-                    continue
-                tid, ptr, val = got
-                equipped.append({**self._describe(tid, val),
-                                 "addr": ptr + inventory.ITEM_BALL_OFF,
-                                 "slot": idx, "side": inventory.slot_side(idx)})
+            for slot, tid, _cnt, p in inventory._walk(sc, head):
+                if slot in inventory.SLOT_ACCESSORY:
+                    val = inventory.ball_value(sc, p)
+                    equipped.append({**self._describe(tid, val),
+                                     "addr": p + inventory.ITEM_BALL_OFF,
+                                     "slot": slot,
+                                     "side": inventory.slot_side(slot)})
+                elif items.is_ball(tid):
+                    bag.append((tid, inventory.ball_value(sc, p)))
         except Exception:
             return None
-
-        # 背包盤點 —— 每輪都做。實測整張表掃完只要 0.4～0.5ms，沒有降頻的必要；
-        # 一降頻反而是背包顆數每隔幾秒才跳一次，看起來像畫面在閃。
-        # 只算確定是球的，否則會把所有雜物都數進去。
-        try:
-            bag = sorted((tid, val)
-                         for idx, tid, _p, val in inventory.scan_slots(sc, head)
-                         if idx not in inventory.SLOT_ACCESSORY
-                         and items.is_ball(tid))
-        except Exception:
-            bag = []
+        equipped.sort(key=lambda e: e["slot"])
+        bag.sort()
 
         # 「有沒有在增加」只拿來決定顏色（綠＝正在練功），不影響任何判定
         cur = {e["addr"]: e["value"] for e in equipped}

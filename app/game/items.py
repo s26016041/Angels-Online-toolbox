@@ -149,4 +149,4 @@ def is_ball(type_id: int | None) -> bool:
 
 # ⚠ 球的種類 ID 每輪都要重讀，不能快取 —— 玩家換飾品時遊戲會把那塊記憶體挪去
 #   放別的物品，位址還在、值也還讀得到，但已經是另一顆球了（現由
-#   inventory.scan_slots 統一讀取）。
+#   watcher._ball() 每輪走 inventory._walk 重讀）。

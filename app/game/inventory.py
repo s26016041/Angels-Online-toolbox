@@ -31,8 +31,13 @@
   1. 刷掉不是物品的候選（走過頭會停在空白上）
   2. 看**誰被別的結構指著**：實測真表頭被指 1～9 次，往前每一格都是 0 次
   3. 最後再確認前 64 格裡有夠多有效物品指標（真表有 90 幾個，巧合命中只有一兩個）
+  4. ★ 回傳前再用 `align_head()` 依「物品自己記的格號」（+0x25）校正 ——
+     前三步在少數機台仍會偏格（實測偏過 5 格與 6 格），偏了的表頭每一格都
+     讀得到「像對的東西」，只是整排錯位：飾品欄讀成空格、裝備中的球被當成
+     背包裡的。所以**任何拿格號當意義的讀取，一律認物品自記的格號**
+     （`_walk()` / `find_by_slot()`），不信陣列索引。
 
-定位一次之後每輪只要讀兩個指標，成本趨近於零，而且換裝當下就會反映。
+定位一次之後每輪只要幾次批次讀取，成本趨近於零，而且換裝當下就會反映。
 純讀記憶體。
 """
 from __future__ import annotations
@@ -188,6 +193,9 @@ def locate(scanner, item_structs) -> int | None:
     item_structs: 可疊代的物品結構起點（技能球的話 = AOB 命中位址 - ITEM_BALL_OFF）。
     需要全記憶體掃一次（跟 AOB 掃描同一個等級的成本），所以只在還沒定位、
     或既有表頭失效時才呼叫。
+
+    ★ 回傳前用 `align_head()` 依物品自記格號校正 —— `_pick_head()` 的投票在
+      少數機台會挑偏 5～6 格（見模組說明第 4 點與 recall.py 的實錄）。
     """
     targets = np.array(sorted(set(item_structs)), dtype="<u4")
     if targets.size == 0:
@@ -206,7 +214,7 @@ def locate(scanner, item_structs) -> int | None:
     for at in sorted(slots):
         head = _pick_head(scanner, at)
         if head is not None:
-            return head
+            return align_head(scanner, head)
     return None
 
 
@@ -229,39 +237,15 @@ def read_pointers(scanner, head: int, count: int = 128) -> list[int]:
     return []
 
 
-def read_slot(scanner, head: int, index: int) -> tuple[int, int, int] | None:
-    """讀某一格：回傳 (種類 ID, 物品結構位址, 球值)；空格或無效回傳 None。
+def ball_value(scanner, ptr: int) -> int:
+    """物品結構 → 技能經驗球的累積值。非球物品讀出來沒有意義，呼叫端自己判斷。
 
-    球值對非球物品沒有意義，呼叫端要自己用種類 ID 判斷。
+    ⚠ 這裡刻意**只收物品結構位址、不收格號** —— 以前有 `read_slot(head, 索引)`
+      這種拿陣列索引讀格子的路徑，表頭一偏格就整排錯位（裝備中的球被讀成
+      背包裡的）。要按格號拿東西一律走 `_walk()` / `find_by_slot()`。
     """
-    if not head:
-        return None                 # 陣列搬家時呼叫端可能還拿著 None
-    p = _dword(scanner, head + index * 4)
-    if not p:
-        return None
-    tid = item_type(scanner, p)
-    if tid is None:
-        return None
-    raw = scanner._read_bytes(p + ITEM_BALL_OFF, 4)
-    val = struct.unpack("<i", raw)[0] if raw else 0
-    return tid, p, val
-
-
-def scan_slots(scanner, head: int, count: int = 128):
-    """走一遍整張表，回傳 [(格號, 種類 ID, 結構位址, 球值), ...]。
-
-    用來數背包裡還有幾顆球。128 格是保守上限。
-    """
-    out = []
-    for i, p in enumerate(read_pointers(scanner, head, count)):
-        if not p:
-            continue
-        tid = item_type(scanner, p)
-        if tid is None:
-            continue
-        raw = scanner._read_bytes(p + ITEM_BALL_OFF, 4)
-        out.append((i, tid, p, struct.unpack("<i", raw)[0] if raw else 0))
-    return out
+    raw = scanner._read_bytes(ptr + ITEM_BALL_OFF, 4)
+    return struct.unpack("<i", raw)[0] if raw else 0
 
 
 HEAD_BACK = 24               # 校正表頭時往前多看幾格
