@@ -6,6 +6,7 @@
   3. 按「能量晶化」之後讀出這次抽到什麼；**抽到勾選的就自動按一次「我要晶能加倍」**
   4. 自動分解小背包：每 3 秒把背包裡的「充能-小背包(20)/(30)」一次全拆成
      晶能（一拍上限 energy.MAX_PER_TICK 顆，剩的下一拍接著），
+     **拆完不停**、一直盯到使用者按「暫停」為止，
      **只認這兩種**（energy.DECOMP_ITEMS 白名單＋送包前當場重驗每一格）
 
 背後都是 `app/game/energy.py`：呼叫遊戲自己的泛用送包函式
@@ -141,7 +142,9 @@ class EnergyTab(BaseTab):
         self.decomp_btn = QPushButton("自動分解小背包")
         self.decomp_btn.setToolTip(
             "每 3 秒把背包裡的「充能-小背包(20)/(30)」**一次全部**拆解成晶能\n"
-            "（＝遊戲分解分頁那顆「拆解」鈕），拆到一顆不剩自動停。\n"
+            "（＝遊戲分解分頁那顆「拆解」鈕）。\n"
+            "★ 拆完**不會停**，繼續盯著背包 —— 掛機掉出新的下一拍就拆掉，\n"
+            "　 要停請按旁邊的「暫停」。\n"
             f"一拍最多 {energy.MAX_PER_TICK} 顆，更多的下一拍接著拆。\n"
             "⚠⚠ **只認這兩種**，其他東西一律不碰 —— 送包前還會當場重讀\n"
             "　 背包逐格再驗一次。\n"
@@ -149,7 +152,9 @@ class EnergyTab(BaseTab):
         self.decomp_btn.clicked.connect(self._start_decomp)
         drow.addWidget(self.decomp_btn)
         self.pause_btn = QPushButton("暫停")
-        self.pause_btn.setToolTip("停下自動分解。已送出的那一顆不會收回。")
+        self.pause_btn.setToolTip(
+            "停下自動分解 —— 這是唯一的出口（不然它會一直盯著背包拆下去）。\n"
+            "已經送出去的那幾顆不會收回。")
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(lambda: self._stop_decomp("手動暫停"))
         drow.addWidget(self.pause_btn)
@@ -527,23 +532,23 @@ class EnergyTab(BaseTab):
     # ------------------------------------------------------------------
     # -- 自動分解小背包 -------------------------------------------------
     def _start_decomp(self) -> None:
+        # ★ 背包裡現在沒有也照樣開跑（使用者定的：跑到按「暫停」為止）——
+        #   掛機掉出來的新小背包會被下一拍撿到。
         _pid, sc, _st = self._cur()
         if sc is None:
             self.status.setText("請先選一個分身")
             return
         n = sum(1 for it in bag.items(sc)
                 if it.type_id in energy.DECOMP_ITEMS)
-        if not n:
-            self.status.setText("背包裡沒有「充能-小背包(20)/(30)」")
-            return
         self._decomp_sent = []
         self._decomp_n = 0
         self._decomp_gain = 0
         self.decomp_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
-        self.decomp_lbl.setText(f"　背包裡有 {n} 顆，開拆")
+        self.decomp_lbl.setText(f"　背包裡有 {n} 顆，開拆" if n else
+                                "　背包裡目前沒有小背包，開始盯著")
         self._decomp_timer.start(DECOMP_MS)
-        self._decomp_tick()                    # 立刻拆第一顆，不空等一拍
+        self._decomp_tick()                    # 立刻拆第一輪，不空等一拍
 
     def _stop_decomp(self, why: str) -> None:
         self._decomp_timer.stop()
@@ -554,11 +559,14 @@ class EnergyTab(BaseTab):
             f"（共拆 {self._decomp_n} 顆、＋{self._decomp_gain} 晶能）")
 
     def _decomp_tick(self) -> None:
-        """自動分解的一拍：先對帳上一拍送的，再把背包裡剩下的**一次全送**。
+        """自動分解的一拍：先對帳上一拍送的，再把背包裡的**一次全送**。
 
+        ★ **拆完不停**：背包空了就繼續每 3 秒看一次，等新的小背包掉出來
+          （使用者要的是「跑到我按暫停為止」）。唯一的出口是「暫停」鈕 ——
+          換分身、關分頁另外算。
         ★ 拆成功的唯一訊號＝**那顆的序號從背包消失**（背包對帳當真相，
-          不信送出成功）。還沒消失的下一拍跟著重送，不設上限 ——
-          「暫停」鈕是出口（使用者定的規矩，見 transient-failure-auto-retry）。
+          不信送出成功）。還沒消失的下一拍跟著重送，不設上限
+          （使用者定的規矩，見 transient-failure-auto-retry）。
         ★ 一拍最多送 energy.MAX_PER_TICK 顆（護著跳板的鎖），超過的
           下一拍接著拆 —— 幾十顆以內就是「一拍全拆」。
         """
@@ -586,10 +594,12 @@ class EnergyTab(BaseTab):
                       got.energy if got else "")
         matches = [it for it in items if it.type_id in energy.DECOMP_ITEMS]
         if not matches:
+            # ★ 拆完**不收工**（使用者要的是「跑到我按暫停為止」）——
+            #   繼續每 3 秒看一次，掛機掉出來的新小背包下一拍就會被拆掉。
             self._decomp_sent = []
-            self._log("分解", "完畢：背包裡已沒有充能小背包",
-                      f"共 +{self._decomp_gain} 晶能")
-            self._stop_decomp("分解完畢")
+            self.decomp_lbl.setText(
+                f"　等新的小背包中：已拆 {self._decomp_n} 顆"
+                f"（＋{self._decomp_gain} 晶能）")
             return
         mv = self._mover(pid)
         if mv is None:
