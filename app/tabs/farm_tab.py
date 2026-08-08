@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QToolButton,
@@ -394,6 +395,58 @@ UNREACH_HITS = 3
 # 目標要連續這麼多次掃不到才當作牠死了／離開視野。
 # 熱區掃描偶爾會漏，單次就放棄會在打鬥中間換目標。
 GONE_SCANS = 2
+
+
+class _NoteLabel(QLabel):
+    """狀態提示字專用的標籤：**永遠不會把版面撐開**。
+
+    ⚠⚠ 為什麼要專門做一個（2026-08-08，使用者回報「跑版」）：
+      主視窗固定 940x700、上半部是兩欄格線，每個方框的寬度是照內容算的。
+      直接把「收尾中（3 隻怪在打我）」「開始巡迴：3 → 4 → 5 → 1 → 2 → 3」
+      這種會變長的字塞進那一列，方框就跟著變寬 → 右欄被推出視窗、
+      整頁多出捲軸。字愈長版面愈歪，而且只有跑到那個狀態才會發生。
+
+    三道防線：
+      · 水平 SizePolicy = Ignored —— 文字多長都**不列入**版面寬度計算
+      · 放不下就用「…」截斷，完整內容進滑鼠提示（資訊不會消失）
+      · 沒訊息時整個隱藏 —— 版面不會多出一條空白列（Qt 會收掉）
+
+    ⚠ 覆寫了 text()：回傳的是**完整內容**不是截斷後的，這樣呼叫端
+      「內容沒變就不要 setText」那種比較才不會每一拍都判定成有變
+      （心跳 10ms 一拍，每拍重畫會閃）。
+    """
+
+    def __init__(self, hide_when_empty: bool = True) -> None:
+        super().__init__("")
+        self.setStyleSheet("color: #9aa2b8;")
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+        self._full = ""
+        self._hide_empty = hide_when_empty
+        if hide_when_empty:
+            self.setVisible(False)
+
+    def setText(self, text: str) -> None:            # noqa: N802 (Qt 命名)
+        text = text or ""
+        if text == self._full:
+            return                                   # 沒變就不重畫
+        self._full = text
+        self.setToolTip(text.strip())
+        if self._hide_empty:
+            self.setVisible(bool(text.strip()))
+        self._paint()
+
+    def text(self) -> str:
+        return self._full
+
+    def _paint(self) -> None:
+        w = max(self.width() - 2, 24)
+        QLabel.setText(self, self.fontMetrics().elidedText(
+            self._full, Qt.ElideRight, w))
+
+    def resizeEvent(self, ev) -> None:               # noqa: N802 (Qt 命名)
+        super().resizeEvent(ev)
+        self._paint()                                # 欄寬變了要重算截斷
 
 
 def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
@@ -1444,8 +1497,11 @@ class CharFarmPage(QWidget):
         #   確認沒有怪在打我** → 坐下 → 回到 100% → 起身繼續。
         #   「要先清乾淨才坐」是使用者明確要求的，理由很實際：
         #   坐著被怪打會死（這個專案有前科，測試時留著怪沒殺，角色被打死）。
+        # ★ 提示字（收尾中／坐下休息…）放**這個方框自己的第二列**，
+        #   不跟控制項擠同一列 —— 見 _NoteLabel 的說明（跑版）。
         g_rest = QGroupBox("坐下休息")
-        s = QHBoxLayout(g_rest)
+        rest_v = QVBoxLayout(g_rest)
+        s = QHBoxLayout()
         self.rest_hp_cb = QCheckBox("HP 低於")
         self.rest_hp_cb.setToolTip(
             "血量低於這個百分比就停下來坐著回血，回到 100% 再繼續。\n"
@@ -1476,10 +1532,10 @@ class CharFarmPage(QWidget):
         #   兩欄加起來就超過視窗寬度（固定 940）→ 整個右欄被推到捲軸外面。
         #   「回滿再繼續」滑鼠提示裡本來就有寫，拿掉不會少資訊。
         s.addWidget(QLabel("%"))
-        self.rest_lbl = QLabel("")
-        self.rest_lbl.setStyleSheet("color: #9aa2b8;")
-        s.addWidget(self.rest_lbl)
         s.addStretch(1)
+        self.rest_lbl = _NoteLabel()
+        rest_v.addLayout(s)
+        rest_v.addWidget(self.rest_lbl)
         grid.addWidget(g_rest, 1, 0)
 
         # ── 巡迴換頻道 ─────────────────────────────────────
@@ -1487,7 +1543,8 @@ class CharFarmPage(QWidget):
         #   在 3 頻就是 3 → 4 → 5 → 1 → 2 → 3。切換靠 app/game/channel.py
         #   （跟選定怪物同一個遊戲函式，只差種類碼）。
         g_rot = QGroupBox("巡迴換頻道")
-        r = QHBoxLayout(g_rot)
+        rot_v = QVBoxLayout(g_rot)
+        r = QHBoxLayout()
         self.rot_cb = QCheckBox("自動換頻")
         self.rot_cb.setToolTip(
             "從**目前這一頻**出發，依序換過每一頻再回到原本那一頻。\n"
@@ -1517,10 +1574,10 @@ class CharFarmPage(QWidget):
             "⚠ 最少 5 秒 —— 客戶端重連要 1~2 秒，太短會一直在換線。")
         r.addWidget(self.rot_stay)
         r.addWidget(QLabel("秒"))
-        self.rot_lbl = QLabel("")
-        self.rot_lbl.setStyleSheet("color: #9aa2b8;")
-        r.addWidget(self.rot_lbl)
         r.addStretch(1)
+        self.rot_lbl = _NoteLabel()
+        rot_v.addLayout(r)
+        rot_v.addWidget(self.rot_lbl)
         grid.addWidget(g_rot, 1, 1)
 
         # ── 回程補給（整列）─────────────────────────────────
@@ -1529,7 +1586,8 @@ class CharFarmPage(QWidget):
         # ★ 三個獨立的觸發開關。**不看遊戲裡精靈自己的回城勾選**
         #   （使用者要求），這樣我們的觸發跟官方互相獨立。
         g_sup = QGroupBox("回程補給")
-        c = QHBoxLayout(g_sup)
+        sup_v = QVBoxLayout(g_sup)
+        c = QHBoxLayout()
         common = (
             "\n\n觸發之後：停掉我們的自動戰鬥 → 開精靈 → 回程 →"
             "\n它修裝買東西 → **回到原本那張地圖**就自動接回自動戰鬥。"
@@ -1620,15 +1678,13 @@ class CharFarmPage(QWidget):
         self.sup_revive_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_revive_cb)
         c.addStretch(1)
-        # ★ 趴趴GO 的倒數（使用者要求放在這一列**最右邊**）：補給觸發之後
-        #   還有多久會傳回原地圖；死亡回程時也用同一個位置顯示。
-        #   平常是空的，不佔視覺；每個心跳更新，但只在字串真的變了才寫
-        #   （setText 會觸發重繪，10ms 一拍全寫等於一直重畫）。
-        self.jump_lbl = QLabel("")
-        self.jump_lbl.setToolTip(
-            "「用天使趴趴GO回地圖」還有多久觸發。\n"
-            "從觸發回程補給那一刻開始算；時間到時人已經回到原地圖就不傳。")
-        c.addWidget(self.jump_lbl)
+        # ★ 趴趴GO 的倒數：補給觸發之後還有多久會傳回原地圖；死亡回程時
+        #   也用同一個位置顯示。平常是空的（整列收起來，不佔高度）。
+        # ⚠ 本來擺在這一列最右邊，但它一有字方框就變寬 → 跑版。改放第二列，
+        #   而且用 _NoteLabel（不列入寬度計算、過長截斷）。
+        self.jump_lbl = _NoteLabel()
+        sup_v.addLayout(c)
+        sup_v.addWidget(self.jump_lbl)
         grid.addWidget(g_sup, 2, 0, 1, 2)
 
         # ⛔ 不要把兩欄硬拉成一樣寬（setColumnStretch(0,1)+(1,1)）——
@@ -1636,8 +1692,15 @@ class CharFarmPage(QWidget):
         #    半個字。讓每一欄照自己的內容決定寬度就好。
         # 每個方框的上下留白縮一點 —— 主視窗固定 940x700，整頁高度很吃緊，
         # 預設留白會讓整頁多出一條垂直捲軸。
-        for _lay in (a, m, s, r, c):
+        for _lay in (a, m):
             _lay.setContentsMargins(12, 6, 12, 6)
+        # 有第二列提示字的三個方框：留白一律交給外層那個 VBox，內層那列歸零，
+        # 兩列之間只留 2px —— 不然外層預設留白 + 內層 12/6 疊起來，
+        # 光是留白就多出快 20px（整頁高度很吃緊，會冒出垂直捲軸）。
+        for _outer, _inner in ((rest_v, s), (rot_v, r), (sup_v, c)):
+            _outer.setContentsMargins(12, 6, 12, 6)
+            _outer.setSpacing(2)
+            _inner.setContentsMargins(0, 0, 0, 0)
         root.addLayout(grid)
 
         # 三個清單。★ 寬度一律照「內容需要多少」給，不寫死 ——
@@ -1727,9 +1790,13 @@ class CharFarmPage(QWidget):
         panes.addWidget(spot)
         root.addLayout(panes)
 
-        self.status = QLabel("尚未掃描")
-        self.status.setStyleSheet("color: #9aa2b8;")
-        self.status.setWordWrap(True)
+        # ⚠ 這一行本來是 setWordWrap(True)：「掛機中：只打「A、B、C」　精靈：…
+        #   　⚠ 勾的鍵上沒有技能」這種長訊息會折成兩三行，整頁就跟著變高
+        #   （固定 700 的視窗立刻多一條捲軸，捲軸又把寬度吃掉 → 跑版）。
+        #   改成單行截斷，完整內容在滑鼠提示裡。**不隱藏**（它一直有字，
+        #   收起來會讓下面的東西上下跳）。
+        self.status = _NoteLabel(hide_when_empty=False)
+        self.status.setText("尚未掃描")
         root.addWidget(self.status)
         root.addStretch(1)
 
@@ -2258,20 +2325,38 @@ class CharFarmPage(QWidget):
 
     # ------------------------------------------------------------------
     # -- 血/魔不足時坐下回復 ---------------------------------------------
-    def _fighting_me(self, m, st: str, p, me) -> bool:
-        """這隻怪是不是「正在打我」——**聯集**兩個訊號，缺一不可靠：
+    def _foe_evidence(self, m, st: str, p, me) -> str:
+        """這隻怪「正在打我」的證據有多硬：`"hard"` / `"guess"` / `""`。
 
-        ① 交戰槽（三個都看，entity.attacking）——
+        ★ **只有這裡定義「誰在打我」**，別的地方一律問這支（或 _fighting_me）。
+
+        `"hard"` 交戰槽（三個都看，entity.attacking）裡有我的角色物件。
            ⚠ 唯讀跟拍實錘：怪出手的當下三個槽**全是空的**（17/17），
-           指標反而殘留在發呆中／屍體上。只能當「跟我交戰過」的弱訊號。
-        ② 動畫是攻擊中（Att/Att2/Cast）**而且**離我 FOE_NEAR 格內 ——
-           出手那幾拍一定抓得到；距離擋掉「在打別人」的怪。
+             指標反而殘留在發呆中／屍體上 —— 所以它會**漏**，
+             但它出現時是真的（不會指到一隻跟我無關的怪身上）。
+        `"guess"` 動畫是攻擊中（Att/Att2/Cast）而且離我 FOE_NEAR 格內。
+           出手那幾拍一定抓得到，但**不知道牠在打誰** —— 別人在我旁邊
+           拉怪打也會中。
         呼叫端自己先排掉屍體（st == "Dead"）。
+
+        ⚠ 還有第三個更寬的訊號（「我在掉血且牠在附近」）**故意不放進來**：
+          那個連「牠有沒有出手」都不看，只有 _pick_next 的收尾反擊在用，
+          而且只准用在本來就要打的目標上。
+        ⚠ 2026-08-08 起「猜的」不再等同「硬的」：反擊名單外的怪（尤其是王）
+          一律要 `"hard"`，見 _pick_next。
         """
-        if entity.attacking(self.sc, m, self.player):
-            return True
-        return (st in entity.ATT_STATES and p is not None and me is not None
-                and math.hypot(p[0] - me[0], p[1] - me[1]) <= FOE_NEAR)
+        if self.player and entity.attacking(self.sc, m, self.player):
+            return "hard"
+        d = (math.hypot(p[0] - me[0], p[1] - me[1])
+             if (p is not None and me is not None) else float("inf"))
+        return "guess" if st in entity.ATT_STATES and d <= FOE_NEAR else ""
+
+    def _fighting_me(self, m, st: str, p, me) -> bool:
+        """這隻怪是不是「正在打我」（證據硬不硬不管）。見 _foe_evidence。
+
+        ⚠ 要據此做危險的事（跑去打一隻沒選的怪）請改看 _foe_evidence 的等級。
+        """
+        return bool(self._foe_evidence(m, st, p, me))
 
     def _under_attack(self) -> bool:
         """最近 UNDER_ATTACK_SECS 內自己的 HP 掉過 → 一定有怪在打我。
@@ -2944,13 +3029,38 @@ class CharFarmPage(QWidget):
                                         f"{self._killed[m.eid] - now:.0f} 秒"))
                     continue
             # 休息中／收尾中：只打正在打我的那幾隻，把牠們清掉才坐得下去。
-            # ⚠ 這裡**不看「選中怪物」也不看只打王** —— 打我的怪不管是什麼
-            #   都得處理掉，不然就是站在那裡挨打。
             # ★ HP 在掉卻抓不到「誰」在打我時，放寬成近距離的活怪都算 ——
             #   否則收尾階段永遠挑不到目標，站著流血（欄位失靈的保底）。
+            #
+            # ⚠⚠⚠ **「誰在打我」有兩個等級的證據，不能一視同仁**
+            #   （2026-08-08，使用者被王打死之後查出來的）：
+            #     硬證據 = 怪的交戰槽裡真的有我（entity.attacking）
+            #     猜的   = ①動畫是攻擊中且離我 ≤3 格（**不知道牠在打誰** ——
+            #                別人在我旁邊拉王打就會中）
+            #              ②我在掉血且牠在 ≤4 格內（**牠可能根本沒碰過我** ——
+            #                咬我的是名單裡的怪，旁邊剛好站著一隻王）
+            #   這一段本來完全不看「選中怪物」也不看只打王，於是猜錯的代價是
+            #   **拿 87 級的角色去打四萬血的王**：一旦鎖上就 _hurt=True，
+            #   零傷害快篩失效、沒進展計時被掉血一直重置，打到我死或王死。
+            #   （而且休息結束也沒有人會重驗 _cur —— 會一路打下去。）
+            #
+            #   所以：**猜的只准用在名單裡的怪身上**。名單裡的怪本來就是要打的，
+            #   猜錯最多只是提早打下一隻；名單外的（王、路過的高等怪）
+            #   一律要硬證據才准反擊。
+            # ⚠ 代價講清楚：王真的在咬我、而交戰槽又抓不到的時候，我們不會
+            #   去反擊牠（會繼續打名單內的怪，或因為「還在掉血」坐不下去）。
+            #   這是刻意的 —— 打不贏的東西，站著挨打至少還跑得掉。
             if only_foes:
-                if not (self._fighting_me(m, st, p, me)
-                        or (self._under_attack() and d <= UNFREEZE_NEAR)):
+                ev = self._foe_evidence(m, st, p, me)
+                guess = bool(ev) or (self._under_attack()
+                                     and d <= UNFREEZE_NEAR)
+                # 「本來就要打的目標」= 勾了只打王時的王，否則名單裡的名字。
+                intended = (monsters.is_boss(self.sc, m.type_id, idx) is True
+                            if boss_only else m.name in want)
+                if not (ev == "hard" or (guess and intended)):
+                    if skipped is not None and guess and me:
+                        skipped.append((d, m.name, "不是要打的目標、又沒有"
+                                        "硬證據說牠在打我 → 收尾不反擊"))
                     continue
             elif boss_only:
                 # ⚠ is_boss 回 None 代表「查不到」（改版位移之類）——
