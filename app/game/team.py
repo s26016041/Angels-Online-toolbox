@@ -75,7 +75,11 @@ MEMBER_STRIDE = 0x62
 MEMBER_MAX = 5               # 遊戲自己 `cmp eax,5 / jge`
 M_ID, M_NAME = 0x00, 0x08
 NAME_MAX = 0x20              # 邀請封包也是複製 32 bytes（push 0x20）
-PENDING_OFF = 0x338C         # 正在邀請我的人的 id（groupjoin 就是推這一格）
+# groupjoin 送出去的第二個參數就是這一格。**它的意義沒有驗證過** ——
+# 使用者按同意的那份擷取裡它是 0，伺服器照樣讓他入隊，所以不能拿它當
+# 「有沒有人在邀請我」的判斷（那會變成永遠不送）。這裡照抄遊戲的做法：
+# 讀到什麼就送什麼。
+PENDING_OFF = 0x338C
 
 SCRATCH_OFF = 0x1C0          # 相對 mover.scratch()；避開 lua 0、jumpmap 0x100、
                              # sell 0x140、exchange 0x180
@@ -139,7 +143,10 @@ def in_party(scanner) -> bool | None:
 
 
 def pending(scanner) -> int | None:
-    """正在邀請我的人的 id（0 = 沒有人在邀請）；讀不到回 None。"""
+    """`groupjoin` 會推出去的那個值；讀不到回 None。
+
+    ⚠ 不要把它解讀成「有沒有人在邀請我」（見 PENDING_OFF 的說明）。
+    """
     mgr = manager(scanner)
     return None if mgr is None else _u32(scanner, mgr + PENDING_OFF)
 
@@ -161,15 +168,20 @@ def leave(mover) -> bool:
 
 
 def join(mover, scanner) -> tuple[bool, str]:
-    """同意組隊邀請。邀請者 id **送出前當場重讀**，沒人邀請就不送。"""
+    """同意組隊邀請。第二個參數 **送出前當場重讀** `[管理器+0x338C]`。
+
+    ⚠⚠ **`+0x338C` 是 0 也照送。** 這不是偷懶，是照抄遊戲自己的行為：
+      使用者那份「同意均分制組隊邀請」的擷取，遊戲送出去的參數就是
+      `(1, 0)` —— 也就是他按下同意的當下那一格本來就是 0，而伺服器照樣
+      讓他入隊了（誰邀請你是伺服器自己記的）。所以拿它當「有沒有人邀請我」
+      的門閂是錯的，真正的驗收訊號是**隊員陣列真的出現那個人**。
+    """
     who = pending(scanner)
     if who is None:
-        return False, "讀不到邀請狀態"
-    if not who:
-        return False, "現在沒有人在邀請"
+        return False, "讀不到隊伍管理器"
     if not _act(mover, JOIN, who):
         return False, "排不進指令槽"
-    return True, f"已送出同意（邀請者 {who:#x}）"
+    return True, "已送出同意" + (f"（邀請者 {who:#x}）" if who else "")
 
 
 def invite(mover, name: str, share: int = SHARE_EVEN) -> tuple[bool, str]:

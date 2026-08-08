@@ -64,11 +64,12 @@ from app import theme
 from app.config import config
 from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
-from app.game import channel, locate, login, move, scene
+from app.game import channel, locate, login, move, robot, scene, team
 from app.tabs.base_tab import BaseTab
 
-COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "狀態")
-(COL_PICK, COL_NAME, COL_ACCT, COL_SRV, COL_CHAN, COL_MAP, COL_STATE) = range(7)
+COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "隊伍", "狀態")
+(COL_PICK, COL_NAME, COL_ACCT, COL_SRV, COL_CHAN, COL_MAP, COL_TEAM,
+ COL_STATE) = range(8)
 
 # 使用者要求「快速更新、但穩定最重要」。一拍要做的事全部是純讀：
 # 列視窗（EnumWindows）＋每台讀兩次視窗標題＋讀一次場景（靜態指標）。
@@ -85,6 +86,15 @@ RETRY_GAP = 0.5
 ROWS_SHOWN = 5              # 天使之戀最多開 5 台，表格就給看得到 5 列的高度
 # 分流數讀不到時，隔多久再試一次（遊戲還在開、還沒解析完伺服器清單）。
 SRV_RETRY = 2.0
+# --- 自動組隊的節奏 ---------------------------------------------------------
+# 邀請隔多久補送一次（等對方的用戶端收到、跳出邀請視窗）。
+INVITE_GAP = 2.0
+# 同意隔多久補送一次。比邀請密是因為它便宜、而且要搶在邀請視窗還開著的時候。
+JOIN_GAP = 0.5
+# 退組之後等隊員陣列真的清空。清不掉就一直重送（停止鈕是出口）。
+LEAVE_GAP = 1.0
+# 精靈開關寫下去到讀得回來的緩衝（純記憶體寫，其實是立即的，留一拍保險）。
+ROBOT_SETTLE = 0.3
 
 
 def _acct(title: str) -> str:
@@ -155,6 +165,36 @@ class MultiTab(BaseTab):
         bar.addStretch(1)
         root.addLayout(bar)
 
+        # --- 自動組隊 ---------------------------------------------------
+        bar2 = QHBoxLayout()
+        self.team_btn = QPushButton("自動組隊")
+        self.team_btn.setToolTip(
+            "把勾選的角色組成一隊，順序是：\n"
+            "  ① 全部關掉天使守護精靈總開關\n"
+            "  ② 已經有隊伍的通通退組（等隊員名單真的清空）\n"
+            "  ③ 第一個勾選的當隊長，一個一個邀請其他人\n"
+            "  ④ 被邀請的送出同意，等隊長的隊員名單真的出現他才換下一個\n"
+            "  ⑤ 全部重新打開天使守護精靈總開關\n"
+            "\n"
+            "⚠ 勾選的分身**必須在同一頻**，不然邀請送不到 ——\n"
+            "　 不同頻會直接擋下來並告訴你，請先用上面的「換頻」弄到同一頻。\n"
+            "⚠ 已經跟別人（不是這裡勾的角色）組隊的，也會被退組。")
+        self.team_btn.clicked.connect(self._do_team)
+        bar2.addWidget(self.team_btn)
+        bar2.addWidget(QLabel("分配方式"))
+        self.share = QComboBox()
+        self.share.addItem("均分制", team.SHARE_EVEN)
+        self.share.addItem("獨享制", team.SHARE_SOLO)
+        self.share.setToolTip(
+            "送出邀請時帶的分配方式，跟你在遊戲裡選的是同一個欄位。\n"
+            "均分制＝隊伍均分，獨享制＝各自撿各自的。")
+        i = self.share.findData(int(config.get("multi.share", team.SHARE_EVEN)))
+        self.share.setCurrentIndex(max(i, 0))
+        self.share.currentIndexChanged.connect(self._save_share)
+        bar2.addWidget(self.share)
+        bar2.addStretch(1)
+        root.addLayout(bar2)
+
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -176,7 +216,8 @@ class MultiTab(BaseTab):
                             (COL_ACCT, "fred26016041"),
                             (COL_SRV, "邱比特(NEW)"),
                             (COL_CHAN, "頻道"),
-                            (COL_MAP, "史萊姆晴空牧場")):
+                            (COL_MAP, "史萊姆晴空牧場"),
+                            (COL_TEAM, "隱狐、天狐、北極狐")):
             self.table.setColumnWidth(col, fm.horizontalAdvance(sample) + pad)
         self.table.horizontalHeaderItem(COL_PICK).setToolTip(
             "點一下「全選」這格就全部勾起來，再點一下全部取消。")
@@ -263,7 +304,7 @@ class MultiTab(BaseTab):
                     Qt.Checked if acc in self._picked else Qt.Unchecked)
                 self.table.setItem(r, COL_PICK, chk)
                 for c in (COL_NAME, COL_ACCT, COL_SRV, COL_CHAN,
-                          COL_MAP, COL_STATE):
+                          COL_MAP, COL_TEAM, COL_STATE):
                     it = QTableWidgetItem("")
                     it.setFlags(Qt.ItemIsEnabled)
                     if c in (COL_CHAN, COL_SRV):
@@ -286,6 +327,7 @@ class MultiTab(BaseTab):
             cur = channel.current(w.hwnd)
             self._set(r, COL_CHAN, str(cur) if cur else "—")
             self._set(r, COL_MAP, self._map_of(pid))
+            self._set(r, COL_TEAM, self._team_of(pid))
             txt = self._state_txt.get(pid, "")
             colour = None
             if txt.startswith("✅"):
@@ -346,6 +388,23 @@ class MultiTab(BaseTab):
         except Exception:                                   # noqa: BLE001
             return "—"
         return got.name if got else "—"
+
+    def _team_of(self, pid: int) -> str:
+        """隊友名單（不含自己）。⚠ 讀不到與沒隊友是兩件事，顯示上要分得開。"""
+        sc = self._scanners.get(pid)
+        if sc is None:
+            return "—"
+        try:
+            got = team.members(sc)
+        except Exception:                                   # noqa: BLE001
+            return "—"
+        if got is None:
+            return "讀不到"
+        return "、".join(m.name for m in got) if got else "沒隊伍"
+
+    def _save_share(self) -> None:
+        config.set("multi.share", int(self.share.currentData()))
+        config.save()
 
     def _resolve_name(self, pid: int, account: str) -> None:
         """把某一台的角色名解出來並記進 preload 的快取（一個 pid 只做一次）。"""
@@ -556,13 +615,19 @@ class MultiTab(BaseTab):
         if not todo:
             self.status.setText(f"沒有需要換頻的分身（目標 {target} 頻）。")
             return
-        self._job = {"target": target, "prep": list(todo), "pend": [],
-                     "wait": {}, "done": 0, "next_try": 0.0}
-        self.go_btn.setEnabled(False)
-        self.chan.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._job = {"kind": "chan", "target": target, "prep": list(todo),
+                     "pend": [], "wait": {}, "done": 0, "next_try": 0.0}
+        self._busy_ui(True)
         self.status.setText(f"準備中 0/{len(todo)}（正在裝跳板）…")
         QTimer.singleShot(0, self._prep_tick)
+
+    def _busy_ui(self, busy: bool) -> None:
+        """任務進行中把會打架的控制項關掉，只留「停止」。"""
+        self.go_btn.setEnabled(not busy and self.chan.count() > 0)
+        self.team_btn.setEnabled(not busy)
+        self.chan.setEnabled(not busy)
+        self.share.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
 
     def _prep_tick(self) -> None:
         """一拍裝一台跳板 —— 疊在一起做會把介面凍住（第一次要組譯）。"""
@@ -586,10 +651,14 @@ class MultiTab(BaseTab):
 
     def _job_tick(self, wins) -> None:
         job = self._job
-        if job is None:
+        if job is None or job["prep"]:        # 還在裝跳板，這裡不動作
             return
-        if job["prep"]:                       # 還在裝跳板，這裡不動作
-            return
+        if job["kind"] == "team":
+            self._team_tick(job, wins)
+        else:
+            self._chan_tick(job, wins)
+
+    def _chan_tick(self, job, wins) -> None:
         now = time.monotonic()
         target = job["target"]
 
@@ -650,20 +719,215 @@ class MultiTab(BaseTab):
         else:
             done = job["done"]
             self._job = None
-            self.go_btn.setEnabled(True)
-            self.chan.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+            self._busy_ui(False)
             self.status.setText(f"換頻完成：{done} 台已經在 {target} 頻。")
 
-    def _stop(self, why: str) -> None:
-        if self._job is None:
+    # ------------------------------------------------------------------
+    # 自動組隊
+    # ------------------------------------------------------------------
+    def _do_team(self) -> None:
+        if self._job is not None:
             return
-        for pid in list(self._job["prep"]) + list(self._job["pend"]) + \
-                list(self._job["wait"]):
-            self._state_txt[pid] = "已停止"
+        wins = sorted(preload.windows(), key=lambda w: w.pid)
+        picked = self._checked_pids()
+        if len(picked) < 2:
+            self.status.setText("自動組隊至少要勾兩台。")
+            return
+        # ⚠ 同一頻才組得起來（隊伍是伺服器端的，跨分流根本收不到邀請）。
+        #   這是「大聲停用」不是安靜略過 —— 讓使用者知道要先換頻。
+        chans = {}
+        for pid in picked:
+            w = self._win_of(pid, wins)
+            chans[pid] = channel.current(w.hwnd) if w else None
+        if None in chans.values():
+            bad = [self._name_of(pid) for pid, c in chans.items() if c is None]
+            self.status.setText(f"⚠ 這幾台還沒進遊戲：{'、'.join(bad)}")
+            return
+        if len(set(chans.values())) > 1:
+            spread = "、".join(f"{self._name_of(p)}={c}頻"
+                               for p, c in chans.items())
+            self.status.setText(
+                f"⚠ 勾選的分身不在同一頻（{spread}），組隊會收不到邀請。"
+                "請先用上面的「換頻」把他們弄到同一頻。")
+            return
+        # ⚠⚠ 邀請封包帶的是**角色名**。角色名沒解析出來時 name_of() 會退回
+        #   帳號 —— 拿帳號去邀請等於邀請一個不存在的人（而且是安靜地失敗）。
+        #   所以這裡當場補掃一次，補不到就整個拒絕動作。
+        unresolved = []
+        for pid in picked:
+            w = self._win_of(pid, wins)
+            acc = _acct(w.title) if w else ""
+            if acc and preload.name_of(pid, account=acc) == acc:
+                self._resolve_name(pid, acc)
+            if not acc or preload.name_of(pid, account=acc) == acc:
+                unresolved.append(acc or str(pid))
+        if unresolved:
+            self.status.setText(
+                f"⚠ 這幾台讀不出角色名：{'、'.join(unresolved)}。"
+                "邀請封包帶的是角色名，讀不到就不送 —— 請按「重新整理」再試。")
+            return
+        self._state_txt.clear()
+        for pid in picked:
+            self._state_txt[pid] = "準備中…"
+        self._update_rows(wins)
+        self._job = {
+            "kind": "team", "phase": "start", "prep": list(picked),
+            "pend": [], "all": [], "leader": None, "targets": [],
+            "cur": None, "next_invite": 0.0, "next_join": 0.0,
+            "next_leave": 0.0, "share": int(self.share.currentData()),
+        }
+        self._busy_ui(True)
+        self.status.setText(f"準備中 0/{len(picked)}（正在裝跳板）…")
+        QTimer.singleShot(0, self._prep_tick)
+
+    def _name_of(self, pid: int) -> str:
+        r = self._pids.index(pid) if pid in self._pids else -1
+        it = self.table.item(r, COL_NAME) if r >= 0 else None
+        return it.text() if it is not None else str(pid)
+
+    def _team_tick(self, job, wins) -> None:
+        now = time.monotonic()
+        alive = {w.pid for w in wins}
+
+        # --- 開場：跳板都裝好了才決定隊長與邀請名單 -------------------
+        if job["phase"] == "start":
+            job["all"] = [p for p in job["pend"] if p in alive]
+            if len(job["all"]) < 2:
+                self._job = None
+                self._busy_ui(False)
+                self.status.setText("⚠ 能用的分身不到兩台（跳板裝不上？），組隊取消。")
+                return
+            job["leader"] = job["all"][0]
+            job["targets"] = job["all"][1:]
+            self._state_txt[job["leader"]] = "隊長"
+            job["phase"] = "robot_off"
+
+        # --- 中途被關掉的分身要踢出任務 ------------------------------
+        for pid in [p for p in job["all"] if p not in alive]:
+            job["all"].remove(pid)
+            if pid in job["targets"]:
+                job["targets"].remove(pid)
+            if job["cur"] == pid:
+                job["cur"] = None
+            self._state_txt[pid] = "⚠ 分身已關閉"
+        if job["leader"] not in alive:
+            self._job = None
+            self._busy_ui(False)
+            self.status.setText("⚠ 隊長那台被關掉了，組隊中止。")
+            return
+
+        # --- ① 全部關掉天使守護精靈總開關 -----------------------------
+        if job["phase"] == "robot_off":
+            for pid in job["all"]:
+                self._robot(pid, False)
+            self.status.setText("已關掉天使守護精靈，接著清空原本的隊伍…")
+            job["phase"] = "leave"
+            job["next_leave"] = 0.0
+            return
+
+        # --- ② 有隊伍的通通退組（等隊員名單真的清空才算數）------------
+        if job["phase"] == "leave":
+            waiting = []
+            for pid in job["all"]:
+                sc = self._scanners.get(pid)
+                got = team.members(sc) if sc is not None else None
+                if got is None:
+                    waiting.append(f"{self._name_of(pid)}(讀不到)")
+                    self._state_txt[pid] = "⚠ 讀不到隊伍狀態"
+                elif got:
+                    waiting.append(self._name_of(pid))
+                    self._state_txt[pid] = "退組中…"
+                elif not self._state_txt.get(pid, "").startswith("✅"):
+                    self._state_txt[pid] = "沒隊伍了"
+            if not waiting:
+                job["phase"] = "invite"
+                self._state_txt[job["leader"]] = "隊長"
+                return
+            if now >= job["next_leave"]:
+                job["next_leave"] = now + LEAVE_GAP
+                for pid in job["all"]:
+                    sc = self._scanners.get(pid)
+                    if sc is not None and team.members(sc):
+                        team.leave(self._movers.get(pid))
+            self.status.setText(
+                f"退組中：還有 {'、'.join(waiting)} 沒清空　—— 要停請按「停止」")
+            return
+
+        # --- ③④ 一個一個邀請，等他真的進隊伍才換下一個 ---------------
+        if job["phase"] == "invite":
+            lead_sc = self._scanners.get(job["leader"])
+            mates = team.members(lead_sc) if lead_sc is not None else None
+            names = {m.name for m in mates} if mates else set()
+
+            if job["cur"] is not None:
+                want = self._name_of(job["cur"])
+                if want in names:                       # ★ 驗收訊號＝真的在名單裡
+                    self._state_txt[job["cur"]] = "✅ 已入隊"
+                    job["cur"] = None
+                else:
+                    if now >= job["next_invite"]:
+                        job["next_invite"] = now + INVITE_GAP
+                        ok, why = team.invite(
+                            self._movers.get(job["leader"]), want, job["share"])
+                        if not ok:
+                            self._state_txt[job["cur"]] = f"⚠ {why}"
+                    if now >= job["next_join"]:
+                        job["next_join"] = now + JOIN_GAP
+                        sc = self._scanners.get(job["cur"])
+                        if sc is not None:
+                            team.join(self._movers.get(job["cur"]), sc)
+                    self.status.setText(
+                        f"邀請 {want} 入隊中…（已入隊 {len(names)} 人）"
+                        "　—— 要停請按「停止」")
+                    return
+
+            if job["targets"]:
+                job["cur"] = job["targets"].pop(0)
+                job["next_invite"] = 0.0            # 立刻送第一次
+                job["next_join"] = now + JOIN_GAP   # 同意晚一點，等邀請先到
+                self._state_txt[job["cur"]] = "邀請中…"
+                return
+
+            job["phase"] = "robot_on"
+            return
+
+        # --- ⑤ 全部重新打開天使守護精靈總開關 -------------------------
+        if job["phase"] == "robot_on":
+            for pid in job["all"]:
+                self._robot(pid, True)
+            n = len(job["all"])
+            self._job = None
+            self._busy_ui(False)
+            self.status.setText(
+                f"組隊完成：{n} 人一隊（隊長 {self._name_of(job['leader'])}），"
+                "天使守護精靈已重新打開。")
+
+    def _robot(self, pid: int, on: bool) -> None:
+        """開／關某一台的天使守護精靈總開關（純寫記憶體，見 robot.set_run）。"""
+        sc = self._scanners.get(pid)
+        mv = self._movers.get(pid)
+        if sc is None or mv is None:
+            return
+        try:
+            robot.set_run(mv, sc, on)
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _stop(self, why: str) -> None:
+        job = self._job
+        if job is None:
+            return
+        # ⚠⚠ 組隊做到一半被停掉，精靈還關著 —— 那是我們留下的副作用，
+        #   一定要收乾淨（使用者按停止是要「別再動了」，不是「幫我關精靈」）。
+        if job["kind"] == "team" and job["phase"] not in ("start", "robot_off"):
+            for pid in job.get("all", []):
+                self._robot(pid, True)
+            why = (why + "，天使守護精靈已重新打開") if why else why
+        for pid in (list(job["prep"]) + list(job.get("pend", []))
+                    + list(job.get("wait", {})) + list(job.get("all", []))):
+            if not self._state_txt.get(pid, "").startswith("✅"):
+                self._state_txt[pid] = "已停止"
         self._job = None
-        self.go_btn.setEnabled(self.chan.count() > 0)
-        self.chan.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self._busy_ui(False)
         if why:
             self.status.setText(why + "（已經送出去的那幾包不會收回）")
