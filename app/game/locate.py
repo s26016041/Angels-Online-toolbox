@@ -146,6 +146,23 @@ SIGS: tuple[Sig, ...] = (
     Sig("robot", "RUN_FLAG", "data", 2,
         "C7 05 A4 FB 9C 00 FF FF FF FF C3 C7 05 A4 FB 9C 00 00 00 00 00 C3",
         0x009CFBA4),
+    # 組隊：同意／踢人／升隊長／退組／解散／拒絕 共用的封包函式。
+    # 跟 attack.SELECT_FN、sell.TALK_FN 是同一個模子（`6A 長度 / 6A 代號 /
+    # call 建封包`），差別只在代號 0x18 —— 特徵一定要蓋到那兩個 push
+    # 與後面「把動作寫進 +2、參數寫進 +3」那兩行，不然三支會互相命中。
+    Sig("team", "ACTION_FN", "fn", None,
+        "55 8B EC 83 EC 10 6A 07 6A 18 8D 4D F0 E8 ?? ?? ?? ?? 8B 4D F4"
+        " 8A 45 08 FF 75 FC 88 41 02 8B 45 0C 89 41 03 FF 35 D0 67 9B 00"
+        " E8 ?? ?? ?? ?? 59 59 C9 C2 08 00",
+        0x005D5355),
+    # 組隊邀請。函式頭是 SEH 序言（`push 0x2C / mov eax,例外處理表`），
+    # 那個表位址是模組內立即值，會被 _auto_mask 遮掉；靠 `6A 24 6A 17`
+    # （內文 36、代號 0x17）與後面取名字、取分配方式那幾行當骨架。
+    Sig("team", "INVITE_FN", "fn", None,
+        "6A 2C B8 72 6A 7C 00 E8 ?? ?? ?? ?? 8B 45 08 8D 4D D8 50"
+        " E8 ?? ?? ?? ?? 6A 24 6A 17 8D 4D C8 C7 45 FC 00 00 00 00"
+        " E8 ?? ?? ?? ?? 83 7D EC 0F",
+        0x005D538A),
     Sig("recall", "USE_ITEM_FN", "fn", None,
         "55 8B EC 83 EC 10 53 8B 5D 08 85 DB 78 4A 8D 4D F0 81 FB FF 00 00 00"
         " 7F 17 6A 07 6A 2E E8 ?? ?? ?? ??",
