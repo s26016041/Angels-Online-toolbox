@@ -125,10 +125,14 @@ SUPPLY_MAX_SECS = 600.0
 #   INV_RELOCATE_GAP 秒重試）。以前不重試，直接放著吊到 10 分鐘超時。
 RECALL_RETRY_SECS = 4.0
 RECALL_RETRIES = 4
-# ★ 趴趴GO傳送暫時送不出去時的重試（重連中連線是 0、跳板不在…）。
-#   以前是一次性計時器，失敗就沒有然後了 —— 人留在城裡等 10 分鐘超時停機。
-JUMP_RETRY_SECS = 20.0
-JUMP_RETRIES = 3
+# ★★ 趴趴GO回程：**封包送出去 ≠ 人到得了**（jumpmap.teleport 的說明就寫了
+#   「到不到得看伺服器」）。所以整段是「時間到送一次 → 盯著地圖有沒有真的變
+#   → 沒變就再送」，由 _supply_tick 的輪詢驅動（見 _jump_step）。
+#   ⚠⚠ 2026-08-09 使用者回報「卡在傳送中」的根因就是舊版**射後不理**：
+#     一次性計時器送完一包就再也沒有人確認，那一包沒生效就永遠回不去。
+#   ⚠ 不設重試上限（使用者要求：暫時性失敗一律自動重試）；出口是補給總逾時
+#     SUPPLY_MAX_SECS 那一聲「已停止掛機」＋通知，不會安靜地卡著。
+JUMP_LAND_SECS = 20.0           # 送出後等這麼久還沒到，就當那一包沒生效 → 再送
 JUMP_BACK_SECS = 180.0          # ★「用天使趴趴GO回地圖」等多久才傳（使用者指定 3 分鐘）
 # ★「死亡自己回練功區」：死了倒數幾秒後送「回標記點」封包復活（使用者指定
 #   3 秒；等死亡視窗出來就好，不再靠精靈復活＋趴趴GO傳送那條舊路）。
@@ -1214,7 +1218,10 @@ class CharFarmPage(QWidget):
         self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._recall_try = 0       # 回程第二段重試了幾次（見 _retry_recall）
-        self._jump_try = 0         # 趴趴GO重試了幾次（見 _retry_jump）
+        # 趴趴GO回程的狀態（見 _jump_step）。⚠ 三個都要在 _start_supply 歸零。
+        self._jump_n = 0           # 這一趟送出去幾次了（顯示用，不設上限）
+        self._jump_sent = None     # 最後一次送出時的 _supply_t（None = 還沒送過）
+        self._jump_off = ""        # 趴趴GO走不通的原因（有字就不再試，標籤顯示它）
         self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
         # 死亡回程模式（勾了「死亡自己回練功區」，角色死掉才會進，見 _death_tick）
         self._death = False        # 進行中（我們完全讓開，等復活）
@@ -1224,7 +1231,9 @@ class CharFarmPage(QWidget):
         self._death_pos = None     # 死在哪（同圖多落點時挑最近的）
         self._death_try = 0.0      # 死亡滿幾秒才（再）送「回標記點」
         self._death_sent = False   # 至少送出去過一次了（狀態列顯示用）
-        self._death_jumped = False # 復活後的趴趴GO已送出，接下來只等著陸
+        # 復活後的趴趴GO是什麼時候送出去的（_death_t 的值；None = 還沒送）。
+        # ⚠ 不是 bool：等超過 JUMP_LAND_SECS 沒到就要當那一包沒生效、再送一次。
+        self._death_jumped = None
         self._death_closed = False # 死亡選擇視窗已經關掉了（一次死亡只關一次）
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
@@ -1641,6 +1650,8 @@ class CharFarmPage(QWidget):
             "・傳完就照原本的流程接回自動戰鬥\n"
             "・同一張地圖有好幾個落點時，挑**離你出發位置最近**的那個\n"
             "・時間到時如果人已經回到原地圖了就不傳\n"
+            f"・送出去之後會**盯著地圖有沒有真的變**，{JUMP_LAND_SECS:.0f} 秒\n"
+            "　 還沒到就再送一次（不限次數，直到補給逾時為止）\n"
             "⚠ 走的是遊戲自己的傳送封包，跟你手動開趴趴GO按下去完全一樣，\n"
             "　 所以**傳送費用、等級限制**照樣算。\n"
             "⚠ 那張地圖不在趴趴GO清單裡就不傳（會在狀態列說一聲）。\n"
@@ -1900,7 +1911,6 @@ class CharFarmPage(QWidget):
             self._supply_left = True        # 已經在外面了，等它回來就好
             self._drop_cached_addrs()
             self._schedule_af_off()
-            self._schedule_jump_back()
             say(f"★ 客戶端已自己回程（現在在 {now}）→ 略過我們的回程")
             return
         ok, msg = robot.do_recall(self._mover, self.sc, self.inv)
@@ -1911,7 +1921,6 @@ class CharFarmPage(QWidget):
             return
         self._drop_cached_addrs()
         self._schedule_af_off()
-        self._schedule_jump_back()
         say("🔧 已交給天使精靈跑補給　" + msg)
 
     def _retry_recall(self, note: str) -> bool:
@@ -1945,69 +1954,61 @@ class CharFarmPage(QWidget):
             lambda: (self._mover is not None and self._mover.active
                      and robot.autofight_off(self._mover, self.sc)))
 
-    def _schedule_jump_back(self) -> None:
-        """勾了「使用天使趴趴GO回地圖」的話，排定幾分鐘後直接傳回原地圖。
+    def _jump_step(self, here: int | None) -> str:
+        """趴趴GO回程的一步：時間到就送、送了沒到就再送。回傳要接在狀態列後
+        面的短句（沒事就空字串）。由 `_supply_tick` 每 `SUPPLY_POLL` 秒叫一次。
 
-        ★ 用計時器而不是掛在補給的輪詢上 —— 補給那段時間輪詢在做別的事，
-          而這件事只跟「觸發之後過了多久」有關，各自算比較單純。
-        ⚠ 補給一趟就一個號碼（_supply_gen）：中途又按一次、或補給提早結束，
-          舊的計時器醒來看到號碼對不上就自己作廢，不會亂傳。
+        ⚠⚠⚠ **這支的存在理由**（2026-08-09 使用者回報「卡在傳送中…」）：
+          `jumpmap.teleport()` 只保證「封包送出去了」，到不到得看伺服器。
+          舊版是一次性計時器 —— 180 秒到了送一包，然後把「傳送中…」掛在畫面上
+          就再也沒有人管。那一包只要沒生效（伺服器不收、正在載地圖、指令槽忙、
+          跳板剛好不在），人就永遠留在城裡，畫面卻一直寫著「傳送中…」。
+          現在改成**盯著地圖有沒有真的變**，沒變就再送 —— 不設重試上限
+          （使用者要求），出口是補給總逾時那一聲停機＋通知。
+
+        ⚠ 「到了沒」一律用 same_map 比對 —— 分流的場景編號不一樣（天使學園
+          41/141/241），趴趴GO 的落點都在本流，拿編號硬比會把「已經站在同一
+          張圖」看成「還沒回去」。
         """
-        if not self.sup_jump_cb.isChecked():
-            return
+        if self._jump_off or not self.sup_jump_cb.isChecked():
+            return ""
         if self._supply_scene is None:
-            self.status.setText("⚠ 不知道出發地圖，這趟不用趴趴GO傳回去")
-            return
-        gen = self._supply_gen
-        QTimer.singleShot(int(JUMP_BACK_SECS * 1000),
-                          lambda: self._jump_back(gen))
-
-    def _jump_back(self, gen: int) -> None:
-        """時間到，用遊戲的傳送封包回原本那張地圖。
-
-        ⚠ 「回來了沒」一律用 same_map 比對 —— 分流的場景編號不一樣
-          （天使學園 41/141/241），趴趴GO 的落點都在本流，拿編號硬比
-          會把「已經站在同一張圖」看成「還沒回去」。
-        """
-        say = self.status.setText
-        if gen != self._supply_gen or self._supply_scene is None:
-            return                              # 上一趟排的，早就過期了
-        now = scene.current(self.sc, allow_scan=False)
-        if now is not None and scene.same_map(now.id, self._supply_scene):
-            return                              # 精靈已經自己走回來了
-        if not (self._mover is not None and self._mover.active):
-            if not self._retry_jump(gen, "跳板不在，沒辦法傳回去"):
-                say("⚠ 跳板一直不在，趴趴GO放棄（等精靈自己走回來）")
-            return
+            self._jump_off = "不知道出發地圖"
+            return ""
+        if self._supply_t < JUMP_BACK_SECS:
+            return ""                       # 還在倒數
+        # ⚠ 讀不到現在在哪張圖就**不要送**：那多半正在載地圖（本來就該等），
+        #   也可能人其實已經到了。CLAUDE.md 的鐵則：驗不過就不要動作。
+        if here is None:
+            return "　⚠ 讀不到目前地圖，趴趴GO先等一下"
+        if scene.same_map(here, self._supply_scene):
+            return ""                       # 已經在原圖了，上面就會判定補完
+        if (self._jump_sent is not None
+                and self._supply_t - self._jump_sent < JUMP_LAND_SECS):
+            return "　✈ 趴趴GO已送出，等著陸…"
         pos = self._supply_pos or (None, None)
         e = jumpmap.nearest(self._supply_scene, pos[0], pos[1])
         if e is None:
-            # 表裡真的沒這張圖 → 重試也不會變出來，讓精靈自己走回來，
-            # SUPPLY_MAX_SECS 當兜底。
-            say("⚠ 趴趴GO 沒有回"
-                f"{scene.scene_name(self._supply_scene)}的傳送點")
-            return
+            # 表裡真的沒這張圖的落點 → 再送幾次也變不出來。停掉趴趴GO、
+            # 讓精靈自己走回來（SUPPLY_MAX_SECS 當兜底），並且**把原因寫在
+            # 標籤上** —— 不准繼續顯示「傳送中…」騙人。
+            self._jump_off = (scene.scene_name(self._supply_scene)
+                              + "沒有傳送點")
+            return f"　⚠ 趴趴GO 沒有回{scene.scene_name(self._supply_scene)}的傳送點"
+        # ⚠ 跳板不在就**重裝**（_ensure_mover），不要空等它自己變回來 ——
+        #   舊版只是每 20 秒看一次 `.active`，看三次沒好就整個放棄。
+        if not self._ensure_mover():
+            return "　⚠ 跳板裝不起來，趴趴GO下一輪再試"
         ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
-        self._drop_cached_addrs()
-        if not ok and self._retry_jump(gen, msg):
-            return                              # 暫時性失敗 → 已排重試
-        say((f"★ 補給 {JUMP_BACK_SECS / 60:.0f} 分鐘到 → " if ok else "⚠ ")
-            + msg)
-
-    def _retry_jump(self, gen: int, note: str) -> bool:
-        """趴趴GO暫時送不出去（重連中連線是 0、跳板重掛中…）→ 過幾秒再試。
-
-        重試醒來會先看「已經回來了沒」再決定要不要送（見 _jump_back 開頭），
-        所以就算精靈在這段時間自己走回來了也不會多傳一次。
-        """
-        if self._jump_try >= JUMP_RETRIES:
-            return False
-        self._jump_try += 1
-        QTimer.singleShot(int(JUMP_RETRY_SECS * 1000),
-                          lambda: self._jump_back(gen))
-        self.status.setText(f"⚠ {note}　→ {JUMP_RETRY_SECS:.0f} 秒後再試趴趴GO"
-                            f"（第 {self._jump_try}/{JUMP_RETRIES} 次）")
-        return True
+        self._drop_cached_addrs()           # 傳送會換地圖，快取位址全作廢
+        if not ok:
+            # 暫時性失敗（連線是 0＝正在重連、指令槽忙…）→ 下一輪再送。
+            # 不動 _jump_sent，所以是每 SUPPLY_POLL 秒重試，不用等著陸窗。
+            return f"　⚠ 趴趴GO 送不出去（{msg}）→ 下一輪再試"
+        self._jump_n += 1
+        self._jump_sent = self._supply_t
+        return (f"　✈ {msg}"
+                + (f"（第 {self._jump_n} 次）" if self._jump_n > 1 else ""))
 
     # ------------------------------------------------------------------
     # -- 死亡回程（勾了「死亡自己回練功區」才會進）-------------------------
@@ -2027,7 +2028,7 @@ class CharFarmPage(QWidget):
         self._death_pos = self.my_pos()      # 屍體的位置還讀得到，拿來挑落點
         self._death_try = DEATH_REVIVE_SECS
         self._death_sent = False
-        self._death_jumped = False
+        self._death_jumped = None
         self._death_closed = False
         # 我們自己完全讓開（跟交棒補給時一樣）：不送技能鍵、不寫目標
         self._keys.set_on(False)
@@ -2103,19 +2104,21 @@ class CharFarmPage(QWidget):
             self._death = False
             self._since_scan = RESCAN_GAP        # 立刻重掃，馬上接回打怪
             self.status.setText("★ 已回到練功地圖 → 接回自動戰鬥"
-                                if self._death_jumped else
+                                if self._death_jumped is not None else
                                 "★ 復活了 → 接回自動戰鬥")
             return True
 
         if alive:
             # 復活了、但人在標記點那張圖（通常是城裡）→ 趴趴GO傳回練功區
-            if self._death_jumped:
-                return True                      # 傳送送出去了，等著陸
+            # ⚠⚠ 跟補給那邊同一個坑（見 _jump_step）：**送出去 ≠ 到得了**。
+            #   舊版送完就把 _death_jumped 舉起來乾等，那一包沒生效就一路等到
+            #   DEATH_WAIT_MAX 停機。現在等 JUMP_LAND_SECS 沒到就再送一次。
+            if self._death_jumped is not None:
+                if self._death_t - self._death_jumped < JUMP_LAND_SECS:
+                    return True                  # 送出去了，還在等著陸
+                self._death_jumped = None        # 等太久 = 沒生效 → 再送一次
             if self._death_scene is None:
                 self._death_fail("死亡時不知道人在哪張地圖，沒辦法傳回去")
-                return True
-            if not self._ensure_mover():
-                self._death_fail("跳板裝不起來，沒辦法用趴趴GO傳回去")
                 return True
             pos = self._death_pos or (None, None)
             e = jumpmap.nearest(self._death_scene, pos[0], pos[1])
@@ -2123,12 +2126,18 @@ class CharFarmPage(QWidget):
                 self._death_fail(f"{scene.scene_name(self._death_scene)}"
                                  "不在趴趴GO清單裡，沒辦法傳回去")
                 return True
+            # ⚠ 跳板裝不起來／指令槽正忙都是**暫時性失敗** —— 下一拍再試就好，
+            #   不要為了這個直接停機（DEATH_WAIT_MAX 還是會兜底＋通知）。
+            if not self._ensure_mover():
+                self.status.setText("★ 復活了 → 跳板裝不起來，再試著趴趴GO…")
+                return True
             ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
             self._drop_cached_addrs()            # 傳送必換地圖，位址全作廢
             if not ok:
-                self._death_fail(f"趴趴GO傳送失敗（{msg}）")
+                self.status.setText(f"★ 復活了 → 趴趴GO送不出去（{msg}），"
+                                    "下一拍再試…")
                 return True
-            self._death_jumped = True
+            self._death_jumped = self._death_t
             self.status.setText("★ 復活了 → 已用趴趴GO傳回練功區，等著陸…")
             return True
 
@@ -2224,7 +2233,11 @@ class CharFarmPage(QWidget):
         self._supply_pos = self.my_pos()
         self._supply_gen += 1
         self._recall_try = 0
-        self._jump_try = 0
+        # ★ 趴趴GO回程的倒數就是從這裡開始算的（_supply_t）—— 跟「回程補給」
+        #   那列的倒數標籤同一個時鐘，畫面寫什麼就是程式在做什麼。
+        self._jump_n = 0
+        self._jump_sent = None
+        self._jump_off = ""
         # ⚠ 這裡刻意**不**重驗「標記傳送捲軸」的設定 —— 開始掛機時關過一次
         #   就夠了，之後使用者在遊戲裡改回去是他自己的決定（使用者明講）。
         # ★ 第一段：調好開關 + 設中心點。第二段（回程）隔幾秒才送，
@@ -2265,15 +2278,28 @@ class CharFarmPage(QWidget):
 
         補給中就倒數到傳送；死亡回程時同一格顯示那邊的倒數。
         其餘時間留白。⚠ 只在字串真的變了才 setText —— 心跳是 10ms 一拍。
+
+        ⚠⚠ **不准再出現一個永遠不會變的「傳送中…」**（使用者 2026-08-09 回報
+          「卡在傳送中」）。倒數走完之後這裡一律顯示**現在到底卡在哪一步**：
+          還沒送出、送出後等著陸幾秒、送了第幾次、或是根本走不通的原因。
         """
         txt = ""
         if self._supply and self.sup_jump_cb.isChecked():
-            if self._supply_scene is None:
+            if self._jump_off:
+                txt = f"趴趴GO：{self._jump_off}"
+            elif self._supply_scene is None:
                 txt = "趴趴GO：不知道出發地圖"
             else:
                 left = max(0.0, JUMP_BACK_SECS - self._supply_t)
-                txt = (f"趴趴GO 倒數 {_mmss(left)}" if left > 0
-                       else "趴趴GO 傳送中…")
+                if left > 0:
+                    txt = f"趴趴GO 倒數 {_mmss(left)}"
+                elif self._jump_sent is None:
+                    txt = "趴趴GO 準備傳送…"
+                else:
+                    wait = max(0.0, self._supply_t - self._jump_sent)
+                    txt = (f"趴趴GO 已送出 {wait:.0f} 秒，等著陸"
+                           + (f"（第 {self._jump_n} 次）"
+                              if self._jump_n > 1 else ""))
         elif self._death:
             left = max(0.0, DEATH_REVIVE_SECS - self._death_t)
             txt = (f"死亡回程 倒數 {_mmss(left)}" if left > 0
@@ -2293,8 +2319,14 @@ class CharFarmPage(QWidget):
         self._supply_t += dt
         self._supply_poll += dt
         if self._supply_t >= SUPPLY_MAX_SECS:
+            # ★ 把趴趴GO試了幾次一起講出來 —— 「送了 20 次都沒到」跟「精靈自己
+            #   走太慢」是兩件完全不同的事，訊息裡分不出來就沒辦法往下查。
             self._end_supply(
-                f"🔧 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒完成 → 已停止掛機",
+                f"🔧 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒完成 → 已停止掛機"
+                + (f"（趴趴GO 送了 {self._jump_n} 次都沒到，"
+                   "傳送費用不夠？等級不足？）" if self._jump_n else "")
+                + (f"（趴趴GO 沒用上：{self._jump_off}）"
+                   if self._jump_off else ""),
                 stop=True)
             return True
         if self._supply_poll >= SUPPLY_POLL:
@@ -2317,10 +2349,14 @@ class CharFarmPage(QWidget):
                         f"🔧 補給完成，已回到{now}{note}　"
                         f"共花 {_mmss(self._supply_t)}")
                     return True
+            # ★ 趴趴GO回程（送 → 盯著地圖有沒有真的變 → 沒變就再送）。
+            #   放在完成判斷**之後**：已經回到原圖的話上面就 return 了。
+            jump = self._jump_step(here)
             self.status.setText(
                 f"🔧 天使精靈補給中…（{_mmss(self._supply_t)}）"
                 + (f"　目前在 {now}" if now else "")
-                + ("" if robot.is_run(self.sc) else "　⚠ 精靈已停下"))
+                + ("" if robot.is_run(self.sc) else "　⚠ 精靈已停下")
+                + jump)
         return True
 
     # ------------------------------------------------------------------
@@ -2534,7 +2570,12 @@ class CharFarmPage(QWidget):
 
         ★ 只有「切換的那幾秒」會暫停，**停留期間照常掛機** ——
           不然巡迴就只是在浪費時間。
+        ⚠ 補給那一趟完全不換頻：換頻會斷線重連、把人丟到別的分流，
+          正在跑回程的精靈跟排著的趴趴GO都會被打斷（回不去的成因之一）。
+          這裡不累積時間，補給結束後接著算就好。
         """
+        if self._supply:
+            return False
         if not self.rot_cb.isChecked():
             if self._rot_seq or self._rot_settle:
                 self._rot_seq, self._rot_settle = [], 0.0
@@ -3339,16 +3380,32 @@ class CharFarmPage(QWidget):
                 else:
                     self.stats = None       # 物件搬家了，等下次掃描重新定位
 
+        # ★ 補給中就整個讓開 —— 那段時間是天使精靈在開車，我們不能同時下指令。
+        #
+        # ⚠⚠⚠ **一定要在 `state is None` 的提早 return 之前**（跟 `_death_tick`
+        #   同一個理由）。補給整趟都在換地圖（回程道具 → 城裡、趴趴GO → 練功區），
+        #   而換地圖時狀態物件會搬家，`self.state` 有好幾秒是 None ——
+        #   放在後面的話那段期間 `_supply_tick` 根本不會跑：
+        #     · 「回到原地圖了沒」不檢查 → 回來了也不知道
+        #     · `_supply_t` 不累加 → **連 10 分鐘逾時的保險都不會響**
+        #   結果就是畫面永遠停在「趴趴GO 傳送中…」而且沒有任何人管
+        #   （使用者 2026-08-09 回報）。補給期間我們完全不碰狀態物件
+        #   （不寫目標、不送鍵），本來就不需要它。
+        #
+        # ⚠⚠⚠ **也一定要在 `_rest_tick` 之前**，同一個道理：補給的觸發常常
+        #   就是「藥水用完」，那時血魔本來就低 → 一到城裡休息流程就接管、
+        #   讓角色坐下（`_rest_tick` 回 True），整個 tick 又被吃掉，
+        #   補給狀態機一樣凍住。而且補給那一趟是天使精靈在開車，
+        #   我們本來就不該同時叫角色坐下。
+        if self._supply_tick(dt):
+            return
+
         if self.state is None:
             return
 
         # ★ 休息（血/魔不足坐下）。收尾階段會回 False 讓它繼續打，
         #   只有真的坐下時才接管。放在讀完血魔之後（見上面那段的警告）。
         if self._rest_tick(dt):
-            return
-
-        # ★ 補給中就整個讓開 —— 那段時間是天使精靈在開車，我們不能同時下指令。
-        if self._supply_tick(dt):
             return
 
         # ★ 自動分身：時間快到了就補一次 F12（見 app/game/buff.py）。
