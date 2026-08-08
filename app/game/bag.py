@@ -18,8 +18,9 @@
     實體 + 0x2FC                       → 物品容器 std::vector
         +0x04 = 頭、+0x08 = 尾，每格 4 bytes 一個物品指標（0 = 空格）
 
-**陣列索引就是格號**（實測五台，非空格 355 個裡只有 2 個不一致 —— 那 2 個是
-格號 > 255 的倉庫格，物品自記的 `+0x25` 只有一個 byte 裝不下）。
+**陣列索引就是格號**（實測五台，非空格 355 個逐一比對物品自記的 `+0x25`，
+全部一致 —— 當初以為有 2 個不一致，那是把 `+0x25` 當 1 byte 讀造成的假象，
+見 `ITEM_SLOT`）。
 
 怎麼反推出來的
 --------------
@@ -91,6 +92,11 @@ ITEM_DURA = 0x2C            # 耐久現值（u16）；0 = 沒耐久這回事，�
 ITEM_TIMELIMIT = 0x2E       # ★ 時限；**0 ＝ 沒時限**。非 0 的東西遊戲不讓分解
 ITEM_TMPL = 0x58            # 指向這種物品的範本
 ITEM_SPAN = 0x5C            # 一次要讀多少 bytes 才涵蓋上面全部
+# ★ 能量／經驗值欄（遊戲的 `getenergy`）。紙娃娃裝的是晶化能量、技能經驗球裝的
+#   是累積的經驗 —— 同一個欄位，看物品分類決定意義。
+#   ⚠ 在 `ITEM_SPAN` 之外，要另外讀（不併進上面那一拍：ITEM_SPAN 是每件物品都會
+#   讀的，拉長到 0xA4 會讓貼著區段結尾的物件整批讀取失敗 → 假的「背包空了」）。
+ITEM_ENERGY = 0xA0
 
 TMPL_KIND = 0x18            # 分類代號（1:1 對到 item.xml 的「物品類別」，見下）
 TMPL_DURA_MAX = 0xDC        # ★ 耐久上限；> 0 ＝ 這是裝備／武器
@@ -152,7 +158,9 @@ DOLL_WORN_LAST = 249
 GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）
 GOLD_TYPE = 1              # 金幣的種類 ID
 
-_MAX_SLOTS = 4096           # 容器格數的合理上限（實測 743）
+MAX_SLOTS = 4096            # 容器格數的合理上限（實測 743）
+                            # ★ 也是「格號的合理上限」：超過就是讀到垃圾，
+                            #   不是真的格子（inventory._slot_of 借用）。
 
 # ★★ 品質（普通白／優質藍／頂級橘）—— **不是靠名字認的**。
 #
@@ -282,7 +290,7 @@ def head(scanner) -> tuple[int, int] | None:
     if not begin or end < begin:
         return None
     count = (end - begin) // 4
-    if not 0 < count <= _MAX_SLOTS:
+    if not 0 < count <= MAX_SLOTS:
         return None
     return begin, count
 

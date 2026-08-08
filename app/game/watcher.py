@@ -225,6 +225,10 @@ class StatsWorker(QThread):
         # ⚠ 不做「同格號去重」：_walk() 會連表頭前 24 格一起看（截斷防護），
         #   萬一外圍殘留指標也自稱第 8/9 格，挑哪個都可能安靜選錯 ——
         #   寧可兩筆都顯示（看得見的怪），也不要挑錯（看不見的錯）。
+        #   ★ 2026-08-08 使用者回報的「雪狐變成兩個左邊飾品」**不是**殘留指標：
+        #     是 inventory 把格號當 1 byte 讀，裝扮隨身包第 264 格低位元組撞成 8
+        #     （已改成 u16，見 inventory.ITEM_SLOT_OFF）。這道「寧可顯示兩筆」的
+        #     設計反而讓錯誤被看見，所以留著。
         equipped, bag = [], []
         try:
             for slot, tid, _cnt, p in inventory._walk(sc, head):

@@ -19,6 +19,11 @@
       結構 +0x08 = 種類 ID（就是 items.py 那張表的鍵）
       結構 +0xA0 = 技能經驗球的累積值（也就是 AOB 特徵找到的那個位址）
 
+    ★★ 物品結構的**欄位表在 `bag.py`**（從遊戲綁給 Lua 的 `ItemData` 方法表
+       逐支反組譯出來的），這支只借用、不自己維護一份 —— 兩份各自寫死就會
+       各自過期：這裡曾把格號當 1 byte 讀，於是裝扮隨身包第 264 格
+       （264 & 0xFF = 8）被當成飾品欄左邊，收益監控畫出「兩個左邊飾品」。
+
 怎麼定位這張表
 --------------
 用 AOB 找到任一顆球的結構位址後，反向搜「誰精確指著它」——那個位置就是它所在的
@@ -31,7 +36,7 @@
   1. 刷掉不是物品的候選（走過頭會停在空白上）
   2. 看**誰被別的結構指著**：實測真表頭被指 1～9 次，往前每一格都是 0 次
   3. 最後再確認前 64 格裡有夠多有效物品指標（真表有 90 幾個，巧合命中只有一兩個）
-  4. ★ 回傳前再用 `align_head()` 依「物品自己記的格號」（+0x25）校正 ——
+  4. ★ 回傳前再用 `align_head()` 依「物品自己記的格號」（+0x25，**u16**）校正 ——
      前三步在少數機台仍會偏格（實測偏過 5 格與 6 格），偏了的表頭每一格都
      讀得到「像對的東西」，只是整排錯位：飾品欄讀成空格、裝備中的球被當成
      背包裡的。所以**任何拿格號當意義的讀取，一律認物品自記的格號**
@@ -47,6 +52,8 @@ from collections import Counter
 
 import numpy as np
 
+from app.game import bag
+
 # 陣列裡的格子索引
 SLOT_ACCESSORY = (8, 9)      # 飾品欄兩格
 EQUIP_SLOTS = 12             # 前 12 格是裝備欄，之後是空格與背包（版面說明用）
@@ -60,19 +67,21 @@ def slot_side(index: int) -> str:
     """格號 → 「左」/「右」；不是飾品欄就回空字串。"""
     return SLOT_SIDE.get(index, "")
 
-# 物品結構內的偏移
-ITEM_TYPE_OFF = 0x08         # 種類 ID
-ITEM_SLOT_OFF = 0x25         # ★ **物品自己記著它在第幾格**（單一 byte）
-ITEM_COUNT_OFF = 0x27        # 數量（可疊物品，例如藥水 60 個）
-ITEM_DURA_OFF = 0x2C         # 耐久度現值；**0 = 壞掉**（使用者確認）
-# ⚠ +0x5C **不是**耐久上限。第一次量到五台都是 70 才會這樣猜，
-# 但遊戲重開後同一個欄位讀到 793772102 —— 那只是剛好同階武器的某個值。
-# 目前**沒有**已知的耐久上限欄位，所以只用「現值 0 = 壞掉」做判斷。
-ITEM_DURA_MAX_OFF = 0x5C     # 保留供日後查證，別拿來當上限用
-DURA_MAX_SANE = 1000         # 超過這個就當作讀到的不是上限
-ITEM_BALL_OFF = 0xA0         # 技能經驗球的值
-
-SLOT_WEAPON = 3              # 武器欄
+# 物品結構內的偏移 —— ★★ **一律借 `bag.py` 那一份，這裡不留第二份。**
+#   兩份各自寫死就會各自過期，而且不會有人警告：這支原本把格號當 **1 byte** 讀
+#   （`bag.py` 早就從遊戲自己的 `getslot`＝`movzx eax, word [this+0x25]` 確認是
+#   u16），於是裝扮隨身包第 264 格（264 & 0xFF = 8）被當成飾品欄左邊 ——
+#   使用者實機遇到「雪狐變成兩個左邊飾品」（水之聖光城，種類 4944，
+#   2026-08-08 五台實測只有雪狐中招）。同一類錯還會把第 259 格讀成武器欄。
+ITEM_TYPE_OFF = bag.ITEM_TYPE      # 種類 ID
+ITEM_SLOT_OFF = bag.ITEM_SLOT      # ★ 物品自己記著它在第幾格（**u16**）
+ITEM_COUNT_OFF = bag.ITEM_COUNT    # 數量（可疊物品，例如藥水 60 個）
+ITEM_BALL_OFF = bag.ITEM_ENERGY    # 技能經驗球的值（＝遊戲的 getenergy）
+# 格號的合理上限：超過就是讀到垃圾，不是真的格子。★ 不可以再用「< 200」那種
+# 只裝得下 1 byte 的門檻 —— 裝扮隨身包本來就排到 251 以後。
+SLOT_SANE_MAX = bag.MAX_SLOTS
+# 一次讀多少 bytes 才涵蓋（種類 ID, 格號 u16, 數量 u16）
+ROW_SPAN = bag.ITEM_COUNT + 2
 
 # 判定表頭用：前這麼多格裡至少要有這麼多個有效物品指標
 HEAD_WINDOW = 64
@@ -248,49 +257,58 @@ def ball_value(scanner, ptr: int) -> int:
     return struct.unpack("<i", raw)[0] if raw else 0
 
 
-HEAD_BACK = 24               # 校正表頭時往前多看幾格
+HEAD_BACK = 24               # 校正表頭時往前多看幾格（只有 align_head 用）
 # ★ 走整條陣列時看多少格。⚠⚠ **這個值太小會變成「假的沒有」**：
 #   實測格號用到 174（白狐 172、嵐狐 174），原本寫 128 就會把放在後面的
-#   藥水判成「用完了」→ 誤觸發回程補給。遊戲本身最大格號 253，取 512 留足餘裕。
+#   藥水判成「用完了」→ 誤觸發回程補給。
+#   ⛔ 舊註解寫「遊戲本身最大格號 253」是錯的：容器實測**五台都是 743 格**
+#     （`bag.head()`），而且 251 起的裝扮隨身包真的用到 264（雪狐的水之聖光城）。
+#     所以窗口開到蓋得住整個容器，寧可多讀 1KB。
 #   成本很低：整段用 `read_pointers()` **一次讀進來**，不是一格發一次系統呼叫。
-FULL_WINDOW = 512
-# ★ 遊戲本身的最大格號是 253，所以「這條陣列我看完了」的最低標準就是
-#   覆蓋到表頭後 254 格。低於這個數的讀取結果只能拿來「找東西」，
-#   **不能拿來下「沒有／歸零」的結論**（見 _array_ptrs 與 count_by_types）。
+FULL_WINDOW = 768
+# ★ 「這條陣列我看完了」的最低標準。**不是陣列長度**，是「可疊消耗品可能待的
+#   最後一格」：背包／角色格都在 254 以內（實測藥水最遠 174），251 起的裝扮
+#   隨身包只放紙娃娃，不會有藥水或回程道具。覆蓋不到這個數的讀取結果只能拿來
+#   「找東西」，**不能拿來下「沒有／歸零」的結論**（見 count_by_types）。
 SLOT_CEILING = 254
+
+
+def _slot_of(raw) -> int | None:
+    """物品前 ROW_SPAN bytes → 它自己記的格號（**u16**，見 ITEM_SLOT_OFF）。"""
+    slot = struct.unpack_from("<H", raw, ITEM_SLOT_OFF)[0]
+    return slot if slot < SLOT_SANE_MAX else None
 
 
 def _item_slot(scanner, ptr: int) -> int | None:
     """這個指標指向的是不是物品？是的話回傳它自己記的格號。"""
     if not (0x01000000 < ptr < 0x40000000):
         return None
-    raw = scanner._read_bytes(ptr, ITEM_COUNT_OFF + 1)
-    if not raw or len(raw) < ITEM_COUNT_OFF + 1:
+    raw = scanner._read_bytes(ptr, ROW_SPAN)
+    if not raw or len(raw) < ROW_SPAN:
         return None
     tid = struct.unpack_from("<I", raw, ITEM_TYPE_OFF)[0]
     if not 0 < tid < MAX_ITEM_ID:
         return None
-    slot = raw[ITEM_SLOT_OFF]
-    return slot if slot < 200 else None
+    return _slot_of(raw)
 
 
 def _item_row(scanner, ptr: int) -> tuple[int, int, int] | None:
     """一次讀出 (格號, 種類 ID, 數量)；不像物品就回 None。
 
     ★ 判定條件跟 `_item_slot()` 一模一樣，只是**順便把數量一起帶回來**。
-      `_walk()` 以前是先叫 `_item_slot()` 讀 0x28 bytes，再自己重讀 0x29 bytes
+      `_walk()` 以前是先叫 `_item_slot()` 讀一次，再自己重讀一次
       —— 同一塊記憶體讀兩次，每件物品都白花一次系統呼叫。
     """
     if not (0x01000000 < ptr < 0x40000000):
         return None
-    raw = scanner._read_bytes(ptr, ITEM_COUNT_OFF + 2)
-    if not raw or len(raw) < ITEM_COUNT_OFF + 2:
+    raw = scanner._read_bytes(ptr, ROW_SPAN)
+    if not raw or len(raw) < ROW_SPAN:
         return None
     tid = struct.unpack_from("<I", raw, ITEM_TYPE_OFF)[0]
     if not 0 < tid < MAX_ITEM_ID:
         return None
-    slot = raw[ITEM_SLOT_OFF]
-    if slot >= 200:
+    slot = _slot_of(raw)
+    if slot is None:
         return None
     return slot, tid, struct.unpack_from("<H", raw, ITEM_COUNT_OFF)[0]
 
@@ -336,24 +354,18 @@ def align_head(scanner, head: int, window: int = HEAD_WINDOW) -> int:
     return votes.most_common(1)[0][0] if votes else head
 
 
-def find_by_slot(scanner, head: int, slot: int,
-                 window: int = HEAD_WINDOW) -> int | None:
+def find_by_slot(scanner, head: int, slot: int) -> int | None:
     """找出「自己說它在第 slot 格」的物品，回傳物件位址；沒有回傳 None。
 
     ★ 為什麼不直接用 `read_pointers(head)[slot]`：
       表頭有可能挑偏（實測五台裡有一台偏了 5 格，結果拿飾品當武器讀）。
-      這裡先用 align_head() 依格號校正，再認格號取值，完全不受表頭影響。
+      走 `_walk()` 就是先校正表頭、再認物品自記的格號，完全不受表頭影響。
       驗證：飾品確實落在 8、9 格，跟既有的 SLOT_ACCESSORY 完全吻合。
+    ⚠ 以前這裡自己走一遍陣列，而且只看前 64 格 —— 放在第 174 格的東西
+      永遠找不到（＝假的沒有）。現在直接借 `_walk()`，範圍就是整個容器。
     """
-    base = align_head(scanner, head, window)
-    if not base:
-        return None                 # 陣列搬家時呼叫端可能還拿著 None
-    ptrs = read_pointers(scanner, base, window)
-    if len(ptrs) != window:
-        ptrs = None                 # 讀不齊就逐格讀（跟以前一樣）
-    for i in range(window):
-        p = ptrs[i] if ptrs is not None else _dword(scanner, base + i * 4)
-        if p and _item_slot(scanner, p) == slot:
+    for s, _tid, _cnt, p in _walk(scanner, head):
+        if s == slot:
             return p
     return None
 
@@ -380,57 +392,96 @@ def find_by_type(scanner, head: int, type_id: int
     return None
 
 
-def _array_ptrs(scanner, base: int, window: int = FULL_WINDOW
-                ) -> tuple[list[int], int]:
-    """讀整條指標陣列，回傳 (指標清單, 覆蓋到表頭後第幾格)。
+def _resolve(scanner, head: int) -> tuple[int, int | None] | None:
+    """把呼叫端給的表頭變成「這一拍真的可以走的 (表頭, 格數)」；不可信就回 None。
 
-    ⚠⚠ **表頭前面那 24 格可能整段沒有映射**（陣列剛好貼著記憶體區段的開頭）。
-      ReadProcessMemory 對這種範圍是**整批失敗**，不是讀一半 ——
-      而 `read_pointers` 的減半重試救不了「開頭就讀不到」，因為起點沒變。
-      結果是整條陣列讀出來是空的：藥水全變 0、天使之翼也變 0
-      → 「水沒了」+「沒有回程道具」→ 掛機被停掉。
-      使用者實際遇到（黑狐，表頭 0x3ac35008，往前 96 bytes 就是未映射）。
-      所以讀不到就退一步，從表頭本身開始讀。
-    ⚠⚠ 反過來**尾端貼著區段結尾**時，減半重試會「成功但被截斷」——
-      只剩前面一小段、後面的格子整批看不見，而且沒有任何錯誤。
-      所以把「覆蓋到第幾格」一起回報：不足 SLOT_CEILING 就代表這次
-      沒看完整條，「沒數到」不能當「沒有」（見 count_by_types）。
-      這正是當年 FULL_WINDOW=128 太小 → 假的沒有 那個 bug 的動態翻版，
-      陣列搬家搬到貼區段尾端的位置就會發作。
+    ★★ 跟**遊戲自己的容器表頭**對帳：`bag.head()` 走的是遊戲取背包那條路
+      （實體 +0x2FC 的 vector，+0x04 頭 +0x08 尾），所以表頭與格數都是遊戲記的。
+      ✅ 2026-08-08 五台實測：AOB 反查 + `align_head()` 的結果跟它**完全一致**。
+
+    ⚠ 對不上就回 None（**安全退化**，呼叫端會走「還沒定位／沒看完」那條保守路）。
+      對不上只有兩種可能：這個表頭已經失效（陣列搬家，呼叫端下一拍會重新定位），
+      或它根本不是物品陣列 —— 兩種都不該繼續算，拿別人的陣列算出來的是
+      「很有自信的錯」（送錯格、藥水數錯），本專案一律當 bug。
+
+    ⚠ 問不到容器（還沒進場、換地圖中、MGR_PTR 定位失敗）時**不退化**：
+      照舊用呼叫端的表頭與固定窗口，行為跟以前一樣。
     """
-    start = base - HEAD_BACK * 4
-    ptrs = read_pointers(scanner, start, HEAD_BACK + window)
-    covered = len(ptrs) - HEAD_BACK
-    if len(ptrs) < HEAD_BACK + window and covered < SLOT_CEILING:
-        # 讀不齊而且覆蓋不夠 → 從表頭本身重讀一次，哪邊看得遠用哪邊
-        alt = read_pointers(scanner, base, window)
-        if len(alt) > covered:
-            return alt, len(alt)
-    return ptrs, covered
+    base = align_head(scanner, head) if head else 0
+    if not base:
+        return None
+    try:
+        got = bag.head(scanner)
+    except Exception:                                        # noqa: BLE001
+        got = None
+    if got is None:
+        return base, None            # 問不到 → 照舊（保守窗口）
+    begin, count = got
+    return (base, count) if begin == base else None
+
+
+def _array_ptrs(scanner, base: int, total: int | None,
+                window: int = FULL_WINDOW) -> tuple[list[int], bool]:
+    """讀整條指標陣列（**從表頭本身開始**），回傳 (指標清單, 整條看完了嗎)。
+
+    ⚠⚠ 以前是從「表頭前 24 格」開始讀，那 24 格**不屬於這條陣列**，兩種病都出過：
+
+      · 表頭剛好貼著記憶體區段的開頭時，前面那 24 格沒有映射，
+        ReadProcessMemory 對這種範圍是**整批失敗**（不是讀一半），而
+        `read_pointers` 的減半重試救不了「開頭就讀不到」（起點沒變）。
+        結果整條陣列讀出來是空的：藥水全變 0、天使之翼也變 0 →
+        「水沒了」＋「沒有回程道具」→ 掛機被停掉（黑狐，表頭 0x3ac35008，
+        往前 96 bytes 就是未映射）。
+      · 反過來，那 24 格**讀得到的時候更麻煩**：裡面可能躺著看起來完全正常的
+        殘留物品指標。2026-08-08 實測北極狐第 -23 格穩定放著一個
+        「1 級腐敗肉片」，自稱第 21 格 —— 撈進來就是憑空多一件：
+        飾品欄可能多一顆（使用者看到的「兩個左邊飾品」就是同一類症狀）、
+        藥水可能多一疊、`find_by_type` 可能把回程道具的格號挑到那一件身上
+        （送錯格＝安靜地做錯事，本專案一律當 bug）。
+
+      表頭前面本來就沒有東西該讀，所以直接從表頭開始，兩種病一起絕根。
+
+    ⚠⚠ 陣列的**尾端**同樣不能猜：讀過尾端就會撈到堆積裡的垃圾。實測黑狐容器
+      743 格，窗口開到 768 就多撈出 3 筆長得很正常的東西（見習手斧、粗糙的小餅乾，
+      都自稱**第 0 格**＝金幣格，其中一筆還重複兩次）。所以格數是**遊戲自己說的**
+      （`total`，由 `_resolve()` 問來），有就照它收手。
+
+    ⚠⚠ 尾端貼著區段結尾時，`read_pointers` 的減半重試會「成功但被截斷」——
+      只剩前面一小段、後面的格子整批看不見，而且沒有任何錯誤。所以第二個回傳值
+      是「整條看完了嗎」：沒看完的話「沒數到」不能當「沒有」（見 count_by_types）。
+      這正是當年 FULL_WINDOW=128 太小 → 假的沒有 那個 bug 的動態翻版。
+    """
+    ptrs = read_pointers(scanner, base, window if total is None
+                         else min(window, total))
+    # 問到格數 → 「看完」就是真的看完整條；問不到 → 退回「至少蓋到可疊消耗品
+    # 待得住的最後一格」這個保守標準（見 SLOT_CEILING）。
+    return ptrs, len(ptrs) >= (total if total is not None else SLOT_CEILING)
 
 
 def _walk(scanner, head: int, window: int = FULL_WINDOW):
     """走整條物品陣列，逐一吐出 (格號, 種類ID, 數量, 物件位址)。
 
-    ★ 指標**一次批次讀進來**（`read_pointers`），所以掃 512 格跟掃 128 格
-      的成本差不多 —— 沒有理由為了省時間去縮範圍。
-    ⚠ 只認「物品自己記得住格號」的（`_item_slot`），過濾掉陣列外圍的殘留指標。
+    ★ 指標**一次批次讀進來**（`read_pointers`），所以走完整條 743 格跟只看
+      128 格的成本差不多 —— 沒有理由為了省時間去縮範圍。
+    ⚠ 範圍是**表頭本身到遊戲說的容器尾端**（見 `_array_ptrs`）：往前一格、
+      往後一格都不是這條陣列的，那裡的殘留指標會變成憑空多出來的物品。
+    ⚠ 只認「物品自己記得住格號」的（`_item_slot`），過濾掉不是物品的殘留指標。
     ⚠ 讀取被截斷時這裡**照樣吐出**讀得到的那段（拿來找東西沒問題）——
       要下「沒有／歸零」結論的請改用 `count_by_types()`，它會回報完整性。
+    ⚠ 表頭跟遊戲的容器對不上時**什麼都不吐**（見 `_resolve()`）。
     """
-    if not head:
+    got = _resolve(scanner, head)
+    if got is None:
         return
-    base = align_head(scanner, head)
-    if not base:
-        return
-    ptrs, _covered = _array_ptrs(scanner, base, window)
+    base, total = got
+    ptrs, _complete = _array_ptrs(scanner, base, total, window)
     for p in ptrs:
         if not p:
             continue
-        got = _item_row(scanner, p)      # 格號＋種類＋數量一次讀完
-        if got is None:
+        row = _item_row(scanner, p)      # 格號＋種類＋數量一次讀完
+        if row is None:
             continue
-        slot, tid, cnt = got
+        slot, tid, cnt = row
         yield slot, tid, cnt, p
 
 
@@ -452,43 +503,29 @@ def count_by_types(scanner, head: int, type_ids
 
     ⚠⚠ 要下「歸零／沒有」結論的一定要用這支、**而且要看第二個值** ——
       `_walk()` 對截斷（陣列尾端貼著區段結尾，見 _array_ptrs）不吭聲，
-      加總出來的 0 可能只是「後面那段沒看到」。實測藥水疊到第 174 格、
-      遊戲最大格號 253，覆蓋不到 SLOT_CEILING 格就不能說東西不在。
+      加總出來的 0 可能只是「後面那段沒看到」。實測藥水疊到第 174 格，
+      沒把整條看完就不能說東西不在。
     ★ 有數到的部分（>0）照樣可信 —— 截斷只會少看，不會多看。
     """
     total = dict.fromkeys(type_ids, 0)
-    if not head:
-        return total, False
-    base = align_head(scanner, head)
-    if not base:
-        return total, False
-    ptrs, covered = _array_ptrs(scanner, base)
+    got = _resolve(scanner, head)
+    if got is None:
+        return total, False           # 表頭失效／對不上 → 不准下「沒有」的結論
+    base, slots = got
+    ptrs, complete = _array_ptrs(scanner, base, slots)
     for p in ptrs:
         if not p:
             continue
         got = _item_row(scanner, p)
         if got is not None and got[1] in total:
             total[got[1]] += got[2]
-    return total, covered >= SLOT_CEILING
+    return total, complete
 
 
-def durability(scanner, head: int) -> tuple[int, int] | None:
-    """武器的 (耐久現值, 上限)；找不到武器回傳 None。**現值 0 = 壞掉。**
-
-    上限回傳 0 代表「不知道」——`+0x5C` 曾經看起來像上限（五台都是 70），
-    但重開遊戲後讀到 793772102，證實不是。判斷只用現值。
-    """
-    ptr = find_by_slot(scanner, head, SLOT_WEAPON)
-    if not ptr:
-        return None
-    raw = scanner._read_bytes(ptr, ITEM_DURA_MAX_OFF + 4)
-    if not raw or len(raw) < ITEM_DURA_MAX_OFF + 4:
-        return None
-    cur = struct.unpack_from("<i", raw, ITEM_DURA_OFF)[0]
-    mx = struct.unpack_from("<i", raw, ITEM_DURA_MAX_OFF)[0]
-    if not 0 < mx <= DURA_MAX_SANE or mx < cur:
-        mx = 0                      # 讀到的顯然不是上限，就別顯示
-    return cur, mx
+# ⛔ 這裡以前有一支 `durability()`（讀武器欄 +0x2C 的耐久、+0x5C 當上限）。
+#   已經刪掉：沒有任何呼叫端，而且它讀的兩個欄位都被 `bag.py` 推翻了 ——
+#   耐久現值是 **u16**（+0x2E 是時限），耐久上限在**範本** +0xDC（拿 item*.xml
+#   對帳 32476 筆 100% 吻合）。要判斷裝備壞掉請用 `bag.worn_broken()`。
 
 
 def is_valid(scanner, head: int) -> bool:
