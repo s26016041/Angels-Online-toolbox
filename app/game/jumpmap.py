@@ -23,9 +23,13 @@
 
 表從哪來
 --------
-`assets/jumpmap.tsv`（120 筆），`tools/build_jumpmap.py` 從遊戲資源包的
-`SETTING/base/JumpMap.xml` + `str_jumpmap.xml` 抽出來的。
+`assets/jumpmap.tsv`（120 筆）與 `assets/jumpmap_class.tsv`（14 個類別），
+`tools/build_jumpmap.py` 從遊戲資源包的 `SETTING/base/JumpMap.xml` ＋
+`str_jumpmap.xml` ＋ `str_jumpmapclass.xml` 抽出來的。
 ⚠ 改版增減傳送點要重跑那支工具。
+
+⚠ 類別**不是嚴格的樹**：一個傳送點最多掛三個類別標籤（`類別1/2/3`），
+  同一個點會同時出現在好幾個類別底下。所以 `by_class()` 是「任一格命中」。
 """
 from __future__ import annotations
 
@@ -35,6 +39,7 @@ from dataclasses import dataclass
 from app.paths import resource
 
 DATA_FILE = "assets/jumpmap.tsv"
+CLASS_FILE = "assets/jumpmap_class.tsv"
 
 # ⚠ 這三個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 BUILD_FN = 0x0050DF6E        # 建封包(代號, 內文長度)，ecx = 暫存區
@@ -54,12 +59,14 @@ class Entry:
     x: int                   # 落點格子座標
     y: int
     name: str                # 例：'向日葵平原(LV12~23)入口'
+    cats: tuple[int, ...] = ()   # 類別編號（最多三個，見檔頭）
 
     def __str__(self) -> str:
         return self.name or f"跳地圖 {self.jump_id}"
 
 
 _table: list[Entry] | None = None
+_classes: dict[int, str] | None = None
 
 
 def entries() -> list[Entry]:
@@ -71,13 +78,45 @@ def entries() -> list[Entry]:
             with open(resource(DATA_FILE), encoding="utf-8") as f:
                 for line in f:
                     p = line.rstrip("\n").split("\t")
-                    if len(p) == 5:
+                    # 6 欄是現在的格式；5 欄是還沒有類別那版的舊檔，照樣讀得進來
+                    if len(p) == 6:
+                        cats = tuple(int(c) for c in p[4].split(",") if c)
+                        out.append(Entry(int(p[0]), int(p[1]), int(p[2]),
+                                         int(p[3]), p[5], cats))
+                    elif len(p) == 5:
                         out.append(Entry(int(p[0]), int(p[1]), int(p[2]),
                                          int(p[3]), p[4]))
         except Exception:                                  # noqa: BLE001
             out = []
         _table = out
     return _table
+
+
+def classes() -> dict[int, str]:
+    """類別編號 → 類別名。檔案缺了就回空字典（呼叫端顯示成編號即可）。"""
+    global _classes
+    if _classes is None:
+        out: dict[int, str] = {}
+        try:
+            with open(resource(CLASS_FILE), encoding="utf-8") as f:
+                for line in f:
+                    p = line.rstrip("\n").split("\t")
+                    if len(p) == 2 and p[0].isdigit():
+                        out[int(p[0])] = p[1]
+        except Exception:                                  # noqa: BLE001
+            out = {}
+        _classes = out
+    return _classes
+
+
+def by_class(class_id: int | None) -> list[Entry]:
+    """某個類別底下的傳送點；class_id=None 就是全部。
+
+    ⚠ 「任一格命中」而不是只看第一格 —— 類別不是嚴格的樹（見檔頭）。
+    """
+    if class_id is None:
+        return list(entries())
+    return [e for e in entries() if class_id in e.cats]
 
 
 def by_scene(scene_id: int) -> list[Entry]:

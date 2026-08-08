@@ -64,7 +64,8 @@ from app import theme
 from app.config import config
 from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
-from app.game import channel, locate, login, move, robot, scene, team
+from app.game import (channel, jumpmap, locate, login, move, robot, scene,
+                      team)
 from app.tabs.base_tab import BaseTab
 
 COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "隊伍", "狀態")
@@ -194,6 +195,46 @@ class MultiTab(BaseTab):
         bar2.addWidget(self.share)
         bar2.addStretch(1)
         root.addLayout(bar2)
+
+        # --- 天使趴趴GO ---------------------------------------------------
+        bar3 = QHBoxLayout()
+        bar3.addWidget(QLabel("趴趴GO"))
+        self.jclass = QComboBox()
+        self.jclass.setToolTip(
+            "傳送點的分類，跟遊戲趴趴GO視窗左邊那排是同一份資料。\n"
+            "⚠ 一個傳送點可能同時掛在好幾個分類底下（遊戲本來就這樣分），\n"
+            "　 所以在不同分類看到同一個地點是正常的。")
+        self.jclass.currentIndexChanged.connect(self._fill_jumps)
+        bar3.addWidget(self.jclass)
+        self.jump = QComboBox()
+        self.jump.setToolTip(
+            "要傳送到哪裡。名稱與落點座標是從遊戲資源包抽出來的，\n"
+            "送出的封包跟你在趴趴GO視窗點下去完全一樣。")
+        # ⚠ 主視窗是**固定 940 寬**的。下拉的預設策略會照「最長的那一筆」
+        #   決定寬度 —— 120 筆地圖名裡只要有一個特別長，整排就被撐開跑版
+        #   （見 memory 的 qt-ui-pitfalls）。這裡把控制項本身的寬度釘在
+        #   固定字數，另外把**展開的清單**放寬，兩邊都顧到。
+        # ⚠ Qt6 只剩 …WithIcon 這個列舉，Qt5 的 AdjustToMinimumContentsLength
+        #   已經被拿掉（用了會 AttributeError → 分頁建不起來）。
+        self.jump.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.jump.setMinimumContentsLength(26)
+        self.jump.view().setMinimumWidth(
+            self.jump.fontMetrics().horizontalAdvance(
+                "喧嘩雨林(LV105~120)重生點（123,456）") + 40)
+        self.jump.currentIndexChanged.connect(self._save_jump)
+        bar3.addWidget(self.jump, 1)
+        self.jump_btn = QPushButton("傳送")
+        self.jump_btn.setToolTip(
+            "把所有勾選的分身傳送到選定的地點。\n"
+            "  · 送出的是遊戲自己的傳送封包，不會去碰趴趴GO那個視窗\n"
+            "  · 傳送完會等**目前地圖真的變成目的地**才算成功\n"
+            "  · 排不進指令槽或逾時會自動重試，要停請按「停止」\n"
+            "⚠ 到不到得看伺服器（等級不足、任務未完成之類會被拒絕）。")
+        self.jump_btn.clicked.connect(self._do_jump)
+        bar3.addWidget(self.jump_btn)
+        root.addLayout(bar3)
+        self._fill_classes()
 
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
@@ -405,6 +446,46 @@ class MultiTab(BaseTab):
     def _save_share(self) -> None:
         config.set("multi.share", int(self.share.currentData()))
         config.save()
+
+    # ------------------------------------------------------------------
+    # 趴趴GO 清單
+    # ------------------------------------------------------------------
+    def _fill_classes(self) -> None:
+        self.jclass.blockSignals(True)
+        self.jclass.addItem("全部", None)
+        names = jumpmap.classes()
+        for cid in sorted(names) or []:
+            self.jclass.addItem(names.get(cid) or f"分類 {cid}", cid)
+        want = config.get("multi.jump_class", None)
+        i = self.jclass.findData(want) if want is not None else 0
+        self.jclass.setCurrentIndex(max(i, 0))
+        self.jclass.blockSignals(False)
+        self._fill_jumps()
+        if not jumpmap.entries():
+            self.jump_btn.setEnabled(False)
+            self.jump.addItem("⚠ 讀不到傳送表（assets/jumpmap.tsv）", None)
+
+    def _fill_jumps(self) -> None:
+        """依分類重填地點清單，選擇盡量留住（使用者常常在分類間來回看）。"""
+        keep = self.jump.currentData()
+        self.jump.blockSignals(True)
+        self.jump.clear()
+        cid = self.jclass.currentData()
+        for e in jumpmap.by_class(cid):
+            self.jump.addItem(f"{e.name}（{e.x},{e.y}）", e.jump_id)
+        i = self.jump.findData(keep)
+        if i < 0:
+            i = self.jump.findData(config.get("multi.jump_id", None))
+        self.jump.setCurrentIndex(max(i, 0))
+        self.jump.blockSignals(False)
+        config.set("multi.jump_class", cid)
+        config.save()
+
+    def _save_jump(self) -> None:
+        jid = self.jump.currentData()
+        if jid is not None:
+            config.set("multi.jump_id", int(jid))
+            config.save()
 
     def _resolve_name(self, pid: int, account: str) -> None:
         """把某一台的角色名解出來並記進 preload 的快取（一個 pid 只做一次）。"""
@@ -625,8 +706,11 @@ class MultiTab(BaseTab):
         """任務進行中把會打架的控制項關掉，只留「停止」。"""
         self.go_btn.setEnabled(not busy and self.chan.count() > 0)
         self.team_btn.setEnabled(not busy)
+        self.jump_btn.setEnabled(not busy and bool(jumpmap.entries()))
         self.chan.setEnabled(not busy)
         self.share.setEnabled(not busy)
+        self.jclass.setEnabled(not busy)
+        self.jump.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
 
     def _prep_tick(self) -> None:
@@ -655,6 +739,8 @@ class MultiTab(BaseTab):
             return
         if job["kind"] == "team":
             self._team_tick(job, wins)
+        elif job["kind"] == "jump":
+            self._jump_tick(job, wins)
         else:
             self._chan_tick(job, wins)
 
@@ -721,6 +807,112 @@ class MultiTab(BaseTab):
             self._job = None
             self._busy_ui(False)
             self.status.setText(f"換頻完成：{done} 台已經在 {target} 頻。")
+
+    # ------------------------------------------------------------------
+    # 天使趴趴GO
+    # ------------------------------------------------------------------
+    def _do_jump(self) -> None:
+        if self._job is not None:
+            return
+        jid = self.jump.currentData()
+        e = jumpmap.get(int(jid)) if jid is not None else None
+        if e is None:
+            self.status.setText("⚠ 沒有選到傳送點（傳送表讀不到？）。")
+            return
+        picked = self._checked_pids()
+        if not picked:
+            self.status.setText("還沒勾任何分身。")
+            return
+        wins = sorted(preload.windows(), key=lambda w: w.pid)
+        self._state_txt.clear()
+        todo: list[int] = []
+        for pid in picked:
+            w = self._win_of(pid, wins)
+            if w is None or channel.current(w.hwnd) is None:
+                self._state_txt[pid] = "未進遊戲，跳過"
+                continue
+            todo.append(pid)
+            self._state_txt[pid] = "準備中…"
+        self._update_rows(wins)
+        if not todo:
+            self.status.setText("沒有可以傳送的分身。")
+            return
+        self._job = {"kind": "jump", "jump_id": e.jump_id, "scene": e.scene_id,
+                     "name": e.name, "prep": list(todo), "pend": [],
+                     "wait": {}, "here": set(), "done": 0, "next_try": 0.0}
+        self._busy_ui(True)
+        self.status.setText(f"準備中 0/{len(todo)}（正在裝跳板）…")
+        QTimer.singleShot(0, self._prep_tick)
+
+    def _jump_tick(self, job, wins) -> None:
+        now = time.monotonic()
+        alive = {w.pid for w in wins}
+        want = job["scene"]
+
+        for pid in [p for p in job["pend"] if p not in alive]:
+            job["pend"].remove(pid)
+            self._state_txt[pid] = "⚠ 分身已關閉"
+        for pid in [p for p in job["wait"] if p not in alive]:
+            del job["wait"][pid]
+            self._state_txt[pid] = "⚠ 分身已關閉"
+
+        # --- 發射：同一拍全部送出 -------------------------------------
+        if job["pend"] and now >= job["next_try"]:
+            again: list[int] = []
+            for pid in job["pend"]:
+                sc = self._scanners.get(pid)
+                mv = self._movers.get(pid)
+                if sc is None or mv is None:
+                    again.append(pid)
+                    continue
+                # 送之前先記下「本來就在這張圖」的 —— 那種情況地圖不會變，
+                # 沒辦法用地圖當驗收訊號（見下面的說明）。
+                cur = scene.current_id(sc, allow_scan=False)
+                already = scene.same_map(cur, want)
+                ok, why = jumpmap.teleport(mv, sc, job["jump_id"])
+                if ok:
+                    # ⚠ 換地圖＝物件搬家，快取位址一定要作廢。
+                    preload.forget_state(pid)
+                    if already:
+                        job["here"].add(pid)
+                    job["wait"][pid] = now
+                    self._state_txt[pid] = "傳送中…"
+                else:
+                    again.append(pid)
+                    self._state_txt[pid] = f"⚠ {why}，重試中…"
+            job["pend"] = again
+            if again:
+                job["next_try"] = now + RETRY_GAP
+
+        # --- 確認：目前地圖真的變成目的地 -----------------------------
+        for pid in list(job["wait"]):
+            sc = self._scanners.get(pid)
+            cur = scene.current_id(sc, allow_scan=False) if sc else None
+            if scene.same_map(cur, want):
+                # ⚠ 本來就在這張圖的沒辦法用「地圖變了」驗收 —— 老實講出來，
+                #   不要拿一個必然成立的條件冒充「已確認到達」。
+                if pid in job["here"]:
+                    self._state_txt[pid] = "✅ 已送出（本來就在這張地圖）"
+                else:
+                    self._state_txt[pid] = f"✅ 已到 {job['name']}"
+                del job["wait"][pid]
+                job["done"] += 1
+            elif now - job["wait"][pid] > SWITCH_TIMEOUT:
+                del job["wait"][pid]
+                job["pend"].append(pid)
+                job["next_try"] = now + RETRY_GAP
+                self._state_txt[pid] = "⚠ 傳送逾時，重送中…"
+
+        left = len(job["pend"]) + len(job["wait"])
+        if left:
+            self.status.setText(
+                f"傳送中：完成 {job['done']}、還有 {left} 台"
+                f"（目的地 {job['name']}）　—— 要停請按「停止」")
+        else:
+            done, name = job["done"], job["name"]
+            self._job = None
+            self._busy_ui(False)
+            self.status.setText(f"傳送完成：{done} 台已到 {name}。")
 
     # ------------------------------------------------------------------
     # 自動組隊
