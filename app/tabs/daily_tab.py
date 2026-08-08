@@ -67,6 +67,11 @@ CHECK_TRIES = 4           # 兌換後背包沒變 → 先多看幾拍（每拍�
 EX_YIELD = 3              # 「開店→兌換→驗背包」整輪重來 3 輪還不成 → 開始讓路。
                           #   背包沒變最常見的原因是開店那包沒被受理（不開店兌換
                           #   伺服器完全不理，見 _ex_begin），所以重來從開店做起。
+READ_TRIES = 8            # ⚠ 讀不到背包（還在讀取畫面／換地圖／剛登入）→ 重試
+                          #   這麼多次（約 2 秒）。這裡**有上限**而且跟上面那些
+                          #   不同款：讀不到不是「伺服器忙」，是這台現在沒東西可
+                          #   讀，一直試只會卡住整輪；試完就**大聲說讀不到**，
+                          #   絕不把它講成「你沒有券」（見 _count）。
 LOG_COLS = ("時間", "分身", "動作", "結果")
 LOG_MAX = 200
 
@@ -404,14 +409,41 @@ class DailyTab(BaseTab):
             f"{r_n} 個{self._name(r_id)}（編號 {got.id}／商店 {got.group}）")
         return 0
 
-    def _count(self, sc) -> tuple[int, int]:
-        """(券, 翔宇聖翼)。背包讀一遍只要 1ms，兩個一起數。"""
-        items = bag.items(sc)
+    def _count(self, sc) -> tuple[int, int, int] | None:
+        """(券, 翔宇聖翼, 讀到幾件)；**讀不到背包回 None**（≠ 沒有券）。
+
+        ⚠⚠ 這支以前是 `bag.items()` 直接加總 —— 讀不到時它回空清單，於是
+          「還在讀取畫面／換地圖／位址定位失敗」全被講成「你沒有獎勵券」。
+          使用者 2026-08-08 回報：另一台電腦身上有 6 張券卻說沒有。
+          現在改用 `bag.scan()` 看「整段真的讀到了嗎」，讀不到就回 None，
+          由呼叫端重試／大聲說讀不到（見 READ_TRIES）。
+
+        ★ 數的是**整個物品容器**（0 ~ 上限），不是只有背包那段 0x14~0xA9：
+          兌換封包填的是「兌換編號＋次數」，跟格號完全無關，所以券躺在任務
+          道具欄那種非背包格照樣換得掉 —— 反而漏數會變成「明明有券卻說沒有」。
+          （容器裡的東西本來就都是自己的；倉庫不在這個容器裡，不會多算。）
+        """
+        items, ok = bag.scan(sc, 0, bag.MAX_SLOTS)
+        if not ok:
+            return None
         return (sum(it.count for it in items if it.type_id == TOKEN_ITEM),
-                sum(it.count for it in items if it.type_id == WING_ITEM))
+                sum(it.count for it in items if it.type_id == WING_ITEM),
+                len(items))
+
+    def _unreadable(self, label: str, reads: int, again) -> int:
+        """背包讀不到時的共同處理：先重試幾次，試完大聲說讀不到。"""
+        if reads < READ_TRIES:
+            self.status.setText(
+                f"{label}：讀不到背包，等一下再看…"
+                f"（{reads + 1}/{READ_TRIES}）")
+            self._steps.insert(0, again)
+            return RETRY_MS
+        self._log(label, "換翔宇聖翼",
+                  "⚠ 讀不到背包 —— 這台沒換（還在登入／讀取畫面？換地圖中？）")
+        return 0
 
     def _ex_begin(self, pid: int, label: str, cycle: int = 0,
-                  tries: int = 0) -> int:
+                  tries: int = 0, reads: int = 0) -> int:
         """數券 → 開兌換商店。沒有券就跳過這台（連商店都不開）。
 
         ⚠⚠ **一定要先開商店**：2026-08-07 使用者實測，不開商店直接送兌換封包
@@ -427,10 +459,18 @@ class DailyTab(BaseTab):
         if sc is None:
             self._log(label, "換翔宇聖翼", "⚠ 讀不到記憶體")
             return 0
-        have, wings = self._count(sc)
+        got = self._count(sc)
+        if got is None:
+            return self._unreadable(
+                label, reads,
+                lambda: self._ex_begin(pid, label, cycle, tries, reads + 1))
+        have, wings, seen = got
         times = _entry.times_for(have)
         if times <= 0:
-            self._log(label, "換翔宇聖翼", f"沒有{self._name(TOKEN_ITEM)}")
+            # ★ 講「背包 N 件裡沒有」不講「沒有」—— 讀得到才敢下這個結論，
+            #   件數也讓使用者一眼看出是不是讀到半份（見 _count）。
+            self._log(label, "換翔宇聖翼",
+                      f"背包 {seen} 件裡沒有{self._name(TOKEN_ITEM)}")
             return 0
         mv = self._mover(pid)
         if mv is None:
@@ -451,7 +491,8 @@ class DailyTab(BaseTab):
         return OPEN_WAIT_MS
 
     def _ex_confirm(self, pid: int, label: str, cycle: int,
-                    have0: int, wings0: int, tries: int = 0) -> int:
+                    have0: int, wings0: int, tries: int = 0,
+                    reads: int = 0) -> int:
         """商店開好了才送兌換。
 
         ⚠ 券在這裡**重新數一次**，不沿用開商店之前那個數字 —— 中間隔了 0.9 秒，
@@ -461,7 +502,18 @@ class DailyTab(BaseTab):
         sc, mv = self._scanners.get(pid), self._movers.get(pid)
         if sc is None or mv is None or _entry is None:
             return 0
-        have, wings = self._count(sc)
+        got = self._count(sc)
+        if got is None:
+            # ⚠ 讀不到就**不准送** —— 次數是照張數算的，猜一個送出去就是
+            #   拿垃圾值給伺服器。等一下再看，試完把視窗關掉收工。
+            delay = self._unreadable(
+                label, reads,
+                lambda: self._ex_confirm(pid, label, cycle, have0, wings0,
+                                         tries, reads + 1))
+            if reads >= READ_TRIES:       # 放棄了 → 順手把商店視窗關掉
+                self._steps.insert(0, lambda: self._ex_close(pid, label))
+            return delay
+        have, wings, _seen = got
         times = _entry.times_for(have)
         if times <= 0:
             # 開店時還有券、現在沒了 —— 幾乎一定是前一發其實成功了
@@ -483,7 +535,7 @@ class DailyTab(BaseTab):
         return RETRY_MS
 
     def _ex_check(self, pid: int, label: str, have: int, wings: int,
-                  cycle: int, probes: int = 0) -> int:
+                  cycle: int, probes: int = 0, reads: int = 0) -> int:
         """回頭讀背包，報告真的換到幾個 —— 只說「送出了」看不出有沒有成功。
 
         背包沒變不急著判死刑：
@@ -498,7 +550,17 @@ class DailyTab(BaseTab):
         if sc is None:
             self._steps.insert(0, lambda: self._ex_close(pid, label))
             return 0
-        now_tok, now_wing = self._count(sc)
+        counted = self._count(sc)
+        if counted is None:
+            # 讀不到就不能說「沒換到」（那會害它整輪重來、白換一次）。
+            delay = self._unreadable(
+                label, reads,
+                lambda: self._ex_check(pid, label, have, wings, cycle,
+                                       probes, reads + 1))
+            if reads >= READ_TRIES:       # 放棄了 → 順手把商店視窗關掉
+                self._steps.insert(0, lambda: self._ex_close(pid, label))
+            return delay
+        now_tok, now_wing, _seen = counted
         used, got = have - now_tok, now_wing - wings
         if got > 0:
             self._done += 1

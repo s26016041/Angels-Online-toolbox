@@ -300,19 +300,38 @@ def items(scanner, first: int = FIRST_SLOT,
     """背包裡的東西（預設只含遊戲認定的背包格 0x14~0xA9）。
 
     讀不到就回空清單 —— 呼叫端看到「一件都沒有」比看到半份資料安全。
+    ⚠ 要下「沒有／用完」這種結論請改用 `scan()`，見那支的說明。
+    """
+    return scan(scanner, first, last)[0]
+
+
+def scan(scanner, first: int = FIRST_SLOT,
+         last: int = LAST_SLOT) -> tuple[list[Item], bool]:
+    """(這段格號裡的東西, **整段是不是真的都讀到了**)。
+
+    ⚠⚠ 要下「沒有／用完／歸零」這種結論**一定要用這支並看第二個值**：
+      `items()` 讀不到容器時回的空清單，跟「真的一件都沒有」長得一模一樣，
+      當成「沒有」就是安靜地做錯事。這是 [[bag-false-empty-guards]]
+      （藥水誤報用完）的同一個坑 —— 2026-08-08 又在每日兌換那顆按鈕上重演
+      （「讀不到背包」被報成「你沒有獎勵券」）。
+      第二值 False 的情形：還沒進場／換地圖中、位址定位失敗、容器搬家搬到
+      區段邊界讀不動、某件物品的物件讀不到。
+    ★ 有數到的東西照樣可信 —— 讀不到只會少看，不會多看。
     """
     got = head(scanner)
     if got is None:
-        return []
+        return [], False
     begin, count = got
     lo, hi = max(first, 0), min(last, count - 1)
     if lo > hi:
-        return []
+        # 容器比 first 還短 —— 這段本來就不存在，不是讀不到
+        return [], True
     raw = scanner._read_bytes(begin + lo * 4, (hi - lo + 1) * 4)
     if not raw:
-        return []
+        return [], False
     ptrs = struct.unpack(f"<{hi - lo + 1}I", bytes(raw))
 
+    complete = True
     tmpl_cache: dict[int, tuple[int, int, int, int, int]] = {}
     out: list[Item] = []
     for offset, ptr in enumerate(ptrs):
@@ -320,6 +339,7 @@ def items(scanner, first: int = FIRST_SLOT,
             continue
         blob = scanner._read_bytes(ptr, ITEM_SPAN)
         if not blob:
+            complete = False       # 有格子但讀不到內容 → 這段不完整
             continue
         b = bytes(blob)
         serial, stamp, type_id = struct.unpack_from("<III", b, ITEM_SERIAL)
@@ -344,7 +364,7 @@ def items(scanner, first: int = FIRST_SLOT,
                         type_id=type_id, count=count_, dura=dura,
                         kind=kind, price=price, grade=grade, dura_max=dmax,
                         time_limit=tlimit, decomp_value=param2))
-    return out
+    return out, complete
 
 
 def worn_broken(scanner) -> list[Item] | None:
