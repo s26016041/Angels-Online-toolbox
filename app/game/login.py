@@ -192,8 +192,18 @@ MAX_SLOTS = 8
 
 # 掃到 VT_LOGIN 之後還要對上的副 vtable（建構函式 0x5363A0 一口氣寫的那組）。
 # ⚠ 只取建構函式**不會再改寫**的四個：+0x30/+0x34 後面會被覆蓋成別的值。
-SUB_VTABLES = {0x10: 0x007D6CAC, 0x14: 0x007D6CC4,
-               0x18: 0x007D6CD0, 0x2C: 0x007D6CDC}
+# ⚠ 存的是「相對 VT_LOGIN 的距離」，不是絕對位址 —— 這四個跟 VT_LOGIN 是
+#   **同一個類別**的一組 vtable，編譯器連著擺在 .rdata；小改版讓 .rdata 位移時
+#   整組一起動、距離不變，locate 把 VT_LOGIN 修好這組就跟著對。（以前寫死
+#   絕對位址：VT_LOGIN 被 locate 修好、這四個還是舊值 → find_login_object
+#   永遠對不上 → 自動登入在小改版後整個停用 —— 2026-08-08 體檢抓到的縫。）
+#   距離會變的只有「這個類別本身的虛擬函式增減」那種底層改動 —— 那時掃不到
+#   → 回 None → 大聲停用，跟以前一樣安全。
+#   （8/04 實測「位移量不一致 +0x10/+0x18」講的是**不同類別之間**；
+#   同類別連續的一組是同一塊，整塊一起移。）
+# 2026-08-04 的絕對位址留當文件：VT_LOGIN=0x7D6C94，
+#   +0x10→0x7D6CAC　+0x14→0x7D6CC4　+0x18→0x7D6CD0　+0x2C→0x7D6CDC
+SUB_VTABLE_DELTAS = {0x10: 0x18, 0x14: 0x30, 0x18: 0x3C, 0x2C: 0x48}
 
 ACCOUNT_LEN = 20            # strncpy 0x14
 PASSWORD_LEN = 32           # strncpy 0x20
@@ -489,6 +499,8 @@ def find_screen(scanner) -> int | None:
     if not VT_LOGIN:
         return None
     pat = struct.pack("<I", VT_LOGIN)
+    # 副 vtable 的期望值從「當下的 VT_LOGIN」推：locate 重新定位後自動跟上。
+    subs = {off: VT_LOGIN + d for off, d in SUB_VTABLE_DELTAS.items()}
     for base, size in scanner._iter_regions(writable_only=True):
         raw = scanner._read_region(base, size)
         if not raw:
@@ -498,7 +510,7 @@ def find_screen(scanner) -> int | None:
         while i >= 0:
             if all(i + off + 4 <= len(raw)
                    and struct.unpack_from("<I", raw, i + off)[0] == vt
-                   for off, vt in SUB_VTABLES.items()):
+                   for off, vt in subs.items()):
                 return base + i
             i = raw.find(pat, i + 1)
     return None

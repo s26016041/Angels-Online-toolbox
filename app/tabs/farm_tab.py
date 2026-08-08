@@ -68,7 +68,8 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
-                      player, quickbar, revive, robot, scene, skills, terrain)
+                      player, quickbar, revive, robot, scene, skills,
+                      tablestamp, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
@@ -4048,21 +4049,29 @@ class FarmTab(BaseTab):
         self._timer.start(TICK_MS)
 
     def _show_locate(self) -> None:
-        """把 AOB 自動定位的結果顯示出來（沒事就不顯示）。"""
+        """把 AOB 自動定位＋資料表戳記的結果顯示出來（沒事就不顯示）。"""
         moved, failed = locate.moved(), locate.failed()
+        stale = tablestamp.check()   # 遊戲換版但寫死資料表還沒重新核對
+        parts, color = [], ""
         if failed:
             # ⚠ 函式位址驗不過會被清成 0＝該功能停用（不是沿用舊值），
             #   資料位址才是沿用舊值。見 app/game/locate.py 檔頭。
-            self.locate_lbl.setText(
+            parts.append(
                 f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（相關功能已停用）："
                 + "、".join(failed[:3]))
-            self.locate_lbl.setStyleSheet("color: #e0b040;")
+            color = "#e0b040"
         elif moved:
-            self.locate_lbl.setText(
-                f"偵測到遊戲改版，已自動重新定位 {len(moved)} 個位址")
-            self.locate_lbl.setStyleSheet("color: #7fc97f;")
-        else:
-            self.locate_lbl.setText("")
+            parts.append(f"偵測到遊戲改版，已自動重新定位 {len(moved)} 個位址")
+            color = "#7fc97f"
+        if stale:
+            # 位址跟得上 ≠ 資料表跟得上：AOB 救位址，救不了抄來的內容
+            #（射程/地圖編號）。這條要一直亮到重新核對＋蓋章為止。
+            parts.append("⚠ " + stale)
+            color = "#e0b040"
+        text = "　".join(parts)
+        self.locate_lbl.setText(text)
+        self.locate_lbl.setToolTip(text)   # 條太長被截掉時滑鼠移上去看全文
+        self.locate_lbl.setStyleSheet(f"color: {color};" if color else "")
 
     # ------------------------------------------------------------------
     def on_show(self) -> None:

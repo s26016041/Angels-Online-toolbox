@@ -521,3 +521,12 @@ def failed(report=None) -> list[str]:
         return ["（定位還沒執行過 —— 讀不到遊戲模組，全部位址未經驗證）"]
     rep = _report if report is None else report
     return [n for n, _, new in rep if new is None]
+
+
+def image_identity() -> tuple[int, int] | None:
+    """最後一次 warm() 認得的映像身分 (基底, PE 表頭 4KB 的 CRC)。
+
+    還沒掃完過回 None。給 tablestamp 比對「寫死資料表是對哪一版遊戲核對的」
+    用 —— 那邊不必再讀一次記憶體。
+    """
+    return _img_key if _ran else None
