@@ -214,6 +214,29 @@ DECOMP_ITEMS = {
     87139: 20,      # 充能-小背包(20)
 }
 
+# --- 「自動分解全部」：**不寫死名單，讀遊戲自己的欄位** -----------------
+#
+# ⚠⚠ 這裡原本做成一份 461 筆的寫死表（從 SETTING 抽出來的
+#   `assets/decomp_items.tsv`）。2026-08-08 把 `ItemData` 那張 Lua 綁定表
+#   逐支反組譯之後發現**判斷需要的三個欄位全都在記憶體裡**，所以整份表
+#   連同 `tools/build_decomp_items.py` 一起刪掉了 —— 照專案鐵則第一條，
+#   遊戲已經載進記憶體的資料不准抄成寫死表（改版會安靜過期）。
+#
+#       getparam2()    → 範本 +0x10C   分解值　　✅五台 341/341 對帳資源包
+#       gettype()      → 範本 +0x18    分類 46＝紙娃娃
+#       gettimelimit() → 物品 +0x2E    時限（★使用者確認：有時限就拆不掉）
+#
+#   判斷整條搬進 `bag.Item.decomposable`（照抄客戶端 `OnSetPDItem`）。
+#
+# ★ 玩家的裝扮不會被掃到，靠的是**格號**：拆解只碰一般背包
+#   （`bag.FIRST_SLOT`~`bag.LAST_SLOT` = 0x14~0xA9）。身上穿著的裝扮欄
+#   （242~249，遊戲常數 DOLL_SLOT_BEGIN/END）連遊戲自己都不讓拆，
+#   「紙娃娃隨身包」（251 起）更在範圍外。
+#
+# ⚠ 分解值**分不出**「充能小背包」跟「點裝」（87381 的 10 點跟 171 件點裝
+#   一模一樣），所以「只拆小背包」那顆鈕還是走上面寫死的兩個編號白名單。
+#   兩顆鈕的名單不同是刻意的。
+
 
 def _send(mover, code: int, arg: int) -> bool:
     if not (mover and mover.active):
@@ -242,10 +265,54 @@ def sync(mover) -> bool:
     return _send(mover, SYNC_CODE, SYNC_ARG)
 
 
-def decompose(mover, scanner, slot: int) -> tuple[bool, str]:
-    """拆解背包第 `slot` 格的充能小背包（＝遊戲「拆解」鈕）。回 (送出了嗎, 原因)。
+def _slot_ok(item, all_items: bool) -> str:
+    """這一格能不能送去拆？能就回 ""，不能就回**原因**（給人看的一句話）。
 
-    ⚠⚠ 送包前**當場重讀那一格**，不在 DECOMP_ITEMS 白名單裡就拒送 ——
+    兩種模式共用的四道關（前三道就是遊戲客戶端 `OnSetPDItem` 自己的判斷）：
+      1. 格號落在**一般背包**（`bag.FIRST_SLOT`~`LAST_SLOT`）—— 身上穿的、
+         裝扮欄、紙娃娃隨身包、倉庫全部擋在外面。
+      2. 記憶體分類是紙娃娃（46）。
+      3. 分解值 > 0。
+      4. **沒有時限** —— 使用者 2026-08-08 確認「限時不能拆」。先擋下來，
+         比送出去被丟掉、然後每 3 秒重送一次好。
+    只拆小背包的模式再多一道：種類 ID 要在 `DECOMP_ITEMS` 白名單裡。
+
+    ★ 第 2 道關也順便補上了 [[items-table-maintenance]] 點名的風險：萬一改版
+      把 87138/87139 這兩個編號回收給別的東西用，光靠白名單擋不住，
+      但那個「別的東西」幾乎不可能同時也是分解值 > 0 的紙娃娃。
+    """
+    from app.game import bag
+    if not bag.FIRST_SLOT <= item.slot <= bag.LAST_SLOT:
+        return f"格 {item.slot} 不在一般背包裡（{item.name}）"
+    if not all_items and item.type_id not in DECOMP_ITEMS:
+        return f"{item.name} 不是充能小背包"
+    if not item.is_doll:
+        return f"{item.name} 記憶體分類是 {item.kind}，不是紙娃娃"
+    if item.decomp_value <= 0:
+        return f"{item.name} 沒有分解值"
+    if item.time_limit:
+        return f"{item.name} 是限時道具，遊戲不讓拆"
+    return ""
+
+
+def gain_of(item, all_items: bool) -> int:
+    """拆這一件會拿到幾點晶能。
+
+    ★ 「全部」模式一律讀記憶體（範本 +0x10C）；只拆小背包的模式沿用寫死的
+      白名單值，讀不到才退回記憶體 —— 那兩個編號是使用者親自指定的。
+    """
+    if all_items:
+        return int(item.decomp_value)
+    return DECOMP_ITEMS.get(item.type_id, int(item.decomp_value))
+
+
+def decompose(mover, scanner, slot: int,
+              all_items: bool = False) -> tuple[bool, str]:
+    """拆解背包第 `slot` 格的東西（＝遊戲「拆解」鈕）。回 (送出了嗎, 原因)。
+
+    all_items: False = 只認充能小背包白名單；True = 遊戲認可以拆的都拆。
+
+    ⚠⚠ 送包前**當場重讀那一格**，過不了 `_slot_ok` 就拒送 ——
       格號是照先前讀到的背包挑的，背包若在這中間變動（撿東西、手動整理），
       同一個格號可能已經換成別的東西。把關放在最底層，呼叫端想錯用也錯不了。
       （鐵則出處見 memory 的 game-crash-root-causes：交給遊戲的東西當場重驗。）
@@ -254,11 +321,40 @@ def decompose(mover, scanner, slot: int) -> tuple[bool, str]:
     got = bag.items(scanner, slot, slot)
     if not got:
         return False, "那一格是空的（已經拆掉了？）"
-    if got[0].type_id not in DECOMP_ITEMS:
-        return False, f"那一格不是充能小背包（{got[0].name}），拒送"
+    why = _slot_ok(got[0], all_items)
+    if why:
+        return False, why + "，拒送"
     if not _send(mover, DECOMP_CODE, int(slot)):
         return False, "指令槽忙碌"
     return True, ""
+
+
+def decomposable(scanner, all_items: bool = False) -> list:
+    """一般背包裡**現在可以拆**的東西（`bag.Item` 清單）。
+
+    呼叫端（分頁）用這個列清單、算件數，跟送包時 `decompose_batch()` 的
+    重驗走**同一條規則**（`_slot_ok`），不會出現「畫面說有 5 件、實際送 0 件」。
+    """
+    from app.game import bag
+    return [it for it in bag.items(scanner) if not _slot_ok(it, all_items)]
+
+
+def blocked_note(scanner, all_items: bool = False) -> str:
+    """一件都沒中時，說明「有東西但被擋下來」的原因；沒事回 ""。
+
+    ⚠ 失效模式只准兩種（大聲停用／安全退化），**不准安靜地不做事** ——
+      所以「本來符合分類、卻因為時限被跳過」這種情況要講出來，不然使用者
+      只會看到一個什麼都不拆的按鈕。
+    """
+    from app.game import bag
+    limited = [it for it in bag.items(scanner)
+               if it.time_limit and it.decomp_value > 0
+               and (it.is_doll if all_items else
+                    it.type_id in DECOMP_ITEMS)]
+    if limited:
+        names = "、".join(sorted({it.name for it in limited}))
+        return f"⚠ 有 {len(limited)} 件是限時道具（{names}），遊戲不讓拆，已跳過"
+    return ""
 
 
 # 一拍最多拆幾顆。批次是連續 call_sync、整段抓著跳板的鎖（每顆正常一幀
@@ -267,20 +363,29 @@ def decompose(mover, scanner, slot: int) -> tuple[bool, str]:
 MAX_PER_TICK = 30
 
 
-def decompose_batch(mover, scanner, slots) -> tuple[list[int], bool]:
+def decompose_batch(mover, scanner, slots,
+                    all_items: bool = False) -> tuple[list[int], bool]:
     """一口氣拆解多格。回 (通過重驗、真的排送的格號, 整批都排進去了嗎)。
 
-    ⚠⚠ 跟單發一樣，送包前**重讀背包**逐格重驗 —— 不在白名單就整格跳過，
-      呼叫端塞錯格號也送不出去。
+    all_items 同 `decompose()`。
+
+    ⚠⚠ 跟單發一樣，送包前**重讀背包**逐格重驗 —— 沒過 `_slot_ok` 就整格
+      跳過，呼叫端塞錯格號也送不出去。
     ⚠ 半路排不進去（指令槽忙碌）時**前面幾格已經送出了** —— 所以成敗
       不能看這裡的回傳，一律以「序號從背包消失」對帳。
     """
     from app.game import bag
     if not (mover and mover.active):
         return [], False
-    fresh = {it.slot: it.type_id for it in bag.items(scanner)}
-    good = [int(s) for s in slots
-            if fresh.get(int(s)) in DECOMP_ITEMS][:MAX_PER_TICK]
+    # ★ 重讀的範圍就是一般背包（bag.items 的預設），裝扮／倉庫根本不會進來。
+    fresh = {it.slot: it for it in bag.items(scanner)}
+    good: list[int] = []
+    for s in slots:
+        it = fresh.get(int(s))
+        if it is not None and not _slot_ok(it, all_items):
+            good.append(int(s))
+        if len(good) >= MAX_PER_TICK:
+            break
     if not good:
         return [], True
     calls = tuple((attack.SELECT_FN, (DECOMP_CODE, s)) for s in good)

@@ -8,6 +8,14 @@
      晶能（一拍上限 energy.MAX_PER_TICK 顆，剩的下一拍接著），
      **拆完不停**、一直盯到使用者按「暫停」為止，
      **只認這兩種**（energy.DECOMP_ITEMS 白名單＋送包前當場重驗每一格）
+  5. 自動分解全部（紅字，比較危險）：同一套流程，但條件換成「遊戲自己認
+     可以拆的」—— **不寫死名單，三個欄位全部讀記憶體**
+     （`bag.Item.decomposable`：分類 46 紙娃娃、分解值 > 0、沒時限、
+     不在身上的裝扮欄）。改版自動跟上。
+     ★ 只動**一般背包**（格 0x14~0xA9）—— 玩家的裝扮收在遊戲自己分區的
+       「紙娃娃隨身包」（格 251 起），碰不到。範圍那道關在 energy._slot_ok，
+       不是分頁自己守的。
+     ⚠ 開跑前會列出即將被拆的東西讓使用者確認（點裝掉在一般背包也會被拆）。
 
 背後都是 `app/game/energy.py`：呼叫遊戲自己的泛用送包函式
 `0x5D3D97(0x38, 1)` / `0x5D3D97(0x39, -1)`，欄位讀狀態物件 +0xB8 起那一段。
@@ -37,6 +45,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -44,6 +53,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app import theme
 from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
@@ -149,8 +159,32 @@ class EnergyTab(BaseTab):
             "⚠⚠ **只認這兩種**，其他東西一律不碰 —— 送包前還會當場重讀\n"
             "　 背包逐格再驗一次。\n"
             "⚠ 進行中請不要手動搬動背包物品。")
-        self.decomp_btn.clicked.connect(self._start_decomp)
+        self.decomp_btn.clicked.connect(lambda: self._start_decomp(False))
         drow.addWidget(self.decomp_btn)
+        # ⚠ 紅字（使用者指定）：這顆會把一般背包裡**所有**可分解的東西拆掉，
+        #   拆掉就回不來了，跟只認兩種編號的那顆不是同一個風險等級。
+        self.decomp_all_btn = QPushButton("自動分解全部")
+        # ⚠ 一定要連 :disabled 一起寫：只寫 color 的話，widget 樣式的優先度會
+        #   蓋掉主題的 QPushButton:disabled，跑起來按鈕變灰了字還是紅的。
+        #   底色／邊框沿用主題（這裡只改文字顏色，兩張樣式表是疊加的）。
+        self.decomp_all_btn.setStyleSheet(
+            f"QPushButton {{ color: {theme.DANGER}; font-weight: bold; }}"
+            "QPushButton:disabled { color: #6b7288; }")
+        self.decomp_all_btn.setToolTip(
+            "⚠⚠ 把**一般背包裡所有遊戲允許分解的東西**每 3 秒一次全部拆成晶能。\n"
+            "　 條件照抄遊戲自己的判斷、而且是**現場讀記憶體**：\n"
+            "　 分類是紙娃娃、分解值 > 0、沒有時限（限時道具遊戲不讓拆）。\n"
+            "\n"
+            "★ 只動一般背包（遊戲分區的「背包的slot」）。你的裝扮收在\n"
+            "　 「紙娃娃隨身包」那一區，這顆碰不到，穿在身上的也碰不到。\n"
+            "⚠⚠ 但**點裝／造型只要放在一般背包裡就會被拆掉**（水藍搖滾裝、\n"
+            "　 水之補師 那類都在名單內，分解值只有 1~12 點）。\n"
+            "　 開跑前請先確認一般背包裡沒有捨不得的裝扮。\n"
+            "\n"
+            "★ 拆完**不會停**，繼續盯著背包，要停請按旁邊的「暫停」。\n"
+            f"一拍最多 {energy.MAX_PER_TICK} 件，更多的下一拍接著拆。")
+        self.decomp_all_btn.clicked.connect(lambda: self._start_decomp(True))
+        drow.addWidget(self.decomp_all_btn)
         self.pause_btn = QPushButton("暫停")
         self.pause_btn.setToolTip(
             "停下自動分解 —— 這是唯一的出口（不然它會一直盯著背包拆下去）。\n"
@@ -284,10 +318,16 @@ class EnergyTab(BaseTab):
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self._auto_tick)
 
-        # 自動分解的狀態：送出去還沒從背包消失的 [(序號, 種類ID), …]＋累計
-        self._decomp_sent: list[tuple[int, int]] = []
+        # 自動分解的狀態：送出去還沒從背包消失的 [(序號, 種類ID, 分解值), …]＋累計
+        self._decomp_sent: list[tuple[int, int, int]] = []
         self._decomp_n = 0
         self._decomp_gain = 0
+        # 這一輪是「全部」還是「只有小背包」。⚠ 一定要記在狀態裡，不能每拍
+        # 去問按鈕 —— 兩顆鈕跑的是同一個計時器與同一份 _decomp_sent。
+        self._decomp_all = False
+        # 送出去以後撐了幾拍還沒消失（序號 → 拍數）。只拿來**提醒**，
+        # 不改重試行為（暫時性失敗照規矩無限重試，出口是「暫停」）。
+        self._decomp_rounds: dict[int, int] = {}
         self._decomp_timer = QTimer(self)
         self._decomp_timer.timeout.connect(self._decomp_tick)
 
@@ -530,33 +570,80 @@ class EnergyTab(BaseTab):
         return self._do("同步資料", energy.sync)
 
     # ------------------------------------------------------------------
-    # -- 自動分解小背包 -------------------------------------------------
-    def _start_decomp(self) -> None:
+    # -- 自動分解（小背包／全部共用同一套流程）---------------------------
+    def _confirm_all(self, found: list) -> bool:
+        """「分解全部」開跑前的確認：把即將拆掉的東西逐項列出來。按取消回 False。
+
+        ⚠ 只列**這一刻**背包裡的；開跑後掉出來的新東西照樣會被拆（這顆鈕
+          本來就是「拆完不停」），所以文字要講清楚，不要讓人以為只拆這幾件。
+        """
+        rows: dict[str, list[int]] = {}
+        for it in found:
+            key = f"{itemname.label(it.type_id)}（{it.decomp_value} 點）"
+            rows.setdefault(key, []).append(it.slot)
+        lines = [f"　• {name}　×{len(s)}　（格 "
+                 + "、".join(str(x) for x in sorted(s)) + "）"
+                 for name, s in sorted(rows.items())]
+        body = ("即將把一般背包裡**這些東西**拆成晶能：\n\n" + "\n".join(lines)
+                if lines else
+                "一般背包裡目前沒有可拆的東西。")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("自動分解全部")
+        box.setText(body)
+        box.setInformativeText(
+            "⚠ 拆掉就**回不來了**。點裝／造型只要放在一般背包裡也會被拆掉"
+            "（分解值通常只有 1~12 點）。\n"
+            "★ 穿在身上的、以及收在「紙娃娃隨身包」的裝扮不會被碰。\n"
+            "★ 拆完不會停，會一直盯著背包 —— 之後掉出來的新東西也會被拆，"
+            "要停請按「暫停」。")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)   # 手滑按 Enter 不會開拆
+        box.button(QMessageBox.Yes).setText("確定，開始拆")
+        box.button(QMessageBox.Cancel).setText("取消")
+        return box.exec() == QMessageBox.Yes
+
+    def _start_decomp(self, all_items: bool = False) -> None:
         # ★ 背包裡現在沒有也照樣開跑（使用者定的：跑到按「暫停」為止）——
         #   掛機掉出來的新小背包會被下一拍撿到。
         _pid, sc, _st = self._cur()
         if sc is None:
             self.status.setText("請先選一個分身")
             return
-        n = sum(1 for it in bag.items(sc)
-                if it.type_id in energy.DECOMP_ITEMS)
+        self._decomp_all = bool(all_items)
+        what = "件可分解的東西" if self._decomp_all else "顆"
+        found = energy.decomposable(sc, self._decomp_all)
+        n = len(found)
+        # ⚠⚠ 「全部」開跑前先把**即將被拆掉的東西逐項列出來讓他確認**。
+        #   理由不是理論上的：實測（2026-08-08，五台分身）嵐狐的一般背包
+        #   第 23 格就躺著一件「水之補師」（點裝，分解值只有 1）——
+        #   「我的裝扮都收在紙娃娃隨身包」這個前提**實際上不成立**。
+        #   拆掉不能還原，所以這裡多問一句；只拆小背包的那顆鈕不問（名單
+        #   寫死兩個編號，沒有誤拆的空間）。
+        if self._decomp_all and not self._confirm_all(found):
+            return
         self._decomp_sent = []
+        self._decomp_rounds = {}
         self._decomp_n = 0
         self._decomp_gain = 0
         self.decomp_btn.setEnabled(False)
+        self.decomp_all_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
-        self.decomp_lbl.setText(f"　背包裡有 {n} 顆，開拆" if n else
-                                "　背包裡目前沒有小背包，開始盯著")
+        head = "⚠ 分解全部：" if self._decomp_all else "　"
+        self.decomp_lbl.setText(
+            f"{head}背包裡有 {n} {what}，開拆" if n else
+            f"{head}背包裡目前沒有可拆的，開始盯著")
         self._decomp_timer.start(DECOMP_MS)
         self._decomp_tick()                    # 立刻拆第一輪，不空等一拍
 
     def _stop_decomp(self, why: str) -> None:
         self._decomp_timer.stop()
         self.decomp_btn.setEnabled(True)
+        self.decomp_all_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.decomp_lbl.setText(
             f"　已停止：{why}"
-            f"（共拆 {self._decomp_n} 顆、＋{self._decomp_gain} 晶能）")
+            f"（共拆 {self._decomp_n} 件、＋{self._decomp_gain} 晶能）")
 
     def _decomp_tick(self) -> None:
         """自動分解的一拍：先對帳上一拍送的，再把背包裡的**一次全送**。
@@ -578,53 +665,71 @@ class EnergyTab(BaseTab):
             # 換地圖／還沒進場，背包暫時讀不到 —— 不停，等它回來。
             self.decomp_lbl.setText("　讀不到背包（換地圖中？），下一拍再試")
             return
-        items = bag.items(sc)
-        present = {it.serial for it in items}
+        present = {it.serial for it in bag.items(sc)}
         # 送過的：序號不見了＝伺服器收走＝拆成功，晶能入帳；還在的留著追蹤
-        still: list[tuple[int, int]] = []
-        for serial, tid in self._decomp_sent:
+        # ★ 分解值在**送出的當下**就記起來（(序號, 種類ID, 分解值)）——
+        #   等它從背包消失才回頭查就查不到了（東西已經不在，範本讀不到）。
+        still: list[tuple[int, int, int]] = []
+        for serial, tid, gain in self._decomp_sent:
             if serial in present:
-                still.append((serial, tid))
+                still.append((serial, tid, gain))
+                self._decomp_rounds[serial] = (
+                    self._decomp_rounds.get(serial, 0) + 1)
                 continue
-            gain = energy.DECOMP_ITEMS[tid]
+            self._decomp_rounds.pop(serial, None)
             self._decomp_n += 1
             self._decomp_gain += gain
             got = self._read()
             self._log("分解", itemname.label(tid), f"晶能 +{gain}",
                       got.energy if got else "")
-        matches = [it for it in items if it.type_id in energy.DECOMP_ITEMS]
+        # ⚠ 列清單跟送包用**同一條規則**（energy.decomposable ↔ decompose_batch
+        #   都走 _slot_ok）：格號範圍、可拆條件、時限一次到位。
+        matches = energy.decomposable(sc, self._decomp_all)
+        # 送出去撐很多拍還在的：遊戲收了包卻沒動作（伺服器擋掉？）。
+        # 只提醒，不改重試（規矩見 memory 的 transient-failure-auto-retry）。
+        stuck = sum(1 for s, _, _ in still
+                    if self._decomp_rounds.get(s, 0) >= 5)
+        stuck_note = (f"　⚠ 有 {stuck} 件送了很多次還在背包裡" if stuck else "")
         if not matches:
             # ★ 拆完**不收工**（使用者要的是「跑到我按暫停為止」）——
-            #   繼續每 3 秒看一次，掛機掉出來的新小背包下一拍就會被拆掉。
-            self._decomp_sent = []
+            #   繼續每 3 秒看一次，掛機掉出來的新的下一拍就會被拆掉。
+            self._decomp_sent = still
+            note = stuck_note
+            if not still:
+                # 一件都沒中時要講得出原因（例如全被時限擋掉），
+                # 不准安靜地不做事。
+                why = energy.blocked_note(sc, self._decomp_all)
+                note = f"　{why}" if why else ""
             self.decomp_lbl.setText(
-                f"　等新的小背包中：已拆 {self._decomp_n} 顆"
-                f"（＋{self._decomp_gain} 晶能）")
+                f"　等新的可分解物品中：已拆 {self._decomp_n} 件"
+                f"（＋{self._decomp_gain} 晶能）" + note)
             return
         mv = self._mover(pid)
         if mv is None:
             self._decomp_sent = still
             return                             # status 已寫原因，下一拍再試
         sent_slots, whole = energy.decompose_batch(
-            mv, sc, [it.slot for it in matches])
+            mv, sc, [it.slot for it in matches], self._decomp_all)
         # 這一拍真的送出去的，補進追蹤名單（送過但還在背包的不重複記）
-        tracked = {s for s, _ in still}
+        tracked = {s for s, _, _ in still}
         sent_set = set(sent_slots)
         for it in matches:
             if it.slot in sent_set and it.serial not in tracked:
-                still.append((it.serial, it.type_id))
+                still.append((it.serial, it.type_id,
+                              energy.gain_of(it, self._decomp_all)))
         self._decomp_sent = still
         if not sent_slots:
             self.decomp_lbl.setText("　⚠ 一包都沒排進去（指令槽忙碌），"
                                     "下一拍再試")
             return
-        note = ""
+        note = stuck_note
         if len(sent_slots) < len(matches):
-            note = (f"　（這一拍先拆 {len(sent_slots)} 顆，剩的下一拍接著）"
-                    if whole else "　⚠ 指令槽忙碌，只送出一部分，下一拍補")
+            note += (f"　（這一拍先拆 {len(sent_slots)} 件，剩的下一拍接著）"
+                     if whole else "　⚠ 指令槽忙碌，只送出一部分，下一拍補")
+        head = "⚠ 分解全部中" if self._decomp_all else "自動分解中"
         self.decomp_lbl.setText(
-            f"　自動分解中：這一拍送 {len(sent_slots)} 顆、"
-            f"已入帳 {self._decomp_n} 顆（＋{self._decomp_gain} 晶能）" + note)
+            f"　{head}：這一拍送 {len(sent_slots)} 件、"
+            f"已入帳 {self._decomp_n} 件（＋{self._decomp_gain} 晶能）" + note)
 
     def _roll(self) -> bool:
         before = self._read()

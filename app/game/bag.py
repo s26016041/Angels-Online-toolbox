@@ -58,20 +58,60 @@ OFF_CONTAINER = 0x2FC       # 實體 + 這裡 = 物品容器 vector
 # ★ +0x00 / +0x04 是**賣出封包要填的那兩個欄位**，不要改名也不要拆開用。
 #   實測：同一批進背包的四疊藥水 +0x04 完全相同、+0x00 依序 +1，
 #   而 +0x04 換算成 Unix 時間剛好落在最近 —— 所以是（唯一序號, 取得時間）。
+#
+# ★★ 2026-08-08：下面的偏移**不再是推的** —— 遊戲把物品物件綁給 Lua 用
+#   （`ItemData` 那張方法表在 angel.dat `0x849718` 起），逐支反組譯就是欄位表：
+#
+#     getid        0x5336CA   [this+0x04] 與 [this+0x00]   ← 兩個一組
+#     getproto     0x5336ED   [this+0x08]                  種類 ID
+#     gettype      0x53370E   [[this+0x58]+0x18]           分類
+#     getcount     0x533732   [this+0x27]                  數量
+#     geticon      0x533753   [[this+0x58]+0x00]           原型介面
+#     getslot      0x533776   movzx eax, **word** [this+0x25]   格號
+#     getparam1    0x53379E   [[this+0x58]+0x108]          動態資料1
+#     getparam2    0x5337C9   [[this+0x58]+0x10C]          動態資料2
+#     getcompose1  0x5337F4   [[this+0x58]+0x110]          一階組合
+#     gettimelimit 0x533853   [this+0x2E]                  時限
+#     getenergy    0x533874   [this+0xA0]（限分類 0x2E＝46 紙娃娃）
+#
 ITEM_SERIAL = 0x00
 ITEM_STAMP = 0x04
 ITEM_TYPE = 0x08            # 種類 ID（itemname 的鍵）
-ITEM_SLOT = 0x25            # 物品自己記的格號（1 byte，> 255 就裝不下）
+# ★★ 格號是 **u16** 不是 1 byte（`getslot` 是 `movzx eax, word ptr [ecx+0x25]`）。
+#   ⚠ 這推翻了舊結論「+0x25 只有一個 byte，格號 > 255 裝不下」——
+#     那是當初只讀了 1 byte 造成的假象。✅ 2026-08-08 五台實測 341 件非空格：
+#     當 1 byte 對 338 件、**當 u16 對 341 件**（差的 3 件正是 > 255 的裝扮格）。
+ITEM_SLOT = 0x25
 ITEM_COUNT = 0x27           # 數量（u16）
-ITEM_DURA = 0x2C            # 耐久現值；0 = 沒耐久這回事，或是壞了
+# ⚠⚠ 耐久要當 **u16** 讀：`gettimelimit` 證明 `+0x2E` 是另一個欄位（時限），
+#   當 u32 讀會把時限的低 2 bytes 吃進來 —— 時限道具的耐久就會變成天文數字，
+#   `broken`（耐久 0 ＝ 壞了）跟著失靈。實測 341 件目前時限全 0，所以兩種讀法
+#   結果一樣；改成 u16 是為了時限道具真的出現時不會安靜算錯。
+ITEM_DURA = 0x2C            # 耐久現值（u16）；0 = 沒耐久這回事，或是壞了
+ITEM_TIMELIMIT = 0x2E       # ★ 時限；**0 ＝ 沒時限**。非 0 的東西遊戲不讓分解
 ITEM_TMPL = 0x58            # 指向這種物品的範本
 ITEM_SPAN = 0x5C            # 一次要讀多少 bytes 才涵蓋上面全部
 
 TMPL_KIND = 0x18            # 分類代號（1:1 對到 item.xml 的「物品類別」，見下）
 TMPL_DURA_MAX = 0xDC        # ★ 耐久上限；> 0 ＝ 這是裝備／武器
 TMPL_PRICE = 0x104          # 售價；<= 0 = 這東西賣不掉
+TMPL_PARAM1 = 0x108         # 動態資料1
+# ★★ 動態資料2 ＝ **分解值**（拆成晶能拿幾點）。遊戲拆解介面的判斷就是
+#   `getparam2() > 0`，所以不必抄資源包 —— 表就在記憶體裡，改版自動跟上。
+#   ✅ 2026-08-08 五台實測 341 件，跟 `item*.xml` 的「動態資料2」**341/341 吻合**。
+TMPL_PARAM2 = 0x10C
+# 一階組合（融合／合成的組別）。★ 拿來分辨「充能小背包 vs 點裝」很好用：
+#   點裝都有組別，充能小背包沒有（說明文字寫「但無法融合」）。
+#   程式沒用它判斷，記著是為了看得懂資料。見 memory 的
+#   decompose-all-and-doll-slots。
+TMPL_COMPOSE1 = 0x110
 TMPL_GRADE = 0x130          # ★ 品質（白／藍／橘），見 GRADE_NAMES
 TMPL_SPAN = 0x134
+
+# ★ 分類代號 46 ＝ 紙娃娃（造型／裝扮）。來源有兩份互相印證：遊戲自己的
+#   Lua 常數 `ITEMOBJ_TYPE_DOLL = 46`，以及 2026-08-08 五台實測
+#   （344 件物品、23 種分類跟 item.xml 的「物品類別」1:1 零衝突）。
+KIND_DOLL = 46
 
 # ★★ 「這是不是裝備／武器」＝ 範本 +0xDC（耐久上限）> 0。
 # ✅ 拿 `setting/base/item*.xml` 的「耐久」欄整張對帳：**32476 筆 100.00% 吻合**
@@ -99,6 +139,15 @@ LAST_SLOT = 0xA9
 # 身上穿的裝備格（掛機「裝備壞掉」看的就是這一段，不含背包）
 WORN_FIRST = 0
 WORN_LAST = 11
+
+# ★★ 容器後半段的分區。**數字是遊戲自己的 Lua 全域常數**（2026-08-08 倒出來，
+#   見 memory 的 lua-readonly-inspect），不是我們數格子推的：
+#       CHAR_SLOT_BEGIN=20  CHAR_SLOT_END=69  BAG_SLOT_BEGIN=70
+#       DOLL_SLOT_BEGIN=242 DOLL_SLOT_END=249   ← 身上穿著的「裝扮欄」
+#   250 是徽章格、251 起是「紙娃娃隨身包」（遊戲裡叫裝扮背包，2 頁×100）。
+#   五台分身的背包實拍完全對得上。
+DOLL_WORN_FIRST = 242
+DOLL_WORN_LAST = 249
 
 GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）
 GOLD_TYPE = 1              # 金幣的種類 ID
@@ -144,6 +193,8 @@ class Item:
     price: int              # 單價；<= 0 = 賣不掉
     grade: int              # 品質，見 GRADE_NAMES
     dura_max: int           # 耐久上限；> 0 = 這是裝備／武器
+    time_limit: int = 0     # +0x2E 時限；0 = 沒時限
+    decomp_value: int = 0   # 範本 +0x10C 分解值；> 0 = 拆得成晶能
 
     @property
     def name(self) -> str:
@@ -167,6 +218,29 @@ class Item:
     def broken(self) -> bool:
         """裝備但耐久歸零（＝壞了）。"""
         return self.is_gear and self.dura <= 0
+
+    @property
+    def is_doll(self) -> bool:
+        """是不是紙娃娃（造型／裝扮）。看記憶體分類，不是看名字。"""
+        return self.kind == KIND_DOLL
+
+    @property
+    def decomposable(self) -> bool:
+        """遊戲**自己**認不認這件可以拆成晶能。
+
+        照抄客戶端的判斷（`OnSetPDItem` 的 Lua bytecode，2026-08-08 倒出來）：
+
+            gettype() == ITEMOBJ_TYPE_DOLL   → kind == 46
+            getparam2() > 0                  → decomp_value > 0
+            gettimelimit() == 0              → 沒時限　★使用者確認：時限不能拆
+            slot 不在 DOLL_SLOT_BEGIN~END(242~249，＝身上穿著的裝扮欄)
+
+        ⚠ 這裡**不含**「哪些格算背包」那道關 —— 那是呼叫端的事
+          （`items()` 預設就只給一般背包）。
+        """
+        return (self.is_doll and self.decomp_value > 0
+                and self.time_limit == 0
+                and not DOLL_WORN_FIRST <= self.slot <= DOLL_WORN_LAST)
 
 
 def _u32(scanner, addr: int) -> int:
@@ -231,7 +305,7 @@ def items(scanner, first: int = FIRST_SLOT,
         return []
     ptrs = struct.unpack(f"<{hi - lo + 1}I", bytes(raw))
 
-    tmpl_cache: dict[int, tuple[int, int, int]] = {}
+    tmpl_cache: dict[int, tuple[int, int, int, int, int]] = {}
     out: list[Item] = []
     for offset, ptr in enumerate(ptrs):
         if not ptr:
@@ -242,9 +316,12 @@ def items(scanner, first: int = FIRST_SLOT,
         b = bytes(blob)
         serial, stamp, type_id = struct.unpack_from("<III", b, ITEM_SERIAL)
         count_ = struct.unpack_from("<H", b, ITEM_COUNT)[0]
-        dura = struct.unpack_from("<I", b, ITEM_DURA)[0]
+        # ⚠ u16 不是 u32 —— +0x2E 是時限，見 ITEM_DURA 的說明。
+        dura = struct.unpack_from("<H", b, ITEM_DURA)[0]
+        tlimit = struct.unpack_from("<I", b, ITEM_TIMELIMIT)[0]
         tmpl = struct.unpack_from("<I", b, ITEM_TMPL)[0]
-        kind, price, grade, dmax = tmpl_cache.get(tmpl, (0, 0, 0, 0))
+        kind, price, grade, dmax, param2 = tmpl_cache.get(
+            tmpl, (0, 0, 0, 0, 0))
         if tmpl and tmpl not in tmpl_cache:
             traw = scanner._read_bytes(tmpl, TMPL_SPAN)
             if traw:
@@ -253,10 +330,12 @@ def items(scanner, first: int = FIRST_SLOT,
                 price = struct.unpack_from("<i", tb, TMPL_PRICE)[0]
                 grade = struct.unpack_from("<I", tb, TMPL_GRADE)[0]
                 dmax = struct.unpack_from("<I", tb, TMPL_DURA_MAX)[0]
-            tmpl_cache[tmpl] = (kind, price, grade, dmax)
+                param2 = struct.unpack_from("<i", tb, TMPL_PARAM2)[0]
+            tmpl_cache[tmpl] = (kind, price, grade, dmax, param2)
         out.append(Item(slot=lo + offset, serial=serial, stamp=stamp,
                         type_id=type_id, count=count_, dura=dura,
-                        kind=kind, price=price, grade=grade, dura_max=dmax))
+                        kind=kind, price=price, grade=grade, dura_max=dmax,
+                        time_limit=tlimit, decomp_value=param2))
     return out
 
 
