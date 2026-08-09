@@ -56,8 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core import charname, preload                       # noqa: E402
 from app.core.memory import MemoryScanner                    # noqa: E402
 from app.game import (bag, channel, energy, entity, inventory, locate,  # noqa: E402,E501
-                      monsters, move, player, quickbar, robot, scene,
-                      terrain)
+                      move, player, quickbar, robot, scene, terrain)
 
 FAST_GAP = 0.1
 SLOW_GAP = 5.0
