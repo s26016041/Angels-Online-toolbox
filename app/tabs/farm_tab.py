@@ -151,6 +151,14 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，�
 #   它一開著，精靈就會自己挑怪打，而且**完全不看我們的「選中怪物」名單**。
 #   純記憶體讀（紅黑樹 0.3ms 級），是關的就什麼都不做。
 AF_WATCH_GAP = 3.0
+# ★★ 「背包裡找不到回程道具」要**連續確認幾次**才准停機（每次間隔就是
+#   GEAR_CHECK_GAP）。⚠ 不可以改回「第一次就停機」：換頻道／傳送後重連時，
+#   容器與內容是**分批到齊**的 —— 使用者 2026-08-09 回報「裝備壞掉卻說我
+#   沒有回程道具，但一定有」，而且當下剛換過地圖。那一拍身上穿的裝備已經
+#   讀得到（所以觸發了「裝備損壞」），整條容器卻還沒填完。
+#   `bag.synced()` 擋得掉「整條都還是空的」，但擋不掉「前面到了、後面沒到」。
+#   結構上分不出來的事就用時間分：空窗只有零點幾秒到幾秒。
+NO_RECALL_TRIES = 3
 # ★ 交棒給天使精靈跑補給：多久看一次「回到原地圖了沒」、最多等多久就放棄。
 #   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
@@ -1279,6 +1287,9 @@ class CharFarmPage(QWidget):
         self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._recall_try = 0       # 回程第二段重試了幾次（見 _retry_recall）
+        # 連續幾輪說「背包裡沒有回程道具」了（見 NO_RECALL_TRIES）。
+        # ⚠ 這是「要停機」的門檻，不是重試上限 —— 讀到就歸零。
+        self._no_recall = 0
         # 趴趴GO回程的狀態（見 _jump_step）。⚠ 三個都要在 _start_supply 歸零。
         self._jump_n = 0           # 這一趟送出去幾次了（顯示用，不設上限）
         self._jump_sent = None     # 最後一次送出時的 _supply_t（None = 還沒送過）
@@ -2332,15 +2343,26 @@ class CharFarmPage(QWidget):
             self.status.setText(f"🔧 {why} → 背包暫時讀不到，下一輪再試回程補給")
             return False
         if not have:
-            # ⚠ 講清楚**我們在找哪一件東西**（使用者 2026-08-09 回報「說我沒有
-            #   回程道具，但一定有」）：我們只認 `recall.RECALL_ITEM`（天使之翼），
-            #   身上放的是別種回城道具（標記傳送捲軸之類）就會找不到 ——
-            #   訊息把名字寫出來，一眼就看得出是「真的沒有」還是「認錯東西」。
+            # ⚠ 講清楚**我們在找哪一件東西**：我們只認 `recall.RECALL_ITEM`
+            #   （天使之翼），身上放的是別種回城道具就會找不到 —— 名字寫出來，
+            #   一眼就看得出是「真的沒有」還是「認錯東西」。
+            #   ✅ 使用者 2026-08-09 確認他用的就是天使之翼，所以那次是讀取問題。
             item = itemname.label(recall.RECALL_ITEM)
-            self._stop_with(f"🔧 {why}，但背包裡找不到「{item}」（回程道具）")
+            # ⚠⚠ **不准第一次就停機**（見 NO_RECALL_TRIES 的說明）：那一次
+            #   剛換過地圖，穿著的裝備已經讀得到、整條容器卻還沒填完。
+            #   觸發條件（裝備壞了／水沒了）不會消失，下一輪自然會再走到這裡。
+            self._no_recall += 1
+            if self._no_recall < NO_RECALL_TRIES:
+                self.status.setText(
+                    f"🔧 {why} → 找不到「{item}」，{GEAR_CHECK_GAP:.0f} 秒後"
+                    f"再確認一次（第 {self._no_recall}/{NO_RECALL_TRIES} 次）")
+                return False
+            self._stop_with(f"🔧 {why}，但背包裡找不到「{item}」（回程道具）"
+                            f"——連續確認 {NO_RECALL_TRIES} 次都沒有")
             self.notify(f"{why}，但背包裡找不到「{item}」（回程道具），"
                         "掛機已停止。")
             return False
+        self._no_recall = 0            # 找到了 → 之前那幾次是空窗，重新計數
         # ★ 記下現在這張地圖 —— 回到它才算補給結束（使用者要求）
         # ⚠⚠ self._scene **本來就是場景編號（int）**，不是 Scene 物件 ——
         #   寫成 `self._scene.id` 會在真的觸發補給的那一刻才炸
