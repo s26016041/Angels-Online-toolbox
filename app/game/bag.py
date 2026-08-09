@@ -465,3 +465,47 @@ def gold(scanner) -> int | None:
     if struct.unpack_from("<I", b, ITEM_TYPE)[0] != GOLD_TYPE:
         return None                      # 第 0 格不是金幣 → 版面變了，不猜
     return struct.unpack_from("<I", b, ITEM_COUNT)[0]
+
+
+def synced(scanner) -> bool:
+    """伺服器真的把背包內容推過來了嗎？——要下「歸零／沒有」結論前先問這句。
+
+    ⚠⚠ 這支專治一種**既有防護全部擋不住**的誤報：換頻道／傳送會斷線重連，
+      重連之後容器 vector 會**先配置好格數、物品再由伺服器一件件推過來**。
+      那段空窗裡容器讀得到、格數正常、每一格都讀得成功，只是全都是空的
+      —— 走一趟的結果跟「東西真的用完了」一模一樣。
+      `complete`（讀取完整性）與 `is_valid`（表頭有效性）都會通過，因為
+      讀取本來就成功、表頭本來就有效。使用者回報「換頻道有時會跳藥水用完」
+      就是撞上這個窗口（見 [[bag-false-empty-guards]]）。
+
+    ★ 判準用**遊戲自己的取金幣路徑**，不是計時也不是數量門檻：背包第 0 格
+      永遠放著金幣物品（種類 1），身無分文的角色那一格也在（數量 0）——
+      見 `gold()` 引的反組譯 `0x508C24`。所以第 0 格是空指標＝「容器配好了、
+      東西還沒到」，不是「什麼都沒有」。
+    ⚠ **不可以改寫成 `gold(scanner) is not None`**：那支對「第 0 格是空指標」
+      回的是 0（身無分文），正好就是這裡要擋掉的狀態。
+
+    ★ 順帶擋掉第二條誤報路徑：這裡只認 `head()`（遊戲自己的容器）。
+      `inventory._resolve()` 在問不到容器時會退回 AOB 找到的舊表頭，而換頻道
+      後舊背包副本還躺在堆積裡、可能已被部分回收 —— 走那份死副本同樣會數出
+      「全部歸零」。要下結論就得問得到遊戲的容器，問不到就不下結論。
+
+    ⚠ 只有要**下結論**時才需要問。平常找東西、數東西都不必：數得到就是有，
+      這道檢查只會讓「沒數到」變成「不知道」。
+    """
+    got = head(scanner)
+    if got is None:
+        return False                     # 還沒進場／換地圖中／定位失敗
+    begin, count = got
+    if count < 1:
+        return False
+    raw = scanner._read_bytes(begin, 4)
+    if not raw:
+        return False
+    ptr = struct.unpack("<I", bytes(raw))[0]
+    if not ptr:
+        return False                     # ★ 容器配好了，東西還沒推過來
+    blob = scanner._read_bytes(ptr + ITEM_TYPE, 4)
+    if not blob:
+        return False
+    return struct.unpack("<I", bytes(blob))[0] == GOLD_TYPE

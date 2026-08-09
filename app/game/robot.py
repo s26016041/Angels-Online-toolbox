@@ -667,7 +667,7 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
       這一組只要有技能格就直接當「不缺」，不觸發。
     ★ 一格都沒設、或設定讀不到，就無從判斷，也不觸發。
     """
-    from app.game import inventory                    # 避免循環相依
+    from app.game import bag, inventory               # 避免循環相依
 
     items = []
     for base in slots:
@@ -691,8 +691,14 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
     #     剛剛數的是死掉的舊副本（實測舊副本還殘留幾個像物品的指標）。
     #   掃描執行緒雖然每輪都 is_valid，但那跟這裡隔了最多零點幾秒 ——
     #   使用者實際遇過「藥水明明很多卻突然報用完」。
+    #   ③ 容器**還沒同步**（`bag.synced`）→ 換頻道／傳送後重連的那段空窗裡，
+    #     格數配好了但物品還沒推過來，每一格都是空的。①②都會通過
+    #     （讀取成功、表頭有效），只有第 0 格的金幣物件在不在看得出來。
+    #     使用者回報「換頻道有時會跳沒有藥水」就是撞上這個。
     #   跟 potions_out「宣告前強制重讀設定」同一個精神：要做決定才多花檢查。
     if not complete or not inventory.is_valid(scanner, inv_head):
+        return None
+    if not bag.synced(scanner):
         return None
     return items
 
@@ -801,8 +807,11 @@ def has_recall_item(scanner, inv_head: int) -> tuple | None:
       ()   = 整條走完了、真的一個都沒有 → 才輪到「沒有回程道具」的處置。
       以前兩種都回 None，表頭剛搬家的那一拍會被判成「沒有」→ 誤停機
       （跟藥水誤報歸零同一類，見 _potion_out 的把關）。
+    ⚠ 換頻道／傳送後重連的空窗（容器配好了、物品還沒推過來）也算「讀不到」
+      —— 那時整條陣列每一格都是空的，看起來就是「一個都沒有」。
+      判準見 `bag.synced()`。
     """
-    from app.game import inventory, recall            # 避免循環相依
+    from app.game import bag, inventory, recall       # 避免循環相依
 
     if not inv_head:
         return None
@@ -817,6 +826,8 @@ def has_recall_item(scanner, inv_head: int) -> tuple | None:
         return (got[0], n) if got else None
     if not complete or not inventory.is_valid(scanner, inv_head):
         return None                        # 沒看完整條 →「沒數到」≠「沒有」
+    if not bag.synced(scanner):
+        return None                        # 重連空窗：東西還沒推過來
     return ()
 
 
@@ -910,6 +921,28 @@ def autofight_off(mover, scanner) -> None:
     精靈不會跟我們的掛機搶怪。（`end_supply()` 做的也是同一件事。）
     """
     set_autofight(mover, scanner, False)
+
+
+def autofight_on(scanner) -> bool | None:
+    """精靈的「自動攻擊」現在是開的嗎？**純記憶體讀，不碰 Lua、不用跳板**。
+
+    讀不到（樹還沒載好／位址失效）回 None —— 呼叫端不准當成「關著」。
+    """
+    return _read_var(scanner, AF_IS_AUTO_FIGHT, VAR_T_BOOL)
+
+
+def force_autofight_off(scanner) -> bool:
+    """把「自動攻擊」關掉，**純記憶體、不需要跳板**；關成了才回 True。
+
+    ⚠⚠ 給看門狗用（`farm_tab._af_tick`）。跟 `autofight_off()` 的差別是
+      **不會因為跳板剛好不在就整個做不成**：關掉自動攻擊是一個要一直維持的
+      狀態，而補給送出後那幾秒正好是換地圖／重連中，跳板最容易掛不上 ——
+      舊寫法在那一拍失敗就永遠不補，精靈於是一路幫我們打怪，
+      而且**牠完全不看我們的「選中怪物」名單**（使用者回報「會打我沒選的怪」）。
+    ★ `_write_var` 本來就寫完重讀確認，所以 False ＝這一拍真的沒關成；
+      呼叫端下一輪再關就好，不設上限（見 [[transient-failure-auto-retry]]）。
+    """
+    return _write_var(scanner, AF_IS_AUTO_FIGHT, VAR_T_BOOL, 0)
 
 
 def missing_supply_settings(mover, scanner) -> list[str]:

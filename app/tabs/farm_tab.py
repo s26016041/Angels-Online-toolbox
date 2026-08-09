@@ -147,6 +147,10 @@ GAME_GONE_POLL = 1.0
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，不必常看）
+# ★★ 官方精靈「自動攻擊」的看門狗間隔（見 CharFarmPage._af_tick）。
+#   它一開著，精靈就會自己挑怪打，而且**完全不看我們的「選中怪物」名單**。
+#   純記憶體讀（紅黑樹 0.3ms 級），是關的就什麼都不做。
+AF_WATCH_GAP = 3.0
 # ★ 交棒給天使精靈跑補給：多久看一次「回到原地圖了沒」、最多等多久就放棄。
 #   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
@@ -744,6 +748,23 @@ class KeyWorker(_Paced):
         try:
             if eid is None:
                 self._sel = None       # 沒目標了，下一隻要重新送「選定」
+                # ★★★ **沒有目標就絕對不出手。**
+                #   底下那條「快捷欄叫不動就送鍵」的退路（`_send_scan`）
+                #   不看 eid，而按 F 鍵放技能時**遊戲會自己挑一隻最近的敵人
+                #   打**（客戶端本來就有這個行為，見 [[client-auto-approach]]）。
+                # ⚠⚠ 這個窗口每換一次目標就出現一次，跟換不換頻道無關：
+                #   `_on_died()`／「走不到」／「零傷害換怪」都是
+                #     ① self._keys.eid = None
+                #     ② if not self._pick_next(): set_on(False)
+                #   而 ② 要走一整趟挑目標（每隻怪重讀死活座標、算距離），
+                #   這條執行緒在那零點幾秒裡照樣在跑 —— eid 已經是 None、
+                #   `_on` 還是 True，於是送出去的那一鍵打的是**遊戲替我們挑的
+                #   怪**：可能是名單外的，也可能是旁邊那隻王
+                #   （使用者回報「會打我沒選的怪、還會去打王打到死」）。
+                #   ⛔ 不可以改成「在 UI 那邊調換 ①② 的順序」：`_pick_next()`
+                #     本來就要先看到 `_cur is None` 才會挑下一隻。
+                #     由這裡自己擋才是唯一真相來源。
+                return
             if not self._on:
                 return
             # ◎ 每 QB_REFRESH 秒重讀快捷欄：使用者中途換鍵上的技能會自動
@@ -1263,6 +1284,10 @@ class CharFarmPage(QWidget):
         self._jump_sent = None     # 最後一次送出時的 _supply_t（None = 還沒送過）
         self._jump_off = ""        # 趴趴GO走不通的原因（有字就不再試，標籤顯示它）
         self._robot_ours = False   # 精靈是我們開的（停手時要負責把自動攻擊關掉）
+        # 「自動攻擊」看門狗（見 _af_tick）：掛機期間它必須是關的。
+        self._af_t = 0.0           # 距離上次確認過了多久
+        self._af_free = 0.0        # 這個時間點之前刻意不管（補給那一趟要開著）
+        self._af_shut = 0          # 幫忙關掉過幾次（狀態列只講第一次）
         # 死亡回程模式（勾了「死亡自己回練功區」，角色死掉才會進，見 _death_tick）
         self._death = False        # 進行中（我們完全讓開，等復活）
         self._death_t = 0.0        # 死了多久（倒數 DEATH_REVIVE_SECS、超時判斷共用）
@@ -1905,6 +1930,11 @@ class CharFarmPage(QWidget):
         self._atk.hold_off()
         self._keys.set_on(False)
         self.state = self.player = self.stats = self.inv = None
+        # ★ 怪物清單整份過期（換頻道／傳送之後都是新場景的怪）。
+        #   ⚠ 不是為了防打錯怪 —— 那條由 `entity.read_live()` 的 vtable＋eid
+        #   驗證擋著（見 _apply_scan 裡同一段說明）。清掉是免得挑目標白跑
+        #   一趟死清單、以及「周圍怪物」停在舊圖的名字上。
+        self.mons = []
         self._keys.eid = None
         self._keys.stats = None
         self._keys.pf = None
@@ -1988,11 +2018,53 @@ class CharFarmPage(QWidget):
           但補給那一趟照樣跑完。
         ⚠ 太早關會讓精靈只走到城裡就停住（0 秒實測失敗），所以這個秒數
           是實測調出來的，不要為了「快一點」去縮。
+
+        ⚠⚠ 2026-08-09 改掉「排一次 QTimer 去關」的舊寫法。舊的長這樣：
+
+            QTimer.singleShot(5 秒, lambda: mover 還在 and autofight_off(...))
+
+          條件不成立就**整個跳過，而且沒有任何人會再關** —— 偏偏那一拍正是
+          「回程道具剛用掉、人在換地圖／重連」，跳板最容易掛不上的時候。
+          自動攻擊於是一路開著，精靈就自己挑怪打，牠**完全不看我們的
+          「選中怪物」名單**（使用者回報「不知道為什麼會打我沒選的怪物」）。
+          這裡現在只負責**解除看管期限**，真正去關的是 `_af_tick()` 的看門狗，
+          關不掉就下一輪再關、不設上限（見 [[transient-failure-auto-retry]]）。
         """
-        QTimer.singleShot(
-            int(robot.AF_HOLD_SECS * 1000),
-            lambda: (self._mover is not None and self._mover.active
-                     and robot.autofight_off(self._mover, self.sc)))
+        self._af_free = time.monotonic() + robot.AF_HOLD_SECS
+
+    def _af_tick(self, dt: float) -> None:
+        """看門狗：掛機期間官方精靈的「自動攻擊」必須是關的。
+
+        ⚠⚠ **關掉是一個要一直維持的狀態，不是一個做過就算的動作。**
+          它一開著，精靈就會自己挑怪打，而且不看「選中怪物」名單、也不看
+          「只打王」—— 使用者看到的就是「跑去打我沒選的怪」。會自己變開的
+          途徑至少三條：補給那趟是我們自己開的（`begin_supply`）、使用者在
+          遊戲面板上勾了、換頻道／換地圖重連之後遊戲重新載設定。
+          所以不能靠「該關的時候關一次」，要每隔幾秒收斂。
+        ★ 補給那一趟刻意讓它開著（回城、修裝、買東西是精靈在跑），
+          `self._af_free` 之前完全不管。
+        ★ 讀是純記憶體（`robot.autofight_on`），關也是（不必跳板）——
+          是關的就什麼都不做，平常成本趨近於零。
+        ⚠ 讀不到回 None：**不猜、不動作**（樹還沒載好／位址失效）。
+        """
+        self._af_t += dt
+        if self._af_t < AF_WATCH_GAP:
+            return
+        self._af_t = 0.0
+        if time.monotonic() < self._af_free:
+            return                          # 補給那一趟，刻意讓它開著
+        if robot.autofight_on(self.sc) is not True:
+            return                          # 關著／讀不到 → 什麼都不做
+        if not robot.force_autofight_off(self.sc):
+            self._dbg("精靈的「自動攻擊」是開的，這一拍關不掉 → 下一輪再關")
+            return
+        self._af_shut += 1
+        self._dbg(f"關掉精靈的「自動攻擊」（累計第 {self._af_shut} 次）")
+        if self._af_shut == 1:
+            # 只講第一次：會反覆被打開的話狀態列每 3 秒閃一次沒有意義，
+            # 次數留在診斷紀錄裡（AO_FARM_LOG=1）。
+            self.status.setText("★ 精靈的「自動攻擊」是開的 → 已關掉"
+                                "（開著牠會自己挑怪打，不看選中怪物）")
 
     def _jump_step(self, here: int | None) -> str:
         """趴趴GO回程的一步：時間到就送、送了沒到就再送。回傳要接在狀態列後
@@ -2284,6 +2356,9 @@ class CharFarmPage(QWidget):
         #   順序與間隔都不能省（見 robot.do_recall）。
         notes = robot.begin_supply(self._mover, self.sc)
         self._robot_ours = True
+        # 這一趟要讓「自動攻擊」開著（精靈在開車）→ 看門狗先讓開，
+        # 由 _schedule_af_off() 在回程送出後把期限改成 AF_HOLD_SECS。
+        self._af_free = float("inf")
         # 我們自己要完全讓開：不送技能鍵、不寫目標
         self._keys.set_on(False)
         self._atk.hold_off()
@@ -2304,6 +2379,10 @@ class CharFarmPage(QWidget):
         self._supply_gen += 1          # 這趟結束，排著的趴趴GO傳送作廢
         if self._mover is not None and self._mover.active:
             robot.end_supply(self._mover, self.sc)   # 只關自動攻擊
+        # ⚠ 上面那一行有可能整個沒跑到（跳板不在）—— 補給結束正是換完地圖、
+        #   跳板最容易掛不上的時候。所以這裡**一定要把看門狗放回來**，
+        #   由它負責真的關掉（見 _af_tick）。
+        self._af_free = 0.0
         self._robot_ours = False
         # 補給跑完一定換過地圖，所有快取位址都要作廢
         self._drop_cached_addrs()
@@ -2929,6 +3008,15 @@ class CharFarmPage(QWidget):
             self._keys.set_on(False)
             self._keys.eid = None
             self._cur = None
+            # ★ 本體搬家 ＝ 換地圖／換頻道／重連／重生 → 舊的怪物清單整份
+            #   過期，不要留給底下那段「掃壞了就沿用上一拍」（SCAN_KEEP_BAD）。
+            #   ⚠ 講清楚**這不是在防打錯怪**：`entity.read_live()` 會當場驗
+            #     vtable＋eid（entity.py `alive`），位址被新場景重用時身分對
+            #     不上就 `alive=False`，`_pick_next` 直接跳過 —— 那條路本來
+            #     就安全（[[boss-attack-triggers]] 已排除過這個假說，別重查）。
+            #   清掉是為了另外兩件事：`_pick_next` 不必每輪白跑一趟死清單，
+            #   以及「周圍怪物」那份清單不會停在上一張圖的怪名上。
+            self.mons = []
         self.state = s.state
         self.player = s.player
         self.stats = s.stats
@@ -3615,6 +3703,12 @@ class CharFarmPage(QWidget):
         #   我們本來就不該同時叫角色坐下。
         if self._supply_tick(dt):
             return
+
+        # ★★ 看住精靈的「自動攻擊」。**刻意放在 `state is None` 之前**：
+        #   它走的是精靈變數樹，跟狀態物件無關，而最需要它的時刻正是
+        #   「剛換完地圖／剛換完頻道」—— 那時 self.state 有好幾秒是 None，
+        #   放在後面就等於在最危險的那幾秒不看管（見 _af_tick）。
+        self._af_tick(dt)
 
         if self.state is None:
             return
