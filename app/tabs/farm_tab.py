@@ -91,8 +91,20 @@ DEFAULT_INTERVAL = ATTACK_GAP   # _Paced 的預設節奏
 WRITE_INTERVAL = 0.02           # 秒；多久重寫一次目標＋檢查它死了沒（50 Hz）
 SEND_TIMEOUT_MS = 60            # 送鍵最多等遊戲多久（正常 3.4ms，卡住就放棄這一拍）
 TICK_MS = 10                    # UI 心跳
-RESCAN_GAP = 0.3                # 沒得打了要多快重掃
-IDLE_SCAN_GAP = 1.5             # 沒在掛機時也持續刷新「周圍怪物」的間隔
+# 「立刻重掃」用的推值：把 _since_scan 推到比**任何**間隔都大，
+# 下一拍心跳（10ms）就會送請求。⚠ 不繞過 `_waiting` 那個閂。
+SCAN_NOW = 999.0
+# 「沒人在看、也沒在掛機」那幾台的刷新間隔 —— 唯一的慢檔。
+# ★★ 刷新節奏**只有兩檔**（使用者要求：不要分掛機／沒掛機，同一份掃描同一個
+#   節奏）。掃描本來就只有一份：ScanWorker 掃一次，「挑目標」跟「周圍怪物」
+#   清單共用同一個結果，這裡從頭到尾只是在決定「多久要一次」。
+#     有人在看這一頁，或這台正在掛機 → REFRESH_GAP（0.15 秒）
+#     兩者都不是                     → 這個值
+# ⚠ 那一檔慢的**不是為了省效能，是因為刷了沒用**：沒人看畫面、也不必挑目標。
+#   但它確實也保護了掃描執行緒 —— 只有一條執行緒服務所有分身，一次熱區掃描
+#   約 30ms，0.15 秒一次等於一台吃掉它的 20%。五台全開快檔就滿載，排隊反而
+#   讓實際刷新拖到 0.2~0.3 秒，還會拖慢掛機中那幾台挑目標。
+IDLE_SCAN_GAP = 1.5
 # 掛機時多久刷新一次怪物清單。熱區掃描實測約 28ms，所以可以一直刷。
 # ★ 必須「一直刷」而不是「沒怪才刷」：跟別人搶怪時，清單一過期就會去打
 #   別人已經殺掉的、或錯過剛生出來的那隻。
@@ -1901,7 +1913,7 @@ class CharFarmPage(QWidget):
         self._scene_obj = None            # 場景物件也會搬家
         self._scene_scanned = False
         self._scene_try = 0.0             # 剛傳送完，允許立刻重新定位一次
-        self._since_scan = RESCAN_GAP     # 重連完立刻重掃
+        self._since_scan = SCAN_NOW       # 重連完立刻重掃
 
     def _on_state_stale(self) -> None:
         """寫入執行緒發現手上的狀態物件位址已經失效（vtable 對不上）。
@@ -2130,7 +2142,7 @@ class CharFarmPage(QWidget):
 
         if back:
             self._death = False
-            self._since_scan = RESCAN_GAP        # 立刻重掃，馬上接回打怪
+            self._since_scan = SCAN_NOW          # 立刻重掃，馬上接回打怪
             self.status.setText("★ 已回到練功地圖 → 接回自動戰鬥"
                                 if self._death_jumped is not None else
                                 "★ 復活了 → 接回自動戰鬥")
@@ -2970,13 +2982,12 @@ class CharFarmPage(QWidget):
             names.add(m.name)
             crown = "【王】" if monsters.is_boss(self.sc, m.type_id, idx) else ""
             seen.append((crown + m.name, m.name))
-        if [t for t, _ in seen] != [self.near.item(i).text()
-                                    for i in range(self.near.count())]:
-            self.near.clear()
-            for text, name in seen:
-                it = QListWidgetItem(text)
-                it.setData(Qt.UserRole, name)
-                self.near.addItem(it)
+        # ⚠⚠ 排序**不能省**。清單本來是照 self.mons 的順序排的，而那是**掃描
+        #   命中的記憶體位址順序** —— 怪一生一死就整個洗牌。刷新從 1.5 秒加快到
+        #   0.15 秒之後，同一批怪會變成每 0.15 秒跳一次位置，使用者滑鼠移過去
+        #   正要點，那一行已經換人了。照名字排之後「內容沒變 → 畫面完全不動」。
+        seen.sort(key=lambda p: p[1])
+        self._sync_near(seen)
 
         if err:
             self.status.setText(
@@ -3024,6 +3035,38 @@ class CharFarmPage(QWidget):
         msg = f"周圍 {len(self.mons)} 隻、{self.near.count()} 種"
         if self.status.text() != msg:
             self.status.setText(msg)
+
+    def _near_name(self, row: int) -> str:
+        """「周圍怪物」第 row 列的**真正名字**（顯示文字可能有「【王】」字首）。"""
+        it = self.near.item(row)
+        return "" if it is None else (it.data(Qt.UserRole) or it.text())
+
+    def _sync_near(self, want: list[tuple[str, str]]) -> None:
+        """把「周圍怪物」清單**就地**改成 want（(顯示文字, 名字)，已依名字排序）。
+
+        ⚠⚠ 不可以 `clear()` 重建。重建會清掉使用者的選取，而且重建那一瞬間
+          按下去的滑鼠會落到新的一行上 —— 刷新加快到 0.15 秒之後，撞上的機會
+          變成十倍。這裡只動**真的有變**的那幾列：怪的種類沒變（絕大多數的拍）
+          就一個 Qt 物件都不碰，畫面完全不會閃。
+        ★ 兩邊都照名字排序，所以一趟合併掃描就對得齊：
+          清單裡排在前面而 want 沒有的 → 刪掉；對得上 → 留著（只有文字不同才
+          改，例如同名怪從小怪換成【王】）；want 有而清單沒有 → 插進去。
+        """
+        i = 0
+        for text, name in want:
+            # 排在這個名字前面的，代表已經不在附近了
+            while i < self.near.count() and self._near_name(i) < name:
+                self.near.takeItem(i)
+            if i < self.near.count() and self._near_name(i) == name:
+                if self.near.item(i).text() != text:
+                    self.near.item(i).setText(text)
+            else:
+                it = QListWidgetItem(text)
+                it.setData(Qt.UserRole, name)
+                self.near.insertItem(i, it)
+            i += 1
+        while self.near.count() > i:               # 尾巴多出來的也清掉
+            self.near.takeItem(i)
 
     def _dbg(self, msg: str) -> None:
         """事件型的診斷紀錄（AO_FARM_LOG=1 才寫），跟每秒的決策行同一個檔。
@@ -3299,7 +3342,7 @@ class CharFarmPage(QWidget):
             return
         if not self._pick_next():
             self._keys.set_on(False)              # 沒目標就別空按
-            self._since_scan = RESCAN_GAP         # 清單空了，才排重掃
+            self._since_scan = SCAN_NOW           # 清單空了，才排重掃
             self.status.setText(
                 f"「{m.name if m else ''}」倒了（累計 {self._kills} 隻）→ 重新掃描…")
 
@@ -3336,7 +3379,7 @@ class CharFarmPage(QWidget):
         # ⛔ 這裡以前會把 _kills 歸零 —— 拿掉了（使用者要求）：擊殺數顯示在
         #   主開關旁邊，只有旁邊的「歸零」鈕和重開程式會歸零。
         self._killed.clear()
-        self._since_scan = RESCAN_GAP      # 清單裡挑不到的話，立刻重掃
+        self._since_scan = SCAN_NOW        # 清單裡挑不到的話，立刻重掃
         self._cur = None
         # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
         #   學法：直讀快捷欄那格（quickbar.py），通常當場拿到；讀不到才退回
@@ -3468,8 +3511,11 @@ class CharFarmPage(QWidget):
             self._wait_t = 0.0
 
         self._since_scan += dt
-        gap = (IDLE_SCAN_GAP if not self.run_cb.isChecked()
-               else RESCAN_GAP if self._cur is None else REFRESH_GAP)
+        # ★★ 只有兩檔（見 IDLE_SCAN_GAP）：有人在看、或這台在掛機 → 快檔。
+        # ⚠ `isVisible()` 對「沒被切到的子分頁」與「整個掛機分頁沒被選到」
+        #   都是 False，一句就涵蓋兩種情形。
+        gap = (REFRESH_GAP if (self.run_cb.isChecked() or self.isVisible())
+               else IDLE_SCAN_GAP)
         if self._since_scan >= gap and not self._waiting:
             self._since_scan = 0.0
             self._waiting = True
@@ -3915,7 +3961,7 @@ class CharFarmPage(QWidget):
             self._keys.eid = None
             if not self._pick_next():
                 self._keys.set_on(False)
-                self._since_scan = RESCAN_GAP
+                self._since_scan = SCAN_NOW
             self.status.setText(f"「{m.name}」走不到（卡在地形裡？）→ 換一隻")
             self._dbg(f"放棄「{m.name}」eid={m.eid:#x}：尋路連續 "
                       f"{UNREACH_HITS} 次算不出（{dist:.1f} 格）")
@@ -4062,7 +4108,7 @@ class CharFarmPage(QWidget):
             self._keys.eid = None
             if not self._pick_next():
                 self._keys.set_on(False)
-                self._since_scan = RESCAN_GAP
+                self._since_scan = SCAN_NOW
             self.status.setText(
                 f"「{m.name}」{NOHIT_SECS:.0f} 秒零傷害（打不到？）→ 換一隻")
             self._dbg(f"零傷害放棄「{m.name}」eid={m.eid:#x}：交戰 "
@@ -4088,7 +4134,7 @@ class CharFarmPage(QWidget):
             self._keys.eid = None
             if not self._pick_next():
                 self._keys.set_on(False)
-                self._since_scan = RESCAN_GAP
+                self._since_scan = SCAN_NOW
             self.status.setText(
                 f"「{m.name}」{limit:.0f} 秒沒進展"
                 + ("（打不中？）" if engaged else "（走不過去？）") + " → 換一隻")
@@ -4376,6 +4422,8 @@ class FarmTab(BaseTab):
         root.addLayout(bar)
 
         self.tabs = QTabWidget()
+        # 切到另一台分身就立刻刷一次「周圍怪物」（見 _refresh_shown）
+        self.tabs.currentChanged.connect(lambda _i: self._refresh_shown())
         root.addWidget(self.tabs, 1)
 
         # ⛔ 這裡原本有一大段說明文字，使用者要求全部拿掉 ——
@@ -4414,6 +4462,19 @@ class FarmTab(BaseTab):
     def on_show(self) -> None:
         if not self._pages:
             self.reload_instances()
+        self._refresh_shown()
+
+    def _refresh_shown(self) -> None:
+        """切到某台分身（或切回這個分頁）時，**立刻**刷一次「周圍怪物」。
+
+        不然要等最多一個刷新間隔才更新，切過去的第一眼看到的
+        是離開前那一拍的清單 —— 中間換過地圖的話整批都是舊圖的怪。
+        ★ 只是把「距離上次掃描」推到門檻以上，下一拍心跳（10ms）就會送請求；
+          不繞過 `_waiting` 那個閂，也不會多送重複的請求。
+        """
+        page = self.tabs.currentWidget()
+        if isinstance(page, CharFarmPage):
+            page._since_scan = SCAN_NOW
 
     def reload_instances(self, force_names: bool = False) -> None:
         # force_names：只有按「重新偵測分身」才 True。on_show 的自動載入
