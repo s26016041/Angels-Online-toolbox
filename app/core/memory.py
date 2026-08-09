@@ -181,6 +181,15 @@ kernel32.WriteProcessMemory.argtypes = [
 ]
 kernel32.WriteProcessMemory.restype = wintypes.BOOL
 
+kernel32.GetExitCodeProcess.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+# GetExitCodeProcess 對還在跑的行程回這個值（STILL_ACTIVE）。
+STILL_ACTIVE = 259
+
 psapi.GetProcessMemoryInfo.argtypes = [
     wintypes.HANDLE,
     ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
@@ -461,6 +470,27 @@ class MemoryScanner:
     @property
     def attached(self) -> bool:
         return self._handle is not None
+
+    def alive(self) -> bool:
+        """遊戲行程還活著嗎？（沒接上程序＝不算活著）
+
+        ⚠⚠ 為什麼需要這支：遊戲被關掉（或自己當掉）之後，我們手上的
+          控制代碼**還是有效的**，`_read_bytes()` 只會安靜地回 None ——
+          看起來就跟「這一拍沒掃到怪」一模一樣。於是掛機會對著一個不存在的
+          行程繼續跑，直到撞上某個沒有防護的讀取（跳板那塊 VirtualAllocEx
+          的記憶體）丟出 ERROR_PARTIAL_COPY(299)，把整個工具箱掀掉 ——
+          使用者實際遇到過（crash.log 停在 move.call_sync）。
+
+        ★ **只有明確問到「已經結束」才回 False**：查詢本身失敗時一律回 True。
+          寧可晚一拍發現，也不要把一台好端端的分身誤判成關掉了。
+        （GetExitCodeProcess 幾微秒，放在每秒跑一次的地方沒有負擔。）
+        """
+        if not self._handle:
+            return False
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+            return True                     # 問不到 → 不要亂判死
+        return code.value == STILL_ACTIVE
 
     @property
     def pid(self) -> int | None:

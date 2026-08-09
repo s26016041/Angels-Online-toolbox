@@ -15,14 +15,24 @@ from pathlib import Path
 
 
 def _log_dir() -> Path:
-    """崩潰記錄放使用者 AppData，打包成 exe 後也寫得進去。"""
-    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    path = Path(base) / "AngelsOnlineToolbox"
+    """崩潰記錄放使用者 AppData，打包成 exe 後也寫得進去。
+
+    ⚠ 只有一份定義（app/core/crashlog.py）—— 分頁那邊的「只停一台分身」
+      也會寫同一個 crash.log，兩邊各寫各的話使用者要看兩個檔案。
+      import 失敗（極端情況）就退回自己算，例外攔截絕不能因此裝不起來。
+    """
     try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return Path(".")
-    return path
+        from app.core.crashlog import log_dir
+        return log_dir()
+    except Exception:                          # noqa: BLE001
+        base = os.environ.get("APPDATA") or os.path.join(
+            os.path.expanduser("~"), ".config")
+        path = Path(base) / "AngelsOnlineToolbox"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return Path(".")
+        return path
 
 
 def _install_excepthook() -> None:

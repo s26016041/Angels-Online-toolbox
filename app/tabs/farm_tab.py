@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import config
-from app.core import charname, injector, preload
+from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
@@ -127,6 +127,11 @@ SCAN_STUCK_SECS = 8.0
 # 掃描結果不可信時（掃描失敗／狀態物件掃到 0 個或多個），最多連續幾拍沿用
 # 上一拍的怪物清單 —— 「這一拍掃壞了」≠「周圍沒有怪」。見 apply_scan。
 SCAN_KEEP_BAD = 10
+# ★★ 多久確認一次「這個遊戲視窗還在不在」（見 _check_game_gone）。
+#   遊戲被關掉之後我們的控制代碼**還是有效的**，記憶體讀取只會安靜地回 None
+#   ——看起來就跟「這一拍沒掃到怪」一樣，掛機會對著一個不存在的行程一直跑。
+#   一次查詢只花幾微秒（GetExitCodeProcess），一秒一次完全沒有負擔。
+GAME_GONE_POLL = 1.0
 INV_RELOCATE_GAP = 8.0          # 找不到物品陣列表頭時，多久才重試（要跑 AOB 全掃）
 HP_CHECK_GAP = 0.5              # 多久確認一次自己還活著（死了就自動停）
 GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，不必常看）
@@ -1194,6 +1199,11 @@ class CharFarmPage(QWidget):
         self._waiting = False      # 正在等重新掃描的結果
         self._wait_t = 0.0         # 等了多久（看門狗用，見 SCAN_STUCK_SECS）
         self._scan_lost = 0        # 掃描結果沒回來、被看門狗救回來幾次
+        # 這台已經停用了（遊戲關掉／心跳丟例外）＝停用的原因字串，見 halt()。
+        # ⚠ 停用之後 tick 什麼都不做 —— 一個已經不存在的行程沒什麼好讀的，
+        #   而且會讓同一個例外每 10ms 重演一次。
+        self._halted = ""
+        self._gone_t = 0.0         # 距離上次確認「遊戲還在不在」過了多久
         self._scan_err = 0         # 套用掃描結果時丟例外幾次
         self._bad_scans = 0        # 連續幾拍掃描結果不可信（見 apply_scan）
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
@@ -3361,12 +3371,83 @@ class CharFarmPage(QWidget):
             + ("　精靈：" + "、".join(notes) if notes else "")
             + skill_note)
 
+    def halt(self, reason: str, gone: bool = False) -> None:
+        """把**這一台**停乾淨並在狀態列說明原因；之後 tick 不再做任何事。
+
+        兩個呼叫端：
+          · 遊戲視窗被關掉（`_check_game_gone`）
+          · 心跳丟出未預期的例外（`FarmTab._page_failed`）
+
+        ★ 這是「大聲停用」不是「安靜地少做事」：勾勾放掉、狀態列寫明原因，
+          例外那條路還會把完整 traceback 寫進 crash.log。
+        ⚠ 順序：先讓兩條背景執行緒停手，再放勾勾（`_on_toggle` 的停止流程
+          會去讀記憶體／叫精靈），最後才蓋上我們的訊息 —— 反過來的話
+          狀態列會被 `_on_toggle` 的「已停止」蓋掉。
+        """
+        if self._halted:
+            return
+        self._halted = reason
+        self._keys.set_on(False)
+        self._keys.stop_learning()
+        self._keys.eid = None
+        self._atk.hold_off()
+        self._cur = None
+        self._death = False
+        # 位址全部作廢：行程沒了的話它們早就沒有意義，
+        # 心跳出事的話也不該讓別條執行緒繼續拿著用。
+        self.state = self.player = self.stats = self.inv = None
+        self._keys.stats = None
+        self._keys.pf = None
+        # ⚠ 收尾本身也可能炸：`_on_toggle` 的停止流程會叫精靈收工，那是往
+        #   遊戲寫記憶體（scanner.write_value 寫不進去會丟 OSError）——
+        #   行程已經不在時正好會踩到。停用流程**不准再炸**，
+        #   不然狀態列的原因就永遠貼不上去，使用者只會看到「已停止」。
+        try:
+            if self.run_cb.isChecked():
+                self.run_cb.setChecked(False)  # 走既有的停止流程
+            if gone and self._mover is not None:
+                # 行程都沒了，IAT 還不還得回去無所謂 —— 重點是別再有人拿著它。
+                # （move.release → stop() 內部本來就整段包在 try 裡。）
+                move.release(self.pid, self)
+                self._mover = None
+        except Exception:                      # noqa: BLE001
+            pass
+        self.status.setText(reason)
+        self.status.setStyleSheet("color: #e06060;")
+
+    def _check_game_gone(self, dt: float) -> bool:
+        """遊戲視窗還在不在？已經關掉就停用這一台並回 True。
+
+        ⚠⚠ 為什麼一定要主動查：遊戲被關掉之後，我們手上的控制代碼**還是
+          有效的**，記憶體讀取只會安靜地回 None —— 跟「這一拍沒掃到怪」
+          長得一模一樣。於是掛機會對著一個不存在的行程一直跑，直到撞上
+          某個沒有防護的讀取（跳板那塊配置的記憶體）丟出
+          ERROR_PARTIAL_COPY(299) 把整個工具箱掀掉 —— 使用者實際遇到過。
+        ★ `alive()` 只有在**明確問到行程已結束**時才回 False（見它的說明），
+          所以不會把好端端的分身誤判成關掉了。
+        """
+        if self._halted:
+            return True
+        self._gone_t += dt
+        if self._gone_t < GAME_GONE_POLL:
+            return False
+        self._gone_t = 0.0
+        if self.sc.alive():
+            return False
+        self.halt("⚠ 這個遊戲視窗已經關閉 → 這台分身已停止"
+                  "（重開遊戲之後按上面的「重新偵測分身」）", gone=True)
+        return True
+
     def tick(self, dt: float) -> None:
         """UI 側的心跳：只做「挑目標、卡住偵測、更新狀態列」。
 
         寫目標與送鍵各自在 TargetWorker / KeyWorker 的執行緒上跑，節奏不受 UI
         影響 —— 原本整個迴圈掛在這裡，UI 一忙節奏就漂掉，感受就是「很卡」。
         """
+        # ★★ 遊戲被關掉／自己當掉 → 這台整個停手，什麼都不要再做。
+        #   一定要放在最前面：底下每一段都在讀寫一個已經不存在的行程。
+        if self._check_game_gone(dt):
+            return
         # ★ 掃描**一直都在跑**，不管有沒有在掛機 ——
         #   這樣「周圍怪物」永遠是即時的，使用者隨時可以把名字加進來，
         #   也不必先按什麼按鈕才能開始（掃描只掃熱區，很便宜）。
@@ -4422,8 +4503,32 @@ class FarmTab(BaseTab):
 
     def _tick(self) -> None:
         dt = TICK_MS / 1000.0
-        for page in self._pages.values():
-            page.tick(dt)
+        for page in list(self._pages.values()):
+            try:
+                page.tick(dt)
+            except Exception as exc:               # noqa: BLE001
+                self._page_failed(page, exc)
+
+    def _page_failed(self, page, exc: Exception) -> None:
+        """一台分身的心跳丟例外 → **只停那一台**，不要把整個工具箱帶走。
+
+        ⚠⚠ tick 掛在 QTimer 上（UI 執行緒），未捕捉的例外會直接走到
+          main.py 的全域攔截 → 訊息框 → **程式關閉**。使用者實際遇到的那次
+          是遊戲被關掉，`move.call_sync` 讀跳板讀到 ERROR_PARTIAL_COPY(299)，
+          結果所有分身一起被關掉（crash.log 有完整呼叫鏈）。
+          那個根因已經在 move.py／`_check_game_gone` 修掉了，這裡是最後一道
+          防線：**任何**沒想到的例外都只該讓一台停用，不該關掉整個程式。
+        ★ 不是安靜地吞掉：那一台的勾勾放掉、狀態列寫紅字、完整 traceback
+          照樣寫進 crash.log（路徑也顯示在下面那一列）。
+        """
+        path = crashlog.record(f"掛機分頁 心跳例外（PID {page.pid}）", exc)
+        try:
+            page.halt(f"⚠ 這台分身發生未預期的錯誤，已停止：{exc}")
+        except Exception:                          # noqa: BLE001
+            pass                                   # 停用流程本身也不准再炸
+        self.found.setText(
+            f"⚠ 有一台分身出錯已停止（PID {page.pid}）"
+            + (f"　紀錄檔：{path}" if path else ""))
 
     # ------------------------------------------------------------------
     def _teardown(self) -> None:

@@ -286,6 +286,7 @@ class Mover:
         self._orig = 0
         self._block = 0
         self._active = False
+        self._gone = False          # 讀不到跳板了＝遊戲行程已經不在（見 _sink）
         self._busy_since = None     # _BUSY 從什麼時候舉著（卡住自救用）
         # RLock 而非 Lock：call_sync() 內部會再呼叫 call()，同一條執行緒要能重入。
         self._lock = threading.RLock()
@@ -302,6 +303,11 @@ class Mover:
         return self._active
 
     @property
+    def gone(self) -> bool:
+        """跳板讀不到了 —— 遊戲行程已經不在（跟「還沒裝」要分得開）。"""
+        return self._gone
+
+    @property
     def slot_wanted(self) -> bool:
         """尋路／移動那邊正在等指令槽 —— 攻擊要讓路。
 
@@ -311,6 +317,41 @@ class Mover:
           直到 10 秒卡住偵測才換怪（使用者回報的「掛機還是會卡住」）。
         """
         return self._wanted > 0
+
+    # --- 跟遊戲行程之間的讀寫 ------------------------------------------------
+    # ⚠⚠⚠ 底下三支是**這個檔案唯一可以直接碰 pymem 的地方**。
+    #   本專案除了 injector 之外，其他讀取都走 scanner（讀不到回 None）；
+    #   只有這裡是裸的 pymem，也就是唯一會把例外丟給呼叫端的讀取點。
+    #
+    #   使用者實際遇到的當機（crash.log）：遊戲被關掉之後 ReadProcessMemory
+    #   丟 ERROR_PARTIAL_COPY(299)，例外從 pymem 一路往上穿過
+    #   call_sync → attack._send → channel.switch → 掛機分頁的 tick
+    #   （QTimer 掛在 UI 執行緒上），全域例外攔截接到就是**整個工具箱關閉**
+    #   —— 多開的話所有分身一起被關掉。
+    #
+    #   遊戲不在了屬於「大聲停用」而不是崩潰：把 `_active` 放掉，之後每個
+    #   呼叫都回「排不進去」，分頁看得到 `.active` 是 False、`.gone` 是 True。
+    def _sink(self) -> None:
+        """跳板讀寫不到了 → 整份作廢，別再對一個不存在的行程下指令。"""
+        self._active = False
+        self._gone = True
+
+    def _rd(self, off: int) -> int | None:
+        """讀跳板區塊的一格；讀不到回 None（並讓整份跳板作廢）。"""
+        try:
+            return self._pm.read_uint(self._block + off)
+        except Exception:                      # noqa: BLE001
+            self._sink()
+            return None
+
+    def _wr(self, off: int, val: int) -> bool:
+        """寫跳板區塊的一格；寫不進去回 False（並讓整份跳板作廢）。"""
+        try:
+            self._pm.write_uint(self._block + off, val & 0xFFFFFFFF)
+            return True
+        except Exception:                      # noqa: BLE001
+            self._sink()
+            return False
 
     @property
     def lock(self) -> threading.RLock:
@@ -394,6 +435,7 @@ class Mover:
         self._pm, self._iat, self._orig = pm, iat, orig
         self._block = block
         self._active = True
+        self._gone = False          # 重新裝起來了（上一份可能是因為遊戲關掉才作廢）
 
     def scratch(self) -> int:
         """跳板那塊配置頁裡可以自由使用的暫存區位址（沒裝好回 0）。
@@ -410,7 +452,11 @@ class Mover:
         """往遊戲行程寫一段位元組（給 scratch 區與 Lua 堆疊用）。"""
         if not self._active:
             return False
-        self._pm.write_bytes(addr, bytes(data), len(data))
+        try:
+            self._pm.write_bytes(addr, bytes(data), len(data))
+        except Exception:                      # noqa: BLE001
+            self._sink()                       # 遊戲不在了（見 _sink）
+            return False
         return True
 
     def call(self, fn: int, a1: int = 0, a2: int = 0, a3: int = 0,
@@ -441,22 +487,24 @@ class Mover:
             #   特徵對不上）。這裡是所有遊戲函式呼叫的唯一閘口 —— 擋下來
             #   ＝該功能大聲停用，絕不拿沒驗證過的位址叫遊戲執行。
             return False
-        pm = self._pm
         with self._lock:                       # ⚠ 見類別說明：不能兩邊交錯寫
-            if pm.read_uint(self._block + _FLAG):
-                return False                   # 上一個還沒被領走
-            if not self._busy_ok(pm):
+            flag = self._rd(_FLAG)
+            if flag is None or flag:
+                return False                   # 讀不到（遊戲沒了）／上一個還沒被領走
+            if not self._busy_ok():
                 return False                   # 上一個還在遊戲那邊跑
             # ⚠ `_FN` **最後才寫**（在 _FLAG 之前）：stub 的讀取順序是
             #   參數 → ecx → fn，寫入順序跟它一致，萬一真的有人插隊也是
             #   「舊函式配舊參數」而不是「新函式配舊參數」。
             for off, val in ((_A1, a1), (_A2, a2), (_CNT, a3), (_A4, a4),
                              (_A5, a5), (_A6, a6), (_ECX, ecx), (_FN, fn)):
-                pm.write_uint(self._block + off, val & 0xFFFFFFFF)
-            pm.write_uint(self._block + _FLAG, 1)
+                if not self._wr(off, val):
+                    return False               # 寫到一半遊戲沒了 → 旗標沒舉，安全
+            if not self._wr(_FLAG, 1):
+                return False
         return True
 
-    def _busy_ok(self, pm) -> bool:
+    def _busy_ok(self) -> bool:
         """跳板現在有空嗎？（`_BUSY` 沒舉起來）
 
         ⚠ 附帶「卡住自救」：函式如果在遊戲那邊被例外掀掉，stub 尾巴的
@@ -464,7 +512,10 @@ class Mover:
           `_BUSY_STUCK_SECS` 就強制解鎖 —— 我們叫的都是幾毫秒的函式，
           卡 5 秒一定是出事了。
         """
-        if not pm.read_uint(self._block + _BUSY):
+        busy = self._rd(_BUSY)
+        if busy is None:
+            return False                           # 讀不到（遊戲沒了）→ 不要下指令
+        if not busy:
             self._busy_since = None
             return True
         now = time.monotonic()
@@ -473,7 +524,7 @@ class Mover:
             return False
         if now - self._busy_since < _BUSY_STUCK_SECS:
             return False
-        pm.write_uint(self._block + _BUSY, 0)      # 卡太久 → 自救
+        self._wr(_BUSY, 0)                         # 卡太久 → 自救
         self._busy_since = None
         return True
 
@@ -505,15 +556,21 @@ class Mover:
         # ⚠ 鎖要**含等待那段**：只鎖 call() 的話，別人可以在我們等結果時排下一個
         #   呼叫，我們就會讀到別人的 eax。
         with self._lock:
-            done0 = self._pm.read_uint(self._block + _DONE)
-            if not self.call(fn, *args, ecx=ecx):
+            # ⚠ 這幾個讀寫都走 `_rd`／`_wr`：遊戲被關掉時它們回 None／False
+            #   （並讓跳板作廢），**不會丟例外把呼叫端連同整個工具箱帶走**。
+            #   見 `_sink()` 的說明（使用者實際遇到的當機就是停在這一行）。
+            done0 = self._rd(_DONE)
+            if done0 is None or not self.call(fn, *args, ecx=ecx):
                 return None
             t0 = time.time()
             while time.time() - t0 < timeout:
-                if self._pm.read_uint(self._block + _DONE) != done0:
-                    return self._pm.read_uint(self._block + _RET)
+                cur = self._rd(_DONE)
+                if cur is None:
+                    return None                          # 遊戲沒了
+                if cur != done0:
+                    return self._rd(_RET)
                 time.sleep(0.005)
-            self._pm.write_uint(self._block + _FLAG, 0)      # 取消還沒被領走的
+            self._wr(_FLAG, 0)                           # 取消還沒被領走的
         return None
 
     def path_to(self, scanner, tile_x: float, tile_y: float,
