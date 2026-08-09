@@ -471,7 +471,13 @@ def gold(scanner) -> int | None:
         return None
     ptr = struct.unpack("<I", bytes(raw))[0]
     if not ptr:
-        return 0
+        # ⚠⚠ 空指標**不是「身無分文」**，是「容器配好了、東西還沒推過來」
+        #   （換地圖／換頻道重連的空窗）。金幣是第 0 格的一個**物品物件**，
+        #   一毛錢都沒有時它照樣在（數量欄是 0）。
+        #   ✅ 2026-08-09 實測抓到：趴趴GO 換地圖時這裡回 0，而同一拍
+        #     `player.read().gold` 是 156001741 —— 兩條獨立的路差了一億五。
+        #     舊寫法回 0 就是安靜地報「你沒錢」（賣東西前後對帳會整個算錯）。
+        return None
     blob = scanner._read_bytes(ptr, ITEM_SPAN)
     if not blob:
         return None

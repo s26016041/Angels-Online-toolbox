@@ -94,7 +94,10 @@ class Probe:
         self.rows = 0
         self.miss: Counter = Counter()      # 每個欄位「讀不到」幾次
         self.bad: list[dict] = []           # ⛔ 讀錯（違反不變量）
-        self.tear = 0                       # 已知暫態：上限暫時等於現值
+        self.tear = 0                       # 已知暫態：上限暫時跟著現值跑
+        # 產品用哪一套穩定血魔上限，這裡就用同一套（見 _check_fast）
+        self._mhp = player.MaxTracker()
+        self._mmp = player.MaxTracker()
         self.mover = None                   # 只有 --switch 才會裝
         self.n_ch: int | None = None        # 這台的分流數（全掃，只算一次）
 
@@ -192,17 +195,19 @@ class Probe:
         if gold_bag is not None and gp is not None and gold_bag != gp:
             self._flag(row, f"金幣兩條路不一致：容器 {gold_bag} vs 屬性 {gp}")
         # ⛔ 測試期間不該變的東西
-        # ★ 例外：掉血當下「最大 HP」會暫時等於「當前 HP」約 1.3 秒
-        #   （2026-08-09 實測，見 player.MaxTracker）。那是**已知暫態**，
-        #   單獨計數，不算讀錯 —— 產品那邊由 MaxTracker 擋住。
-        for k in ("lv", "mhp", "mmp"):
+        self._invariant("lv", row.get("lv"), row)
+        # ★ 血魔上限要**先過產品同一套 `MaxTracker` 再檢查**：原始欄位在
+        #   掉血／掉魔當下會暫時跟著現值往下跑（見 player.MaxTracker 的時間軸），
+        #   那是已知暫態、單獨計數。這樣測到的就是使用者實際會用到的值。
+        for k, tr in (("mhp", self._mhp), ("mmp", self._mmp)):
             v = row.get(k)
-            cur_v = row.get("hp" if k == "mhp" else "mp")
-            if (k in ("mhp", "mmp") and v is not None and v == cur_v
-                    and self.ref.get(k, 0) > v):
-                self.tear += 1
+            if v is None:
                 continue
-            self._invariant(k, v, row)
+            if v != self.ref.get(k + "_raw", v):
+                self.tear += 1
+            self.ref[k + "_raw"] = v
+            row[k + "_stable"] = tr.value(v, row.get("lv"))
+            self._invariant(k, row[k + "_stable"], row)
         # ⛔ 背包件數只在「整段真的讀到了」時才拿來比（沒買賣就不該變）
         if row.get("bag_ok"):
             self._invariant("bag_n", row.get("bag_n"), row)
@@ -288,6 +293,21 @@ class Probe:
         self.base = self.inv = self.state = self.pobj = None
         return f"{cur} → {nxt} 頻　{'送出' if ok else '❌沒送出'}"
 
+    def jump(self, jump_id: int) -> str:
+        """天使趴趴GO 換地圖。"""
+        from app.core import injector
+        from app.game import jumpmap
+
+        if self.mover is None:
+            self.mover = move.acquire(self.pid,
+                                      injector.process_path(self.pid), self)
+        if not (self.mover and self.mover.active):
+            return "跳板掛不上"
+        ok, msg = jumpmap.teleport(self.mover, self.sc, jump_id)
+        # 換地圖同樣會讓物件全部搬家
+        self.base = self.inv = self.state = self.pobj = None
+        return f"{'送出' if ok else '❌沒送出'}　{msg}"
+
 
 _MISSING = object()
 
@@ -299,8 +319,17 @@ def main() -> int:
     ap.add_argument("--slow", type=float, default=SLOW_GAP)
     ap.add_argument("--switch", default="",
                     help="在這幾秒各換一次頻道，例如 8,20,32")
+    ap.add_argument("--jump", default="",
+                    help="趴趴GO換地圖：`秒=跳點編號` 用逗號分隔，"
+                         "例如 12=4,32=114（只動第一台，影響最小）")
     args = ap.parse_args()
     switch_at = [float(s) for s in args.switch.split(",") if s.strip()]
+    jump_at = []
+    for part in args.jump.split(","):
+        if part.strip():
+            sec, _, jid = part.partition("=")
+            jump_at.append((float(sec), int(jid)))
+    jump_at.sort()
 
     wins = preload.windows()
     if not wins:
@@ -347,6 +376,13 @@ def main() -> int:
                 t = time.monotonic() - t0
                 if args.secs and t >= args.secs:
                     break
+                # 趴趴GO：**只動第一台** —— 換地圖比換頻道影響大，
+                # 一台就足以拍到整個過程，其餘四台當對照組。
+                while jump_at and t >= jump_at[0][0]:
+                    _sec, jid = jump_at.pop(0)
+                    p = probes[0]
+                    print(f"\n--- t={t:.1f}s {p.name} 趴趴GO → 跳點 {jid} ---")
+                    print(f"  {p.jump(jid)}\n")
                 while switch_at and t >= switch_at[0]:
                     switch_at.pop(0)
                     print(f"\n--- t={t:.1f}s 換頻道 ---")
