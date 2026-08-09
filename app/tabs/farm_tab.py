@@ -69,7 +69,7 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
-                      player, quickbar, revive, robot, scene, skills,
+                      player, quickbar, recall, revive, robot, scene, skills,
                       tablestamp, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
@@ -2332,8 +2332,14 @@ class CharFarmPage(QWidget):
             self.status.setText(f"🔧 {why} → 背包暫時讀不到，下一輪再試回程補給")
             return False
         if not have:
-            self._stop_with(f"🔧 {why}，但背包裡沒有回程道具")
-            self.notify(f"{why}，但背包裡沒有回程道具，掛機已停止。")
+            # ⚠ 講清楚**我們在找哪一件東西**（使用者 2026-08-09 回報「說我沒有
+            #   回程道具，但一定有」）：我們只認 `recall.RECALL_ITEM`（天使之翼），
+            #   身上放的是別種回城道具（標記傳送捲軸之類）就會找不到 ——
+            #   訊息把名字寫出來，一眼就看得出是「真的沒有」還是「認錯東西」。
+            item = itemname.label(recall.RECALL_ITEM)
+            self._stop_with(f"🔧 {why}，但背包裡找不到「{item}」（回程道具）")
+            self.notify(f"{why}，但背包裡找不到「{item}」（回程道具），"
+                        "掛機已停止。")
             return False
         # ★ 記下現在這張地圖 —— 回到它才算補給結束（使用者要求）
         # ⚠⚠ self._scene **本來就是場景編號（int）**，不是 Scene 物件 ——
