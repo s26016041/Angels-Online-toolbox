@@ -135,6 +135,102 @@ def pick(scanner, hits) -> int | None:
     return (ok[0] - OFF_VTABLE) if len(ok) == 1 else None
 
 
+# ★★★ 掉血當下「最大 HP」會暫時等於「當前 HP」，要多久才修正回來。
+#   ✅ 2026-08-09 實測（五台 10Hz 全程採樣）：北極狐被打掉 89 血的那一刻，
+#      `+0x04`（HP）與 `+0x08`（最大 HP）**同時**變成 3149，
+#      **1.31 秒後** `+0x08` 才修正回真值 3238：
+#        t=26.89  3238/3238
+#        t=27.00  3149/3149   ← 這裡開始，hp / max_hp 算出來是 100%
+#        t=28.31  3149/3238   ← 修正回來
+#   ⚠⚠ 這 1.3 秒**血量百分比會算成 100%**，休息判斷會被騙 —— 而角色連續
+#     挨打時每一次掉血都會重新開始這 1.3 秒，等於「血很低卻一直顯示滿血」，
+#     那就是「掛機被打死、藥水還剩很多」的死法之一。
+#   ⚠ 找過替代欄位：整個物件（−0x80 ~ +0x400）除了 +0x04／+0x08 沒有第三個
+#     存最大 HP 的地方，所以只能在讀取端擋。
+MAXV_SETTLE = 3.0
+
+
+class MaxTracker:
+    """把「最大值」穩下來，擋掉上面那個暫態。HP 一個、MP 一個。
+
+        mhp = tracker.value(stats.max_hp, stats.level)
+
+    規則（失效方向刻意選在**安全**那一邊）：
+      · 變大 → 立刻採用（升級、穿裝備）。
+      · 變小 → **先不採用**，除非**同一個較小的值穩定地**撐過 `MAXV_SETTLE` 秒
+        （真的脫裝備／buff 到期）。
+      · 等級變了 → 整個重來（升級會換一組上限）。
+
+    ⚠⚠ 「**同一個**值」這三個字不能省（離線測試抓到的）：光看「比較小」
+      加計時器的話，連續挨打超過 `MAXV_SETTLE` 秒就會採信撕裂值 ——
+      實測血從 3238 一路掉到 508，百分比被算成 42% 而不是 16%。
+      撕裂的特徵正是**上限跟著血一起往下跑**（每一拍都是新的較小值），
+      真的降上限則是**停在一個固定值**。所以值一變就重新計時。
+      ★ 停止挨打之後上限 1.3 秒內就會自己修正回真值，不會卡在小值上。
+
+    高估上限的後果是百分比偏低 → 偏向「多休息一下」；低估的後果是
+    該休息卻不休息 → 被打死。所以寧可高估。
+    """
+
+    def __init__(self) -> None:
+        self.seen = 0
+        self.level = None
+        self._low_val = None      # 正在觀察的那個「較小的值」
+        self._low_since = 0.0
+
+    def value(self, cur: int, level=None, now: float | None = None) -> int:
+        import time as _t
+
+        now = _t.monotonic() if now is None else now
+        if level is not None and level != self.level:
+            self.level, self.seen = level, cur
+            self._low_val, self._low_since = None, 0.0
+            return self.seen
+        if cur >= self.seen:
+            self.seen = cur
+            self._low_val, self._low_since = None, 0.0
+        elif cur != self._low_val:
+            self._low_val, self._low_since = cur, now   # 換了值 → 重新計時
+        elif now - self._low_since >= MAXV_SETTLE:
+            self.seen = cur
+            self._low_val, self._low_since = None, 0.0
+        return self.seen
+
+
+# ★★★ 角色資料物件掛在**狀態物件**（`[quickbar.MGR_PTR]`）底下的固定位置。
+#   ✅ 2026-08-09 五台實測 + 兩次換頻道全程 10Hz 採樣：
+#      · 慢層對帳 25/25：`[MGR_PTR] + 這個` == 全掃找到的基準
+#      · 快層 2895/2895 拍算得出來，而且 vtable 特徵全部驗得過
+#      · 換頻道後拿到角色屬性：**捷徑 1.6 秒 vs 全掃 5.1~13.4 秒**
+#   ⚠ 這是結構偏移（同一塊配置內的位置），屬於「大更新改版面才會壞」那一類；
+#     壞掉也只是**變慢**，不會讀到錯的東西 —— 因為 `_signature_ok()` 會擋下來，
+#     然後自動退回底下那條全掃。
+STATS_FROM_MGR = 0xCB88
+
+
+def locate_fast(scanner) -> int | None:
+    """不必全掃的捷徑：狀態物件 + `STATS_FROM_MGR`，**驗過 vtable 才算數**。
+
+    為什麼值得做：`locate()` 的全掃要 0.4~1 秒／台，而換頻道／換地圖之後
+    物件會搬家 —— 那幾秒等級／HP／MP 全部讀不到，休息與補給判斷都是瞎的
+    （實測換頻道後全掃最久要 13.4 秒才把基準找回來）。
+    ⚠ 驗不過一律回 None 讓呼叫端走全掃：**寧可慢，不可錯**。
+    """
+    from app.game import quickbar                   # 避免模組載入期循環相依
+
+    vtable = _vtable_value(scanner)
+    if vtable is None:
+        return None
+    raw = scanner._read_bytes(quickbar.MGR_PTR, 4)
+    if not raw:
+        return None
+    mgr = struct.unpack("<I", bytes(raw))[0]
+    if not 0x10000 < mgr < 0x7FFF0000:
+        return None
+    base = mgr + STATS_FROM_MGR
+    return base if _signature_ok(scanner, base + OFF_VTABLE, vtable) else None
+
+
 def locate(scanner, should_stop=None) -> int | None:
     """找玩家物件，回傳「角色資料基準」位址；找不到回傳 None。
 
@@ -142,8 +238,15 @@ def locate(scanner, should_stop=None) -> int | None:
     真的一直找不到（例如遊戲改版讓 VTABLE_RVA 位移），寧可什麼都不顯示，也不要
     退回「靠數值猜」而顯示錯的資料。
 
+    ★ 先走 `locate_fast()`（兩次讀取），對不上才全掃。
+    ⚠ **畫面執行緒不要叫這一支** —— 捷徑失敗時它會全掃（實測 195~231ms），
+      畫面就卡那麼久。那種地方請直接叫 `locate_fast()`，回 None 就這一拍算了。
+
     should_stop: 可選的 callable，每個記憶體區塊掃之前呼叫一次，回傳 True 就放棄。
     """
+    got = locate_fast(scanner)
+    if got is not None:
+        return got
     vtable = _vtable_value(scanner)
     if vtable is None:
         return None

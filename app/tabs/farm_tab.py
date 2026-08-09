@@ -1299,6 +1299,10 @@ class CharFarmPage(QWidget):
         self._af_t = 0.0           # 距離上次確認過了多久
         self._af_free = 0.0        # 這個時間點之前刻意不管（補給那一趟要開著）
         self._af_shut = 0          # 幫忙關掉過幾次（狀態列只講第一次）
+        # 血魔上限的暫態防護（掉血當下最大 HP 會暫時等於當前 HP，見
+        # player.MaxTracker）。HP／MP 各一份。
+        self._mhp = player.MaxTracker()
+        self._mmp = player.MaxTracker()
         # 死亡回程模式（勾了「死亡自己回練功區」，角色死掉才會進，見 _death_tick）
         self._death = False        # 進行中（我們完全讓開，等復活）
         self._death_t = 0.0        # 死了多久（倒數 DEATH_REVIVE_SECS、超時判斷共用）
@@ -3681,15 +3685,34 @@ class CharFarmPage(QWidget):
         self._hp_t += dt
         if self._hp_t >= HP_CHECK_GAP:
             self._hp_t = 0.0
+            # ★★★ 位址剛失效（換頻道／換地圖／重連／重生）就**當場自己補回來**，
+            #   不要空等下一次全掃。角色屬性物件掛在狀態物件底下的固定位置，
+            #   `locate_fast()` 只要兩次讀取（實測 0.024~0.116ms），而全掃是
+            #   195~231ms —— 差了三個數量級。
+            #   ⚠⚠ 實測（2026-08-09，五台 10Hz 全程採樣換頻道）：靠全掃補回來
+            #     要 **1.8~10.7 秒**，那段期間血魔百分比停在舊值、**連死了都
+            #     偵測不到**（死亡偵測讀的就是這個物件）。
+            #   ⚠ 這裡只准用 `locate_fast()`，**不可以叫 `locate()`** ——
+            #     那支對不上時會全掃，畫面執行緒會卡 0.2 秒。
+            #     捷徑對不上就維持 None，照舊等 ScanWorker 那條全掃的路。
+            if not self.stats:
+                self.stats = player.locate_fast(self.sc)
+                if self.stats:
+                    self._keys.stats = self.stats   # 送鍵執行緒學技能 ID 也要
             if self.stats:
                 st = player.read(self.sc, self.stats)
                 if st is not None:
                     # 血/魔百分比：休息判斷用。上限是 0 時當作滿的，
                     # 免得剛換地圖讀到一半的資料就誤觸發休息。
-                    self._hp_pct = (st.hp / st.max_hp * 100
-                                    if st.max_hp else 100.0)
-                    self._mp_pct = (st.mp / st.max_mp * 100
-                                    if st.max_mp else 100.0)
+                    # ★★★ 上限要走 `MaxTracker`：掉血當下「最大 HP」欄位會
+                    #   **暫時等於當前 HP** 約 1.3 秒（2026-08-09 實測，見
+                    #   player.MAXV_SETTLE 的時間軸），那段期間百分比會算成
+                    #   100% —— 連續挨打時每次掉血都重新開始，等於「血很低
+                    #   卻一直顯示滿血」，休息永遠不會啟動。
+                    mhp = self._mhp.value(st.max_hp, st.level)
+                    mmp = self._mmp.value(st.max_mp, st.level)
+                    self._hp_pct = st.hp / mhp * 100 if mhp else 100.0
+                    self._mp_pct = st.mp / mmp * 100 if mmp else 100.0
                     # ★ HP 比上一拍低 → 有怪在打我（_under_attack 的來源）。
                     #   坐下休息與挑目標都靠這個硬保險，交戰欄位會失靈。
                     if 0 < st.hp < self._hp_prev:

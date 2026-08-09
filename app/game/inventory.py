@@ -268,9 +268,26 @@ def _slot_of(raw) -> int | None:
     return slot if slot < SLOT_SANE_MAX else None
 
 
+# ★★★ 「這看起來像不像一個指標」的範圍。**用專案統一的那組**
+#   （CLAUDE.md：指標範圍 0x10000~0x7FFF0000），不要自己另外訂。
+#
+# ⚠⚠⚠ 這裡本來寫的是 `0x01000000 < ptr < 0x40000000`，2026-08-09 實測抓到
+#   它**已經在生產環境誤殺**：五台分身裡嵐狐的 85 件物品全部落在
+#   `0x42c1c6f0 ~ 0x42c2bb80` —— **100% 超過 1GB 那條線**，於是走這條路的
+#   每一件東西都被當成「不是指標」濾掉：
+#     · `selfcheck` 的「背包物品陣列」顯示 **0 件**（另一條路 `bag.scan` 同時
+#       讀得到 85 件 —— 兩條路對同一個背包給出完全相反的答案）
+#     · `count_by_types()` 一律回 0 → **「藥水用完了」「沒有回程道具」**
+#   而且它是**慢慢逼近**的：同一批分身裡北極狐最高只到 `0x3fdbe390`，
+#   離那條線剩 2.4MB —— 遊戲開久一點、記憶體長大一點就會突然開始誤報。
+#   使用者要求的「不能因為掛了 10 小時換了記憶體位置就壞掉」講的正是這個。
+PTR_LO = 0x10000
+PTR_HI = 0x7FFF0000
+
+
 def _item_slot(scanner, ptr: int) -> int | None:
     """這個指標指向的是不是物品？是的話回傳它自己記的格號。"""
-    if not (0x01000000 < ptr < 0x40000000):
+    if not (PTR_LO < ptr < PTR_HI):
         return None
     raw = scanner._read_bytes(ptr, ROW_SPAN)
     if not raw or len(raw) < ROW_SPAN:
@@ -287,8 +304,9 @@ def _item_row(scanner, ptr: int) -> tuple[int, int, int] | None:
     ★ 判定條件跟 `_item_slot()` 一模一樣，只是**順便把數量一起帶回來**。
       `_walk()` 以前是先叫 `_item_slot()` 讀一次，再自己重讀一次
       —— 同一塊記憶體讀兩次，每件物品都白花一次系統呼叫。
+    ⚠ 範圍要跟 `_item_slot()` 用同一組（見 PTR_LO/PTR_HI 那段的實測）。
     """
-    if not (0x01000000 < ptr < 0x40000000):
+    if not (PTR_LO < ptr < PTR_HI):
         return None
     raw = scanner._read_bytes(ptr, ROW_SPAN)
     if not raw or len(raw) < ROW_SPAN:
