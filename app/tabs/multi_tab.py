@@ -1,10 +1,11 @@
 """分身總控：對所有勾選的分身**同時**下同一個指令。
 
-目前只有一個動作 —— 一次把勾起來的角色全部換到同一個頻道。
+四個動作：換頻、自動組隊、天使趴趴GO、走到指定座標。
 
 畫面
 ----
     目標頻道 [3 ▾] [換頻] [停止] [重新整理]
+    走到座標 [X 97] [Y 62] [帶入目前位置] [移動]
     ┌────┬────────┬──────────────┬────────┬──────┬──────────┬────────┐
     │全選│ 角色名 │ 帳號         │ 伺服器 │ 頻道 │ 目前地圖 │ 狀態   │
     └────┴────────┴──────────────┴────────┴──────┴──────────┴────────┘
@@ -34,15 +35,34 @@
 送完立刻 `preload.forget_state()`：換頻＝斷線重連，狀態物件會搬家，
 快取位址一定要作廢（不作廢就是拿舊位址去寫別人的記憶體）。
 
+走到座標是怎麼做的
+------------------
+按「移動」之後每一台各自跑一份 `navigate.Navigator`（跟掛機分頁走巡邏點
+是同一支）：讀遊戲載在記憶體裡的**地形圖**算 A* 最短路，再一段一段交給
+遊戲自己的走路常式。所以「那裡到不到得了」不是猜的，是算出來的。
+
+出發前的四道檢查（任何一道不過就**大聲擋下**，不會有分身默默亂走）：
+  ① 勾選的分身**必須都在同一張地圖**（分流算同一張）—— 否則「移動」鈕
+     直接變灰，因為座標在別張圖是完全不同的地方。
+  ② 讀得到地形圖 —— 讀不到就不動（無法確認走不走得到）。
+  ③ 座標在地圖範圍內，而且**那一格本身可以站**（是障礙物就跳警告，
+     使用者要求不要自作主張改走旁邊）。
+  ④ 從目標**泛洪**出「哪些格子走得到這裡」（一次 33ms，全部分身查表），
+     被地形隔開的那幾台跳警告列出來、留在原地，其餘照走。
+
 失效模式
 --------
   · 讀不到分流數 → 下拉留空、換頻鈕停用（**不猜** FALLBACK_MAX 去送）
   · 那台伺服器沒有第 N 頻 → 該列標 ⚠ 跳過，其他台照換
   · 還沒進遊戲（標題沒有頻道）→ 該列標「未進遊戲」跳過
   · 排不進指令槽／換頻逾時 → **自動重試不設上限**，「停止」鈕是唯一出口
+  · 走到一半換了地圖 → 那一台立刻停手（座標已經沒有意義）
+  · 走不到／久久沒有前進 → 那一台標 ⛔ 收工，其他台繼續（不是暫時性失敗，
+    所以**不重試**；重試只用在「指令槽忙」那種一定會好的情況）
 """
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -54,7 +74,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -64,9 +86,9 @@ from app import theme
 from app.config import config
 from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
-from app.game import (channel, jumpmap, locate, login, move, robot, scene,
-                      team)
-from app.tabs.base_tab import BaseTab
+from app.game import (channel, entity, jumpmap, locate, login, move, navigate,
+                      robot, scene, team, terrain)
+from app.tabs.base_tab import BaseTab, fit_spin
 
 COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "隊伍", "狀態")
 (COL_PICK, COL_NAME, COL_ACCT, COL_SRV, COL_CHAN, COL_MAP, COL_TEAM,
@@ -96,6 +118,23 @@ JOIN_GAP = 0.5
 LEAVE_GAP = 1.0
 # 精靈開關寫下去到讀得回來的緩衝（純記憶體寫，其實是立即的，留一拍保險）。
 ROBOT_SETTLE = 0.3
+# --- 走到座標 ---------------------------------------------------------------
+# 走路任務進行中的心跳。300ms 太慢：導航是「走完一段馬上送下一段」（官方就是
+# 這個節奏），一拍慢一點每個轉折點就多頓一點。一拍實測 0.36ms，100ms 一拍
+# 五台加起來還不到一顆核心的 1%。
+WALK_MS = 100
+# 看門狗：這麼久都沒有更靠近目標就放棄那一台。
+# ⚠ 導航自己有「走不到」的判斷（地形圖說沒路／繞太多段），這道是**它也卡住
+#   時**的最後一層 —— 專案踩過太多次「舉了沒放的閂」永遠不會自己醒。
+#   正常情況一段路 30 秒早就走完好幾段了。
+WALK_NO_PROGRESS = 30.0
+# 離目標多近算到了 —— 用導航自己的標準，不要在這裡另外訂一個。
+WALK_ARRIVE = navigate.ARRIVE
+# 進到「算到了」的範圍之後，最多再等這麼久讓它把最後一段走完（見 _walk_tick）。
+WALK_SETTLE = 3.0
+# 「因為 xxx 所以不動」這種訊息在狀態列上撐多久（每一拍都會重寫狀態列，
+# 不撐著的話跳窗一關就被蓋掉了）。
+STICKY_SECS = 20.0
 
 
 def _acct(title: str) -> str:
@@ -125,6 +164,14 @@ class MultiTab(BaseTab):
         self._job: dict | None = None
         self._loading = False                 # 重建表格時擋掉 itemChanged
         self._srv_try = 0.0                   # 上次嘗試讀分流數的時間
+        # pid -> 這一拍讀到的場景編號（None = 讀不到）。「移動」鈕的灰不灰
+        # 看它，所以每一拍都要更新（見 _map_of）。
+        self._scenes: dict[int, int | None] = {}
+        self._maps: dict[int, terrain.Cache] = {}   # pid -> 地形圖快取
+        self._walk_ok = False                 # 「移動」現在能不能按
+        self._walk_why = ""                   # 不能按的原因（要說得出來）
+        self._sticky = ""                     # 擋下動作的原因（撐一段時間）
+        self._sticky_t = 0.0
 
         root = QVBoxLayout(self)
 
@@ -236,6 +283,41 @@ class MultiTab(BaseTab):
         root.addLayout(bar3)
         self._fill_classes()
 
+        # --- 走到座標 -----------------------------------------------------
+        bar4 = QHBoxLayout()
+        bar4.addWidget(QLabel("走到座標"))
+        tip = ("目的地的格子座標，跟掛機分頁的巡邏點是同一組座標。\n"
+               "不知道要填什麼就先按「帶入目前位置」看看現在站在哪。")
+        # ⚠ 座標名放框外的 QLabel，不要用 setPrefix() —— 那會把字塞進輸入框裡
+        #   （使用者反映過「輸入框應該只有數字」，見 energy_tab 同一段註解）。
+        bar4.addWidget(QLabel("X"))
+        self.wx = QSpinBox()
+        self.wx.setRange(0, terrain.MAX_DIM - 1)
+        self.wx.setToolTip(tip)
+        self.wx.setValue(int(config.get("multi.walk_x", 0) or 0))
+        fit_spin(self.wx)              # 寬度照最大值算，不然數字會被箭頭擠掉
+        self.wx.valueChanged.connect(self._save_walk)
+        bar4.addWidget(self.wx)
+        bar4.addWidget(QLabel("Y"))
+        self.wy = QSpinBox()
+        self.wy.setRange(0, terrain.MAX_DIM - 1)
+        self.wy.setToolTip(tip)
+        self.wy.setValue(int(config.get("multi.walk_y", 0) or 0))
+        fit_spin(self.wy)
+        self.wy.valueChanged.connect(self._save_walk)
+        bar4.addWidget(self.wy)
+        self.here_btn = QPushButton("帶入目前位置")
+        self.here_btn.setToolTip(
+            "把**第一個勾選的分身**現在站的格子填進左邊兩格。\n"
+            "先把某一台走到你要的位置，再按這顆，其他分身就能一起過去。")
+        self.here_btn.clicked.connect(self._fill_here)
+        bar4.addWidget(self.here_btn)
+        self.walk_btn = QPushButton("移動")
+        self.walk_btn.clicked.connect(self._do_walk)
+        bar4.addWidget(self.walk_btn)
+        bar4.addStretch(1)
+        root.addLayout(bar4)
+
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -272,6 +354,7 @@ class MultiTab(BaseTab):
         self.status.setWordWrap(True)
         root.addWidget(self.status)
 
+        self._apply_walk_btn()          # 一開始沒勾任何分身 → 灰的
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(REFRESH_MS)
@@ -290,6 +373,8 @@ class MultiTab(BaseTab):
         for sc in self._scanners.values():
             sc.close()
         self._scanners.clear()
+        self._maps.clear()
+        self._scenes.clear()
 
     # ------------------------------------------------------------------
     # 每一拍
@@ -321,6 +406,8 @@ class MultiTab(BaseTab):
                 self._scanners.pop(pid).close()
                 self._drop_mover(pid)
                 self._state_txt.pop(pid, None)
+                self._scenes.pop(pid, None)
+                self._maps.pop(pid, None)
                 self._named.discard(pid)
         self._loading = True
         try:
@@ -385,6 +472,8 @@ class MultiTab(BaseTab):
             if acc and pid not in self._named:
                 self._named.add(pid)
                 QTimer.singleShot(0, lambda p=pid, a=acc: self._resolve_name(p, a))
+        # ⚠ 一定要在上面那圈之後 —— 它才剛把 `_scenes` 更新成這一拍的值。
+        self._apply_walk_btn()
         if self._job is not None:
             return                              # 狀態列由 _job_tick 負責
         if not wins:
@@ -399,9 +488,16 @@ class MultiTab(BaseTab):
                 "⚠ 讀不到伺服器的分流數，換頻先停用 —— 寧可不換，也不拿猜的"
                 f"頻道編號送給伺服器。（視窗標題上的伺服器：{here}；"
                 f"記憶體讀到的伺服器清單：{names}）")
+        elif self._sticky and time.monotonic() < self._sticky_t:
+            self.status.setText(f"⚠ {self._sticky}")   # 剛擋下來的原因先留著
         else:
-            self.status.setText(
-                f"找到 {len(wins)} 個分身，已勾 {len(self._checked_pids())} 個")
+            picked = self._checked_pids()
+            msg = f"找到 {len(wins)} 個分身，已勾 {len(picked)} 個"
+            # 「移動」是灰的時候，原因一定要看得到 —— 只有滑鼠移上去才知道
+            # 為什麼不能按，等於安靜地停用。
+            if picked and self._walk_why:
+                msg += f"　⛔ 移動停用：{self._walk_why}"
+            self.status.setText(msg)
 
     def _set(self, row: int, col: int, text: str,
              colour: QColor | None = None) -> None:
@@ -419,15 +515,17 @@ class MultiTab(BaseTab):
             it.setForeground(colour)
 
     def _map_of(self, pid: int) -> str:
+        """地圖欄的字，順便把場景編號記進 `_scenes`（「移動」鈕的灰不灰靠它）。"""
+        got = None
         sc = self._scanners.get(pid)
-        if sc is None:
-            return "—"
-        try:
-            # allow_scan=False：只走靜態指標（1.5ms）。這裡每 300ms 會跑到，
-            # 絕不能開那條 0.3 秒的全掃備援。
-            got = scene.current(sc, allow_scan=False)
-        except Exception:                                   # noqa: BLE001
-            return "—"
+        if sc is not None:
+            try:
+                # allow_scan=False：只走靜態指標（1.5ms）。這裡每一拍會跑到，
+                # 絕不能開那條 0.3 秒的全掃備援。
+                got = scene.current(sc, allow_scan=False)
+            except Exception:                               # noqa: BLE001
+                got = None
+        self._scenes[pid] = got.id if got else None
         return got.name if got else "—"
 
     def _team_of(self, pid: int) -> str:
@@ -508,6 +606,8 @@ class MultiTab(BaseTab):
         self._pids = []
         self._named.clear()
         self._state_txt.clear()
+        self._scenes.clear()
+        self._maps.clear()               # 地形圖重讀（可能已經換圖了）
         self._srv_cache = []
         wins = sorted(preload.windows(), key=lambda w: w.pid)
         self._rebuild(wins)
@@ -711,6 +811,10 @@ class MultiTab(BaseTab):
         self.share.setEnabled(not busy)
         self.jclass.setEnabled(not busy)
         self.jump.setEnabled(not busy)
+        self.walk_btn.setEnabled(not busy and self._walk_ok)
+        self.wx.setEnabled(not busy)
+        self.wy.setEnabled(not busy)
+        self.here_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
 
     def _prep_tick(self) -> None:
@@ -741,6 +845,8 @@ class MultiTab(BaseTab):
             self._team_tick(job, wins)
         elif job["kind"] == "jump":
             self._jump_tick(job, wins)
+        elif job["kind"] == "walk":
+            self._walk_tick(job, wins)
         else:
             self._chan_tick(job, wins)
 
@@ -913,6 +1019,334 @@ class MultiTab(BaseTab):
             self._job = None
             self._busy_ui(False)
             self.status.setText(f"傳送完成：{done} 台已到 {name}。")
+
+    # ------------------------------------------------------------------
+    # 走到座標
+    # ------------------------------------------------------------------
+    def _save_walk(self) -> None:
+        config.set("multi.walk_x", int(self.wx.value()))
+        config.set("multi.walk_y", int(self.wy.value()))
+        config.save()
+
+    def _grid_of(self, pid: int) -> terrain.Cache:
+        """這台分身的地形圖快取（一台一份 —— 那是它自己行程裡的記憶體）。"""
+        got = self._maps.get(pid)
+        if got is None:
+            got = self._maps[pid] = terrain.Cache()
+        return got
+
+    def _player_of(self, pid: int) -> int | None:
+        """玩家物件位址；算不出或**驗不過**回 None（那就不准拿去走路）。
+
+        ⚠⚠ 不快取、每次重算。玩家物件會搬家（換地圖、傳送、重連），
+          而舊位址照樣讀得到 —— 讀出來是別人的資料卻長得像一組合法座標，
+          拿去算路就是安靜地走到不相干的地方（CLAUDE.md 明令禁止）。
+        ★ `pathfinder_this()` 是查遊戲自己的「本尊 ID → 物件」表算出來的
+          （不靠 vtable，改版也跟得上），**它 +8 就是玩家物件**；
+          `player_pos()` 再比對一次物件開頭的 vtable，同一次讀取免費。
+        """
+        sc = self._scanners.get(pid)
+        if sc is None:
+            return None
+        try:
+            pf = move.pathfinder_this(sc)
+        except Exception:                                   # noqa: BLE001
+            return None
+        if not pf:
+            return None
+        obj = pf + 8
+        return obj if entity.player_pos(sc, obj) is not None else None
+
+    def _walk_state(self) -> tuple[bool, str]:
+        """「移動」能不能按 + 不能按的原因。
+
+        ★ 使用者要求：**勾選的分身只要有一台地圖不一樣就不給按**。
+          座標是每張地圖各自從 0 開始算的，同一組 (x,y) 在別張圖是完全
+          不相干的地方 —— 那正是「安靜地做錯事」，寧可整個停用。
+        """
+        picked = self._checked_pids()
+        if not picked:
+            return False, "還沒勾任何分身"
+        groups: dict[int, list[int]] = {}
+        for pid in picked:
+            sid = self._scenes.get(pid)
+            if sid is None:
+                # 讀不到＝無法確認，跟「在別張圖」一樣要擋（還沒進遊戲的
+                # 分身也會落在這裡）。
+                return False, f"讀不到 {self._name_of(pid)} 在哪張地圖"
+            groups.setdefault(scene.map_key(sid), []).append(pid)
+        if len(groups) > 1:
+            spread = "、".join(
+                f"{self._name_of(p)}＝{scene.scene_name(self._scenes.get(p))}"
+                for p in picked)
+            return False, f"勾選的分身不在同一張地圖（{spread}）"
+        return True, ""
+
+    def _apply_walk_btn(self) -> None:
+        ok, why = self._walk_state()
+        self._walk_ok, self._walk_why = ok, why
+        self.walk_btn.setEnabled(ok and self._job is None)
+        tip = (
+            "把所有勾選的分身走到左邊那個座標。\n"
+            "  · 路是**讀遊戲的地形圖自己算的**（A* 最短路），會繞過障礙物\n"
+            "  · 那個座標不存在、是障礙物、或算不出路 → 跳警告不動\n"
+            "  · 走到一半換了地圖的那一台會立刻停手\n"
+            "⚠ 勾選的分身必須都在同一張地圖，不然這顆是灰的。\n"
+            "⚠ 正在掛機的分身請先停掛機 —— 掛機自己也會下移動指令，"
+            "兩邊會互相打斷。")
+        if not ok:
+            tip = f"⛔ 現在不能按：{why}\n\n{tip}"
+        if self.walk_btn.toolTip() != tip:
+            self.walk_btn.setToolTip(tip)
+
+    def _fill_here(self) -> None:
+        """把第一個勾選的分身現在站的格子填進座標框。"""
+        for pid in self._checked_pids():
+            sc = self._scanners.get(pid)
+            obj = self._player_of(pid)
+            pos = entity.player_pos(sc, obj) if (sc and obj) else None
+            if pos is None:
+                continue
+            self.wx.setValue(int(pos[0]))
+            self.wy.setValue(int(pos[1]))
+            self.status.setText(
+                f"帶入 {self._name_of(pid)} 目前的位置："
+                f"({int(pos[0])},{int(pos[1])})"
+                f"　{scene.scene_name(self._scenes.get(pid))}")
+            return
+        self.status.setText(
+            "⚠ 讀不到座標 —— 勾選的分身都還沒進到地圖嗎？"
+            "（也可能是遊戲改版位移，見診斷分頁）")
+
+    def _warn(self, title: str, text: str) -> None:
+        """擋下動作時**跳出來**講原因，狀態列再留一份。
+
+        ⚠ 狀態列每一拍都會被 `_update_rows` 重寫，直接 setText 的話跳窗一關
+          就被蓋掉了 —— 所以用 `_sticky` 讓它撐一段時間（使用者關掉跳窗
+          之後還看得到剛剛擋下來的原因）。
+        """
+        one_line = " ".join(text.split())
+        self._sticky, self._sticky_t = one_line, time.monotonic() + STICKY_SECS
+        self.status.setText(f"⚠ {one_line}")
+        QMessageBox.warning(self, title, text)
+
+    def _do_walk(self) -> None:
+        if self._job is not None:
+            return
+        picked = self._checked_pids()
+        if not picked:
+            self.status.setText("還沒勾任何分身。")
+            return
+        wins = sorted(preload.windows(), key=lambda w: w.pid)
+        tx, ty = int(self.wx.value()), int(self.wy.value())
+        self._sticky = ""                    # 上一次擋下來的原因不再顯示
+
+        # --- ① 地圖：送出前**當場重讀**，不信上一拍的 -------------------
+        keys = set()
+        for pid in picked:
+            sc = self._scanners.get(pid)
+            sid = None
+            if sc is not None:
+                try:
+                    sid = scene.current_id(sc, allow_scan=False)
+                except Exception:                           # noqa: BLE001
+                    sid = None
+            self._scenes[pid] = sid
+            keys.add(scene.map_key(sid))
+        self._apply_walk_btn()
+        if None in keys or len(keys) > 1:
+            self._warn("不能一起移動",
+                       f"{self._walk_why or '勾選的分身不在同一張地圖'}。\n\n"
+                       "座標是每張地圖各自算的，同一組 (x,y) 在別張圖是完全"
+                       "不相干的地方，所以不動。")
+            return
+        map_key = next(iter(keys))
+
+        # --- ② 地形圖：讀不到就不動（無法確認走不走得到）-----------------
+        grids: dict[int, terrain.Grid | None] = {}
+        for pid in picked:
+            sc = self._scanners.get(pid)
+            try:
+                grids[pid] = self._grid_of(pid).get(sc) if sc else None
+            except Exception:                               # noqa: BLE001
+                grids[pid] = None
+        ref = next((g for g in grids.values() if g is not None), None)
+        if ref is None:
+            self._warn(
+                "讀不到地形圖",
+                "讀不到這張地圖「哪裡能走」的資料（遊戲改版位移？還沒真的"
+                "進到地圖？）。\n\n無法確認那個座標走不走得到，所以不動 —— "
+                "寧可不走，也不讓分身往牆裡撞。")
+            return
+
+        # --- ③ 那個座標存在嗎、站得住嗎 ---------------------------------
+        if not (0 <= tx < ref.w and 0 <= ty < ref.h):
+            self._warn(
+                "那個座標不存在",
+                f"{scene.scene_name(self._scenes.get(picked[0]))} 只有 "
+                f"{ref.w}×{ref.h} 格，({tx},{ty}) 在地圖外面。")
+            return
+        if not ref.walkable(tx, ty):
+            self._warn(
+                "那裡是障礙物",
+                f"({tx},{ty}) 這一格不能站（地形圖說它是障礙物）。\n\n"
+                "請改填旁邊走得到的格子 —— 你可以先把一台分身走到你要的"
+                "位置，再按「帶入目前位置」。")
+            return
+        gx, gy = tx + 0.5, ty + 0.5         # 走到格子中心（跟地形圖同一套）
+
+        # --- ④ 誰走得到 —— **從目標泛洪一次**，全部分身查表 --------------
+        # ⚠ 不要一台一台叫 route()：走不到是 A* 最貴的情況（實測 115ms／台，
+        #   五台就是半秒的畫面凍結）。泛洪一次 33ms，答案完全一樣。
+        reach = ref.reachable(tx, ty) or set()
+        self._state_txt.clear()
+        todo: list[int] = []
+        unreach: list[str] = []
+        for pid in picked:
+            w = self._win_of(pid, wins)
+            sc = self._scanners.get(pid)
+            if sc is None or w is None or channel.current(w.hwnd) is None:
+                self._state_txt[pid] = "未進遊戲，跳過"
+                continue
+            obj = self._player_of(pid)
+            pos = entity.player_pos(sc, obj) if obj else None
+            if pos is None:
+                self._state_txt[pid] = "⚠ 讀不到目前座標，跳過"
+                continue
+            if math.hypot(pos[0] - gx, pos[1] - gy) <= WALK_ARRIVE:
+                self._state_txt[pid] = f"✅ 已經在 ({tx},{ty})"
+                continue
+            # ⚠ 角色站的那格偶爾會是「不能走」（站在一格寬的縫裡、剛傳送完），
+            #   所以跟 route() 一樣先放寬到最近的可走格再查 —— 不放寬會把
+            #   走得好好的分身誤判成走不到。
+            spot = ref.nearest_open(int(pos[0]), int(pos[1]))
+            if spot is None or spot not in reach:
+                self._state_txt[pid] = "⛔ 地形圖顯示走不到"
+                unreach.append(f"{self._name_of(pid)}"
+                               f"（在 {pos[0]:.0f},{pos[1]:.0f}）")
+                continue
+            todo.append(pid)
+            self._state_txt[pid] = "準備中…"
+        self._update_rows(wins)
+        if unreach:
+            rest = (f"其餘 {len(todo)} 台照常前往。" if todo
+                    else "沒有任何一台走得到，所以都不動。")
+            self._warn(
+                "有分身走不到",
+                f"這幾台從現在的位置走不到 ({tx},{ty})，會留在原地：\n"
+                f"　{'、'.join(unreach)}\n\n{rest}\n\n"
+                "（是讀遊戲的地形圖算出來的：中間整片被牆隔開。"
+                "多半是隔在另一個區域，要先傳送或走出這一區。）")
+        if not todo:
+            if not unreach:
+                self.status.setText(f"沒有需要移動的分身（目標 {tx},{ty}）。")
+            return
+        self._job = {"kind": "walk", "gx": gx, "gy": gy, "tx": tx, "ty": ty,
+                     "map": map_key, "prep": list(todo), "pend": [],
+                     "run": {}, "done": 0}
+        self._busy_ui(True)
+        self._timer.setInterval(WALK_MS)     # 走路要跟得上，見 WALK_MS
+        self.status.setText(f"準備中 0/{len(todo)}（正在裝跳板）…")
+        QTimer.singleShot(0, self._prep_tick)
+
+    def _walk_tick(self, job, wins) -> None:
+        now = time.monotonic()
+        alive = {w.pid for w in wins}
+        gx, gy = job["gx"], job["gy"]
+        tx, ty = job["tx"], job["ty"]
+
+        # 剛裝好跳板的（_prep_tick 放進 pend）→ 各自開一份導航器。
+        for pid in job["pend"]:
+            job["run"][pid] = {"nav": navigate.Navigator(self._grid_of(pid)),
+                               "best": None, "since": now, "mv_try": 0.0,
+                               "near": None}
+        job["pend"] = []
+
+        for pid in list(job["run"]):
+            st = job["run"][pid]
+            if pid not in alive:
+                self._state_txt[pid] = "⚠ 分身已關閉"
+                del job["run"][pid]
+                continue
+            sc = self._scanners.get(pid)
+            if sc is None:
+                self._state_txt[pid] = "⚠ 讀不到這台的記憶體"
+                del job["run"][pid]
+                continue
+            # ⚠ 換地圖了就立刻停手：目的地座標在新的圖上是別的地方
+            #   （被傳走、死掉回城都會這樣）。
+            sid = self._scenes.get(pid)
+            if sid is not None and not scene.same_map(sid, job["map"]):
+                self._state_txt[pid] = "⚠ 換了地圖 → 停止移動"
+                del job["run"][pid]
+                continue
+            # ⚠ 位址每一拍重算重驗（物件會搬家），見 _player_of。
+            obj = self._player_of(pid)
+            pos = entity.player_pos(sc, obj) if obj else None
+            if pos is None:
+                self._state_txt[pid] = "讀不到座標，重試中…"
+                continue
+            d = math.hypot(pos[0] - gx, pos[1] - gy)
+            if d <= WALK_ARRIVE:
+                # ★ 進到「算到了」的範圍之後**還在走**就再等一下下：最後一段
+                #   的終點本來就是目標本身，等它自己走完，回報的誤差才是真的
+                #   （不然會在 2.8 格處就寫「已到」，那是報喜不報憂）。
+                if st["near"] is None:
+                    st["near"] = now
+                if (entity.is_walking(sc, obj)
+                        and now - st["near"] < WALK_SETTLE):
+                    self._state_txt[pid] = f"快到了…（{d:.1f} 格）"
+                    continue
+                self._state_txt[pid] = f"✅ 已到 ({tx},{ty}) 差 {d:.1f} 格"
+                job["done"] += 1
+                del job["run"][pid]
+                continue
+            mv = self._movers.get(pid)
+            if mv is None or not mv.active:
+                # 跳板掉了 → 重裝，但**隔一下再試**：裝一次要組譯 0.3~1 秒，
+                # 每一拍都試會把介面凍住。
+                if now < st["mv_try"]:
+                    self._state_txt[pid] = "⚠ 跳板掉了，重裝中…"
+                    continue
+                st["mv_try"] = now + RETRY_GAP
+                mv = self._mover(pid)
+                if mv is None:
+                    self._state_txt[pid] = "⚠ 裝不上跳板，重試中…"
+                    continue
+            note = st["nav"].step(sc, mv, obj, gx, gy)
+            if st["nav"].stuck:
+                # 導航自己說到不了（地形圖沒路／繞太多段還靠不近）——
+                # 這不是暫時性失敗，重試只會一直繞，收工並講清楚。
+                self._state_txt[pid] = f"⛔ 走不到（{st['nav'].note}）"
+                del job["run"][pid]
+                continue
+            if st["best"] is None or d < st["best"] - 0.5:
+                st["best"], st["since"] = d, now
+            elif now - st["since"] > WALK_NO_PROGRESS:
+                self._state_txt[pid] = (
+                    f"⛔ {int(WALK_NO_PROGRESS)} 秒沒有更靠近，放棄"
+                    f"（停在 {pos[0]:.0f},{pos[1]:.0f}）")
+                del job["run"][pid]
+                continue
+            self._state_txt[pid] = f"還有 {d:.0f} 格　{note}"
+
+        left = len(job["run"]) + len(job["pend"])
+        if left:
+            self.status.setText(
+                f"移動中：完成 {job['done']}、還有 {left} 台前往 ({tx},{ty})"
+                "　—— 要停請按「停止」")
+        else:
+            done = job["done"]
+            self._end_walk()
+            self.status.setText(
+                f"移動完成：{done} 台已到 ({tx},{ty})。"
+                if done else f"沒有分身走到 ({tx},{ty}) —— 原因看每一列的狀態。")
+
+    def _end_walk(self) -> None:
+        """走路任務收尾：心跳調回平時的頻率。"""
+        self._job = None
+        self._timer.setInterval(REFRESH_MS)
+        self._busy_ui(False)
 
     # ------------------------------------------------------------------
     # 自動組隊
@@ -1115,11 +1549,19 @@ class MultiTab(BaseTab):
             for pid in job.get("all", []):
                 self._robot(pid, True)
             why = (why + "，天使守護精靈已重新打開") if why else why
+        walking = job["kind"] == "walk"
         for pid in (list(job["prep"]) + list(job.get("pend", []))
-                    + list(job.get("wait", {})) + list(job.get("all", []))):
+                    + list(job.get("wait", {})) + list(job.get("all", []))
+                    + list(job.get("run", {}))):
             if not self._state_txt.get(pid, "").startswith("✅"):
                 self._state_txt[pid] = "已停止"
         self._job = None
+        # 走路任務把心跳調快過（見 WALK_MS），一定要調回來。
+        self._timer.setInterval(REFRESH_MS)
         self._busy_ui(False)
         if why:
-            self.status.setText(why + "（已經送出去的那幾包不會收回）")
+            # 走路沒有「收回」這回事：正在走的那一段是遊戲自己在走，
+            # 我們只是不再送下一段。老實講出來，不要讓人以為會急停。
+            tail = ("（正在走的那一段會走完，之後就停住）" if walking
+                    else "（已經送出去的那幾包不會收回）")
+            self.status.setText(why + tail)

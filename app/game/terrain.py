@@ -62,6 +62,9 @@ GOAL_RELAX = 4
 # —— 切短一點保證每段都在它的能力範圍內。
 MAX_SEG = 24.0
 _SQRT2 = math.sqrt(2.0)
+# 八方鄰居（dx, dy, 是不是斜的）。斜的要多驗兩個「肩膀」，見 clear_line。
+_NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
+               (1, 1, 1), (1, -1, 1), (-1, 1, 1), (-1, -1, 1))
 
 
 class Grid:
@@ -103,6 +106,35 @@ class Grid:
                 if not (self.walkable(x - sx, y) and self.walkable(x, y - sy)):
                     return False
         return self.walkable(x1, y1)
+
+    def reachable(self, tx: int, ty: int) -> set | None:
+        """所有「走得到 (tx,ty)」的格子（同一個連通區）。那一格不能走回 None。
+
+        ★ 為什麼要有它：**好幾台分身問同一個目標**時，答案只差在「我站哪一格」。
+          一台一台叫 `route()` 是每台各展開一次 A*，而**走不到是最貴的**
+          （實測 300×180 的圖 115ms／台，五台就是半秒的畫面凍結）；
+          從目標泛洪一次 33ms，全部分身查表就有答案。
+        ⚠ 連通規則跟 `route()` 完全一樣（含不許鑽對角縫），而且那個規則是
+          **對稱的** —— 「從目標走得到我」等於「我走得到目標」。
+          規則要是分岔了，就會出現「說走得到卻算不出路」。
+        """
+        if not self.walkable(tx, ty):
+            return None
+        walk = self.walkable
+        seen = {(tx, ty)}
+        stack = [(tx, ty)]
+        add, push, pop = seen.add, stack.append, stack.pop
+        while stack:
+            x, y = pop()
+            for dx, dy, diag in _NEIGHBOURS:
+                nx, ny = x + dx, y + dy
+                if (nx, ny) in seen or not walk(nx, ny):
+                    continue
+                if diag and not (walk(nx, y) and walk(x, ny)):
+                    continue
+                add((nx, ny))
+                push((nx, ny))
+        return seen
 
     def nearest_open(self, gx: int, gy: int, radius: int = GOAL_RELAX):
         """終點落在牆上時找最近的可走格；找不到回 None。"""
