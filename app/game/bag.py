@@ -379,8 +379,10 @@ def scan(scanner, first: int = FIRST_SLOT,
     begin, count = got
     lo, hi = max(first, 0), min(last, count - 1)
     if lo > hi:
-        # 容器比 first 還短 —— 這段本來就不存在，不是讀不到
-        return [], True
+        # 容器比 first 還短 —— 這段本來就不存在，不是讀不到。
+        # ⚠ 還是要問一次「同步好了嗎」：格數異常小的時候多半也是還沒推完，
+        #   回 True 會讓呼叫端拿「這段不存在」當「確定沒有」。
+        return [], _gold_slot_ok(scanner, begin)
     # ★ 讀不到的格子只會壞那一格，不會讓整個背包變空（見 read_ptrs）
     ptrs, complete = read_ptrs(scanner, begin + lo * 4, hi - lo + 1)
 
@@ -419,7 +421,13 @@ def scan(scanner, first: int = FIRST_SLOT,
                         type_id=type_id, count=count_, dura=dura,
                         kind=kind, price=price, grade=grade, dura_max=dmax,
                         time_limit=tlimit, decomp_value=param2))
-    return out, complete
+    # ★★★ 最後一道：**容器同步好了嗎**。換頻道／傳送會斷線重連，重連後容器
+    #   會先配好格數、物品才由伺服器一件件推過來 —— 那段空窗裡上面每一格都
+    #   「讀取成功但是空的」，`complete` 是 True，結果跟「真的一件都沒有」
+    #   一模一樣。判準見 `synced()`（第 0 格的金幣物件在不在）。
+    #   ★ 放在讀取層而不是每個呼叫端各補一次：這正是 2026-08-08 那次
+    #     「從讀取層根治」的同一個方針（見 read_ptrs 的說明）。
+    return out, complete and _gold_slot_ok(scanner, begin)
 
 
 def worn_broken(scanner) -> list[Item] | None:
@@ -431,10 +439,16 @@ def worn_broken(scanner) -> list[Item] | None:
       不會被誤判（見 TMPL_DURA_MAX 那段的對帳）。
     ⚠ **None 跟空清單是兩回事**：None = 還沒進場／換地圖中，什麼都別做；
       [] = 讀得到而且沒有一件壞。呼叫端拿 None 去觸發停機就是誤殺。
+
+    ⚠⚠ 2026-08-09 改成走 `scan()` 並看第二個值。舊寫法只問「`head()` 讀不讀
+      得到」，於是換頻道／傳送後的重連空窗（容器配好了、東西還沒推過來）
+      會回 `[]` ＝「讀得到而且一件都沒壞」。
+      **方向剛好是安全的**（不會誤報「裝備壞了」把人拉回城），但它是在
+      安靜地講錯話：補給回來那句「裝備完好」（farm_tab 用 `bad == []` 判的）
+      就可能在裝備還壞著的時候講出來。現在那種情況回 None ＝ 不知道、不提。
     """
-    if head(scanner) is None:
-        return None
-    return [it for it in items(scanner, WORN_FIRST, WORN_LAST) if it.broken]
+    got, ok = scan(scanner, WORN_FIRST, WORN_LAST)
+    return [it for it in got if it.broken] if ok else None
 
 
 def gold(scanner) -> int | None:
@@ -467,6 +481,22 @@ def gold(scanner) -> int | None:
     return struct.unpack_from("<I", b, ITEM_COUNT)[0]
 
 
+def _gold_slot_ok(scanner, begin: int) -> bool:
+    """容器第 0 格是不是金幣物件 ——「東西真的推過來了嗎」的訊號本體。
+
+    抽出來是因為 `scan()` 已經問過 `head()`，不必為了這一件事再走一次
+    那條路（6 次 4-byte 讀取）。判準與理由見 `synced()`。
+    """
+    raw = scanner._read_bytes(begin, 4)
+    if not raw:
+        return False
+    ptr = struct.unpack("<I", bytes(raw))[0]
+    if not ptr:
+        return False                     # ★ 容器配好了，東西還沒推過來
+    blob = scanner._read_bytes(ptr + ITEM_TYPE, 4)
+    return bool(blob) and struct.unpack("<I", bytes(blob))[0] == GOLD_TYPE
+
+
 def synced(scanner) -> bool:
     """伺服器真的把背包內容推過來了嗎？——要下「歸零／沒有」結論前先問這句。
 
@@ -497,15 +527,4 @@ def synced(scanner) -> bool:
     if got is None:
         return False                     # 還沒進場／換地圖中／定位失敗
     begin, count = got
-    if count < 1:
-        return False
-    raw = scanner._read_bytes(begin, 4)
-    if not raw:
-        return False
-    ptr = struct.unpack("<I", bytes(raw))[0]
-    if not ptr:
-        return False                     # ★ 容器配好了，東西還沒推過來
-    blob = scanner._read_bytes(ptr + ITEM_TYPE, 4)
-    if not blob:
-        return False
-    return struct.unpack("<I", bytes(blob))[0] == GOLD_TYPE
+    return count >= 1 and _gold_slot_ok(scanner, begin)
