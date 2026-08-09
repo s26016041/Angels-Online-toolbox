@@ -2542,6 +2542,10 @@ class CharFarmPage(QWidget):
         """這隻怪是不是「正在打我」（證據硬不硬不管）。見 _foe_evidence。
 
         ⚠ 要據此做危險的事（跑去打一隻沒選的怪）請改看 _foe_evidence 的等級。
+        ⚠⚠ **這支跟 `_foes()` 已經不是同一個標準了**（2026-08-09）：
+          `_foes()` 只認 `"hard"`（見那裡的正回饋循環說明），這支照舊連
+          `"guess"` 都收。唯一的呼叫端是「冷卻中的怪要不要解禁」——
+          解禁只是**允許**它重新被挑，不是強制去打，猜錯的代價很小。
         """
         return bool(self._foe_evidence(m, st, p, me))
 
@@ -2554,10 +2558,28 @@ class CharFarmPage(QWidget):
         return time.monotonic() - self._hp_drop_t <= UNDER_ATTACK_SECS
 
     def _foes(self) -> list:
-        """現在有哪些怪正在打我。
+        """現在有哪些怪**真的**在打我 —— 只認硬證據（交戰槽裡有我）。
 
         ⚠ 屍體要排掉：怪死了物件不會馬上回收，交戰欄位還留著舊值
         （實錄 Dead＋三槽全滿 47 筆）。
+
+        ⚠⚠⚠ **只認 `"hard"`，不准收 `"guess"`**（2026-08-09 使用者回報
+          「血量到休息條件時一直誤認為有怪物打我，明明沒有，然後一直打怪，
+          最後打王害我死」）：
+
+          `"guess"` 的定義是「動畫在攻擊中而且離我 3 格內」——**它不知道那隻怪
+          在打誰**。搶怪區、或旁邊有人在拉怪，隨時都有一堆怪符合這個條件。
+          這支的兩個呼叫端都是「能不能坐下休息」，於是：
+
+            收尾階段 → `_foes()` 永遠非空 → 永遠不准坐下 → 繼續打怪
+            → 打怪被反擊 → HP 掉 → `_under_attack()` 成立 → 更不准坐下
+            → 血越打越低、魔越打越少 → **永遠回不到 100%**，最後被拖去打王。
+
+          這是會自我維持的**正回饋**，不是偶發。
+        ★ 只認硬證據會**漏**（交戰欄位在怪出手當下是空的，見
+          [[foe-field-unreliable]]），但漏掉不要緊：兩個呼叫端都把
+          `_under_attack()`（我的 HP 真的在掉）並排當硬保險，
+          而那個訊號**不會被別人的戰鬥污染** —— 我的血只有打我的怪扣得動。
         """
         if not self.player:
             return []
@@ -2565,7 +2587,8 @@ class CharFarmPage(QWidget):
         out = []
         for m in self.mons:
             alive, st, p = entity.read_live(self.sc, m)
-            if alive and st != "Dead" and self._fighting_me(m, st, p, me):
+            if (alive and st != "Dead"
+                    and self._foe_evidence(m, st, p, me) == "hard"):
                 out.append(m)
         return out
 
@@ -3334,8 +3357,18 @@ class CharFarmPage(QWidget):
             #   這是刻意的 —— 打不贏的東西，站著挨打至少還跑得掉。
             if only_foes:
                 ev = self._foe_evidence(m, st, p, me)
-                guess = bool(ev) or (self._under_attack()
-                                     and d <= UNFREEZE_NEAR)
+                # ⚠⚠⚠ **「猜的」一律要配上「我的 HP 真的在掉」**
+                #   （2026-08-09 使用者回報「明明沒有怪打我，卻一直打怪、
+                #   最後打王害我死」）。
+                #   舊寫法是 `bool(ev) or (掉血 and 近)` —— 前半只要看到
+                #   **一隻動畫在攻擊中、離我 3 格內的怪**就成立，而那隻怪
+                #   可能正在打別人（`"guess"` 的定義就寫著「不知道牠在打誰」）。
+                #   於是收尾階段完全沒被打也會一直挑到新目標打下去，
+                #   血魔永遠回不到 100%，最後被拖進王的攻擊範圍。
+                #   ★ 掉血是唯一不會被別人的戰鬥污染的訊號：我的血只有
+                #     打我的怪扣得動。沒掉血 → 沒人打我 → 收尾就該收。
+                hurt = self._under_attack()
+                guess = hurt and (bool(ev) or d <= UNFREEZE_NEAR)
                 # 「本來就要打的目標」= 勾了只打王時的王，否則名單裡的名字。
                 intended = (monsters.is_boss(self.sc, m.type_id, idx) is True
                             if boss_only else m.name in want)
