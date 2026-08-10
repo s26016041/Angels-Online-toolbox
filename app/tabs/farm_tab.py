@@ -40,6 +40,7 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -68,7 +69,8 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
-                      player, quickbar, recall, revive, robot, scene, skills,
+                      player, quickbar, recall, revive, robot, scene,
+                      skillcost, skills,
                       tablestamp, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
@@ -265,18 +267,29 @@ STUCK_ENGAGED = 15.0
 # ⚠ 2.0 太小：實拍到角色在 (88.5,40.5) 與 (90.5,42.5) 之間來回，
 #   相距 2.8 格，錨點一直被重設，卡了 35 秒還是沒觸發。
 STUCK_EPS = 4.0
-# ★★ 交戰零傷害快篩（使用者指定 4 秒）：「打得到＋選定已送出」卻從鎖定起
-#   一滴血都沒看牠掉過 → 那個「打得到」是假的，直接換怪，不等 15 秒耐心。
-#   實拍（黑狐 02:10）：隔著地形站 10.8 格，射程 12 判定打得到，
-#   15 秒約 150 發零傷害呆站 —— 尋路的「直線可通」問的是**走路**，
-#   技能被不被地形擋線是伺服器說了算，我們讀不到；唯一可靠的訊號是血。
-# ⚠ 「3 格外才觸發」是雪狐的保命條件：近戰貼身打高 9~11 級的怪，
-#   開場連空揮 4 秒真的會發生（命中率低）；貼身不存在擋線問題，
-#   交給 15 秒的交戰耐心處理就好。
-# ⚠ 冷卻用短的 NOHP_MEMORY：這不是「走不到」，用遞增冷卻 8 秒後
-#   牠又被挑回來，同個位置重演（02:10 那次就被誤記成走不到 ×1）。
-NOHIT_SECS = 4.0
-NOHIT_RANGE = 3.0
+# ⛔ 「4 秒零傷害快篩」**2026-08-10 整段刪掉**（使用者要求）。
+#   它的條件是「打得到（dist <= reach）＋ 選定已送出 ＋ 沒掉過血 ＋ 超過 3 格」，
+#   完全沒看「我是不是正在走過去」—— 而 reach 在交棒／遠程時是 **12 格**，
+#   所以從 12 格外一路走近的整段路上計時器都在跑。繞一下路就超過 4 秒，
+#   一隻**其實走得到**的怪就被丟掉還冷凍 20 秒（使用者回報：走到一半就放棄）。
+#   它原本要抓的「站定了卻被地形擋線」由 STUCK_ENGAGED(15 秒) 接手 ——
+#   那條用「離錨點的淨位移」判斷有沒有前進，走路中會自己歸零，不會誤觸。
+#   ⚠ 別把 15 秒那條也拿掉：「怪一直刷新去打最近的」救不了擋線呆站，
+#     因為那時候**卡住我們的那隻自己就是最近的**，永遠排第一。
+# ★★ 「趕路途中冒出更近的怪就改打牠」（使用者要求 2026-08-10）。
+#   周圍怪物本來就每 0.15 秒刷新一次（見 [[farm-scan-refresh-tiers]]），
+#   所以不必另外掃描，拿現成的清單照同一套規則重排一次就好。
+# ⚠⚠ **打傷過的怪絕不換**（使用者明確指定：打到之後一定要確定打死才能換）。
+#   換掉等於留一隻結仇的怪在後面追著咬，以前就是這樣被圍毆致死的。
+SWITCH_GAIN = 3.0     # 新目標要近這麼多格才值得換（少了這道會兩隻互相取代乒乓）
+SWITCH_GAP = 1.0      # 多久評估一次（每 0.1 秒重挑一次純粹是浪費）
+# ★★★ 「近」一律指**我們自己 A* 算出來的路徑長度**，不是直線距離（使用者指定）。
+#   直線近但要繞一大圈的怪不算近 —— 河對岸、牆後面那種就是這樣騙人的。
+# ⚠ 路徑長度用「幾何成本」（直走 1、斜走 √2），跟直線距離同單位才比得起來，
+#   而且**直線距離永遠 ≤ 路徑長度**：這條下限讓我們可以照直線排序後提早收手，
+#   一次評估通常只要算兩三次 A*（每次 0.2~0.8ms），不必每隻都算。
+PATH_COST_CAP = 3.0   # 繞超過直線距離這麼多倍就當走不到（跟 tick 的 waypoints 一致）
+_SQRT2 = math.sqrt(2.0)
 # ★★★ 「正在打我」的聯集判定（2026-08-07 唯讀跟拍實錘，見 _fighting_me）：
 #   交戰槽在怪**出手的當下**反而是空的（17/17），單靠 entity.attacking()
 #   會漏掉正在咬人的怪 —— 解禁／坐下／收尾三道保險全部失靈，這就是
@@ -497,6 +510,26 @@ def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
     win.send_key(hwnd, vk, SEND_TIMEOUT_MS)
 
 
+class _NamedKeyBox(QComboBox):
+    """按下去才去讀「這個鍵現在放什麼技能」的下拉（首次攻擊用）。
+
+    ★ 只改字（setItemText），**不重建清單**：選單重建會讓順序跳動、
+      使用者點不到（見 [[qt-ui-pitfalls]]）。所以項目在建構時就固定，
+      展開的當下只更新顯示文字。
+    """
+
+    def __init__(self, refresh, parent=None) -> None:
+        super().__init__(parent)
+        self._refresh = refresh
+
+    def showPopup(self) -> None:                   # noqa: N802（Qt 的命名）
+        try:
+            self._refresh()
+        except Exception:                          # noqa: BLE001
+            pass                                   # 讀不到快捷欄就顯示素的 F1~F12
+        super().showPopup()
+
+
 class _Paced(QThread):
     """固定節奏的背景迴圈。子類別實作 step()。
 
@@ -585,10 +618,27 @@ class KeyWorker(_Paced):
         self.eid = None             # 現在要打誰
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
-        # ★ 出手前自己再驗一次距離用的（見 step()）：玩家物件位址與打得到的距離。
+        # ★ 出手前自己再量一次距離用的玩家物件位址（見 step()）。
         self.player = None
+        # ⚠ `reach` **只有交棒那一輪才有值**（總距離）。平常是 0 ＝ 沒有單一
+        #   攻擊距離，每一招在 step() 裡各自比自己的射程（使用者指定）。
         self.reach = 0.0
+        # ★★ 這一輪是不是「交棒給客戶端自己走過去」（見掛機那邊的 handoff）。
+        #   ⚠⚠ 交棒時**不可以**用單招射程擋出手：交棒的整個作用就是
+        #     「在 9.8 格叫快捷鍵，讓遊戲自己走過去打」，用近戰射程 2 格去擋
+        #     等於把交棒整個廢掉（角色站在原地不動）。
+        self.client_walk = False
         self._sel = None            # 已經送過「選定」的目標（換目標才要再送）
+        # ★★ 首次攻擊（使用者要求）：**每一隻怪的第一下一定要是這個鍵上的招**，
+        #   它真的放出去之前，其他招一個都不放 —— 那招在冷卻就站著等它好。
+        #   0 = 不指定（照舊直接輪流放）。
+        self.opener_vk = 0
+        self._open_eid = None       # 現在這道鎖是針對哪一隻（換怪就重新上鎖）
+        self._opened = False        # 這一隻的首發已經**真的**放出去了
+        self._open_verify = False   # 這一隻能不能驗證（見 _opener_gate）
+        self._open_since = 0.0
+        self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
+        self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
         self._next_round = 0.0      # 下一輪可以開始的時間
         self._page = 0              # 快捷欄目前頁（開始掛機時讀一次）
         self._on = False
@@ -628,6 +678,19 @@ class KeyWorker(_Paced):
         return ("　※ " + "、".join(note) + " 不是攻擊型技能（照樣會放）"
                 if note else "")
 
+    def all_keys(self) -> list[int]:
+        """輪替的鍵**加上**首發鍵（首發可以是沒勾的鍵，見 _opener_gate）。
+
+        ⚠ 讀快捷欄、算走位距離、判斷能不能交棒都要用這一份 ——
+          只看勾選的鍵的話，「只當開場、不進輪替」的那一招會：
+          ① 解析不到技能 ID（首發閘門直接失效）
+          ② 不列入 min_range → 停在別招的射程外，首發永遠打不到。
+        """
+        vks = list(self.vks)
+        if self.opener_vk and self.opener_vk not in vks:
+            vks.append(self.opener_vk)
+        return vks
+
     @property
     def handoff(self) -> bool:
         """這一輪的技能能不能「交給客戶端自己走過去」。
@@ -640,7 +703,7 @@ class KeyWorker(_Paced):
         ⚠ 只要輪裡有任何一招要走封包，就不能交棒（那招會在遠處空放）。
         """
         got = False
-        for vk in self.vks:
+        for vk in self.all_keys():
             sid = self.skills.get(vk)
             if not sid:
                 continue
@@ -661,8 +724,49 @@ class KeyWorker(_Paced):
           把攻擊距離壓成 1 格，怪還沒進範圍就不打了。
         """
         out = [r for r in (skills.range_of(self.skills.get(vk) or 0)
-                           for vk in self.vks) if r]
+                           for vk in self.all_keys()) if r]
         return min(out) if out else None
+
+    def reach_of(self, sid: int) -> float:
+        """**這一招自己**打得到的距離（格）。
+
+        ★★★ 攻擊距離是**每一招各自的事**，不准取全輪的最短或最長
+          （使用者 2026-08-10 明確指定）。以前用「輪替裡最短的射程」當
+          單一攻擊距離，混合輪替（幻影刺殺 12 格＋破甲劈擊 1 格）就被壓成
+          2 格 —— 射程 12 的那招被硬生生拖到臉上才放，走不進去時還會整段
+          站著不動（實測 90 秒有 45 秒在發呆）。
+        ⚠ 射程 0 ＝ 對自己的 buff：不看距離（回 inf），但**不能**拿它去
+          決定「打不打得到」，見 in_range_of_any。
+        ⚠ 換算：技能表寫的是格數，斜角相鄰算一格，所以歐氏距離 ≈ 射程 + 1；
+          上限 ATTACK_PACKET_RANGE 是封包攻擊實測打得到的最遠距離。
+        """
+        r = skills.range_of(sid)
+        if not r:
+            return float("inf")
+        return min(ATTACK_PACKET_RANGE, float(r) + 1.0)
+
+    def in_range_of_any(self, dist: float | None) -> bool:
+        """這個距離下**有沒有任何一招打得到**（每一招各自比自己的射程）。
+
+        ★ 這取代了舊的「單一攻擊距離」：有一招打得到就該出手，打不到的
+          那幾招由 step() 自己跳過。所以不必、也不該先算出一個代表值。
+        ⚠ 純 buff（射程 0）不列入判斷 —— 不然站在 50 格外也會被算成
+          「打得到」而開打。
+        ⚠ 一招都查不到射程（改版新技能／快捷欄讀不到）就退回舊的 12 格，
+          不要因此完全不出手。
+        """
+        if dist is None:
+            return True
+        known = False
+        for vk in self.all_keys():
+            sid = self.skills.get(vk)
+            r = skills.range_of(sid) if sid else None
+            if not r:
+                continue
+            known = True
+            if dist <= min(ATTACK_PACKET_RANGE, float(r) + 1.0):
+                return True
+        return False if known else dist <= ATTACK_PACKET_RANGE
 
     @property
     def selected(self) -> bool:
@@ -692,8 +796,10 @@ class KeyWorker(_Paced):
         self._rot = 0
         self._next_qb = 0.0
         self._learning = False
+        self._open_eid = None          # 重新開始 → 首發重新上鎖
+        self.open_wait = 0.0
         try:
-            got = self._qb.skills(list(self.vks))
+            got = self._qb.skills(self.all_keys())
             self._page = self._qb.page()       # 出手要指名頁＋格
         except Exception:                      # noqa: BLE001
             got = None
@@ -729,6 +835,104 @@ class KeyWorker(_Paced):
             self.skills = {**self.skills, vk: sid}
             self._learning = False
 
+    def _arm_opener(self) -> bool:
+        """換到新的一隻怪 → 把「最近使用的技能」欄位清成 0。
+
+        回傳「等一下讀得準嗎」。清完立刻讀回來驗證：讀到 0（`read_last_skill`
+        回 None）才算數 —— 那同時證明角色屬性位址現在是有效的。
+
+        ⚠⚠ **一定要清零**。首發每隻怪都會放，欄位裡本來就留著上一隻的
+          同一個技能 ID；不清就每一隻都當成「首發已經放過了」，
+          整個功能會**安靜地失效**（跟當年雪狐把 F3 的技能當成 F2 同一個坑）。
+        ⚠ `clear_last_skill` 內含 `base_ok` 驗證，位址過期時不會亂寫別人的堆積。
+        """
+        if not self.stats:
+            return False
+        try:
+            player.clear_last_skill(self.sc, self.stats)
+            return player.read_last_skill(self.sc, self.stats) is None
+        except Exception:                          # noqa: BLE001
+            return False
+
+    def _sp_blocked(self, sid: int) -> str:
+        """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
+
+        ★★ 使用者指定：吃 SP（能量燈）的技能 SP 不夠時要**跳過**，不要等 ——
+          SP 是打怪打出來的，我們為了等首發又不出手，SP 永遠不會回來，
+          站在那裡就是死結。冷卻不一樣（時間到就會好），那個要等。
+
+        判斷完全讀遊戲自己的資料（app/game/skillcost.py）：技能範本的
+        `消耗SP燈` 與角色目前的 SP，兩邊都當場驗過才採用。
+
+        ⚠ **「不知道」也算跳過**（回原因字串）：讀不到就代表我們分不出
+          「在冷卻」跟「SP 不夠」，賭錯一邊就是永久卡死。跳過會在狀態列
+          寫清楚，不是安靜地發生。
+        """
+        stats = player.read(self.sc, self.stats) if self.stats else None
+        ok = skillcost.sp_enough(self.sc, self.player or 0,
+                                 stats.mp if stats else 0, sid)
+        if ok is True:
+            return ""
+        name = skills.name_of(sid) or f"技能{sid}"
+        if ok is False:
+            return f"⚡ SP 不夠，這一隻跳過首發「{name}」"
+        return f"⚠ 讀不到 SP／技能消耗 → 這一隻跳過首發「{name}」"
+
+    def _opener_gate(self, eid, bykey: dict, now: float) -> int | None:
+        """首次攻擊的閘門：回傳「這一輪只准放這個鍵」，None = 沒鎖／已解鎖。
+
+        怎麼知道首發**真的**放出去了
+        ----------------------------
+        ⚠⚠ **不能看 `quickbar.use()` 的回傳值** —— 它只代表指令排進遊戲了；
+          技能還在冷卻時遊戲會自己拒絕，那支照樣回 True。
+        唯一的訊號是「最近使用的技能 ID」欄位（角色屬性 −0x50）：反組譯
+        `0x549CD9` 可以看到，遊戲是**所有檢查都過了**才寫那個欄位
+        （被冷卻／狀態擋下來就不寫），正好就是我們要的語意。
+
+        ★★ **走封包的技能（射程 > 8）一樣驗得到** —— 2026-08-10 五台實測
+          日誌打臉了我原本的假設：fred26016041 打 743（幻影刺殺Ⅳ，射程 12、
+          走封包）時欄位就是 743、s26016041 打 946（冰凍狙擊Ⅳ，同樣走封包）
+          時欄位就是 946。所以**不必**為了首發去動「射程 < 8 送鍵、> 8 打封包」
+          那條分流（那是使用者定的規則）—— 我一度那樣改，被退回來了。
+
+        ⚠ 只有一種情況驗不了，退化成「送出去就算數」——
+          寧可少一道保證，也**絕不能讓角色永遠站著不出手**：
+          角色屬性位址還沒定位／已失效（清零＋讀回驗證沒過）。
+        """
+        vk = self.opener_vk
+        sid = bykey.get(vk) if vk else None
+        if not sid:
+            # 沒指定首發、或那個鍵上現在沒技能（空格／物品格／快捷欄讀不到）
+            # → 不上鎖，照舊輪流放。
+            self._open_eid = None
+            self.open_wait = 0.0
+            return None
+        if self._open_eid != eid:                  # 換了一隻 → 重新上鎖
+            self._open_eid = eid
+            self._opened = False
+            self._open_since = now
+            self._open_verify = self._arm_opener()
+        if self._opened:
+            self.open_wait = 0.0
+            return None
+        if (self._open_verify
+                and player.read_last_skill(self.sc, self.stats) == sid):
+            self._opened = True                    # 遊戲受理了 → 其他招解鎖
+            self.open_wait = 0.0
+            return None
+        # ★ SP 不夠（或分不出來）→ 放行其他招，別站在那裡等一個不會好的條件。
+        why = self._sp_blocked(sid)
+        if why:
+            self._opened = True
+            self.open_wait = 0.0
+            self.open_note = why
+            return None
+        # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
+        #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
+        #   會被當成「沒在等」。
+        self.open_wait = max(now - self._open_since, 0.001)
+        return vk
+
     def step(self) -> None:
         # ⚠⚠ 先把 GUI 執行緒會改的欄位抄成區域變數，整拍只看這份快照。
         #   踩點在 `_sel`：以前是「送 select(self.eid) → 成功 → self._sel =
@@ -742,6 +946,8 @@ class KeyWorker(_Paced):
         try:
             if eid is None:
                 self._sel = None       # 沒目標了，下一隻要重新送「選定」
+                self._open_eid = None  # 首發：下一隻重新上鎖
+                self.open_wait = 0.0
                 # ★★★ **沒有目標就絕對不出手。**
                 #   底下那條「快捷欄叫不動就送鍵」的退路（`_send_scan`）
                 #   不看 eid，而按 F 鍵放技能時**遊戲會自己挑一隻最近的敵人
@@ -760,6 +966,12 @@ class KeyWorker(_Paced):
                 #     由這裡自己擋才是唯一真相來源。
                 return
             if not self._on:
+                # ⚠⚠ 打不到（怪跑出射程、正在走過去）時**一定要把「等首發」
+                #   歸零** —— 掛機那邊拿它凍住「沒進展就換一隻」的計時器，
+                #   不歸零的話一隻走不過去的怪會被無限期追下去
+                #   （被 early return 餓死的狀態機，見 [[frozen-tick-state-machines]]）。
+                #   鎖本身（_open_eid/_opened）留著，回到射程內接著等就好。
+                self.open_wait = 0.0
                 return
             # ◎ 每 QB_REFRESH 秒重讀快捷欄：使用者中途換鍵上的技能會自動
             #   跟上（純讀零副作用）。讀失敗**保留舊結果**——改版位移那種
@@ -768,7 +980,8 @@ class KeyWorker(_Paced):
             if now >= self._next_qb:
                 self._next_qb = now + QB_REFRESH
                 try:
-                    got = self._qb.skills(vks)
+                    # ⚠ 要連首發鍵一起讀（它可以是沒勾的鍵）—— 見 all_keys()
+                    got = self._qb.skills(self.all_keys())
                     self._page = self._qb.page()   # 使用者中途翻頁也要跟上
                 except Exception:              # noqa: BLE001
                     got = None
@@ -802,6 +1015,13 @@ class KeyWorker(_Paced):
             usable = [k for k in vks if bykey.get(k)]
             if not usable and self.qb_ok:
                 return                    # 快捷欄讀得到、但勾的鍵上沒技能
+            # ★★ 首次攻擊（使用者要求）：這一隻的第一下**一定要是**指定的那招。
+            #   還沒真的放出去之前，這一輪就只試它一個 —— 那招在冷卻就等，
+            #   等多久都等（不設上限，出口是「暫停」；狀態列會顯示等了幾秒）。
+            # ★ 首發鍵**不必**在勾選的技能鍵裡：可以拿一招只當開場、不進輪替。
+            opener = self._opener_gate(eid, bykey, now)
+            if opener is not None:
+                usable = [opener]
             # ★★★ 出手方式**依射程分流**（使用者定的）：
             #   射程 ≤ QUICKKEY_RANGE(8) → 叫遊戲的快捷鍵（quickbar.use，
             #     等同按 F2）。⚠⚠ 自己送施放封包**只打得出普攻**：實測 MP
@@ -823,12 +1043,15 @@ class KeyWorker(_Paced):
             #   0.15 秒）和掃描結果處理卡住，那段期間怪已經跑出射程、旗標卻
             #   還是舊的 —— 就會出現「超出射程還在放技能」（使用者指出的）。
             #   這裡只多讀一次玩家座標（微秒級），目標座標用 UI 上一拍給的。
-            in_reach = True
-            if self.reach and self.player and pos != (0.0, 0.0):
+            # ★ 順便把「現在離目標多遠」留下來：底下每一招要各自驗自己的射程。
+            dist_now = None
+            if self.player and pos != (0.0, 0.0):
                 me_now = entity.read_pos(self.sc, self.player)
                 if me_now:
-                    in_reach = math.hypot(pos[0] - me_now[0],
-                                          pos[1] - me_now[1]) <= self.reach
+                    dist_now = math.hypot(pos[0] - me_now[0],
+                                          pos[1] - me_now[1])
+            in_reach = not (self.reach and dist_now is not None
+                            and dist_now > self.reach)
             if not (in_reach and now >= self._next_round):
                 return
             # ⚠ 先排下一輪再開始放：中間任何一招失敗都不影響節奏，
@@ -840,11 +1063,26 @@ class KeyWorker(_Paced):
                     sid = bykey.get(k)
                     if not sid:
                         continue
+                    # ★★★ **每一招各自比自己的射程**（使用者 2026-08-10 指定：
+                    #   攻擊距離不准取全輪的最短或最長）。輪替裡混著近戰與遠程
+                    #   時，射程 12 的那招 12 格就丟出去，近戰那幾招這時候放
+                    #   只是空放、白花 MP／SP，直接跳過這一輪。
+                    # ⚠ 射程 0 ＝ 對自己的 buff，reach_of 回 inf ＝ 不看距離。
+                    # ⚠⚠ 交棒給客戶端走的那一輪**不擋**：那時候本來就是
+                    #   「站得遠、叫快捷鍵讓遊戲自己走過去」（見 client_walk）。
+                    if (not self.client_walk and dist_now is not None
+                            and dist_now > self.reach_of(sid)):
+                        continue
                     # 依射程分流（使用者定的）：≤ QUICKKEY_RANGE 叫遊戲的
                     # 快捷鍵，超過就送帶 ID＋座標的施放封包；對地技能一律封包。
+                    # ⛔ 首發**不例外**：2026-08-10 我一度讓首發一律走快捷鍵，
+                    #   被使用者退回 ——「射程 < 8 送鍵、> 8 打封包」是他定的
+                    #   規則，不准偷改。首發的等待改用欄位驗證（見 _opener_gate），
+                    #   兩條路都驗得到，本來就不必動這個分流。
                     rng = skills.range_of(sid)
                     by_packet = (skills.is_ground(sid)
-                                 or (rng is not None and rng > QUICKKEY_RANGE))
+                                 or (rng is not None
+                                     and rng > QUICKKEY_RANGE))
                     if by_packet:
                         ok = attack.cast_at(mover, sid, eid, *pos)
                     elif (quickbar.VK_F1 <= k
@@ -862,6 +1100,10 @@ class KeyWorker(_Paced):
                 self._rot += 1
                 if self._learning:
                     self._learn(vk)            # 剛按過鍵，順手讀一下
+            # 驗不了的那兩種情況（見 _opener_gate）：送出去就當首發完成。
+            # ⚠ 這一條就是「絕不會永遠站著不出手」的保險，別拿掉。
+            if opener is not None and not self._open_verify:
+                self._opened = True
         except Exception:                      # noqa: BLE001
             pass
 
@@ -1248,8 +1490,13 @@ class CharFarmPage(QWidget):
         self._path_t = 0.0         # 距離上次問尋路過了多久
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._unreach = 0          # 連續幾次尋路算不出路徑
-        self._hurt = False         # 這隻有沒有被我們打傷過
-        self._nohit_t = 0.0        # 交戰中連續多久零傷害（見 NOHIT_SECS）
+        self._hurt = False         # 這隻有沒有被我們打傷過（打傷了就不准換目標）
+        self._switch_t = 0.0       # 下一次可以評估「有沒有更近的怪」的時間
+        # ★★ 我站的這一塊連通區有哪些格（terrain.Grid.reachable 泛洪的結果）。
+        #   挑目標時用它把「對岸／島上／牆裡」的怪整個排除掉。
+        #   算一次約 33ms，所以要快取：只有換地圖或自己跳到別的連通區才重算。
+        self._reach: set | None = None
+        self._reach_grid = None    # 上次泛洪是對哪一張地圖物件做的
         self._handoff_fail = False  # 這隻「交棒給客戶端走」失敗過了嗎
         self._handoff_t = 0.0      # 交棒之後多久沒真的接戰
         self._near_fail = 0        # 近距離直線走連續幾次沒位移（撞牆偵測）
@@ -1494,10 +1741,36 @@ class CharFarmPage(QWidget):
         # 點開選單的當下把每個鍵標上「現在放什麼」：F1（電擊術Ⅳ）。
         # GUI 執行緒自己開一個 Reader，不跟攻擊執行緒共用（省得搶快取）。
         self._qb_ui = quickbar.Reader(self.sc)
-        km.aboutToShow.connect(self._refresh_key_menu)
+        km.aboutToShow.connect(self._label_keys)
         self.key_btn.setMenu(km)
         self._sync_key_btn()
         a.addWidget(self.key_btn)
+        a.addSpacing(10)
+        # ★ 首次攻擊（使用者要求）：每一隻怪的第一下一定要是這一招。
+        a.addWidget(QLabel("首次攻擊"))
+        self.open_box = _NamedKeyBox(self._label_keys)
+        self.open_box.setToolTip(
+            "每一隻怪的**第一下**一定要是這個鍵上的招，放出去之後才會開始\n"
+            "輪流放「技能鍵」勾選的那些。\n"
+            "\n"
+            "・那一招在冷卻 → **站著等它好**，等多久都等（其他招一個都不放）。\n"
+            "　 等待期間狀態列會顯示等了幾秒；要中斷就取消「開始掛機」。\n"
+            "・等待的那幾秒不算「沒進展」，不會因此被換掉去打別隻。\n"
+            "・這個鍵**不必**在上面勾選 —— 可以拿一招只當開場、不進輪替。\n"
+            "・那個鍵是空的／放物品／快捷欄讀不到 → 自動當作沒設定，照常打。\n"
+            "\n"
+            "・出手方式照原本的規則（射程 ≤ 8 送鍵、> 8 打封包），不受影響。\n"
+            "⚠ 角色屬性讀不到時無法確認有沒有放出去 → 那一隻送一次就放行\n"
+            "　（不會讓角色站在那裡永遠不出手）。")
+        self.open_box.addItem("不指定", 0)
+        for label, vk in SKILL_KEYS:
+            self.open_box.addItem(label, vk)
+        # 字會變長（F3（破甲劈擊Ⅳ）），寬度**固定住**才不會把整條列撐開；
+        # 展開的清單另外放寬，長名字才看得完整（見 [[qt-ui-pitfalls]]）。
+        self.open_box.setFixedWidth(150)
+        self.open_box.view().setMinimumWidth(240)
+        self.open_box.currentIndexChanged.connect(self._opener_changed)
+        a.addWidget(self.open_box)
         # ⛔ 「每隔幾秒」的輸入框拿掉了（使用者要求固定，不給輸入）。
         #    出手節奏是 ROUND_GAP（一輪放完隔 0.1 秒），這裡設的是執行緒節拍，
         #    要比它細才切得出來。
@@ -3042,8 +3315,99 @@ class CharFarmPage(QWidget):
         self._dbg(f"冷卻（走不到 ×{n + 1}）eid={eid:#x} {wait:.0f} 秒"
                   + (f"　{self._why}" if self._why else ""))
 
-    def _pick_next(self) -> bool:
-        """挑一隻名字在「選中怪物」裡、**離自己最近**的接著打；挑不到回傳 False。
+    def _reach_set(self, me) -> tuple[object, set | None]:
+        """我現在站的這一塊連通區（走得到的所有格）；讀不到地形圖回 (grid, None)。
+
+        ★★★ 為什麼挑目標一定要有它：`_candidates` 是照**直線距離**排的，
+          而直線距離跟「走不走得到」完全是兩回事 —— 河對岸那隻直線 12 格
+          就贏過同岸 15 格的，鎖上去才發現過不去。而且「走不到就換一隻」
+          那條規則有 `PATHFIND_RANGE`(25 格) 上限，更遠的**根本不會觸發**，
+          只能等 15 秒沒進展 → 冷卻 8 秒 → 牠又是最近的 → 再挑一次，
+          就是使用者看到的「掃到對岸的怪就卡住」。
+          先泛洪一次把不同連通區的怪整個排除，這個迴圈就不存在了。
+
+        ⚠ 泛洪一次約 33ms，**一定要快取**：只有換地圖（grid 物件換掉）或
+          自己跑到別的連通區（傳送、走過門）才重算，平常每拍只是一次
+          set 查詢（微秒級）。
+        ⚠ 起點落在不可走格（站在縫裡、剛傳送完）→ 先放寬到最近的可走格；
+          還是不行就回 None = **不過濾**（安全退化，維持舊行為）。
+        """
+        grid = self._maps.get(self.sc)
+        if grid is None or not me:
+            return grid, None
+        tile = (int(me[0]), int(me[1]))
+        # ⚠⚠ 快取的鍵要用**放寬後的起點**，不能用原始格：角色偶爾會站在
+        #   判定為牆的格子上（一格寬的縫、剛傳送完），那時原始格永遠不在
+        #   泛洪結果裡 → 每次呼叫都重跑一次 33ms 的泛洪（每秒好幾次）。
+        #   nearest_open 對可走格是 O(1)（直接回自己），所以這行幾乎不花錢，
+        #   而且它的結果一定在自己那次泛洪的集合裡 —— 快取必定命中。
+        start = grid.nearest_open(*tile)
+        if (start is not None and self._reach is not None
+                and self._reach_grid is grid and start in self._reach):
+            return grid, self._reach          # 還在同一塊，直接用
+        got = grid.reachable(*start) if start else None
+        self._reach, self._reach_grid = got, grid
+        if got is not None:
+            self._dbg(f"重算連通區：站 {tile}，這一塊有 {len(got)} 格")
+        return grid, got
+
+    def _path_cost(self, grid, me, pos, max_cost: float | None = None
+                   ) -> float | None:
+        """從我這裡走到 pos 的**實際路徑長度**（格）；走不到／超過上限回 None。
+
+        ⚠ 回傳的是幾何成本（直走 1、斜走 √2），跟直線距離同單位 —— 兩者混用
+          會讓「近多少」的門檻失去意義。
+        ⚠ max_cost 一定要給：走不到的目標最貴（A* 要把整片展開完才敢說 None）。
+        """
+        if grid is None or not me or not pos:
+            return None
+        path = grid.route((int(me[0]), int(me[1])),
+                          (int(pos[0]), int(pos[1])), max_cost=max_cost)
+        if not path:
+            return None
+        tot = 0.0
+        for (x0, y0), (x1, y1) in zip(path, path[1:]):
+            tot += _SQRT2 if (x0 != x1 and y0 != y1) else 1.0
+        return tot
+
+    def _nearest_by_path(self, pool, grid, me, cap: float | None = None):
+        """在候選裡挑出**路徑最短**的那一隻 → (路徑長度, 直線距離, 怪)；沒有回 None。
+
+        ★★ 這就是使用者要的「近＝我們自己算出來的路徑，不是無腦直線」。
+        ★ 效率靠一條數學性質：**直線距離永遠 ≤ 路徑長度**。所以照直線排序後，
+          一旦手上最好的路徑長度已經 ≤ 下一隻的直線距離，後面**不可能**更近，
+          直接收手 —— 實務上只會算兩三次 A*，不是每隻都算。
+        ⚠ 每次 route() 都把 max_cost 設成「目前最好的成績」，走不到的候選
+          也就不會把整張圖展開。
+        cap: 還沒有任何成績時的上限（None = 用直線距離的 PATH_COST_CAP 倍）。
+        """
+        if grid is None or not me:
+            # ⚠ 讀不到地形圖 → **退回直線距離**（安全退化 = 舊行為）。
+            #   不能因此整個不挑／不換：那會讓功能安靜地消失。
+            for d, mon, _pos in pool:
+                if cap is not None and d >= cap:
+                    break
+                return (d, d, mon)
+            return None
+        best = None                      # (路徑長度, 直線距離, 怪)
+        for d, mon, pos in pool:
+            limit = best[0] if best is not None else cap
+            if limit is not None and d >= limit:
+                break                    # 直線就輸了 → 後面排序更遠的更不用算
+            lim = limit if limit is not None else max(d * PATH_COST_CAP, 30.0)
+            c = self._path_cost(grid, me, pos, max_cost=lim)
+            if c is not None and (best is None or c < best[0]):
+                best = (c, d, mon)
+        return best
+
+    def _candidates(self, quiet: bool = False) -> tuple[
+            list[tuple[float, entity.Entity, tuple[float, float] | None]],
+            list[tuple[float, str, str]] | None]:
+        """照規則挑出「現在打得了」的怪，**照距離排序**（近→遠）。
+
+        回傳 (候選, 被跳過的診斷紀錄)。挑目標與「有沒有更近的」兩條路都走這一支
+        —— 規則只能有一份，兩邊各寫一套遲早會不一致。
+        quiet=True 時不寫診斷紀錄（「偷看一眼」用的，免得每秒灌一次檔案）。
 
         用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
 
@@ -3071,9 +3435,14 @@ class CharFarmPage(QWidget):
         for eid, until in list(self._killed.items()):
             if now > until:
                 del self._killed[eid]
-        pool = []
+        # (直線距離, 怪, 牠這一拍的座標)。座標要一起帶著 —— 後面算路徑長度
+        # 時才不必再讀一次記憶體，也才確定用的是同一份快照。
+        pool: list[tuple[float, entity.Entity, tuple[float, float] | None]] = []
         # 診斷用：被跳過的怪（距離, 名字, 原因）。平常是 None，完全不花錢。
-        skipped: list[tuple[float, str, str]] | None = [] if _FARM_LOG else None
+        skipped: list[tuple[float, str, str]] | None = (
+            [] if (_FARM_LOG and not quiet) else None)
+        # ★★★ 走不走得到，**挑之前**就要問（見 _reach_set）。
+        grid, reach = self._reach_set(me)
         for m in self.mons:
             # ★ eid=0 的實體絕不能挑（唯讀實測：場上真的會出現，多半是屍體
             #   但也拍到過活狀態 —— 剛生成還沒填 ID／回收中被清掉 ID）。
@@ -3152,18 +3521,111 @@ class CharFarmPage(QWidget):
             #   然後為了追那隻遠的去撞牆。
             #   使用者的判斷：純粹挑最近的就好 —— 打我的怪本來就貼在身上，
             #   排序自然會先輪到牠們。
-            pool.append((d, m))
+            # ★★★ 但**走不到的一律不收**：跟我不在同一塊連通區的怪（河對岸、
+            #   島上、牆圍起來的），直線再近也只是拿來卡住自己（見 _reach_set）。
+            #   ⚠ 牠站的那格不可走時放寬到附近的可走格再問 —— 怪偶爾會站在
+            #     判定為牆的格子上，直接刷掉會漏打。
+            #   ⚠ 讀不到地形圖 → reach 是 None → **完全不過濾**（安全退化）。
+            if reach is not None and p is not None:
+                t = (int(p[0]), int(p[1]))
+                if t not in reach:
+                    t2 = grid.nearest_open(*t)
+                    if t2 is None or t2 not in reach:
+                        if skipped is not None and me:
+                            skipped.append((d, m.name, "走不到（不同連通區）"))
+                        continue
+            pool.append((d, m, p))
         pool.sort(key=lambda t: t[0])
-        if not pool:
+        if not pool and skipped and now - self._dbg_empty_t >= 5.0:
             # 挑不到時每 0.3 秒就會再試一次，照實寫會灌爆檔案 —— 節流 5 秒。
-            if skipped and now - self._dbg_empty_t >= 5.0:
-                self._dbg_empty_t = now
-                dd, name, why = min(skipped)
-                self._dbg(f"挑不到目標：清單 {len(self.mons)} 隻、"
-                          f"被跳過 {len(skipped)} 隻；"
-                          f"最近的是 {name} {dd:.1f} 格（{why}）")
+            self._dbg_empty_t = now
+            dd, name, why = min(skipped)
+            self._dbg(f"挑不到目標：清單 {len(self.mons)} 隻、"
+                      f"被跳過 {len(skipped)} 隻；"
+                      f"最近的是 {name} {dd:.1f} 格（{why}）")
+        return pool, skipped
+
+    def _pick_next(self) -> bool:
+        """挑**路徑最短**的一隻接著打；挑不到回傳 False。
+
+        ★★ 「最近」＝我們自己 A* 算出來的路徑長度（使用者指定），不是直線距離：
+          隔著一道牆的怪直線 8 格、實際要繞 40 格，比同一條路上 12 格的還遠。
+        ⚠ 讀不到地形圖就退回直線排序（安全退化，維持舊行為）。
+        """
+        pool, skipped = self._candidates()
+        if not pool:
             return False
-        d, self._cur = pool[0]           # 純粹挑最近的
+        grid, _ = self._reach_set(self.my_pos())
+        best = self._nearest_by_path(pool, grid, self.my_pos())
+        if best is None:                 # 沒地形圖／全都算不出路 → 照直線挑
+            d, mon, _p = pool[0]
+        else:
+            cost, d, mon = best
+            if cost > d + 0.5:           # 有繞路才值得記一筆
+                self._dbg(f"挑「{mon.name}」：直線 {d:.1f} 格、實走 {cost:.1f} 格")
+        self._engage(d, mon, skipped)
+        return True
+
+    def _switch_closer(self, cur, dist: float | None) -> bool:
+        """趕路途中冒出**明顯更近**的怪就改打牠；真的換了回傳 True。
+
+        ★ 使用者要的行為：周圍怪物本來就一直在刷新，出現更近的就去打那隻，
+          不必傻傻走完一整段路。
+
+        ★★★ 「近」比的是**我們自己 A* 算出來的路徑長度**，不是直線距離
+          （使用者指定）—— 直線 5 格但要繞過一整片湖的怪一點都不近。
+          目前這隻也一樣重算一次實走距離，兩邊同一把尺才比得準。
+        ⚠⚠ **打傷過的絕不換**（使用者明確指定：打到之後一定要確定牠死了才能換）。
+          換掉等於留一隻結仇的怪在背後追著咬 —— 以前被圍毆致死就是這樣來的。
+        ⚠ 要近 SWITCH_GAIN 格以上才換：兩隻怪距離差不多時會互相取代，
+          路線一直重算等於原地打轉（乒乓，見 [[patrol-navigator-bounce]]）。
+        ⚠ 節流 SWITCH_GAP 秒一次；候選清單本身是現成的，不重掃記憶體。
+        """
+        now = time.monotonic()
+        if self._hurt or dist is None or now < self._switch_t:
+            return False
+        self._switch_t = now + SWITCH_GAP
+        pool, _ = self._candidates(quiet=True)
+        me = self.my_pos()
+        grid, _reach = self._reach_set(me)
+        # 目前這隻的**實走距離**。算不出來（繞太遠／被地形圍住）就當成無限遠，
+        # 任何走得到的怪都比牠好 —— 那正是「掃到對岸的怪」該有的結果。
+        cur_pos = next((p for _d, m2, p in pool if m2.eid == cur.eid), None)
+        cur_cost = self._path_cost(grid, me, cur_pos,
+                                   max_cost=max(dist * PATH_COST_CAP, 30.0))
+        if grid is None:
+            cur_cost = dist              # 沒地形圖 → 退回直線比（安全退化）
+        elif cur_cost is None:
+            cur_cost = float("inf")
+        # 上限直接設成「要贏過的那條線」：A* 一超過就放棄，省掉沒必要的展開。
+        best = self._nearest_by_path(
+            [t for t in pool if t[1].eid != cur.eid], grid, me,
+            cap=None if cur_cost == float("inf") else cur_cost - SWITCH_GAIN)
+        if best is None or best[0] > cur_cost - SWITCH_GAIN:
+            return False
+        cost2, d2, m2 = best
+        self._dbg(f"改打更近的：「{cur.name}」實走 {cur_cost:.1f} 格 → "
+                  f"「{m2.name}」實走 {cost2:.1f} 格（直線 {d2:.1f}）")
+        # ⚠ 順序照其他換目標的路徑：先把上一隻整個放掉（不寫目標、不出手），
+        #   再鎖新的 —— 中間那一瞬間 eid 是 None，攻擊執行緒就不會多打一下
+        #   舊目標（見 KeyWorker.step 開頭「沒有目標就絕對不出手」）。
+        self._atk.hold_off()
+        self._cur = None
+        self._keys.eid = None
+        self._engage(d2, m2, None)
+        return True
+
+    def _engage(self, d: float, mon, skipped) -> None:
+        """鎖定這一隻：把所有「跟目標綁在一起」的狀態全部重設，再通知兩條執行緒。
+
+        ⚠⚠ 換目標**只准走這一支**。漏掉任何一個欄位，上一隻的狀態就會被帶進
+          新目標（卡住秒數、走不到次數、有沒有打傷過…），症狀通常是
+          「剛換目標就馬上又被放棄」。
+        """
+        me = self.my_pos()
+        boss_only = self.boss_cb.isChecked()
+        idx = monsters.index_base(self.sc) if boss_only else None
+        self._cur = mon
         self._stuck = 0.0
         self._anchor = me                # 換目標 → 卡住偵測從這裡重新算
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
@@ -3171,8 +3633,8 @@ class CharFarmPage(QWidget):
         self._path_t = PATH_GAP                   # 下一拍就問
         self._way = []
         self._unreach = 0
-        self._hurt = False
-        self._nohit_t = 0.0
+        self._hurt = False           # 換了新目標 → 又回到「還沒打傷，可以再換」
+        self._switch_t = 0.0
         self._handoff_fail = False   # 這一隻的「交棒給客戶端」失敗過了嗎
         self._handoff_t = 0.0
         self._near_fail = 0          # 換目標就重算「近距離直線走」的失敗次數
@@ -3196,7 +3658,6 @@ class CharFarmPage(QWidget):
             + f"鎖定「{self._cur.name}」"
             + (f"（{info}）" if info else "")
             + f"　距離 {d:.1f} 格　累計擊殺 {self._kills}")
-        return True
 
     def _bump_kills(self) -> None:
         self._kills += 1
@@ -3306,6 +3767,11 @@ class CharFarmPage(QWidget):
                           "　⚠ 勾的技能鍵上沒有技能（空格／物品會略過）")
         else:
             skill_note = self._keys.skip_note()   # 只是提醒，不會過濾
+        # 首發鍵設了、但那個鍵上沒技能 → 閘門會自動失效，講一聲免得他以為有在等。
+        if self._keys.opener_vk and not self._keys.skills.get(
+                self._keys.opener_vk):
+            skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} 上沒有技能"
+                           "（空格／物品）→ 這次不生效")
         self.status.setText(
             ("掛機中：只打「" + "、".join(want) + "」" if want
              else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
@@ -3795,9 +4261,14 @@ class CharFarmPage(QWidget):
         #       站 7.4 / 8.7 / 11.4 格 → 12~20 秒、101~168 次出手，**零傷害**
         #   換算：有效歐氏距離 ≈ 射程 + 1（斜角相鄰算一格）。
         #   查不到射程（改版新技能、快捷欄讀不到）就退回舊的 12 格。
+        # ★★★ **攻擊距離不再有「一個數字」**（使用者 2026-08-10 指定）：
+        #   打不打得到由**每一招各自**比自己的射程（KeyWorker.reach_of /
+        #   in_range_of_any）。這裡只剩下一個「走多近」要決定 —— 走位本來就
+        #   只能站在一個位置上，所以它照**最短**射程走進去（走到那裡，輪替裡
+        #   每一招才都用得到）。⚠ 這是**走位**的數字，不是攻擊距離。
         rng = self._keys.min_range
-        reach_skill = (ATTACK_PACKET_RANGE if rng is None
-                       else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
+        reach_walk = (ATTACK_PACKET_RANGE if rng is None
+                      else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
         # ★★★ 「最後一段交給客戶端自己走」（使用者的點子，2026-08-06 實測驗證）
         #   短射程技能走的是「叫遊戲的快捷鍵」那條路，而**遊戲自己會走過去**：
         #   實測雪狐站 9.8 格、我們一步移動指令都沒下，只呼叫快捷鍵 ——
@@ -3817,14 +4288,18 @@ class CharFarmPage(QWidget):
         #   回多點，但「路徑要繞」跟「技能被擋線」是兩回事 —— 射程 12 的
         #   黑狐被判「打不到」，只走路不出手，追到 2 格又卡進 [2,3) 死區呆
         #   10 秒。現在：一邊走近一邊照打；真的被牆擋線（零傷害）交給
-        #   NOHIT_SECS 快篩換怪 —— 打不打得到只有目標的血知道（實錘）。
-        reach = HANDOFF_RANGE if handoff else reach_skill
-        in_range = dist is not None and dist <= reach
+        #   STUCK_ENGAGED(15 秒) 換怪 —— 打不打得到只有目標的血知道（實錘）。
+        #   ⚠ 這裡以前寫「交給 4 秒零傷害快篩」，那條 2026-08-10 刪了（見它的說明）。
+        # 「打得到嗎」＝**有沒有任何一招打得到**（每一招各自比自己的射程）。
+        # ⚠ 交棒那一輪例外：那時候本來就是「站得遠、叫快捷鍵讓遊戲自己走過去」，
+        #   用射程去擋會把交棒整個廢掉（見 KeyWorker.client_walk）。
+        in_range = (dist is not None and dist <= HANDOFF_RANGE if handoff
+                    else self._keys.in_range_of_any(dist))
         # ⚠ 交棒的保險：交出去之後如果一直沒真的接戰（>3 秒還在技能射程外、
         #   而且沒掉過血），就收回來自己走 —— 免得客戶端因為地形之類走不到，
         #   我們卻站在 10 格外一直空按（那又變成使用者最討厭的發呆）。
         if handoff and dist is not None:
-            if dist <= reach_skill or self._hurt:
+            if dist <= reach_walk or self._hurt:
                 self._handoff_t = 0.0
             else:
                 self._handoff_t += dt
@@ -3838,12 +4313,16 @@ class CharFarmPage(QWidget):
         #   等於**站在射程邊緣**，怪往外走一步就出界 —— 那一瞬間我們還在送
         #   施放，就是「超出射程還在放技能」，而且會一直重走、很卡。
         #   遠程留 2 格（法師停 10；2026-08-07 試過留 3 停 9，同晚使用者又
-        #   改回 10 —— 地形擋線的呆站已由零傷害快篩 NOHIT_SECS 接手，
+        #   改回 10 —— 地形擋線的呆站由 STUCK_ENGAGED(15 秒) 接手，
         #   不必犧牲一格距離）、近戰留 0.6 格（射程 1 → reach 2.0 → 停 1.4，
         #   再多留就進不了近戰射程了）。下限 MIN_GAP：更近會卡進怪的身體。
-        margin = 2.0 if reach >= 6.0 else 0.6
+        # ⚠⚠ 這是**走位**用的距離（走到那裡每一招都用得到），跟「打不打得到」
+        #   完全分開 —— 後者是每一招各自判斷的，這裡不代表任何一招的射程。
+        reach_keep = HANDOFF_RANGE if handoff else reach_walk
+        margin = 2.0 if reach_keep >= 6.0 else 0.6
         keep = (MELEE_RANGE if blocked
-                else min(max(reach - margin, move.MIN_GAP), reach - 0.5))
+                else min(max(reach_keep - margin, move.MIN_GAP),
+                         reach_keep - 0.5))
 
         # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
         #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
@@ -3898,7 +4377,7 @@ class CharFarmPage(QWidget):
         #   技能表寫的射程（12），而實測真正打得出傷害只到約 11.0 格。
         #   遠程真正的界線是 WALK_SLACK 那個 1.0（見它的說明與
         #   [[ranged-dead-band]]），不是這道 reach−0.5。
-        slack = min(WALK_SLACK, max(0.3, reach - 0.5 - gkeep))
+        slack = min(WALK_SLACK, max(0.3, reach_keep - 0.5 - gkeep))
         need_walk = gd is not None and (
             gd > gkeep + slack or (not in_range and gd > gkeep))
         # ★ 還在趕路（離目標 > FAR_ENOUGH）就用短冷卻，貼身微調維持 0.4 秒。
@@ -3921,12 +4400,24 @@ class CharFarmPage(QWidget):
         self._atk.engaged = self._keys.selected
         # 出手執行緒自己也會用這兩個再驗一次距離（見 KeyWorker.step）
         self._keys.player = self.player
-        self._keys.reach = reach
+        # ⚠ `reach` 只在交棒那一輪有值：交棒時出手不看單招射程，只看這個
+        #   總距離。平常是 0 ＝ **沒有單一攻擊距離**，每一招在 step() 裡
+        #   各自比自己的射程（使用者指定）。
+        self._keys.reach = HANDOFF_RANGE if handoff else 0.0
+        self._keys.client_walk = handoff
         self._keys.set_on(in_range)
 
         # ★ 為什麼沒在打？把原因記下來給狀態列 —— 使用者回報「鎖定一隻怪發呆」，
         #   發呆一定是「不在範圍內、又沒有在走過去」，但成因有好幾種，
         #   直接標出來才不必猜。
+        # ★★ 等首發技能：這段是**故意不出手**的（使用者要的「第一下一定要是
+        #   那一招」），所以底下所有「沒進展就換一隻」的計時器都要凍住。
+        waiting_opener = self._keys.open_wait > 0.0
+        # 跳過首發（SP 不夠／讀不到）要**講出來**，不能安靜地發生。
+        if self._keys.open_note:
+            self.status.setText(self._keys.open_note)
+            self._dbg(self._keys.open_note)
+            self._keys.open_note = ""
         if in_range and dist is not None and dist <= keep:
             self._why = ""
         elif in_range:
@@ -3945,6 +4436,9 @@ class CharFarmPage(QWidget):
                          else "⛰ 隔著地形，走近一點")
         else:
             self._why = "→ 走進攻擊範圍"
+        if waiting_opener:
+            self._why = (f"⏳ 等首發技能 {self._opener_label()} 冷卻好"
+                         f"（{self._keys.open_wait:.0f} 秒）")
 
         # ★ 診斷紀錄：每秒把這一拍的**決策**寫進檔案。
         #   從外面只看得到「站太遠」，看不到為什麼不走 —— 這幾輪我猜了太多次。
@@ -3996,25 +4490,14 @@ class CharFarmPage(QWidget):
         else:
             self._stuck += dt
         self._last_hp = hp
-        # ★★ 零傷害快篩（使用者指定，見 NOHIT_SECS 的說明）。
-        #   放在 15 秒耐心之前：符合條件的話 4 秒就換，不陪它耗。
-        if (in_range and self._keys.selected and not self._hurt
-                and dist is not None and dist > NOHIT_RANGE):
-            self._nohit_t += dt
-        else:
-            self._nohit_t = 0.0
-        if self._nohit_t >= NOHIT_SECS:
-            self._killed[m.eid] = time.monotonic() + NOHP_MEMORY
-            self._atk.hold_off()
-            self._cur = None
-            self._keys.eid = None
-            if not self._pick_next():
-                self._keys.set_on(False)
-                self._since_scan = SCAN_NOW
-            self.status.setText(
-                f"「{m.name}」{NOHIT_SECS:.0f} 秒零傷害（打不到？）→ 換一隻")
-            self._dbg(f"零傷害放棄「{m.name}」eid={m.eid:#x}：交戰 "
-                      f"{NOHIT_SECS:.0f} 秒血沒掉過（距離 {dist:.1f} 格）")
+        # ⚠⚠ 等首發的那幾秒不算「沒進展」：怪本來就不會掉血。不凍住的話
+        #   「15 秒沒進展」會把牠丟掉換一隻，換完又從頭等首發 ——
+        #   變成**永遠不出手**的迴圈（見 [[frozen-tick-state-machines]]）。
+        if waiting_opener:
+            self._stuck = 0.0
+        # ★★ 還沒打傷牠之前，冒出更近的怪就改打那隻（使用者要求）。
+        #   放在 15 秒耐心之前：能換就換，不必等它逾時。
+        if self._switch_closer(m, dist):
             return
         # ★★ 「沒進展」要等多久才放棄，**打得到的時候要有耐心**。
         #   STUCK_SECS(10 秒) 是為「走不過去」設計的；套在交戰上剛好是災難：
@@ -4098,6 +4581,10 @@ class CharFarmPage(QWidget):
         picked = {int(v) for v in vks}
         for cb, vk, _ in self._key_cbs:
             cb.setChecked(vk in picked)
+        # 首次攻擊（0 = 不指定）。存的是鍵碼，用 findData 找回位置 ——
+        # 找不到（設定壞了）就退回「不指定」，不要當掉。
+        idx = self.open_box.findData(int(g(self._key("opener_vk"), 0) or 0))
+        self.open_box.setCurrentIndex(idx if idx >= 0 else 0)
         self.move_cb.setChecked(bool(g(self._key("move"), True)))
         self.patrol_cb.setChecked(bool(g(self._key("patrol"),
                                          g(self._key("back"), False))))
@@ -4171,12 +4658,15 @@ class CharFarmPage(QWidget):
         """勾選的技能鍵（照 F1→F12 順序）。"""
         return [vk for cb, vk, _ in self._key_cbs if cb.isChecked()]
 
-    def _refresh_key_menu(self) -> None:
-        """點開技能鍵選單時，把每個鍵標上快捷欄現在放什麼。
+    def _label_keys(self) -> None:
+        """把「技能鍵」選單與「首次攻擊」下拉標上快捷欄現在放什麼。
 
         技能格 → F1（電擊術Ⅳ）、物品格 → F5（物品：高效紅藥水）、
         空格 → F7（空）。讀不到快捷欄（還沒進遊戲／改版位移）就維持
         素的 F1~F12，不亂標。純讀取，開著掛機點開也沒差。
+
+        ⚠ 只改字（setText/setItemText），**不重建清單** —— 重建會讓順序跳動
+          （見 [[qt-ui-pitfalls]]）。兩個元件展開時各自呼叫這一支。
         """
         try:
             cells = quickbar.read_page(self.sc, self._qb_ui.page())
@@ -4199,6 +4689,30 @@ class CharFarmPage(QWidget):
                     nm = itemname.of(c.value)
                     text = f"{label}（物品：{nm}）" if nm else f"{label}（物品）"
             cb.setText(text)
+            # 首次攻擊的下拉：第 0 項是「不指定」，之後才照 F1~F12。
+            self.open_box.setItemText(i + 1, text)
+
+    def _opener_label(self) -> str:
+        """狀態列用的首發技能名稱：F3（破甲劈擊Ⅳ）；查不到就只寫鍵名。"""
+        vk = self._keys.opener_vk
+        if not vk:
+            return ""
+        key = (f"F{vk - quickbar.VK_F1 + 1}"
+               if quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS
+               else f"鍵{vk:#x}")
+        sid = self._keys.skills.get(vk)
+        nm = skills.name_of(sid) if sid else ""
+        return f"{key}（{nm}）" if nm else key
+
+    def _opener_changed(self) -> None:
+        """首次攻擊改了：推給攻擊執行緒，並且**當場把鎖打開**。
+
+        ⚠ 不重設的話，改設定的當下正在等的那一隻會繼續等舊的那一招。
+        """
+        self._keys.opener_vk = int(self.open_box.currentData() or 0)
+        self._keys._open_eid = None
+        self._keys.open_wait = 0.0
+        self._save_settings()
 
     def _sync_key_btn(self) -> None:
         """按鈕字樣＝勾了哪些鍵；勾太多就縮寫，別把整條列撐爆。"""
@@ -4226,6 +4740,7 @@ class CharFarmPage(QWidget):
         s = config.set
         s(self._key("monsters"), self.wanted())
         s(self._key("vks"), self._sel_vks())
+        s(self._key("opener_vk"), int(self.open_box.currentData() or 0))
         s(self._key("move"), self.move_cb.isChecked())
         s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("boss_only"), self.boss_cb.isChecked())

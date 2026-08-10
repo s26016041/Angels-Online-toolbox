@@ -224,6 +224,15 @@ SIGS: tuple[Sig, ...] = (
         " A1 88 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
         " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 B9 88 00 00 56",
         0x0098BC88, as_rva=True, keep_imm=True),
+    # 技能範本表（[這裡]+技能ID*4 → 範本；見 app/game/skillcost.py）。
+    # ⚠ 跟怪物表是**同一種**查表函式（模組裡有 28 支長得一模一樣），但這一支
+    #   的邊界值 0x61A7 與錯誤訊息編號 0x61A9 是它自己的 —— 所以表位址本身
+    #   可以交給 _auto_mask 遮掉（不像 monsters 那段被迫 keep_imm）。
+    Sig("skillcost", "TABLE_PTR", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 A7 61 00 00 77 0A"
+        " A1 B0 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 A9 61 00 00 56",
+        0x0098BCB0),
     Sig("move", "WAYPOINTS", "data", 1,
         "68 84 66 9B 00 FF 75 0C 8B C8 FF 75 08 E8 ?? ?? ?? ?? 33 C9 85 C0 0F 9F C1",
         0x009B6684),
