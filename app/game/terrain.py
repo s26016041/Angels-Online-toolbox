@@ -44,6 +44,7 @@ from __future__ import annotations
 import heapq
 import math
 import struct
+import time
 import zlib
 
 # ⚠ 這個位址會被 locate.warm() 依 AOB 重新定位，不要在別處複製一份。
@@ -56,6 +57,11 @@ CELL = 7                   # 每格幾 bytes
 FLAG_OFF = 2               # 格子裡的阻擋旗標在第幾個 byte
 BLOCK_MASK = 3             # 那個 byte 的哪幾個 bit 代表不能走
 MAX_DIM = 4096             # 合理性上限（讀到亂數就當失敗）
+# 讀不到時當場重試幾次（一次 6~8ms）。換圖那一瞬間會短暫讀不到，
+# 而沒有地形圖我們就不走路 —— 多花十幾毫秒把圖拿到手划算得多。
+LOAD_TRIES = 3
+# 連續失敗之後隔多久才准再讀一整張圖（見 Cache.get）。
+RETRY_GAP = 0.2
 # 終點落在牆上時，往外找可走格的半徑。遊戲自己也是走到旁邊。
 GOAL_RELAX = 4
 # 一段最多幾格。遊戲的走路常式自己會再尋路一次，而它一次只算得出約 30 格
@@ -245,37 +251,47 @@ def _u32(scanner, addr: int):
     return struct.unpack("<I", bytes(raw))[0] if raw else None
 
 
-def load(scanner) -> Grid | None:
-    """讀出目前這張地圖的可走格；讀不到回 None（呼叫端要有退路）。
+def load(scanner) -> tuple["Grid | None", str]:
+    """讀出目前這張地圖的可走格；回 (圖, 讀不到的原因)。
 
-    實測 300x180 只要 5ms —— 一列一次讀取，180 次系統呼叫。
+    實測 300x190 只要 6~8ms —— 一列一次讀取，190 次系統呼叫。
+
+    ⚠⚠⚠ **讀不到的列絕對不准當成牆**（2026-08-10 修）。舊版是「整列讀不到
+      → 那一列全部不能走，但整張圖照樣回傳」，於是一次暫時性的
+      ReadProcessMemory 失敗就會產生一張**假的地圖**：那幾列變成一道憑空的
+      牆，然後被 `Cache` 存起來（身分沒變就永遠不會重讀）。後果正是本專案
+      一律當 bug 的那種 —— 明明走得過去卻說到不了、挑目標時把整片怪刷掉，
+      而且安靜、沒有任何警示。
+      現在：任何一列讀不到就**整張失敗**（回 None ＋原因），呼叫端會重試，
+      再不行就大聲停用。半張地圖比沒有地圖危險得多。
     """
     obj = _u32(scanner, MAP_PTR)
     if not obj or not 0x10000 < obj < 0x7FFF0000:
-        return None
+        return None, "讀不到地圖物件指標"
     w = _u32(scanner, obj + OFF_W)
     h = _u32(scanner, obj + OFF_H)
     rows = _u32(scanner, obj + OFF_ROWS)
     if not w or not h or not rows:
-        return None
+        return None, "地圖還在載入（寬高／列陣列是 0）"
     if w > MAX_DIM or h > MAX_DIM or not 0x10000 < rows < 0x7FFF0000:
-        return None
+        return None, f"地圖版面不合理（{w}x{h}）"
     raw = scanner._read_bytes(rows, h * 4)
     if not raw or len(raw) < h * 4:
-        return None
+        return None, "讀不到列指標陣列"
     ptrs = struct.unpack(f"<{h}I", bytes(raw))
     open_rows: list[bytearray] = []
     for y in range(h):
         line = scanner._read_bytes(ptrs[y], w * CELL) if ptrs[y] else None
         if not line or len(line) < w * CELL:
-            # 整列讀不到 → 當成不能走（保守），但不要讓整張圖失敗
-            open_rows.append(bytearray(w))
-            continue
+            return None, f"第 {y} 列讀不到（共 {h} 列）"
         b = bytes(line)
         open_rows.append(bytearray(
             0 if (b[x * CELL + FLAG_OFF] & BLOCK_MASK) else 1
             for x in range(w)))
-    return Grid(w, h, obj, open_rows)
+    # 一格都不能走 = 這份資料還沒填好（換圖那一瞬間），不是一張全是牆的地圖。
+    if not any(any(r) for r in open_rows):
+        return None, "整張圖沒有一格可走（還在載入）"
+    return Grid(w, h, obj, open_rows), ""
 
 
 class Cache:
@@ -292,11 +308,18 @@ class Cache:
       成本是幾次小讀取（列陣列 h*4 ≈ 720 bytes），而且只在要規劃路線時問。
     """
 
-    __slots__ = ("_grid", "_key")
+    __slots__ = ("_grid", "_key", "why", "_fails", "_cool")
 
     def __init__(self) -> None:
         self._grid: Grid | None = None
         self._key = None
+        # 剛失敗過就先冷卻一下再重試（見 get()）
+        self._cool = 0.0
+        # 最近一次讀不到的原因（空字串 = 現在有圖）。呼叫端拿去**大聲**顯示
+        # —— 沒有地形圖時我們不走路了（不再退回遊戲的尋路撞牆），
+        # 所以「為什麼沒有」一定要看得到。
+        self.why = ""
+        self._fails = 0
 
     @staticmethod
     def _identity(scanner):
@@ -320,15 +343,45 @@ class Cache:
         return obj, w, h, sid, zlib.crc32(bytes(raw))
 
     def get(self, scanner) -> Grid | None:
+        """目前這張圖的可走格；讀不到回 None，原因寫在 `why`。
+
+        ★ 讀不到就**當場重試**（`LOAD_TRIES` 次）。一次 6~8ms，而讀失敗
+          幾乎都是暫時的（換圖那一瞬間、系統忙）—— 產品這邊沒有圖就不走路，
+          所以寧可多花十幾毫秒也要把圖拿到手。
+        ⚠ 失敗**絕不快取**：`_key` 留 None，下一拍會再試一次。
+        """
         key = self._identity(scanner)
         if key is None:
             self._grid, self._key = None, None
+            self.why = "讀不到地圖物件（換圖中？）"
+            self._fails += 1
             return None
         if self._grid is not None and self._key == key:
+            self.why = ""
             return self._grid
-        self._grid = load(scanner)
-        self._key = key if self._grid is not None else None
-        return self._grid
+        # ⚠ 剛失敗過就先別急著再讀一整張圖：呼叫端（挑目標、走位）一秒會問
+        #   好幾十次，每次都重試 3 遍 = 每次 20~25ms，換圖那幾拍會把畫面拖住。
+        #   隔 RETRY_GAP 再試一次就好 —— 反正沒有圖的期間我們本來就不走路。
+        now = time.monotonic()
+        if now < self._cool:
+            return None
+        for _ in range(LOAD_TRIES):
+            grid, why = load(scanner)
+            if grid is not None:
+                self._grid, self._key, self.why, self._fails = grid, key, "", 0
+                self._cool = 0.0
+                return grid
+        self._grid, self._key = None, None
+        self.why = why
+        self._fails += 1
+        self._cool = now + RETRY_GAP
+        return None
+
+    @property
+    def fails(self) -> int:
+        """連續幾拍讀不到（拿到圖就歸零）。給呼叫端決定何時開始喊。"""
+        return self._fails
 
     def drop(self) -> None:
-        self._grid, self._key = None, None
+        """把快取丟掉，下一次 `get()` 一定重讀（冷卻也一併清掉）。"""
+        self._grid, self._key, self._cool = None, None, 0.0

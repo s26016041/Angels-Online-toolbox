@@ -15,10 +15,16 @@
 
 技能編號怎麼來
 --------------
-⛔ 快捷欄的技能欄位找不到（連同這次用五個已知技能當特徵，共試過五種方法）。
-★ 所以**學一次**：第一次啟用時按一下 F12，讀「角色屬性 −0x50」就知道是哪個
-  技能，然後**存進設定**。之後一律走封包，重開也不用再按。
-  那一下按鍵正好就是使用者要的「開起來先無腦放一次」。
+★★★ **直接讀快捷欄**（`quickbar.read_page`，2026-08-06 找到的表）——
+  零副作用、當場拿到，呼叫端用 `adopt()` 塞進來。
+⚠⚠ 舊的「按一下 F12 再讀角色屬性 −0x50」是**保底**，只有快捷欄整個讀不到
+  （改版位移）才會走。2026-08-10 實機抓到它的代價：白狐的 F12 是**空的**，
+  於是每 `RETRY`(8) 秒按一次、**永遠學不到、無限重試**；而 `win.send_key`
+  中間有 40ms 的 `sleep`，又是在 GUI 執行緒上呼叫的 —— 等於每 8 秒把整個
+  程式（五台分頁共用一條 GUI 執行緒）卡一下，狀態列也被錯誤訊息一直蓋掉。
+  → 現在那一格沒有技能時用 `block()` **大聲停手**，不再盲按。
+⛔ 更早的註記「快捷欄的技能欄位找不到（試過五種方法）」已經過時 ——
+  那是因為一格 9 bytes、技能 ID 落在未對齊位址（見 [[quickbar-table]]）。
 
 計時
 ----
@@ -61,6 +67,38 @@ class AutoBuff:
         self._learning = False
         self.note = ""
         self.armed = False
+        self.blocked = ""        # 那個鍵上根本沒有可用的技能 → 停手（見 block）
+
+    def adopt(self, skill_id: int) -> bool:
+        """直接指定技能編號（呼叫端從**快捷欄**讀到的），成功回 True。
+
+        ★ 這是現在的正路：零副作用、不必按鍵、當場拿到。
+        ⚠ 查不到持續時間（`skills.of` 只收 buff 類）就**不採用** ——
+          那代表那一格放的不是 buff，硬補只會白扣魔。
+        """
+        info = skills.of(skill_id) if skill_id else None
+        if info is None:
+            return False
+        if self.skill == info.id:
+            self.blocked = ""
+            return True
+        self.skill, self.secs = info.id, float(info.secs)
+        self._cast_at = 0.0                  # 還沒放過 → 下一拍就補一次
+        self._sent_at = 0.0
+        self._learning = False
+        self.blocked = ""
+        return True
+
+    def block(self, why: str) -> None:
+        """那個鍵上沒有可用的技能 → **停手**，別再盲按（大聲說明原因）。
+
+        ⚠⚠ 這不是「暫時性失敗要無限重試」那一類（見 memory
+          transient-failure-auto-retry）：F12 是空的是**確定的狀態**，
+          再按幾次都一樣。舊版每 8 秒按一次、在 GUI 執行緒 sleep 40ms，
+          白狐實機上就是這樣一直卡（2026-08-10）。
+        ★ 使用者把技能放上去之後，呼叫端下一次 adopt() 會自動解除。
+        """
+        self.blocked = why
 
     def arm(self) -> None:
         """開始（或中途勾選）—— 下一拍無腦放一次，不管身上有沒有。"""
@@ -113,7 +151,12 @@ class AutoBuff:
             return self.note                    # 剛失敗過，先等等
 
         # ③ 還沒學過技能編號 → 按一次 F12（這一下也就是第一次施放）
+        #    ⚠⚠ 這是**保底**：正路是呼叫端直接讀快捷欄再 adopt()。
+        #      那一格確定沒有技能時呼叫端會 block()，這裡就停手不再盲按 ——
+        #      按鍵會在 GUI 執行緒 sleep 40ms，每 8 秒一次會拖累全部分頁。
         if not self.skill:
+            if self.blocked:
+                return self.blocked
             if not stats_base:
                 self.note = "⚠ 讀不到角色屬性，沒辦法學 F12 的技能"
                 return self.note

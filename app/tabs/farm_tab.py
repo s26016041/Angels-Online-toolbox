@@ -288,7 +288,10 @@ SWITCH_GAP = 1.0      # 多久評估一次（每 0.1 秒重挑一次純粹是浪
 # ⚠ 路徑長度用「幾何成本」（直走 1、斜走 √2），跟直線距離同單位才比得起來，
 #   而且**直線距離永遠 ≤ 路徑長度**：這條下限讓我們可以照直線排序後提早收手，
 #   一次評估通常只要算兩三次 A*（每次 0.2~0.8ms），不必每隻都算。
-PATH_COST_CAP = 3.0   # 繞超過直線距離這麼多倍就當走不到（跟 tick 的 waypoints 一致）
+# ⛔ PATH_COST_CAP（繞超過直線距離 3 倍就當走不到）2026-08-10 刪除。
+#   它讓「牆對面、要繞遠路」的怪整批算不出路徑，於是挑目標退回直線最近、
+#   走路退回遊戲的尋路 —— 就是使用者回報的「卡在牆邊直到怪重生」。
+#   繞得遠不等於到不了；真的到不了由連通區泛洪（Grid.reachable）回答。
 _SQRT2 = math.sqrt(2.0)
 # ★★★ 「正在打我」的聯集判定（2026-08-07 唯讀跟拍實錘，見 _fighting_me）：
 #   交戰槽在怪**出手的當下**反而是空的（17/17），單靠 entity.attacking()
@@ -431,10 +434,17 @@ ROT_SETTLE = 5.0
 # ⛔ 這裡以前是「血/魔不足時坐下回復」的一整組常數（VK_INSERT／REST_FULL／
 #   REST_HP_DEFAULT／REST_MP_DEFAULT／SIT_GAP／SIT_CONFIRM／REST_SAMPLE）。
 #   整個功能 2026-08-09 依使用者要求移除，理由與替代路徑見建構式裡那段說明。
-PATH_GAP = 0.2                  # 問尋路「中間有沒有障礙物」的重試間隔
-# 尋路一次算得出的範圍（實測約 30~40 格，超過就回 0）。
-# 超過這個距離回 0 只代表「太遠，要接力走」，**不是**「到不了」。
-PATHFIND_RANGE = 25.0
+PATH_GAP = 0.2                  # 重算「跟目標之間有沒有地形」的最短間隔
+# ★ 規劃路徑最多只准佔這麼一小部分的時間（1/20 = 5%）：算完之後休息
+#   「這次花掉的時間 × PATH_BUDGET」再算下一次。近距離的 A* 是 0.1~0.8ms，
+#   乘 20 也還在 PATH_GAP 之內＝節奏完全不變；只有極遠的目標
+#   （實測整張圖最遠 337 格的路要 48.6ms）才會自動放慢。
+PATH_BUDGET = 20.0
+PATH_GAP_MAX = 1.0              # 再怎麼貴也至少這麼久重算一次
+# ⛔ PATHFIND_RANGE（25 格）2026-08-10 刪除：那是**遊戲的尋路**一次算得出的
+#   範圍，用來把它的「回 0」翻譯成「太遠要接力」而不是「到不了」。
+#   現在判定走不走得到的是我們自己的 A*（整張圖、沒有距離上限），
+#   算不出來就是真的到不了，再拿距離去擋只會讓遠處走不到的怪永遠不被放棄。
 # 要連續這麼多次「算不出路徑」才判定走不到。怪會走動，單一次很可能只是
 # 牠剛好站到走不進去的格子 —— 每次都信就會變成「打一下就換下一隻」。
 UNREACH_HITS = 3
@@ -1485,9 +1495,13 @@ class CharFarmPage(QWidget):
         self._path_pts = -1        # 尋路點數（-1=還沒算、1=直線通、>1=有地形）
         # ★ 「地形圖**這一拍親口說**跟目標之間直線可通」。只有它是 True 才敢
         #   把「走直線到目標」當成自己算好的路徑交給遊戲（見 _walk_toward）。
-        #   讀不到地形圖時永遠是 False → 退回讓遊戲自己尋路。
+        #   讀不到地形圖時永遠是 False → **這一拍不走路**（不再退回遊戲的尋路）。
         self._line_clear = False
-        self._path_t = 0.0         # 距離上次問尋路過了多久
+        # 地形圖讀不到的原因（空字串 = 有圖）。沒有圖就不走路，所以要看得到。
+        self._no_grid = ""
+        self._path_t = 0.0         # 距離上次重算路徑過了多久
+        # 下一次重算要等多久（會依上一次 A* 的實際成本自我調節，見 tick）
+        self._path_gap = PATH_GAP
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._unreach = 0          # 連續幾次尋路算不出路徑
         self._hurt = False         # 這隻有沒有被我們打傷過（打傷了就不准換目標）
@@ -1566,15 +1580,13 @@ class CharFarmPage(QWidget):
         self._maps = terrain.Cache()
         # ★ 走去巡邏點的導航器（會繞路、會判斷到不了），見 navigate.py
         self._nav = navigate.Navigator(self._maps)
-        # ★★ 走通過的巡邏路線（(地圖, 從哪點, 到哪點) → 去彎後的路線）。
-        #   探索一次之後同一段路直接重播 —— 實測 142 格的腿探索走了 429 格
-        #   （來回乒乓 6 次，「卡很久、牆邊蠕動」的來源），重播就是直達。
-        #   反方向自動用倒過來的路線。只留在記憶體：重開程式再學一次即可。
-        self._routes: dict[tuple, list] = {}
-        self._leg_from: int | None = None    # 這一段是從哪個巡邏點出發的
+        # ⛔ 「走通過的巡邏路線」記憶（_routes）2026-08-10 刪除：它是探索式
+        #   繞路的配件，而探索本身已經刪了。地形圖 A* 12~19ms 就給最短路，
+        #   記一條走過的路只會更差。
         # ★ 自動分身：時間到了自動補 F12 的 buff（見 app/game/buff.py）
         self._buff = buff.AutoBuff(BUFF_KEY)
         self._buff_note = ""     # 上次顯示過的補 buff 訊息（沒變就不重畫）
+        self._buff_read_t = 0.0  # 下一次可以讀快捷欄找分身技能的時間
         # 目前所在地圖。心跳每 SCENE_SAMPLE 秒更新一次（見 _refresh_scene）。
         self._scene: int | None = None
         self._scene_t = SCENE_SAMPLE    # 第一拍就讀
@@ -2936,16 +2948,13 @@ class CharFarmPage(QWidget):
                    "想要地圖比對請刪掉重加。"))
 
     def _forget_routes(self) -> None:
-        """巡邏點清單一動，記住的路線就全部作廢。
+        """巡邏點清單一動 → 導航整個重來（正在走的那一段的目標可能換人了）。
 
-        ⚠⚠ 路線是用**點的編號**當 key 的（地圖, 從第幾點, 到第幾點）。
-          中間插一個點或刪掉一個點，後面所有點的編號就整個位移 ——
-          舊路線會被套到**另一對點**上，角色就往完全不相干的方向走。
-          （現在走路優先用地形最短路，這份記憶只是讀不到地圖時的退路，
-          但錯的退路比沒有退路更糟。）
+        ⛔ 這裡以前還會清掉「記住的路線」（_routes）。那份記憶 2026-08-10
+          跟著 navigate 的探索式繞路一起刪了 —— 走路現在一律用地形圖算的
+          最短路，A* 12~19ms 就給出**最佳**路線，記住一條走過的路只會更差
+          （而且它是用點的編號當 key 的，插一個點就整個對錯人）。
         """
-        self._routes.clear()
-        self._leg_from = None
         self._nav.reset()
 
     def _add_spot(self) -> None:
@@ -3029,7 +3038,12 @@ class CharFarmPage(QWidget):
         #     ① 上一次尋路說要繞路（_path_pts > 1）→ 直接走 walk_route
         #     ② 尋路只在 dist > NO_PATH_NEED 時才更新，**3 格以內那個判斷是舊的**
         #        → 所以再加一道實測保險：連續走了兩次都沒真的位移，就改用尋路
-        if gd < NEAR_WALK and self._path_pts <= 1 and self._near_fail < 2:
+        # ⚠ 再加一個條件 `self._line_clear`（2026-08-10）：`_path_pts <= 1` 在
+        #   「地形圖讀不到」時也成立（那時它是 0），等於在沒有任何擋線判斷的
+        #   情況下走直線。3 格以內的貼身微調不受影響 —— 那個距離上面那段
+        #   本來就直接把 _line_clear 設成 True。
+        if (gd < NEAR_WALK and self._path_pts <= 1 and self._near_fail < 2
+                and self._line_clear):
             # 上一次 walk_near 之後到底有沒有動？沒動就記一次失敗。
             if self._near_from is not None and me:
                 if math.hypot(me[0] - self._near_from[0],
@@ -3051,8 +3065,14 @@ class CharFarmPage(QWidget):
         #     問遊戲尋路 —— 拿一個可能過期的判斷去走直線會直接撞牆。
         # ⚠ 終點用**格子中心**不要用怪的浮點座標：踩到怪自己那一格時
         #   伺服器不給站，整段移動會被退回（見 move.walk_route 的說明）。
+        # ⛔⛔ 沒有路徑點就**不走**（2026-08-10 使用者指定）。以前這裡是
+        #   `points=None`，而 walk_route 收到 None 會去問遊戲的尋路，問不到
+        #   就沿直線取 28/18/10/5 格的中繼點、再 ±40°/±70° 亂試 ——
+        #   那就是「卡在牆邊」。現在只走**我們自己從地形圖算出來的路**。
         pts = self._way or ([(int(gx) + 0.5, int(gy) + 0.5)]
                             if self._line_clear else None)
+        if not pts:
+            return 0
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
                                    stop_short=keep, points=pts)
         self._walk_t = 0.0
@@ -3320,11 +3340,16 @@ class CharFarmPage(QWidget):
 
         ★★★ 為什麼挑目標一定要有它：`_candidates` 是照**直線距離**排的，
           而直線距離跟「走不走得到」完全是兩回事 —— 河對岸那隻直線 12 格
-          就贏過同岸 15 格的，鎖上去才發現過不去。而且「走不到就換一隻」
-          那條規則有 `PATHFIND_RANGE`(25 格) 上限，更遠的**根本不會觸發**，
+          就贏過同岸 15 格的，鎖上去才發現過不去。（2026-08-10 之前「走不到
+          就換一隻」那條規則還有 25 格上限，更遠的**根本不會觸發**，
           只能等 15 秒沒進展 → 冷卻 8 秒 → 牠又是最近的 → 再挑一次，
-          就是使用者看到的「掃到對岸的怪就卡住」。
+          就是使用者看到的「掃到對岸的怪就卡住」。）
           先泛洪一次把不同連通區的怪整個排除，這個迴圈就不存在了。
+
+        ★★ 2026-08-10 起這一支還多了一個責任：**它是「走不到」的唯一權威**。
+          走路那邊的 A* 已經沒有距離／繞路倍數上限了，所以「算不出路徑」
+          必須真的等於走不到 —— 靠這裡先把不同連通區的怪剔掉，A* 才不會
+          去展開一整片走不通的地方（那才是它唯一會變慢的情況）。
 
         ⚠ 泛洪一次約 33ms，**一定要快取**：只有換地圖（grid 物件換掉）或
           自己跑到別的連通區（傳送、走過門）才重算，平常每拍只是一次
@@ -3377,9 +3402,11 @@ class CharFarmPage(QWidget):
         ★ 效率靠一條數學性質：**直線距離永遠 ≤ 路徑長度**。所以照直線排序後，
           一旦手上最好的路徑長度已經 ≤ 下一隻的直線距離，後面**不可能**更近，
           直接收手 —— 實務上只會算兩三次 A*，不是每隻都算。
-        ⚠ 每次 route() 都把 max_cost 設成「目前最好的成績」，走不到的候選
-          也就不會把整張圖展開。
-        cap: 還沒有任何成績時的上限（None = 用直線距離的 PATH_COST_CAP 倍）。
+        ⚠ 每次 route() 都把 max_cost 設成「目前最好的成績」——那是**純粹的
+          剪枝**（比目前最好的還長就不必算完），不是「走不到」的判準。
+        cap: 還沒有任何成績時的上限（None = 不設限，照樣把路算完）。
+          ⛔ 這裡以前預設 `max(直線×3, 30)`：繞路遠的怪整批算不出來 →
+            退回直線最近 → 挑到牆對面那隻。已刪。
         """
         if grid is None or not me:
             # ⚠ 讀不到地形圖 → **退回直線距離**（安全退化 = 舊行為）。
@@ -3394,8 +3421,14 @@ class CharFarmPage(QWidget):
             limit = best[0] if best is not None else cap
             if limit is not None and d >= limit:
                 break                    # 直線就輸了 → 後面排序更遠的更不用算
-            lim = limit if limit is not None else max(d * PATH_COST_CAP, 30.0)
-            c = self._path_cost(grid, me, pos, max_cost=lim)
+            # ⛔ 「還沒有成績時用 max(直線×3, 30) 當上限」**拿掉了**
+            #   （2026-08-10）。那道上限的語意是「繞超過 3 倍就當走不到」，
+            #   於是繞路遠的怪整批算不出來 → 下面退回「直線最近」→ 挑到的
+            #   正好是牆對面那隻（使用者回報的症狀）。
+            #   ★ 不必怕慢：pool 已經被連通區泛洪過濾過，這裡的 A* 一定
+            #     找得到路（貴的是「走不到」，那個情況不存在了），
+            #     而且第一隻算完之後就有 limit 可以夾。
+            c = self._path_cost(grid, me, pos, max_cost=limit)
             if c is not None and (best is None or c < best[0]):
                 best = (c, d, mon)
         return best
@@ -3557,7 +3590,14 @@ class CharFarmPage(QWidget):
             return False
         grid, _ = self._reach_set(self.my_pos())
         best = self._nearest_by_path(pool, grid, self.my_pos())
-        if best is None:                 # 沒地形圖／全都算不出路 → 照直線挑
+        if best is None and grid is not None:
+            # ★★ 有地形圖卻**每一隻都算不出路** = 真的沒有走得到的怪。
+            #   ⛔ 以前這裡會退回「直線最近的那隻」—— 那等於明知走不到還鎖上去，
+            #     然後走去牆邊卡著（使用者回報的症狀）。現在當作沒目標，
+            #     交給上層重掃／巡邏。
+            self._dbg(f"候選 {len(pool)} 隻**全部算不出路徑** → 這一輪不挑")
+            return False
+        if best is None:                 # 沒地形圖 → 照直線挑（安全退化）
             d, mon, _p = pool[0]
         else:
             cost, d, mon = best
@@ -3591,8 +3631,9 @@ class CharFarmPage(QWidget):
         # 目前這隻的**實走距離**。算不出來（繞太遠／被地形圍住）就當成無限遠，
         # 任何走得到的怪都比牠好 —— 那正是「掃到對岸的怪」該有的結果。
         cur_pos = next((p for _d, m2, p in pool if m2.eid == cur.eid), None)
-        cur_cost = self._path_cost(grid, me, cur_pos,
-                                   max_cost=max(dist * PATH_COST_CAP, 30.0))
+        # ⚠ 這裡也**不設上限**（2026-08-10）：設了的話「繞得比較遠但走得到」
+        #   的目標會被當成無限遠，於是每秒都想換一隻（乒乓）。
+        cur_cost = self._path_cost(grid, me, cur_pos)
         if grid is None:
             cur_cost = dist              # 沒地形圖 → 退回直線比（安全退化）
         elif cur_cost is None:
@@ -3630,7 +3671,9 @@ class CharFarmPage(QWidget):
         self._anchor = me                # 換目標 → 卡住偵測從這裡重新算
         self._path_pts = -1                       # -1 = 還沒算，tick() 會去問尋路
         self._line_clear = False                  # 還沒問過地形圖，先別走直線
-        self._path_t = PATH_GAP                   # 下一拍就問
+        self._no_grid = ""
+        self._path_t = PATH_GAP                   # 下一拍就算
+        self._path_gap = PATH_GAP                 # 換目標 → 節奏重來
         self._way = []
         self._unreach = 0
         self._hurt = False           # 換了新目標 → 又回到「還沒打傷，可以再換」
@@ -3658,6 +3701,44 @@ class CharFarmPage(QWidget):
             + f"鎖定「{self._cur.name}」"
             + (f"（{info}）" if info else "")
             + f"　距離 {d:.1f} 格　累計擊殺 {self._kills}")
+
+    def _adopt_buff_skill(self) -> None:
+        """自動分身的技能編號：**直接讀快捷欄的 F12 那一格**，不必按鍵。
+
+        ★ 讀得到技能 → `adopt()` 收下並存進設定，之後全走封包。
+        ⚠ 那一格是空的／放物品／放的不是 buff（查不到持續時間）→ `block()`
+          停手並在狀態列說清楚。**不要無限重試按鍵**：那是確定的狀態，
+          不是暫時性失敗，而且每按一次就在 GUI 執行緒 sleep 40ms
+          （白狐 2026-08-10 實機就是這樣每 8 秒卡一下）。
+        ⚠ 快捷欄整個讀不到（改版位移）就什麼都不做 —— 讓 buff.py 的舊按鍵
+          保底法接手（安全退化）。
+        """
+        now = time.monotonic()
+        if now < self._buff_read_t:
+            return
+        self._buff_read_t = now + 2.0        # 純讀很便宜，但也不必每一拍讀
+        try:
+            cells = quickbar.read_page(self.sc, self._qb_ui.page())
+        except Exception:                    # noqa: BLE001
+            return
+        if cells is None:
+            return                           # 讀不到 → 走舊的按鍵保底法
+        slot = BUFF_KEY - quickbar.VK_F1
+        c = cells[slot] if 0 <= slot < len(cells) else None
+        if c is not None and c.is_skill and self._buff.adopt(c.value):
+            self._save_settings()
+            self.status.setText(
+                f"✨ 自動分身：F12 = {skills.name_of(c.value) or c.value}"
+                f"（持續 {self._buff.secs / 60:.0f} 分）")
+            return
+        if c is None:
+            why = "⚠ 自動分身：F12 上沒有技能 → 先不補（放上去就會自動接手）"
+        elif c.is_item:
+            why = "⚠ 自動分身：F12 放的是物品 → 先不補"
+        else:
+            why = (f"⚠ 自動分身：F12 的技能 {c.value} 沒有持續時間"
+                   "（不是 buff）→ 先不補")
+        self._buff.block(why)
 
     def _bump_kills(self) -> None:
         self._kills += 1
@@ -4002,6 +4083,12 @@ class CharFarmPage(QWidget):
         if self.buff_cb.isChecked():
             if not self._buff.armed:
                 self._buff.arm()          # 中途才勾的話，下一拍就無腦放一次
+            # ★★★ 技能編號**直接讀快捷欄**（零副作用），不要再按 F12 學。
+            #   2026-08-10 白狐實機：F12 是空的 → 舊的按鍵學習法永遠學不到，
+            #   每 8 秒按一次、每次在 GUI 執行緒 sleep 40ms（五台分頁共用
+            #   一條 GUI 執行緒），狀態列也被錯誤訊息一直蓋掉。
+            if not self._buff.skill:
+                self._adopt_buff_skill()
             # ⚠ `_my_id` 傳的是**函式本身**不是值：它要讀一次記憶體，而只有
             #   真的要補分身（20 分鐘一次）才用得到，心跳每 10ms 一拍先算好
             #   等於每秒白讀 100 次。
@@ -4058,11 +4145,10 @@ class CharFarmPage(QWidget):
             self._scene_t = 0.0
             was = self._scene
             self._scene = self._read_scene()
-            # ⚠ 換地圖時導航記憶一定要清掉：走過的地方／黑名單都是座標，
-            #   在別張圖上完全沒有意義，留著會讓它一開始就排除掉正確方向。
+            # ⚠ 換地圖時導航一定要重來：算好的路線是**這張圖的座標**，
+            #   在別張圖上完全沒有意義（會照著它往一個不相干的方向走）。
             if was != self._scene:
                 self._nav.reset()
-                self._leg_from = None   # 換圖了，出發點跟路線都對不上了
 
         # ★★ 「角色正在走路嗎」——**直接讀遊戲的動畫狀態**（'Run' / 'Wait'），
         #   不要再隔 0.3 秒比一次位置。移動中一律不重下移動指令（會把多點路徑
@@ -4100,15 +4186,6 @@ class CharFarmPage(QWidget):
             sx, sy, _sid = self._spots[self._spot_i]
             d = math.hypot(me[0] - sx, me[1] - sy)
             if d <= SPOT_SLACK:
-                # ★ 這一段走通了 → 把實際路線（去彎後）記下來，下次直接重播。
-                #   ⚠ 要在 reset() 之前拿（reset 會清掉軌跡）；重播那趟拿到的
-                #   是空清單，**不能**拿去覆蓋原本學到的路線。
-                rt = self._nav.learned()
-                if (rt and self._leg_from is not None
-                        and self._leg_from != self._spot_i):
-                    self._routes[(scene.map_key(self._scene),
-                                  self._leg_from, self._spot_i)] = rt
-                self._leg_from = self._spot_i
                 # 到了這個點還是沒怪 → 換下一個點繼續找（只在這張圖的點裡輪）
                 self._spot_i = here[(here.index(self._spot_i) + 1) % len(here)]
                 self._nav.reset()
@@ -4117,27 +4194,14 @@ class CharFarmPage(QWidget):
                     f"巡邏點 {self._spot_i + 1} 沒怪 → 前往下一個"
                     f"（{scene.scene_name(self._scene)} 共 {len(here)} 點）")
                 return
-            # ★★ 走巡邏點交給 app/game/navigate.py：算不出直達路徑時會 360 度
-            #   找中繼點繞過去，而且**允許暫時走遠**（凹形地形非這樣不可）。
-            #   舊做法只沿著往目標的直線取點，實測會停在牆前面
-            #   「60 秒送 158 次指令、一格沒動」，而且一直顯示「直線可通」。
+            # ★★ 走巡邏點交給 app/game/navigate.py：它讀地形圖算最短路，
+            #   一個轉折點一個轉折點走過去（純讀記憶體，不問遊戲的尋路）。
             # ⚠ 它自己會判斷角色在不在走路、要不要重下指令，所以這裡**不要**
             #   再加 _moving / _walk_t 的節流，會互相打架。
             if not self._ensure_mover():
                 self.status.setText("⛔ 移動跳板沒裝上 → 不移動")
                 return
-            # ★ 這一段走通過就重播上次的路線（反方向自動倒過來用）。
-            #   從半路接上也行 —— Navigator 會從離自己最近的路線點開始走。
-            route = None
-            if self._leg_from is not None and self._leg_from != self._spot_i:
-                mk = scene.map_key(self._scene)
-                route = self._routes.get((mk, self._leg_from, self._spot_i))
-                if route is None:
-                    rev = self._routes.get((mk, self._spot_i, self._leg_from))
-                    if rev:
-                        route = list(reversed(rev))
-            note = self._nav.step(self.sc, self._mover, self.player, sx, sy,
-                                  route=route)
+            note = self._nav.step(self.sc, self._mover, self.player, sx, sy)
             if self._nav.stuck:
                 # ★ 真的到不了就換下一個點（舊版沒有這道，會站到天亮）
                 nxt = here[(here.index(self._spot_i) + 1) % len(here)]
@@ -4202,24 +4266,45 @@ class CharFarmPage(QWidget):
         if dist is not None and dist <= NO_PATH_NEED:
             self._path_pts, self._way, self._unreach = 1, [], 0
             self._line_clear = True
-        elif (self._path_t >= PATH_GAP and mp is not None and me
+        elif (self._path_t >= self._path_gap and mp is not None and me
                 and dist is not None):
             self._path_t = 0.0
+            plan_t0 = time.perf_counter()
             # ⚠ 地圖快取的身分檢查放在這裡、不要放在每一拍：它要讀列指標
             #   陣列（約 720 bytes）＋場景編號，一次約 0.07ms —— 心跳是
             #   10ms 一拍、五台分身，每拍都問等於每秒白花 35ms。
             grid = self._maps.get(self.sc)
             mtile = (int(me[0]), int(me[1]))
             ttile = (int(mp[0]), int(mp[1]))
-            if grid is not None and grid.clear_line(mtile, ttile):
+            # ★★★ 沒有地形圖時**什麼都不猜**（2026-08-10 使用者指定）：
+            #   不走直線、也**不再退回遊戲自己的尋路** —— 那條路只會沿著
+            #   「往目標的直線」取中繼點，遇到擋在中間的地形就是一路推著牆走
+            #   （使用者實拍：卡在牆邊直到周圍怪物重生）。
+            #   地形圖實測 5 台 4 張圖 150/150 次全讀得到，讀不到就是換圖那
+            #   一瞬間 —— 那一瞬間本來就不該走路。
+            self._no_grid = "" if grid is not None else (
+                self._maps.why or "讀不到地形圖")
+            if grid is None:
+                # ⚠ 這裡**不准動 _unreach**：那是「這隻怪走不到」的計數，
+                #   我們自己讀不到圖不能算在怪頭上（會把牠冷凍起來）。
+                self._path_pts, self._way = 0, []
+                self._line_clear = False
+            elif grid.clear_line(mtile, ttile):
                 self._path_pts, self._way, self._unreach = 1, [], 0
                 self._line_clear = True
-            elif grid is not None:
+            else:
                 self._line_clear = False
-                # 直線被擋 → 算一條繞過去的路。**上限是直線距離的 3 倍**：
-                # 繞這麼遠還到不了的怪本來就不該追，而且這道上限同時把
-                # 「走不到的目標」最壞的展開成本壓住（見 terrain.route）。
-                wp = grid.waypoints(mtile, ttile, max_cost=max(dist * 3.0, 30.0))
+                # 直線被擋 → 算一條繞過去的路。
+                # ⛔ **上限拿掉了**（原本是直線距離的 3 倍）。那道上限是
+                #   「卡在牆邊」的真正根因：繞路超過 3 倍就算不出來 → _way 空
+                #   → 走路退回遊戲的尋路 → 直線推牆。而地形複雜的地方
+                #   （沙漠的岩層、峽谷）繞 4~6 倍是常態。
+                #   ★ 不必怕慢：`_candidates` 已經先用連通區泛洪把「真的走不到」
+                #     的怪整批刷掉了，所以這裡的 A* 一定找得到路，成本跟路徑
+                #     長度成正比（實測整張圖最壞 12~19ms，一般 0.2~0.8ms）。
+                #     A* 最貴的情況是「走不到」要把整片展開完 —— 那個情況
+                #     在這裡已經不存在。
+                wp = grid.waypoints(mtile, ttile)
                 if wp:
                     self._path_pts = max(2, len(wp))
                     self._way = [(x + 0.5, y + 0.5) for x, y in wp]
@@ -4233,18 +4318,24 @@ class CharFarmPage(QWidget):
                     #   把那隻怪丟掉並加黑名單。症狀是一直換目標、跑來跑去
                     #   卻沒進帳（實測 3 分鐘裡 39% 的時間在空轉）。
                     self._unreach += 1
-            elif dist > NO_PATH_NEED:
-                # 讀不到地形圖（改版位移／還沒進場）→ 退回問遊戲的尋路，
-                # 而且**不敢自己走直線**（沒有可信的擋線判斷）。
-                self._line_clear = False
-            if grid is None and dist is not None and dist > NO_PATH_NEED and (
-                    self._mover is not None and self._mover.active):
-                n = self._mover.path_to(self.sc, mp[0], mp[1])
-                if n >= 0:             # -1 = 這次沒問到，保留上一次的判斷
-                    self._path_pts = n
-                    self._unreach = (self._unreach + 1) if n == 0 else 0
-                    self._way = (self._mover.read_path(self.sc, n)
-                                 if n > 1 else [])
+            # ★★ **重算節奏自我調節**（2026-08-10，跟著「拿掉繞路上限」一起加）。
+            #   拿掉上限之後，極遠的目標 A* 真的會變貴：實測整張圖最遠的可走格
+            #   （巨木梯道 337 格的路）要 48.6ms —— 每 0.2 秒重算一次、五台
+            #   一起跑就是把 GUI 執行緒吃掉（畫面凍住，見 [[qt-ui-pitfalls]]）。
+            #   規則：**這一次花了多久，就休息 PATH_BUDGET 倍**，也就是規劃
+            #   路徑最多只准佔 1/PATH_BUDGET 的時間。近距離（0.1~0.8ms）算完
+            #   仍然是 PATH_GAP 的節奏，完全沒變；只有超遠的目標會放慢到
+            #   最多 PATH_GAP_MAX 重算一次 —— 而那種距離下，一秒前算的路
+            #   跟現在算的幾乎一樣（我們也才走了幾格）。
+            self._path_gap = min(max(PATH_GAP,
+                                     (time.perf_counter() - plan_t0)
+                                     * PATH_BUDGET),
+                                 PATH_GAP_MAX)
+        # ⛔ 這裡以前還有一段「地形圖讀不到 → 改問遊戲的尋路（mover.path_to）」。
+        #    **整段刪掉了**（2026-08-10 使用者指定）。它是唯一還會把走路交回
+        #    遊戲的地方，而遊戲那條在 walk_route 裡是「沿直線取中繼點、
+        #    失敗就 ±40°/±70°」—— 凹地形一定推牆。現在沒有地形圖就不走路，
+        #    狀態列會寫原因（self._no_grid）。
         # ⚠ blocked 只決定「要走多近」，**不能拿來擋攻擊**。
         #   之前寫成 `in_range = … and not blocked`，結果隔著地形的怪就算已經
         #   走到牠臉上（實測 1.1 格）也永遠不送封包 —— 角色走過去然後發呆，
@@ -4324,18 +4415,21 @@ class CharFarmPage(QWidget):
                 else min(max(reach_keep - margin, move.MIN_GAP),
                          reach_keep - 0.5))
 
-        # ★ 尋路說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落，
-        #   我們走不過去、隔著地形也多半打不到，不必耗到 10 秒逾時。
-        # ⚠ 只在尋路射程內才算數：更遠時尋路本來就回 0（一次只算得出約
-        #   30~40 格），那是要接力走過去，不是到不了。
+        # ★ 地形圖說「到不了」→ 換一隻（使用者定的規則）：牠站在走不進去的角落
+        #   （水裡、圍起來的平台），我們走不過去、隔著地形也多半打不到。
+        # ⛔ 舊條件裡的 `dist <= PATHFIND_RANGE`（25 格）**拿掉了**。那道門檻是
+        #   為**遊戲的尋路**設的 —— 它一次只算得出約 30~40 格，更遠一律回 0，
+        #   那是「太遠要接力」不是「到不了」，所以不能當真。現在判定改成
+        #   我們自己的 A*（整張圖，沒有距離上限），算不出來就是**真的到不了**，
+        #   再拿距離去擋只會讓 25 格外走不到的怪永遠不被放棄 ——
+        #   那正是「一路走到牆邊卡著」的另一半原因（10 秒逾時前它會一直推牆）。
         # ⚠⚠ **已經打傷的怪絕不放棄**，而且要連續 UNREACH_HITS 次算不出來
         #   才算數 —— 怪會走動，打鬥中某一瞬間牠站到走不進去的格子，
         #   路徑就會變 0。少了這兩條會變成「打一下就換下一隻」，
         #   結果一路結仇、被圍毆致死（使用者實際遇到）。
         # ⚠ 貼在身上的**永遠不算走不到**：都走到牠旁邊了，還需要走去哪？
         if (self._unreach >= UNREACH_HITS and not self._hurt
-                and dist is not None
-                and NO_PATH_NEED < dist <= PATHFIND_RANGE):
+                and dist is not None and dist > NO_PATH_NEED):
             self._cool_unreach(m.eid)
             self._atk.hold_off()
             self._cur = None
@@ -4428,6 +4522,9 @@ class CharFarmPage(QWidget):
             self._why = "⚠ 沒開「自動走過去」"
         elif self._mover is None or not self._mover.active:
             self._why = "⚠ 移動跳板沒裝上"
+        elif self._no_grid:
+            # 沒有地形圖就不走路（不再交給遊戲的尋路撞牆）——大聲說出來。
+            self._why = f"⚠ {self._no_grid} → 這一拍不走位"
         elif not self._walked_ok:
             self._why = "⛔ 走不過去"
         elif blocked:
@@ -4494,6 +4591,11 @@ class CharFarmPage(QWidget):
         #   「15 秒沒進展」會把牠丟掉換一隻，換完又從頭等首發 ——
         #   變成**永遠不出手**的迴圈（見 [[frozen-tick-state-machines]]）。
         if waiting_opener:
+            self._stuck = 0.0
+        # ⚠ 讀不到地形圖的那幾拍也要凍住：那時我們**故意不走路**，
+        #   不能把自己的讀取失敗算成「這隻怪走不過去」而把牠冷凍起來
+        #   （見 [[frozen-tick-state-machines]]：別讓保險機制去罰無辜的目標）。
+        if self._no_grid:
             self._stuck = 0.0
         # ★★ 還沒打傷牠之前，冒出更近的怪就改打那隻（使用者要求）。
         #   放在 15 秒耐心之前：能換就換，不必等它逾時。

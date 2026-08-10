@@ -75,16 +75,11 @@ MIN_GAP = 1.4
 # 維持距離的容差：離目標在 [keep-SLACK, keep] 之間就當作已經站好，不再微調。
 # 沒有它的話每一拍都會推一小步，看起來就是抖動。
 SLACK = 0.4
-# 這段算不出來就縮短再試（由遠到近）
-PATH_TRY = (28.0, 18.0, 10.0, 5.0)
-# ★ 直線方向被牆擋住時，換角度找繞路。
-# 為什麼需要：中繼點全部取在「往目標的直線」上，那個方向有牆的話會全部算不出來，
-# 角色就停在牆邊不動 —— 使用者回報「沒怪物回原點怎麼沒有計算路徑」。
-# 實測（黑狐，原點在 195 格外）：直線 28/18 格算不出，但 −40°/−60° 的 20 格
-# 都算得出 3 點路徑，也就是繞得過去，只是我們沒去試。
-# 角度控制在 ±70° 以內，這樣繞路仍然會朝目標前進（cos70° ≈ 0.34）。
-DETOUR_TRY = ((20.0, -40), (20.0, 40), (20.0, -70), (20.0, 70),
-              (12.0, -40), (12.0, 40))
+# ⛔ PATH_TRY／DETOUR_TRY（沿直線取中繼點、再 ±40°/±70° 換角度試）已刪除，
+#   2026-08-10。那是還沒有地形圖的年代留下的猜測式繞路：中繼點取在往目標的
+#   直線上，隔著岩層時每一個都在牆裡，於是角色一路推牆（使用者實拍「卡在
+#   牆邊直到周圍怪物重生」）。現在繞路一律由 app/game/terrain.py 的 A* 算好
+#   再用 `points=` 傳進來 —— 那是真正的最短路，而且純讀記憶體。
 
 # --- 尋路要的 this ----------------------------------------------------------
 # ⚠⚠ **不是**我們用 VT_PLAYER 掃到的那個位址，而是**它 −8**。
@@ -683,37 +678,20 @@ class Mover:
                     WAYPOINTS, ecx=this, timeout=0.15)
                 return v if (v and 0 < v <= MAX_POINTS) else 0
 
+            # ⛔⛔ 「算不出來就沿直線取 28/18/10/5 格的中繼點，再 ±40°/±70°
+            #   亂試」那一整段**刪掉了**（2026-08-10 使用者指定）。
+            #   它是「卡在牆邊直到怪重生」的直接來源：中繼點全部取在
+            #   **往目標的直線**上，目標與我之間隔著岩層時每一個中繼點都在
+            #   牆裡，尋路回 0；好不容易試到一個算得出來的，方向也是朝著牆
+            #   —— 角色就一路推著牆。
+            #   現在走路一律用**我們自己讀地形圖算出來的路**（points=），
+            #   這條沒有 points 的路只剩「一次就要算得出來」的短程用途，
+            #   算不出來就回 0 讓呼叫端換目標。
             n = path(tile_x, tile_y)
-            short = stop_short
             if not n:
-                # 目標超出尋路一次算得出的範圍（實測約 28~40 格）→ 走中繼點
-                # 接力，呼叫端下一拍再下一次就能走很遠。
-                # ⚠ 直線方向整條算不出來 = 那個方向有牆，換角度繞。
-                dx, dy = tile_x - cx, tile_y - cy
-                full = math.hypot(dx, dy) or 1.0
-                for hop in PATH_TRY:
-                    if hop < full:
-                        n = path(cx + dx / full * hop, cy + dy / full * hop)
-                        if n:
-                            break
-                if not n:
-                    ang = math.atan2(dy, dx)
-                    for hop, deg in DETOUR_TRY:
-                        if hop >= full:
-                            continue
-                        a = ang + math.radians(deg)
-                        px, py = cx + math.cos(a) * hop, cy + math.sin(a) * hop
-                        if math.hypot(tile_x - px, tile_y - py) >= full:
-                            continue      # 繞過去反而更遠，不要
-                        n = path(px, py)
-                        if n:
-                            break
-                if not n:
-                    return 0
-                short = 0.0               # 中繼點本身就要走到底
-
+                return 0
             pts = self.read_path(scanner, n)
-            gx, gy = _approach_point((cx, cy), pts, short) or pts[-1]
+            gx, gy = _approach_point((cx, cy), pts, stop_short) or pts[-1]
             self.call(WALK_FN, this, wx, wy,
                       int(gx * entity.TILE_UNITS) & 0xFFFF,
                       int(gy * entity.TILE_UNITS) & 0xFFFF, 0)
