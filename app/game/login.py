@@ -168,6 +168,9 @@ ITEM_SELECTED = 6           # 項目物件 +6：非 0 = 被選中
 #     2（雅典娜）完全吻合。
 
 # 伺服器記錄的版面（見檔頭）
+# ★ SRV_BEGIN 與 SRV_STRIDE 由 locate.SIGS 自動定位（錨在遊戲自己的
+#   `imul esi,[伺服器索引],0x178` / `mov edx,[ecx+0x500]` 那道）；下面的值只是
+#   還沒 warm()／定位失敗時的退路。SRV_END 固定是 BEGIN+4（vector 的 end 指標）。
 SRV_BEGIN = 0x500
 SRV_END = 0x504
 SRV_STRIDE = 0x178

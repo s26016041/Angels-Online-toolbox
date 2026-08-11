@@ -50,12 +50,20 @@ ADDR_LO, ADDR_HI = 0x400000, 0xA00000
 NOT_ADDR = ("MAX_", "MIN_", "LIMIT_", "CAP_", "THRESHOLD_")
 ADDR_ALLOW = {("injector", "CODE_LO"), ("injector", "CODE_HI")}
 
-# 偏移常數的名字長什麼樣（AST 掃出來之後再過這個篩）
-OFF_NAME = re.compile(r"(^OFF_|_OFF$|_OFF_|STRIDE|^VT_OFF|^ITEM_)")
-# ⚠ `SCRATCH_OFF` 是**我們自己注入的暫存區**裡的位置（`mover.scratch()+這個`），
-#   不是遊戲的結構偏移 —— 遊戲改版跟它一點關係都沒有。第一版把 4 個算成
-#   「沒保護」，是假債。
-NOT_GAME_OFF = ("SCRATCH",)
+# ⚠⚠ 偏移**不一定叫 OFF_***：`SRV_BEGIN`、`M_ID`、`OBJ_UI_MGR`、`PENDING_OFF`
+#   都是結構偏移。第一版用名字白名單（`^OFF_|STRIDE|…`）去撈，`SRV_BEGIN`
+#   整個沒被看到 —— 盲點比錯誤更難發現，因為報告上什麼都沒有。
+#   現在改成**先全收 app/game 的模組層整數常數，再明列排除了什麼**，
+#   排除清單也印進報告，讓「不算偏移」這個判斷本身可以被檢查。
+NOT_GAME_OFF = (
+    "SCRATCH",          # 我們自己注入的暫存區，跟遊戲無關
+    "TIMEOUT", "_MS", "MS_", "_SEC", "TRIES", "RETRY", "INTERVAL", "SETTLE",
+    "SPAN", "MAX", "MIN", "LIMIT", "CAP_", "NAME_MAX", "COUNT", "PAGES",
+    "SLOTS", "SIZE", "VK_", "KIND_", "BIT_", "RUN_", "TILE", "FULL",
+)
+# 這些模組不是「跟遊戲要資料」的層，裡面的數字是我們自己的設定
+SKIP_MODULES = ("locate", "aob", "signatures", "navigate", "watcher",
+                "itemname", "items", "skills", "tablestamp")
 
 # 寫死的遊戲資料清單。第三欄＝遊戲記憶體裡有沒有同一份資料（41 張表的表名，
 # 或 None）。⚠ 新增寫死表時要一起加進來，不然這支就漏掉它了。
@@ -95,9 +103,52 @@ except Exception:                                          # noqa: BLE001
 
 
 # ---------------------------------------------------------------------------
+def _const_of(node):
+    """`X = 0x10` 與 `X = -0x50` 都要抓得到（負偏移是 UnaryOp，不是 Constant）。
+
+    ⚠ 第一版漏掉負的 —— `player.OFF_LAST_SKILL = -0x50` 就這樣不在清單裡，
+      而它一樣會隨改版搬家。
+    """
+    v = node.value
+    if isinstance(v, ast.Constant) and isinstance(v.value, int):
+        return v.value
+    if (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub)
+            and isinstance(v.operand, ast.Constant)
+            and isinstance(v.operand.value, int)):
+        return -v.operand.value
+    return None
+
+
+def _justified(path: str, lineno: int) -> bool:
+    """這個常數上面有沒有**說明為什麼不能更好**的註解？
+
+    使用者的規矩是「一律用特徵搜尋，**除非真的無法或有更好的方式**」——
+    那個「除非」必須寫下來。沒寫理由的例外就是債，不是設計。
+    往上找連續的註解行（跳過空行），看有沒有交代限制的字眼。
+    """
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return False
+    words = ("⚠", "⛔", "★", "不能", "無法", "沒辦法", "只能", "沒有更好",
+             "改版", "會壞", "出處", "反組譯", "實測", "驗證")
+    i = lineno - 2                       # lineno 是 1 起算，-2 = 上面那行
+    seen = []
+    while i >= 0 and len(seen) < 8:
+        s = lines[i].strip()
+        if not s:
+            i -= 1
+            continue
+        if not s.startswith("#"):
+            break
+        seen.append(s)
+        i -= 1
+    return any(w in s for s in seen for w in words)
+
+
 def scan_consts():
-    """掃出 (位址常數, 偏移常數) 兩份清單。"""
-    addrs, offs = [], []
+    """掃出 (位址常數, 偏移常數, 函式內裸數字, 被排除的) 四份清單。"""
+    addrs, offs, inline, skipped = [], [], [], []
     app = os.path.join(ROOT, "app")
     for dirpath, _d, files in os.walk(app):
         for fn in files:
@@ -110,21 +161,36 @@ def scan_consts():
             except SyntaxError:
                 continue
             for node in tree.body:
-                if not (isinstance(node, ast.Assign)
-                        and isinstance(node.value, ast.Constant)
-                        and isinstance(node.value.value, int)):
+                if not isinstance(node, ast.Assign):
                     continue
-                v = node.value.value
+                v = _const_of(node)
+                if v is None:
+                    continue
                 for t in node.targets:
                     if not isinstance(t, ast.Name):
                         continue
-                    where = f"{os.path.relpath(path, ROOT)}:{node.lineno}"
+                    rel = os.path.relpath(path, ROOT)
+                    where = f"{rel}:{node.lineno}"
+                    why = _justified(path, node.lineno)
                     if ADDR_LO <= v < ADDR_HI and not t.id.startswith(NOT_ADDR):
-                        addrs.append((mod, t.id, v, where))
-                    elif (0 < v < 0x400000 and OFF_NAME.search(t.id)
-                          and not any(k in t.id for k in NOT_GAME_OFF)):
-                        offs.append((mod, t.id, v, where))
-    return addrs, offs
+                        addrs.append((mod, t.id, v, where, why))
+                    elif not (0 < abs(v) < 0x400000):
+                        continue
+                    elif "game" not in dirpath or mod in SKIP_MODULES:
+                        continue          # 只看 app/game 這層跟遊戲要資料的
+                    elif any(k in t.id for k in NOT_GAME_OFF):
+                        skipped.append(f"{mod}.{t.id} = {v:#x}   {where}")
+                    else:
+                        offs.append((mod, t.id, v, where, why))
+            # 函式內直接寫的 `+ 0x2FC` —— 這種連名字都沒有，最難維護
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+                        and isinstance(node.right, ast.Constant)
+                        and isinstance(node.right.value, int)
+                        and 0x20 <= node.right.value < 0x400000):
+                    inline.append((mod, node.right.value,
+                                   f"{os.path.relpath(path, ROOT)}:{node.lineno}"))
+    return addrs, offs, inline, skipped
 
 
 def offsets_with_invariant() -> list[tuple[str, str]]:
@@ -164,6 +230,42 @@ def has_invariant(mod: str, name: str, cov: list[tuple[str, str]]) -> bool:
     return any(m == mod and (name == p or (p.endswith("_")
                                            and name.startswith(p)))
                for m, p in cov)
+
+
+# 「怎麼跟遊戲要資料」的手段，由穩到脆。key = 在原始碼裡找得到的樣子。
+# ★ 這一段回答的是使用者問的「還有哪裡沒有用特徵搜尋或更好的方式」——
+#   常數盤點只看得到位址與偏移，看不到「這個功能是用全掃找的」這種事。
+MEANS = (
+    ("指標路徑／AOB", r"locate\.warm|\.MGR_PTR|locate\.located", "最穩"),
+    ("全記憶體掃描", r"_iter_regions|_read_region\(|aob\.scan\(", "慢＋會誤中；有指標路徑就別用"),
+    ("vtable 掃描", r"_scan_vtables?\(", "比全掃準，但仍是掃描"),
+    ("視窗標題", r"GetWindowTextW|w\.title|\.title\b", "遊戲改標題就壞；分流／帳號目前只有這條"),
+    # ⚠ 別只比對字面路徑：實際寫法是 `resource(RANGE_FILE)`，第一版的
+    #   `resource("assets/` 一個都沒中 → 報告顯示 0 檔，又是一個假數字。
+    ("讀 assets 檔", r"resource\(|assets/", "資源包抄本，改版會安靜過期"),
+    ("呼叫 Lua", r"lua\.(call|getfield|pcall)", "會跟遊戲自己的 Lua 搶堆疊"),
+)
+
+
+def scan_means() -> dict[str, list[str]]:
+    """每種手段出現在哪些檔案（只掃 app/，不含 tools/）。"""
+    out: dict[str, list[str]] = {k: [] for k, _p, _w in MEANS}
+    app = os.path.join(ROOT, "app")
+    for dirpath, _d, files in os.walk(app):
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                src = open(path, encoding="utf-8").read()
+            except OSError:
+                continue
+            rel = os.path.relpath(path, ROOT)
+            for name, pat, _why in MEANS:
+                n = len(re.findall(pat, src))
+                if n:
+                    out[name].append(f"{rel}({n})")
+    return out
 
 
 def call_conv(img: bytes, base: int) -> dict[str, str]:
@@ -220,7 +322,7 @@ def main() -> int:
         print("⛔ 讀不到映像。")
         return 2
 
-    addrs, offs = scan_consts()
+    addrs, offs, inline, skipped = scan_consts()
     sig_addr = {(s.module, s.attr) for s in locate.SIGS if s.kind != "off"}
     sig_off = {(s.module, s.attr) for s in locate.SIGS if s.kind == "off"}
     inv = offsets_with_invariant()
@@ -229,25 +331,84 @@ def main() -> int:
     bad_addr = [a for a in addrs
                 if (a[0], a[1]) not in sig_addr and (a[0], a[1]) not in ADDR_ALLOW]
     lines.append(f"  共 {len(addrs)} 個，沒有特徵的 {len(bad_addr)} 個")
-    for mod, name, v, where in bad_addr:
+    for mod, name, v, where, _why in bad_addr:
         lines.append(f"  ⚠ {mod}.{name} = {v:#x}   {where}")
 
+    # ⚠ 偏移 vs 代碼／列舉分不出來的話，報告會一直吵。用一條**寫在報告裡、
+    #   可以被質疑**的粗規則分桶：值 >= 0x20 當疑似結構偏移，否則當代碼／列舉
+    #   （`attack.SELECT_CODE = 0xC`、`bag.GRADE_FINE = 3` 那種）。
+    #   代碼不會因為「物件版面搬家」而錯，只有官方重新定義才會 —— 那種
+    #   AOB 也救不了，只能靠實測。⚠ 這條規則會誤判（`DOLL_WORN_LAST = 0xF9`
+    #   是格號不是偏移），所以真正的訊號是「有沒有寫理由」那一欄。
+    def _is_offset(name: str, v: int) -> bool:
+        # 名字比數值可靠：`OFF_`/`TMPL_`/`SRV_`/`M_`/`OBJ_` 開頭、或 `_OFF`
+        # 結尾、含 STRIDE 的一律當偏移（`entity.OFF_ID` 是偏移不是編號）；
+        # 含 CODE/SLOT/GRADE/_TYPE/_ITEM/_ID 的當代碼或編號
+        # （`channel.SWITCH_CODE = 0x47` 是封包代碼，跟版面無關）；
+        # 都不像就退回看值大小。
+        if re.match(r"^(OFF_|TMPL_|SRV_|M_|OBJ_|VT_OFF|MEMBERS_|PENDING_)", name) \
+                or name.endswith("_OFF") or "STRIDE" in name:
+            return True
+        if re.search(r"(CODE|SLOT|GRADE|_TYPE$|_ITEM|_ID$|_LAST$|_FIRST$)", name):
+            return False
+        return abs(v) >= 0x20
+
+    codes = [r for r in offs if not _is_offset(r[1], r[2])]
+    offs = [r for r in offs if _is_offset(r[1], r[2])]
+
     lines += ["", "=== ② 結構偏移（改版真的會搬家）==="]
-    auto, loud, silent = [], [], []
-    for mod, name, v, where in offs:
+    auto, loud, silent, silent_nowhy = [], [], [], []
+    for mod, name, v, where, why in offs:
         key = f"{mod}.{name}"
         if (mod, name) in sig_off:
             auto.append((key, v, where))
         elif has_invariant(mod, name, inv):
             loud.append((key, v, where))
-        else:
+        elif why:
             silent.append((key, v, where))
+        else:
+            silent_nowhy.append((key, v, where))
     lines.append(f"  共 {len(offs)} 個：AOB 自動跟上 {len(auto)}、"
-                 f"有不變量會大聲 {len(loud)}、**兩者都沒有 {len(silent)}**")
-    for tag, group in (("✅ AOB", auto), ("🟡 不變量", loud), ("⚠ 沒保護", silent)):
+                 f"有不變量會大聲 {len(loud)}、只有註明理由 {len(silent)}、"
+                 f"**連理由都沒寫 {len(silent_nowhy)}**")
+    lines.append("  ⚠ 「有沒有理由」只看**緊貼在常數上面**的註解 —— 寫在模組"
+                 "檔頭或更上面的區塊註解看不到，所以這一格會**高估**。")
+    lines.append("    這是刻意的：理由要寫在用的人一眼看得到的地方才有用。")
+    for tag, group in (("✅ AOB 自動跟上", auto), ("🟡 有不變量會大聲", loud),
+                       ("△ 沒保護但有註明為什麼", silent),
+                       ("⚠ 沒保護、也沒寫理由", silent_nowhy)):
         lines.append(f"  --- {tag} ---")
         for key, v, where in sorted(group):
             lines.append(f"    {key} = {v:#x}   {where}")
+
+    nowhy_code = [r for r in codes if not r[4]]
+    lines += ["", "=== ②d 代碼／列舉（值 < 0x20；版面搬家不會影響它們）===",
+              f"  共 {len(codes)} 個，其中 {len(nowhy_code)} 個沒寫出處／理由",
+              "  ⚠ 這種 AOB 救不了（不是位址也不是偏移），只有官方重新定義才會錯，",
+              "    要靠動作層實測才抓得到 —— 但**出處一定要寫**（反組譯哪一段來的）。"]
+    for mod, name, v, where, why in sorted(codes):
+        lines.append(f"    {'  ' if why else '⚠ '}{mod}.{name} = {v:#x}   {where}")
+
+    lines += ["", "=== ②a 判定成「不是遊戲結構偏移」而排除的 ===",
+              "  （排除規則本身也要能被檢查 —— 看到不該排的就改 NOT_GAME_OFF）"]
+    for s in sorted(skipped):
+        lines.append(f"    {s}")
+
+    lines += ["", "=== ②b 函式內的裸數字（連名字都沒有，最難維護）==="]
+    lines.append(f"  共 {len(inline)} 處")
+    byfile: dict[str, int] = {}
+    for _mod, _v, where in inline:
+        byfile[where.split(":")[0]] = byfile.get(where.split(":")[0], 0) + 1
+    for f, n in sorted(byfile.items(), key=lambda kv: -kv[1]):
+        lines.append(f"    {f:<34} {n} 處")
+
+    lines += ["", "=== ②c 怎麼跟遊戲要資料（由穩到脆）==="]
+    means = scan_means()
+    for name, _pat, why in MEANS:
+        hits = means.get(name) or []
+        lines.append(f"  {name}（{why}）：{len(hits)} 個檔")
+        for h in hits:
+            lines.append(f"    {h}")
 
     lines += ["", "=== ③ 寫死的遊戲資料（記憶體有沒有同一份？）==="]
     can_move = [r for r in HARDCODED_DATA if r[2]]
@@ -289,21 +450,28 @@ def main() -> int:
     open(REPORT, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
     print(f"① 位址　　{len(addrs)} 個，沒有特徵 {len(bad_addr)} 個")
-    for mod, name, v, where in bad_addr:
+    for mod, name, v, where, _why in bad_addr:
         print(f"   ⚠ {mod}.{name} = {v:#x}  {where}")
     print(f"② 偏移　　{len(offs)} 個：AOB {len(auto)}、不變量 {len(loud)}、"
-          f"沒保護 {len(silent)}")
-    for key, v, where in sorted(silent)[:12]:
+          f"有理由沒保護 {len(silent)}、**連理由都沒寫 {len(silent_nowhy)}**")
+    for key, v, where in sorted(silent_nowhy)[:12]:
         print(f"   ⚠ {key} = {v:#x}  {where}")
-    if len(silent) > 12:
-        print(f"   …還有 {len(silent) - 12} 個，看報告")
+    if len(silent_nowhy) > 12:
+        print(f"   …還有 {len(silent_nowhy) - 12} 個，看報告")
+    print(f"②d 代碼／列舉 {len(codes)} 個（值<0x20，AOB 救不了），"
+          f"沒寫出處 {len(nowhy_code)} 個")
+    print(f"②b 函式內裸數字 {len(inline)} 處")
+    print("②c 取得資料的手段："
+          + "、".join(f"{k} {len(v)} 檔" for k, v in means.items() if v))
     print(f"③ 寫死資料 {len(HARDCODED_DATA)} 份，其中 {len(can_move)} 份"
           "記憶體裡有對應的表（★ 可以改成現場讀）")
     print(f"④ 呼叫版面 {len(conv)} 支"
           + ("（第一次跑，已建立基準）" if not old
              else f"，變了 {len(changed)} 支"))
     print(f"\n報告：{REPORT}")
-    return 1 if (bad_addr or changed) else 0
+    # 「連理由都沒寫」也算不過 —— 使用者的規矩是「一律用特徵，除非真的無法或
+    # 有更好的方式」，那個「除非」沒寫下來就不算例外，是債。
+    return 1 if (bad_addr or changed or silent_nowhy) else 0
 
 
 if __name__ == "__main__":
