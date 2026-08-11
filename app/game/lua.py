@@ -39,7 +39,7 @@ import struct
 # ⚠ 這三個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 GETFIELD_FN = 0x006A4290     # lua_getfield(L, idx, k)
 PCALL_FN = 0x006A4740        # lua_pcall(L, nargs, nresults, errfunc)
-CTX_PTR = 0x00891010         # [CTX_PTR] + 8 = lua_State
+CTX_PTR = 0x00890FF0         # [CTX_PTR] + 8 = lua_State
 
 GLOBALSINDEX = 0xFFFFD8EE    # -10002
 TOPINDEX = 0xFFFFFFFF        # -1（堆疊頂）

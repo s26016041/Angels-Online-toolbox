@@ -128,6 +128,7 @@ import struct
 import subprocess
 
 from app.core.memory import VALUE_TYPES
+from app.game import locate
 
 GAME_EXE = "angel.dat"      # 遊戲本體（副檔名不是 exe，但就是個一般執行檔）
 
@@ -454,8 +455,13 @@ def skip_eula(scanner) -> bool:
       實測遊戲啟動後約 13 秒才會檢查，第 1 秒就寫得進去，非常寬裕。
 
     ⚠ 只有一個 byte，而且遊戲自己看完合約也是寫同一個值，重複寫沒有副作用。
+    ⚠⚠ **除非 AOB 這一輪真的定位到 EULA_OK，否則什麼都不做**（見
+      `locate.located()`）。2026-08-11 實際踩到：沒先 `warm()` 就叫這支，
+      拿舊版的 0x890FFC 去寫 1 —— 那個位址在新版落在 Lua 全域區，登入畫面的
+      UI 當場壞掉（分流清單點了不動），而症狀跟位址一點關係都看不出來。
+      `data` 類定位失敗是**保留舊值**的，所以「有值」不等於「驗過」。
     """
-    if not EULA_OK:
+    if not EULA_OK or not locate.located("login", "EULA_OK"):
         return False
     try:
         scanner.write_value(EULA_OK, VALUE_TYPES["int8"], 1)
@@ -516,6 +522,21 @@ def find_screen(scanner) -> int | None:
     return None
 
 
+def _writable(*attrs: str) -> str:
+    """要寫的那些全域，這一輪 AOB 真的定位到了嗎？沒有就回一句話擋下來。
+
+    ⚠⚠ **寫入前必問。** `data` 類定位失敗是「保留舊值」——那對讀取是對的
+      取捨（讀錯只會讀不到，讀取端都有驗證），但**寫**進舊位址等於拿 1 去砸
+      新版遊戲裡不相干的記憶體。2026-08-11 實際踩到一次（見 `skip_eula`
+      的註記），症狀完全看不出跟位址有關。
+    """
+    bad = [a for a in attrs if not locate.located("login", a)]
+    if bad:
+        return ("遊戲位址還沒驗證過（" + "、".join(bad) +
+                "）—— 可能是改版讓特徵失效了，先跑 py tools\\patch_doctor.py。")
+    return ""
+
+
 def sign_in(mover, scanner, account: str, password: str,
             server_index: int | None = None) -> str:
     """帳密登入。成功回空字串，失敗回一句「為什麼不行」。
@@ -530,6 +551,9 @@ def sign_in(mover, scanner, account: str, password: str,
         return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
     if not account or not password:
         return "請先填帳號與密碼。"
+    err = _writable("ACCOUNT", "PASSWORD", "FLAG_TOKEN", "FLAG_BLOB")
+    if err:
+        return err
     obj = find_screen(scanner)
     if obj is None:
         return "找不到登入畫面 —— 這台分身可能已經進遊戲了。"
@@ -573,7 +597,7 @@ def pick_channel(mover, scanner, channel: int) -> str:
     """
     if not (mover and mover.active):
         return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
-    err = _check_channel(scanner, channel)
+    err = _check_channel(scanner, channel) or _writable("CHANNEL")
     if err:
         return err
     obj = find_screen(scanner)
@@ -613,7 +637,8 @@ def enter_game(mover, scanner, slot: int, channel: int,
         return "跳板還沒裝好（遊戲剛開或被防毒擋住）。"
     if slot < 0:
         return "角色格號不對。"
-    err = _check_channel(scanner, channel)
+    err = _check_channel(scanner, channel) or _writable(
+        "CHANNEL", "CHAR_SLOT", *(("PROTECT_HASH",) if protect else ()))
     if err:
         return err
     if not _u32(scanner, CONN_ID):

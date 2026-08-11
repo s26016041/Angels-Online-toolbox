@@ -56,9 +56,10 @@ import struct
 
 from app.game import skills
 
-# ⚠ 遊戲改版會位移；locate.py 有 AOB 特徵（錨在查表本體的 0x61A7／0x61A9
-#   邊界值與錯誤訊息編號）會自動跟上。
-TABLE_PTR = 0x0098BCB0
+# ⚠ 遊戲改版會位移；locate.py 有 AOB 特徵會自動跟上 —— 錨是查表函式尾巴
+#   `push "Magic"` 那個**字串內容**（模組裡 28 支查表函式長得一模一樣，
+#   連邊界值 0x61A7 都被自動遮罩吃掉，只有字串分得出來）。
+TABLE_PTR = 0x0098BC90
 MAX_SKILL_ID = 0x61A8         # 查表本體的邊界：(id-1) <= 0x61A7
 
 # --- 技能範本的欄位（magic.xml 解析器抄來的，見上面）---

@@ -281,7 +281,13 @@ def set_run(mover, scanner, on: bool) -> tuple[bool, object]:
       重開面板就會對。這是刻意的取捨 —— 顯示不同步只是看起來怪，
       去戳它卻會讓遊戲崩潰。
     """
-    from app.game import quickbar          # 取最新值，見檔頭 ROBOT_READY_OFF 註記
+    from app.game import locate, quickbar  # 取最新值，見檔頭 ROBOT_READY_OFF 註記
+
+    # ⚠⚠ 寫全域之前先確認這一輪 AOB 真的定位到它。定位失敗時 data 類是**保留
+    #   舊值**的，拿舊位址去寫 = 砸新版遊戲裡不相干的記憶體（2026-08-11 用
+    #   舊的 login.EULA_OK 寫壞登入畫面 Lua UI，實際踩過）。
+    if not locate.located("robot", "RUN_FLAG"):
+        return False, "遊戲位址還沒驗證過（改版？）—— 先跑 tools/patch_doctor.py"
     mgr = _u32(scanner, quickbar.MGR_PTR)
     ready = scanner._read_bytes(mgr + ROBOT_READY_OFF, 1) if mgr else None
     if not ready or not ready[0]:

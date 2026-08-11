@@ -157,9 +157,16 @@ SIGS: tuple[Sig, ...] = (
         "55 8B EC 8B 45 14 83 EC 08 57 8B 7D 08 85 C0 75 04 33 D2 EB 0F"
         " 50 57 E8 ?? ?? ?? ?? 8B D0 83 C4",
         0x006A4740),
+    # Lua 狀態的全域（`[CTX_PTR]+8` = lua_State）。
+    # ⚠ 這段的指令骨架**完全不獨特** —— 全遮之後 445 個命中（`mov ecx,[全域] /
+    #   push 字串 / lea ecx,[ecx+4] / call` 是叫 Lua 函式的固定慣用碼，滿地都是）。
+    #   以前只有「只遮目標」那層唯一，而那層拿舊位址當錨 —— 位址一移就沒了，
+    #   跟 2026-08-11 弄壞自動登入的 VT_LOGIN 是同一種病（`patch_doctor` 抓到的）。
+    # ★ 改錨在後面 push 的**字串內容** `UpdateEquipPetNew`：445 → 1，
+    #   而且模擬改版也定位得回來。
     Sig("lua", "CTX_PTR", "data", 2,
-        "8B 0D 10 10 89 00 68 C4 3D 7D 00 8D 49 04 E8 ?? ?? ?? ??",
-        0x00891010),
+        "8B 0D F0 0F 89 00 68 C4 3D 7D 00 8D 49 04 E8 ?? ?? ?? ??",
+        0x00890FF0, str_at=7, str_val=b"UpdateEquipPetNew"),
     Sig("robot", "RUN_FLAG", "data", 2,
         "C7 05 A4 FB 9C 00 FF FF FF FF C3 C7 05 A4 FB 9C 00 00 00 00 00 C3",
         0x009CFBA4),
@@ -253,14 +260,20 @@ SIGS: tuple[Sig, ...] = (
         " 68 C0 29 7D 00",
         0x0098BC68, as_rva=True, str_at=58, str_val=b"Npc"),
     # 技能範本表（[這裡]+技能ID*4 → 範本；見 app/game/skillcost.py）。
-    # ⚠ 跟怪物表是**同一種**查表函式（模組裡有 28 支長得一模一樣），但這一支
-    #   的邊界值 0x61A7 與錯誤訊息編號 0x61A9 是它自己的 —— 所以表位址本身
-    #   可以交給 _auto_mask 遮掉（monsters 那段是靠字串內容分辨的，見上面）。
+    # ⚠ 跟怪物表是**同一種**查表函式（模組裡 28 支長得一模一樣）。以前以為
+    #   「邊界值 0x61A7 與錯誤訊息編號 0x61A9 是它自己的、可以當錨」——
+    #   **錯了**：`_auto_mask` 會把 `F9 A7 61 00`(=0x61A7F9) 與 `68 A9 61 00`
+    #   (=0x61A968) 當成模組內位址遮掉，全遮之後那兩個常數根本不在特徵裡，
+    #   28 支又撞成一團。它一直是靠「只遮目標」那層才唯一的（＝拿舊位址當錨，
+    #   改版必失效）。2026-08-11 `patch_doctor` 抓到的預防性項目。
+    # ★ 跟 monsters 一樣改用**字串內容**當錨：`Magic`（怪物表那支是 `Npc`）。
+    #   28 → 1，模擬改版也定位得回來。
     Sig("skillcost", "TABLE_PTR", "data", 16,
         "56 8B 75 08 8D 4E FF 81 F9 A7 61 00 00 77 0A"
-        " A1 B0 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
-        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 A9 61 00 00 56",
-        0x0098BCB0),
+        " A1 90 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 A9 61 00 00 56"
+        " 68 74 29 7D 00",
+        0x0098BC90, str_at=58, str_val=b"Magic"),
     Sig("move", "WAYPOINTS", "data", 1,
         "68 84 66 9B 00 FF 75 0C 8B C8 FF 75 08 E8 ?? ?? ?? ?? 33 C9 85 C0 0F 9F C1",
         0x009B6684),
@@ -624,6 +637,23 @@ def failed(report=None) -> list[str]:
         return ["（定位還沒執行過 —— 讀不到遊戲模組，全部位址未經驗證）"]
     rep = _report if report is None else report
     return [n for n, _, new in rep if new is None]
+
+
+def located(module: str, attr: str) -> bool:
+    """這一段這次真的定位成功了嗎？（沒掃過、或那段失敗 → False）
+
+    ⚠⚠ **要寫進遊戲記憶體的全域，寫之前一定要問這個。**
+    讀錯位址頂多讀到垃圾（讀取端都有驗證擋著）；**寫錯位址是直接破壞遊戲的
+    記憶體**。2026-08-11 實際踩到：一支沒先 `warm()` 的腳本拿舊版的
+    `login.EULA_OK`（0x890FFC）去寫 1，而那裡在新版落在 Lua 全域區
+    （新的 `lua.CTX_PTR` 就是 0x890FF0）—— 登入畫面的 Lua UI 當場壞掉，
+    分流清單點下去不動，症狀跟位址完全扯不上關係。
+
+    `data` 類定位失敗會**保留舊值**（那對讀取是對的取捨），所以「值看起來
+    正常」完全不代表它有被驗證過 —— 只能問這裡。
+    """
+    name = f"{module}.{attr}"
+    return any(n == name and new is not None for n, _old, new in _report)
 
 
 def image_identity() -> tuple[int, int] | None:
