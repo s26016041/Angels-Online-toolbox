@@ -94,11 +94,19 @@ def switch(mover, channel: int, max_channel: int = FALLBACK_MAX) -> bool:
 # ⚠ +0x54 與 +0x5C **兩格都是 5**，三台伺服器都一樣，所以分不出哪一格才是
 #   「分流」。因此 `count()` 兩格都讀、**要求兩格一致**才採用 ——
 #   哪天版面變了或兩格意義分岔，我們會得到 None（不換頻道），而不是一個錯的數字。
-OFF_IP = 0x40
-OFF_PORT = 0x50
-OFF_SUBSET_A = 0x54
-OFF_ID = 0x58
-OFF_SUBSET_B = 0x5C
+#
+# ⚠⚠ **版面不要在這裡再寫一份** —— `app/game/login.py` 的 `SRV_*` 是同一個
+#   結構（那邊還有 AOB 錨：遊戲自己的 `imul esi,[伺服器索引],0x178` /
+#   `cmp [edx+esi+0x5C],0` 一次給出 stride 與分流欄）。以前這裡有自己的
+#   OFF_IP/OFF_PORT/… 五個常數，等於同一個版面兩份 —— 改版時 login 那份會
+#   被人維護、這份不會，而且**不會有任何警告**。現在直接借用。
+from app.game.login import (SRV_ID as OFF_ID,               # noqa: E402
+                            SRV_NAME as _SRV_NAME,          # noqa: F401
+                            SRV_PORT as OFF_PORT,
+                            SRV_SUBSET_A as OFF_SUBSET_A,
+                            SRV_SUBSET_B as OFF_SUBSET_B)
+
+OFF_IP = 0x40             # login.py 沒有用到這欄（那邊靠索引直接取記錄）
 REC_SPAN = 0x60           # 讀到 +0x5C 就夠了
 MAX_SUBSET = 32           # 合理性上限：分流數不可能比這大
 
@@ -119,6 +127,19 @@ def count(scanner, hwnd: int, should_stop=None) -> int | None:
     name = server_name(hwnd)
     if not name:
         return None
+    # ★ 先走 login.servers()：它從**應用程式主物件的伺服器陣列**直接讀
+    #   （`[APP_PTR]+0x500` 那條，位址有 AOB 蓋著），毫秒級。
+    #   下面那條全掃是退路 —— 兩條讀的是同一份清單，2026-08-11 五台實測
+    #   結果一致（都 5），速度 0.0~1.1ms vs 35~58ms（memory 記過最壞 0.3~1 秒）。
+    #   ⚠ 在函式內 import：`login` 的模組常數要等 locate.warm() 改寫過才是新值。
+    try:
+        from app.game import login
+
+        got = dict(login.servers(scanner)).get(name)
+        if got and 1 <= got <= MAX_SUBSET:
+            return got
+    except Exception:                                      # noqa: BLE001
+        pass                       # 讀不到就走下面的全掃，不要因此整個功能停用
     pat = name.encode("utf-8") + b"\x00"
     for base, size in scanner._iter_regions(writable_only=True):
         if should_stop is not None and should_stop():

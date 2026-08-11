@@ -41,6 +41,29 @@ from app.game import team, terrain                          # noqa: E402
 OUT = ROOT / "reports" / "offset_verify.txt"
 NA = None                       # 「這台驗不了」
 
+# ★ 這支到底驗到了哪些偏移 —— 給 tools/coverage_audit.py 算覆蓋率用。
+#   (模組, 名字或前綴)；前綴以底線結尾表示「開頭是這個的都算」。
+#   ⚠ **加新檢查時要一起加這裡**，不然覆蓋率報告會把它算成「沒保護」。
+#   ⚠ 反過來更糟：這裡寫了、下面卻沒真的驗，等於自己騙自己 —— 只准照實寫。
+COVERS: tuple[tuple[str, str], ...] = (
+    ("entity", "OFF_TARGET"), ("entity", "OFF_TARGET_HP_GAP"),
+    ("entity", "OFF_POS_"), ("entity", "OFF_ID"), ("entity", "OFF_STATE"),
+    ("team", "MEMBERS_OFF"), ("team", "MEMBER_STRIDE"),
+    ("energy", "OFF_"),
+    ("quickbar", "TABLE_OFF"),
+    ("robot", "ROBOT_READY_OFF"),
+    # 場景管理器那條：查表(bag 那串偏移) vs vtable 掃描，兩條獨立的路要對上
+    ("bag", "OFF_MY_ID"), ("bag", "OFF_ENT_TABLE"), ("bag", "OFF_ENT_CAP"),
+    ("bag", "OFF_ENT_ID"),
+    # OFF_SCENE_MGR 沒有自己的檢查，但背包那條讀不到就會紅 —— 間接涵蓋
+    ("bag", "OFF_SCENE_MGR"), ("bag", "ITEM_"), ("bag", "OFF_CONTAINER"),
+    ("monsters", "OFF_"),
+    ("player", "OFF_"),
+    ("skillcost", "OFF_"),
+    ("scene", "OFF_SCENE_ID"),
+    ("terrain", "OFF_W"), ("terrain", "OFF_H"), ("terrain", "OFF_ROWS"),
+)
+
 
 def u32(sc, a):
     r = sc._read_bytes(a, 4)
