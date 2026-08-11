@@ -70,7 +70,14 @@ JOIN, KICK, PROMOTE, LEAVE, DISBAND, DENY = 1, 2, 3, 4, 5, 7
 SHARE_EVEN, SHARE_SOLO = 0, 1
 
 # --- 隊員陣列的版面（反組譯出處見檔頭）---------------------------------
-MEMBERS_OFF = 0x31A0
+# ⚠⚠ **結構偏移，2026-08-11 改版搬過家：0x31A0 → 0x3140（−0x60）。**
+#   已進 locate.SIGS（`team.MEMBERS_OFF`，kind="off"），開機自動跟上。
+#   出處是遊戲自己的 Lua 綁定 `groupkick`（0x58C6E6）：
+#       call 取Lua參數 / cmp eax,5 / jge 跳過 / imul ebx,eax,0x62
+#       / add ebx,0x3140 / add ebx,esi(狀態物件) / push [ebx] / push 2 / call 動作函式
+#   —— 一行就給了陣列偏移、間距 0x62、上限 5、隊員 ID 在 +0x00 四件事。
+#   ⚠ 寫舊偏移不會報錯，只會讀到垃圾 ID（自動組隊就會邀請／踢到不存在的人）。
+MEMBERS_OFF = 0x3140
 MEMBER_STRIDE = 0x62
 MEMBER_MAX = 5               # 遊戲自己 `cmp eax,5 / jge`
 M_ID, M_NAME = 0x00, 0x08
@@ -79,7 +86,11 @@ NAME_MAX = 0x20              # 邀請封包也是複製 32 bytes（push 0x20）
 # 使用者按同意的那份擷取裡它是 0，伺服器照樣讓他入隊，所以不能拿它當
 # 「有沒有人在邀請我」的判斷（那會變成永遠不送）。這裡照抄遊戲的做法：
 # 讀到什麼就送什麼。
-PENDING_OFF = 0x338C
+# ⚠⚠ 同上，2026-08-11 從 0x338C → 0x332C（−0x60）。出處是遊戲自己的
+#   `groupjoinok`（0x58C689）：`mov ecx,[狀態物件全域] / push [ecx+0x332c]
+#   / push 1 / call 動作函式` —— 我們送「同意組隊」照抄這一段。
+#   已進 locate.SIGS（`team.PENDING_OFF`）。
+PENDING_OFF = 0x332C
 
 SCRATCH_OFF = 0x1C0          # 相對 mover.scratch()；避開 lua 0、jumpmap 0x100、
                              # sell 0x140、exchange 0x180

@@ -87,10 +87,36 @@ SLACK = 0.4
 #     同一個物件有兩個 vtable、相隔 8 bytes。
 # 來源鏈（`0x5045DE` 只是表查找，可以純讀取重現，不必呼叫）：
 MGR_PTR = 0x0096E638        # 管理器指標
-MGR_ID = 0x2A90             # 本尊的實體 ID
-MGR_TBL = 0x2A74            # ID → 物件的表
-MGR_MAX = 0x2AA4            # 表的上限
-OBJ_ID = 0xBC               # 物件裡回存的 ID（要跟查表用的 ID 一致才算數）
+# ⚠⚠ 底下四個偏移**跟 bag.py 是同一組**（同一個場景管理器、同一張實體表）。
+#   以前這裡自己抄了一份 —— 那正是 CLAUDE.md 明令禁止的「同一個位址記在
+#   兩個地方」：`bag.OFF_MY_ID` 已經進 locate.SIGS 會自動跟上改版，這裡那份
+#   不會跟，於是改版後一邊對一邊錯，而且沒有任何警告。改成直接引用。
+def _bag():
+    from app.game import bag        # 延後 import：bag 也會用到 move
+    return bag
+
+
+class _MgrOff:
+    """場景管理器的欄位偏移 —— 一律轉問 bag.py（那邊才是唯一來源）。"""
+
+    @property
+    def ID(self) -> int:            # 本尊的實體 ID（locate 會更新 bag 那份）
+        return _bag().OFF_MY_ID
+
+    @property
+    def TBL(self) -> int:           # ID → 物件的表
+        return _bag().OFF_ENT_TABLE
+
+    @property
+    def MAX(self) -> int:           # 表的上限
+        return _bag().OFF_ENT_CAP
+
+    @property
+    def OBJ_ID(self) -> int:        # 物件裡回存的 ID（要跟查表用的一致才算數）
+        return _bag().OFF_ENT_ID
+
+
+MGR = _MgrOff()
 
 
 def _approach_point(here: tuple[float, float],
@@ -170,11 +196,11 @@ def pathfinder_this(scanner) -> int | None:
     mgr = u32(MGR_PTR)
     if not mgr:
         return None
-    ident, tbl, mx = u32(mgr + MGR_ID), u32(mgr + MGR_TBL), u32(mgr + MGR_MAX)
+    ident, tbl, mx = u32(mgr + MGR.ID), u32(mgr + MGR.TBL), u32(mgr + MGR.MAX)
     if None in (ident, tbl, mx) or (ident & 0xFFFF) > mx:
         return None
     obj = u32(tbl + (ident & 0xFFFF) * 4)
-    if not obj or u32(obj + OBJ_ID) != ident:
+    if not obj or u32(obj + MGR.OBJ_ID) != ident:
         return None
     return obj
 # 尋路／移動舉手之後，最多等這麼久拿指令槽。

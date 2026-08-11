@@ -72,11 +72,32 @@ from app.game import attack, entity
 #   三次都等於 +0xC4 + 索引*4。
 #   也就是說：按下晶化 = 把 +10 記進「原本顯示的那個屬性」，再隨機選一個新的
 #   放進 +0xBC。所以**「這次抽到什麼」要讀按下去之後的 +0xBC**。
-OFF_ENERGY = 0xB8
-OFF_RESULT = 0xBC
-OFF_PER_ROLL = 0xC0
-OFF_POINTS = 0xC4
+# ⚠⚠⚠ **2026-08-11 改版整組搬家：0xB8 → 0x54（−0x64）。**
+#   四個欄位是**連在一起的**（能量／抽到的屬性／每次點數／12 格點數），
+#   所以只留一個起點，其餘用 +4 推 —— 同一個位址不准記在兩個地方。
+#
+# ⚠ 這一組**沒有 AOB 錨可用**（晶化介面整個是 Lua 寫的，C++ 那邊只有封包
+#   處理常式會碰這些欄位，找不到穩定的指令骨架），所以它不能像
+#   `entity.OFF_TARGET`／`team.MEMBERS_OFF` 那樣自動跟上。
+#   補償措施有兩道，**改版後它會大聲壞掉、不會安靜算錯**：
+#     ① 讀取端逐欄驗證（見 read()）：抽到的屬性只准 −1 或 0~11、每次點數
+#        只准 0 或 10、能量與點數不准是天文數字 —— 驗不過一律回 None。
+#     ② `tools/verify_offsets.py` 會對真遊戲把這四欄再驗一次（改版後跑
+#        `/_patchCheck` 就會看到）。
+#
+# 值是怎麼定下來的（2026-08-11，五台交叉比對，不是推的）：
+#   送一發同步請求 0x3F，看**哪一格會變**：北極狐 +0x54 由 0 → 10。
+#   再比五台：+0x54 因人而異（10/10/0/2/2395）＝能量；+0x58 是 −1（還沒抽）
+#   或 6/10（0~11 的屬性索引）；+0x5C 有資料的都是 10 ＝每次點數；
+#   +0x60 起 12 格是各屬性累積點數（嵐狐 11042/17820/2182/74/…）。
+OFF_ENERGY = 0x54
+OFF_RESULT = OFF_ENERGY + 4       # 目前選中／剛抽到的屬性索引（0~11；−1 = 還沒抽）
+OFF_PER_ROLL = OFF_ENERGY + 8     # 每次獲得的點數（有資料時固定 10）
+OFF_POINTS = OFF_ENERGY + 12      # 各屬性累積點數，12 格 int32
 ATTR_COUNT = 12
+# 合理性上限（見上面②）。能量與單一屬性點數都不可能到千萬。
+MAX_ENERGY = 10_000_000
+MAX_POINTS = 100_000_000
 
 # 屬性名稱。**優先從記憶體讀**（見 attr_names()），這份只是讀不到時的後備。
 # 順序是從記憶體裡那一排連續字串抄的，跟遊戲畫面上的排列一致。
@@ -110,11 +131,16 @@ def read(scanner, state: int) -> EnergyState | None:
       畫面上的能量、抽到的屬性、12 格點數全是垃圾值，而且因為「讀到了」，
       呼叫端永遠不會判定要重新定位 —— 錯下去不會自己好。
       （CLAUDE.md 的鐵則：讀取端一律做合理性驗證，驗不過就退安全預設。）
-    ★ vtable 在 +0、能量在 +0xB8，一次整塊讀回來就同時拿到，等於免費；
+    ★ vtable 在 +0、能量在 OFF_ENERGY，一次整塊讀回來就同時拿到，等於免費；
       而且所有欄位是**同一瞬間**的快照。vtable 值本身由 locate.warm() 依 AOB
       重新定位，改版也跟得上。
     ★ 回 None 的意思統一是「這份資料不可信」，呼叫端照原本的路重新定位
       （energy_tab 的 `_read()` 就會 forget_state → 下一輪重找）。
+
+    ⚠⚠ **這四欄的偏移沒有 AOB 可以自動跟上**（晶化介面整個是 Lua 寫的，
+      C++ 那邊找不到穩定的指令骨架當錨），所以底下**逐欄驗版面**：
+      2026-08-11 那次改版它們整組搬了 −0x64，而舊偏移**照樣讀得到**
+      （讀到的是別的成員）—— 沒有這道驗證就會安靜地顯示垃圾數字。
     """
     if not state:
         return None
@@ -124,13 +150,24 @@ def read(scanner, state: int) -> EnergyState | None:
     b = bytes(raw)
     if struct.unpack_from("<I", b, 0)[0] != entity.VT_STATE:
         return None                       # 位址過期了 —— 不准拿垃圾值當答案
-    energy, result, per = struct.unpack_from("<III", b, OFF_ENERGY)
-    pts = struct.unpack_from(f"<{ATTR_COUNT}I", b, OFF_POINTS)
+    energy, result, per = struct.unpack_from("<Iii", b, OFF_ENERGY)
+    pts = struct.unpack_from(f"<{ATTR_COUNT}i", b, OFF_POINTS)
+    # --- 版面驗證（改版搬家就擋在這裡）---
+    #   抽到的屬性：−1（還沒抽）或 0~11；每次點數：實測只有 0 或 10。
+    #   五台實測都符合；其它值代表這裡根本不是那幾個欄位。
+    if not (result == -1 or 0 <= result < ATTR_COUNT):
+        return None
+    if per not in (0, 10):
+        return None
+    if not 0 <= energy <= MAX_ENERGY:
+        return None
+    if any(not 0 <= p <= MAX_POINTS for p in pts):
+        return None
     return EnergyState(
         energy=energy,
-        result=None if result >= ATTR_COUNT else result,
+        result=None if result < 0 else result,
         per_roll=per,
-        points=pts,
+        points=tuple(pts),
     )
 
 

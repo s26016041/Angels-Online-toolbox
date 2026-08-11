@@ -417,6 +417,52 @@ SIGS: tuple[Sig, ...] = (
         "FF B6 ?? ?? 00 00 E8 ?? ?? ?? ?? FF B7 ?? ?? ?? ??"
         " 8B CE 89 45 08 E8 ?? ?? ?? ?? 50 8B CE",
         0x00000270),
+    # 隊員陣列在狀態物件裡的位置（2026-08-11：0x31A0 → 0x3140）。
+    # 錨是 Lua 綁定 `groupkick`（0x58C6E6）算隊員位址那四行 ——
+    # `imul ebx,eax,0x62 / add ebx,偏移 / add ebx,esi / push [ebx]
+    #  / mov ecx,[狀態物件全域] / push 2(踢人動作碼) / call 動作函式`。
+    # ⚠ 間距 0x62 與動作碼 2 留著當骨架（它們是遊戲的語意常數，不是位址）；
+    #   偏移自己寫 `??`，全域位址由 _auto_mask 遮、rel32 也遮。
+    Sig("team", "MEMBERS_OFF", "off", 5,
+        "6B D8 62 81 C3 ?? ?? ?? ?? 03 DE FF 33 8B 0D ?? ?? ?? ?? 6A 02 E8",
+        0x00003140),
+    # 「有人邀請我」那一格（2026-08-11：0x338C → 0x332C）。錨是遊戲自己的
+    # 「同意組隊」：`mov ecx,[狀態物件全域] / push [ecx+偏移] / push 1 / call`。
+    Sig("team", "PENDING_OFF", "off", 8,
+        "8B 0D ?? ?? ?? ?? FF B1 ?? ?? ?? ?? 6A 01 E8",
+        0x0000332C),
+    # 「我自己的實體 ID」在場景管理器裡的位置（見 bag.OFF_MY_ID）。
+    # 錨在 usequickkey 函式頭：`mov esi,[狀態物件全域] / push edi / mov edi,ecx
+    #   / mov ecx,[esi+8](場景管理器) / push [ecx+我的ID偏移] / call 取實體`。
+    # ⚠ `[esi+8]`（bag.OFF_SCENE_MGR）是**單位元組位移**，這套只讀得回 4 bytes，
+    #   所以那個 0x08 仍是寫死的 —— 但它同時被這段特徵的骨架釘住：0x08 一變，
+    #   這段就不命中，`moved()`／`failed()` 會叫出來。
+    Sig("bag", "OFF_MY_ID", "off", 14,
+        "8B 35 ?? ?? ?? ?? 57 8B F9 8B 4E 08 FF B1 ?? ?? ?? ?? E8",
+        0x00002A90),
+    # 角色數值子物件在實體裡的位置（見 skillcost.OFF_ATTR）。錨在施放前的
+    # 「放得出來嗎」那三行：`push [範本+消耗SP] / mov edi,[範本+消耗MP]
+    #  / lea ecx,[實體+子物件偏移] / push edi / call 檢查`。
+    Sig("skillcost", "OFF_ATTR", "off", 8,
+        "FF 73 5C 8B 7B 58 8D 8E ?? ?? ?? ?? 57 E8 ?? ?? ?? ?? 84 C0",
+        0x00000210),
+    # 目前 MP／SP 在那個子物件裡的位置。**同一段特徵抽兩個值** —— 那支檢查
+    # 函式短到整支都能當骨架：`cost_mp≠0 → 比 [ecx+MP]；否則比 [ecx+SP]`。
+    Sig("skillcost", "OFF_ATTR_MP", "off", 15,
+        "55 8B EC 8B 55 08 8B 45 0C 85 D2 74 0C 39 91 ?? ?? ?? ?? 7D 13"
+        " 32 C0 EB 11 85 C0 74 0B 39 81 ?? ?? ?? ?? 0F 9D C0",
+        0x00000084),
+    Sig("skillcost", "OFF_ATTR_SP", "off", 31,
+        "55 8B EC 8B 55 08 8B 45 0C 85 D2 74 0C 39 91 ?? ?? ?? ?? 7D 13"
+        " 32 C0 EB 11 85 C0 74 0B 39 81 ?? ?? ?? ?? 0F 9D C0",
+        0x00000088),
+    # 「天使守護精靈子系統就緒」旗標在狀態物件裡的位置（見 robot.py）。
+    # 錨在它前面那個相鄰子物件的初始化：`push edi / lea ecx,[edi+前一個]
+    #   / call / lea ecx,[edi+這個] / mov byte [ebp-4],序號 / call`。
+    # ⚠ 前一個偏移與 SEH 序號都放萬用，只留指令骨架。
+    Sig("robot", "ROBOT_READY_OFF", "off", 14,
+        "57 8D 8F ?? ?? ?? ?? E8 ?? ?? ?? ?? 8D 8F ?? ?? ?? ?? C6 45 FC ?? E8",
+        0x0000F2FC),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。
