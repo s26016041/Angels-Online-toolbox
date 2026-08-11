@@ -133,8 +133,23 @@ def attacking(scanner, ent, player_obj: int) -> bool:
 TILE_UNITS = 32.0
 
 # --- 狀態物件的欄位 ---
-OFF_TARGET = 0x2D8        # 目前選定的目標（實體 ID）
-OFF_TARGET_HP = 0x2DC     # 目標的血量百分比；**攻擊前會檢查它 > 0**
+# ⚠⚠⚠ **這是結構偏移，2026-08-11 改版搬過家：0x2D8 → 0x270（−0x68）。**
+#   已登記進 locate.SIGS（`entity.OFF_TARGET`，kind="off"），開機自動跟上。
+#   血量欄固定在它 **+4**（實測：只寫 ID、遊戲就自己把 100 填進 +0x274）。
+#
+# 為什麼一定要自動定位：舊值 0x2D8 在新版是**別的成員**，寫進去的後果是
+#   「安靜地什麼都不會發生」—— 施放路徑 0x5B7565 讀的是 `[狀態物件+0x270]`，
+#   讀到 0 就走失敗分支（`[+0x279C]=0x11/0x12`、eax=0x12），**不出手、不扣 MP、
+#   沒有任何錯誤訊息**。2026-08-11 整個下午「掛機站在怪旁邊發呆」就是這樣來的：
+#   跳板每秒替我們執行 8~9 次 usequickkey，MP 連續 12 秒一格不扣。
+#   （同時我們還每 20ms 往一個不明成員寫 4 bytes —— 見 read_target_checked。）
+# ★ 實測三組對照（北極狐，沉重刺擊Ⅳ 27 MP）：
+#     只寫 +0x2D8 → eax=18(失敗) MP 不扣　　只寫 +0x270 → eax=1 MP −27
+#     +0x270 併寫 +0x274=100 → eax=1 MP −27、怪血 55→0（打死）
+OFF_TARGET = 0x270        # 目前選定的目標（實體 ID）
+# 目標的血量百分比 = 目標欄位 +4。**不要寫死** —— 寫死就變成「同一個位址記在
+# 兩個地方」，下次改版只有一邊會跟上（見 CLAUDE.md 的鐵則）。
+OFF_TARGET_HP_GAP = 4
 TARGET_HP_FULL = 100      # 實測選中滿血目標時這裡是 0x64 = 100
 
 NAME_MAX = 40             # 名字最多讀幾 bytes
@@ -504,9 +519,12 @@ def state_ok(scanner, state: int) -> bool:
 #    留著只會被將來的人誤用 —— 要讀這兩個欄位一律走 `read_target_checked()`，
 #    它把 vtable 比對併在同一次系統呼叫裡，不多花錢。
 
-# 從狀態物件開頭一路讀到目標血量 —— 涵蓋 vtable(+0) 與 +0x2D8/+0x2DC
+# 從狀態物件開頭一路讀到目標血量 —— 涵蓋 vtable(+0) 與 目標 ID／血量
 # （一次整塊讀，兩個值才是同一瞬間的：分開讀會拿到「舊 ID 配新血量」的組合）
-STATE_SPAN = OFF_TARGET_HP + 4
+# ⚠ 每次呼叫**當場算**，不要在模組載入時算成常數：`locate.warm()` 會在開機時
+#   把 OFF_TARGET 改成這一版遊戲的值，常數化就會停在舊版的長度。
+def _state_span() -> int:
+    return OFF_TARGET + OFF_TARGET_HP_GAP + 4
 
 
 def read_target_checked(scanner, state: int) -> tuple[bool, int, int]:
@@ -526,7 +544,7 @@ def read_target_checked(scanner, state: int) -> tuple[bool, int, int]:
     """
     if not state:
         return False, 0, 0
-    raw = scanner._read_bytes(state, STATE_SPAN)
+    raw = scanner._read_bytes(state, _state_span())
     if not raw:
         # 讀不到 ≠ 位址錯了（可能只是這一瞬間讀失敗）。回報「還沒失效」但
         # 沒有數值，讓呼叫端照原本的邏輯處理讀不到的情形。
@@ -535,7 +553,8 @@ def read_target_checked(scanner, state: int) -> tuple[bool, int, int]:
         return False, 0, 0
     return (True,
             struct.unpack_from("<I", raw, OFF_TARGET)[0],
-            struct.unpack_from("<I", raw, OFF_TARGET_HP)[0])
+            struct.unpack_from("<I", raw,
+                               OFF_TARGET + OFF_TARGET_HP_GAP)[0])
 
 
 def _write_u32(scanner, addr: int, value: int) -> None:
@@ -554,11 +573,13 @@ def set_target_id(scanner, state: int, eid: int) -> None:
     """**只寫目標 ID，不碰血量欄位。**
 
     ★ 用封包攻擊時要用這個，不要用 set_target()。
-      血量欄位（+0x2DC）是遊戲用來告訴我們「這隻剩多少血、死了沒」的，
+      血量欄位（目標欄 +4）是遊戲用來告訴我們「這隻剩多少血、死了沒」的，
       set_target() 會把它寫成 100 —— 那是為了餵飽**按鍵**攻擊的前置檢查
-      （`cmp [esi+0x2dc],0 / jle 跳過`）。封包攻擊是直接呼叫施放函式，
+      （`cmp [esi+血量欄],0 / jle 跳過`）。封包攻擊是直接呼叫施放函式，
       不經過那個檢查，所以沒必要寫；一寫就把死亡訊號蓋掉了，
       結果是打死了還一直打屍體（使用者回報的「鎖定一隻怪發呆」）。
+    ★ 2026-08-11 實測：只寫 ID，遊戲**自己**會把血量填進 +4（送出選定封包
+      之後 0.3 秒內就填好 100），所以死亡訊號照樣讀得到。
     """
     _write_u32(scanner, state + OFF_TARGET, eid)
 
@@ -569,22 +590,20 @@ def set_target(scanner, state: int, eid: int,
 
     ★ 必須**同時寫兩個欄位**，只寫 ID 是不夠的：
 
-        +0x2D8  目標實體 ID
-        +0x2DC  目標血量百分比
+        OFF_TARGET      目標實體 ID       （2026-08-11 起 = +0x270）
+        OFF_TARGET + 4  目標血量百分比    （            = +0x274）
 
-    因為攻擊的程式碼長這樣（反組譯 0x60266C）：
+    因為攻擊的程式碼長這樣（反組譯 0x60266C，舊版位址）：
 
-        cmp  dword ptr [esi+0x2dc], 0
+        cmp  dword ptr [esi+血量欄], 0
         jle  跳過攻擊                    ← 血量 ≤ 0 就當成目標已死，不出手
-        push [esi+0x2d8] ; push 0xc ; call 0x5d3eb5
+        push [esi+目標欄] ; push 0xc ; call 送出函式
 
-    只寫 +0x2D8 的話，+0x2DC 停在 0，遊戲會認為那隻已經死了而直接跳過攻擊
-    —— 症狀是「血條出現了（那只看 +0x2D8），但按 F2 完全沒反應」。
-
-    遊戲自己選目標時也是兩個一起設（0x5FA550 寫 +0x2DC、0x5FA5F0 寫 +0x2D8）。
+    只寫 ID 的話血量欄停在 0，遊戲會認為那隻已經死了而直接跳過攻擊
+    —— 症狀是「血條出現了（那只看目標欄），但按 F2 完全沒反應」。
     """
     _write_u32(scanner, state + OFF_TARGET, eid)
-    _write_u32(scanner, state + OFF_TARGET_HP, hp_pct)
+    _write_u32(scanner, state + OFF_TARGET + OFF_TARGET_HP_GAP, hp_pct)
 
 
 def is_alive(scanner, ent: Entity) -> bool:

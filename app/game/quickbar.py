@@ -47,15 +47,33 @@ MGR_PTR = 0x009B66AC
 
 # ★★★「用快捷鍵」的本體 —— 等於使用者自己按 F2，遊戲會走完整流程：
 #   檢查射程與冷卻、扣 MP、播動作、送它自己那一整組封包。
-#   __thiscall：this = 快捷欄管理物件 [MGR_PTR]，參數 (格號, 頁, 0)。
-#   出處：Lua 綁定 usequickkey 0x58F2C9 取兩個 Lua 參數之後
-#         `push 0 / push esi(頁) / push eax(格) / call 0x5B87C5`（ecx=[MGR_PTR]）。
+#   __thiscall：this = 快捷欄管理物件 [MGR_PTR]，參數 (格號, 頁, 對目標施放)。
 # ⚠⚠ 參數順序是 (格號, 頁)，**不是 (頁, 格號)** —— 反過來實測完全沒反應
 #   （12 次呼叫、零傷害、MP 一格沒扣）。
 # ★ 為什麼要用它而不是自己送施放封包：自送封包**只會打出普攻**
 #   （實測 MP 一格不扣、傷害是武器普攻），而這支一次就扣 25 MP
 #   （破甲劈擊Ⅳ 的耗魔）、2 次呼叫 2 秒打死一隻。
 USE_FN = 0x005B87C5
+
+# ★★★ 第三個參數＝「對目前選定的目標施放」，**一定要 1**（2026-08-11 反組譯）。
+#   技能分支 `0x5B7565(技能ID, 這個參數)` 裡：
+#       mov  al, byte ptr [ebp+0xC]        ; 這個參數
+#       mov  byte ptr [自己實體+0x464], al
+#       ...  switch (技能範本+0x48 對象類型)
+#       0/2（對自己）→ 直接 call 0x549E19 施放      ← 不看這個參數
+#       3/4（要目標）→ cmp byte ptr [ebp+0xC], 0
+#                      je  失敗（[快捷欄+0x279C] = 0x13，**完全不施放**）
+#   也就是說：傳 0 時**自我 buff 放得出來、打怪的技能一個都放不出來**，
+#   而且沒有任何錯誤回報 —— 呼叫照樣「成功」、跳板照樣執行、MP 一格不扣。
+#   ⚠⚠ 這正是 2026-08-11 改版後「站在怪旁邊猛按卻什麼都沒發生」的根因：
+#     實測跳板每秒替我們執行 8~9 次 usequickkey，連續 12 秒 MP 完全沒動、
+#     怪血 100% 不變；偶爾掉的那幾點 MP 是送鍵那條退路打出來的。
+#     連帶讓「首次攻擊」永遠等不到確認（短射程首發走的就是這條路）→ 卡死。
+# ★ 出處是**遊戲自己按 F 鍵的呼叫點** 0x5B1921：
+#       push 1 / push -1（頁＝-1 表示「用目前頁」）/ push 格號 / call USE_FN
+#   （0x5AD105、0x5AD167 兩處同款；只有 Lua 綁定 0x58E71F 傳 0 ——
+#     那支是給介面用的，不是按鍵路徑。舊版能用 0 是因為那時還沒有這道閘。）
+USE_TARGETED = 1
 
 # ⚠⚠ 這是**結構偏移**，遊戲改版動版面就會變：2026-08-11 那次 0x609C → 0x603C
 #   （−0x60，跟 player.VT_OFF_FROM_MGR、robot.ROBOT_READY_OFF 同一批）。
@@ -148,6 +166,8 @@ def use(mover, scanner, slot: int, page: int = 0, wait: bool = True) -> bool:
       快捷欄物件會因為換地圖／重連搬家，拿舊的去呼叫會讓遊戲當場崩潰。
     ⚠ 遊戲有自己的冷卻，叫太密只是白叫（跟一直按 F2 一樣，不會出事，
       但每一次呼叫都佔跳板，呼叫端請自己節流）。
+    ⚠⚠ 第三個參數一定是 `USE_TARGETED`(1)：傳 0 的話打怪的技能**一個都放不出來**
+      而且完全沒有回報（見 USE_TARGETED 的說明）。
     """
     if not (mover and mover.active and 0 <= slot < SLOTS and 0 <= page < PAGES):
         return False
@@ -155,8 +175,8 @@ def use(mover, scanner, slot: int, page: int = 0, wait: bool = True) -> bool:
     if not mgr:
         return False
     if not wait:
-        return mover.call(USE_FN, slot, page, 0, ecx=mgr)
-    return mover.call_sync(USE_FN, slot, page, 0, ecx=mgr,
+        return mover.call(USE_FN, slot, page, USE_TARGETED, ecx=mgr)
+    return mover.call_sync(USE_FN, slot, page, USE_TARGETED, ecx=mgr,
                            timeout=CALL_TIMEOUT) is not None
 
 
