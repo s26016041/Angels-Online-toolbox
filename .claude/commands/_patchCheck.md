@@ -97,20 +97,35 @@ py tools\patch_doctor.py     # 進遊戲後它會自己把 selfcheck 那段跑�
 （`sign_in` → `pick_channel` → 等 `character()` → `enter_game`）。
 ⚠ 動使用者的分身前要有授權；沒說過就先問。
 
-## 7. 資源包（寫死資料表）
+## 7. 寫死資料表（★ 先別急著叫使用者重新解包）
 
-`UPDATE.PAK` 換了就要重新解包 —— **那一步是 GUI（`D:\RPGViewer`），只能請使用者做**。
-解完之後：
+`UPDATE.PAK` 換了不代表表變了。使用者的實務經驗是
+**「通常只有大更新新增內容才要重新解包」** —— 而那句話現在可以**驗證**：
 
 ```
-py tools\build_item_names.py ; py tools\build_jumpmap.py
-py tools\build_skills.py ; py tools\build_skill_names.py ; py tools\build_skill_range.py
-py tools\stamp_tables.py        # 核對過才蓋章，否則等於把警示靜音
+py tools\recheck_tables.py        # 要進遊戲（資料表進遊戲才載進來）
 ```
 
-★ **技能射程表可以不等解包就驗**：遊戲把技能範本載進記憶體了，
-拿 `assets/skill_range.tsv.gz` 逐筆對 `[TABLE_PTR]+ID*4` 的 +0x50/+0x54
-（2026-08-11 實測 19312/19312 全中）。能用記憶體驗的表就別等解包。
+★ **遊戲自己把 41 張資料表載進記憶體了**（Npc／Magic／JumpMap／Item／
+OnlineGift／Exchange…；那 41 支查表函式共用 `Get %s Data Error` 這句訊息，
+`%s` 就是表名）。所以「會做錯事」的那兩張都能直接跟記憶體對帳：
+
+| 表 | 過期後果 | 對帳方式 |
+|---|---|---|
+| `skill_range.tsv.gz` | 走位停太遠 → 零傷害，不報錯 | Magic 範本 +0x50/+0x54 |
+| `jumpmap.tsv` | 傳到錯的地方 | JumpMap 範本 +0x04 場景 / +0x10 X / +0x14 Y |
+
+* **全對** → 這次不必解包。跑 `py tools\stamp_tables.py` 蓋章，警示就熄。
+* **對不上** → 才請使用者重新解包（`D:\RPGViewer` 是 GUI，我們代跑不了），
+  然後 `build_item_names / build_jumpmap / build_skills / build_skill_names /
+  build_skill_range` 重跑一輪再蓋章。
+
+⚠ 名稱類（物品名／技能名／分類名）在字串資源檔，記憶體裡沒有 → 驗不了。
+但它們過期只會**顯示成編號**，不會做錯事，不值得為它擋著。
+
+★★ **要寫死任何遊戲資料之前，先看 `reports/table_recheck.txt` 末尾那份 41 張
+表的清單** —— 在清單裡就別抄資源包，照 `skillcost.TABLE_PTR` 的做法把表位址
+進 `locate.SIGS`（錨在查表函式尾巴 push 的**表名字串**）。
 
 ## 8. 收尾
 

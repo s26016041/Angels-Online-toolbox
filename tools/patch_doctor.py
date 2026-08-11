@@ -458,8 +458,9 @@ def main() -> int:
         lines.append("  ✔ 已對這一版遊戲核對過")
     else:
         lines.append(f"  ⚠ 戳記 {stamp:#010x} ≠ 這版 {crc:#010x}"
-                     " —— 資源包可能換了，要重新解包 SETTING → 重跑 "
-                     "tools/build_*.py → py tools\\stamp_tables.py 蓋章")
+                     " —— 表**可能**過期。先進遊戲跑 py tools\\recheck_tables.py"
+                     "（會做錯事的那兩張可以直接跟記憶體對帳），全對就只要"
+                     " py tools\\stamp_tables.py 蓋章，不必重新解包。")
 
     # 執行時體檢
     runtime_bad: list[str] = []
@@ -569,8 +570,8 @@ def main() -> int:
               + ("（執行時欄位也驗過）" if ingame else
                  "（還沒進遊戲，欄位版面沒驗到）"))
     if stamp is not None and stamp != crc:
-        print("  ⚠ 另外：寫死資料表還沒對這版核對 —— 重新解包 SETTING → "
-              "重跑 tools/build_*.py → py tools\\stamp_tables.py")
+        print("  ⚠ 另外：寫死資料表還沒對這版核對 —— 進遊戲跑 "
+              "py tools\\recheck_tables.py（多半不必重新解包）")
     print(f"\n報告：{REPORT}")
     if broken or weak:
         print(f"修法：{FIXFILE}")
