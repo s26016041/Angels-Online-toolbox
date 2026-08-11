@@ -57,7 +57,15 @@ MGR_PTR = 0x009B66AC
 #   （破甲劈擊Ⅳ 的耗魔）、2 次呼叫 2 秒打死一隻。
 USE_FN = 0x005B87C5
 
-TABLE_OFF = 0x609C
+# ⚠⚠ 這是**結構偏移**，遊戲改版動版面就會變：2026-08-11 那次 0x609C → 0x603C
+#   （−0x60，跟 player.VT_OFF_FROM_MGR、robot.ROBOT_READY_OFF 同一批）。
+#   壞掉的症狀很難看：讀到的不是快捷欄，型別欄多半 >4 → read_page 回 None
+#   → 掛機以為「快捷鍵上沒有技能」。所以它跟位址一樣進了 locate.SIGS
+#   （`quickbar.TABLE_OFF`，錨在 USE_FN 裡算格子位址那兩行），會自動跟上。
+#   下面這個值只是還沒 warm()／定位失敗時的退路。
+# ★ 新版的算式：ecx = (頁*12 + 格)*9，再 `movzx eax, byte [ecx+esi+TABLE_OFF]`
+#   （舊版是把 0xE5*12*9 折進常數，結果一樣）。
+TABLE_OFF = 0x603C
 ENTRY_SIZE = 9
 PAGES = 4
 SLOTS = 12                    # F1~F12

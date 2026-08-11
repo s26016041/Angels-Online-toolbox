@@ -42,7 +42,14 @@ RUN_ON, RUN_OFF = 0, -1
 #     0x009B66AC，改版位移後 quickbar 那份會跟上、這份不會，而且它不在
 #     SIGS 裡，failed() 永遠不會提醒。取用要在函式內（quickbar.MGR_PTR
 #     是 locate.warm() 之後才變成新值的模組屬性，import 時抄一份會凍住舊值）。
-ROBOT_READY_OFF = 0xF35C
+#   ⚠ 2026-08-11 改版：0xF35C → 0xF2FC（−0x60，跟快捷欄表、角色屬性同一批）。
+#     那次的 setrobotisrun 也小改了寫法：`lea esi,[ecx+0xF2FC] / call 取那個
+#     byte 的 getter（0x54D950 就是 mov al,[ecx]; ret）`，讀的還是同一個 byte。
+#     沒做成 AOB 特徵的原因：開／關兩支函式除了最後 jmp 的目標之外一模一樣，
+#     遮掉 rel32 就分不出來（實測 2 個命中）。壞掉的後果只是這道 guard 讀到
+#     別的 byte —— 要嘛說「精靈還沒準備好」（安全退化），要嘛照常寫旗標
+#     （寫的位址本身有 AOB 蓋著），不會做出危險的事。
+ROBOT_READY_OFF = 0xF2FC
 
 # ---------------------------------------------------------------------------
 # ★★★ 直接從記憶體讀精靈的設定（不必呼叫 Lua）

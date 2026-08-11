@@ -30,12 +30,18 @@
     `Mover.call()` 開頭會把 fn=0 擋下來，功能**大聲停用**（`failed()`
     列得出來、分頁的定位警示看得到），而不是亂呼叫。
 
-## 兩種目標
+## 三種目標
 
 * `fn`   —— 函式進入點。直接對那個位址的頭幾道指令建特徵。
 * `data` —— vtable／全域指標這種**資料位址**。AOB 不能直接掃資料（內容會變），
   改成找「程式碼裡把這個位址當立即值用」的地方，對那段程式碼建特徵，
   命中後從 `imm_at` 把立即值讀回來。
+* `off`  —— **結構偏移**（`[edi+0xCB08]` 那個 0xCB08）。跟 data 同一套，只是
+  讀回來的值不是位址、不做模組範圍檢查。2026-08-11 那次改版就是它變了
+  （狀態物件裡角色屬性從 +0xCB68 搬到 +0xCB08），本來只會**安靜變慢**
+  （捷徑驗不過 → 退回 0.4~1 秒全掃），現在跟著自動定位。
+  ⚠ 偏移不落在模組範圍內 → `_auto_mask` 不會自動遮，pattern 裡要**自己寫 `??`**，
+  不然又是「拿答案當錨」。
 
 ## 遮罩規則（決定改版後還準不準）
 
@@ -80,7 +86,13 @@ class Sig:
     pattern: str
     known: int
     as_rva: bool = False
-    keep_imm: bool = False   # 例外：只有位址本身能區分這一段，見 monsters
+    # ★ 字串內容當錨（2026-08-11 加）：命中後從 str_at 讀 4 bytes 當指標，
+    #   那裡的 NUL 結尾字串必須等於 str_val，不然這個命中不算。
+    #   用途：兩支「同一個模子印出來」的函式只差一個字串（`Npc` / `Pet`），
+    #   位址會位移但**字串內容不會變** —— 這樣就不必像以前那樣把表位址
+    #   寫死在特徵裡當錨（那等於拿答案比對答案，改版必定定位失敗）。
+    str_at: int | None = None
+    str_val: bytes = b""
 
 
 SIGS: tuple[Sig, ...] = (
@@ -104,10 +116,15 @@ SIGS: tuple[Sig, ...] = (
         0x00559EA0),
     # 「用快捷鍵」的本體（= 按 F2）。錨在函式頭＋讀快捷欄全域＋取 +0x2A90，
     # 全域位址與 call 的 rel32 放萬用。見 quickbar.USE_FN。
+    # ⚠ 2026-08-11 改版重編譯過，暫存器配置變了（舊：`8B 3D 全域 / 8B F1 /
+    #   8B 4F 08`＝edi 拿全域、esi=this；新：`8B 35 全域 / 8B F9 / 8B 4E 08`
+    #   ＝反過來）。骨架其他部分一字未改，所以只換了那三處。
+    #   ★ 找回它的方法：quickbar.MGR_PTR 那段特徵就是 Lua 綁定 usequickkey
+    #     的函式頭，它結尾那個 call 的目標就是這一支（0x58E71F → 0x5B76C4）。
     Sig("quickbar", "USE_FN", "fn", None,
-        "55 8B EC 53 56 57 8B 3D ?? ?? ?? ?? 8B F1 8B 4F 08 FF B1 90 2A 00 00"
+        "55 8B EC 53 56 8B 35 ?? ?? ?? ?? 57 8B F9 8B 4E 08 FF B1 90 2A 00 00"
         " E8 ?? ?? ?? ?? 8B D8 8B 45 0C 85 C0 79 19",
-        0x005B87C5),
+        0x005B76C4),
     Sig("jumpmap", "BUILD_FN", "fn", None,
         "55 8B EC 56 8B F1 33 C0 57 8B 7D 0C 57 89 06 89 46 04 89 46 08"
         " 89 46 0C E8 ?? ?? ?? ?? 8B 4E 04 66 8B 45 08 66 89 01",
@@ -200,34 +217,45 @@ SIGS: tuple[Sig, ...] = (
         "A1 ?? ?? ?? ?? 85 C0 75 ?? 6A 50 E8 ?? ?? ?? ?? 59 8B C8 89 4D 08 "
         "33 C0 89 45 FC 85 C9",
         0x0096E630),
+    # 角色屬性物件的 vtable，寫在狀態物件建構函式裡（`mov [edi+偏移], vtable`）。
+    # ⚠⚠ 2026-08-11 改版**兩個結構偏移都變了**（0xCB68→0xCB08、0xF280→0xF220），
+    #   舊特徵把它們當骨架 → 整段不命中。現在那兩個 disp32 與 SEH 序號一律放
+    #   萬用（實測全遮之後仍然唯一），只靠 `mov [edi+disp],imm / lea ecx,[edi+disp]
+    #   / mov byte [ebp-4],序號 / call` 這串骨架。
     Sig("player", "VTABLE_RVA", "data", 6,
-        "C7 87 68 CB 00 00 1C 3E 7E 00 8D 8F 80 F2 00 00 C6 45 FC 24 E8 ?? ?? ?? ??",
-        0x007E3E1C, as_rva=True),
+        "C7 87 ?? ?? 00 00 F4 3D 7E 00 8D 8F ?? ?? 00 00 C6 45 FC ?? E8 ?? ?? ?? ??",
+        0x007E3DF4, as_rva=True),
+    # ★ 同一道指令的 disp32 ＝ 角色屬性物件在狀態物件裡的位置（見 player.py
+    #   的 VT_OFF_FROM_MGR）。以前寫死成 0xCB68+0x20，改版後捷徑就驗不過、
+    #   每次都退回全掃（只變慢、不會算錯）。現在跟著自動定位。
+    Sig("player", "VT_OFF_FROM_MGR", "off", 2,
+        "C7 87 ?? ?? 00 00 F4 3D 7E 00 8D 8F ?? ?? 00 00 C6 45 FC ?? E8 ?? ?? ?? ??",
+        0x0000CB08),
     Sig("scene", "VTABLE_RVA", "data", 6,
         "C7 83 3C 10 00 00 3C CF 7D 00 A1 6C 09 89 00 89 1D 64 5F 9B 00 6A 1F 59",
         0x007DCF3C, as_rva=True),
     Sig("scene", "SCENE_PTR_RVA", "data", 1,
         "0D 48 09 89 00 8B 75 FC 8B 45 0C 03 C3 8B 11 FF 76 20 50 FF 52 18 8B 0D 48 09 89 00",
         0x00890948, as_rva=True),
-    # ⚠⚠⚠ **全專案唯一保留 tautology 的一段**（keep_imm=True），原因是實測出來的：
-    #   模組裡有 **28 支一模一樣**的「依 ID 查表」存取函式 —— 同樣的邊界檢查
-    #   （`cmp ecx,0x88B7`）、同樣的錯誤訊息編號（`push 0x88B9`）、同樣的
-    #   「push 0x1FF ／清 512 bytes 緩衝」慣用碼，是同一個樣板產生的，
-    #   **彼此只差表位址**，也就是我們要解出來的那個值本身。
-    #   把位址遮掉 → 28 個命中（模糊）；往前往後延伸都試過，區分不出來。
-    #   所以這段的取捨是：位址留在特徵裡當錨。
-    #   後果（已知、可接受）：.data 位移時這段會**定位失敗而不是抓錯**，
-    #   failed() 會列出來、分頁警示會亮，monsters 退化成讀不到王／等級／滿血，
-    #   不會崩潰。要根治得改用「找 28 個候選再讀表內容驗證哪個是怪物表」。
+    # 怪物／NPC 範本表（[這裡]+種類ID*4 → 範本；見 app/game/monsters.py）。
+    # ⚠ 這是那 28 支「同一個模子印出來」的查表函式之一。連邊界值 0x88B7 與
+    #   錯誤訊息編號 0x88B9 都跟另一支（寵物表）**完全相同** —— 全遮之後
+    #   剩下兩個候選 0x508D89（Npc）與 0x5AC245（Pet）。
+    # ★★ 2026-08-11 起靠**字串內容**分辨：那句錯誤訊息是
+    #   `Get %s Data Error, ID:%d >= MAX:%d`，%s 帶進去的常數字串一支是
+    #   `Npc`、一支是 `Pet`。字串位址會位移，**內容不會**，所以拿它當錨
+    #   完全不必把表位址寫死（以前那段 keep_imm 的 tautology 就是被這個取代的
+    #   —— 2026-08-11 改版 .data 位移 −0x20，舊寫法如預期整段定位失敗）。
     Sig("monsters", "INDEX_PTR_RVA", "data", 16,
         "56 8B 75 08 8D 4E FF 81 F9 B7 88 00 00 77 0A"
-        " A1 88 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
-        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 B9 88 00 00 56",
-        0x0098BC88, as_rva=True, keep_imm=True),
+        " A1 68 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 B9 88 00 00 56"
+        " 68 C0 29 7D 00",
+        0x0098BC68, as_rva=True, str_at=58, str_val=b"Npc"),
     # 技能範本表（[這裡]+技能ID*4 → 範本；見 app/game/skillcost.py）。
     # ⚠ 跟怪物表是**同一種**查表函式（模組裡有 28 支長得一模一樣），但這一支
     #   的邊界值 0x61A7 與錯誤訊息編號 0x61A9 是它自己的 —— 所以表位址本身
-    #   可以交給 _auto_mask 遮掉（不像 monsters 那段被迫 keep_imm）。
+    #   可以交給 _auto_mask 遮掉（monsters 那段是靠字串內容分辨的，見上面）。
     Sig("skillcost", "TABLE_PTR", "data", 16,
         "56 8B 75 08 8D 4E FF 81 F9 A7 61 00 00 77 0A"
         " A1 B0 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
@@ -259,13 +287,19 @@ SIGS: tuple[Sig, ...] = (
         " 8B 4D F4 8A 45 08 6A 20 68 14 08 89 00 88 41 02"
         " A0 10 08 89 00 88 41 03 8D 41 04 50 E8",
         0x0050F880),
-    # 登入畫面物件的主 vtable。⚠ 有兩支建構函式寫一模一樣的五行，全遮之後
-    # 會撞在一起 —— 靠前面那句 `mov edi,ecx` 區分（另一支是 `mov [ebp-4],6`）。
-    # 實測會退回「只遮目標」那層才唯一，這是 locate 本來就有的退路。
+    # 登入畫面物件的主 vtable（`find_screen()` 靠它掃出登入畫面物件）。
+    # ⚠⚠ 2026-08-11 這一段是**整個自動登入卡在「等遊戲開好」的元凶**：
+    #   舊特徵只蓋到 +0x2C 那行，全遮之後跟另一支建構函式（0x608B52，
+    #   vtable 0x7E71B4）撞在一起 → 模糊命中 → data 類保留舊值 0x7D6C94
+    #   → 掃不到登入畫面物件 → 一直等下去。以前靠「只遮目標」那層才唯一，
+    #   而那層是拿舊位址當錨的，位址一移就沒了 —— 等於沒有退路。
+    # ★ 現在往後多蓋兩行（+0x30、+0x34）：那兩行只有登入畫面這一支有，
+    #   全遮之後就唯一，跟位址完全無關。
     Sig("login", "VT_LOGIN", "data", 4,
-        "8B F9 C7 07 94 6C 7D 00 C7 47 10 AC 6C 7D 00 C7 47 14 C4 6C 7D 00"
-        " C7 47 18 D0 6C 7D 00 C7 47 2C DC 6C 7D 00",
-        0x007D6C94),
+        "8B F9 C7 07 74 6C 7D 00 C7 47 10 8C 6C 7D 00 C7 47 14 A4 6C 7D 00"
+        " C7 47 18 B0 6C 7D 00 C7 47 2C BC 6C 7D 00 C7 47 30 C8 6C 7D 00"
+        " C7 47 34 D4 6C 7D 00 E8",
+        0x007D6C74),
     # 帳號／密碼緩衝區。錨在登入按鈕裡「把輸入框的字抄進全域」那兩段。
     Sig("login", "ACCOUNT", "data", 7,
         "6A 14 8D 45 E4 50 68 80 09 89 00 E8 ?? ?? ?? ?? 8B 03 83 C4 1C 8B CB",
@@ -333,8 +367,25 @@ SIGS: tuple[Sig, ...] = (
         "8D 41 04 50 E8 ?? ?? ?? ?? FF 75 FC FF 35 7C 09 89 00"
         " E8 ?? ?? ?? ?? 83 C4 14 C9 C2 04 00",
         0x0089097C),
+    # 登入時選中的伺服器索引。⚠ 2026-08-11 稽核抓到的縫：它以前**沒有特徵**，
+    # 是 login.py 裡唯一寫死又沒被 AOB 蓋住的位址（改版位移 −0x20 之後
+    # `server_info()` 會拿別的東西當索引 —— 這正是「安靜地做錯事」）。
+    # 錨在遊戲自己用它進伺服器陣列那行：`imul esi,[索引],0x178`（0x178 = 一筆
+    # 伺服器記錄的大小）＋後面 `mov edx,[ecx+0x500] / cmp [edx+esi+0x5C],0`
+    # —— 順便就是 SRV_STRIDE / SRV_BEGIN / SRV_SUBSET_B 三個版面常數的出處。
+    Sig("login", "SERVER_INDEX", "data", 2,
+        "69 35 88 0C 89 00 78 01 00 00 FF 35 F4 0B 89 00"
+        " 8B 91 00 05 00 00 83 7C 32 5C 00 74 3D",
+        0x00890C88),
     # 快捷欄管理物件的全域指標。錨在 usequickkey（Lua 綁定）的函式頭 ——
     # 表就掛在它 +0x609C（見 quickbar.py）。
+    # 快捷欄表在管理物件裡的位置（結構偏移；2026-08-11 從 0x609C 變 0x603C）。
+    # 錨在 USE_FN 裡算格子位址那兩行：`imul ecx,eax,9 / movzx eax,byte
+    # [ecx+esi+表偏移] / movzx edx,word [ecx+edi+表偏移+1]`。
+    # ⚠ 偏移不在模組範圍內 → 不會被 _auto_mask 遮，pattern 裡自己寫 `??`。
+    Sig("quickbar", "TABLE_OFF", "off", 7,
+        "6B C8 09 0F B6 84 31 ?? ?? ?? ?? 0F B7 94 39 ?? ?? ?? ??",
+        0x0000603C),
     Sig("quickbar", "MGR_PTR", "data", 40,
         "55 8B EC 51 51 8B 45 08 8D 4D F8 56 6A 01 89 45 FC C6 45 F8 00"
         " E8 ?? ?? ?? ?? 6A 02 8D 4D F8 8B F0 E8 ?? ?? ?? ?? 8B 0D AC 66 9B 00"
@@ -436,23 +487,50 @@ def _image_key(scanner) -> tuple[int, int] | None:
     return (base, zlib.crc32(bytes(head)))
 
 
-def _find_unique(img: bytes, sig: bytes, mask: bytes) -> int | None:
-    """回傳唯一命中的位移；找不到或不只一個都回 None（寧可保留舊值）。"""
+def _find_all(img: bytes, sig: bytes, mask: bytes) -> list[int]:
+    """所有命中的位移（給字串錨過濾用；一般情況直接看 `_find_unique`）。"""
     seed, at = _seed(sig, mask)
     if not seed:
-        return None
-    hit = None
+        return []
+    hits: list[int] = []
     i = img.find(seed)
     while i >= 0:
         start = i - at
         if start >= 0 and start + len(sig) <= len(img):
             if all(not mask[k] or img[start + k] == sig[k]
                    for k in range(len(sig))):
-                if hit is not None:
-                    return None            # 不只一個 → 特徵不夠強，別亂改
-                hit = start
+                hits.append(start)
         i = img.find(seed, i + 1)
-    return hit
+    return hits
+
+
+def str_ok(img: bytes, base: int, off: int, s: Sig) -> bool:
+    """字串錨：命中處 +str_at 的指標指到的字串是不是 str_val。
+
+    沒設 str_at 的段一律通過。指標指到模組外、或字串不吻合 → 這個命中不算。
+    """
+    if s.str_at is None:
+        return True
+    k = off + s.str_at
+    if k + 4 > len(img):
+        return False
+    ptr = int.from_bytes(img[k:k + 4], "little") - base
+    if not 0 <= ptr < len(img):
+        return False
+    end = ptr + len(s.str_val)
+    return img[ptr:end] == s.str_val and end < len(img) and img[end] == 0
+
+
+def _find_unique(img: bytes, sig: bytes, mask: bytes,
+                 s: Sig | None = None, base: int = 0) -> int | None:
+    """回傳唯一命中的位移；找不到或不只一個都回 None（寧可保留舊值）。
+
+    s/base 有給的話，先用字串錨把命中過濾一輪再判斷唯一性。
+    """
+    hits = _find_all(img, sig, mask)
+    if s is not None and s.str_at is not None:
+        hits = [h for h in hits if str_ok(img, base, h, s)]
+    return hits[0] if len(hits) == 1 else None
 
 
 def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
@@ -486,16 +564,12 @@ def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
             sig, mask = _parse(s.pattern)
             m_full, m_only, targets = _auto_mask(
                 sig, mask, s.known, base + 0x1000, base + info.size)
-            if s.keep_imm:
-                # 例外段：位址本身就是唯一的區分點（見 monsters 的說明）。
-                off, targets = _find_unique(img, sig, mask), ()
-            else:
-                # ★ 先用全遮（最抗改版）；那樣不唯一才退回「只遮目標」，
-                #   讓其他內嵌位址當錨把它區分開來（見 _auto_mask）。
-                #   兩層都要求**唯一命中** —— 模糊命中一律當定位失敗。
-                off = _find_unique(img, sig, m_full)
-                if off is None:
-                    off = _find_unique(img, sig, m_only)
+            # ★ 先用全遮（最抗改版）；那樣不唯一才退回「只遮目標」，
+            #   讓其他內嵌位址當錨把它區分開來（見 _auto_mask）。
+            #   兩層都要求**唯一命中** —— 模糊命中一律當定位失敗。
+            off = _find_unique(img, sig, m_full, s, base)
+            if off is None:
+                off = _find_unique(img, sig, m_only, s, base)
             found = None
             if off is not None:
                 if s.kind == "fn":
@@ -511,8 +585,11 @@ def warm(scanner, force: bool = False) -> list[tuple[str, int, int | None]]:
                             and int.from_bytes(
                                 img[off + t:off + t + 4], "little") == v
                             for t in targets)
-                        # 資料位址一定落在模組內，不然就是抓錯了
-                        if same and base <= v < base + info.size:
+                        # data 位址一定落在模組內；off 是結構偏移，只要求
+                        # 非 0 且小得合理（物件再大也不會到 1MB）。
+                        ok = (base <= v < base + info.size if s.kind == "data"
+                              else 0 < v < 0x100000)
+                        if same and ok:
                             found = v
             mod = importlib.import_module(f"app.game.{s.module}")
             if found is not None:

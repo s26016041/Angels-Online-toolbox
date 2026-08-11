@@ -74,29 +74,30 @@ def main() -> int:
         return 2
 
     lines: list[str] = [f"pid={pid} base={base:#x} size={info.size:#x}", ""]
-    bad = 0
+    bad = nmoved = 0
     for s in locate.SIGS:
         sig, mask = locate._parse(s.pattern)
         m_full, m_only, targets = locate._auto_mask(
             sig, mask, s.known, base + 0x1000, base + info.size)
-        # 跟 warm() 同一套策略：keep_imm 例外段直接用原 mask；
-        # 其餘全遮優先，不唯一才退回只遮目標。
-        if s.keep_imm:
-            hits, seedlen = _all_hits(img, sig, mask)
-            tier, used, targets = "keep-imm", mask, ()
-        else:
-            hits, seedlen = _all_hits(img, sig, m_full)
-            tier, used = "full", m_full
-            if len(hits) != 1:
-                hits2, seedlen2 = _all_hits(img, sig, m_only)
-                if len(hits2) == 1:
-                    hits, seedlen = hits2, seedlen2
-                    tier, used = "only-target", m_only
+        # 跟 warm() 同一套策略：全遮優先，不唯一才退回只遮目標；
+        # 有字串錨的段先用字串內容過濾一輪（見 locate.str_ok）。
+        def _hits(m):
+            h, n = _all_hits(img, sig, m)
+            return [x for x in h if locate.str_ok(img, base, x, s)], n
+
+        hits, seedlen = _hits(m_full)
+        tier, used = "full", m_full
+        if len(hits) != 1:
+            hits2, seedlen2 = _hits(m_only)
+            if len(hits2) == 1:
+                hits, seedlen = hits2, seedlen2
+                tier, used = "only-target", m_only
         masked = sum(1 for a, b in zip(mask, used) if a and not b)
         name = f"{s.module}.{s.attr}"
         row = (f"{name:<24} {s.kind:<4} {tier:<11} hits={len(hits)} "
                f"seed={seedlen}B masked={masked}B targets={list(targets)}")
         ok = len(hits) == 1
+        moved = False
         if ok:
             off = hits[0]
             if s.kind == "fn":
@@ -110,51 +111,57 @@ def main() -> int:
                     ok = False
                     row += " ✗交叉驗證失敗（多個目標視窗不同值）"
             row += f" got={got:#x} known={s.known:#x}"
-            if got != s.known:
-                ok = False
-                row += " ✗讀回值 ≠ known（同版遊戲上不該發生）"
+            # ⚠ got ≠ known **不是壞掉**：遊戲改版之後本來就該不一樣，
+            #   那正是「特徵自動跟上了」的證據。真正的壞是沒命中／模糊／
+            #   交叉驗證對不齊。以前這裡一律算 BAD，改版當天會看到
+            #   「壞 43 段」的假警報，把真的 4 段淹掉。
+            if got != s.known and ok:
+                moved = True
+                row += " ← 改版位移（特徵有跟上；known 只是當年的紀錄）"
         else:
             row += (" ✗多重命中（模糊）：" +
                     ", ".join(f"{base + h:#x}" for h in hits[:8])
                     if hits else " ✗沒命中")
         if not ok:
             bad += 1
-        lines.append(("OK   " if ok else "BAD  ") + row)
+        nmoved += moved
+        lines.append(("MOVED" if moved else "OK   " if ok else "BAD  ") + row)
 
-    lines += ["", f"共 {len(locate.SIGS)} 段，壞 {bad} 段。", "",
-              "--- 模擬改版：把映像副本裡的目標位址改掉，看還定不定得到 ---",
+    lines += ["", f"共 {len(locate.SIGS)} 段：壞 {bad} 段、改版位移 {nmoved} 段。",
+              "",
+              "--- 模擬改版：把映像副本裡的目標值改掉，看還定不定得到 ---",
               "（⚠ 純記憶體副本運算，不碰遊戲。舊的『模擬改版 17/17』是改 Python",
-              "  常數、映像沒動，測不到特徵把答案寫死的問題 —— 這裡才測得到。）"]
+              "  常數、映像沒動，測不到特徵把答案寫死的問題 —— 這裡才測得到。）",
+              "（改的是**現在**讀回來的值，不是 known —— 不然改版後這段整批假失敗。）"]
     sim_bad = 0
     SHIFT = 0x2000
     for s in locate.SIGS:
-        if s.kind != "data":
-            continue
+        if s.kind == "fn":
+            continue                      # fn 的答案是命中位址本身，沒得改
         name = f"{s.module}.{s.attr}"
         sig, mask = locate._parse(s.pattern)
         m_full, m_only, targets = locate._auto_mask(
             sig, mask, s.known, base + 0x1000, base + info.size)
-        if s.keep_imm:
-            lines.append(f"SKIP {name:<24} keep_imm（位址即錨，已知會定位失敗）")
-            continue
-        off = locate._find_unique(img, sig, m_full)
+        off = locate._find_unique(img, sig, m_full, s, base)
         used = m_full
         if off is None:
-            off = locate._find_unique(img, sig, m_only)
+            off = locate._find_unique(img, sig, m_only, s, base)
             used = m_only
         if off is None:
             sim_bad += 1
             lines.append(f"BAD  {name:<24} 原始映像就定位不到")
             continue
-        # 把這一段裡所有「等於 known」的視窗都改成 known+SHIFT
+        # 把這一段裡所有「等於現在這個值」的視窗都改成 值+SHIFT
+        k0 = off + (s.imm_at or 0)
+        cur = int.from_bytes(img[k0:k0 + 4], "little")
         patched = bytearray(img)
-        new_val = s.known + SHIFT
-        for t in (targets or (s.imm_at or 0,)):
+        new_val = cur + SHIFT
+        for t in set(targets) | {s.imm_at or 0}:
             k = off + t
-            if int.from_bytes(patched[k:k + 4], "little") == s.known:
+            if int.from_bytes(patched[k:k + 4], "little") == cur:
                 patched[k:k + 4] = new_val.to_bytes(4, "little")
         pimg = bytes(patched)
-        off2 = locate._find_unique(pimg, sig, used)
+        off2 = locate._find_unique(pimg, sig, used, s, base)
         got2 = None
         if off2 is not None:
             k = off2 + (s.imm_at or 0)
@@ -163,7 +170,7 @@ def main() -> int:
         if not ok2:
             sim_bad += 1
         lines.append(("OK   " if ok2 else "BAD  ") +
-                     f"{name:<24} 位址 {s.known:#x} → {new_val:#x}：" +
+                     f"{name:<24} 值 {cur:#x} → {new_val:#x}：" +
                      ("重新定位成功" if ok2 else
                       f"失敗（找到 {got2 if got2 is None else hex(got2)}）"))
     lines += ["", f"模擬改版：壞 {sim_bad} 段。"]
@@ -171,9 +178,13 @@ def main() -> int:
     os.makedirs(os.path.dirname(REPORT), exist_ok=True)
     with open(REPORT, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+    # 主控台只印壞掉的那幾行＋結論（全量在報告檔裡，見 CLAUDE.md 的省 token 規定）
     for ln in lines:
-        print(ln)
-    print(f"\n報告：{REPORT}")
+        if ln.startswith("BAD"):
+            print(ln)
+    print(f"\n共 {len(locate.SIGS)} 段：壞 {bad} 段"
+          f"（其中模擬改版 {sim_bad} 段）、改版位移 {nmoved} 段。")
+    print(f"報告：{REPORT}")
     return 1 if bad else 0
 
 

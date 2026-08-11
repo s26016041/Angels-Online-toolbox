@@ -149,7 +149,7 @@ CHANNEL = 0x00890810        # 頻道／分流，**1 byte、0 起算**
 PROTECT_HASH = 0x00890814   # 保護密碼的 MD5，32 個十六進位小寫字（不補 NUL）
 PROTECT_LEN = 32            # ENTER_FN 就是從這裡 strncpy 0x20 bytes 進封包
 APP_PTR = 0x0089096C        # 應用程式主物件；伺服器陣列掛在它 +0x500/+0x504
-SERVER_INDEX = 0x00890CA8   # 登入時選中的伺服器索引（進陣列用）
+SERVER_INDEX = 0x00890C88   # 登入時選中的伺服器索引（進陣列用）
 EULA_OK = 0x00890FFC        # 「授權合約已同意」旗標，1 byte
 
 # 登入畫面物件上的欄位

@@ -205,11 +205,16 @@ class MaxTracker:
 #   ⚠ 這是結構偏移（同一塊配置內的位置），屬於「大更新改版面才會壞」那一類；
 #     壞掉也只是**變慢**，不會讀到錯的東西 —— 因為 `_signature_ok()` 會擋下來，
 #     然後自動退回底下那條全掃。
-STATS_FROM_MGR = 0xCB88
+#   ⚠⚠ 2026-08-11 改版真的變了：0xCB68 → 0xCB08（−0x60）。症狀就是上面說的
+#     「只是變慢」—— 一聲不吭每拍全掃。所以現在改成**跟著 AOB 自動定位**：
+#     locate.SIGS 的 `player.VT_OFF_FROM_MGR` 從狀態物件建構函式那道
+#     `mov [edi+偏移], 角色屬性vtable` 直接把偏移讀回來（同一段特徵也解出
+#     VTABLE_RVA）。下面這個值只是「還沒 warm() 或定位失敗」時的退路。
+VT_OFF_FROM_MGR = 0xCB08          # 角色屬性物件的 vtable 在狀態物件裡的位置
 
 
 def locate_fast(scanner) -> int | None:
-    """不必全掃的捷徑：狀態物件 + `STATS_FROM_MGR`，**驗過 vtable 才算數**。
+    """不必全掃的捷徑：狀態物件 + `VT_OFF_FROM_MGR`，**驗過 vtable 才算數**。
 
     為什麼值得做：`locate()` 的全掃要 0.4~1 秒／台，而換頻道／換地圖之後
     物件會搬家 —— 那幾秒等級／HP／MP 全部讀不到，休息與補給判斷都是瞎的
@@ -227,7 +232,8 @@ def locate_fast(scanner) -> int | None:
     mgr = struct.unpack("<I", bytes(raw))[0]
     if not 0x10000 < mgr < 0x7FFF0000:
         return None
-    base = mgr + STATS_FROM_MGR
+    # 角色資料基準 = vtable 位置 − OFF_VTABLE（OFF_VTABLE 是負的 −0x20）
+    base = mgr + VT_OFF_FROM_MGR - OFF_VTABLE
     return base if _signature_ok(scanner, base + OFF_VTABLE, vtable) else None
 
 
