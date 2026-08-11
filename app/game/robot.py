@@ -191,6 +191,7 @@ AS_TOBUY_NUM = 1517          # AS_INTLIST_TOBUYNUM
 #   **內嵌陣列、永不搬家**，所以從外面照遊戲的步驟寫是安全的：
 #   append＝先寫元素、再把筆數 +1（0x54DF4C 就是這兩步）。
 VAR_T_INTLIST = 4
+VAR_T_STRLIST = 6            # 字串清單（元素是指標，指向 **UTF-8** 內容）
 _L_COUNT, _L_ELEMS, _L_CAP = 0x0C, 0x10, 0x7CF
 # 清單類編輯完，遊戲的 add/set/remove 收尾都會把管理員單例 +0x4C 的
 # 髒 byte 設 1（0x54EDEF 整支就這一行）—— 我們編輯完也照做，
@@ -213,6 +214,44 @@ REVIVE_SOUL, REVIVE_RECALL, REVIVE_SPOT = 0, 1, 2   # 靈魂／回城／原地
 # 畫面同步用的勾選框控制項 id（XML 裡的固定值，不是執行期代號）
 SUPPLY_SCROLL_CHECK_ID = 10073   # 補給頁「使用標記傳送捲軸回練功點」
 REVIVE_CHECK_ID = 14100          # 輔助頁「陣亡時自動復活」
+
+# ★★ 「生產」面板（CreateAutoProduceWindow）的兩顆勾選框。
+#   DATAID 是**逼出來的，不是照名字猜的** —— 三個獨立來源都對得上：
+#     ① `tools/dump_lua_globals.py`（純讀遊戲的 Lua 全域常數）：
+#          DATAID_AUTO_GATHER_CHECK = 2311
+#          DATAID_DESIGNATED_GATHER_CHECK = 2320
+#          PRODUCE_RES_DIFF = 12000
+#     ② `tools/dump_lua_fn.py` 反組譯那兩顆勾選框自己的 handler
+#        （`OnClickAutoGatherCheckBtn`／`OnClickDesignatedGatherCheckBtn`）：
+#          兩支都是 `SaveCheckButtonForDATAID(視窗, 按鈕, DATAID, PRODUCE_RES_DIFF)`，
+#          而 `SaveCheckButtonForDATAID` 整支就是
+#              window.find(視窗, DATAID + RES_DIFF) == 按鈕
+#                  → game.setrobotvar_bool(DATAID, window.ischeck(按鈕))
+#          → 這兩項就是這棵樹上的 **bool**，跟補給頁那些同一種東西。
+#     ③ 交叉驗證：控制項 id = DATAID + 12000，而 wndtext 裡
+#        14311 = 「自動採集」、14320 = 「採集指定資源」，跟畫面上的字一致。
+#   ⚠ 「自動採集」的 handler 自己還會關掉自動攻擊（AF_BOL_ISAUTOFIGHT）並
+#     記下採集中心點 —— 我們只把值設成 False（關掉），那些副作用是**開**的
+#     時候才會發生的，不會被我們觸發。
+AS_AUTO_GATHER = 2311        # 生產頁「自動採集」
+AS_DESIGNATED_GATHER = 2320  # 生產頁「採集指定資源」
+# 勾「自動採集」時遊戲**連帶**會做的事（照抄 OnClickAutoGatherCheckBtn 的
+# bytecode，順序也一樣）：設採集中心點與地圖、清掉「用過傳送道具」旗標、
+# **關掉自動攻擊**（採集跟打怪互斥，遊戲自己就是這樣）、關掉練功技能。
+AS_GATHER_ORG_MAP = 2312     # 採集中心點在哪張地圖
+AS_GATHER_RANGE = 2313       # 採集搜尋範圍（格；五台實測都是 20）
+AS_GATHER_ORG_X = 2314       # 中心點 X ── ★ 單位是**格子 × 32**
+AS_GATHER_ORG_Y = 2315       # 中心點 Y    （廚狐實測 7600 = 237.5 格 × 32）
+AS_USED_TP_ITEM = 2000       # DATAID_USED_TP_ITEM
+AS_EXERCISE_SKILL = 2090     # DATAID_EXERCISE_SKILL_CHECK（輔助頁「練功技能」）
+# 「採集指定資源」的目標清單。**字串**清單（型別 6），存的就是資源名字。
+# ⚠⚠ 這一份**只能走 Lua**：五台實機都還沒有這筆記錄，建記錄要 malloc＋插
+#   紅黑樹、加一筆要在遊戲的字串池裡建 TString —— 都不是從外面能做的。
+#   2026-08-11 為此讓 `lua.call` 支援字串參數（lua.PUSHSTRING_FN）。
+#   ★ 為什麼非做不可：只設「採集中心點」擋不住精靈採別種東西 ——
+#     使用者實測「選了魚藻，她跑去採花叢」。中心點只決定「去哪一帶」，
+#     要**只採某幾種**就得填這份清單並開 AS_DESIGNATED_GATHER。
+AS_DESIGNATED_RES_LIST = 2323
 
 # ★★ 補血／補魔藥水設在「天使輔助精靈」那一頁，用 DATAID 存（也是 robot var）。
 #   每一格是一對：`DATAID` 放**型別**、`DATAID + 10` 放**值**。
@@ -492,7 +531,8 @@ def ensure_buy_item(mover, scanner, item_id: int, keep: int) -> str | None:
 def apply_prefs(mover, scanner, *, main_switch: bool = False,
                 jump_back: bool = False,
                 revive_mark: bool = False,
-                supply: bool = False) -> list[str]:
+                supply: bool = False,
+                produce: bool = False) -> list[str]:
     """照掛機分頁的勾選把精靈調成該有的樣子。回傳實際動了哪些（給人看）。
 
     ★ 只「往要的方向推」：每一項都先純記憶體讀，已經是對的就完全不碰 Lua。
@@ -514,6 +554,10 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
                      免得補給跑了裝沒修、翼用完了下一趟連回程都回不去。
                      ★ 購買清單**只加翼這一項**，他原本設的都不動；
                        翼已經設更多也不改小（見 `ensure_buy_item`）。
+    · produce        開始自動生產 → 生產頁的「自動採集」「採集指定資源」
+                     **兩個都關掉**（使用者要求）：那兩項會讓精靈跑去採集
+                     （「自動採集」自己還會關掉自動攻擊、把中心點設在原地），
+                     跟我們要它做的生產是兩回事。
     """
     notes: list[str] = []
 
@@ -550,7 +594,173 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
         if note:
             notes.append(note)
 
+    if produce:
+        # ★ 只往「關掉」推：本來就是關的完全不碰（連寫入都不會發生）。
+        for var_id, label in ((AS_AUTO_GATHER, "自動採集"),
+                              (AS_DESIGNATED_GATHER, "採集指定資源")):
+            ok, cur = get_bool(mover, scanner, var_id)
+            if ok and cur is not False:
+                set_bool(mover, scanner, var_id, False)
+                notes.append(f"關了「{label}」")
+
     return notes
+
+
+def res_list(mover, scanner) -> list[str] | None:
+    """讀「目標資源列表」現在有哪幾種。讀不到回 None（**不是空清單**）。
+
+    ★ 走 Lua 的 `robotvar_getnum_list` + `getrobotvar_stringlist`：字串清單的
+      元素是指標，指向什麼還沒驗過版面，猜著讀等於拿垃圾當答案。
+      這是「寫完要對帳」用的，一輪只叫幾次，成本可以接受。
+    """
+    ok, n = lua.call(mover, scanner, "game.robotvar_getnum_list",
+                     AS_DESIGNATED_RES_LIST)
+    if not ok or not isinstance(n, (int, float)):
+        return None
+    out: list[str] = []
+    for i in range(int(n)):
+        ok, v = lua.call(mover, scanner, "game.getrobotvar_stringlist",
+                         AS_DESIGNATED_RES_LIST, i)
+        if not ok:
+            return None
+        out.append(str(v))
+    return out
+
+
+def set_res_list(mover, scanner, names: list[str]) -> tuple[bool, str]:
+    """把「目標資源列表」換成 `names`，**寫完讀回來對帳**。
+
+    回傳 (成功嗎, 說明)。任何一步不成就回 False —— 呼叫端要**大聲**降級
+    （不開「採集指定資源」），絕不能一邊說「只採魚藻」一邊讓精靈亂採。
+
+    ⚠ 走 Lua（唯一的路，見 AS_DESIGNATED_RES_LIST 的說明）。呼叫次數＝
+      1 + 名字數 + 對帳，只在按下開始時做一次，不放進心跳。
+    """
+    ok, why = lua.call(mover, scanner, "game.robotvar_clear_list",
+                       AS_DESIGNATED_RES_LIST)
+    if not ok:
+        return False, f"清空清單失敗（{why}）"
+    for name in names:
+        ok, why = lua.call(mover, scanner, "game.robotvar_add_stringlist",
+                           AS_DESIGNATED_RES_LIST, name)
+        if not ok:
+            return False, f"加「{name}」失敗（{why}）"
+    # ★★ 對帳直接讀**記錄的原始位元組**，不走 Lua。兩個理由：
+    #   ⚠ Lua 的 `robotvar_getnum_list` 在 add 完**立刻問會回 0**（實測），
+    #     拿它對帳會誤報失敗、把設好的東西又當成沒設好。
+    #   ⚠⚠ 更重要：**比對解碼後的字串擋不住編碼錯誤** —— 讀取端有 big5
+    #     退路，名字編成 big5 寫進去，讀回來照樣解得出同一個字，看起來
+    #     「一致」。2026-08-11 就是這樣被騙過去：遊戲比對不到、面板顯示
+    #     不出來，我們卻回報「設好了」。所以比的是**位元組**，而遊戲存的
+    #     是 UTF-8（使用者手動加一筆並排比對確認的）。
+    rec = _find_var(scanner, AS_DESIGNATED_RES_LIST)
+    if not isinstance(rec, int):
+        return False, "寫完找不到那筆記錄"
+    head = scanner._read_bytes(rec, _L_ELEMS)
+    if not head or head[_V_TYPE] != VAR_T_STRLIST:
+        return False, "那筆記錄不是字串清單"
+    n = struct.unpack_from("<i", bytes(head), _L_COUNT)[0]
+    if n != len(names):
+        return False, f"筆數對不上（寫了 {len(names)} 筆，記錄裡是 {n}）"
+    for i, name in enumerate(names):
+        ptr = _u32(scanner, rec + _L_ELEMS + i * 4)
+        raw = scanner._read_bytes(ptr, 128) if ptr else None
+        got = bytes(raw).split(b"\x00")[0] if raw else b""
+        if got != name.encode("utf-8"):
+            return False, f"「{name}」寫進去的位元組不對（{got!r}）"
+    return True, ""
+
+
+def begin_gather(mover, scanner, center: tuple[float, float],
+                 scene_id: int, names: list[str] | None = None) -> list[str]:
+    """讓精靈開始自動採集。回傳「實際做了哪些事」給人看。
+
+    ## 為什麼是交棒給精靈，不自己走位
+
+    採集這件事遊戲自己就整套做完了 —— 走過去、採、**採完換下一個**、
+    範圍內沒了會找別的（`AS_GATHER_RANGE`）。我們自己做只會更差，
+    而且要多送一堆指令。跟回程補給同一個分工。
+
+    ## 做的事＝照抄遊戲那顆勾選框的 handler
+
+    `OnClickAutoGatherCheckBtn` 勾起來時做的（bytecode 反組譯，順序照抄）：
+        中心點 ← 現在的位置、中心地圖 ← 現在的地圖
+        DATAID_USED_TP_ITEM ← false
+        **自動攻擊 ← false**（採集跟打怪互斥，遊戲自己就是這樣關的）
+        練功技能 ← false
+        自動採集 ← true
+    ⚠ 我們**只多做兩件**：
+      ① 中心點不一定放在腳下，可以放在使用者選的那種資源上（呼叫端算好
+         傳進來），這樣精靈就會往他要的東西那邊採。
+      ② `names` 有給就填「目標資源列表」＋開「採集指定資源」——
+         **中心點擋不住它採別種**（使用者實測：選了魚藻卻去採花叢），
+         要只採某幾種非填這份清單不可。
+         ⚠ 清單寫不進去就**不開**那個開關，並在回傳的說明裡講出來：
+           寧可誠實地「全都採」，也不要嘴上說只採魚藻卻在採花叢。
+    ⚠ 「自動採集」的記錄五台都已經存在（型別 bool），所以那條是純記憶體
+      寫入；只有記錄不存在時才會退回 Lua（`set_bool` 自己會處理）。
+    """
+    notes: list[str] = []
+
+    if names:
+        good, why = set_res_list(mover, scanner, names)
+        if good:
+            set_bool(mover, scanner, AS_DESIGNATED_GATHER, True)
+            notes.append("只採：" + "、".join(names))
+        else:
+            set_bool(mover, scanner, AS_DESIGNATED_GATHER, False)
+            notes.append(f"⚠ 指定資源設不進去（{why}）→ 這次會採**全部**種類")
+    else:
+        # 沒指定＝採全部。⚠ 一定要主動把開關關掉：上一輪可能開著，
+        #   留著的話清單還是舊的，等於在採使用者這次沒選的東西。
+        ok, cur = get_bool(mover, scanner, AS_DESIGNATED_GATHER)
+        if ok and cur is not False:
+            set_bool(mover, scanner, AS_DESIGNATED_GATHER, False)
+    cx, cy = int(center[0] * TILE), int(center[1] * TILE)
+    if scene_id is not None:
+        set_int(mover, scanner, AS_GATHER_ORG_MAP, int(scene_id))
+    set_int(mover, scanner, AS_GATHER_ORG_X, cx)
+    set_int(mover, scanner, AS_GATHER_ORG_Y, cy)
+    notes.append(f"採集中心點設在 ({center[0]:.0f}, {center[1]:.0f})")
+
+    for var_id, want, label in ((AS_USED_TP_ITEM, False, ""),
+                                (AF_IS_AUTO_FIGHT, False, "自動攻擊"),
+                                (AS_EXERCISE_SKILL, False, "練功技能")):
+        ok, cur = get_bool(mover, scanner, var_id)
+        if ok and cur is not want:
+            set_bool(mover, scanner, var_id, want)
+            if label:
+                notes.append(f"關了「{label}」")
+
+    ok, cur = get_bool(mover, scanner, AS_AUTO_GATHER)
+    if ok and cur is not True:
+        set_bool(mover, scanner, AS_AUTO_GATHER, True)
+    notes.append("開了「自動採集」")
+
+    if not is_run(scanner):
+        good, why = set_run(mover, scanner, True)
+        notes.append("開了天使守護精靈"
+                     if good else f"⚠ 天使守護精靈開不起來（{why}）")
+    return notes
+
+
+def end_gather(mover, scanner) -> list[str]:
+    """停止自動採集。**只關「自動採集」**，其他設定不動。
+
+    ⚠ 不把自動攻擊開回去 —— 那是使用者自己的設定，我們只負責關掉
+      我們開的東西（跟 apply_prefs 同一個原則）。
+    """
+    ok, cur = get_bool(mover, scanner, AS_AUTO_GATHER)
+    if ok and cur is not False:
+        set_bool(mover, scanner, AS_AUTO_GATHER, False)
+        return ["關了「自動採集」"]
+    return []
+
+
+def gather_running(scanner) -> bool:
+    """精靈現在是不是「自動採集開著而且主開關也開著」（純讀）。"""
+    return bool(_read_var(scanner, AS_AUTO_GATHER, VAR_T_BOOL)) and is_run(
+        scanner)
 
 
 def begin_supply(mover, scanner) -> list[str]:
@@ -844,7 +1054,8 @@ def has_recall_item(scanner, inv_head: int) -> tuple | None:
     return ()
 
 
-def do_recall(mover, scanner, inv_head: int) -> tuple[bool | None, str]:
+def do_recall(mover, scanner, inv_head: int,
+              need_robot: bool = True) -> tuple[bool | None, str]:
     """觸發的**第二段**：用掉回程道具。第一段是 `begin_supply()`。
     回傳 (成功嗎, 說明)；第一個值 **None = 暫時性失敗，過幾秒重試就好**。
 
@@ -883,7 +1094,13 @@ def do_recall(mover, scanner, inv_head: int) -> tuple[bool | None, str]:
     if not got:
         return False, f"背包裡沒有{itemname.label(recall.RECALL_ITEM)}"
     slot, count = got
-    if not is_run(scanner):
+    # ⚠ 這道檢查是**給精靈補給那條路用的**：那一趟是「讓精靈帶我們回城修裝
+    #   買東西」，精靈沒在跑就白回。
+    # ★ 但「自己用掉一張翼」不需要精靈 —— 自動生產那邊的流程第一步就是
+    #   **關掉主開關**再回程（使用者指定），檢查照做只會自相矛盾：
+    #   2026-08-12 使用者實測就是卡在「天使精靈不在執行中，這趟取消」。
+    #   → 那種呼叫端傳 need_robot=False。
+    if need_robot and not is_run(scanner):
         return False, "天使精靈不在執行中（旗標沒變）"
     if not recall.use_item(mover, slot):
         return False, "回程道具送不出去"

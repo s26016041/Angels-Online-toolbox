@@ -776,6 +776,47 @@ class Mover:
         finally:
             self._lock.release()
 
+    def walk_exact(self, scanner, player_obj: int,
+                   tile_x: float, tile_y: float) -> bool:
+        """**精確走到那一格**（不留距離、不尋路）。
+
+        跟 `walk_near` 是同一條路（送 `WALK_FN` 目的地讓遊戲自己走），
+        差別只有一個：**不套 `MIN_GAP`**。
+
+        ⚠ 為什麼要分開一支：`MIN_GAP`(1.4) 是**為了打怪**才有的 ——
+          停在怪身體裡會被判定重疊。但「使用者自己站過的格子」
+          （製作檯位置、定位點）沒有這個問題，硬套下限的結果就是
+          **永遠差一格多**，使用者 2026-08-12 回報「走過去跟我定的位置不同」。
+        ⚠ 終點必須是**真的可走的格子**（見 [[walk-to-monster-rules]] 規則①）
+          —— 呼叫端要保證，這裡不檢查。使用者站過的地方本來就可走。
+        ⚠ 一樣走 `WALK_FN` 不是 `MOVE_FN`（規則②）。
+        ★ 只給短距離用：長距離請走 `navigate.Navigator`（讀地形圖算 A*）。
+        """
+        if not self._active or not player_obj:
+            return False
+        this = pathfinder_this(scanner)
+        if not this:
+            return False
+        raw = scanner._read_bytes(player_obj + entity.OFF_POS_X, 8)
+        if not raw:
+            return False
+        wx, wy = (v >> 16 for v in struct.unpack("<II", raw))
+        with self._wanted_lock:            # 跟 walk_near 一樣要舉手搶指令槽
+            self._wanted += 1
+        try:
+            got = self._lock.acquire(timeout=SLOT_YIELD)
+        finally:
+            with self._wanted_lock:
+                self._wanted -= 1
+        if not got:
+            return False
+        try:
+            return self.call(WALK_FN, this, wx, wy,
+                             int(tile_x * entity.TILE_UNITS) & 0xFFFF,
+                             int(tile_y * entity.TILE_UNITS) & 0xFFFF, 0)
+        finally:
+            self._lock.release()
+
     @staticmethod
     def read_path(scanner, count: int) -> list[tuple[float, float]]:
         """讀出剛才 path_to() 算好的路徑點（格子座標）。

@@ -36,7 +36,7 @@ from app.core.memory import MemoryScanner                   # noqa: E402
 from app.game import bag, energy, entity, inventory         # noqa: E402
 from app.game import locate, monsters, move, player         # noqa: E402
 from app.game import quickbar, scene, skillcost, skills     # noqa: E402
-from app.game import team, terrain                          # noqa: E402
+from app.game import scenery, team, terrain                 # noqa: E402
 
 OUT = ROOT / "reports" / "offset_verify.txt"
 NA = None                       # 「這台驗不了」
@@ -48,6 +48,7 @@ NA = None                       # 「這台驗不了」
 COVERS: tuple[tuple[str, str], ...] = (
     ("entity", "OFF_TARGET"), ("entity", "OFF_TARGET_HP_GAP"),
     ("entity", "OFF_POS_"), ("entity", "OFF_ID"), ("entity", "OFF_STATE"),
+    ("entity", "OFF_WEIGHT"), ("entity", "OFF_WEIGHT_MAX"),
     ("team", "MEMBERS_OFF"), ("team", "MEMBER_STRIDE"),
     ("energy", "OFF_"),
     ("quickbar", "TABLE_OFF"),
@@ -62,6 +63,7 @@ COVERS: tuple[tuple[str, str], ...] = (
     ("skillcost", "OFF_"),
     ("scene", "OFF_SCENE_ID"),
     ("terrain", "OFF_W"), ("terrain", "OFF_H"), ("terrain", "OFF_ROWS"),
+    ("scenery", "OFF_MODEL"),
 )
 
 
@@ -168,6 +170,18 @@ def checks(sc, log):
         put("座標 entity.OFF_POS_X/Y 對地形圖", inside,
             f"{pos[0]:.1f},{pos[1]:.1f} vs 地圖 {grid.w}x{grid.h}")
 
+    # entity.OFF_WEIGHT / OFF_WEIGHT_MAX：負重要是「0 < 現值 <= 上限」，
+    # 而且上限說得通（實測五台 11308~34860）。版面搬家的話這兩格會變成
+    # 別的欄位 —— 幾乎不可能同時滿足這三個條件，所以會紅。
+    wt = entity.weight(sc, pl) if pl else None
+    if wt is None:
+        put("負重 entity.OFF_WEIGHT", NA, "讀不到（沒進場／版面變了）")
+    else:
+        cur, cap = wt
+        put("負重 entity.OFF_WEIGHT",
+            0 < cap < 1 << 22 and 0 <= cur <= cap,
+            f"{cur} / {cap}（{cur * 100.0 / cap:.0f}%）")
+
     # entity.OFF_ID：每隻唯一 + 玩家自己的 ID 要跟場景管理器記的一致
     if ents:
         uniq = len({e.eid for e in ents}) == len(ents)
@@ -255,6 +269,23 @@ def checks(sc, log):
         put("背包欄位 bag.ITEM_*",
             slot_ok == len(items) and dura_ok and named > 0,
             f"{len(items)} 件、格號合法 {slot_ok}、查得到名字 {named}")
+
+    # scenery：可以點的佈景物件（製作檯就是其中一個）。
+    # 不變量：讀得到一些、每一筆的 ID 低 16 位＝表格索引（nearby 自己就在驗，
+    # 這裡再拿座標範圍當第二票）、座標落在地形圖裡面。
+    me = entity.player_pos(sc, (move.pathfinder_this(sc) or 0) + 8)
+    props = scenery.nearby(sc, me, 25.0) if me else None
+    if not props:
+        put("可點物件 scenery.VT_SCENERY", NA,
+            "附近沒有可點物件／讀不到（換張有東西的圖再驗）")
+    else:
+        grid, _msg = terrain.load(sc)
+        inside = all(0 <= p.x < (grid.w if grid else 4096)
+                     and 0 <= p.y < (grid.h if grid else 4096) for p in props)
+        ids_ok = all((p.oid & 0xFFFF) and p.model for p in props)
+        put("可點物件 scenery.VT_SCENERY", inside and ids_ok,
+            f"{len(props)} 個、最近 {props[0].dist(me):.1f} 格"
+            f"、外觀 {props[0].model}")
     return out
 
 

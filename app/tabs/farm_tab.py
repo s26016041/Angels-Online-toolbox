@@ -1711,8 +1711,9 @@ class CharFarmPage(QWidget):
 
         # ★ 依分類分組（使用者要求）：原本 5 條平鋪的橫列很難一眼看懂哪個是
         #   哪個，改成有標題的方框、排成兩欄，垂直空間也省下來給下面的清單。
-        # ★ 沒有「掃描周圍怪物」按鈕：分頁一開就會自動持續刷新（見 tick），
-        #   所以「周圍怪物」永遠是即時的，也不必先掃過才能開始掛機。
+        # ★ 「周圍怪物」下面有「掃描周圍怪物」鈕（2026-08-11 使用者要求）：
+        #   沒在掛機時清單不會自己更新，要按才掃；掛機中照舊自動刷新。
+        #   ⚠ 不必先掃過才能開始掛機 —— 按下開始的當下就會排一次掃描。
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(4)
@@ -2084,6 +2085,17 @@ class CharFarmPage(QWidget):
         self.near.itemClicked.connect(
             lambda it: self._add_name(it.data(Qt.UserRole) or it.text()))
         rv.addWidget(self.near)
+        # ★ 使用者要求（2026-08-11）：**沒在掛機時改成按按鈕才掃**，
+        #   不要一直刷。掛機中仍然自動刷新 —— 見 tick 裡那段說明。
+        self.scan_btn = QPushButton("掃描周圍怪物")
+        self.scan_btn.setToolTip(
+            "掃一次周圍有哪些怪（純讀記憶體，不會對遊戲做任何事）。\n"
+            "・沒在掛機時清單**不會自己更新**，要看最新的就按這顆\n"
+            "・切到這台分身時會自動掃一次，免得看到的是上次留下的清單\n"
+            "★ 掛機中不必按：那時清單本來就會一直自動刷新（要靠它接下一隻怪、"
+            "跟人搶怪）。")
+        self.scan_btn.clicked.connect(self._scan_now)
+        rv.addWidget(self.scan_btn)
         # 「周圍怪物」多一個「【王】」字首
         fit_list(right, self.near, "【王】曼陀羅怪菇菌絲體")
         panes.addWidget(right, 1)
@@ -2933,6 +2945,16 @@ class CharFarmPage(QWidget):
         if sid is None:
             return True
         return scene.same_map(sid, self._scene)
+
+    def _scan_now(self) -> None:
+        """「掃描周圍怪物」鈕：排一次掃描。
+
+        ★ 只是把「距離上次掃描」推到門檻以上，下一拍心跳（10ms）就會送請求；
+          **不繞過 `_waiting` 那個閂**，也不會多送重複的請求。
+        """
+        self._since_scan = SCAN_NOW
+        if not self.run_cb.isChecked():
+            self.status.setText("掃描中…")
 
     # ------------------------------------------------------------------
     # -- 巡邏點 --------------------------------------------------------
@@ -3956,11 +3978,23 @@ class CharFarmPage(QWidget):
             self._wait_t = 0.0
 
         self._since_scan += dt
-        # ★★ 只有兩檔（見 IDLE_SCAN_GAP）：有人在看、或這台在掛機 → 快檔。
-        # ⚠ `isVisible()` 對「沒被切到的子分頁」與「整個掛機分頁沒被選到」
-        #   都是 False，一句就涵蓋兩種情形。
-        gap = (REFRESH_GAP if (self.run_cb.isChecked() or self.isVisible())
-               else IDLE_SCAN_GAP)
+        # ★★ 2026-08-11 起只剩一檔自動的（使用者要求「掃周圍怪物改成按鈕」）：
+        #       掛機中     → REFRESH_GAP 自動刷新
+        #       沒在掛機   → **完全不自動掃**，只有明確要求時才掃
+        #                    （「掃描周圍怪物」鈕、切到這台、換地圖／重連、
+        #                      清單裡挑不到目標…那些地方都是把 `_since_scan`
+        #                      推到 SCAN_NOW）
+        # ⚠⚠ 掛機中**不能**改成手動：那份掃描是拿來接下一隻怪、跟人搶怪的，
+        #   停掉等於打完一隻就發呆（memory 的 farm-scan-refresh-tiers）。
+        # ⚠ 沒在掛機而且沒人要求時要把累加值**夾住** —— 不夾的話開著十幾分鐘
+        #   自己就會越過 SCAN_NOW 的門檻，又變回會自動掃。
+        asked = self._since_scan >= SCAN_NOW
+        if not self.run_cb.isChecked():
+            if not asked:
+                self._since_scan = min(self._since_scan, IDLE_SCAN_GAP)
+            gap = SCAN_NOW
+        else:
+            gap = REFRESH_GAP
         if self._since_scan >= gap and not self._waiting:
             self._since_scan = 0.0
             self._waiting = True

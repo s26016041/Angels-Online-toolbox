@@ -480,6 +480,105 @@ SIGS: tuple[Sig, ...] = (
     Sig("robot", "ROBOT_READY_OFF", "off", 14,
         "57 8D 8F ?? ?? ?? ?? E8 ?? ?? ?? ?? 8D 8F ?? ?? ?? ?? C6 45 FC ?? E8",
         0x0000F2FC),
+    # lua_pushstring(L, const char*)。整支就是「s 是 NULL → 推 nil；否則
+    # 內聯 strlen 再 pushlstring」，沒有 call 也沒有內嵌位址，骨架本身就夠獨特。
+    # 找到它的方法：反組譯 game.getrobotvar_string 的收尾（push 字串 / push L /
+    # call / pop ecx ×2）。見 lua.PUSHSTRING_FN。
+    Sig("lua", "PUSHSTRING_FN", "fn", None,
+        "55 8B EC 8B 45 0C 85 C0 75 13 8B 4D 08 8B 41 08 C7 40 08 00 00 00 00"
+        " 83 41 08 10 5D C3 53 56 57 8B F8 8D 4F 01 8A 07 47 84 C0 75 F9"
+        " 8B 5D 08 2B F9 8B 4B 10 8B 41 44 3B 41 40",
+        0x006A4BC0),
+    # ── 周圍採集品（見 app/game/gather.py）──────────────────────
+    # 全部錨在生產面板「重新整理周圍資源列表」叫的那支 C 函式
+    # （Lua game 表 → game.autogatherreloadresource），它一支就把我們要的
+    # 三樣東西都用到了：世界指標、那棵樹的偏移、採集種類的偏移。
+    #
+    # ① 世界管理員的全域指標。函式頭當骨架，兩個 call 的 rel32 放萬用；
+    #    那個全域位址在這一段裡出現**兩次**（+0x1E 與 +0x38），data 類的
+    #    交叉驗證會要求兩處讀回同一個新值，所以不怕誤命中。
+    Sig("gather", "WORLD_PTR", "data", 0x1E,
+        "55 8B EC 83 EC 20 8B 45 08 8D 4D E0 53 56 6A 01 89 45 E4 C6 45 E0 00"
+        " E8 ?? ?? ?? ?? 8B 0D 9C 66 9B 00 50 8B 49 0C E8 ?? ?? ?? ?? 8B C8"
+        " 89 45 F8 E8 ?? ?? ?? ?? 8B 0D 9C 66 9B 00 8B 71 08",
+        0x009B669C),
+    # ② 採集品物件的 vtable。錨在它的建構函式（`call 基底建構 / mov [esi],vt /
+    #    mov [esi+8],第二個 vt`）。⚠ 模組內的立即值會被 _auto_mask 自動遮掉，
+    #    所以這裡不是「拿答案當錨」；骨架是那三行指令本身。
+    #    同一個 vtable 在模組裡有兩處寫入點，另一處的前後骨架完全不同
+    #    （帶 SEH），不會互相命中。
+    Sig("gather", "VT_RESOURCE", "data", 0x14,
+        "55 8B EC 51 56 FF 75 08 8B F1 89 75 FC E8 ?? ?? ?? ?? C7 06 B4 87 7D 00"
+        " 8B C6 C7 46 08 F4 87 7D 00 5E C9 C2 04 00",
+        0x007D87B4),
+    # ③ 世界物件裡那棵「場上物件」樹的偏移。錨在迴圈進入處
+    #    （`test ebx,ebx / je 收尾 / mov ecx,[esi+樹] / mov eax,[ecx] /
+    #      mov [ebp-4],eax / cmp eax,ecx`＝拿 begin 跟哨兵比）。
+    #    ⚠ off 類不會自動遮，偏移自己寫 ??。
+    Sig("gather", "OFF_TREE", "off", 0x0A,
+        "85 DB 0F 84 ?? ?? ?? ?? 8B 8E ?? ?? ?? ?? 8B 01 89 45 FC 3B C1",
+        0x00002AA8),
+    # ④ 採集種類的偏移。錨在遊戲自己的篩選那三步：
+    #    `xor eax,eax / cmp [esi+座標X],eax / je 跳過 / cmp [esi+座標Y],eax /
+    #     je 跳過 / mov edi,[esi+採集種類] / cmp edi,3`。
+    #    ⚠ 座標那兩個偏移留著當骨架（它們屬於「大更新才會壞」那類；
+    #      真的一起搬家時這段會定位失敗 → 大聲報出來，不會安靜用舊值）。
+    Sig("gather", "OFF_GATHER_KIND", "off", 0x1C,
+        "33 C0 39 86 C4 00 00 00 0F 84 ?? ?? ?? ?? 39 86 C8 00 00 00"
+        " 0F 84 ?? ?? ?? ?? 8B BE ?? ?? ?? ?? 83 FF 03",
+        0x00000184),
+    # ── 佈景／可點物件的 vtable（見 app/game/scenery.py）─────────
+    # 製作檯就是這一族，我們靠「點它」讓伺服器把製作面板開起來。
+    # 錨在它的建構函式：`call 基底建構 / xor eax,eax / mov [esi],vtable /
+    # mov [esi+0x1A4],eax / mov [esi+0x1A8],eax`。模組內的立即值（vtable 本身
+    # 與 rel32）由 _auto_mask 遮掉 —— 骨架是那幾行指令，不是答案。
+    # ⚠ 這個模子在模組裡有**三支**兄弟建構函式（0x580EC3／0x581168 是另外兩個
+    #   類別），前 40 bytes 一字不差 —— 分岔點在第四行欄位初始化：只有我們這支
+    #   是 `mov byte [esi+0x1C8],al`（88），另外兩支是 `mov [esi+0x1AC],eax`
+    #   （89）。所以特徵一定要蓋到那一行，少一行就是三重命中。
+    Sig("scenery", "VT_SCENERY", "data", 22,
+        "55 8B EC 51 56 FF 75 08 8B F1 89 75 FC E8 ?? ?? ?? ?? 33 C0"
+        " C7 06 40 81 7D 00 89 86 A4 01 00 00 89 86 A8 01 00 00"
+        " 88 86 C8 01 00 00",
+        0x007D8140),
+    # ── 製作／公會貢獻（見 app/game/recipes.py）──────────────────
+    # 前三段是「依 ID 查表」那種函式，模組裡有 41 支長得一模一樣
+    # （怪物表、技能表都是），差別只有邊界值與錯誤訊息裡的**表名字串**。
+    # ⚠ 邊界值與錯誤編號都是模組**外**的小常數，_auto_mask 不會遮，可以當
+    #   骨架；但光靠它們不保證唯一（0x1FF 到處都是），所以跟 monsters/
+    #   skillcost 一樣用 `str_at` 拿表名當最後一道 —— 位址會位移，
+    #   **表名內容不會**（見 memory 的 monster-table-aob-deadend）。
+    Sig("recipes", "MAKE_TAB", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 FF 0F 00 00 77 0A"
+        " A1 A0 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 01 10 00 00 56"
+        " 68 D4 8F 7D 00",
+        0x0098BCA0, str_at=58, str_val=b"Make"),
+    # ⚠ 貢獻品那支的骨架跟上面**不一樣**：邊界值先進 eax
+    #   （`mov eax,0x1FF / lea ecx,[esi-1] / cmp ecx,eax`），所以 imm/str
+    #   的位置也跟著移，不能照抄上面那組數字。
+    Sig("recipes", "GC_TAB", "data", 17,
+        "56 8B 75 08 B8 FF 01 00 00 8D 4E FF 3B C8 77 0A"
+        " A1 2C FD 98 00 8B 04 B0 EB 37 50 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 01 02 00 00 56"
+        " 68 30 A1 7D 00",
+        0x0098FD2C, str_at=55, str_val=b"Gcontrib"),
+    Sig("recipes", "ITEM_TAB", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 8F 5F 01 00 77 0A"
+        " A1 70 BC 98 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 91 5F 01 00 56"
+        " 68 A8 28 7D 00",
+        0x0098BC70, str_at=58, str_val=b"Item"),
+    # 「這個配方學會了沒」的位元圖偏移。錨在 `initmakeclasswnd` 逐一檢查
+    # 配方那段：`xor edx,edx / mov ecx,edi / and ecx,0x1F / inc edx /
+    # shl edx,cl / mov eax,edi / mov ecx,[ebp-0x18] / shr eax,5 /
+    # test [ecx+eax*4+位元圖], edx`。
+    # ⚠ off 類不會自動遮，偏移自己寫 ??；後面那個 call 打到的正是上面
+    #   那支 Make 查表函式，rel32 一律遮。
+    Sig("recipes", "OFF_LEARNED", "off", 21,
+        "33 D2 8B CF 83 E1 1F 42 D3 E2 8B C7 8B 4D E8 C1 E8 05"
+        " 85 94 81 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? 57 E8 ?? ?? ?? ??",
+        0x000058F8),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。

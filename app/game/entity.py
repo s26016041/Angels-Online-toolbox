@@ -111,6 +111,13 @@ ATT_STATES = ("Att", "Att2", "Cast")
 OFF_STATE = 0x12C
 STATE_MAX = 8             # 讀幾 bytes；最長的是 'Att2'
 
+# ★ 負重（只有自己的物件有意義）。2026-08-11 五台實測：現值一律小於上限、
+#   五台的上限各不相同（廚狐 34860、其他 11308~13084），跟遊戲介面對得上。
+#   ⚠ 這兩個是**結構偏移**，屬於「大更新改版面才會壞」那一類（CLAUDE.md）。
+#     讀取端要驗合理性：上限為 0 或現值 > 上限 → 當這一拍讀不到。
+OFF_WEIGHT_MAX = 0x500
+OFF_WEIGHT = 0x504
+
 
 def attacking(scanner, ent, player_obj: int) -> bool:
     """交戰槽（三個都看）裡有沒有我。
@@ -306,6 +313,29 @@ def player_pos(scanner, player_obj: int) -> tuple[float, float] | None:
         return None                       # 搬家了 —— 不准拿別人的座標當我的
     vx, vy = struct.unpack_from("<II", b, OFF_POS_X)
     return (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS
+
+
+def weight(scanner, player_obj: int) -> tuple[int, int] | None:
+    """**我自己**的 (負重現值, 負重上限)；讀不到或值說不通回 None。
+
+    ⚠ 跟 `player_pos` 同一個道理，先驗 vtable 再取值 —— 玩家物件搬家後
+      舊位址照樣讀得到，不驗就會拿別人的負重去決定「該不該回城做半成品」。
+    ⚠ 「讀不到」回 None，**不是回 0**：0 會被上層當成「身上空空」而永遠
+      不去處理負重（bag-false-empty-guards 那類誤判）。
+    """
+    if not player_obj:
+        return None
+    raw = scanner._read_bytes(player_obj, OFF_WEIGHT + 4)
+    if not raw:
+        return None
+    b = bytes(raw)
+    if struct.unpack_from("<I", b, 0)[0] != VT_PLAYER:
+        return None
+    cap = struct.unpack_from("<I", b, OFF_WEIGHT_MAX)[0]
+    cur = struct.unpack_from("<I", b, OFF_WEIGHT)[0]
+    if not 0 < cap < 1 << 30 or cur > cap:
+        return None                       # 版面搬家了 —— 不要拿垃圾值算百分比
+    return cur, cap
 
 
 def locate_state(scanner, should_stop=None) -> int | None:

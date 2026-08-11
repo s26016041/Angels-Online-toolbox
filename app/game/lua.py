@@ -29,17 +29,25 @@
 `autofight.lua:201: bad argument #1 to 'ischeck' (number expected, got boolean)`
 —— 一看就知道那個參數要傳數字而不是布林。
 
-⚠ 只支援數字與布林參數。字串要先在遊戲裡建 TString，做不到也用不到。
+⚠ 參數支援數字、布林與**字串**（字串走 `lua_pushstring`，見 PUSHSTRING_FN；
+  2026-08-11 為「採集指定資源」那份字串清單加的）。
 ⚠ 位址全部由 `app/game/locate.py` 依 AOB 自動定位，改版位移會自己跟上。
 """
 from __future__ import annotations
 
 import struct
 
-# ⚠ 這三個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
+# ⚠ 這四個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 GETFIELD_FN = 0x006A4290     # lua_getfield(L, idx, k)
 PCALL_FN = 0x006A4740        # lua_pcall(L, nargs, nresults, errfunc)
 CTX_PTR = 0x00890FF0         # [CTX_PTR] + 8 = lua_State
+# lua_pushstring(L, const char*) —— 2026-08-11 加，為了「採集指定資源」那份
+# **字串**清單（`game.robotvar_add_stringlist`）。
+# 出處：反組譯 `game.getrobotvar_string`(0x594529) 的收尾三行 ——
+#     push eax（讀出來的字串）/ push esi（L＝第一個參數）/ call 0x6A4BC0
+#     / pop ecx / pop ecx        ← cdecl、兩個參數、呼叫端清堆疊
+# ★ 它會把字串**複製進 Lua 的字串池**，所以我們那塊暫存區之後可以隨便覆寫。
+PUSHSTRING_FN = 0x006A4BC0
 
 GLOBALSINDEX = 0xFFFFD8EE    # -10002
 TOPINDEX = 0xFFFFFFFF        # -1（堆疊頂）
@@ -91,6 +99,68 @@ def state(scanner) -> int | None:
     if _u32(scanner, L + OFF_L_GT + 8) != T_TABLE:
         return None
     return L
+
+
+def globals_of(scanner, names) -> dict | None:
+    """**純讀**遊戲 Lua 的全域常數（數字／布林）。讀不到回 None。
+
+    不注入、不呼叫 Lua、不動堆疊 —— 只走全域表的雜湊節點陣列，
+    跟 `tools/dump_lua_globals.py` 同一條路（那支已經用了很久）。
+
+    用途：`WND_xxx` 這種「視窗開著沒有」的全域（開著是執行期代號、
+    關著是 0），例如製作面板的 `WND_MAKE`。跟 `robot._wnd` 同一招。
+
+    ⚠ 回傳的 dict **只含真的讀到的名字**；某個名字不在裡面代表
+      「這個全域現在不存在」，跟「讀不到整張表」（回 None）是兩件事。
+    """
+    want = set(names)
+    L = state(scanner)
+    if L is None:
+        return None
+    tab = _u32(scanner, L + OFF_L_GT)
+    if not 0x10000 < tab < 0x7FFF0000:
+        return None
+    raw = scanner._read_bytes(tab + 7, 1)
+    node = _u32(scanner, tab + 0x10)
+    if not raw or not 0x10000 < node < 0x7FFF0000:
+        return None
+    lsize = raw[0]
+    if lsize > 20:                       # 2^20 個節點已經荒謬，當版面對不上
+        return None
+    out: dict = {}
+    for i in range(1 << lsize):
+        # Node = 32 bytes：值 TValue(16) + 鍵(值 8 + tt 4 + next 4)
+        blob = scanner._read_bytes(node + i * 32, 32)
+        if not blob or len(blob) < 32:
+            continue
+        b = bytes(blob)
+        if struct.unpack_from("<I", b, 24)[0] != T_STRING:
+            continue
+        ts = struct.unpack_from("<I", b, 16)[0]
+        n = _u32(scanner, ts + OFF_TSTRING_LEN)
+        if not 0 < n < 64:
+            continue
+        s = scanner._read_bytes(ts + OFF_TSTRING_DATA, n)
+        if not s:
+            continue
+        try:
+            name = bytes(s).decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if name not in want:
+            continue
+        vtt = struct.unpack_from("<I", b, 8)[0]
+        if vtt == T_NUMBER:
+            v = struct.unpack_from("<d", b, 0)[0]
+            out[name] = v if v != v or v in (float("inf"), float("-inf")) \
+                else (int(v) if v == int(v) else v)
+        elif vtt == T_BOOL:
+            out[name] = bool(struct.unpack_from("<I", b, 0)[0])
+        elif vtt == T_NIL:
+            pass                         # nil ＝ 沒有這個全域
+        else:
+            out[name] = vtt              # 別的型別：至少讓呼叫端知道非 0
+    return out
 
 
 def _room_for(scanner, L: int, top: int, n: int) -> bool:
@@ -232,6 +302,25 @@ def call(mover, scanner, path: str, *args) -> tuple[bool, object]:
             if not _room_for(scanner, L, top, len(args)):
                 return False, "Lua 堆疊快滿了，這次不推參數"
             for v in args:
+                if isinstance(v, str):
+                    # ★ 字串要交給遊戲自己推（`lua_pushstring` 會建 TString 並
+                    #   複製內容）—— 我們沒辦法從外面在 Lua 的字串池裡建物件。
+                    # ⚠ 它**自己會動 top**，所以先把我們手寫到一半的 top 落地，
+                    #   叫完再重讀，順序錯了參數就會被蓋掉。
+                    mover.write(L + OFF_TOP, struct.pack("<I", top))
+                    # ⚠⚠ **UTF-8，不是 big5**（跟 `_read_value` 同一件事，
+                    #   那邊的註解早就寫了）。2026-08-11 踩過：寫進「目標資源
+                    #   列表」的名字編成 big5，遊戲比對不到、面板也顯示不出來；
+                    #   使用者手動加一筆並排比對才看出來 —— 他那筆是
+                    #   `\xe5\xb0\x8f...`（UTF-8 的「小」），我那筆是 big5。
+                    # ⚠ 而且**對帳抓不到這種錯**：讀取端有 big5 退路，寫 big5
+                    #   讀回來照樣解得出同一個字，看起來「一致」。
+                    raw = v.encode("utf-8") + b"\0"
+                    mover.write(buf, raw)
+                    if _sync(mover, PUSHSTRING_FN, L, buf) is None:
+                        return False, "呼叫排不進去"
+                    top = _u32(scanner, L + OFF_TOP)
+                    continue
                 mover.write(top, _tvalue(v))
                 top += TVALUE
             mover.write(L + OFF_TOP, struct.pack("<I", top))
