@@ -1,28 +1,29 @@
-"""寫死資料表 vs 遊戲記憶體：改版之後**不必重新解包**就能知道表有沒有過期。
+"""查表體檢：寫死資料表 vs 遊戲記憶體，順便回答「setting 這次要不要重新解包」。
 
-    py tools\\recheck_tables.py        # 遊戲開著（登入畫面就夠？不夠，要進遊戲）
+    py tools\\recheck_tables.py        # 要進遊戲（資料表進遊戲才載得進來）
 
 ## 為什麼
 
 `assets/` 底下那幾張表是從遊戲資源包（SETTING）解包抄出來的。官方改版換掉
-UPDATE.PAK 時，它們**不會報錯，只會安靜過期** —— 射程錯 → 走位停太遠 → 零傷害；
+UPDATE.PAK 時它們**不會報錯，只會安靜過期** —— 射程錯 → 走位停太遠 → 零傷害；
 趴趴GO 地圖編號錯 → 傳到別的地方。以前唯一的辦法是請使用者用 RPGViewer 重新
-解包再重跑 build 工具（那是 GUI，自動化不了）。
+解包（GUI，自動化不了）。
 
-★ 但**遊戲自己把 41 張資料表都載進記憶體了**（那 41 支「依 ID 查表」的函式共用
-同一句錯誤訊息 `Get %s Data Error, ID:%d >= MAX:%d`，%s 就是表名：Npc、Magic、
-JumpMap、Item、OnlineGift、Exchange…）。所以能直接拿記憶體當真相去對帳。
-使用者的實務經驗也是「通常只有大更新新增內容才需要重新解包」——
-這支就是把那句話變成**可驗證的事實**而不是猜測。
+★ 但**遊戲自己把 41 張資料表都載進記憶體了**，所以能直接拿記憶體當真相對帳。
+  使用者的實務經驗「通常只有大更新新增內容才要重新解包」因此變成**可驗證的事實**。
 
-⚠ 名稱類（物品名／技能名／地圖名）不在這些表裡，在字串資源檔，記憶體查不到 ——
-那幾張只能等解包。好消息是它們過期只會「顯示成編號」，不會做錯事。
+## 41 張表怎麼找到的（不必寫死任何位址）
 
-純讀取，不寫入、不呼叫遊戲函式。
+那 41 支「依 ID 查表」的函式共用同一句錯誤訊息
+`Get %s Data Error, ID:%d >= MAX:%d`，`%s` 帶進去的常數字串就是**表名**。
+所以：找那句格式字串的每一個參照 → 往前 40 bytes 找 `push <表名字串>`
+→ 再往前 260 bytes 找 `A1 <表位址> / 8B 04 B0`（= `mov eax,[表]; mov eax,[eax+id*4]`）。
+**字串位址會隨改版位移，內容不會** —— 這條路改版自動跟上。
+
+⚠ 純讀取：不寫記憶體、不呼叫遊戲函式、不送封包。
 """
 from __future__ import annotations
 
-import gzip
 import os
 import struct
 import sys
@@ -31,29 +32,51 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
-from app.game import locate, skillcost, skills        # noqa: E402
+from app.game import (bag, entity, itemname, locate,   # noqa: E402
+                      monsters, skillcost, skills)
 from app.paths import resource                        # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPORT = os.path.join(ROOT, "reports", "table_recheck.txt")
 
-# 遊戲載進記憶體的資料表（tools 用 scratchpad/list_tables.py 從那 41 支查表函式
-# 的錯誤訊息字串抽出來的）。⚠ 這些位址跟別的一樣會隨改版位移 —— 需要用到哪一張
-# 就照 skillcost.TABLE_PTR 的做法進 locate.SIGS（錨在那支查表函式尾巴 push 的
-# 表名字串），**不要直接抄下面的數字**。這裡列出來是給「這份資料要不要寫死」
-# 這個問題一個現成答案：清單裡有的，就別抄資源包。
-IN_MEMORY_TABLES = (
-    "Achievement ActivityURL Adv CatchPet Class Collection Crops Crown "
-    "CustomAdv Doll Drop Exchange ExchangeGroup Furniture Gcontrib Item "
-    "Itemset Jeweleffect JumpMap JumpMapClass LoginGift Magic Make Mall Mat "
-    "Npc OnlineGift Pet Petaspect Petskill Petstar Prestige Quest Roulette "
-    "Shop Skill Stage Theme Treasuremap Word"
-).split()
+FMT = b"Get %s Data Error, ID:%d >= MAX:%d"
 
-# JumpMap 範本的欄位偏移。2026-08-11 用「拿 120 筆寫死表去對，看哪個偏移對全部
-# 都成立」定出來的，三個欄位各自**只有一個**偏移全中（120/120），不是猜的。
-JUMPMAP_TABLE_PTR = 0x0098FD54     # ⚠ 會位移；只給這支對帳工具用，不進產品路徑
+# JumpMap 範本的欄位偏移。2026-08-11 拿 120 筆寫死表去掃「哪個偏移對全部都成立」
+# 定出來的，三個欄位**各自只有一個偏移 120/120 全中**，不是猜的。
 JM_OFF_SCENE, JM_OFF_X, JM_OFF_Y = 0x04, 0x10, 0x14
+
+
+# ---------------------------------------------------------------------------
+def find_tables(img: bytes, base: int) -> dict[str, int]:
+    """{表名: 表指標位址}。做法見檔頭；41 張一次全拿。"""
+    out: dict[str, int] = {}
+    fpos = img.find(FMT)
+    while fpos >= 0:
+        fptr = (base + fpos).to_bytes(4, "little")
+        i = img.find(fptr)
+        while i >= 0:
+            # 往前 40 bytes 找 push <可讀字串>
+            name = None
+            for j in range(max(0, i - 40), i):
+                if img[j] != 0x68:
+                    continue
+                p = int.from_bytes(img[j + 1:j + 5], "little")
+                if not base < p < base + len(img):
+                    continue
+                s = img[p - base:p - base + 32].split(b"\x00")[0]
+                if 1 <= len(s) <= 24 and all(32 < c < 127 for c in s):
+                    name = s.decode()
+                    break
+            if name:
+                tab = None
+                for k in range(max(0, i - 260), i):
+                    if img[k] == 0xA1 and img[k + 5:k + 8] == b"\x8b\x04\xb0":
+                        tab = int.from_bytes(img[k + 1:k + 5], "little")
+                if tab and base < tab < base + len(img):
+                    out.setdefault(name, tab)
+            i = img.find(fptr, i + 1)
+        fpos = img.find(FMT, fpos + 1)
+    return out
 
 
 def _u32(sc, addr):
@@ -61,23 +84,31 @@ def _u32(sc, addr):
     return struct.unpack("<I", bytes(raw))[0] if raw and len(raw) >= 4 else None
 
 
-def check_skill_range(sc, lines) -> tuple[str, bool]:
-    """assets/skill_range.tsv.gz 的射程 vs 記憶體的技能範本（+0x50/+0x54）。"""
+def _sane(p) -> bool:
+    return bool(p) and 0x10000 < p < 0x7FFF0000
+
+
+# ---------------------------------------------------------------------------
+# 各項對帳（回 (訊息, 過了嗎)）
+# ---------------------------------------------------------------------------
+def check_skill_range(sc, tabs, lines):
+    """assets/skill_range.tsv.gz 的射程 vs 記憶體 Magic 範本（+0x50/+0x54）。"""
     skills._load_ranges()
     table = skills._ranges or {}
-    tab = _u32(sc, skillcost.TABLE_PTR)
-    if not tab or not skillcost._sane_ptr(tab):
-        return "讀不到技能範本表（還沒進遊戲？）", False
+    ptr = tabs.get("Magic")
+    tab = _u32(sc, ptr) if ptr else None
+    if not _sane(tab):
+        return "讀不到 Magic 表", False
     ptrs = sc._read_bytes(tab + 4, skillcost.MAX_SKILL_ID * 4)
     if not ptrs:
-        return "讀不到技能範本表內容", False
+        return "讀不到 Magic 表內容", False
     ptrs = bytes(ptrs)
     same = diff = miss = 0
     for sid, want in sorted(table.items()):
         if not 1 <= sid <= skillcost.MAX_SKILL_ID:
             continue
         p = struct.unpack_from("<I", ptrs, (sid - 1) * 4)[0]
-        if not skillcost._sane_ptr(p):
+        if not _sane(p):
             miss += 1
             continue
         raw = sc._read_bytes(p + skillcost.OFF_SHOOT_RANGE, 8)
@@ -92,14 +123,14 @@ def check_skill_range(sc, lines) -> tuple[str, bool]:
             if diff <= 40:
                 lines.append(f"    技能 {sid}（{skills.name_of(sid)}）"
                              f"表={want} 記憶體 射程={shoot} 範圍={area}")
-    return (f"{same} 對上、{diff} 對不上、{miss} 記憶體查不到（共 {len(table)}）",
+    return (f"{same} 對上、{diff} 對不上、{miss} 查不到（共 {len(table)}）",
             diff == 0 and same > 0)
 
 
-def check_jumpmap(sc, lines) -> tuple[str, bool]:
-    """assets/jumpmap.tsv 的 場景/座標 vs 記憶體的 JumpMap 範本。"""
+def check_jumpmap(sc, tabs, lines):
+    """assets/jumpmap.tsv 的 場景/座標 vs 記憶體 JumpMap 範本。"""
+    rows = []
     try:
-        rows = []
         with open(resource("assets/jumpmap.tsv"), encoding="utf-8") as f:
             for line in f:
                 p = line.rstrip("\n").split("\t")
@@ -107,13 +138,14 @@ def check_jumpmap(sc, lines) -> tuple[str, bool]:
                     rows.append((int(p[0]), int(p[1]), int(p[2]), int(p[3])))
     except Exception as exc:                               # noqa: BLE001
         return f"讀不到 assets/jumpmap.tsv（{exc}）", False
-    tab = _u32(sc, JUMPMAP_TABLE_PTR)
-    if not tab or not 0x10000 < tab < 0x7FFF0000:
-        return "讀不到 JumpMap 表（還沒進遊戲？）", False
+    ptr = tabs.get("JumpMap")
+    tab = _u32(sc, ptr) if ptr else None
+    if not _sane(tab):
+        return "讀不到 JumpMap 表", False
     same = diff = miss = 0
-    for jid, scene, x, y in rows:
+    for jid, sid, x, y in rows:
         p = _u32(sc, tab + jid * 4)
-        if not p or not 0x10000 < p < 0x7FFF0000:
+        if not _sane(p):
             miss += 1
             continue
         b = sc._read_bytes(p, JM_OFF_Y + 4)
@@ -124,31 +156,91 @@ def check_jumpmap(sc, lines) -> tuple[str, bool]:
         got = (struct.unpack_from("<i", b, JM_OFF_SCENE)[0],
                struct.unpack_from("<i", b, JM_OFF_X)[0],
                struct.unpack_from("<i", b, JM_OFF_Y)[0])
-        if got == (scene, x, y):
+        if got == (sid, x, y):
             same += 1
         else:
             diff += 1
             if diff <= 40:
-                lines.append(f"    跳點 {jid}：表=(場景{scene}, {x}, {y}) "
+                lines.append(f"    跳點 {jid}：表=(場景{sid}, {x}, {y}) "
                              f"記憶體=(場景{got[0]}, {got[1]}, {got[2]})")
-    return (f"{same} 對上、{diff} 對不上、{miss} 記憶體查不到（共 {len(rows)}）",
+    return (f"{same} 對上、{diff} 對不上、{miss} 查不到（共 {len(rows)}）",
             diff == 0 and same > 0)
 
 
-CHECKS = (
-    ("assets/skill_range.tsv.gz（技能射程）", check_skill_range,
-     "過期後果：走位停太遠 → 零傷害，完全不報錯"),
-    ("assets/jumpmap.tsv（趴趴GO 傳送點）", check_jumpmap,
-     "過期後果：傳到錯的地方"),
-)
+def check_item_table(sc, tabs, lines):
+    """背包每一件物品的種類 ID，都要在記憶體的 Item 表查得到範本。
 
-# 驗不了的（名稱類在字串資源檔，記憶體裡沒有）
-CANT_CHECK = (
-    ("assets/item_names.tsv.gz（物品名）", "過期只會顯示成編號，不會做錯事"),
-    ("assets/skill_names.tsv.gz（技能名）", "同上"),
-    ("assets/jumpmap_class.tsv（傳送點分類名）", "同上"),
-    ("assets/skills.tsv.gz（buff 持續時間）",
-     "⚠ 還沒做對帳；持續時間在記憶體的 Magic 範本裡，之後可以補"),
+    這同時驗三件事：Item 表指標、物品結構的種類 ID 欄位、還有「背包讀到的
+    是不是真的物品」。查不到就是有一邊錯了。
+    """
+    ptr = tabs.get("Item")
+    tab = _u32(sc, ptr) if ptr else None
+    if not _sane(tab):
+        return "讀不到 Item 表", False
+    its = bag.items(sc)
+    if not its:
+        return "背包讀不到東西（不算表壞，但也驗不到）", False
+    ok = bad = 0
+    for i in its:
+        p = _u32(sc, tab + i.type_id * 4)
+        if _sane(p):
+            ok += 1
+        else:
+            bad += 1
+            if bad <= 20:
+                lines.append(f"    背包第 {i.slot} 格 種類 {i.type_id}"
+                             f"（{itemname.of(i.type_id)}）在 Item 表查不到")
+    return f"{ok} 件查得到範本、{bad} 件查不到", bad == 0 and ok > 0
+
+
+def check_npc_table(sc, tabs, lines):
+    """怪物範本表：場上的怪要查得到，抽樣的等級／血量要落在合理範圍。"""
+    idx = monsters.index_base(sc)
+    if idx is None:
+        return "讀不到怪物範本表", False
+    lv, hp, n = [], [], 0
+    for tid in range(1, 2000):
+        info = monsters.info(sc, tid, idx)
+        if info:
+            n += 1
+            lv.append(info.level)
+            hp.append(info.max_hp)
+    if n < 100:
+        return f"只查得到 {n} 種（表壞了？）", False
+    sane = max(lv) <= 5000 and max(hp) <= 2_000_000_000
+    state, me, ents, _r, _e = entity.snapshot(sc)
+    mobs = [e for e in ents if e.addr != me and e.type_id]
+    missing = [e.name for e in mobs if monsters.info(sc, e.type_id, idx) is None]
+    if missing:
+        lines.append(f"    場上這幾隻查不到範本：{missing}")
+    return (f"抽樣 1~1999 查得到 {n} 種（等級 ≤{max(lv)}、滿血 ≤{max(hp)}）；"
+            f"場上 {len(mobs)} 隻、查不到 {len(missing)} 隻",
+            sane and not missing)
+
+
+def check_item_names(sc, tabs, lines):
+    """物品名稱表（只驗**涵蓋率**：名稱在字串資源檔，記憶體裡沒有真相可比）。"""
+    its = bag.items(sc)
+    if not its:
+        return "背包讀不到東西", False
+    unnamed = [i.type_id for i in its if itemname.of(i.type_id).strip().isdigit()]
+    if unnamed:
+        lines.append(f"    這些種類查不到名字（會顯示成編號）：{sorted(set(unnamed))[:20]}")
+    return (f"背包 {len(its)} 件，查不到名字 {len(set(unnamed))} 種"
+            + ("　← 新道具，重新解包才會有" if unnamed else ""), True)
+
+
+CHECKS = (
+    ("skill_range.tsv.gz（技能射程）", check_skill_range,
+     "⛔ 過期後果：走位停太遠 → 零傷害，完全不報錯", True),
+    ("jumpmap.tsv（趴趴GO 傳送點）", check_jumpmap,
+     "⛔ 過期後果：傳到錯的地方", True),
+    ("Item 表 ↔ 背包物品", check_item_table,
+     "驗 Item 表指標＋物品結構的種類 ID 欄位", True),
+    ("Npc 表（怪物範本）", check_npc_table,
+     "驗王／等級／滿血血量的來源", True),
+    ("item_names（物品名稱）", check_item_names,
+     "只影響顯示：查不到就顯示成編號，不會做錯事", False),
 )
 
 
@@ -165,36 +257,45 @@ def main() -> int:
     sc.open(pid)
     try:
         locate.warm(sc)
-        lines = [f"pid={pid}", ""]
-        allok = True
-        for name, fn, why in CHECKS:
+        base = sc.module_base(locate.GAME_MODULE)
+        info = next(m for m in sc.list_modules()
+                    if m.name.lower() == locate.GAME_MODULE)
+        img = bytes(sc._read_bytes(base, info.size) or b"")
+        tabs = find_tables(img, base)
+        lines = [f"pid={pid}　遊戲載進記憶體的資料表：{len(tabs)} 張", ""]
+        print(f"遊戲載進記憶體的資料表：{len(tabs)} 張")
+
+        hard_bad = False
+        for name, fn, why, hard in CHECKS:
             lines.append(f"=== {name} ===")
             lines.append(f"  {why}")
             try:
-                msg, ok = fn(sc, lines)
+                msg, ok = fn(sc, tabs, lines)
             except Exception as exc:                       # noqa: BLE001
                 msg, ok = f"{type(exc).__name__}: {exc}", False
-            lines.append(f"  {'✔' if ok else '✘'} {msg}")
-            lines.append("")
+            lines += [f"  {'✔' if ok else '✘'} {msg}", ""]
             print(f"{'✔' if ok else '✘'} {name}：{msg}")
-            allok = allok and ok
-        lines += ["=== 記憶體驗不了的（只能等解包）===", ""]
-        for name, why in CANT_CHECK:
-            lines.append(f"  · {name} —— {why}")
-        lines += ["", "=== 遊戲載進記憶體的資料表（要寫死之前先看這裡）===",
-                  "  " + "、".join(IN_MEMORY_TABLES)]
+            if hard and not ok:
+                hard_bad = True
+
+        lines += ["=== 遊戲載進記憶體的資料表（要寫死之前先看這裡）===",
+                  "  " + "、".join(f"{k}={v:#x}" for k, v in sorted(tabs.items())),
+                  "", "⚠ 上面的位址每次改版都會位移 —— 要用哪張就照本檔的",
+                  "  find_tables() 現場找，或照 skillcost.TABLE_PTR 進 locate.SIGS。"]
         os.makedirs(os.path.dirname(REPORT), exist_ok=True)
         open(REPORT, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+
         print()
-        if allok:
-            print("✔ 會做錯事的那幾張表都跟這一版遊戲對得上 —— **不必重新解包**。")
-            print("  （剩下的是名稱類，過期只會顯示成編號。想熄掉掛機頁的警示："
-                  "py tools\\stamp_tables.py）")
+        if hard_bad:
+            print("⛔ setting 這次**要重新解包**：有會做錯事的表跟遊戲對不上了。")
+            print("   D:\\RPGViewer 解包 → 覆蓋 setting\\ → 重跑 tools\\build_*.py"
+                  " → py tools\\stamp_tables.py")
         else:
-            print("⛔ 有表跟遊戲對不上了 —— 這次要重新解包 SETTING、重跑 "
-                  "tools\\build_*.py，再蓋章。")
+            print("✔ setting 這次**不必重新解包**：會做錯事的表都跟這一版對得上。")
+            print("   （名稱類查不到只會顯示成編號。想熄掉掛機頁警示："
+                  "py tools\\stamp_tables.py）")
         print(f"\n報告：{REPORT}")
-        return 0 if allok else 1
+        return 1 if hard_bad else 0
     finally:
         sc.close()
 

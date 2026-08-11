@@ -317,6 +317,10 @@ def audit_addresses() -> list[str]:
     covered = {(s.module, s.attr) for s in locate.SIGS}
     # 這幾個是「範圍界線」不是位址，不需要定位
     allow = {("injector", "CODE_LO"), ("injector", "CODE_HI")}
+    # ⚠ 這是靠「值落在 0x400000~0xA00000」判斷的，**上限值會誤報** ——
+    #   `energy.MAX_ENERGY = 0x989680`（＝一千萬，能量上限）就中槍過。
+    #   名字開頭是這些的一律當數值不當位址。
+    not_addr = ("MAX_", "MIN_", "LIMIT_", "CAP_", "THRESHOLD_")
     out = []
     app = os.path.join(ROOT, "app")
     for dirpath, _d, files in os.walk(app):
@@ -339,7 +343,8 @@ def audit_addresses() -> list[str]:
                     if not isinstance(t, ast.Name):
                         continue
                     key = (mod, t.id)
-                    if key in covered or key in allow:
+                    if (key in covered or key in allow
+                            or t.id.startswith(not_addr)):
                         continue
                     out.append(f"{mod}.{t.id} = {node.value.value:#x}   "
                                f"({os.path.relpath(path, ROOT)}:{node.lineno})")
@@ -483,7 +488,7 @@ def main() -> int:
     else:
         lines += ["", "=== 執行時體檢 ===",
                   "  跳過（還沒進遊戲）。位址修好之後登入一台，再跑 "
-                  "py tools\\selfcheck.py 驗欄位。"]
+                  "py tools\\tab_check.py 與 py tools\\recheck_tables.py。"]
 
     os.makedirs(os.path.dirname(REPORT), exist_ok=True)
     open(REPORT, "w", encoding="utf-8").write("\n".join(lines) + "\n")
@@ -575,6 +580,11 @@ def main() -> int:
     print(f"\n報告：{REPORT}")
     if broken or weak:
         print(f"修法：{FIXFILE}")
+    # 這支只驗「位址層」。分頁真的讀得對不對、查表對不對、setting 要不要重解包，
+    # 是另外兩支的事 —— 位址全綠不等於功能沒壞（2026-08-11 實際發生過）。
+    print("\n位址層過了之後還要跑（要進遊戲）：")
+    print("  py tools\\tab_check.py        # 逐分頁驗「讀得對」")
+    print("  py tools\\recheck_tables.py   # 查表正確＋setting 要不要重新解包")
     return 1 if (broken or gaps or cross_bad or runtime_bad) else 0
 
 
