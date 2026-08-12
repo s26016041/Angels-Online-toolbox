@@ -893,6 +893,16 @@ class CharProducePage(QWidget):
                 self._nav.reset()
                 s["step"] = "resume"
                 return
+            # ★ 最後一段自己貼上去：Navigator 離目標 3 格（ARRIVE）就判定「到了」
+            #   不再走，若只靠它就會**卡在 1 格外一直說「還有 1 格」**（使用者
+            #   2026-08-12 回報：補給飛回來後卡在「走回定位…還有 1 格」）。定位點
+            #   是使用者站過的可走格，walk_exact 直接踩上去（跟 walk_spot 同一招）。
+            if d <= navigate.ARRIVE:
+                pf = move.pathfinder_this(self.sc)
+                if pf:
+                    self._mover.walk_exact(self.sc, pf + 8, spot[0], spot[1])
+                self._note(f"走回定位點…還有 {d:.1f} 格")
+                return
             # ⚠ 跟 _trip 那邊同一個坑：遠距離**不能**用 mover.walk_route
             #   （對目標本身尋路，遠了就回 0 個點＝一步都不走）。
             note = self._walk_to(spot[0], spot[1])
