@@ -185,7 +185,7 @@ def teleport(mover, scanner, jump_id: int) -> tuple[bool, str]:
             return False, "封包資料指標不合理"
         mover.write(data + 2, struct.pack("<I", jump_id))
         # ⚠⚠ 連線與封包指標**送出去之前先擋掉 0**。
-        #   這支是補給完 3 分鐘後由計時器觸發的，那個時間點客戶端很可能正在
+        #   這支是補給完等待計時（約 2 分鐘）後由計時器觸發的，那個時間點客戶端很可能正在
         #   重連或載地圖 —— 那時 [CONN_PTR] 會是 0，而 SEND_FN 是拿它去算
         #   位址之後才檢查 NULL 的，送 0 進去等於叫遊戲讀一個算出來的爛位址。
         #   ⚠ 只擋 0：第一個參數到底是「連線物件指標」還是「連線編號」還沒
