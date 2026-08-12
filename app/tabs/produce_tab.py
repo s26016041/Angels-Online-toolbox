@@ -26,15 +26,15 @@
 有解 —— 遊戲自己的「採集指定資源」就是為此存在的：
 
     ① 使用者勾的種類 → 寫進「目標資源列表」(`DATAID_DESIGNATED_RES_LIST`)
-       ＋開「採集指定資源」  → `robot.set_res_list()`
+       ＋**強制開「採集指定資源」**  → `robot.set_res_list()`
     ② 採集中心點放在要採的那種資源上（沒得挑就放腳下）
     ③ 開「自動採集」、關自動攻擊（採集跟打怪互斥，遊戲自己也這樣）
        → 以上 ②③ 都在 `robot.begin_gather()`
 
 ⚠ 那份清單是**字串**清單、記錄原本不存在，只能靠遊戲自己的
   `robotvar_add_stringlist` 建（為此讓 `lua.call` 支援了字串參數）。
-  ★ 寫完一定**讀回來對帳**，對不上就不開「採集指定資源」並在狀態列說出來
-    —— 寧可誠實地「全都採」，也不要嘴上說只採魚藻卻在採花叢。
+  ★ 2026-08-12 使用者要求「採集指定資源」**強制勾**：一律開著，清單寫不進去
+    **也不退回「全都採」** —— 寧可採不到（狀態列大聲說），也不採沒選的種類。
 
 ⛔ 走過的死路（2026-08-11，別再試）：自己送採集封包。封包結構其實解出來了
    （`0x2D` = `0x5D199B(格子X, 格子Y)`，統一入口 `0x50794B`），但**實測沒有
@@ -119,6 +119,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import time
 from collections import Counter
 
@@ -126,6 +127,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -140,7 +142,7 @@ from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (bag, entity, gather, itemname, jumpmap, locate, move,
+from app.game import (bag, entity, gather, itemname, jumpmap, locate, lua, move,
                       navigate, produce, recipes, robot, scene, scenery)
 from app.tabs.base_tab import BaseTab, fit_list, no_elide
 
@@ -162,6 +164,8 @@ SUPPLY_MAX_SECS = 900.0      # 整趟的兜底：超過就放棄，回到採集�
 # ⛔ 「存進倉庫」2026-08-11 已刪：開倉庫要選 NPC 對話選項，而選項編號是
 #    伺服器當下發的、湊不出來（見 app/game/produce.py 檔頭）。
 #    → 只剩「捐公會」；沒選就做完停著不動。
+# 捐獻歷史紀錄最多留幾筆（每台分身各一份，存在設定檔）。
+DONATE_LOG_MAX = 500
 DISPOSE_GUILD, DISPOSE_NONE = "guild", "none"
 DISPOSE_LABELS = ((DISPOSE_GUILD, "全部捐公會"),
                   (DISPOSE_NONE, "做完就停著（不處理）"))
@@ -174,10 +178,15 @@ FULL_PCT = 95.0              # 負重到這個百分比就回程做半成品（�
 # 製作那一段要跑得比 5 秒快很多：一個半成品做幾秒，5 秒一拍等於一半時間在發呆。
 # 這一拍只讀背包（幾毫秒的純讀），不送任何東西，所以 0.6 秒完全吃得消。
 CRAFT_TICK_MS = 600
-# 送出一包「製作」之後，等多久沒看到材料變少就重送一次。
-# ⚠ 這是**暫時性失敗自動重試**（使用者的規矩：不設上限，「取消勾選」當出口），
-#   不是放棄 —— 站錯地方、伺服器忙、剛好在讀取都可能讓一包沒生效。
+# 開製作面板：點了站台之後等多久沒開起來就換下一個候選點。
+# ⚠ 這是**暫時性失敗自動重試**（使用者的規矩：不設上限，「取消勾選」當出口）。
 CRAFT_RETRY_SECS = 6.0
+# 一批最多排幾個（makeadd 的數量）。客戶端會自己把整批做完，做完再開下一批。
+# ★ 開大一點＝少幾次 makeadd；材料不夠時 make_batch 只會排「做得出來的」那些。
+BATCH_MAX = 999
+# 一批開始後，多久沒看到材料變少就當「這批做完了或卡住」→ 收掉重算。
+# 客戶端一個約 2.9 秒，8 秒留足伺服器延遲；空清單自然停也是靠這個收尾。
+BATCH_STALL_SECS = 8.0
 # 整趟製作的兜底：超過就大聲說並收尾，不要無聲無息卡在那裡。
 CRAFT_MAX_SECS = 3600.0
 # ★★ 使用者要求：**要走到他定的那個點**，不要有差距（2026-08-12）。
@@ -362,7 +371,7 @@ class CharProducePage(QWidget):
         test_bar.addWidget(self.test_full_btn)
         self.test_broken_btn = QPushButton("假裝裝備壞掉")
         self.test_broken_btn.setToolTip(
-            "下一拍當成身上有裝備耐久歸零 → 觸發回程補給那一趟：\n"
+            "下一拍當成身上有裝備耐久剩 1 → 觸發回程補給那一趟：\n"
             "天使之翼回程 → 5 秒後關自動採集 → 等 3 分鐘 →\n"
             "趴趴GO 回原圖 → 走回定位點 → 重新設定＋開採集。\n"
             "★ 只有這一次是假的。\n"
@@ -417,6 +426,13 @@ class CharProducePage(QWidget):
             "　 與其留一條每次都要你自己開倉庫的半自動路徑，不如不做。")
         self.dispose.currentIndexChanged.connect(lambda _i: self._save_settings())
         top.addWidget(self.dispose)
+        top.addSpacing(12)
+        self.donate_log_btn = QPushButton("捐獻紀錄")
+        self.donate_log_btn.setToolTip(
+            "看這台分身捐給公會的歷史：每次捐了什麼、加了多少名聲（貢獻點數）。\n"
+            "★ 名聲是照遊戲自己的貢獻品表算的（每組的點數 × 捐的組數）。")
+        self.donate_log_btn.clicked.connect(self._show_donate_log)
+        top.addWidget(self.donate_log_btn)
         top.addStretch(1)
         v.addLayout(top)
 
@@ -424,10 +440,20 @@ class CharProducePage(QWidget):
         #   背包裡做得出來的半成品全做、湊得成整組的貢獻品全捐。
         #   所以這裡不放「挑配方」的清單 —— 沒有東西要挑。
         row = QHBoxLayout()
-        # ── 製作檯（**只顯示，沒有要按的東西**）─────────────────
-        # ★ 2026-08-12 使用者要求全自動：舊的「記下製作檯位置」按鈕拿掉了。
-        #   檯子由工具箱自己找（走到記住的位置 → 由近而遠點點看 → 面板開
-        #   起來的那個就是它），做成功一次就把位置與外觀記起來。
+        # ── 製作檯位置（手動標記 ＋ 顯示）───────────────────────
+        # ★ 2026-08-12 傍晚把「記下製作檯位置」按鈕加回來（先前改全自動時拿掉了）：
+        #   自動學到的位置有時落在檯子那一格，而遊戲的走路踩不上站台那格 →
+        #   回程卡在 2 格外。改成「使用者站在走得到的好位置自己標」最準，
+        #   4 個主號職業不同、製作檯不同各標各的。沒手動標的話仍會自動學（備援）。
+        self.mark_bench_btn = QPushButton("記下製作檯位置")
+        self.mark_bench_btn.setToolTip(
+            "把角色**現在站的位置**記成這台分身的製作檯位置。\n"
+            "★ 站在你**走得到**的好位置再按（製作檯旁邊一格就好）——\n"
+            "　 別站在檯子那一格上：那一格遊戲的走路踩不上去，回程會卡住。\n"
+            "★ 4 個主號職業不同、製作檯不同，各自站好各自按一次。\n"
+            "　 之後每一趟回程就走到你記的這一點，再點旁邊的檯子開工。")
+        self.mark_bench_btn.clicked.connect(self._mark_bench)
+        row.addWidget(self.mark_bench_btn)
         self.bench_lbl = QLabel("")
         self.bench_lbl.setStyleSheet("color: #9aa2b8;")
         row.addWidget(self.bench_lbl)
@@ -438,29 +464,57 @@ class CharProducePage(QWidget):
 
     # ------------------------------------------------------------------
     # -- 製作檯（工具箱自己找、自己記，使用者不必按任何東西）--------------
-    def _learn_bench(self, pos: tuple[float, float], model: int) -> None:
-        """做成功一次就記住：站在哪裡、點中的東西長什麼樣。
+    def _mark_bench(self) -> None:
+        """**手動**把角色現在站的位置記成製作檯位置（使用者按按鈕）。
 
-        ⚠ **不記實體 ID** —— 那個號碼每次載入地圖都會重配（見 scenery.py），
-          存起來下次用等於「安靜地點到別的東西」。位置與外觀編號才是穩的。
+        ★ 為什麼要有這顆（2026-08-12 加回來）：自動學到的位置有時正好落在
+          檯子那一格，而遊戲的走路**踩不上站台那格**（回程會卡在 2 格外）。
+          讓使用者站在**走得到的好位置**（檯子旁邊一格）自己按，最準。
+          4 個主號職業不同、製作檯不同，各自標各自的。
+        ⚠ 純讀角色位置，不必跳板；站的那格請確定是能走上去的（旁邊一格）。
         """
-        sid = scene.current_id(self.sc)
-        learned = (pos[0], pos[1], sid, model)
-        if self._bench == learned:
+        pos = self._my_pos()
+        if pos is None:
+            self._note("讀不到角色位置（還沒進到地圖？）—— 這次沒記下來",
+                       warn=True)
             return
-        self._bench = learned
+        # 記最近站台的外觀當指紋（找不到就記 0，位置照樣記）
+        props = scenery.nearby(self.sc, pos, BENCH_SCAN_R)
+        model = props[0].model if props else 0
+        sid = scene.current_id(self.sc)
+        self._bench = (pos[0], pos[1], sid, model)
+        self._refresh_bench()
+        self._save_settings()
+        where = scene.scene_name(sid) if sid is not None else "未知地圖"
+        near = f"（旁邊有站台，外觀 {model}）" if model else "（附近沒掃到站台）"
+        self._note(f"已記下製作檯位置：{where} ({pos[0]:.0f}, {pos[1]:.0f}){near}")
+
+    def _learn_bench(self, pos: tuple[float, float], model: int) -> None:
+        """做成功一次就自動記住站在哪、點中的東西長什麼樣。
+
+        ⚠ **只在還沒有製作檯位置時才自動學**（`self._bench is None`）——
+          使用者手動標記過（或上一趟已學過）就**不覆蓋**：手動標的那點是他
+          挑的走得到的好位置，自動學可能學回檯子那一格（走不上去）。
+        ⚠ **不記實體 ID** —— 那號碼每次載入地圖重配（見 scenery.py），位置與
+          外觀編號才是穩的。
+        """
+        if self._bench is not None:
+            return                                 # 已有（手動標或先前學的）→ 不覆蓋
+        sid = scene.current_id(self.sc)
+        self._bench = (pos[0], pos[1], sid, model)
         self._refresh_bench()
         self._save_settings()
 
     def _refresh_bench(self) -> None:
         """製作檯那一行的文字：還沒找過就直說，找過就顯示地圖與座標。"""
         if not self._bench:
-            self.bench_lbl.setText("製作檯：還沒找過（第一趟回程時自己找）")
+            self.bench_lbl.setText("製作檯：還沒標（站到檯子旁按「記下製作檯位置」）")
             self.bench_lbl.setStyleSheet("color: #9aa2b8;")
             self.bench_lbl.setToolTip(
-                "回程做半成品時，工具箱會在落點附近由近而遠點點看，\n"
-                "製作面板開起來的那個就是製作檯 —— 成功一次就記起來，\n"
-                "以後每一趟直接走過去。你不必按任何東西。")
+                "建議：走到製作檯**旁邊一格**（走得到的位置）站好，\n"
+                "按「記下製作檯位置」記起來，以後每趟回程就走到這一點。\n"
+                "沒標的話工具箱也會在回程時自己找（備援），但自己找到的\n"
+                "位置有時會落在檯子那格、走路踩不上去 —— 手動標最保險。")
             return
         x, y, sid = self._bench[0], self._bench[1], self._bench[2]
         where = scene.scene_name(sid) if sid is not None else "未標記地圖"
@@ -468,7 +522,7 @@ class CharProducePage(QWidget):
         self.bench_lbl.setText(text)
         self.bench_lbl.setStyleSheet("color: #9aa2b8;")
         self.bench_lbl.setToolTip(
-            text + "　（工具箱自己記的，做成功一次就會更新）"
+            text + "　（要換位置就站到新位置再按「記下製作檯位置」）"
             + (f"\n場景編號 {sid}" if sid is not None else "\n沒記到地圖"))
 
     # ------------------------------------------------------------------
@@ -969,6 +1023,77 @@ class CharProducePage(QWidget):
                 out.append((c.cid, n // c.group))
         return out
 
+    # ------------------------------------------------------------------
+    # -- 捐獻歷史紀錄（捐了什麼、加多少名聲）------------------------------
+    def _log_donation(self, rows: list[tuple[int, int]]) -> None:
+        """把這次捐獻記進歷史。`rows` = 剛送出去的 [(貢獻編號, 組數), …]。
+
+        ★ 名聲＝照遊戲自己的貢獻品表算：每組點數(`Contrib.points`) × 捐的組數。
+          物品名字、每組幾個也都從那張表查（不猜）。表讀不到就不記這筆。
+        ⚠ 公會貢獻沒有上限、隨時可捐（介面說明），送出去等於捐成功，所以拿
+          「送出去的 rows」當紀錄；表查不到的編號跳過（不硬湊）。
+        """
+        contribs = recipes.contribs(self.sc)
+        if not contribs:
+            return
+        by_cid = {c.cid: c for c in contribs}
+        items, total = [], 0
+        for cid, groups in rows:
+            c = by_cid.get(int(cid))
+            if not c or groups <= 0:
+                continue
+            pts = int(groups) * c.points
+            items.append([itemname.of(c.item), int(groups) * c.group, pts])
+            total += pts
+        if not items:
+            return
+        rec = {"t": datetime.datetime.now().strftime("%m-%d %H:%M"),
+               "items": items, "total": total}
+        log = config.get(self._key("donate_log"), []) or []
+        log.append(rec)
+        if len(log) > DONATE_LOG_MAX:
+            log = log[-DONATE_LOG_MAX:]
+        config.set(self._key("donate_log"), log)
+
+    def _show_donate_log(self) -> None:
+        """捐獻歷史視窗：每次捐了什麼＋加多少名聲，新的在上面＋累計名聲。"""
+        log = config.get(self._key("donate_log"), []) or []
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"捐獻紀錄 — {self.char_name}")
+        dlg.resize(480, 500)
+        lay = QVBoxLayout(dlg)
+
+        grand = sum(int(r.get("total", 0)) for r in log)
+        head = QLabel(f"共 {len(log)} 次捐獻，累計名聲 {grand}")
+        head.setStyleSheet("font-weight: bold; color: #d0d4e0;")
+        lay.addWidget(head)
+
+        lst = QListWidget()
+        no_elide(lst)
+        for r in reversed(log):                        # 新的在上面
+            what = "、".join(f"{n}×{cnt}" for n, cnt, _p in r.get("items", []))
+            lst.addItem(f"{r.get('t','')}　{what}　+{int(r.get('total',0))} 名聲")
+        if not log:
+            lst.addItem("還沒有捐獻紀錄")
+        lay.addWidget(lst, 1)
+
+        btns = QHBoxLayout()
+        clr = QPushButton("清除紀錄")
+        clr.setToolTip("清空捐獻歷史（只清紀錄，不影響遊戲）。")
+        clr.clicked.connect(lambda: self._clear_donate_log(dlg))
+        btns.addWidget(clr)
+        btns.addStretch(1)
+        close = QPushButton("關閉")
+        close.clicked.connect(dlg.accept)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+        dlg.exec()
+
+    def _clear_donate_log(self, dlg: QDialog) -> None:
+        config.set(self._key("donate_log"), [])
+        dlg.accept()
+        self._note("已清空捐獻紀錄")
+
     def _trip_tick(self) -> None:
         """負重那一趟的狀態機。CRAFT_TICK_MS 一拍。"""
         if self._trip is None or self._loading:
@@ -998,6 +1123,8 @@ class CharProducePage(QWidget):
                 return
             if rows:
                 ok, msg = produce.donate(self._mover, self.sc, rows)
+                if ok:
+                    self._log_donation(rows)       # 記進捐獻歷史
                 self._note(("先捐一次：" + msg) if ok else f"⚠ 捐獻沒送出：{msg}",
                            warn=not ok)
             else:
@@ -1149,6 +1276,7 @@ class CharProducePage(QWidget):
             if not ok:
                 self._note(f"捐獻重試中…（{msg}）")
                 return
+            self._log_donation(rows)               # 記進捐獻歷史（捐了什麼＋名聲）
             s["step"] = "back"
             self._note(msg + "　→ 回標記點")
             return
@@ -1239,45 +1367,38 @@ class CharProducePage(QWidget):
         兩邊各建一份的話，加了欄位就會有一邊漏掉（然後只在跑到一半時炸）。
 
             idx    現在做 plans 的第幾個配方
-            sent   上一包送出去的時間（判斷要不要重送）
             sig    上一次看到的材料總數（少了＝真的做出一個）
+            last_drop 上次材料變少的時間（判斷這一批停了沒）
             made   已經做出幾個　　t0 這一段開始的時間
             plans  這一輪的配方清單（材料用完就重算）
             total  總共要做幾個（給人看的進度）
             first  第一個做好的時間（拿來估「一個要多久」）
-            props  這附近可以點的東西（找製作檯用；None = 還沒掃）
+            props  這附近可點的**站台**（scenery.nearby 回的互動物；None=還沒掃）
             pi     現在點到第幾個候選
-            poked  最後點中的那個候選（做成功時就是它 → 記起來）
-            clicked 這一段有沒有點過檯子（**第一包一定要點一次**）
+            poked  最後點中的那個候選（面板開起來就是它 → 記起來）
+            wnd    製作面板 WND_MAKE 的值（開著才非 0）
+            batch  這一批的狀態（None=還沒開批；開了＝{"added":排入數量}）
             scene  開始做的時候在哪張圖（點到門被帶走時看得出來）
         """
-        return {"idx": 0, "sent": 0.0, "sig": None, "made": 0,
+        return {"idx": 0, "sig": None, "last_drop": 0.0, "made": 0,
                 "t0": time.monotonic(), "plans": None,
                 "total": None, "first": None,
-                "props": None, "pi": 0, "poked": None, "clicked": False,
-                "scene": None}
+                "props": None, "pi": 0, "poked": None,
+                "wnd": None, "batch": None, "scene": None}
 
     # ------------------------------------------------------------------
     def _poke_bench(self, c: dict, advance: bool = False) -> str:
-        """點一下製作檯，讓伺服器把製作面板開起來（沒有面板 0x36 不算數）。
+        """點一個製作站台候選，讓伺服器把製作面板開起來。回狀態字串。
 
-        回傳給狀態列看的一句話（**呼叫端負責顯示** —— 這裡自己 `_note`
-        會被後面那句蓋掉，「附近沒東西可點」就永遠看不到）。
-
-        ★ 哪個是檯子客戶端不知道（`scenery.py` 有完整說明），所以由近而遠
-          **點點看**：面板開起來的那個就是它。點到桌椅不會有事。
-        ⚠ **這一段的第一包一定要點一次**，即使面板看起來是開著的 ——
-          那可能是上一趟留下來的視窗，伺服器那邊早就不算數了（我們中間
-          跑去採集、換過地圖）。點一次的代價是一個封包。
-        ⚠ 之後面板開著就不重點（`advance=True` 例外 —— 那是「送了沒反應，
-          換一個點」的路徑，這時候面板開著也可能是別的檯子）。
-        ⚠ 讀不到面板狀態時**照點不誤**：把「讀不到」當成「開著」就會卡在
-          這裡什麼都不做（bag-false-empty-guards 那個教訓）。
+        ★ `scenery.nearby` 現在回的是**真的互動站台**（vtable 0x7D87B4／kind0／
+          有選定 id，見 scenery.py），不是舊的 model685 純裝飾。哪個是「烹飪」檯
+          客戶端不知道 → 由近而遠一個一個點，**面板開起來（WND_MAKE 非0）的
+          那個就是它**（呼叫端下一拍判斷）。點到別的站台/門不會壞事。
+        ⚠ 讀不到面板狀態時照點不誤（把「讀不到」當「開著」會卡死 ——
+          bag-false-empty-guards）。
         """
         if not (self._mover and self._mover.active):
             return ""
-        if not advance and c.get("clicked") and produce.panel_open(self.sc):
-            return "製作面板開著"
         me = self._my_pos()
         if me is None:
             return "讀不到角色位置"
@@ -1298,8 +1419,8 @@ class CharProducePage(QWidget):
                  if (here, p.model) not in self._bad_props]
         c["props"] = props
         if not props:
-            return (f"⛔ {BENCH_SCAN_R:.0f} 格內沒有任何可以點的東西 —— "
-                    "製作檯不在這裡（角色停在這，不會亂走）")
+            return (f"⛔ {BENCH_SCAN_R:.0f} 格內沒有可點的製作站台 —— "
+                    "這裡沒有檯子（角色停在這，不會亂走）")
         # ★ 記住的檯子長什麼樣就先點它（位置對得上＋外觀編號一樣）
         if not advance and self._bench and self._bench[3]:
             bx, by, _sid, model = self._bench
@@ -1312,24 +1433,25 @@ class CharProducePage(QWidget):
         c["poked"] = p if ok else None
         if not ok:
             return f"⚠ 點製作檯沒送出（{msg}）"
-        c["clicked"] = True
         return (f"點了第 {c['pi'] + 1}/{len(props)} 個候選"
-                f"（{p.dist(me):.1f} 格）")
+                f"（{p.dist(me):.1f} 格），等面板開…")
 
     def _craft_step(self, s: dict) -> None:
-        """一拍推一格製作。**「材料變少」才算真的做出來一個。**
+        """一拍推一格製作。**開一整批交給客戶端自己做完，工具箱只監看。**
 
-        ⚠ 不能靠「送出去了」當完成 —— 站錯地方、伺服器忙、背包滿都會讓那包
-          沒有效果，而封包送得出去跟做得成完全是兩回事（跟掛機那邊
-          「真打得到的唯一訊號是目標血量」同一個教訓）。
-        ⚠ 沒反應就重送、**不設上限**（使用者的規矩），出口是取消勾選；
-          但整段有 CRAFT_MAX_SECS 兜底，免得無聲無息卡一整天。
+        流程（2026-08-12 傍晚實機定案，見 memory craft-donate-storage-packets）：
+          點站台開面板(WND_MAKE 非0) → `produce.make_batch(配方,數量)` 選配方+設
+          數量+makeadd+makestart → 客戶端每 ~2.9 秒自己做一個直到清單空。
+        ⚠ **不再自送 0x36**（舊寫法只做得出第一個就被伺服器拒、跳「製作物品
+          失敗」還卡住訊息迴圈）。這一批做完（材料停 BATCH_STALL_SECS 沒少）就
+          收掉重算：材料還有就再開一批，換配方或做完就往下走。
+        ⚠ 站錯地方／伺服器忙／背包滿都可能讓一批沒生效 → 收掉重來，**不設上限**
+          （使用者的規矩），出口是取消勾選；整段有 CRAFT_MAX_SECS 兜底。
         """
         c = s["craft"]
         now = time.monotonic()
         # ⚠ 點東西是有風險的一步：萬一點到的是門／傳送點，人會被帶走。
-        #   場景一變就**立刻停手**、把那個外觀記成「不要再點」，回去採集
-        #   （下一趟會重來，但不會再點同一個 → 不會變成無限迴圈）。
+        #   場景一變就**立刻停手**、把那個外觀記成「不要再點」，回去採集。
         here = scene.current_id(self.sc)
         if here is not None:
             if c.get("scene") is None:
@@ -1367,12 +1489,12 @@ class CharProducePage(QWidget):
                 return          # 讓這句留在狀態列一拍，不要同一拍就被蓋掉
 
         # 還沒挑配方、或上一個配方材料用完了 → 重新算一次做得出什麼。
-        # ⚠ 每次都重算：好幾個配方會吃同一種原料，用舊的清單會愈算愈偏。
         if c["plans"] is None:
             plans = recipes.plan(self.sc, have)
             if plans is None:
                 return                             # 配方表讀不到，等下一拍
-            c["plans"], c["idx"], c["sig"] = plans, 0, None
+            c["plans"], c["idx"] = plans, 0
+            c["sig"], c["batch"] = None, None
         if c["idx"] >= len(c["plans"]):
             c["plans"] = None
             if not recipes.plan(self.sc, have):
@@ -1382,62 +1504,78 @@ class CharProducePage(QWidget):
 
         cur = c["plans"][c["idx"]]
         # 這個配方現在還做得出幾個（拿背包當唯一真相，不信先前算的）
-        left = min((have.get(mid, 0) // num for mid, num in cur.recipe.mats),
-                   default=0)
-        if left <= 0:
+        makeable = min((have.get(mid, 0) // num for mid, num in cur.recipe.mats),
+                       default=0)
+        if makeable <= 0:                          # 這個配方材料用完 → 下一個
             c["idx"] += 1
-            c["sig"] = None
+            c["sig"], c["batch"] = None, None
             return
 
-        sig = sum(have.get(mid, 0) for mid, _n in cur.recipe.mats)
-        if c["sig"] is None:                       # 這個配方的第一包
-            # ★ 先點檯子：面板沒開伺服器不受理 0x36（2026-08-12 A/B 實測）。
-            #   點完**照樣把 0x36 送出去** —— 面板開沒開我們只是「看得到」，
-            #   不拿它當放行條件（讀不到就會卡住不動）。
-            poke = self._poke_bench(c)
-            ok, msg = produce.craft(self._mover, self.sc, cur.recipe.rid)
-            c["sig"], c["sent"] = sig, now
-            self._note(self._craft_note(c, cur)
-                       + (f"　{poke}" if poke else "")
-                       + ("" if ok else f"　⚠ {msg}"),
-                       warn=poke.startswith(("⛔", "⚠")))
+        # ── 確保製作面板開著（點站台；開起來的那個就記成製作檯）──────────
+        if not produce.panel_open(self.sc):
+            c["wnd"], c["batch"] = None, None
+            # 點過了就等面板開（CRAFT_RETRY_SECS）；等不到才換下一個候選點
+            waited = now - c.get("poke_t", 0)
+            if c.get("poked") is not None and waited < CRAFT_RETRY_SECS:
+                self._note("點了製作檯，等面板開…")
+                return
+            poke = self._poke_bench(c, advance=bool(c.get("poked")))
+            c["poke_t"] = now
+            self._note(poke or "找製作檯…", warn=poke.startswith(("⛔", "⚠")))
             return
-        if sig < c["sig"]:                         # ★ 材料少了＝真的做出一個
-            # ★★ 做出東西＝剛剛點中的那個真的是製作檯（唯一可信的證據）。
-            #   把「站在哪、它長什麼樣」記起來，下一趟直接走過去點它。
-            if c["poked"] is not None:
+
+        # 面板開著 → 記下 WND_MAKE，並把「剛剛點開它的那個站台」學起來
+        if c["wnd"] is None:
+            g = lua.globals_of(self.sc, ("WND_MAKE",)) or {}
+            c["wnd"] = g.get("WND_MAKE")
+            if c.get("poked") is not None:
                 me = self._my_pos()
                 if me is not None:
                     self._learn_bench(me, c["poked"].model)
-                c["poked"] = None
-            c["made"] += 1
-            if c["first"] is None:
-                # 從**第一個做好**才開始計時 —— 走過去、第一包在路上的時間
-                # 算進去會把「一個要多久」估得太長。
-                c["first"] = now
-            # ⛔⛔ **這裡不要再送一包**（2026-08-12 使用者回報「一直停止
-            #   製作物品」的根因）：客戶端做完一個**會自己再送下一包**
-            #   （另一個送包點 0x55701A，見 memory 的
-            #   craft-donate-storage-packets）。我們再插一包進去＝同時有兩個
-            #   製作請求，遊戲就把正在做的那個中斷掉 → 畫面一直跳
-            #   「停止製作物品」，而且愈送愈慢。
-            # ★ 我們只要**看著**：材料持續變少就代表它自己做得好好的；
-            #   真的停了（CRAFT_RETRY_SECS 沒動靜）下面那段才會補一包。
-            c["sig"], c["sent"] = sig, now
+            if not c["wnd"]:
+                return                             # 讀不到 WND_MAKE，等下一拍
+
+        sig = sum(have.get(mid, 0) for mid, _n in cur.recipe.mats)
+
+        # ── 沒有進行中的批次 → 開一批（選配方+設數量+makeadd+makestart）──────
+        if c["batch"] is None:
+            qty = min(makeable, BATCH_MAX)
+            ok, added, msg = produce.make_batch(self._mover, self.sc,
+                                                c["wnd"], cur.recipe.rid, qty)
+            if not ok:
+                if msg == produce.WRONG_PANEL:
+                    # ★ 點到**別種生產**的檯子（面板裡沒有這個配方）→ 關掉它、
+                    #   把這個外觀記成「這台不是」，下一拍換下一個站台點。
+                    #   這樣「附近有對的台子」就找得到，不會卡在錯面板重試。
+                    produce.close_panel(self._mover, self.sc)
+                    if c.get("poked") is not None:
+                        self._bad_props.add((here, c["poked"].model))
+                    c["wnd"], c["batch"], c["poked"] = None, None, None
+                    self._note(f"這個檯子{msg} → 換下一個站台", warn=True)
+                    return
+                # 其他失敗（面板剛開沒好/槽忙/材料檢查沒過）→ 重開面板再試
+                c["wnd"] = None
+                self._note(f"⚠ 開製作批次失敗（{msg}）→ 重試", warn=True)
+                return
+            c["batch"] = {"added": added}
+            c["sig"], c["last_drop"] = sig, now
             self._note(self._craft_note(c, cur))
             return
-        if now - c["sent"] > CRAFT_RETRY_SECS:     # 沒反應 → 重送（不設上限）
-            # ★ 沒反應最可能就是「面板沒開／點錯東西」——所以重送之前先
-            #   **換下一個候選點一下**（advance=True）。一輪點完會重掃再來，
-            #   不設上限（使用者的規矩），出口是取消勾選。
-            open_txt = {True: "面板是開著的", False: "面板沒開",
-                        None: "看不出面板開沒開"}[produce.panel_open(self.sc)]
-            poke = self._poke_bench(c, advance=True)
-            produce.craft(self._mover, self.sc, cur.recipe.rid)
-            c["sent"] = now
-            self._note(f"⚠ {CRAFT_RETRY_SECS:.0f} 秒沒做出東西（{open_txt}）"
-                       f" → {poke or '再送一次'}"
-                       f"　已完成 {c['made']} 個", warn=True)
+
+        # ── 監看這一批：材料變少＝真的在做 ──────────────────────────────
+        if c["sig"] is not None and sig < c["sig"]:
+            step = sum(num for _m, num in cur.recipe.mats) or 1
+            c["made"] += max(1, (c["sig"] - sig) // step)
+            c["sig"], c["last_drop"] = sig, now
+            if c["first"] is None:
+                c["first"] = now                   # 從第一個做好才開始估時
+            self._note(self._craft_note(c, cur))
+            return
+        # 停了 BATCH_STALL_SECS 沒動靜＝這批做完（清單空了）或卡住 → 收掉重算。
+        #   材料還有 → 下一拍再開一批；材料用完 → 換配方；都做完 → dispose。
+        if now - c["last_drop"] > BATCH_STALL_SECS:
+            c["batch"], c["sig"] = None, None
+            return
 
     @staticmethod
     def _craft_note(c: dict, cur) -> str:

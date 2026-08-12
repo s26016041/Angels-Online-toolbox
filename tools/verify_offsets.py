@@ -270,22 +270,23 @@ def checks(sc, log):
             slot_ok == len(items) and dura_ok and named > 0,
             f"{len(items)} 件、格號合法 {slot_ok}、查得到名字 {named}")
 
-    # scenery：可以點的佈景物件（製作檯就是其中一個）。
-    # 不變量：讀得到一些、每一筆的 ID 低 16 位＝表格索引（nearby 自己就在驗，
-    # 這裡再拿座標範圍當第二票）、座標落在地形圖裡面。
+    # scenery：可以點的**製作站台**（vtable 0x7D87B4／kind0／選定id在 +0x1D0）。
+    # 不變量：讀得到一些、每一筆的選定 id 世代碼與索引都非 0（⚠不是固定 0x13——
+    # 那是每張圖的世代碼，見 scenery.py）＋外觀非 0、座標落在地形圖裡面。
     me = entity.player_pos(sc, (move.pathfinder_this(sc) or 0) + 8)
     props = scenery.nearby(sc, me, 25.0) if me else None
     if not props:
-        put("可點物件 scenery.VT_SCENERY", NA,
-            "附近沒有可點物件／讀不到（換張有東西的圖再驗）")
+        put("製作站台 scenery.nearby", NA,
+            "附近沒有製作站台／讀不到（換到有檯子的圖再驗）")
     else:
         grid, _msg = terrain.load(sc)
         inside = all(0 <= p.x < (grid.w if grid else 4096)
                      and 0 <= p.y < (grid.h if grid else 4096) for p in props)
-        ids_ok = all((p.oid & 0xFFFF) and p.model for p in props)
-        put("可點物件 scenery.VT_SCENERY", inside and ids_ok,
+        ids_ok = all((p.oid >> 16) and (p.oid & 0xFFFF) and p.model
+                     for p in props)
+        put("製作站台 scenery.nearby", inside and ids_ok,
             f"{len(props)} 個、最近 {props[0].dist(me):.1f} 格"
-            f"、外觀 {props[0].model}")
+            f"、外觀 {props[0].model}、選定id {props[0].oid:#x}")
     return out
 
 

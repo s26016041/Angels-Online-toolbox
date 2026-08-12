@@ -86,7 +86,7 @@ ITEM_SLOT = 0x25
 ITEM_COUNT = 0x27           # 數量（u16）
 # ⚠⚠ 耐久要當 **u16** 讀：`gettimelimit` 證明 `+0x2E` 是另一個欄位（時限），
 #   當 u32 讀會把時限的低 2 bytes 吃進來 —— 時限道具的耐久就會變成天文數字，
-#   `broken`（耐久 0 ＝ 壞了）跟著失靈。實測 341 件目前時限全 0，所以兩種讀法
+#   `broken`（耐久 ≤ 1 ＝ 壞了）跟著失靈。實測 341 件目前時限全 0，所以兩種讀法
 #   結果一樣；改成 u16 是為了時限道具真的出現時不會安靜算錯。
 ITEM_DURA = 0x2C            # 耐久現值（u16）；0 = 沒耐久這回事，或是壞了
 ITEM_TIMELIMIT = 0x2E       # ★ 時限；**0 ＝ 沒時限**。非 0 的東西遊戲不讓分解
@@ -224,8 +224,14 @@ class Item:
 
     @property
     def broken(self) -> bool:
-        """裝備但耐久歸零（＝壞了）。"""
-        return self.is_gear and self.dura <= 0
+        """裝備而且**耐久 ≤ 1**（＝壞了或快壞了）。
+
+        ★ 使用者 2026-08-12 要求：**剩 1 就當壞掉，不必等歸零**（提早回去修，
+          免得掛到一半真的破了）。這是全程式唯一的「壞裝門檻」——`worn_broken`
+          與各分頁（掛機／自動生產／精靈補給）都走這裡，改這一處就全改到。
+        ⚠ 一樣要 `is_gear`（範本耐久上限 > 0）才算，藥水那種現值 0/1 不會誤判。
+        """
+        return self.is_gear and self.dura <= 1
 
     @property
     def is_doll(self) -> bool:
@@ -431,7 +437,7 @@ def scan(scanner, first: int = FIRST_SLOT,
 
 
 def worn_broken(scanner) -> list[Item] | None:
-    """身上穿的裝備裡**壞掉的那些**（耐久 0）；讀不到容器回 **None**。
+    """身上穿的裝備裡**壞掉的那些**（耐久 ≤ 1，見 `Item.broken`）；讀不到回 **None**。
 
     ★ 「裝備壞掉」看全身（0~11 格），不是只看武器（使用者 2026-08-07 要求）。
       背包裡的東西不算 —— 壞的白裝躺在背包裡本來就正常。

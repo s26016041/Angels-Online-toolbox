@@ -180,8 +180,143 @@ def click(mover, scanner, prop) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# 開一整批製作：選配方 → 設數量 → makeadd → makestart，讓**客戶端自己續做整批**
+# ---------------------------------------------------------------------------
+# 2026-08-12 傍晚實機攔包＋實測定案（見 memory craft-donate-storage-packets）：
+# 面板開著時，照這步驟做，客戶端就自己每 ~2.9 秒送一包 0x36 做完整批（續做函式
+# 0x5C32E3），做好一個把製作清單那列數量 −1、到 0 移除該列、清單空了自然停。
+# ★ **不能靠工具箱自送 0x36**：只做得出第 1 個，之後伺服器拒收（跳「製作物品
+#   失敗」對話框），還會卡住遊戲訊息迴圈。要走這條「填清單→makestart→放手」。
+#
+# GET_CTRL(ecx=[0x9B669C+0xC], window, 控制項id) → 控制項指標（已 AOB 登記）。
+GET_CTRL = 0x00624FCC
+WORLD_PTR = 0x009B669C
+# 三個控制項 id（UI 層常數，跟封包代號一樣屬「大更新改協定才會變」）：
+CTRL_RECIPES = 0xAFE          # 配方清單（選要做的配方）
+CTRL_QTY = 0xB03              # 數量輸入框
+CTRL_MAKELIST = 0xB0F         # 製作清單（makestart 讀它、客戶端續做也讀它）
+# 控制項裡的結構偏移（反組譯出處見下）：
+#   0x625487：item = [ctrl+0x150 + index*4]；資料 = [item+0x8c]
+CTRL_VEC_FIRST, CTRL_VEC_LAST = 0x150, 0x154
+ITEM_DATA_OFF = 0x8C          # 配方清單：=配方ID；製作清單：=配方<<16|剩餘數量
+#   0x625252：找第一個 [item+6]!=0 的列＝選中的那一列
+ITEM_SEL_OFF = 0x06
+#   數量框取值虛擬函式 0x625E9D＝`mov eax,[ctrl+0xf8]` → 字串緩衝指標，
+#   makeadd 對它做**窄字元 atoi**（0x757F96）→ 要寫**窄 ASCII 數字**。
+QTY_STR_OFF = 0xF8
+_CALL_T = 0.6
+# make_batch 專用回傳：開到的面板裡**沒有**這個配方（多半是別種生產的檯子）。
+# 呼叫端看到它就該「關掉這個面板、換下一個站台點」，而不是在原面板一直重試。
+WRONG_PANEL = "面板裡沒有這個配方（可能是別種生產的檯子）"
+
+
+def _ctrl(mover, scanner, wnd: int, ctrl_id: int):
+    """取製作面板裡某個控制項的指標。拿不到回 None。"""
+    if not GET_CTRL:
+        return None
+    thisptr = _u32(scanner, _u32(scanner, WORLD_PTR) + 0xC)
+    if not _PTR_LO < (thisptr or 0) < _PTR_HI:
+        return None
+    ptr = mover.call_sync(GET_CTRL, wnd, ctrl_id, ecx=thisptr, timeout=_CALL_T)
+    return ptr if ptr and _PTR_LO < ptr < _PTR_HI else None
+
+
+def _rows(scanner, ctrl: int) -> list[int]:
+    """控制項的項目指標陣列（vector）。"""
+    first = _u32(scanner, ctrl + CTRL_VEC_FIRST)
+    last = _u32(scanner, ctrl + CTRL_VEC_LAST)
+    if not first or last is None or last < first:
+        return []
+    n = (last - first) // 4
+    return [_u32(scanner, first + i * 4) for i in range(min(n, 4096))]
+
+
+def make_batch(mover, scanner, wnd: int, recipe_id: int,
+               qty: int) -> tuple[bool, int, str]:
+    """開一整批：在**已開著的**面板裡選配方、設數量、makeadd、makestart。
+
+    回 (成功嗎, 真的排進製作清單的數量, 訊息)。成功之後**客戶端會自己做完整批**，
+    呼叫端只要看背包材料變少即可（別再自送 0x36）。
+
+    ⚠ 面板要先開著（呼叫端用 `produce.click(站台)` 開）。`wnd` 傳 `WND_MAKE`
+      的值（`panel_open` 讀得到）。
+    """
+    if not (mover and mover.active):
+        return False, 0, "跳板沒裝好"
+    if not GET_CTRL:
+        return False, 0, "取控制項函式定位失敗（遊戲改版？）—— 這個功能停用"
+    if not 1 <= recipe_id < 0x10000 or qty <= 0:
+        return False, 0, f"配方或數量不合理（{recipe_id}, {qty}）"
+    rec_c = _ctrl(mover, scanner, wnd, CTRL_RECIPES)
+    qty_c = _ctrl(mover, scanner, wnd, CTRL_QTY)
+    mk_c = _ctrl(mover, scanner, wnd, CTRL_MAKELIST)
+    if not (rec_c and qty_c and mk_c):
+        return False, 0, "面板控制項讀不到（面板還沒開好？）"
+
+    # ① 選配方：清掉所有列的選取旗標，只把目標那列設 1（0x625252 認第一個 !=0）
+    target = None
+    for it in _rows(scanner, rec_c):
+        if not (it and _PTR_LO < it < _PTR_HI):
+            continue
+        mover.write(it + ITEM_SEL_OFF, b"\x00")
+        if _u32(scanner, it + ITEM_DATA_OFF) == recipe_id:
+            target = it
+    if target is None:
+        # ★ 開到的面板不是這個配方的生產類別（點到別種站台）。回 WRONG_PANEL，
+        #   呼叫端會關掉它、換下一個站台再點（見 produce_tab._craft_step）。
+        return False, 0, WRONG_PANEL
+    if not mover.write(target + ITEM_SEL_OFF, b"\x01"):
+        return False, 0, "選配方寫入失敗"
+
+    # ② 設數量：往數量框的字串緩衝寫窄 ASCII（makeadd 讀不到數字就不加）
+    sbuf = _u32(scanner, qty_c + QTY_STR_OFF)
+    if not (sbuf and _PTR_LO < sbuf < _PTR_HI):
+        return False, 0, "數量框讀不到"
+    if not mover.write(sbuf, str(int(qty)).encode("ascii") + b"\0"):
+        return False, 0, "設數量寫入失敗"
+
+    # ③ makeadd → 把（選中配方 + 數量）加進製作清單
+    from app.game import lua
+    ok, _v = lua.call(mover, scanner, "game.makeadd", wnd)
+    if not ok:
+        return False, 0, f"makeadd 沒成功（{_v}）"
+    added = 0
+    for it in _rows(scanner, mk_c):
+        data = _u32(scanner, it + ITEM_DATA_OFF) or 0
+        if (data >> 16) == recipe_id:
+            added = max(added, data & 0xFFFF)
+    if added <= 0:
+        # makeadd 有前置檢查（材料/等級/數量），不合就不加、也不報錯
+        return False, 0, "makeadd 沒把配方排進去（材料不足／數量 0／等級不夠？）"
+
+    # ④ makestart → 送首包、客戶端接手續做整批
+    ok, _v = lua.call(mover, scanner, "game.makestart", wnd)
+    if not ok:
+        return False, added, f"已排 {added} 個但 makestart 沒成功（{_v}）"
+    return True, added, ""
+
+
+def make_stop(mover, scanner) -> tuple[bool, str]:
+    """停止整批製作（送 0x37）。跟 `craft_stop` 同一包，換個看得懂的名字。"""
+    return craft_stop(mover, scanner)
+
+
+def close_panel(mover, scanner) -> bool:
+    """關掉製作面板（`OnMakeClose`，也會送 makestop）。點錯站台時用來換一個再點。
+
+    ⚠ 開關視窗在這個專案是安全操作（查清單內容才會卡死，見 lua-engine）。
+    """
+    if not (mover and mover.active):
+        return False
+    from app.game import lua
+    ok, _v = lua.call(mover, scanner, "OnMakeClose")
+    return bool(ok)
+
+
+# ---------------------------------------------------------------------------
 def craft(mover, scanner, recipe_id: int) -> tuple[bool, str]:
-    """做**一個**。要做很多個就等做完再叫一次（客戶端自己也是這樣）。"""
+    """做**一個**。⚠ 只做得出第一個就會被拒（見 make_batch 的說明）——
+    正常製作請走 `make_batch`。這支保留給診斷／單發用。"""
     if not 1 <= recipe_id < 0x10000:
         return False, f"配方編號不合理（{recipe_id}）"
     ok, msg = _send(mover, scanner, OP_CRAFT, BODY_CRAFT,

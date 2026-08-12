@@ -527,20 +527,19 @@ SIGS: tuple[Sig, ...] = (
         "33 C0 39 86 C4 00 00 00 0F 84 ?? ?? ?? ?? 39 86 C8 00 00 00"
         " 0F 84 ?? ?? ?? ?? 8B BE ?? ?? ?? ?? 83 FF 03",
         0x00000184),
-    # ── 佈景／可點物件的 vtable（見 app/game/scenery.py）─────────
-    # 製作檯就是這一族，我們靠「點它」讓伺服器把製作面板開起來。
-    # 錨在它的建構函式：`call 基底建構 / xor eax,eax / mov [esi],vtable /
-    # mov [esi+0x1A4],eax / mov [esi+0x1A8],eax`。模組內的立即值（vtable 本身
-    # 與 rel32）由 _auto_mask 遮掉 —— 骨架是那幾行指令，不是答案。
-    # ⚠ 這個模子在模組裡有**三支**兄弟建構函式（0x580EC3／0x581168 是另外兩個
-    #   類別），前 40 bytes 一字不差 —— 分岔點在第四行欄位初始化：只有我們這支
-    #   是 `mov byte [esi+0x1C8],al`（88），另外兩支是 `mov [esi+0x1AC],eax`
-    #   （89）。所以特徵一定要蓋到那一行，少一行就是三重命中。
-    Sig("scenery", "VT_SCENERY", "data", 22,
-        "55 8B EC 51 56 FF 75 08 8B F1 89 75 FC E8 ?? ?? ?? ?? 33 C0"
-        " C7 06 40 81 7D 00 89 86 A4 01 00 00 89 86 A8 01 00 00"
-        " 88 86 C8 01 00 00",
-        0x007D8140),
+    # ── 取視窗控制項的函式（見 app/game/produce.py）──────────────
+    # `GET_CTRL(ecx=[0x9B669C+0xC], window, 控制項id)` → 控制項指標。製作面板要
+    # 靠它拿到「配方清單/數量框/製作清單」三個控制項，才能選配方、設數量。
+    # 錨在函式本體骨架：`cmp [ebp+8],0 / push ebx/esi/edi / mov edi,ecx /
+    # je … / push [ebp+8] / call(遞迴查找) / mov ebx,eax / test ebx,ebx / je … /
+    # mov esi,[ebx+0xC8] / jmp …`。兩個 rel32 的 call 交給遮罩，靠指令骨架當錨。
+    # ⚠ 這一族「佈景/可點物件 vtable 0x7D8140」的舊特徵已拿掉：製作檯其實不是
+    #   0x7D8140（那是純裝飾），是 gather.VT_RESOURCE（已登記），見 scenery.py。
+    Sig("produce", "GET_CTRL", "fn", None,
+        "55 8B EC 83 7D 08 00 53 56 57 8B F9 74 47 FF 75 08 E8 ?? ?? ?? ??"
+        " 8B D8 85 DB 74 61 8B B3 C8 00 00 00 EB 27 FF 36 8B CF"
+        " E8 ?? ?? ?? ?? 85 C0 74 17",
+        0x00624FCC),
     # ── 製作／公會貢獻（見 app/game/recipes.py）──────────────────
     # 前三段是「依 ID 查表」那種函式，模組裡有 41 支長得一模一樣
     # （怪物表、技能表都是），差別只有邊界值與錯誤訊息裡的**表名字串**。

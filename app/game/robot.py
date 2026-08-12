@@ -692,30 +692,32 @@ def begin_gather(mover, scanner, center: tuple[float, float],
     ⚠ 我們**只多做兩件**：
       ① 中心點不一定放在腳下，可以放在使用者選的那種資源上（呼叫端算好
          傳進來），這樣精靈就會往他要的東西那邊採。
-      ② `names` 有給就填「目標資源列表」＋開「採集指定資源」——
+      ② 填「目標資源列表」＝ `names`，並**強制勾「採集指定資源」**——
          **中心點擋不住它採別種**（使用者實測：選了魚藻卻去採花叢），
          要只採某幾種非填這份清單不可。
-         ⚠ 清單寫不進去就**不開**那個開關，並在回傳的說明裡講出來：
-           寧可誠實地「全都採」，也不要嘴上說只採魚藻卻在採花叢。
+         ★ 2026-08-12 使用者要求：這個開關**一律 ON**（強制勾）。清單寫不進去
+           **也不退回「採全部」**——寧可採很少/採不到（大聲說），也不要把使用者
+           沒選的東西也採了。（以前寫失敗會退回採全部，已改。）
     ⚠ 「自動採集」的記錄五台都已經存在（型別 bool），所以那條是純記憶體
       寫入；只有記錄不存在時才會退回 Lua（`set_bool` 自己會處理）。
     """
     notes: list[str] = []
 
+    # ★★ 使用者要求（2026-08-12）：「採集指定資源」**強制勾**——永遠 ON，
+    #    寧可「清單空/寫失敗時採很少或採不到」也**不退回「採全部」**把沒選的
+    #    東西也採了。以前寫失敗會退回採全部（安全退化），現在改成大聲說、不退。
+    set_bool(mover, scanner, AS_DESIGNATED_GATHER, True)
     if names:
         good, why = set_res_list(mover, scanner, names)
         if good:
-            set_bool(mover, scanner, AS_DESIGNATED_GATHER, True)
             notes.append("只採：" + "、".join(names))
         else:
-            set_bool(mover, scanner, AS_DESIGNATED_GATHER, False)
-            notes.append(f"⚠ 指定資源設不進去（{why}）→ 這次會採**全部**種類")
+            notes.append(f"⚠ 指定資源清單寫不進去（{why}）→ 已強制只採指定，"
+                         "但清單可能是舊的，若採不到請重開一次採集")
     else:
-        # 沒指定＝採全部。⚠ 一定要主動把開關關掉：上一輪可能開著，
-        #   留著的話清單還是舊的，等於在採使用者這次沒選的東西。
-        ok, cur = get_bool(mover, scanner, AS_DESIGNATED_GATHER)
-        if ok and cur is not False:
-            set_bool(mover, scanner, AS_DESIGNATED_GATHER, False)
+        # 沒勾任何種類，卻強制指定＝清單空＝採不到 → 大聲說，不再靜默採全部。
+        notes.append("⚠ 沒勾任何資源種類，但「採集指定資源」強制開著 → "
+                     "會採不到東西，請先勾要採的種類")
     cx, cy = int(center[0] * TILE), int(center[1] * TILE)
     if scene_id is not None:
         set_int(mover, scanner, AS_GATHER_ORG_MAP, int(scene_id))
@@ -987,7 +989,7 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
       （使用者要求：「不要管他遊戲裡面有沒有設定」）。這樣我們的觸發跟
       官方的觸發互相獨立，不會因為他在遊戲裡沒勾就變成不動。
 
-    · `on_broken` → **身上穿的裝備**任何一件耐久 0（`bag.worn_broken()`；
+    · `on_broken` → **身上穿的裝備**任何一件耐久 ≤ 1（`bag.worn_broken()`；
       使用者 2026-08-07 要求：以前只看武器，改成全身、不含背包）
     · `on_hp` → **HP 藥水那一組**全部歸零（見 `_potion_out`）
     · `on_mp` → **MP 藥水那一組**全部歸零
