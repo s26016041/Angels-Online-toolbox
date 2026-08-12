@@ -578,6 +578,21 @@ SIGS: tuple[Sig, ...] = (
         "33 D2 8B CF 83 E1 1F 42 D3 E2 8B C7 8B 4D E8 C1 E8 05"
         " 85 94 81 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? 57 E8 ?? ?? ?? ??",
         0x000058F8),
+    # ── 失焦不凍畫面（見 app/game/unfreeze.py）──────────────────────
+    # 要 patch 的那 2 個位元組所在位址：視窗程序 WndProc(0x70CAB0) 處理
+    # WM_ACTIVATE/WM_ACTIVATEAPP 的 handler 裡，把「失焦」算成 inactive 的
+    # `xor al,al`（機器碼 32 C0）。改成 `mov al,1`（B0 01）就永遠當自己 active。
+    # ⚠ kind='fn' 回傳的是命中處位址 = 要 patch 的位址；特徵**開頭那 2 個
+    #   位元組（就是要改的 32 C0）故意遮成 `??`** —— 這樣 patch 前(32 C0)、
+    #   patch 後(B0 01) 都定位得到（不然套用之後重掃就找不到自己了）。
+    #   靠後面那串骨架當錨：`jmp +2 / mov al,1 / mov [ebp-0x20],al /
+    #   mov [ebx+0xc],al / cmp al,cl / je … / mov eax,[ebx] / mov ecx,ebx /
+    #   push [ebp-0x20] / call [eax+0x50]`。je 的 rel32 遮掉，call 的 +0x50
+    #   是類別版面（大更新才會變）留著。已用真映像驗證唯一命中 0x70CC5A。
+    Sig("unfreeze", "PATCH_ADDR", "fn", None,
+        "?? ?? EB 02 B0 01 88 45 E0 88 43 0C 3A C1 0F 84 ?? ?? ?? ??"
+        " 8B 03 8B CB FF 75 E0 FF 50 50",
+        0x0070CC5A),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。
