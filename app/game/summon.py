@@ -1,7 +1,23 @@
 """自動召喚：F11 的召喚物不見了／死了就自動重放（掛機用）。
 
-跟 `buff.py`（自動分身）同一個掛法，但多了「召喚物還在不在」的偵測 ——
-分身看不到剩餘時間所以按時間補；召喚物在**實體清單**裡看得到，照著看就好。
+跟 `buff.py`（自動分身）同一個掛法，但多了「召喚物還在不在」的偵測。
+
+「還在不在」怎麼看（2026-08-13 第二輪實測大翻案）
+------------------------------------------------
+⚠⚠ **召喚物的 eid 不穩定**：伺服器會不時整隻重建（施放後前 10 秒連換三次、
+  走遠了瞬移跟上主人時也換），每次都是新物件＋新 eid。所以「記 eid 用
+  read_live 盯」會一直誤判成「不見了」——使用者實際回報的症狀就是
+  「走太快就重召，其實牠還在」。
+✅ 正解＝讀遊戲自己記的「我的召喚物」：**[[quickbar.MGR_PTR]+PET_SLOT_OFF]**
+  （就在角色屬性基準 +0xCB88 前面，同一個角色管理結構）。實測語意：
+    · 在視野內：等於實體清單裡那隻的 eid
+    · 走遠（不在視野、正在重建）：**保持非零**，換 eid 後 ~1 秒內跟上
+    · 跳地圖：歸零 2~4 秒 → 召喚物**自己跟過來** → 恢復非零（新 eid）
+    · 重召喚：~1 秒內變成新 eid；連環重建期間**從不歸零**
+  → 存在偵測＝「槽 != 0」；歸零**持續 LOST_GRACE 秒**才算真的沒了。
+⚠ PET_SLOT_OFF 是**結構偏移**（大更新改版面才會壞的那類），所以要
+  **執行時自我驗證**：施放並認養到新實體後，槽值曾經等於牠的 eid 才敢信
+  （slot_ok 閂）；驗不過就退回舊的實體追蹤法（會誤判但不會不動作）。
 
 召喚物長什麼樣（2026-08-13 黑狐「召喚噬魂怪Ⅰ」實測，見 memory summon-creature）
 --------------------------------------------------------------------------
@@ -9,17 +25,12 @@
   （「召喚噬魂怪Ⅰ」→「噬魂怪Ⅰ」），OFF_KIND = 4。
   ⚠ kind=4 **不是召喚物專屬**：擺攤中的玩家也是 4（天使學園實拍 22 隻全是
     玩家名），所以認召喚物不能只看 kind。
-* **物件裡沒有主人欄位**：整個物件 0x1000 掃不到玩家 eid／玩家物件指標
-  （+0x4E8 曾出現過玩家指標，但那是交戰槽殘留，第二隻就沒有了——
-  跟 [[foe-field-unreliable]] 同一回事）。angel.dat 也沒有任何全域指著它。
-  → 「這隻是**我的**」唯一可靠的認法：**我施放之後那一刻新冒出來的那隻**，
-    記住它的 eid 一路追蹤。
-* 換地圖召喚物直接消失、物件被回收；回原圖也不會回來。
-* 位址會被重複使用（第二隻跟第一隻同一個位址、不同 eid）——
-  所以追蹤一律 `entity.read_live()`（vtable＋eid 一起驗），跟怪一樣。
+* **物件裡沒有主人欄位**（+0x4E8 是交戰槽殘留，不可信）；
+  「這隻是我的」＝我施放後出生在封包那一格的那隻（認養用）。
+* 位址、eid 都會變 —— 別拿任何一個當長期身分，長期身分只有上面那個槽。
 * **活著時再放一次＝直接換一隻新的**（舊的消失、新 eid 出現）——
   所以「不確定在不在就重放」是安全的，最壞只是多耗一次 MP。
-* 死掉跟怪一樣：動畫狀態變 'Dead'。
+* ⚠ 死掉會不會變 'Dead' 沒實機看過（測試沒讓牠死成）；死亡偵測靠槽歸零。
 
 怎麼放
 ------
@@ -32,16 +43,26 @@ F11 空的／放物品就 block() 大聲停手，不盲按。
 """
 from __future__ import annotations
 
+import struct
 import time
 
 from app.game import attack, entity, quickbar, skills
 
 SLOT = 10                 # F11（固定，使用者指定）
 PAGE = 0
-CHECK_GAP = 0.5           # 追蹤中的召喚物多久驗一次死活（一次 1 個系統呼叫）
-MISS_GRACE = 2            # 連續幾次「讀不到」才算不見 —— 防瞬間讀失敗誤判
+CHECK_GAP = 0.5           # 多久驗一次存在（讀槽 1 次系統呼叫）
+MISS_GRACE = 2            # （退路模式）連續幾次讀不到才算不見
 ADOPT_WAIT = 4.0          # 施放後等新實體出現多久（實測 1.5 秒內就會出現）
 RETRY = 6.0               # 施放了卻沒看到新召喚物（MP 不足？）→ 隔這麼久再試
+# 「我的召喚物 eid」在角色管理結構裡的偏移（[MGR_PTR]+這個）。
+# ⚠ 結構偏移（大更新才會壞的類別）；壞掉靠 slot_ok 自我驗證退回實體追蹤。
+#   出處：2026-08-13 全記憶體交叉掃描（兩個不同 eid 都出現在這一格）＋
+#   跳圖歸零／走遠不歸零／重召喚跟上，三種事件實測（見檔頭）。
+#   角色屬性基準在 [MGR_PTR]+0xCB88（player.py 那條捷徑），這格在它前面 0x6C。
+PET_SLOT_OFF = 0xCB1C
+# 槽歸零要**連續**這麼久才算真的沒了：跳地圖時會暫時歸零 2~4 秒
+# （召喚物幾秒後自己跟過來），馬上重召等於把跟過來的那隻白白換掉。
+LOST_GRACE = 8.0
 # 認養的兩道錨（使用者 2026-08-13 提醒：**同職業的玩家也會召喚**——
 # 同名＋新 eid 一模一樣，能分的只有出生點）：
 # ① **正中施放格**優先：施放封包的座標是我們自己填的，而兩輪實測召喚物
@@ -56,6 +77,25 @@ NEAR = 2.0
 PREFIX = "召喚"           # 技能名的字首；去掉就是召喚物的名字
 
 
+def read_pet_slot(scanner) -> int | None:
+    """遊戲記的「我的召喚物 eid」；讀不到（沒進遊戲／位移）回 None。
+
+    0 ＝ 現在沒有召喚物（跳圖的暫態也是 0，呼叫端要配 LOST_GRACE 用）。
+    ⚠ 回 None 跟回 0 是兩回事：None 是「不知道」，不能當「沒有」
+      （[[bag-false-empty-guards]] 那條鐵則）。
+    """
+    raw = scanner._read_bytes(quickbar.MGR_PTR, 4)
+    if not raw:
+        return None
+    mgr = struct.unpack("<I", bytes(raw))[0]
+    if not 0x10000 <= mgr < 0x7FFF0000:
+        return None
+    raw = scanner._read_bytes(mgr + PET_SLOT_OFF, 4)
+    if not raw:
+        return None
+    return struct.unpack("<I", bytes(raw))[0]
+
+
 class AutoSummon:
     """一個角色一份。
 
@@ -68,6 +108,10 @@ class AutoSummon:
         self.skill = skill_id or None
         self.expect: str | None = None       # 預期的召喚物名字；None = 不知道
         self.page = PAGE                     # 讀到技能的那一頁（按鍵退路要用）
+        # 「我的召喚物」槽驗證過了沒 —— 驗過才敢拿它當存在依據。
+        # ⚠ 故意**不放進 reset()**：偏移對不對是這一版遊戲的性質，
+        #   跟勾選框開開關關無關，驗過一次就一直有效。
+        self._slot_ok = False
         self.reset()
 
     def reset(self) -> None:
@@ -81,6 +125,8 @@ class AutoSummon:
         self._cast_pos: tuple[float, float] | None = None
         self._cast_tile: tuple[int, int] | None = None   # 封包裡填的那一格
         self._check_t = 0.0
+        self._zero_since: float | None = None    # 槽從什麼時候開始一直是 0
+        self._slot_at_cast = 0                   # 施放那一刻的槽值（認養備援用）
 
     def adopt(self, skill_id: int, page: int = PAGE) -> bool:
         """指定 F11 的技能編號（呼叫端從快捷欄讀到的）。
@@ -133,17 +179,52 @@ class AutoSummon:
         if not self.skill:
             return self.blocked or self.note
         now = time.monotonic()
+        slot_v = read_pet_slot(scanner)
 
-        # ① 有追蹤中的召喚物 → 定期驗它還在不在（vtable＋eid＋沒死）
+        # 槽的執行時驗證：槽值對得上**畫面上任何一隻同名召喚物的 eid**
+        # 就算驗證通過（那正是我們要依賴的語意）。
+        # ★ 不等認養：第一次施放時熱區掃描可能晚幾秒才看到新實體，
+        #   認養窗撲空 → 沒驗證 → 沒有備援 → 白白多放一次（實機踩到）。
+        #   場上有舊召喚物（上一輪的、手動放的）時這裡當場就驗完了。
+        if not self._slot_ok and slot_v:
+            for e in (pets or []):
+                if e.eid == slot_v and (self.expect is None
+                                        or e.name == self.expect):
+                    self._slot_ok = True
+                    break
+
+        # ① 有追蹤中的召喚物 → 定期驗它還在不在
         if self._tracked is not None:
             if now - self._check_t < CHECK_GAP:
                 return self.note
             self._check_t = now
+            # 驗證的另一半：曾經等於我們認養那隻的 eid 也算數。
+            # （施放後槽會晚實體清單 ~1 秒才跟上，所以是「曾經」不是「當下」。）
+            if not self._slot_ok and slot_v and slot_v == self._tracked.eid:
+                self._slot_ok = True
+            if self._slot_ok:
+                # ★ 正路：existence ＝ 槽 != 0。eid 重建（走遠瞬移跟上、
+                #   伺服器重發）槽只會換值不會歸零 —— 這正是舊法誤判成
+                #   「不見了」的情況，這裡完全不會。
+                if slot_v:
+                    self._zero_since = None
+                    return self.note
+                if slot_v == 0:
+                    if self._zero_since is None:
+                        self._zero_since = now      # 開始計時（跳圖暫態也是 0）
+                    elif now - self._zero_since >= LOST_GRACE:
+                        self._tracked = None
+                        self._zero_since = None
+                        self._sent_at = 0.0         # 確定沒了 → 馬上重放
+                        self.note = "召喚物沒了 → 重新召喚"
+                    return self.note
+                return self.note                    # None＝這拍讀不到，不動作
+            # 退路（槽還沒驗證過／偏移壞掉）：舊的實體追蹤。
+            # ⚠ eid 重建時這條路會誤判成不見 → 多放一次（浪費 MP 但不會壞事）。
             alive, st, _pos = entity.read_live(scanner, self._tracked)
             if alive and st != "Dead":
                 self._miss = 0
                 return self.note
-            # 'Dead' 是確定死了；讀不到再給 MISS_GRACE 次機會（瞬間讀失敗）
             self._miss += 1
             if st == "Dead" or self._miss >= MISS_GRACE:
                 self._tracked = None
@@ -159,7 +240,18 @@ class AutoSummon:
                 self._tracked = got
                 self._miss = 0
                 self._check_t = now
+                self._zero_since = None
                 self.note = f"已召喚：{got.name}"
+            elif (self._slot_ok and slot_v
+                    and slot_v != self._slot_at_cast):
+                # 認養備援：實體沒對上（出生點被佔挪走之類），但槽已經換成
+                # 新 eid ＝ 召喚成功。造個占位追蹤物，之後全靠槽看存在。
+                self._tracked = entity.Entity(0, slot_v, 0,
+                                              self.expect or "召喚物")
+                self._miss = 0
+                self._check_t = now
+                self._zero_since = None
+                self.note = f"已召喚：{self.expect or '召喚物'}（用槽認的）"
             return self.note
 
         # ③ 施放過卻一直沒出現（MP 不足／被打斷）→ 照 RETRY 節奏無限重試
@@ -179,6 +271,10 @@ class AutoSummon:
             return self.note
         # 施放那一刻場上已有的 kind=4 —— 之後**不在這份名單裡的**才是我的
         self._pre = {e.eid for e in (pets or [])}
+        # 施放那一刻的槽值：認養備援要比「槽有沒有換新」（重放＝換一隻，
+        # 槽會從舊 eid 變新 eid；施放失敗就不會變）
+        self._slot_at_cast = slot_v or 0
+        self._zero_since = None
         if skills.is_ground(self.skill):
             # 對地：施放封包帶自己腳下的格子座標（實測就長出在**那一格正中**）
             tx, ty = int(pos[0]), int(pos[1])
