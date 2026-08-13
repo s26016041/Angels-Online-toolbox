@@ -232,26 +232,31 @@ def _rows(scanner, ctrl: int) -> list[int]:
 
 
 def make_batch(mover, scanner, wnd: int, recipe_id: int,
-               qty: int) -> tuple[bool, int, str]:
+               qty: int) -> tuple[bool, int, int, str]:
     """開一整批：在**已開著的**面板裡選配方、設數量、makeadd、makestart。
 
-    回 (成功嗎, 真的排進製作清單的數量, 訊息)。成功之後**客戶端會自己做完整批**，
-    呼叫端只要看背包材料變少即可（別再自送 0x36）。
+    回 (成功嗎, 真的排進製作清單的數量, 製作清單控制項指標, 訊息)。
+    成功之後**客戶端會自己做完整批**（別再自送 0x36）。
+
+    ★ 「真的排進去的數量」可能**比要求的少**（makeadd 自己會依材料／負重
+      ／背包裁掉）—— 呼叫端要拿這個數字當真相，不能拿自己要求的 qty。
+    ★ 控制項指標給呼叫端**監看進度**用：`make_left()` 純讀那列「還剩幾個」，
+      那才是遊戲自己的進度（吃了製作加倍、被打斷都反映在上面）。
 
     ⚠ 面板要先開著（呼叫端用 `produce.click(站台)` 開）。`wnd` 傳 `WND_MAKE`
       的值（`panel_open` 讀得到）。
     """
     if not (mover and mover.active):
-        return False, 0, "跳板沒裝好"
+        return False, 0, 0, "跳板沒裝好"
     if not GET_CTRL:
-        return False, 0, "取控制項函式定位失敗（遊戲改版？）—— 這個功能停用"
+        return False, 0, 0, "取控制項函式定位失敗（遊戲改版？）—— 這個功能停用"
     if not 1 <= recipe_id < 0x10000 or qty <= 0:
-        return False, 0, f"配方或數量不合理（{recipe_id}, {qty}）"
+        return False, 0, 0, f"配方或數量不合理（{recipe_id}, {qty}）"
     rec_c = _ctrl(mover, scanner, wnd, CTRL_RECIPES)
     qty_c = _ctrl(mover, scanner, wnd, CTRL_QTY)
     mk_c = _ctrl(mover, scanner, wnd, CTRL_MAKELIST)
     if not (rec_c and qty_c and mk_c):
-        return False, 0, "面板控制項讀不到（面板還沒開好？）"
+        return False, 0, 0, "面板控制項讀不到（面板還沒開好？）"
 
     # ① 選配方：清掉所有列的選取旗標，只把目標那列設 1（0x625252 認第一個 !=0）
     target = None
@@ -264,22 +269,22 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
     if target is None:
         # ★ 開到的面板不是這個配方的生產類別（點到別種站台）。回 WRONG_PANEL，
         #   呼叫端會關掉它、換下一個站台再點（見 produce_tab._craft_step）。
-        return False, 0, WRONG_PANEL
+        return False, 0, mk_c, WRONG_PANEL
     if not mover.write(target + ITEM_SEL_OFF, b"\x01"):
-        return False, 0, "選配方寫入失敗"
+        return False, 0, mk_c, "選配方寫入失敗"
 
     # ② 設數量：往數量框的字串緩衝寫窄 ASCII（makeadd 讀不到數字就不加）
     sbuf = _u32(scanner, qty_c + QTY_STR_OFF)
     if not (sbuf and _PTR_LO < sbuf < _PTR_HI):
-        return False, 0, "數量框讀不到"
+        return False, 0, mk_c, "數量框讀不到"
     if not mover.write(sbuf, str(int(qty)).encode("ascii") + b"\0"):
-        return False, 0, "設數量寫入失敗"
+        return False, 0, mk_c, "設數量寫入失敗"
 
     # ③ makeadd → 把（選中配方 + 數量）加進製作清單
     from app.game import lua
     ok, _v = lua.call(mover, scanner, "game.makeadd", wnd)
     if not ok:
-        return False, 0, f"makeadd 沒成功（{_v}）"
+        return False, 0, mk_c, f"makeadd 沒成功（{_v}）"
     added = 0
     for it in _rows(scanner, mk_c):
         data = _u32(scanner, it + ITEM_DATA_OFF) or 0
@@ -287,13 +292,46 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
             added = max(added, data & 0xFFFF)
     if added <= 0:
         # makeadd 有前置檢查（材料/等級/數量），不合就不加、也不報錯
-        return False, 0, "makeadd 沒把配方排進去（材料不足／數量 0／等級不夠？）"
+        return False, 0, mk_c, \
+            "makeadd 沒把配方排進去（材料不足／數量 0／等級不夠？）"
 
     # ④ makestart → 送首包、客戶端接手續做整批
     ok, _v = lua.call(mover, scanner, "game.makestart", wnd)
     if not ok:
-        return False, added, f"已排 {added} 個但 makestart 沒成功（{_v}）"
-    return True, added, ""
+        return False, added, mk_c, f"已排 {added} 個但 makestart 沒成功（{_v}）"
+    return True, added, mk_c, ""
+
+
+def make_left(scanner, mk_ctrl: int, recipe_id: int) -> int | None:
+    """這個配方在製作清單裡**還剩幾個**（純讀，開一批之後拿來監看進度）。
+
+    ★ 這是**遊戲自己的進度數字**：做好一個那列 −1、到 0 移除該列。拿它當
+      進度比「數材料變少」準 —— 遊戲排得比要求少（負重／背包）、吃了製作
+      加倍、被系統打斷，全都反映在這個數字上。
+    ⚠ `mk_ctrl` 是開批那一刻拿的控制項指標，面板一關就懸空 —— 呼叫端要先
+      確認 `panel_open()` 是 True 才來讀；這裡再驗一次指標與 vector 合理性，
+      驗不過回 **None**（不是 0）：「讀不到」≠「做完了」
+      （bag-false-empty-guards 那類誤報復發過六次）。回 0 ＝清單裡真的
+      沒有這個配方＝這一批做完了。
+    """
+    if not (mk_ctrl and _PTR_LO < mk_ctrl < _PTR_HI):
+        return None
+    first = _u32(scanner, mk_ctrl + CTRL_VEC_FIRST)
+    last = _u32(scanner, mk_ctrl + CTRL_VEC_LAST)
+    if first == 0 and last == 0:
+        return 0                       # 沒配置過的空 vector＝清單空
+    if not (_PTR_LO < first < _PTR_HI and first <= last
+            and last - first <= 4096 * 4):
+        return None
+    left = 0
+    for i in range((last - first) // 4):
+        it = _u32(scanner, first + i * 4)
+        if not _PTR_LO < it < _PTR_HI:
+            continue
+        data = _u32(scanner, it + ITEM_DATA_OFF) or 0
+        if (data >> 16) == recipe_id:
+            left = max(left, data & 0xFFFF)
+    return left
 
 
 def make_stop(mover, scanner) -> tuple[bool, str]:

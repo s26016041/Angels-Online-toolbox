@@ -88,10 +88,13 @@
    選項編號是伺服器當下發的、湊不出來（見 `app/game/produce.py` 檔頭）。
    → 處理方式只剩「全部捐公會」與「做完就停著」兩個。
 
-★★ 「做出一個」的唯一訊號是**材料變少**，不是「封包送出去了」。
-   站錯地方、伺服器忙、背包滿都會讓那包沒有效果；送得出去 ≠ 做得成
-   （跟掛機那邊「真打得到的唯一訊號是目標血量」同一個教訓）。
-   沒反應就重送、**不設上限**（使用者的規矩），出口是取消勾選。
+★★ 進度**以遊戲自己的製作清單為準**（2026-08-13 改）：開一批之後那列
+   「還剩幾個」做好一個 −1，遊戲排得比要求少（負重／背包）、吃了製作
+   加倍、被打斷，全反映在上面 —— 不再自己預計然後跟現實脫鉤。清單讀
+   不到才退回「材料變少」備援。「封包送出去了」永遠不算數：站錯地方、
+   伺服器忙、背包滿都會讓那包沒有效果（跟掛機「真打得到的唯一訊號是
+   目標血量」同一個教訓）。沒反應就重送、**不設上限**（使用者的規矩），
+   出口是取消勾選。
 
 ⚠ 整趟與製作各有兜底逾時，卡住會**大聲**停並放掉勾勾，不會無聲無息停住
   （見 memory 的 frozen-tick-state-machines）。
@@ -184,10 +187,14 @@ CRAFT_RETRY_SECS = 6.0
 # 一批最多排幾個（makeadd 的數量）。客戶端會自己把整批做完，做完再開下一批。
 # ★ 開大一點＝少幾次 makeadd；材料不夠時 make_batch 只會排「做得出來的」那些。
 BATCH_MAX = 999
-# 一批開始後，多久沒看到材料變少就當「這批做完了或卡住」→ 收掉重算。
-# 客戶端一個約 2.9 秒，8 秒留足伺服器延遲；空清單自然停也是靠這個收尾。
+# 一批開始後，多久沒看到進度（清單變少／材料變少）就當「卡住」→ 收掉重算。
+# 客戶端一個約 2.9 秒，8 秒留足伺服器延遲。
 BATCH_STALL_SECS = 8.0
-# 整趟製作的兜底：超過就大聲說並收尾，不要無聲無息卡在那裡。
+# 製作的兜底：**沒有進展**超過這麼久才算卡住（每做出一個就重新起算）。
+# ⚠⚠ 不能拿「總時長」當上限（2026-08-13 使用者實測踩到）：材料多的時候
+#   一趟做上萬個、好幾個小時是正常的 —— 舊寫法 30/60 分鐘總時長一到就把
+#   整趟砍掉、勾勾放掉，遊戲自己把已排進去的那批（≤999 個）做完就停，
+#   看起來就是「工具說 9000 多、遊戲做 900 多、做完發呆」。
 CRAFT_MAX_SECS = 3600.0
 # ★★ 使用者要求：**要走到他定的那個點**，不要有差距（2026-08-12）。
 #   所以門檻是「站上同一格」而不是「靠近就好」——格子座標都是 x.5，
@@ -195,7 +202,10 @@ CRAFT_MAX_SECS = 3600.0
 # ⚠ 走位分兩段：遠距離 navigate（A* 最短路），最後一段 move.walk_exact
 #   （直送目的地、**不套打怪用的 MIN_GAP**，那個下限會讓人永遠差一格多）。
 BENCH_DONE = 0.8
-TRIP_MAX_SECS = 1800.0       # 整趟（回程→製作→捐→回標記點）的兜底
+# 整趟（回程→製作→捐→回標記點）的兜底：**沒有進展**超過這麼久才放棄。
+# ★ 製作有進展（清單變少／材料變少／開了新批）都會把起算點往後推 ——
+#   見 CRAFT_MAX_SECS 的教訓：總時長上限會把大批製作砍在半路。
+TRIP_MAX_SECS = 1800.0
 # ★ 找製作檯：到了現場之後，多遠以內的佈景物件算「可能是檯子」。
 #   點東西伺服器會判距離，站在檯子前面的話它一定在幾格內；範圍開太大只是
 #   讓「一個一個點」變慢（每 CRAFT_RETRY_SECS 才點一個）。
@@ -1117,9 +1127,12 @@ class CharProducePage(QWidget):
 
     def _trip_step(self) -> None:                  # noqa: C901 —— 狀態機本來就長
         s = self._trip
+        # ⚠ s["t0"] 是「上一次有進展」的時間，不是這一趟開始的時間 ——
+        #   製作那一段每做出一個就會把它往後推（一批 999 個要做快 1 小時，
+        #   拿總時長判會把好好在做的整趟砍掉，2026-08-13 使用者踩到）。
         if time.monotonic() - s["t0"] > TRIP_MAX_SECS:
             self._trip_end(
-                f"⚠ 這一趟超過 {TRIP_MAX_SECS / 60:.0f} 分鐘還沒走完，"
+                f"⚠ 這一趟超過 {TRIP_MAX_SECS / 60:.0f} 分鐘沒有任何進展，"
                 "停在這裡不再自己動 —— 請看一下角色卡在哪", bad=True)
             self._halt(self.run_cb, self.status.text())
             return
@@ -1377,17 +1390,20 @@ class CharProducePage(QWidget):
         兩邊各建一份的話，加了欄位就會有一邊漏掉（然後只在跑到一半時炸）。
 
             idx    現在做 plans 的第幾個配方
-            sig    上一次看到的材料總數（少了＝真的做出一個）
-            last_drop 上次材料變少的時間（判斷這一批停了沒）
-            made   已經做出幾個　　t0 這一段開始的時間
+            sig    上一次看到的材料總數（**備援**訊號：清單讀不到才用它計數）
+            last_drop 上次看到進度的時間（判斷這一批停了沒）
+            made   已經做出幾個
+            t0     **上一次有進展**的時間（看門狗起算點；⚠ 不是開始時間 ——
+                   拿總時長判會把幾小時的大批製作砍在半路，2026-08-13 踩到）
             plans  這一輪的配方清單（材料用完就重算）
-            total  總共要做幾個（給人看的進度）
+            total  總共要做幾個（給人看的進度；**每開一批就拿背包重算**）
             first  第一個做好的時間（拿來估「一個要多久」）
             props  這附近可點的**站台**（scenery.nearby 回的互動物；None=還沒掃）
             pi     現在點到第幾個候選
             poked  最後點中的那個候選（面板開起來就是它 → 記起來）
             wnd    製作面板 WND_MAKE 的值（開著才非 0）
-            batch  這一批的狀態（None=還沒開批；開了＝{"added":排入數量}）
+            batch  這一批的狀態（None=還沒開批；開了＝{"added":遊戲排進去的
+                   數量, "mk":製作清單控制項指標, "left":清單還剩幾個}）
             scene  開始做的時候在哪張圖（點到門被帶走時看得出來）
         """
         return {"idx": 0, "sig": None, "last_drop": 0.0, "made": 0,
@@ -1452,11 +1468,17 @@ class CharProducePage(QWidget):
         流程（2026-08-12 傍晚實機定案，見 memory craft-donate-storage-packets）：
           點站台開面板(WND_MAKE 非0) → `produce.make_batch(配方,數量)` 選配方+設
           數量+makeadd+makestart → 客戶端每 ~2.9 秒自己做一個直到清單空。
+        ★★ 進度**以遊戲自己的製作清單為準**（`produce.make_left` 純讀那列
+          「還剩幾個」，2026-08-13 改）：遊戲排得比要求少（負重／背包上限）、
+          吃了製作加倍、被打斷 —— 全都反映在清單上，不再自己預計然後跟現實
+          脫鉤。清單讀不到才退回「材料變少」備援；清單空了**馬上**開下一批。
+          「總共要做幾個」每開一批也拿當下的背包重算一次。
         ⚠ **不再自送 0x36**（舊寫法只做得出第一個就被伺服器拒、跳「製作物品
-          失敗」還卡住訊息迴圈）。這一批做完（材料停 BATCH_STALL_SECS 沒少）就
-          收掉重算：材料還有就再開一批，換配方或做完就往下走。
+          失敗」還卡住訊息迴圈）。一批停了 BATCH_STALL_SECS 沒進度就收掉重算：
+          材料還有就再開一批，換配方或做完就往下走。
         ⚠ 站錯地方／伺服器忙／背包滿都可能讓一批沒生效 → 收掉重來，**不設上限**
-          （使用者的規矩），出口是取消勾選；整段有 CRAFT_MAX_SECS 兜底。
+          （使用者的規矩），出口是取消勾選；CRAFT_MAX_SECS 是「沒有進展」的
+          兜底，**不是總時長** —— 一趟做上萬個、好幾個小時是正常的。
         """
         c = s["craft"]
         now = time.monotonic()
@@ -1474,8 +1496,10 @@ class CharProducePage(QWidget):
                            " —— 那個不是製作檯，已記住不再點它，這趟先回去採集",
                            warn=True)
                 return
+        # ⚠ c["t0"] 也是「上一次有進展」的時間（有做出東西就重設）——
+        #   這是「卡死一小時」的兜底，不是總時長上限。
         if now - c["t0"] > CRAFT_MAX_SECS:
-            self._note(f"⚠ 製作超過 {CRAFT_MAX_SECS / 60:.0f} 分鐘，"
+            self._note(f"⚠ 製作超過 {CRAFT_MAX_SECS / 60:.0f} 分鐘沒有進展，"
                        f"先收尾（已做 {c['made']} 個）", warn=True)
             s["step"] = "dispose"
             return
@@ -1517,12 +1541,22 @@ class CharProducePage(QWidget):
         makeable = min((have.get(mid, 0) // num for mid, num in cur.recipe.mats),
                        default=0)
         if makeable <= 0:                          # 這個配方材料用完 → 下一個
+            # ★ 走人之前先把**最後一件**記上：材料歸零的這一拍還沒輪到下面的
+            #   批次計數就 return 了，少補這一下每個配方都會少算一個
+            #   （trip_sim 情境⑭抓到的「一共 9 個」）。
+            if c["batch"] is not None and c["sig"] is not None:
+                sig0 = sum(have.get(mid, 0) for mid, _n in cur.recipe.mats)
+                if sig0 < c["sig"]:
+                    step = sum(num for _m, num in cur.recipe.mats) or 1
+                    c["made"] += max(1, (c["sig"] - sig0) // step)
+                    s["t0"] = c["t0"] = now
             c["idx"] += 1
             c["sig"], c["batch"] = None, None
             return
 
         # ── 確保製作面板開著（點站台；開起來的那個就記成製作檯）──────────
-        if not produce.panel_open(self.sc):
+        po = produce.panel_open(self.sc)
+        if po is False:
             c["wnd"], c["batch"] = None, None
             # 點過了就等面板開（CRAFT_RETRY_SECS）；等不到才換下一個候選點
             waited = now - c.get("poke_t", 0)
@@ -1533,6 +1567,8 @@ class CharProducePage(QWidget):
             c["poke_t"] = now
             self._note(poke or "找製作檯…", warn=poke.startswith(("⛔", "⚠")))
             return
+        # po is None＝**讀不到**面板狀態，不是「沒開」（panel_open 的說明就
+        # 這麼寫）：不重置批次也不去亂點站台 —— 進行中的批次退回材料訊號監看。
 
         # 面板開著 → 記下 WND_MAKE，並把「剛剛點開它的那個站台」學起來
         if c["wnd"] is None:
@@ -1549,9 +1585,17 @@ class CharProducePage(QWidget):
 
         # ── 沒有進行中的批次 → 開一批（選配方+設數量+makeadd+makestart）──────
         if c["batch"] is None:
+            if po is not True:
+                return                 # 面板狀態不明，先不開新批（等下一拍）
+            # ★ 開批前先跟現實對一次帳：「總共要做幾個」拿當下背包重算。
+            #   一開始那個數字會失真 —— 負重／背包會讓遊戲少排、製作加倍會
+            #   讓產出變多，不重算畫面就跟遊戲脫鉤（2026-08-13 使用者回報）。
+            sched = recipes.schedule(self.sc, have)
+            if sched is not None:
+                c["total"] = c["made"] + sum(n for _r, n in sched)
             qty = min(makeable, BATCH_MAX)
-            ok, added, msg = produce.make_batch(self._mover, self.sc,
-                                                c["wnd"], cur.recipe.rid, qty)
+            ok, added, mk, msg = produce.make_batch(
+                self._mover, self.sc, c["wnd"], cur.recipe.rid, qty)
             if not ok:
                 if msg == produce.WRONG_PANEL:
                     # ★ 點到**別種生產**的檯子（面板裡沒有這個配方）→ 關掉它、
@@ -1567,22 +1611,62 @@ class CharProducePage(QWidget):
                 c["wnd"] = None
                 self._note(f"⚠ 開製作批次失敗（{msg}）→ 重試", warn=True)
                 return
-            c["batch"] = {"added": added}
+            c["batch"] = {"added": added, "mk": mk, "left": added}
             c["sig"], c["last_drop"] = sig, now
-            self._note(self._craft_note(c, cur))
+            s["t0"] = c["t0"] = now                # 有進展 → 看門狗重新起算
+            if added < qty:
+                # ★ 遊戲排得比我們要的少（多半是負重／背包上限）——**大聲說**。
+                #   安靜吞掉就是「工具說 9000、遊戲做 999」那種脫鉤。
+                self._note(f"⚠ 要排 {qty} 個、遊戲只收了 {added} 個"
+                           "（負重／背包上限？）—— 先做這批，做完再排下一批",
+                           warn=True)
+            else:
+                self._note(self._craft_note(c, cur))
             return
 
-        # ── 監看這一批：材料變少＝真的在做 ──────────────────────────────
-        if c["sig"] is not None and sig < c["sig"]:
+        # ── 監看這一批：**以遊戲自己的製作清單為準** ─────────────────────
+        # 清單那列「還剩幾個」做好一個 −1 —— 這才是遊戲的進度（吃了製作加倍、
+        # 被打斷都反映在上面）；清單讀不到（面板狀態不明等）才退回數材料。
+        b = c["batch"]
+        left = (produce.make_left(self.sc, b.get("mk") or 0, cur.recipe.rid)
+                if po is True else None)
+        if left is not None:
+            if left < b["left"]:                   # 遊戲做掉了幾個
+                c["made"] += b["left"] - left
+                b["left"] = left
+                c["sig"], c["last_drop"] = sig, now
+                if c["first"] is None:
+                    c["first"] = now               # 從第一個做好才開始估時
+                s["t0"] = c["t0"] = now            # 有進展 → 看門狗重新起算
+                self._note(self._craft_note(c, cur))
+                return
+            if left > b["left"]:                   # 變多＝有人手動加排 → 照著追
+                b["left"], c["last_drop"] = left, now
+                return
+            if left <= 0:
+                # 清單裡沒有這個配方了＝這一批做完 → **馬上**開下一批，
+                # 不必等 8 秒停滯判定（材料還有就續排，沒了換配方／收尾）。
+                c["batch"], c["sig"] = None, None
+                s["t0"] = c["t0"] = now
+                return
+        elif c["sig"] is not None and sig < c["sig"]:
+            # 備援：材料變少＝真的在做。⚠ 清單讀得到時**不走這條** ——
+            #   兩條都計數會把同一個算兩次。
             step = sum(num for _m, num in cur.recipe.mats) or 1
-            c["made"] += max(1, (c["sig"] - sig) // step)
+            n = max(1, (c["sig"] - sig) // step)
+            c["made"] += n
+            # ★ 清單模型也要跟著扣：不同步的話，等清單又讀得到時
+            #   left < b["left"] 會把備援期間算過的又算一次（灌水）。
+            b["left"] = max(0, b["left"] - n)
             c["sig"], c["last_drop"] = sig, now
             if c["first"] is None:
-                c["first"] = now                   # 從第一個做好才開始估時
+                c["first"] = now
+            s["t0"] = c["t0"] = now
             self._note(self._craft_note(c, cur))
             return
-        # 停了 BATCH_STALL_SECS 沒動靜＝這批做完（清單空了）或卡住 → 收掉重算。
-        #   材料還有 → 下一拍再開一批；材料用完 → 換配方；都做完 → dispose。
+        # 停了 BATCH_STALL_SECS 沒進度＝這批卡住（或清單讀不到又沒材料訊號）
+        # → 收掉重算：材料還有 → 下一拍再開一批；材料用完 → 換配方；都做完
+        # → dispose。（清單讀得到時「做完」走上面 left==0 那條，不會等到這裡。）
         if now - c["last_drop"] > BATCH_STALL_SECS:
             c["batch"], c["sig"] = None, None
             return
@@ -1593,11 +1677,18 @@ class CharProducePage(QWidget):
 
         ⚠ 「還要多久」是**量出來的**（拿已完成幾個除以花掉的時間），不是猜的；
           量不到（還沒做完第二個）就老實說「估算中」，不要編一個數字。
+        ★ 「這批遊戲還排著 N 個」是**遊戲清單上的數字**（make_left 讀的），
+          不是我們預計的 —— 使用者要的就是看得到遊戲自己打算做幾個。
         """
         total = c["total"] or 0
         done = c["made"]
         head = f"做 {itemname.of(cur.recipe.product)}"
-        pos = f"　第 {done + 1}/{total} 個" if total else f"　已完成 {done} 個"
+        # total 每一批會重算（可能變小），done 追過它時別顯示「第 1001/999 個」
+        pos = (f"　第 {done + 1}/{total} 個" if total and done < total
+               else f"　已完成 {done} 個")
+        b = c.get("batch")
+        if b and b.get("left"):
+            pos += f"（這批遊戲還排著 {b['left']} 個）"
         eta = "　剩餘時間估算中…"
         if c["first"] is not None and done >= 2 and total > done:
             per = (time.monotonic() - c["first"]) / (done - 1)
