@@ -70,7 +70,7 @@ from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
                       player, quickbar, recall, revive, robot, scene,
-                      skillcost, skills,
+                      skillcost, skills, summon,
                       tablestamp, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
@@ -1268,6 +1268,9 @@ class Scan:
     stats: int | None = None      # 角色屬性基準（讀 HP 用；見 app/game/player.py）
     inv: int | None = None        # 物品指標陣列表頭（數藥水／找回程道具用）
     mons: list = field(default_factory=list)
+    # kind=4 的實體（召喚物、擺攤玩家…）。自動召喚認養剛召出來的那隻要用；
+    # is_monster 會把它們濾掉，所以另外帶一份。⚠ 掃描本來就一次拿齊，零成本。
+    pets: list = field(default_factory=list)
     err: str = ""
 
 
@@ -1366,6 +1369,7 @@ class ScanWorker(QThread):
                 #    購買紀錄、裝備名稱、角色名），而且**不會跟著換地圖更新**
                 #    （換到沼澤之後，表裡還是前一張圖的名字）。
                 out.mons = [e for e in ents if e.is_monster]
+                out.pets = [e for e in ents if e.kind == 4]
                 if state is None:
                     out.err = "找不到狀態物件（掃到 0 個或多個）"
                 elif pobj is None:
@@ -1472,6 +1476,7 @@ class CharFarmPage(QWidget):
         self.stats: int | None = None            # 角色屬性基準（拿來讀 HP）
         self.inv: int | None = None              # 物品陣列表頭（藥水／回程道具用）
         self.mons: list[entity.Entity] = []
+        self.pets: list[entity.Entity] = []      # kind=4（自動召喚認養用）
         self._on_scan = on_scan
         self._cur: entity.Entity | None = None   # 正在打的那隻
         self._kills = 0
@@ -1587,6 +1592,10 @@ class CharFarmPage(QWidget):
         self._buff = buff.AutoBuff(BUFF_KEY)
         self._buff_note = ""     # 上次顯示過的補 buff 訊息（沒變就不重畫）
         self._buff_read_t = 0.0  # 下一次可以讀快捷欄找分身技能的時間
+        # ★ 自動召喚：F11 的召喚物不見了就重放（見 app/game/summon.py）
+        self._summon = summon.AutoSummon()
+        self._summon_note = ""
+        self._summon_read_t = 0.0
         # 目前所在地圖。心跳每 SCENE_SAMPLE 秒更新一次（見 _refresh_scene）。
         self._scene: int | None = None
         self._scene_t = SCENE_SAMPLE    # 第一拍就讀
@@ -1824,6 +1833,24 @@ class CharFarmPage(QWidget):
             "⚠ 被驅散或施法被打斷我們不會知道，最壞情況是斷到下次補的空窗。")
         self.buff_cb.toggled.connect(self._save_settings)
         a.addWidget(self.buff_cb)
+        a.addSpacing(10)
+        # ★ 自動召喚：F11 的召喚物不見了／死了就自動重放（見 app/game/summon.py）
+        self.summon_cb = QCheckBox("自動召喚")
+        self.summon_cb.setToolTip(
+            "⚠⚠ **召喚技能要自己先放到遊戲的 F11**。\n"
+            "　　 這裡只認 F11，放在別的鍵不會動。\n"
+            "⚠　 **要開「開始掛機」才有作用**，單獨勾這個沒有用。\n"
+            "\n"
+            "召喚出來的怪會一直盯著：死了、換地圖消失了就自動再召喚一次。\n"
+            "・召喚是送**封包**（座標填自己腳下），不占鍵盤、不必停下腳步。\n"
+            "・每次開始掛機（或打到一半才勾）都會**先放一次** ——\n"
+            "　 就算場上已經有一隻（手動放的），也會直接換成新的一隻，\n"
+            "　 因為召喚技能再放一次本來就是換一隻（實測）。\n"
+            "・「是不是我的召喚物」認的是**我施放後冒出來的那隻**，\n"
+            "　 別人同名的召喚物不會被誤認。\n"
+            "・放不出來（MP 不足等）會每 6 秒一直重試，直到把勾拿掉。")
+        self.summon_cb.toggled.connect(self._save_settings)
+        a.addWidget(self.summon_cb)
         a.addStretch(1)
         grid.addWidget(g_atk, 0, 0)
 
@@ -2203,6 +2230,7 @@ class CharFarmPage(QWidget):
         #   驗證擋著（見 _apply_scan 裡同一段說明）。清掉是免得挑目標白跑
         #   一趟死清單、以及「周圍怪物」停在舊圖的名字上。
         self.mons = []
+        self.pets = []
         self._keys.eid = None
         self._keys.stats = None
         self._keys.pf = None
@@ -3175,6 +3203,7 @@ class CharFarmPage(QWidget):
             #   清掉是為了另外兩件事：`_pick_next` 不必每輪白跑一趟死清單，
             #   以及「周圍怪物」那份清單不會停在上一張圖的怪名上。
             self.mons = []
+            self.pets = []
         self.state = s.state
         self.player = s.player
         self.stats = s.stats
@@ -3204,6 +3233,9 @@ class CharFarmPage(QWidget):
                         self._ask_full(f"{len(lost)} 隻怪從掃描消失但物件還在")
                         break
             self.mons = s.mons or []
+            # kind=4 跟著同一套規則走：掃壞了沿用上一拍（自動召喚的認養
+            # 有時間窗，用到的每一隻也都會 read_live 重驗，舊清單無害）。
+            self.pets = s.pets or []
         # 送鍵執行緒要的兩樣東西，跟著掃描一起更新（物件會搬家）：
         #   stats —— 學技能 ID 用（角色屬性基準 −0x50）
         #   pf    —— 三連包第①包的參數，**玩家物件 −8**（純讀取算得出來）
@@ -3762,6 +3794,42 @@ class CharFarmPage(QWidget):
                    "（不是 buff）→ 先不補")
         self._buff.block(why)
 
+    def _adopt_summon_skill(self) -> None:
+        """自動召喚的技能編號：直讀快捷欄**目前頁**的 F11 那一格。
+
+        跟 `_adopt_buff_skill` 同一套（零副作用、有 2 秒節流），差別是
+        召喚技能不在 buff 主表（沒有持續時間），所以**任何技能格都收**；
+        F11 是空的／放物品才 block() 停手。
+        """
+        now = time.monotonic()
+        if now < self._summon_read_t:
+            return
+        self._summon_read_t = now + 2.0
+        try:
+            page = self._qb_ui.page()
+            cells = quickbar.read_page(self.sc, page)
+        except Exception:                    # noqa: BLE001
+            return
+        if cells is None:
+            return                           # 讀不到（改版位移）→ 下次再試
+        c = (cells[summon.SLOT]
+             if 0 <= summon.SLOT < len(cells) else None)
+        prev = self._summon.skill
+        if c is not None and c.is_skill and self._summon.adopt(c.value, page):
+            # ⚠ 只在技能真的變了才講話 —— 這支每 2 秒跑一次，每次都 setText
+            #   會把別人的狀態訊息一直蓋掉（跟 buff 的倒數同一個教訓）。
+            # ⚠ 不用 emoji 當字首（🐾 這類中文字型沒有字形，會變豆腐方塊，
+            #   見 memory qt-ui-pitfalls）。
+            if self._summon.skill != prev:
+                self.status.setText(
+                    f"自動召喚：F11 = {skills.name_of(c.value) or c.value}")
+            return
+        if c is None:
+            why = "⚠ 自動召喚：F11 上沒有技能 → 先不召（放上去就會自動接手）"
+        else:
+            why = "⚠ 自動召喚：F11 放的是物品 → 先不召"
+        self._summon.block(why)
+
     def _bump_kills(self) -> None:
         self._kills += 1
         self.kills_lbl.setText(f"已擊殺 {self._kills} 隻")
@@ -3812,6 +3880,9 @@ class CharFarmPage(QWidget):
         if on:
             # ★ 開自動戰鬥就無腦放一次分身（使用者要求，不偵測身上有沒有）
             self._buff.arm()
+            # ★ 召喚同理：就算場上已有一隻（手動放的），重放＝換一隻新的，
+            #   順便把它變成我們追蹤得到的（認不出手動那隻是誰的）。
+            self._summon.arm()
         if not on:
             self._keys.set_on(False)
             self._keys.stop_learning()
@@ -3825,6 +3896,8 @@ class CharFarmPage(QWidget):
             #   自動攻擊關掉 —— 不然使用者以為停了，角色還在自己打。
             self._buff.reset()
             self._buff_note = ""
+            self._summon.reset()
+            self._summon_note = ""
             if self._supply or self._robot_ours:
                 self._supply = False
                 self._supply_gen += 1        # 排著的趴趴GO傳送就此作廢
@@ -4136,6 +4209,29 @@ class CharFarmPage(QWidget):
                     self._save_settings()
         elif self._buff.armed:
             self._buff.armed = False
+
+        # ★ 自動召喚：F11 的召喚物不見了／死了就重放（見 app/game/summon.py）。
+        #   位置跟自動分身同一個理由：補給之後、打怪之前。
+        #   它自己控節奏（追蹤中 0.5 秒驗一次死活、失敗 6 秒重試），不必節流。
+        if self.summon_cb.isChecked():
+            if not self._summon.armed:
+                self._summon.arm()        # 中途才勾：下一拍就放一次
+            # 技能編號直讀快捷欄 F11（零副作用；換技能幾秒內自動跟上）
+            self._adopt_summon_skill()
+            # 召喚要送封包 → 跟「自動走過去」一樣要跳板；裝不上會大聲說
+            if (self._summon.skill and self._summon.armed
+                    and not (self._mover is not None and self._mover.active)):
+                self._ensure_mover()
+            note = self._summon.step(
+                self.sc,
+                self._mover if (self._mover is not None
+                                and self._mover.active) else None,
+                self.player, self.pets)
+            if note and self._summon_note != note:
+                self._summon_note = note
+                self.status.setText(f"自動召喚：{note}")
+        elif self._summon.armed:
+            self._summon.armed = False
 
         # ★ 該不該回去補給。勾了「回程補給」就照觸發開關判斷（壞裝、藥水
         #   見底）；沒勾就只看裝備壞掉並停機通知。幾秒看一次就夠。
@@ -4730,6 +4826,8 @@ class CharFarmPage(QWidget):
         # 學過的分身技能編號 —— 有存就不用再按 F12 學一次
         self._buff = buff.AutoBuff(
             BUFF_KEY, int(g(self._key("buff_skill"), 0) or 0))
+        # 召喚技能不用存：每次掛機都直讀快捷欄 F11（零副作用、當場拿到）
+        self.summon_cb.setChecked(bool(g(self._key("auto_summon"), False)))
         self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
         self.sup_gear_cb.setChecked(bool(g(self._key("supply_gear"), False)))
         # 「藥水觸發」拆成 HP／MP 兩個之前存的舊值，兩邊都吃 ——
@@ -4883,6 +4981,7 @@ class CharFarmPage(QWidget):
         s(self._key("notify_on"), self.notify_cb.isChecked())
         s(self._key("auto_buff"), self.buff_cb.isChecked())
         s(self._key("buff_skill"), int(self._buff.skill or 0))
+        s(self._key("auto_summon"), self.summon_cb.isChecked())
         s(self._key("rotate"), self.rot_cb.isChecked())
         s(self._key("supply_gear"), self.sup_gear_cb.isChecked())
         s(self._key("supply_hp"), self.sup_hp_cb.isChecked())
