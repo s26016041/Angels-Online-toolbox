@@ -1074,6 +1074,10 @@ class CharProducePage(QWidget):
         if len(log) > DONATE_LOG_MAX:
             log = log[-DONATE_LOG_MAX:]
         config.set(self._key("donate_log"), log)
+        # ★ set 只改記憶體、不寫檔（config-set-needs-save）：掛機捐完之後
+        #   沒有人會再去動設定，不當場 save 工具箱一重開紀錄就全沒了
+        #   （2026-08-13 使用者回報「捐獻紀錄壞掉」就是這個）。
+        config.save()
 
     def _show_donate_log(self) -> None:
         """捐獻歷史視窗：每次捐了什麼＋加多少名聲，新的在上面＋累計名聲。"""
@@ -1111,6 +1115,7 @@ class CharProducePage(QWidget):
 
     def _clear_donate_log(self, dlg: QDialog) -> None:
         config.set(self._key("donate_log"), [])
+        config.save()               # 不存檔的話，重開工具箱清掉的又回來
         dlg.accept()
         self._note("已清空捐獻紀錄")
 
