@@ -56,9 +56,13 @@ class AutoBuff:
 
     def __init__(self, vk: int, skill_id: int | None = None) -> None:
         self.vk = vk
-        self.skill = skill_id or None
-        self.secs = float(getattr(skills.of(self.skill), "secs", 0)
-                          if self.skill else 0)
+        # ⚠ 存檔帶回來的技能編號也要**重新過表**（跟 adopt() 同一道門檻）：
+        #   查不到持續時間就不收、當沒學過，讓快捷欄那條路重新學。
+        #   不擋的話 secs=0 → left() 恆為 0 → 每 RETRY(8) 秒盲補一次，
+        #   安靜地一直扣魔（表改版把那招移掉時就會發生）。
+        info = skills.of(skill_id) if skill_id else None
+        self.skill = info.id if info else None
+        self.secs = float(info.secs) if info else 0.0
         self.reset()
 
     def reset(self) -> None:

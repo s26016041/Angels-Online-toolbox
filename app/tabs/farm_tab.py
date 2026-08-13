@@ -1820,10 +1820,11 @@ class CharFarmPage(QWidget):
             "　　 這裡只認 F12，放在別的鍵不會動。\n"
             "⚠　 F12 要放**對象是「自己」**的技能（按了就直接生效）；\n"
             "　　 對象是「角色」的要先選人，這裡不處理。\n"
-            "⚠　 **要開「開始掛機」才有作用**，單獨勾這個沒有用。\n"
+            "★　 **不必開「開始掛機」**：單獨勾也會動（手動打王時自動補）。\n"
             "\n"
-            f"時間到就自動補：剩不到 {buff.LEAD:.0f} 秒再放一次。\n"
-            "・每次開始掛機（或打到一半才勾）都會**先無腦放一次**，\n"
+            f"時間到就自動補：剩不到 {buff.LEAD:.0f} 秒再放一次\n"
+            "（持續幾分鐘是查遊戲資料表的，每招不一樣）。\n"
+            "・剛勾起來（或開始掛機時還沒放過）會**先無腦放一次**，\n"
             "　 不去偵測身上還有沒有。\n"
             "・補的時候送**封包**，不占鍵盤、也不必停下腳步。\n"
             "・持續時間讀遊戲資源包（黑狐的 F12 是技能 5424，20 分鐘）。\n"
@@ -1839,13 +1840,13 @@ class CharFarmPage(QWidget):
         self.summon_cb.setToolTip(
             "⚠⚠ **召喚技能要自己先放到遊戲的 F11**。\n"
             "　　 這裡只認 F11，放在別的鍵不會動。\n"
-            "⚠　 **要開「開始掛機」才有作用**，單獨勾這個沒有用。\n"
+            "★　 **不必開「開始掛機」**：單獨勾也會動（手動打王時自動補）。\n"
             "\n"
             "召喚出來的怪會一直盯著：死了、換地圖消失了就自動再召喚一次。\n"
             "・召喚是送**封包**（座標填自己腳下），不占鍵盤、不必停下腳步。\n"
-            "・每次開始掛機（或打到一半才勾）都會**先放一次** ——\n"
-            "　 就算場上已經有一隻（手動放的），也會直接換成新的一隻，\n"
-            "　 因為召喚技能再放一次本來就是換一隻（實測）。\n"
+            "・剛勾起來會**先放一次** —— 就算場上已經有一隻（手動放的），\n"
+            "　 也會直接換成新的一隻，因為召喚技能再放一次本來就是換一隻\n"
+            "　（實測），順便把它變成我們追蹤得到的。\n"
             "・「是不是我的召喚物」認的是**施放後出生在封包裡那一格的**\n"
             "　（座標是我們自己填的，實測召喚物正好出生在那格正中央）——\n"
             "　 同職業的玩家貼著同時召喚也分得開：他的出生在他那一格。\n"
@@ -3833,6 +3834,66 @@ class CharFarmPage(QWidget):
             why = "⚠ 自動召喚：F11 放的是物品 → 先不召"
         self._summon.block(why)
 
+    def _companion_tick(self) -> None:
+        """自動分身＋自動召喚各走一步。
+
+        ★★ **獨立於「開始掛機」**（使用者 2026-08-13 改的規則，推翻先前的
+          「單獨勾沒有用」）：手動打王時只勾這兩個，也要自己補分身／補召喚。
+          tick() 有兩個呼叫點 —— 沒掛機時直接呼叫；掛機中放在補給之後、
+          打怪之前（交棒給精靈的那段不會走到這裡，不必讓路）。
+        ⚠ 兩個各自控節奏（buff 看剩餘時間、summon 0.5 秒驗一次死活），
+          心跳每拍呼叫沒有成本。
+        """
+        # 兩個功能都要靠跳板送封包 —— 沒掛機時沒人裝跳板，這裡自己裝
+        #   （_ensure_mover 有失敗記憶，不會每拍狂試）。
+        if (((self.buff_cb.isChecked() and self._buff.skill)
+             or (self.summon_cb.isChecked() and self._summon.skill))
+                and not (self._mover is not None and self._mover.active)):
+            self._ensure_mover()
+
+        # ── 自動分身：時間快到了就補一次 F12（見 app/game/buff.py）──
+        if self.buff_cb.isChecked():
+            if not self._buff.armed:
+                self._buff.arm()          # 中途才勾的話，下一拍就無腦放一次
+            # ★★★ 技能編號**直接讀快捷欄**（零副作用），不要再按 F12 學。
+            #   2026-08-10 白狐實機：F12 是空的 → 舊的按鍵學習法永遠學不到，
+            #   每 8 秒按一次、每次在 GUI 執行緒 sleep 40ms（五台分頁共用
+            #   一條 GUI 執行緒），狀態列也被錯誤訊息一直蓋掉。
+            if not self._buff.skill:
+                self._adopt_buff_skill()
+            # ⚠ `_my_id` 傳的是**函式本身**不是值：它要讀一次記憶體，而只有
+            #   真的要補分身（20 分鐘一次）才用得到，心跳每 10ms 一拍先算好
+            #   等於每秒白讀 100 次。
+            note = self._buff.step(
+                self.sc, self._mover, self.hwnd, self._keys.pf,
+                self._my_id, self.stats, win.send_key)
+            if note and self._buff_note != note:
+                self._buff_note = note
+                self.status.setText(f"✨ {note}")
+                if self._buff.skill:      # 學到了就存起來，之後不用再按 F12
+                    self._save_settings()
+        elif self._buff.armed:
+            self._buff.reset()            # 勾拿掉＝停手（重勾會重新無腦放一次）
+            self._buff_note = ""
+
+        # ── 自動召喚：F11 的召喚物不見了／死了就重放（app/game/summon.py）──
+        if self.summon_cb.isChecked():
+            if not self._summon.armed:
+                self._summon.arm()        # 中途才勾：下一拍就放一次
+            # 技能編號直讀快捷欄 F11（零副作用；換技能幾秒內自動跟上）
+            self._adopt_summon_skill()
+            note = self._summon.step(
+                self.sc,
+                self._mover if (self._mover is not None
+                                and self._mover.active) else None,
+                self.player, self.pets)
+            if note and self._summon_note != note:
+                self._summon_note = note
+                self.status.setText(f"自動召喚：{note}")
+        elif self._summon.armed:
+            self._summon.reset()
+            self._summon_note = ""
+
     def _bump_kills(self) -> None:
         self._kills += 1
         self.kills_lbl.setText(f"已擊殺 {self._kills} 隻")
@@ -3881,11 +3942,14 @@ class CharFarmPage(QWidget):
 
     def _on_toggle(self, on: bool) -> None:
         if on:
-            # ★ 開自動戰鬥就無腦放一次分身（使用者要求，不偵測身上有沒有）
-            self._buff.arm()
-            # ★ 召喚同理：就算場上已有一隻（手動放的），重放＝換一隻新的，
-            #   順便把它變成我們追蹤得到的（認不出手動那隻是誰的）。
-            self._summon.arm()
+            # ★ 開自動戰鬥時把分身／召喚叫起來。**已經 armed 就不重來** ——
+            #   2026-08-13 起兩個功能獨立於掛機（_companion_tick），使用者
+            #   可能已經在「沒掛機」狀態下跑著它們：分身的計時是查表來的，
+            #   重 arm 等於白放一次；召喚重 arm 會把活得好好的那隻換掉。
+            if not self._buff.armed:
+                self._buff.arm()          # 沒在跑 → 開掛機先無腦放一次（原規則）
+            if not self._summon.armed:
+                self._summon.arm()
         if not on:
             self._keys.set_on(False)
             self._keys.stop_learning()
@@ -3897,10 +3961,9 @@ class CharFarmPage(QWidget):
             #   不然使用者以為停了，角色卻還在自己跑。
             # ⚠ 精靈如果是我們開的（自動交棒或測試按鈕），停掛機時一定要把
             #   自動攻擊關掉 —— 不然使用者以為停了，角色還在自己打。
-            self._buff.reset()
-            self._buff_note = ""
-            self._summon.reset()
-            self._summon_note = ""
+            # ⛔ 這裡**不再** reset 分身／召喚（2026-08-13）：它們獨立於掛機，
+            #   停掛機後照樣自己補（手動打王用）。要停就把勾拿掉 ——
+            #   _companion_tick 的 elif 會 reset。
             if self._supply or self._robot_ours:
                 self._supply = False
                 self._supply_gen += 1        # 排著的趴趴GO傳送就此作廢
@@ -4066,9 +4129,17 @@ class CharFarmPage(QWidget):
         #   自己就會越過 SCAN_NOW 的門檻，又變回會自動掃。
         asked = self._since_scan >= SCAN_NOW
         if not self.run_cb.isChecked():
-            if not asked:
-                self._since_scan = min(self._since_scan, IDLE_SCAN_GAP)
-            gap = SCAN_NOW
+            if self.buff_cb.isChecked() or self.summon_cb.isChecked():
+                # ★ 自動分身／自動召喚**不開掛機也要動**（使用者 2026-08-13
+                #   改的規則：手動打王時要它們自己補）。它們靠掃描拿玩家物件
+                #   ／屬性／kind=4 清單，所以這時恢復慢檔自動掃。
+                #   不牴觸「掃周圍怪物改成按鈕」那條要求 —— 純看清單、兩個都
+                #   沒勾時照樣完全不自動掃。
+                gap = IDLE_SCAN_GAP
+            else:
+                if not asked:
+                    self._since_scan = min(self._since_scan, IDLE_SCAN_GAP)
+                gap = SCAN_NOW
         else:
             gap = REFRESH_GAP
         if self._since_scan >= gap and not self._waiting:
@@ -4093,6 +4164,10 @@ class CharFarmPage(QWidget):
         self._update_jump_countdown()
 
         if not self.run_cb.isChecked():
+            # ★ 自動分身／自動召喚獨立於掛機（使用者 2026-08-13：手動打王
+            #   不開掛機也要能補）。補給／死亡回程／巡迴換頻是掛機才有的
+            #   狀態，這條路不會經過，所以不必讓路。
+            self._companion_tick()
             return
 
         # ★ 死亡回程要在最前面：死亡／復活／傳送期間 state 常常是 None、
@@ -4183,58 +4258,11 @@ class CharFarmPage(QWidget):
         if self.state is None:
             return
 
-        # ★ 自動分身：時間快到了就補一次 F12（見 app/game/buff.py）。
+        # ★ 自動分身＋自動召喚（見 _companion_tick）。
         # ⚠ 位置刻意放在**補給之後、打怪之前**：
         #   交棒給精靈時不要插隊按鍵，但打怪中該補還是要補
-        #   —— buff 斷掉的損失比少打一下大。
-        # ⚠ 它自己會控制節奏（沒到時間就什麼都不做），不必在這裡節流。
-        # ★ 只有開了自動戰鬥才會走到這裡（上面 run_cb 沒勾就 return 了）——
-        #   使用者要求：單獨勾這個沒有用。
-        if self.buff_cb.isChecked():
-            if not self._buff.armed:
-                self._buff.arm()          # 中途才勾的話，下一拍就無腦放一次
-            # ★★★ 技能編號**直接讀快捷欄**（零副作用），不要再按 F12 學。
-            #   2026-08-10 白狐實機：F12 是空的 → 舊的按鍵學習法永遠學不到，
-            #   每 8 秒按一次、每次在 GUI 執行緒 sleep 40ms（五台分頁共用
-            #   一條 GUI 執行緒），狀態列也被錯誤訊息一直蓋掉。
-            if not self._buff.skill:
-                self._adopt_buff_skill()
-            # ⚠ `_my_id` 傳的是**函式本身**不是值：它要讀一次記憶體，而只有
-            #   真的要補分身（20 分鐘一次）才用得到，心跳每 10ms 一拍先算好
-            #   等於每秒白讀 100 次。
-            note = self._buff.step(
-                self.sc, self._mover, self.hwnd, self._keys.pf,
-                self._my_id, self.stats, win.send_key)
-            if note and self._buff_note != note:
-                self._buff_note = note
-                self.status.setText(f"✨ {note}")
-                if self._buff.skill:      # 學到了就存起來，之後不用再按 F12
-                    self._save_settings()
-        elif self._buff.armed:
-            self._buff.armed = False
-
-        # ★ 自動召喚：F11 的召喚物不見了／死了就重放（見 app/game/summon.py）。
-        #   位置跟自動分身同一個理由：補給之後、打怪之前。
-        #   它自己控節奏（追蹤中 0.5 秒驗一次死活、失敗 6 秒重試），不必節流。
-        if self.summon_cb.isChecked():
-            if not self._summon.armed:
-                self._summon.arm()        # 中途才勾：下一拍就放一次
-            # 技能編號直讀快捷欄 F11（零副作用；換技能幾秒內自動跟上）
-            self._adopt_summon_skill()
-            # 召喚要送封包 → 跟「自動走過去」一樣要跳板；裝不上會大聲說
-            if (self._summon.skill and self._summon.armed
-                    and not (self._mover is not None and self._mover.active)):
-                self._ensure_mover()
-            note = self._summon.step(
-                self.sc,
-                self._mover if (self._mover is not None
-                                and self._mover.active) else None,
-                self.player, self.pets)
-            if note and self._summon_note != note:
-                self._summon_note = note
-                self.status.setText(f"自動召喚：{note}")
-        elif self._summon.armed:
-            self._summon.armed = False
+        #   —— buff／召喚斷掉的損失比少打一下大。
+        self._companion_tick()
 
         # ★ 該不該回去補給。勾了「回程補給」就照觸發開關判斷（壞裝、藥水
         #   見底）；沒勾就只看裝備壞掉並停機通知。幾秒看一次就夠。
