@@ -1859,35 +1859,20 @@ class CharFarmPage(QWidget):
         self.summon_cb.toggled.connect(self._save_settings)
         a.addWidget(self.summon_cb)
         a.addStretch(1)
-        grid.addWidget(g_atk, 0, 0)
+        # ★ 攻擊群組跨滿一列 ——「移動與巡邏」整個群組已移除（見下）。
+        grid.addWidget(g_atk, 0, 0, 1, 2)
 
-        # ── 移動與巡邏 ──────────────────────────────────────
-        g_mov = QGroupBox("移動與巡邏")
-        m = QHBoxLayout(g_mov)
-        self.move_cb = QCheckBox("自動走過去")
-        self.move_cb.setChecked(True)
-        self.move_cb.setToolTip(
-            "半徑內沒有選中的怪時，主動走到最近那隻旁邊。\n"
-            "⚠ 這項功能需要在遊戲行程裡執行一小段程式碼（掛 PeekMessageA），\n"
-            "　 才能呼叫遊戲自己的移動函式 —— 純讀寫記憶體做不到移動。")
-        m.addWidget(self.move_cb)
-        m.addSpacing(10)
-        # ⛔ 「接戰距離」輸入框已移除（使用者要求）——現在停多遠是**照技能射程
-        #    自動算的**（skills.range_of，讀遊戲自己的資料表），不必也不該讓
-        #    使用者填。留著只會變地雷：雪狐當初就是把它留在遠程預設的 11，
-        #    近戰射程只有 1，於是站在 11 格外空打（見 [[melee-attack-range]]）。
-        #    舊設定檔裡的 "range" 值直接忽略，不必清掉。
-        # ⚠ 字數就是版面寬度：這個勾選框每多一個字，整個右欄就多 13px，
-        #   超過視窗（固定 940）就會被推到水平捲軸外面。完整說明在滑鼠提示。
-        self.patrol_cb = QCheckBox("沒怪去巡邏點")
-        self.patrol_cb.setToolTip(
-            "追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
-            "**完全沒有**選中的怪時，才依序走去右邊的巡邏點找。\n"
-            "★ 只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
-            "　 同一張圖的不同分流算同一張，會照走。")
-        m.addWidget(self.patrol_cb)
-        m.addStretch(1)
-        grid.addWidget(g_mov, 0, 1)
+        # ⛔ 「移動與巡邏」群組已移除（2026-08-13 使用者指定，兩個勾都多餘）：
+        #    ·「自動走過去」→ 走位**永遠開**。當初獨立成開關的理由是「沒勾就
+        #      不在遊戲裡放程式碼」（2026-08-02 移動是第一個要跳板的功能）——
+        #      現在封包攻擊/分身/召喚/補給全都要跳板，理由名存實亡；而且挑目標
+        #      本來就要對每隻怪跑地形尋路（走不到的不挑），走位是掛機的地基。
+        #    ·「沒怪去巡邏點」→ **有設巡邏點就巡，沒設就不巡**（使用者原話：
+        #      「不想巡邏就別設定巡邏點」）。行為說明搬去「巡邏點」清單的提示。
+        #    舊設定檔裡的 "move" / "patrol" / "back" 鍵直接忽略，不必清掉。
+        # ⛔ 「接戰距離」輸入框更早移除（使用者要求）——停多遠照技能射程自動算
+        #    （skills.range_of）。雪狐踩過：留在遠程預設 11，近戰射程 1，
+        #    站在 11 格外空打（見 [[melee-attack-range]]）。舊 "range" 鍵忽略。
 
         # ⛔ 這裡以前是「坐下休息」（血/魔低於門檻就坐下回滿再繼續）。
         #   **2026-08-09 使用者要求整個移除**，原話：「我用這程式是想練等快速，
@@ -2059,8 +2044,7 @@ class CharFarmPage(QWidget):
         #    內容決定寬度就好。
         # 每個方框的上下留白縮一點 —— 主視窗固定 940x700，整頁高度很吃緊，
         # 預設留白會讓整頁多出一條垂直捲軸。
-        for _lay in (a, m):
-            _lay.setContentsMargins(12, 6, 12, 6)
+        a.setContentsMargins(12, 6, 12, 6)
         # 有第二列提示字的三個方框：留白一律交給外層那個 VBox，內層那列歸零，
         # 兩列之間只留 2px —— 不然外層預設留白 + 內層 12/6 疊起來，
         # 光是留白就多出快 20px（整頁高度很吃緊，會冒出垂直捲軸）。
@@ -2136,6 +2120,14 @@ class CharFarmPage(QWidget):
 
         # 巡邏點：沒怪時依序走過去找怪（取代原本只有一個的「原點」）
         spot = QGroupBox("巡邏點")
+        # ★ 沒有開關（2026-08-13）：**有設點就會巡、不想巡就別設**。
+        #   行為說明放在群組的滑鼠提示（原本在「沒怪去巡邏點」勾選框上）。
+        spot.setToolTip(
+            "掛機時完全沒有選中的怪，就依序走這些點找怪；\n"
+            "清單是空的就原地不動。**不想巡邏就把點全部刪掉。**\n"
+            "・追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
+            "・只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
+            "　 同一張圖的不同分流算同一張，會照走。")
         # 每一列是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
         # （專家級遺落之地／史萊姆晴空牧場）—— 太窄會被切掉。
         sv = QVBoxLayout(spot)
@@ -3248,7 +3240,7 @@ class CharFarmPage(QWidget):
         #   pf    —— 三連包第①包的參數，**玩家物件 −8**（純讀取算得出來）
         self._keys.stats = s.stats
         self._keys.pf = move.pathfinder_this(self.sc) if s.player else None
-        # 跳板可能是「自動走過去」那邊裝上的（比開始掛機晚），所以跟著更新
+        # 跳板可能是走位那邊裝上的（比開始掛機晚），所以跟著更新
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
         err = s.err
@@ -4329,7 +4321,8 @@ class CharFarmPage(QWidget):
             # ★ 只走「現在這張圖」的巡邏點 —— 座標在每張地圖都從 0 開始算，
             #   拿別張圖的點來走會往一個完全不相干的地方衝（使用者要求擋掉）。
             #   分流不算不同圖（天使學園 41/141/241 是同一張），見 scene.map_key。
-            if not (self.patrol_cb.isChecked() and self._spots and me):
+            # ★ 有設巡邏點就巡、沒設就不巡（2026-08-13 起沒有開關）
+            if not (self._spots and me):
                 return
             # ⚠ 讀不到目前地圖時**寧可不動**：無法確認就走，等於有機會拿 A 圖的
             #   座標在 B 圖亂衝。停下來並把原因寫在狀態列，比默默走錯好。
@@ -4641,7 +4634,7 @@ class CharFarmPage(QWidget):
         # ★ 還在趕路（離目標 > FAR_ENOUGH）就用短冷卻，貼身微調維持 0.4 秒。
         walk_gap = (WALK_GAP_FAR if (gd is not None and gd > FAR_ENOUGH)
                     else WALK_GAP)
-        if (self.move_cb.isChecked() and me and not self._moving
+        if (me and not self._moving
                 and self._walk_t >= walk_gap and need_walk):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
@@ -4682,8 +4675,6 @@ class CharFarmPage(QWidget):
             self._why = f"打得到，同時走近到 {keep:.1f} 格"
         elif dist is None:
             self._why = "⚠ 讀不到座標"
-        elif not self.move_cb.isChecked():
-            self._why = "⚠ 沒開「自動走過去」"
         elif self._mover is None or not self._mover.active:
             self._why = "⚠ 移動跳板沒裝上"
         elif self._no_grid:
@@ -4851,9 +4842,8 @@ class CharFarmPage(QWidget):
         # 找不到（設定壞了）就退回「不指定」，不要當掉。
         idx = self.open_box.findData(int(g(self._key("opener_vk"), 0) or 0))
         self.open_box.setCurrentIndex(idx if idx >= 0 else 0)
-        self.move_cb.setChecked(bool(g(self._key("move"), True)))
-        self.patrol_cb.setChecked(bool(g(self._key("patrol"),
-                                         g(self._key("back"), False))))
+        # ⛔ 舊的 "move"（自動走過去）/"patrol"/"back" 不再讀：走位永遠開、
+        #    巡邏＝有設巡邏點就巡（見「移動與巡邏」群組移除處）。
         self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
         self.notify_cb.setChecked(bool(g(self._key("notify_on"), True)))
         self.buff_cb.setChecked(bool(g(self._key("auto_buff"), False)))
@@ -5009,8 +4999,6 @@ class CharFarmPage(QWidget):
         s(self._key("monsters"), self.wanted())
         s(self._key("vks"), self._sel_vks())
         s(self._key("opener_vk"), int(self.open_box.currentData() or 0))
-        s(self._key("move"), self.move_cb.isChecked())
-        s(self._key("patrol"), self.patrol_cb.isChecked())
         s(self._key("boss_only"), self.boss_cb.isChecked())
         s(self._key("notify_on"), self.notify_cb.isChecked())
         s(self._key("auto_buff"), self.buff_cb.isChecked())
@@ -5036,8 +5024,6 @@ class CharFarmPage(QWidget):
         """
         self.picked.model().rowsInserted.connect(self._save_settings)
         self.picked.model().rowsRemoved.connect(self._save_settings)
-        self.move_cb.toggled.connect(self._save_settings)
-        self.patrol_cb.toggled.connect(self._save_settings)
         self.boss_cb.toggled.connect(self._save_settings)
         self.rot_cb.toggled.connect(self._save_settings)
         self.rot_every.valueChanged.connect(self._save_settings)
