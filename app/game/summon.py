@@ -42,12 +42,16 @@ CHECK_GAP = 0.5           # 追蹤中的召喚物多久驗一次死活（一次 
 MISS_GRACE = 2            # 連續幾次「讀不到」才算不見 —— 防瞬間讀失敗誤判
 ADOPT_WAIT = 4.0          # 施放後等新實體出現多久（實測 1.5 秒內就會出現）
 RETRY = 6.0               # 施放了卻沒看到新召喚物（MP 不足？）→ 隔這麼久再試
-# 認養時離施放點最遠幾格。⚠ 收得很緊是故意的（使用者 2026-08-13 提醒：
-# **同職業的玩家也會召喚**——同名＋新 eid 一模一樣）：兩輪實測召喚物都
-# **正好出生在施放點那一格**（誤差 0.0），所以 2 格就夠我們認自己的；
-# 旁邊的人同時召喚，他的出生在**他**腳下，超過 2 格就不會被撿走。
-# 萬一真的有人貼著我們同一拍施放而認錯：對方的召喚物會跟著主人走遠 →
-# 物件被回收 → read_live 失敗 → 我們自動重放，會自己好，不會永久錯下去。
+# 認養的兩道錨（使用者 2026-08-13 提醒：**同職業的玩家也會召喚**——
+# 同名＋新 eid 一模一樣，能分的只有出生點）：
+# ① **正中施放格**優先：施放封包的座標是我們自己填的，而兩輪實測召喚物
+#   都**正好出生在那一格**（誤差 0.0）。認「站在我封包打的那一格」的，
+#   旁邊的人同拍施放也不會撞——他的出生在**他**填的那格。
+# ② 沒有正中的才退回「離施放格 NEAR 格內取最近」。這道退路不能拿掉：
+#   「出生點會不會因為那格被佔而挪到隔壁」沒驗證過，賭死正中的話，
+#   萬一會挪就變成**永遠認不到 → 每 6 秒白放一次**的無限循環，
+#   比偶爾認錯（會自己好：對方召喚物跟主人走遠 → read_live 失敗 → 重放）
+#   嚴重得多。
 NEAR = 2.0
 PREFIX = "召喚"           # 技能名的字首；去掉就是召喚物的名字
 
@@ -75,6 +79,7 @@ class AutoSummon:
         self._sent_at = 0.0
         self._pre: set[int] = set()          # 施放那一刻已存在的 kind=4 eid
         self._cast_pos: tuple[float, float] | None = None
+        self._cast_tile: tuple[int, int] | None = None   # 封包裡填的那一格
         self._check_t = 0.0
 
     def adopt(self, skill_id: int, page: int = PAGE) -> bool:
@@ -174,12 +179,17 @@ class AutoSummon:
             return self.note
         # 施放那一刻場上已有的 kind=4 —— 之後**不在這份名單裡的**才是我的
         self._pre = {e.eid for e in (pets or [])}
-        self._cast_pos = pos
         if skills.is_ground(self.skill):
-            # 對地：施放封包帶自己腳下的格子座標（實測就長出在腳下）
-            ok = attack.cast_at(mover, self.skill, 0, int(pos[0]), int(pos[1]))
+            # 對地：施放封包帶自己腳下的格子座標（實測就長出在**那一格正中**）
+            tx, ty = int(pos[0]), int(pos[1])
+            self._cast_tile = (tx, ty)
+            self._cast_pos = (tx + 0.5, ty + 0.5)    # 預期的出生點＝格子中心
+            ok = attack.cast_at(mover, self.skill, 0, tx, ty)
         else:
-            # 不是對地 → 按 F11（自我系技能按了就直接生效）
+            # 不是對地 → 按 F11（自我系技能按了就直接生效）。
+            # 這條路封包裡沒有我們填的座標，退回「腳下附近」認養。
+            self._cast_tile = None
+            self._cast_pos = pos
             ok = quickbar.use(mover, scanner, SLOT, self.page)
         self._sent_at = now
         self.note = "召喚中…" if ok else "⚠ 召喚的封包排不進去"
@@ -189,8 +199,10 @@ class AutoSummon:
         """從最新掃描認養「我剛召喚出來的那隻」。
 
         條件：kind=4、施放那一刻不存在（eid 是新的）、離施放點 NEAR 格內；
-        知道名字就再多一道名字比對（別人同時召喚也認不錯）。
-        多隻都符合時取離施放點最近的。
+        知道名字就再多一道名字比對。
+        ★ **站在封包裡我們自己填的那一格的優先**（使用者點的做法）——
+          實測召喚物正好出生在施放格，同職業在旁邊同拍施放也分得開；
+          沒有正中的才退回「NEAR 格內取最近」（理由見 NEAR 的說明）。
         """
         if not self._cast_pos:
             return None
@@ -201,4 +213,9 @@ class AutoSummon:
                 and (e.x - px) ** 2 + (e.y - py) ** 2 <= NEAR * NEAR]
         if not cand:
             return None
+        if self._cast_tile is not None:
+            exact = [e for e in cand
+                     if (int(e.x), int(e.y)) == self._cast_tile]
+            if exact:
+                cand = exact
         return min(cand, key=lambda e: (e.x - px) ** 2 + (e.y - py) ** 2)
