@@ -43,10 +43,9 @@ F11 空的／放物品就 block() 大聲停手，不盲按。
 """
 from __future__ import annotations
 
-import struct
 import time
 
-from app.game import attack, entity, quickbar, skills
+from app.game import attack, entity, player, quickbar, skills
 
 SLOT = 10                 # F11（固定，使用者指定）
 PAGE = 0
@@ -54,12 +53,10 @@ CHECK_GAP = 0.5           # 多久驗一次存在（讀槽 1 次系統呼叫）
 MISS_GRACE = 2            # （退路模式）連續幾次讀不到才算不見
 ADOPT_WAIT = 4.0          # 施放後等新實體出現多久（實測 1.5 秒內就會出現）
 RETRY = 6.0               # 施放了卻沒看到新召喚物（MP 不足？）→ 隔這麼久再試
-# 「我的召喚物 eid」在角色管理結構裡的偏移（[MGR_PTR]+這個）。
-# ⚠ 結構偏移（大更新才會壞的類別）；壞掉靠 slot_ok 自我驗證退回實體追蹤。
-#   出處：2026-08-13 全記憶體交叉掃描（兩個不同 eid 都出現在這一格）＋
-#   跳圖歸零／走遠不歸零／重召喚跟上，三種事件實測（見檔頭）。
-#   角色屬性基準在 [MGR_PTR]+0xCB88（player.py 那條捷徑），這格在它前面 0x6C。
-PET_SLOT_OFF = 0xCB1C
+# 「我的召喚物 eid」的位址**只住在 player.py**（pet_eid()）：它就在角色
+# 屬性物件的特徵區裡（vtable+PET_EID_OFF），跟著 VT_OFF_FROM_MGR 的 AOB
+# 自動定位走 —— 這裡不准再抄一份偏移（CLAUDE.md：同一位址不寫第二處）。
+# 壞掉靠 slot_ok 自我驗證退回實體追蹤。
 # 槽歸零要**連續**這麼久才算真的沒了：跳地圖時會暫時歸零 2~4 秒
 # （召喚物幾秒後自己跟過來），馬上重召等於把跟過來的那隻白白換掉。
 LOST_GRACE = 8.0
@@ -78,22 +75,11 @@ PREFIX = "召喚"           # 技能名的字首；去掉就是召喚物的名�
 
 
 def read_pet_slot(scanner) -> int | None:
-    """遊戲記的「我的召喚物 eid」；讀不到（沒進遊戲／位移）回 None。
+    """遊戲記的「我的召喚物 eid」；0＝沒有、None＝讀不到（≠沒有）。
 
-    0 ＝ 現在沒有召喚物（跳圖的暫態也是 0，呼叫端要配 LOST_GRACE 用）。
-    ⚠ 回 None 跟回 0 是兩回事：None 是「不知道」，不能當「沒有」
-      （[[bag-false-empty-guards]] 那條鐵則）。
+    真正的位址算式在 `player.pet_eid()`（跟角色屬性共用 AOB 定位）。
     """
-    raw = scanner._read_bytes(quickbar.MGR_PTR, 4)
-    if not raw:
-        return None
-    mgr = struct.unpack("<I", bytes(raw))[0]
-    if not 0x10000 <= mgr < 0x7FFF0000:
-        return None
-    raw = scanner._read_bytes(mgr + PET_SLOT_OFF, 4)
-    if not raw:
-        return None
-    return struct.unpack("<I", bytes(raw))[0]
+    return player.pet_eid(scanner)
 
 
 class AutoSummon:

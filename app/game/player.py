@@ -77,6 +77,14 @@ VTABLE_RVA = 0x3E3E1C
 OFF_VTABLE = -0x20
 # vtable 之後有幾個 dword 是 0（五台一致）。加這條讓特徵更不容易誤中。
 ZERO_DWORDS = 7
+# ⚠⚠⚠ 那 7 個「0」裡有一格**不是保留欄位**：vtable+PET_EID_OFF 是
+#   「我的召喚物 eid」（2026-08-13 交叉掃描實證，見 [[summon-creature]]）。
+#   身上有召喚物時它非零 → 舊版特徵整個驗不過 → **有召喚物的那台
+#   等級/HP/金幣全部定位失敗**（收益監控「定位中…」、掛機讀不到 HP）。
+#   使用者實機踩到（黑狐帶著噬魂怪，全記憶體 0 個候選）。
+#   → _signature_ok 檢查零值時**跳過這一格**；它同時也是 summon.py 讀
+#   「召喚物還在不在」的來源（那邊透過 pet_eid() 拿，不另抄位址）。
+PET_EID_OFF = 0x14
 
 
 @dataclass(frozen=True)
@@ -103,12 +111,19 @@ class PlayerStats:
 
 
 def _signature_ok(scanner, obj: int, vtable: int) -> bool:
-    """物件開頭是不是我們要的類別：vtable + 連續 7 個 0。純結構，不看數值。"""
+    """物件開頭是不是我們要的類別：vtable + 連續 7 個 0。純結構，不看數值。
+
+    ⚠ **召喚物 eid 那一格（+PET_EID_OFF）不算**：那是活欄位，身上有
+      召喚物時非零。把它算進「必須為 0」害過整台定位全滅（見常數說明）。
+    """
     raw = scanner._read_bytes(obj, 4 + ZERO_DWORDS * 4)
     if not raw or len(raw) < 4 + ZERO_DWORDS * 4:
         return False
     vals = struct.unpack(f"<{1 + ZERO_DWORDS}I", raw)
-    return vals[0] == vtable and all(v == 0 for v in vals[1:])
+    if vals[0] != vtable:
+        return False
+    skip = PET_EID_OFF // 4                  # vals[0] 是 vtable，欄位從 1 起算
+    return all(v == 0 for i, v in enumerate(vals[1:], start=1) if i != skip)
 
 
 def _vtable_value(scanner) -> int | None:
@@ -211,6 +226,31 @@ class MaxTracker:
 #     `mov [edi+偏移], 角色屬性vtable` 直接把偏移讀回來（同一段特徵也解出
 #     VTABLE_RVA）。下面這個值只是「還沒 warm() 或定位失敗」時的退路。
 VT_OFF_FROM_MGR = 0xCB08          # 角色屬性物件的 vtable 在狀態物件裡的位置
+
+
+def pet_eid(scanner) -> int | None:
+    """遊戲記的「我的召喚物 eid」；0＝現在沒有，None＝讀不到。
+
+    位置＝[MGR] + VT_OFF_FROM_MGR + PET_EID_OFF —— 就在角色屬性物件的
+    vtable 後面（那串「保留 0」裡唯一的活欄位）。VT_OFF_FROM_MGR 有 AOB
+    自動定位，所以這裡**不寫死絕對偏移**，改版跟著搬。
+    語意實測（2026-08-13，見 [[summon-creature]]）：召喚物在視野＝清單那隻
+    的 eid；走遠（重建中）保持非零；跳圖歸零 2~4 秒後跟過來恢復；
+    真的沒了＝持續 0。
+    ⚠ None 是「不知道」不是「沒有」（bag-false-empty-guards 鐵則）。
+    """
+    from app.game import quickbar                   # 避免模組載入期循環相依
+
+    raw = scanner._read_bytes(quickbar.MGR_PTR, 4)
+    if not raw:
+        return None
+    mgr = struct.unpack("<I", bytes(raw))[0]
+    if not 0x10000 < mgr < 0x7FFF0000:
+        return None
+    raw = scanner._read_bytes(mgr + VT_OFF_FROM_MGR + PET_EID_OFF, 4)
+    if not raw:
+        return None
+    return struct.unpack("<I", bytes(raw))[0]
 
 
 def locate_fast(scanner) -> int | None:
