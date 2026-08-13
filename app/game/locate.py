@@ -579,18 +579,18 @@ SIGS: tuple[Sig, ...] = (
         " 85 94 81 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? 57 E8 ?? ?? ?? ??",
         0x000058F8),
     # ── 失焦不凍畫面（見 app/game/unfreeze.py）──────────────────────
-    # 要 patch 的那 2 個位元組所在位址：視窗程序 WndProc(0x70CAB0) 處理
-    # WM_ACTIVATE/WM_ACTIVATEAPP 的 handler 裡，把「失焦」算成 inactive 的
-    # `xor al,al`（機器碼 32 C0）。改成 `mov al,1`（B0 01）就永遠當自己 active。
-    # ⚠ kind='fn' 回傳的是命中處位址 = 要 patch 的位址；特徵**開頭那 2 個
-    #   位元組（就是要改的 32 C0）故意遮成 `??`** —— 這樣 patch 前(32 C0)、
-    #   patch 後(B0 01) 都定位得到（不然套用之後重掃就找不到自己了）。
-    #   靠後面那串骨架當錨：`jmp +2 / mov al,1 / mov [ebp-0x20],al /
-    #   mov [ebx+0xc],al / cmp al,cl / je … / mov eax,[ebx] / mov ecx,ebx /
-    #   push [ebp-0x20] / call [eax+0x50]`。je 的 rel32 遮掉，call 的 +0x50
-    #   是類別版面（大更新才會變）留著。已用真映像驗證唯一命中 0x70CC5A。
+    # 要 patch 的位址：視窗程序 WndProc(0x70CAB0) 處理 WM_ACTIVATE 的 handler。
+    # v2（2026-08-13）patch 兩處：命中處那 2 bytes（32 C0→B0 01，失焦也算
+    # active＝不凍）＋命中處 +0xE 那 6 bytes（je「沒變就跳走」→ cmp wParam／
+    # je，取得焦點時每次都呼叫 OnActivate(1)＝重設輸入，手動操作才不會壞）。
+    # ⚠ kind='fn' 回傳的是命中處位址；**兩處要改的 8 個位元組全部遮成 ??**
+    #   —— patch 前後都要定位得到（不然套用之後重掃就找不到自己了）。
+    #   靠中間那串骨架當錨：`jmp +2 / mov al,1 / mov [ebp-0x20],al /
+    #   mov [ebx+0xc],al / cmp al,cl`（這 12 bytes 也保證 +0xE 這個距離），
+    #   加上後面 `mov eax,[ebx] / mov ecx,ebx / push [ebp-0x20] /
+    #   call [eax+0x50]`（+0x50 是類別版面，大更新才會變）。
     Sig("unfreeze", "PATCH_ADDR", "fn", None,
-        "?? ?? EB 02 B0 01 88 45 E0 88 43 0C 3A C1 0F 84 ?? ?? ?? ??"
+        "?? ?? EB 02 B0 01 88 45 E0 88 43 0C 3A C1 ?? ?? ?? ?? ?? ??"
         " 8B 03 8B CB FF 75 E0 FF 50 50",
         0x0070CC5A),
 )

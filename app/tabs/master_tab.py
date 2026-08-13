@@ -6,9 +6,11 @@
 目前只有一個設定：
 
 * **畫面凍結解除** —— 天戀失焦（點到別的視窗）時畫面本來會凍住、但角色照樣掛機；
-  打開後失焦也會繼續更新畫面。改的是遊戲視窗程序 2 個位元組（讓它失焦時不去
-  停畫面），不注入程式碼、不搶前景、不影響邏輯與網路。關掉就還原。
-  詳見 app/game/unfreeze.py 與 memory 的 background-unfreeze-investigation。
+  打開後失焦也會繼續更新畫面。改的是遊戲視窗程序 8 個位元組（v2：失焦時不去
+  停畫面＋**點回視窗時把輸入重設回來** —— 舊版只做前者，切回來手動放技能會
+  失靈），不注入程式碼、不搶前景、不影響邏輯與網路。關掉就還原。
+  詳見 app/game/unfreeze.py 與 memory 的 background-unfreeze-investigation、
+  manual-cast-broken-investigation。
 
 ## 為什麼是「一直掃」
 
@@ -77,7 +79,9 @@ class MasterTab(BaseTab):
         self.cb_unfreeze.setToolTip(
             "天戀失焦（點到別的視窗）時畫面本來會凍住 —— 打開這個就不會凍，"
             "失焦也繼續更新畫面。\n"
-            "改的是遊戲視窗程序 2 個位元組，只是讓它失焦時不去停畫面；\n"
+            "改的是遊戲視窗程序 8 個位元組：失焦時不去停畫面、"
+            "點回視窗時把輸入裝置重設回來\n"
+            "（v2：修掉了舊版「開著防凍、切回來後手動放技能會失靈」的問題）；\n"
             "不注入程式碼、不搶前景、不影響邏輯與網路。關掉就還原。\n"
             "⚠ 最小化仍然會停（那是 Windows 自己收掉，不在這裡管）。")
         self.cb_unfreeze.toggled.connect(self._on_unfreeze_toggled)
@@ -191,11 +195,13 @@ class MasterTab(BaseTab):
 
             st = unfreeze.state(sc)
             # 核對「想要 vs 現況」，補齊差異（apply/remove 都是冪等的）。
+            # ★ "mixed"＝套了一半（多半是舊版工具箱只套了第一處）——
+            #   照「想要的方向」推一把就會補齊／收乾淨。
             if st != "unknown" and sc.can_write:
-                if want and st == "off":
+                if want and st in ("off", "mixed"):
                     unfreeze.apply(sc)
                     st = unfreeze.state(sc)
-                elif not want and st == "on":
+                elif not want and st in ("on", "mixed"):
                     unfreeze.remove(sc)
                     st = unfreeze.state(sc)
 
@@ -205,6 +211,11 @@ class MasterTab(BaseTab):
             elif st == "off":
                 self._set(r, COL_STATE, "會凍（原始）", QColor(theme.MUTED))
                 n_off += 1
+            elif st == "mixed":
+                # 沒有寫入權限時會停在這裡出不去，照樣算「有問題」提醒。
+                self._set(r, COL_STATE, "⚠ 套用到一半（下一拍補齊）",
+                          QColor(theme.BAD))
+                n_bad += 1
             elif not sc.can_write:
                 self._set(r, COL_STATE,
                           "⚠ 沒有寫入權限（請用系統管理員身分執行）",
