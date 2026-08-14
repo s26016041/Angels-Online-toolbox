@@ -44,6 +44,7 @@ GAME_MODULE = "angel.dat"
 #    症狀是 current() 開始回 None（結構檢查擋下來了，不會顯示錯的地圖）。
 #    重新定位的方法就是當初找到它的方法，見本檔最後的「怎麼重新定位」。
 SCENE_PTR_RVA = 0x490948   # 全域指標所在（絕對位址 0x00890948）
+# ⚠ 場景物件的 vtable（掃描備援＋讀值驗證用）；改版會位移，重定位見檔尾。
 VTABLE_RVA = 0x3DCF3C      # 場景物件的 vtable 值（絕對 0x007DCF3C）
 OFF_SCENE_ID = 0x1190      # 物件內：目前場景編號
 

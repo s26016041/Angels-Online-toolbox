@@ -46,7 +46,8 @@ VT_RESOURCE = 0x007D87B4   # 採集品物件的 vtable
 OFF_TREE = 0x2AA8          # 世界物件裡那棵「場上物件」樹
 OFF_GATHER_KIND = 0x184    # 採集品的「採集種類」欄位
 
-# 物件起點 → entity 偏移的基準差（entity.py 檔頭：實體有兩個 vtable，差 8）
+# ★ 物件起點 → entity 偏移的基準差（出處：entity.py 檔頭「實體有兩個
+#   vtable、差 8」，attack.py 檔頭記的實測老坑同一件事）。
 E = 8
 _TREE_MAX_DEPTH = 48       # 紅黑樹頂多十幾層；48 是給爛資料的煞車
 _MAX_NODES = 4000          # 場上物件再多也不該破這個數

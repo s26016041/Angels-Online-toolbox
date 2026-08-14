@@ -66,7 +66,9 @@ from app.game import attack
 # 使用背包物品。⚠ 這個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 USE_ITEM_FN = 0x005DB4E0
 
-RECALL_ITEM = 1905          # 回程道具的種類 ID（五台都有）
+# ★ 回程道具（天使之翼）的種類 ID。出處：五台背包實測對照
+#   （⚠ 舊記的 3966 是表頭偏格讀錯，見 memory recall-item-packet）。
+RECALL_ITEM = 1905
 
 
 def use_item(mover, slot: int) -> bool:

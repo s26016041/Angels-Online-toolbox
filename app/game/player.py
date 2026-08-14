@@ -75,7 +75,7 @@ GAME_MODULE = "angel.dat"
 VTABLE_RVA = 0x3E3E1C
 # 物件起點相對「角色資料基準」的位置
 OFF_VTABLE = -0x20
-# vtable 之後有幾個 dword 是 0（五台一致）。加這條讓特徵更不容易誤中。
+# ★ vtable 之後有幾個 dword 是 0（五台實測一致）。加這條讓特徵更不容易誤中。
 ZERO_DWORDS = 7
 # ⚠⚠⚠ 那 7 個「0」裡有一格**不是保留欄位**：vtable+PET_EID_OFF 是
 #   「我的召喚物 eid」（2026-08-13 交叉掃描實證，見 [[summon-creature]]）。

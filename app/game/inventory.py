@@ -83,7 +83,8 @@ SLOT_SANE_MAX = bag.MAX_SLOTS
 # 一次讀多少 bytes 才涵蓋（種類 ID, 格號 u16, 數量 u16）
 ROW_SPAN = bag.ITEM_COUNT + 2
 
-# 判定表頭用：前這麼多格裡至少要有這麼多個有效物品指標
+# ⚠ 判定表頭用的**我們自己的啟發式門檻**（不是遊戲結構偏移，AOB 救不了也不必救）：
+#   前 HEAD_WINDOW 格裡至少要有 HEAD_MIN_ITEMS 個有效物品指標才認這是表頭。
 HEAD_WINDOW = 64
 HEAD_MIN_ITEMS = 12
 MAX_ITEM_ID = 200_000
@@ -246,7 +247,8 @@ def ball_value(scanner, ptr: int) -> int:
     return struct.unpack("<i", raw)[0] if raw else 0
 
 
-HEAD_BACK = 24               # 校正表頭時往前多看幾格（只有 align_head 用）
+# ⚠ 我們自己的校正窗（不是遊戲結構、改版不會壞）：align_head 往前多看幾格用。
+HEAD_BACK = 24
 # ★ 走整條陣列時看多少格。⚠⚠ **這個值太小會變成「假的沒有」**：
 #   實測格號用到 174（白狐 172、嵐狐 174），原本寫 128 就會把放在後面的
 #   藥水判成「用完了」→ 誤觸發回程補給。

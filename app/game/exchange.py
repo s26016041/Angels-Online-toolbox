@@ -66,21 +66,33 @@ from dataclasses import dataclass
 from app.game import attack
 
 # 泛用送包的「開啟兌換商店」代碼（參數＝群組）。函式沿用 attack.SELECT_FN。
+# ★ 出處：實測打通 —— 不先送 0x49 開商店、0x148 兌換不會生效
+#   （memory exchange-packet；代碼表見 generic-send-fn）。
 OPEN_CODE = 0x49
 
 # 兌換確認封包。組包／送出／連線指標跟 jumpmap 共用已定位好的那組（見 _fns）。
+# ★ 出處：封包代號對照表＋兌換實測打通（memory packet-opcode-table、exchange-packet）。
 OPCODE = 0x148
-BODY = 10                    # 代號(u16) + 編號(u32) + 次數(u32)
+# ★ 出處同上（實測版面）：代號(u16) + 編號(u32) + 次數(u32) = 10。
+BODY = 10
 SCRATCH_OFF = 0x180          # 相對 mover.scratch()；避開 jumpmap 0x100、sell 0x140
 CALL_TIMEOUT = 1.0
 
 # --- 兌換記錄的版面 ------------------------------------------------------
+# ★ 出處：檔頭 docstring 那次「記憶體記錄 ↔ exchange.xml」逐欄比對（一字不差）。
+#   版面搬家也不會亂換 —— find() 是用內容反查編號、對不上就拒送。
 REC_ID = 0x00
+# ⚠ 出處同上（exchange.xml 逐欄比對）。
 REC_GROUP = 0x04
-REC_REWARD = 0x0C            # 獎賞 4 格
-REC_REWARD_N = 0x1C          # 獎賞數量 4 格
-REC_MATERIAL = 0x2C          # 材料 4 格
-REC_MATERIAL_N = 0x3C        # 材料數量 4 格
+# ⚠ 出處同上。獎賞 4 格。
+REC_REWARD = 0x0C
+# ⚠ 出處同上。獎賞數量 4 格。
+REC_REWARD_N = 0x1C
+# ⚠ 出處同上。材料 4 格。
+REC_MATERIAL = 0x2C
+# ⚠ 出處同上。材料數量 4 格。
+REC_MATERIAL_N = 0x3C
+# ⚠ 出處同上。排序欄，比對用的最後一欄。
 REC_SORT = 0x4C
 REC_SPAN = 0x50              # 讀到排序就夠了
 SLOTS = 4

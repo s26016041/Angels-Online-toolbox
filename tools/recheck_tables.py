@@ -127,6 +127,47 @@ def check_skill_range(sc, tabs, lines):
             diff == 0 and same > 0)
 
 
+def check_skill_secs(sc, tabs, lines):
+    """assets/skills.tsv.gz 的 buff 持續時間（秒）vs 記憶體 Magic 範本（+0x100）。
+
+    偏移出處：2026-08-14 拿全部 10516 筆寫死持續時間掃「哪個偏移全中」——
+    只有 +0x100 10516/10516（skillcost.OFF_DURATION_SECS 的註解有全程記錄）。
+    """
+    table = skills._load()
+    if not table:
+        return "讀不到 assets/skills.tsv.gz", False
+    ptr = tabs.get("Magic")
+    tab = _u32(sc, ptr) if ptr else None
+    if not _sane(tab):
+        return "讀不到 Magic 表", False
+    ptrs = sc._read_bytes(tab + 4, skillcost.MAX_SKILL_ID * 4)
+    if not ptrs:
+        return "讀不到 Magic 表內容", False
+    ptrs = bytes(ptrs)
+    same = diff = miss = 0
+    for sid, sk in sorted(table.items()):
+        if not 1 <= sid <= skillcost.MAX_SKILL_ID:
+            continue
+        p = struct.unpack_from("<I", ptrs, (sid - 1) * 4)[0]
+        if not _sane(p):
+            miss += 1
+            continue
+        raw = sc._read_bytes(p + skillcost.OFF_DURATION_SECS, 4)
+        if not raw or len(raw) < 4:
+            miss += 1
+            continue
+        got = struct.unpack("<i", bytes(raw))[0]
+        if got == sk.secs:
+            same += 1
+        else:
+            diff += 1
+            if diff <= 40:
+                lines.append(f"    技能 {sid}（{skills.name_of(sid)}）"
+                             f"表={sk.secs}s 記憶體={got}s")
+    return (f"{same} 對上、{diff} 對不上、{miss} 查不到（共 {len(table)}）",
+            diff == 0 and same > 0)
+
+
 def check_jumpmap(sc, tabs, lines):
     """assets/jumpmap.tsv 的 場景/座標 vs 記憶體 JumpMap 範本。"""
     rows = []
@@ -233,6 +274,8 @@ def check_item_names(sc, tabs, lines):
 CHECKS = (
     ("skill_range.tsv.gz（技能射程）", check_skill_range,
      "⛔ 過期後果：走位停太遠 → 零傷害，完全不報錯", True),
+    ("skills.tsv.gz（buff 持續時間）", check_skill_secs,
+     "⛔ 過期後果：補 buff 的時間點算錯（太早浪費 MP／太晚裸奔）", True),
     ("jumpmap.tsv（趴趴GO 傳送點）", check_jumpmap,
      "⛔ 過期後果：傳到錯的地方", True),
     ("Item 表 ↔ 背包物品", check_item_table,

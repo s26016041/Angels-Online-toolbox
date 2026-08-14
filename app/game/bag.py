@@ -76,7 +76,9 @@ OFF_CONTAINER = 0x2FC       # 實體 + 這裡 = 物品容器 vector
 #     getenergy    0x533874   [this+0xA0]（限分類 0x2E＝46 紙娃娃）
 #
 ITEM_SERIAL = 0x00
+# ★ 出處：getid 0x5336CA 的第二欄 [this+0x04]（取得時間；實測見檔頭那段）
 ITEM_STAMP = 0x04
+# ★ 出處：getproto 0x5336ED ＝ [this+0x08]（上面的反組譯欄位表）
 ITEM_TYPE = 0x08            # 種類 ID（itemname 的鍵）
 # ★★ 格號是 **u16** 不是 1 byte（`getslot` 是 `movzx eax, word ptr [ecx+0x25]`）。
 #   ⚠ 這推翻了舊結論「+0x25 只有一個 byte，格號 > 255 裝不下」——
@@ -98,9 +100,12 @@ ITEM_SPAN = 0x5C            # 一次要讀多少 bytes 才涵蓋上面全部
 #   讀的，拉長到 0xA4 會讓貼著區段結尾的物件整批讀取失敗 → 假的「背包空了」）。
 ITEM_ENERGY = 0xA0
 
+# ★ 出處：gettype 0x53370E ＝ [[this+0x58]+0x18]（上面的反組譯欄位表）
 TMPL_KIND = 0x18            # 分類代號（1:1 對到 item.xml 的「物品類別」，見下）
 TMPL_DURA_MAX = 0xDC        # ★ 耐久上限；> 0 ＝ 這是裝備／武器
+# ★ 出處：反組譯算單價的主分支（單價＝範本+0x104；分支全貌見下面 0x602391 那段）
 TMPL_PRICE = 0x104          # 售價；<= 0 = 這東西賣不掉
+# ★ 出處：getparam1 0x53379E ＝ [[this+0x58]+0x108]（上面的反組譯欄位表）
 TMPL_PARAM1 = 0x108         # 動態資料1
 # ★★ 動態資料2 ＝ **分解值**（拆成晶能拿幾點）。遊戲拆解介面的判斷就是
 #   `getparam2() > 0`，所以不必抄資源包 —— 表就在記憶體裡，改版自動跟上。
@@ -111,6 +116,8 @@ TMPL_PARAM2 = 0x10C
 #   程式沒用它判斷，記著是為了看得懂資料。見 memory 的
 #   decompose-all-and-doll-slots。
 TMPL_COMPOSE1 = 0x110
+# ★ 出處：反組譯提示框上色 0x5F358A（讀範本+0x130 挑名字顏色）；
+#   對帳 item*.xml 的顏色欄 32476 筆 100% 吻合（詳見下面 GRADE_* 那段）
 TMPL_GRADE = 0x130          # ★ 品質（白／藍／橘），見 GRADE_NAMES
 TMPL_SPAN = 0x134
 
@@ -140,10 +147,12 @@ KIND_DOLL = 46
 # 背包的格號範圍，照抄遊戲賣東西視窗的迴圈（0x602357 / 0x6024EB）。
 # 0~11 是身上穿的、12~19 是空的裝備格 —— **都不在這個範圍內，所以不會被賣掉**。
 FIRST_SLOT = 0x14
+# ⚠ 出處同上：賣東西視窗迴圈的終值（改版擴充格數這裡會無聲漏格）
 LAST_SLOT = 0xA9
 
 # 身上穿的裝備格（掛機「裝備壞掉」看的就是這一段，不含背包）
 WORN_FIRST = 0
+# ★ 出處：上面賣東西視窗那段（0~11＝身上穿的，迴圈刻意跳過的範圍）
 WORN_LAST = 11
 
 # ★★ 容器後半段的分區。**數字是遊戲自己的 Lua 全域常數**（2026-08-08 倒出來，
@@ -153,9 +162,11 @@ WORN_LAST = 11
 #   250 是徽章格、251 起是「紙娃娃隨身包」（遊戲裡叫裝扮背包，2 頁×100）。
 #   五台分身的背包實拍完全對得上。
 DOLL_WORN_FIRST = 242
+# ★ 出處同上：DOLL_SLOT_END＝249（遊戲自己的 Lua 全域常數）
 DOLL_WORN_LAST = 249
 
 GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）
+# ★ 出處：gold() 那段反組譯（0x508C24 取第 0 格）＋五台實測第 0 格種類恆為 1
 GOLD_TYPE = 1              # 金幣的種類 ID
 
 MAX_SLOTS = 4096            # 容器格數的合理上限（實測 743）
@@ -182,7 +193,9 @@ MAX_SLOTS = 4096            # 容器格數的合理上限（實測 743）
 #   一件是裝備類，對「賣裝備」不影響。
 # ⚠ 值 1（灰）在遊戲載進來的表裡一次都沒出現過，所以沒給它名字。
 GRADE_NORMAL = 0            # 普通（白）
+# ★ 出處同上：0x5F358A 的 case 2＝橘金（資料表寫「黃」）
 GRADE_TOP = 2               # 頂級（橘／資料表寫「黃」）
+# ★ 出處同上：0x5F358A 的 case 3＝青藍
 GRADE_FINE = 3              # 優質（藍）
 GRADE_NAMES = {GRADE_NORMAL: "普通", GRADE_TOP: "頂級", GRADE_FINE: "優質"}
 

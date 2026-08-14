@@ -233,9 +233,12 @@ def _names_ok(names) -> bool:
             and len(set(names)) == ATTR_COUNT
             and all(n and len(n) <= 8 and "%" not in n for n in names))
 
-# 泛用送包函式的種類碼與參數。函式本身沿用 attack.SELECT_FN。
+# ★ 泛用送包的種類碼與參數，函式沿用 attack.SELECT_FN。出處：使用者攔包
+#   呼叫鏈 0x589B65 那層 (0x38, 1)（見檔頭「怎麼找到的」）。
 ROLL_CODE = 0x38
+# ⚠ 攔包實錄的第二參數就是 1（視窗定義帶進去的常數，不是猜的）。
 ROLL_ARG = 1
+# ★ 出處：同上攔包，加倍那包同一層是 (0x39, 0xFFFFFFFF)。
 DOUBLE_CODE = 0x39
 # ⚠ 是 -1（擷取到的是 0xFFFFFFFF），**不是 1**。跳板寫入時會 & 0xFFFFFFFF，
 #   所以這裡放 Python 的 -1 就好。

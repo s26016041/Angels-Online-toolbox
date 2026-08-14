@@ -51,6 +51,8 @@ PUSHSTRING_FN = 0x006A4BC0
 
 GLOBALSINDEX = 0xFFFFD8EE    # -10002
 TOPINDEX = 0xFFFFFFFF        # -1（堆疊頂）
+# ★ 出處：Lua 5.1 原始碼 lstate.h 的 lua_State 版面（CommonHeader＋status 對齊後
+#   top 在 +0x08，x86）；遊戲用的就是原版 Lua 5.1（見 memory lua-engine）。
 OFF_TOP = 0x08               # lua_State 裡的 top
 # Lua 5.1 的 lua_State：CommonHeader(6)+status(1)+對齊 → top 0x08、base 0x0C、
 # l_G 0x10、ci 0x14、savedpc 0x18、**stack_last 0x1C**、stack 0x20。
@@ -58,7 +60,9 @@ OFF_TOP = 0x08               # lua_State 裡的 top
 #   所以 `_room_for()` 只在讀出來的值「看起來合理」時才採用，
 #   對不上就當作沒這道檢查（維持原本行為，不會因為推錯而讓功能失效）。
 OFF_STACK_LAST = 0x1C
+# ★ 出處：Lua 5.1 lstate.h —— hook(+0x44) 之後的 l_gt（x86 版面）；讀取端拿它驗版面。
 OFF_L_GT = 0x48              # lua_State 裡的全域表（拿來驗證版面）
+# ★ 出處：Lua 5.1 lobject.h 的 TValue（Value union 8B 對齊＋tt → x86 共 16 bytes）。
 TVALUE = 16
 
 T_NIL, T_BOOL, T_NUMBER, T_STRING, T_TABLE, T_FUNCTION = 0, 1, 3, 4, 5, 6

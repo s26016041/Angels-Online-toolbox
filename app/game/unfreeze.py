@@ -66,8 +66,9 @@ from app.game import locate
 # locate.warm() 會把這個改寫成當下的絕對位址。沒定位成功前是 2026-08-12 的值，
 # 但 apply()/remove() 一律先問 locate.located() 才會用，所以這個預設值只是文件。
 PATCH_ADDR = 0x0070CC5A
-# 位置 B（je 那 6 個位元組）＝ PATCH_ADDR + 0xE。中間隔的 12 bytes
-# （EB 02 B0 01 88 45 E0 88 43 0C 3A C1）就是 AOB 特徵的錨，距離跟著特徵走。
+# ★ 位置 B（je 那 6 個位元組）＝ PATCH_ADDR + 0xE。中間隔的 12 bytes
+#   （EB 02 B0 01 88 45 E0 88 43 0C 3A C1）就是 AOB 特徵的錨 —— 相對距離由
+#   特徵骨架保證，改版時 PATCH_ADDR 重新定位、這個距離不變（見檔頭）。
 SITE2_OFF = 0xE
 
 ORIG = b"\x32\xc0"      # xor al,al   → 算出「失焦＝inactive」

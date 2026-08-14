@@ -57,9 +57,17 @@ ADDR_ALLOW = {("injector", "CODE_LO"), ("injector", "CODE_HI")}
 #   排除清單也印進報告，讓「不算偏移」這個判斷本身可以被檢查。
 NOT_GAME_OFF = (
     "SCRATCH",          # 我們自己注入的暫存區，跟遊戲無關
+    "PAGE_",            # WinAPI 記憶體保護旗標（PAGE_EXECUTE_READWRITE），不是遊戲結構
     "TIMEOUT", "_MS", "MS_", "_SEC", "TRIES", "RETRY", "INTERVAL", "SETTLE",
     "SPAN", "MAX", "MIN", "LIMIT", "CAP_", "NAME_MAX", "COUNT", "PAGES",
     "SLOTS", "SIZE", "VK_", "KIND_", "BIT_", "RUN_", "TILE", "FULL",
+)
+# 全名（模組.名字）精準排除 —— 名字太短、子字串比對會誤傷別人的才放這裡
+# （例如 "_CODE" 會吃掉 SWITCH_CODE/SELECT_CODE 那些真封包代碼＝假覆蓋率）。
+NOT_GAME_OFF_EXACT = (
+    # move.py 跳板 stub 的版面（緊鄰的 _FLAG.._ESP 是元組賦值本來就掃不到）：
+    # 我們自己 _stub_asm 產的緩衝區，跟遊戲結構無關、改版不會壞。
+    "move._A6", "move._BUSY", "move._CODE",
 )
 # 這些模組不是「跟遊戲要資料」的層，裡面的數字是我們自己的設定
 SKIP_MODULES = ("locate", "aob", "signatures", "navigate", "watcher",
@@ -178,7 +186,8 @@ def scan_consts():
                         continue
                     elif "game" not in dirpath or mod in SKIP_MODULES:
                         continue          # 只看 app/game 這層跟遊戲要資料的
-                    elif any(k in t.id for k in NOT_GAME_OFF):
+                    elif (any(k in t.id for k in NOT_GAME_OFF)
+                          or f"{mod}.{t.id}" in NOT_GAME_OFF_EXACT):
                         skipped.append(f"{mod}.{t.id} = {v:#x}   {where}")
                     else:
                         offs.append((mod, t.id, v, where, why))

@@ -34,7 +34,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 from app.core import charname, preload                      # noqa: E402
 from app.core.memory import MemoryScanner                   # noqa: E402
 from app.game import bag, energy, entity, inventory         # noqa: E402
-from app.game import locate, monsters, move, player         # noqa: E402
+from app.game import locate, login, monsters, move, player  # noqa: E402
 from app.game import quickbar, scene, skillcost, skills     # noqa: E402
 from app.game import scenery, team, terrain                 # noqa: E402
 
@@ -64,6 +64,9 @@ COVERS: tuple[tuple[str, str], ...] = (
     ("scene", "OFF_SCENE_ID"),
     ("terrain", "OFF_W"), ("terrain", "OFF_H"), ("terrain", "OFF_ROWS"),
     ("scenery", "OFF_MODEL"),
+    # 伺服器清單那條：servers() 走 SRV_BEGIN/END/STRIDE 撈整張、每筆驗
+    # port 範圍＋兩格分流數互驗＋名稱可讀 —— SRV_ 開頭的整組都吃這條。
+    ("login", "SRV_"),
 )
 
 
@@ -287,6 +290,20 @@ def checks(sc, log):
         put("製作站台 scenery.nearby", inside and ids_ok,
             f"{len(props)} 個、最近 {props[0].dist(me):.1f} 格"
             f"、外觀 {props[0].model}、選定id {props[0].oid:#x}")
+
+    # login.SRV_*：伺服器清單版面。servers() 每筆已做結構性驗證（port 範圍、
+    # 兩格分流數互驗、名稱可讀）——版面搬家時整張清單會讀成空。
+    # 分流數改讀這條是 2026-08-11 換 channel.count() 時五台實測過的路。
+    app = u32(sc, login.APP_PTR)
+    if not app or not 0x10000 < app < 0x7FFF0000:
+        put("伺服器清單 login.SRV_*", NA, "APP 物件還沒好（還在載入？）")
+    else:
+        srv = login.servers(sc)
+        good = bool(srv) and all(
+            1 <= n <= login.MAX_SUBSET and nm for nm, n in srv)
+        put("伺服器清單 login.SRV_*", good,
+            "、".join(f"{nm}×{n}" for nm, n in srv) if srv
+            else "APP 物件在、清單卻讀不到 —— SRV_* 版面八成搬家了")
     return out
 
 

@@ -33,7 +33,9 @@ from __future__ import annotations
 
 from app.game import attack
 
-REVIVE_CODE = 0x02      # 泛用送包的「復活選擇」種類碼
+# ★ 泛用送包的「復活選擇」種類碼。出處：使用者死亡點「回標記點」的攔包
+#   呼叫鏈 0x589B65 那層 (2, 0)（見檔頭「怎麼找到的」）。
+REVIVE_CODE = 0x02
 MARK_PARAM = 0          # 「回標記點」（攔包原樣；其他值未驗證，不要亂試）
 
 

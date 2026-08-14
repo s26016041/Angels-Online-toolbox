@@ -35,10 +35,13 @@ BUY_OPCODE = 0x27          # 跟 NPC 買
 #   ③ 買（0x27）。
 #   ⚠ talkaction(10) 碼是對的，但**一定要先用 0x54A520 開真對話**才有效（少了它 talkaction 無效）。
 INTERACT_FN = 0x0054A520   # ★ AOB 定位（locate.py supply.INTERACT_FN）：thiscall ecx=玩家物件−8
-INTERACT_MODE = 1          # 模式 1 = 走到 NPC 並互動（開對話）
-TALK_BUY = 10              # 對話選項「我要買東西」＝TALK_OPTION1（買）
-TALK_REPAIR = 10           # 對話選項「我要修裝」——擷取的呼叫鏈跟「買東西」完全一樣，
-                           #   ＝對話第一個選項（商人是買、維修商是修），所以也是 10。
+# ★ 出處同上段實測序列①：0x54A520 的第一參數，1＝走到 NPC 並互動（開對話）。
+INTERACT_MODE = 1
+# ★ 出處同上段實測序列②：TALK_OPTION1＝對話第一個選項（商人＝我要買東西）。
+TALK_BUY = 10
+# ★ 出處：擷取的呼叫鏈跟「買東西」完全一樣＝對話第一個選項
+#   （商人是買、維修商是修），所以也是 10。
+TALK_REPAIR = 10
 # 「全修」＝ repairall UI 指令（0x5906BD）呼叫的本體：thiscall，讀 WND_REPAIR 視窗的待修
 #   清單、逐件送修裝包 0x3B。開維修視窗後直接叫它就全修（repairone 是 0x5D6320）。
 #   ★ AOB 定位（locate.py supply.REPAIR_ALL_FN，錨在 push 2/push 0x3C 分家 repairone）。
@@ -67,7 +70,8 @@ SALE_WAIT = 0.8            # talkaction 後等販售頁/伺服器交易開起來
 #   ⚠ 兩個碼是擷取到的實際值（TALK_OPTION1=10…TALK_OPTION10=19 是選單位置碼）；
 #     跟買東西「我要買東西=10」同一組機制。
 TALK_BANK_USE = 11         # 我要用倉庫
-TALK_BANK_SELF = 10        # 自己的倉庫（非公會）
+# ★ 出處同上段擷取：TALK_OPTION1＝子選單第 1 項「自己的倉庫」（非公會）。
+TALK_BANK_SELF = 10
 BANK_WND = "WND_BANK"      # 倉庫視窗名（確認真的開了）
 WND_SALE = "WND_NPCSALE"   # 買東西的販售視窗（確認交易真的開了）
 WND_REPAIR = "WND_REPAIR"  # 修裝視窗（確認真的開了）
@@ -75,29 +79,39 @@ WND_REPAIR = "WND_REPAIR"  # 修裝視窗（確認真的開了）
 #   代號 0x2F、內文 11 bytes = u16代號 + u8動作(0x11) + u32格號 + u32(0)
 #   ★ 建/送/連線完全沿用 jumpmap.BUILD_FN/SEND_FN/CONN_PTR（跟買東西同一組，已 AOB）。
 DEPOSIT_OPCODE = 0x2F
-DEPOSIT_ACTION = 0x11      # 動作碼「存入」
+# ★ 出處同上反組譯 0x5D2988：內文 u8 動作碼，0x11＝存入。
+DEPOSIT_ACTION = 0x11
+# ★ 出處同上反組譯：push 0xB＝內文 11 bytes。
 DEPOSIT_BODY = 11
-# 「處理列表」＝補給頁那張「這些物品要怎麼處理」的平行清單（robot var 樹，DATAID）：
-#   AS_STRLIST_TODISCARD(1516)=物品**名字**、AS_INTLIST_TODISCARD(1518)=**處理方式**。
+# ★ 出處：補給頁「這些物品要怎麼處理」的平行清單（robot var 樹 DATAID，
+#   dump_lua 全域常數對照）：AS_STRLIST_TODISCARD(1516)=物品**名字**、
+#   AS_INTLIST_TODISCARD(1518)=**處理方式**。
 #   方式：0 移除 / 1 存銀行 / 2 賣掉 / 3 丟棄（HANDLETYPE_*，遊戲 Lua 常數）。
 #   我們只認「1=存銀行」的，背包有同名的就存。（不寫死物品，讀使用者設的那張。）
 AS_HANDLE_NAMES = 1516
+# ★ 出處同上：處理方式那張 int 清單（AS_INTLIST_TODISCARD）。
 AS_HANDLE_TYPES = 1518
+# ★ 出處同上：遊戲 Lua 常數 HANDLETYPE_*，1＝存銀行。
 HANDLETYPE_DEPOSIT = 1
 MAX_DEPOSIT = 120          # 一趟最多存幾件（防呆上限；正常一批物品遠少於此）
 DEPOSIT_WAIT = 0.25        # 每存一件後等背包更新（會 poll 到真的少一件）
-DEPOSIT_POLL = 6           # 存完最多 poll 幾次確認物品離開（×DEPOSIT_WAIT ≈ 1.5s）
+# ⚠ 自家的輪詢上限（不是遊戲常數）：存完最多 poll 幾次確認物品離開（×DEPOSIT_WAIT ≈ 1.5s）。
+DEPOSIT_POLL = 6
 
-# 買入封包版面：u16 代號 + u32 件數 + 每件 { u32 全域種類id, u32 數量 }
+# ★ 買入封包版面（擷取＋實測，見 memory self-supply-buy）：
+#   u16 代號 + u32 件數 + 每件 { u32 全域種類id, u32 數量 }
 _BODY_HEAD = 6
+# ★ 出處同上：每件 8 bytes（種類id + 數量）。
 _BODY_ENTRY = 8
 SCRATCH_OFF = 0x180        # 相對 mover.scratch()；避開 jumpmap/lua/sell 用的區段
 CALL_TIMEOUT = 1.0
 
 # 商人物件欄位（結構偏移，改版才會壞；出處 self-supply-buy）
 OFF_SELECT_ID = 0x1D0      # NPC 交給伺服器的選定 id（會變，每次現讀）
-OFF_NPC_NUM = 0x1D8        # ★ NPC 編號（對到 npc.xml / str_npc）——用它精準認商人
-OFF_NPC_NAME = 0x1DC       # NPC 名字（內嵌 UTF-8）；只拿來 debug/顯示
+# ★ 出處同上（self-supply-buy 實測）：NPC 編號，對到 npc.xml / str_npc——用它精準認商人。
+OFF_NPC_NUM = 0x1D8
+# ★ 出處同上：NPC 名字（內嵌 UTF-8）；只拿來 debug/顯示。
+OFF_NPC_NAME = 0x1DC
 
 # ★ 各城的補給/維修商 **編號＋位置**（由 tools/build_supply_merchants.py 從 GAMEDATA/map 的
 #   .MPC 自動抽，不手打）。認人**用編號**（+0x1D8，唯一確定）不用名字——

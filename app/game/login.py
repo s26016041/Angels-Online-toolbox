@@ -148,36 +148,51 @@ CHAR_SLOT = 0x00890BE8      # 選中的角色格號（0 起算）
 CONN_ID = 0x0089097C        # 登入連線編號；0 = 還沒連上
 CHANNEL = 0x00890810        # 頻道／分流，**1 byte、0 起算**
 PROTECT_HASH = 0x00890814   # 保護密碼的 MD5，32 個十六進位小寫字（不補 NUL）
-PROTECT_LEN = 32            # ENTER_FN 就是從這裡 strncpy 0x20 bytes 進封包
+# ★ 出處：反組譯 ENTER_FN 組包 —— `strncpy(封包+4, 0x890814, 0x20)`（見檔頭
+#   「三、進入遊戲」；實測 md5("7777777") 逐位對上）。
+PROTECT_LEN = 32
 APP_PTR = 0x0089096C        # 應用程式主物件；伺服器陣列掛在它 +0x500/+0x504
 SERVER_INDEX = 0x00890C88   # 登入時選中的伺服器索引（進陣列用）
 EULA_OK = 0x00890FFC        # 「授權合約已同意」旗標，1 byte
 
 # 登入畫面物件上的欄位
+# ★ 出處：反組譯登入動作問「清單選了哪個」那條鏈 —— 取控制項
+#   `0x624D17(視窗id=[畫面物件+0x1064], 控制項id)`、`ecx=[畫面物件+0x0C]`
+#   （memory auto-login-memory-driven）。結構偏移，大更新改物件版面才會壞。
 OBJ_UI_MGR = 0x0C           # UI 管理者（取控制項時當 this）
+# ★ 同上出處（0x624D17 的第一個參數就是讀這格）。
 OBJ_WIN_ID = 0x1064         # 這個畫面的視窗 id（取控制項的第一個參數）
 
 # 伺服器清單控制項。⚠ 這是 UI 定義檔給的編號、不是程式碼位址，沒得 AOB 定位；
 # 改版動 UI 才會變，屆時 pick_server() 會「找不到控制項」而不是選錯。
 SERVER_LIST_ID = 0xA92
+# ★ 出處：反組譯遊戲自己的「取選取索引」0x624F9D —— 掃 [控制項+0x150]~[+0x154]
+#   的項目向量，回傳第一個「項目+6 非 0」的索引。實機驗證：三個項目只有索引 2
+#   是 1，跟 SERVER_INDEX 讀到的 2（雅典娜）完全吻合。
 ITEM_VEC_BEGIN = 0x150      # 控制項的項目向量（begin/end）
+# ★ 同上出處（BEGIN+4 = vector 的 end 指標）。
 ITEM_VEC_END = 0x154
+# ★ 同上出處（0x624F9D 認「項目+6 非 0 = 被選中」）。
 ITEM_SELECTED = 6           # 項目物件 +6：非 0 = 被選中
-#   ↑ 遊戲自己的「取選取索引」就是掃這個向量、回傳第一個 +6 非 0 的索引
-#     （0x624F9D）。實機驗證：三個項目只有索引 2 是 1，跟 SERVER_INDEX 讀到的
-#     2（雅典娜）完全吻合。
 
 # 伺服器記錄的版面（見檔頭）
 # ★ SRV_BEGIN 與 SRV_STRIDE 由 locate.SIGS 自動定位（錨在遊戲自己的
 #   `imul esi,[伺服器索引],0x178` / `mov edx,[ecx+0x500]` 那道）；下面的值只是
 #   還沒 warm()／定位失敗時的退路。SRV_END 固定是 BEGIN+4（vector 的 end 指標）。
 SRV_BEGIN = 0x500
+# ★ 固定 = BEGIN+4（vector 的 end 指標；出處同上段 AOB 錨那道指令）。
 SRV_END = 0x504
 SRV_STRIDE = 0x178
 SRV_NAME = 0x00
+# ★ 記錄版面出處：檔頭「伺服器清單怎麼讀」——+0x50 port、+0x54/+0x5C 兩格分流數、
+#   +0x58 伺服器編號；五台實測分流數對上（[[channel-switch]]）。讀取端有驗：
+#   port 限 1024~65535、兩格分流數要相等，版面搬家會讀不出而不是讀錯。
 SRV_PORT = 0x50
+# ★ 同上（兩格分流數的第一格；讀取端拿它跟 +0x5C 交叉比對）。
 SRV_SUBSET_A = 0x54
+# ★ 同上（伺服器編號，實測 2＝雅典娜）。
 SRV_ID = 0x58
+# ★ 同上（兩格分流數的第二格，跟 +0x54 同值 —— 不相等就整筆不採用）。
 SRV_SUBSET_B = 0x5C
 MAX_SUBSET = 8              # 上限跟遊戲一致：0x591B03 的 `cmp ecx, 8`
 MAX_SERVERS = 64            # 合理性上限，避免版面變了就跑一個天文數字的迴圈
@@ -188,8 +203,13 @@ MAX_SERVERS = 64            # 合理性上限，避免版面變了就跑一個�
 #     −0x10  旗標，bit 0x40000000 立起來代表這格不能進（遊戲也是這樣擋）
 #     +0x04  角色名（UTF-8，內嵌）★ 實機讀到「白狐」「Foxsw」對上畫面
 CHAR_HAS = 0x008909DF
+# ★ 出處：反組譯 `0x5103FB: cmp dword [格號*0xB7 + 0x8909DF], 0`（一格 0xB7）。
 CHAR_STRIDE = 0xB7
+# ★ 出處：同上段反組譯 —— 旗標欄跟 CHAR_HAS 固定差 −0x10（遊戲拿
+#   bit 0x40000000 擋「這格不能進」，我們照抄同一個判斷）。
 CHAR_FLAG_OFF = -0x10
+# ★ 出處：同上段 —— 名字欄在 +0x04（UTF-8 內嵌）；實機讀到「白狐」「Foxsw」
+#   跟畫面對上（驗證過才用）。
 CHAR_NAME_OFF = 0x04
 CHAR_BLOCKED = 0x40000000
 MAX_SLOTS = 8
@@ -210,7 +230,8 @@ MAX_SLOTS = 8
 SUB_VTABLE_DELTAS = {0x10: 0x18, 0x14: 0x30, 0x18: 0x3C, 0x2C: 0x48}
 
 ACCOUNT_LEN = 20            # strncpy 0x14
-PASSWORD_LEN = 32           # strncpy 0x20
+# ★ 出處：反組譯 LOGIN_FN 抄密碼框那段的 `strncpy(0x890998, …, 0x20)`（見檔頭「一、」）。
+PASSWORD_LEN = 32
 
 # 登入那一下要建 socket、關舊連線、動 UI，比純送包的函式重得多。
 CALL_TIMEOUT = 1.0

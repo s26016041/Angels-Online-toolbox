@@ -60,7 +60,8 @@ ctypes.windll.user32.GetWindowTextW.argtypes = [
     wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 ctypes.windll.user32.GetWindowTextW.restype = ctypes.c_int
 
-# 泛用送包函式的「切換分流」種類碼。函式本身沿用 attack.SELECT_FN。
+# ★ 泛用送包的「切換分流」種類碼。出處：反組譯換分流那條（跟「選定怪物」同一支
+#   泛用送包函式，見 memory channel-switch），實測 1 秒換好。函式沿用 attack.SELECT_FN。
 SWITCH_CODE = 0x47
 
 MIN_CHANNEL = 1
@@ -106,7 +107,9 @@ from app.game.login import (SRV_ID as OFF_ID,               # noqa: E402
                             SRV_SUBSET_A as OFF_SUBSET_A,
                             SRV_SUBSET_B as OFF_SUBSET_B)
 
-OFF_IP = 0x40             # login.py 沒有用到這欄（那邊靠索引直接取記錄）
+# ⚠ ip 欄只有這裡在用（login.py 靠索引取記錄、用不到它，所以 SRV_* 沒這格）。
+#   出處：上面那張版面表的 +0x40（跟名稱／port 同一輪實機對出來的）。
+OFF_IP = 0x40
 REC_SPAN = 0x60           # 讀到 +0x5C 就夠了
 MAX_SUBSET = 32           # 合理性上限：分流數不可能比這大
 

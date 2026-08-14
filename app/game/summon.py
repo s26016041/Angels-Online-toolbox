@@ -47,10 +47,13 @@ import time
 
 from app.game import attack, entity, player, quickbar, skills
 
-SLOT = 10                 # F11（固定，使用者指定）
+# ★ F11 那一格（使用者指定固定用 F11；quickbar 格號 0 起算＝第 10 格）。
+SLOT = 10
 PAGE = 0
 CHECK_GAP = 0.5           # 多久驗一次存在（讀槽 1 次系統呼叫）
-MISS_GRACE = 2            # （退路模式）連續幾次讀不到才算不見
+# ⚠ 自家的防抖門檻（不是遊戲常數）：單拍讀不到可能只是掃描空窗，
+#   連續 2 次才算不見（退路模式用）。
+MISS_GRACE = 2
 ADOPT_WAIT = 4.0          # 施放後等新實體出現多久（實測 1.5 秒內就會出現）
 RETRY = 6.0               # 施放了卻沒看到新召喚物（MP 不足？）→ 隔這麼久再試
 # 「我的召喚物 eid」的位址**只住在 player.py**（pet_eid()）：它就在角色

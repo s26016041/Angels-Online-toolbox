@@ -47,8 +47,8 @@ from app.game import entity, gather, move
 OFF_SELECT_ID = 0x1D0
 # 外觀編號。**只拿來當「同一種東西」的指紋**（記住上次點中的檯子長什麼樣）。
 OFF_MODEL = 0xB4
-# 物件起點 → entity 偏移的基準差（entity.py 檔頭：實體有兩個 vtable，差 8）。
-# gather.py 走同一棵樹拿到的也是物件起點，用的是同一個常數。
+# ★ 物件起點 → entity 偏移的基準差（出處：entity.py 檔頭「實體有兩個
+#   vtable、差 8」）。gather.py 走同一棵樹拿到的也是物件起點，同一個常數。
 E = 8
 _PTR_LO, _PTR_HI = 0x10000, 0x7FFF0000
 

@@ -191,18 +191,22 @@ GET_CTRL = 0x00624FCC
 # ★ 世界指標＝gather.WORLD_PTR（0x9B669C）。⚠ 不在這裡再寫一份位址 ——
 #   那個全域已登記 AOB（locate gather.WORLD_PTR，交叉驗證兩處），
 #   用時直接讀 gather.WORLD_PTR 拿 warm() 之後的值（同 supply.py 的做法）。
-# 三個控制項 id（UI 層常數，跟封包代號一樣屬「大更新改協定才會變」）：
+# ⚠ 三個控制項 id（UI 層常數，跟封包代號一樣屬「大更新改協定才會變」）；
+#   出處＝反組譯 makestart(0x5D47AF)／makeadd(0x58F93E) 叫 GET_CTRL 帶的 id：
 CTRL_RECIPES = 0xAFE          # 配方清單（選要做的配方）
+# ⚠ 出處同上（GET_CTRL 的 id 參數）。
 CTRL_QTY = 0xB03              # 數量輸入框
+# ⚠ 出處同上（GET_CTRL 的 id 參數）。
 CTRL_MAKELIST = 0xB0F         # 製作清單（makestart 讀它、客戶端續做也讀它）
 # 控制項裡的結構偏移（反組譯出處見下）：
 #   0x625487：item = [ctrl+0x150 + index*4]；資料 = [item+0x8c]
 CTRL_VEC_FIRST, CTRL_VEC_LAST = 0x150, 0x154
+# ⚠ 出處＝反組譯 0x625487（同上）：資料 = [item+0x8C]。
 ITEM_DATA_OFF = 0x8C          # 配方清單：=配方ID；製作清單：=配方<<16|剩餘數量
-#   0x625252：找第一個 [item+6]!=0 的列＝選中的那一列
+#   ⚠ 出處＝反組譯 0x625252：找第一個 [item+6]!=0 的列＝選中的那一列
 ITEM_SEL_OFF = 0x06
-#   數量框取值虛擬函式 0x625E9D＝`mov eax,[ctrl+0xf8]` → 字串緩衝指標，
-#   makeadd 對它做**窄字元 atoi**（0x757F96）→ 要寫**窄 ASCII 數字**。
+#   ⚠ 出處＝反組譯數量框取值虛擬函式 0x625E9D＝`mov eax,[ctrl+0xf8]` → 字串緩衝
+#   指標，makeadd 對它做**窄字元 atoi**（0x757F96）→ 要寫**窄 ASCII 數字**。
 QTY_STR_OFF = 0xF8
 _CALL_T = 0.6
 # make_batch 專用回傳：開到的面板裡**沒有**這個配方（多半是別種生產的檯子）。

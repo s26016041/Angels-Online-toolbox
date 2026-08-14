@@ -46,7 +46,8 @@ from __future__ import annotations
 
 from app.game import attack
 
-# 泛用送包函式的「領取在線獎勵」種類碼。函式本身沿用 attack.SELECT_FN。
+# ★ 泛用送包的「領取在線獎勵」種類碼，函式沿用 attack.SELECT_FN。出處：攔包
+#   呼叫鏈 (0x48, 編號)＋OnClickABOnlineRaward 的 bytecode `netcommand(72, d)`（見檔頭）。
 CLAIM_CODE = 0x48
 
 # 獎勵格編號（onlinegift.xml 的「編號」欄，1 起算）。

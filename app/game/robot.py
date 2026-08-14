@@ -161,20 +161,27 @@ SETUP_SETTLE = 3.0
 #     5 秒不夠而改成 6，其實是那時計時的起點不對（設定和回程還沒拆成兩段）。
 AF_HOLD_SECS = 5.0
 
-# 精靈的變數代號（從遊戲的 Lua 全域常數讀出來的，不是猜的）
+# ★ 精靈的變數代號（DATAID）。出處：遊戲的 Lua 全域常數純讀
+#   （tools/dump_lua_globals.py），不是猜的 —— 底下整個 AS_*/AF_* 家族同源。
 AF_IS_AUTO_FIGHT = 1001      # AF_BOL_ISAUTOFIGHT
 # ⚠ 「攻擊指定敵人」（面板控制項 974）。**開著補給就不會觸發**（使用者實測）。
 AF_ATTACK_TARGET_ONLY = 1006  # AF_BOL_ISATTACKTARGET
-AS_BACK_NO_HP_ITEM = 1500    # 補 HP 物品用完自動回城
-AS_BACK_NO_MP_ITEM = 1501    # 補 MP 物品用完自動回城
-AS_BACK_BROKEN_EQ = 1502     # ★ 裝備損壞回城
-AS_BACK_NO_SPACE = 1504      # 背包滿了回城
-AS_IS_REPAIR = 1508          # ★ 回城後修理裝備
+# ★ 出處：Lua 全域 DATAID（同上，dump_lua_globals.py 純讀）。補 HP 物品用完自動回城。
+AS_BACK_NO_HP_ITEM = 1500
+# ★ 出處同上。補 MP 物品用完自動回城。
+AS_BACK_NO_MP_ITEM = 1501
+# ★ 出處同上。裝備損壞回城。
+AS_BACK_BROKEN_EQ = 1502
+# ★ 出處同上。背包滿了回城。
+AS_BACK_NO_SPACE = 1504
+# ★ 出處同上。回城後修理裝備。
+AS_IS_REPAIR = 1508
 # ⚠ 1509 是「使用**標記傳送捲軸**回練功點」，不是「補給完回去戰鬥」。
 #   （對照 GAMEDATA/setting/BASE/WND01.XML 控制項 10073 的 appdata。我一開始標錯過。）
 #   關著的話精靈是**用走的**走回原練功點 —— 距離太遠或走不到就會停在城裡。
 AS_USE_RETURN_SCROLL = 1509
-AS_IS_BUY_ITEM = 1511        # 購買物品保持身上數量（⚠ 這**不是**回城觸發條件）
+# ★ 出處：Lua 全域 DATAID（同上）。購買物品保持身上數量（⚠ 這**不是**回城觸發條件）。
+AS_IS_BUY_ITEM = 1511
 
 # ★★ 補給頁的「購買清單」（勾了 AS_IS_BUY_ITEM 進城會照這張表補貨）。
 #   兩個 DATAID 是**平行陣列**：TOBUY_ID[i] 放種類 ID、TOBUY_NUM[i] 放
@@ -182,7 +189,8 @@ AS_IS_BUY_ITEM = 1511        # 購買物品保持身上數量（⚠ 這**不是*
 #   （39556 實機對照：ID 清單第 14 格=1905 天使之翼、NUM 清單第 14 格=50，
 #     跟補給頁畫面一致 —— 平行索引就是這樣確認的。）
 AS_TOBUY_ID = 1512           # AS_INTLIST_TOBUYID
-AS_TOBUY_NUM = 1517          # AS_INTLIST_TOBUYNUM
+# ★ 出處同上段：AS_INTLIST_TOBUYNUM，39556 實機對照平行索引驗證。
+AS_TOBUY_NUM = 1517
 # 清單型設定在同一棵樹裡，型別碼 4（字串清單是 6）。記錄版面
 # （反組譯 0x54DF4C append／0x54E2C0 get_at／0x54F297 set_at，
 #   全量在 reports/intlist_probe*.txt）：
@@ -191,13 +199,15 @@ AS_TOBUY_NUM = 1517          # AS_INTLIST_TOBUYNUM
 #   **內嵌陣列、永不搬家**，所以從外面照遊戲的步驟寫是安全的：
 #   append＝先寫元素、再把筆數 +1（0x54DF4C 就是這兩步）。
 VAR_T_INTLIST = 4
-VAR_T_STRLIST = 6            # 字串清單（元素是指標，指向 **UTF-8** 內容）
+# ★ 出處同上段反組譯；字串清單型別碼 6，元素是指標、指向 **UTF-8** 內容
+#   （⚠ 編碼是實測踩過的坑，見 memory gather-auto-collect）。
+VAR_T_STRLIST = 6
 _L_COUNT, _L_ELEMS, _L_CAP = 0x0C, 0x10, 0x7CF
 # 清單類編輯完，遊戲的 add/set/remove 收尾都會把管理員單例 +0x4C 的
 # 髒 byte 設 1（0x54EDEF 整支就這一行）—— 我們編輯完也照做，
 # 遊戲才知道設定變了。⚠ 只有 1 個 byte。
 _MGR_DIRTY_OFF = 0x4C
-# 回程補給要幫使用者保持的天使之翼數量（使用者定的）。
+# ⚠ 使用者定的數量（不能自己改）：回程補給要幫他保持的天使之翼張數。
 BUY_KEEP_WINGS = 50
 
 # ★「輔助」頁的陣亡自動復活。DATAID 從遊戲的 Lua 全域常數純讀出來
@@ -211,9 +221,11 @@ AS_AUTO_REVIVE = 2100        # 陣亡時自動復活（bool）
 #   自己送「回標記點」封包，見 app/game/revive.py）。留著當逆向文件。
 AS_REVIVE_MODE = 2102        # 復活方式（int，值 = 下拉列號）
 REVIVE_SOUL, REVIVE_RECALL, REVIVE_SPOT = 0, 1, 2   # 靈魂／回城／原地
-# 畫面同步用的勾選框控制項 id（XML 裡的固定值，不是執行期代號）
-SUPPLY_SCROLL_CHECK_ID = 10073   # 補給頁「使用標記傳送捲軸回練功點」
-REVIVE_CHECK_ID = 14100          # 輔助頁「陣亡時自動復活」
+# ★ 出處：介面定義 GAMEDATA/setting/BASE/WND01.XML 的固定控制項 id
+#   （不是執行期代號）。補給頁「使用標記傳送捲軸回練功點」。
+SUPPLY_SCROLL_CHECK_ID = 10073
+# ★ 出處同上：介面 XML 固定 id。輔助頁「陣亡時自動復活」。
+REVIVE_CHECK_ID = 14100
 
 # ★★ 「生產」面板（CreateAutoProduceWindow）的兩顆勾選框。
 #   DATAID 是**逼出來的，不是照名字猜的** —— 三個獨立來源都對得上：
@@ -234,16 +246,22 @@ REVIVE_CHECK_ID = 14100          # 輔助頁「陣亡時自動復活」
 #     記下採集中心點 —— 我們只把值設成 False（關掉），那些副作用是**開**的
 #     時候才會發生的，不會被我們觸發。
 AS_AUTO_GATHER = 2311        # 生產頁「自動採集」
+# ★ 出處：同上段三重驗證之①（DATAID_DESIGNATED_GATHER_CHECK = 2320）。
 AS_DESIGNATED_GATHER = 2320  # 生產頁「採集指定資源」
-# 勾「自動採集」時遊戲**連帶**會做的事（照抄 OnClickAutoGatherCheckBtn 的
-# bytecode，順序也一樣）：設採集中心點與地圖、清掉「用過傳送道具」旗標、
-# **關掉自動攻擊**（採集跟打怪互斥，遊戲自己就是這樣）、關掉練功技能。
+# ★ 出處：照抄（反組譯）OnClickAutoGatherCheckBtn 的 bytecode，順序也一樣 ——
+# 勾「自動採集」時遊戲**連帶**會做的事：設採集中心點與地圖、清掉「用過傳送
+# 道具」旗標、**關掉自動攻擊**（採集跟打怪互斥，遊戲自己就是這樣）、關掉練功技能。
 AS_GATHER_ORG_MAP = 2312     # 採集中心點在哪張地圖
-AS_GATHER_RANGE = 2313       # 採集搜尋範圍（格；五台實測都是 20）
-AS_GATHER_ORG_X = 2314       # 中心點 X ── ★ 單位是**格子 × 32**
-AS_GATHER_ORG_Y = 2315       # 中心點 Y    （廚狐實測 7600 = 237.5 格 × 32）
-AS_USED_TP_ITEM = 2000       # DATAID_USED_TP_ITEM
-AS_EXERCISE_SKILL = 2090     # DATAID_EXERCISE_SKILL_CHECK（輔助頁「練功技能」）
+# ★ 出處同上段 bytecode；範圍值五台實測都是 20（格）。
+AS_GATHER_RANGE = 2313
+# ★ 出處同上段 bytecode；單位是**格子 × 32**。
+AS_GATHER_ORG_X = 2314
+# ★ 出處同上（廚狐實測 7600 = 237.5 格 × 32）。
+AS_GATHER_ORG_Y = 2315
+# ★ 出處：Lua 全域 DATAID_USED_TP_ITEM（dump_lua_globals.py 純讀）。
+AS_USED_TP_ITEM = 2000
+# ★ 出處：Lua 全域 DATAID_EXERCISE_SKILL_CHECK（輔助頁「練功技能」）。
+AS_EXERCISE_SKILL = 2090
 # 「採集指定資源」的目標清單。**字串**清單（型別 6），存的就是資源名字。
 # ⚠⚠ 這一份**只能走 Lua**：五台實機都還沒有這筆記錄，建記錄要 malloc＋插
 #   紅黑樹、加一筆要在遊戲的字串池裡建 TString —— 都不是從外面能做的。
@@ -259,14 +277,19 @@ AS_DESIGNATED_RES_LIST = 2323
 #   實測：雪狐 HP1=道具 4836、MP1=道具 4837；白狐 HP1=**技能 64**、MP2=道具 4837。
 #   （`SKILLITEM_VALUE_DIFF` 這個 Lua 常數就是那個 +10。）
 SKILLITEM_VALUE_DIFF = 10
+# ★ 出處同上段實測：型別 1＝技能（用技能補，不吃藥水）。
 SKILLITEM_TYPE_SKILL = 1
+# ★ 出處同上段實測：型別 2＝道具（值就是種類 ID）。
 SKILLITEM_TYPE_ITEM = 2
 HP_ITEM_SLOTS = (2121, 2122, 2123)   # DATAID_RECOVER_HP1~3_SKILLITEM
 MP_ITEM_SLOTS = (2124, 2125)         # DATAID_RECOVER_MP1~2_SKILLITEM
 
-# 精靈的「原練功點」—— 補給完會走回這裡。座標是格子 × 32 的原始值。
+# ★ 精靈的「原練功點」—— 補給完會走回這裡。出處：Lua 全域 DATAID
+#   （同檔頭那個家族，dump_lua_globals.py 純讀）；座標是格子 × 32 的原始值。
 AF_ORG_MAP = 1030
+# ★ 出處同上。
 AF_ORG_X = 1025
+# ★ 出處同上。
 AF_ORG_Y = 1026
 TILE = 32
 
@@ -1156,7 +1179,9 @@ def set_org_spot(mover, scanner) -> tuple[bool, object]:
     return got
 
 
-AUTOFIGHT_CHECK_ID = 960          # 面板上「自動攻擊」勾選框（XML 裡的固定 id）
+# ★ 出處：介面定義 GAMEDATA/setting/BASE/WND01.XML 的固定控制項 id
+#   （面板上「自動攻擊」勾選框，不是執行期代號）。
+AUTOFIGHT_CHECK_ID = 960
 
 
 def set_autofight(mover, scanner, on: bool) -> None:

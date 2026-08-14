@@ -68,6 +68,11 @@ OFF_RANGE = 0x54
 OFF_COST_MP = 0x58
 OFF_COST_SP = 0x5C
 TMPL_SPAN = OFF_COST_SP + 4
+# buff 持續時間（**秒**）。★ 出處：照 recheck_tables 的 JumpMap 慣例，拿 skills.tsv
+#   的 10516 筆寫死持續時間去掃「哪個偏移對全部樣本都成立」——**只有 +0x100
+#   10516/10516 全中**（第二名 169 筆），同輪自檢 mp@+0x58 10510/10516（2026-08-14，
+#   reports/duration_offset_probe.txt）。recheck_tables 每次改版拿它對帳 skills.tsv。
+OFF_DURATION_SECS = 0x100
 
 # --- 玩家實體裡的「數值」子物件（0x549E7D 的 this = 實體 + 0x210）---
 OFF_ATTR = 0x210

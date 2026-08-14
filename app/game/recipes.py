@@ -82,6 +82,7 @@ MAT_SLOTS = 5
 G_ID, G_ITEM, G_GROUP, G_POINTS = 0x00, 0x04, 0x08, 0x0C
 G_SIZE = 0x10
 
+# ⚠ 出處＝反組譯 initmakeclasswnd：分半成品時讀「物品範本 +0x18」當分類欄（見檔頭）。
 OFF_ITEM_CLASS = 0x18      # 物品範本的分類欄
 
 _PTR_LO, _PTR_HI = 0x10000, 0x7FFF0000
