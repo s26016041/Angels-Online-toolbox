@@ -93,8 +93,9 @@ HARDCODED_DATA = (
      "名稱不在記憶體；過期只會顯示成「場景 123」"),
     ("scene.py SAME_MAP_AS", "同圖別名 15 筆", None,
      "⚠ 過期 → 巡邏點被判成不同圖；還沒找到記憶體來源"),
-    ("dailygift.py REWARD_IDS", "在線獎勵格數", "OnlineGift",
-     "★ 可以改讀記憶體的 OnlineGift 表"),
+    ("dailygift.py REWARD_IDS", "在線獎勵格數（退路）", "OnlineGift",
+     "✅ 2026-08-14 正路已改 reward_ids() 現場讀表；這份只剩安全退路，"
+     "recheck_tables 有對帳"),
     ("energy.py DECOMP_ITEMS", "自動分解白名單 2 個 ID", "Item",
      "★★ 後果最嚴重的一份；Item 表在記憶體，值得找出能認出「充能-小背包」的欄位"),
     ("daily_tab.py WING_ITEM/TOKEN_ITEM", "兩個道具編號", "Item",

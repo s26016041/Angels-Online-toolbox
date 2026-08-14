@@ -311,12 +311,16 @@ class DailyTab(BaseTab):
         if not clients:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")
             return
-        n = len(dailygift.REWARD_IDS)
-        # ⚠ 第一步先開一個 scanner —— 那會順便跑 locate.warm()（改版位移校正）。
-        #   領獎不讀記憶體，少了這一步就會拿沒校正過的位址去呼叫遊戲函式。
+        # ⚠ 先開一個 scanner —— 那會順便跑 locate.warm()（改版位移校正）。
+        #   領獎本身不讀記憶體，少了這一步就會拿沒校正過的位址去呼叫遊戲函式。
+        # ★ 順便把獎勵格編號**現場讀 OnlineGift 表**（改版增減格數自動跟上）；
+        #   讀不到 reward_ids() 自己退回寫死的 REWARD_IDS（跟以前一模一樣）。
+        sc0 = self._scanner(clients[0][0])
+        ids = dailygift.reward_ids(sc0) if sc0 else dailygift.REWARD_IDS
+        n = len(ids)
         steps = [lambda p=clients[0][0]: self._warm(p)]
         for pid, label in clients:
-            for k, rid in enumerate(dailygift.REWARD_IDS):
+            for k, rid in enumerate(ids):
                 steps.append(
                     lambda p=pid, l=label, r=rid, k=k, n=n:
                     self._claim_one(p, l, r, k, n))

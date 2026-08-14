@@ -598,6 +598,15 @@ SIGS: tuple[Sig, ...] = (
         " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 91 5F 01 00 56"
         " 68 A8 28 7D 00",
         0x0098BC70, str_at=58, str_val=b"Item"),
+    # 在線獎勵表（見 app/game/dailygift.py）。同一族查表函式，差別是邊界值
+    # 走 imm8（`cmp ecx,9`＝編號 1~10）——那個 9 遮成 ??，改版加格數時特徵
+    # 照樣定位得到，靠 `str_at` 的表名 "OnlineGift" 分辨 28 支同模子。
+    Sig("dailygift", "GIFT_TAB", "data", 13,
+        "56 8B 75 08 8D 4E FF 83 F9 ?? 77 0A"
+        " A1 9C FD 98 00 8B 04 B0 EB 38 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 6A 0B 56"
+        " 68 A0 88 7D 00",
+        0x0098FD9C, str_at=52, str_val=b"OnlineGift"),
     # 「這個配方學會了沒」的位元圖偏移。錨在 `initmakeclasswnd` 逐一檢查
     # 配方那段：`xor edx,edx / mov ecx,edi / and ecx,0x1F / inc edx /
     # shl edx,cl / mov eax,edi / mov ecx,[ebp-0x18] / shr eax,5 /

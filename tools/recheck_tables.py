@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
-from app.game import (bag, entity, itemname, locate,   # noqa: E402
+from app.game import (bag, dailygift, entity, itemname, locate,   # noqa: E402
                       monsters, skillcost, skills)
 from app.paths import resource                        # noqa: E402
 
@@ -168,6 +168,23 @@ def check_skill_secs(sc, tabs, lines):
             diff == 0 and same > 0)
 
 
+def check_onlinegift(sc, tabs, lines):
+    """dailygift.REWARD_IDS（安全退路）vs 記憶體 OnlineGift 表。
+
+    正路已改成 dailygift.reward_ids() 現場讀；這裡驗退路那份沒過期＋
+    表本身讀得到（兩條路輸出一致才放行，跟 channel.count() 那次同一套）。
+    """
+    got = dailygift.reward_ids(sc)
+    raw = sc._read_bytes(dailygift.GIFT_TAB, 4)
+    tab = struct.unpack("<I", bytes(raw))[0] if raw else 0
+    if not _sane(tab):
+        return "讀不到 OnlineGift 表（GIFT_TAB 搬家？）", False
+    if got != dailygift.REWARD_IDS:
+        lines.append(f"    記憶體={list(got)} 寫死退路={list(dailygift.REWARD_IDS)}")
+        return ("獎勵格數變了 —— 正路會自動跟上，但 REWARD_IDS 退路要更新", False)
+    return f"{len(got)} 格，記憶體與退路一致", True
+
+
 def check_jumpmap(sc, tabs, lines):
     """assets/jumpmap.tsv 的 場景/座標 vs 記憶體 JumpMap 範本。"""
     rows = []
@@ -276,6 +293,8 @@ CHECKS = (
      "⛔ 過期後果：走位停太遠 → 零傷害，完全不報錯", True),
     ("skills.tsv.gz（buff 持續時間）", check_skill_secs,
      "⛔ 過期後果：補 buff 的時間點算錯（太早浪費 MP／太晚裸奔）", True),
+    ("在線獎勵格（OnlineGift）", check_onlinegift,
+     "正路現場讀表自動跟上；這裡驗退路 REWARD_IDS 沒過期", True),
     ("jumpmap.tsv（趴趴GO 傳送點）", check_jumpmap,
      "⛔ 過期後果：傳到錯的地方", True),
     ("Item 表 ↔ 背包物品", check_item_table,

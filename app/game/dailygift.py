@@ -39,10 +39,12 @@ appdata 是 C++（`game.updateABOnlineRawardData`，0x59AD26）填的**獎勵編
   · 還沒到時間／已領過的格子，判定本來就在伺服器 —— 客戶端不送只是省流量，
     伺服器收到不合法的領取就忽略（跟連點兩下同一格一樣）。
 
-⚠ REWARD_IDS 是照 onlinegift.xml 寫死的。改版增減獎勵格要跟著改
-  （目前 6 格已經涵蓋在線 60 分鐘的全部獎勵）。
+★ 2026-08-14：獎勵格編號改**讀遊戲載進記憶體的 OnlineGift 表**（`reward_ids()`），
+  改版增減格數自動跟上；REWARD_IDS 降級成「表讀不到時的安全退路」。
 """
 from __future__ import annotations
+
+import struct
 
 from app.game import attack
 
@@ -50,8 +52,41 @@ from app.game import attack
 #   呼叫鏈 (0x48, 編號)＋OnClickABOnlineRaward 的 bytecode `netcommand(72, d)`（見檔頭）。
 CLAIM_CODE = 0x48
 
-# 獎勵格編號（onlinegift.xml 的「編號」欄，1 起算）。
+# 獎勵格編號的**安全退路**（onlinegift.xml 的「編號」欄，1 起算）。
+# 正路是 reward_ids() 現場讀記憶體的 OnlineGift 表；讀不到才用這份。
 REWARD_IDS = (1, 2, 3, 4, 5, 6)
+
+# ★ OnlineGift 表的全域指標（跟怪物/技能表同一族查表函式）。
+#   出處：反組譯 0x548365 那支 `lea ecx,[esi-1] / cmp ecx,9 / ja 錯誤 /
+#   mov eax,[0x98FD9C] / mov eax,[eax+esi*4]`＋錯誤訊息表名 "OnlineGift"。
+#   ⚠ 改版會位移 —— locate.py 有 AOB（dailygift.GIFT_TAB，表名字串當錨）。
+GIFT_TAB = 0x0098FD9C
+# ⚠ 查表本體的邊界：(id-1) <= 9 ＝ 編號 1~10（同上那段 `cmp ecx,9`）。
+#   陣列只配到這裡，掃超過就是隔壁堆積的垃圾（2026-08-14 五台實測：
+#   界內乾淨一致、界外各台隨機出現「長得像指標」的雜訊）。
+GIFT_MAX = 10
+
+
+def reward_ids(scanner) -> tuple[int, ...]:
+    """現在遊戲裡真的存在的獎勵格編號（讀 OnlineGift 表）；讀不到回 REWARD_IDS。
+
+    ⚠ 只在遊戲自己的邊界（1~GIFT_MAX）內認指標，不多讀一格；空表／讀失敗
+      一律退回寫死的 REWARD_IDS —— 跟今天的行為一模一樣（安全退化）。
+    """
+    try:
+        raw = scanner._read_bytes(GIFT_TAB, 4)
+        tab = struct.unpack("<I", bytes(raw))[0] if raw else 0
+        if not 0x10000 < tab < 0x7FFF0000:
+            return REWARD_IDS
+        body = scanner._read_bytes(tab + 4, GIFT_MAX * 4)
+        if not body or len(body) < GIFT_MAX * 4:
+            return REWARD_IDS
+        ids = tuple(i for i, p in enumerate(
+            struct.unpack(f"<{GIFT_MAX}I", bytes(body)), start=1)
+            if 0x10000 < p < 0x7FFF0000)
+        return ids or REWARD_IDS
+    except Exception:                                      # noqa: BLE001
+        return REWARD_IDS
 
 
 def claim(mover, reward_id: int) -> bool:
