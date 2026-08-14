@@ -32,8 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
-from app.game import (bag, dailygift, entity, itemname, locate,   # noqa: E402
-                      monsters, skillcost, skills)
+from app.game import (bag, dailygift, energy, entity, itemname,   # noqa: E402
+                      locate, monsters, skillcost, skills)
 from app.paths import resource                        # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -251,6 +251,36 @@ def check_item_table(sc, tabs, lines):
     return f"{ok} 件查得到範本、{bad} 件查不到", bad == 0 and ok > 0
 
 
+def check_decomp_whitelist(sc, tabs, lines):
+    """energy.DECOMP_ITEMS（自動分解白名單）vs 記憶體 Item 範本。
+
+    ⚠ 白名單本身是**使用者明令**的（「只能分解這兩個」，87381 刻意排除）——
+    不能也不該改成自動認欄位。真正的風險是改版把編號**回收給別的東西**：
+    送分解前執行時已驗「紙娃娃＋分解值>0＋沒時限」，這裡再對帳「範本的
+    分類與分解值跟白名單記的一致」，編號被挪用第一時間就亮紅。
+    """
+    ptr = tabs.get("Item")
+    tab = _u32(sc, ptr) if ptr else None
+    if not _sane(tab):
+        return "讀不到 Item 表", False
+    bad = []
+    for tid, val in sorted(energy.DECOMP_ITEMS.items()):
+        p = _u32(sc, tab + tid * 4)
+        if not _sane(p):
+            bad.append(f"{tid}（{itemname.label(tid)}）查不到範本")
+            continue
+        kind = _u32(sc, p + bag.TMPL_KIND)
+        dv = _u32(sc, p + bag.TMPL_PARAM2)
+        if kind != bag.KIND_DOLL or dv != val:
+            bad.append(f"{tid}（{itemname.label(tid)}）分類={kind} "
+                       f"分解值={dv}，白名單記 紙娃娃/{val}")
+    if bad:
+        lines += [f"    {b}" for b in bad]
+        return "白名單編號的範本對不上 —— 編號可能被改版挪用，先別自動分解", False
+    names = "、".join(itemname.label(t) for t in sorted(energy.DECOMP_ITEMS))
+    return f"{len(energy.DECOMP_ITEMS)} 個編號範本仍是紙娃娃＋分解值一致（{names}）", True
+
+
 def check_npc_table(sc, tabs, lines):
     """怪物範本表：場上的怪要查得到，抽樣的等級／血量要落在合理範圍。"""
     idx = monsters.index_base(sc)
@@ -295,6 +325,8 @@ CHECKS = (
      "⛔ 過期後果：補 buff 的時間點算錯（太早浪費 MP／太晚裸奔）", True),
     ("在線獎勵格（OnlineGift）", check_onlinegift,
      "正路現場讀表自動跟上；這裡驗退路 REWARD_IDS 沒過期", True),
+    ("自動分解白名單（DECOMP_ITEMS）", check_decomp_whitelist,
+     "⛔ 過期後果：編號被改版挪用 → 自動分解拆錯東西（執行時另有三道驗證）", True),
     ("jumpmap.tsv（趴趴GO 傳送點）", check_jumpmap,
      "⛔ 過期後果：傳到錯的地方", True),
     ("Item 表 ↔ 背包物品", check_item_table,
