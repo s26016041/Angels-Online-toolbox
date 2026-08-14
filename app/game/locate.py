@@ -146,6 +146,31 @@ SIGS: tuple[Sig, ...] = (
         " 8A 4D 08 FF 75 FC 88 48 02 FF 35 ?? ?? ?? ?? E8 ?? ?? ?? ??"
         " 59 59 C9 C2 04 00",
         0x005DA91E),
+    # 補給「點 NPC 開對話」用的自動走路/互動狀態機 setup（見 app/game/supply.py）。
+    # 錨在函式頭＋那串把參數寫進 +0x41A4/+0x41A8/+0x41B4 的搬移（自動走路狀態機
+    # 專屬的偏移，很獨特）；中間那個 E9 rel32 放萬用。
+    Sig("supply", "INTERACT_FN", "fn", None,
+        "55 8B EC 83 B9 A0 41 00 00 00 74 06 5D E9 ?? ?? ?? ?? 8B 55 08"
+        " 8B 45 0C 89 91 A4 41 00 00 89 81 A8 41 00 00 8B 45 10 89 81 B4 41",
+        0x0054A520),
+    # 「全修」本體（repairall UI 指令 0x5906BD 呼叫的）：找 WND_REPAIR 視窗、檢查有東西
+    # 要修就送修裝全部包（opcode 0x3C）。三個位址（[0x890FF0]、字串 0x7D9230、[0x9B669C]）與
+    # 兩個 call 的 rel32 放萬用；錨在 +0x154/+0x150 那對視窗欄位、視窗 id 0xB55、與 push 2/push
+    # 0x3C（body 2、代號 0x3C）—— 那個 0x3C 是跟 repairone(0x3B) 分家的關鍵，一定要蓋到。
+    Sig("supply", "REPAIR_ALL_FN", "fn", None,
+        "55 8B EC 8B 0D ?? ?? ?? ?? 83 EC 10 68 ?? ?? ?? ?? 8D 49 04"
+        " E8 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 68 55 0B 00 00 50 8B 49 0C"
+        " E8 ?? ?? ?? ?? 8B 88 54 01 00 00 2B 88 50 01 00 00 F7 C1 FC FF FF FF"
+        " 74 1C 6A 02 6A 3C",
+        0x005D62C1),
+    # 「關維修畫面」（repairclose UI 指令 0x5906CB）：找 WND_REPAIR、送「離開 NPC」包
+    # 0x5D29C1(0x22,0)。修完不叫它角色會卡住不能走（伺服器端還在維修互動）。
+    # 錨在兩個 test/je 骨架＋ push 0/push 0x22（0x22 是「離開」代碼，關鍵），位址與 rel32 放萬用。
+    Sig("supply", "REPAIR_CLOSE_FN", "fn", None,
+        "8B 0D ?? ?? ?? ?? 68 ?? ?? ?? ?? 8D 49 04 E8 ?? ?? ?? ?? 85 C0"
+        " 74 1E 8B 0D ?? ?? ?? ?? 50 8B 49 0C E8 ?? ?? ?? ?? 85 C0 74 0B"
+        " 6A 00 6A 22 E8 ?? ?? ?? ?? 59 59 33 C0 C3",
+        0x005906CB),
     Sig("lua", "GETFIELD_FN", "fn", None,
         "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
         " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"
@@ -502,14 +527,19 @@ SIGS: tuple[Sig, ...] = (
         " E8 ?? ?? ?? ?? 8B 0D 9C 66 9B 00 50 8B 49 0C E8 ?? ?? ?? ?? 8B C8"
         " 89 45 F8 E8 ?? ?? ?? ?? 8B 0D 9C 66 9B 00 8B 71 08",
         0x009B669C),
-    # ② 採集品物件的 vtable。錨在它的建構函式（`call 基底建構 / mov [esi],vt /
-    #    mov [esi+8],第二個 vt`）。⚠ 模組內的立即值會被 _auto_mask 自動遮掉，
-    #    所以這裡不是「拿答案當錨」；骨架是那三行指令本身。
-    #    同一個 vtable 在模組裡有兩處寫入點，另一處的前後骨架完全不同
-    #    （帶 SEH），不會互相命中。
-    Sig("gather", "VT_RESOURCE", "data", 0x14,
-        "55 8B EC 51 56 FF 75 08 8B F1 89 75 FC E8 ?? ?? ?? ?? C7 06 B4 87 7D 00"
-        " 8B C6 C7 46 08 F4 87 7D 00 5E C9 C2 04 00",
+    # ② 採集品物件的 vtable。錨在**帶 SEH 的那個建構函式**（模組裡兩處寫入點
+    #    之一，0x547828）：`mov eax,[GS cookie] / xor eax,ebp / push / lea /
+    #    mov fs:[0],eax / mov esi,ecx / push 0 / 連寫兩個 vtable / call /
+    #    mov ecx,esi / call / 還原 fs:[0] / 收尾`。
+    #    ★ 2026-08-14 換錨：舊錨是另一處的迷你建構函式（`call 基底 / mov [esi],vt /
+    #      mov [esi+8],vt2`），全遮之後跟一堆同模子建構函式撞、只剩「只遮目標」
+    #      那層唯一＝拿舊位址當錨，下次改版必失效（patch_doctor 警告）。
+    #      這段「push 0 之後才寫 vtable、再連兩個 call」的順序夠怪，
+    #      全遮（cookie／兩個 vtable／rel32 全遮）實測仍唯一命中。
+    Sig("gather", "VT_RESOURCE", "data", 0x17,
+        "A1 40 82 87 00 33 C5 50 8D 45 F4 64 A3 00 00 00 00 8B F1 6A 00"
+        " C7 06 B4 87 7D 00 C7 46 08 F4 87 7D 00 E8 ?? ?? ?? ?? 8B CE"
+        " E8 ?? ?? ?? ?? 8B 4D F4 64 89 0D 00 00 00 00 59 5E C9 C3",
         0x007D87B4),
     # ③ 世界物件裡那棵「場上物件」樹的偏移。錨在迴圈進入處
     #    （`test ebx,ebx / je 收尾 / mov ecx,[esi+樹] / mov eax,[ecx] /

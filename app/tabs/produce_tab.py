@@ -123,6 +123,7 @@
 from __future__ import annotations
 
 import datetime
+import threading
 import time
 from collections import Counter
 
@@ -146,7 +147,8 @@ from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import (bag, entity, gather, itemname, jumpmap, locate, lua, move,
-                      navigate, produce, recipes, robot, scene, scenery)
+                      navigate, produce, recall, recipes, robot, scene, scenery,
+                      supply)
 from app.tabs.base_tab import BaseTab, fit_list, no_elide
 
 SETTINGS_PREFIX = "produce"
@@ -159,6 +161,9 @@ GATHER_TICK_MS = 5000
 STUCK_TICKS = 3
 # ── 壞裝補給那一趟的時間（全部是使用者指定的）──────────────
 RECALL_OFF_SECS = 5.0        # 回程送出後多久關掉自動採集
+# 翼送出後最多等這麼久看地圖有沒有變 —— 沒變＝多半沒生效（採集狀態沒退乾淨），
+# 要重按 ESC 再用一張。⚠ 別設太短：慢電腦施放＋轉場好幾秒，太早判沒生效會多燒翼。
+RECALL_VERIFY_SECS = 12.0
 SUPPLY_WAIT_SECS = 120.0     # 關掉之後等 2 分鐘（讓精靈在城裡修裝、補貨；2026-08-12 從 3 分鐘改）
 JUMP_LAND_SECS = 10.0        # 趴趴GO 送出後等著陸再看有沒有到
 WALK_DONE = 0.8              # 走到定位點**那一格**才算到（同上，要精確）
@@ -238,6 +243,12 @@ class CharProducePage(QWidget):
         #   掛機的巡邏點早就改用它了（見 memory 的 terrain-grid）。
         self._nav = navigate.Navigator()
         self._sup: dict | None = None   # 壞裝補給那一趟的狀態
+        # ★ 補給背景執行緒的把手：還活著就**絕不能**再開第二條（兩條會同時
+        #   搶走位、各燒各的翼）。逾時放棄／取消勾選都只作廢結果，殺不掉它。
+        self._sup_thread: threading.Thread | None = None
+        # 連續幾趟補給回來裝備**還是壞的**（≥2 就大聲停 —— 那不是暫時性失敗，
+        #   多半是該城沒維修商／修裝一直失敗，重試只會每趟燒一張翼）。
+        self._broken_trips = 0
         self._trip: dict | None = None  # 負重滿了那一趟的狀態
         # ★ 測試鈕用的一次性旗標（使用者要求：不必真的把背包裝滿／打壞裝備
         #   就能驗整條流程）。**只騙判斷、不騙結果** —— 後續每一步讀到的
@@ -576,6 +587,10 @@ class CharProducePage(QWidget):
             # ★ 取消勾選也是「負重那一趟」的出口（重試不設上限，靠這個停）。
             self._trip = None
             self._trip_timer.stop()
+            # ⚠ 停生產時若回程補給的背景執行緒還在跑：作廢它的結果（_sup=None）。
+            #   ⚠⚠ 那一趟**沒法中途硬殺**（run_full_supply 各段有逾時，會自己跑完）——
+            #   跟掛機同一個取捨。
+            self._sup = None
             try:
                 if self._mover is not None and self._mover.active:
                     notes = robot.end_gather(self._mover, self.sc)
@@ -588,6 +603,24 @@ class CharProducePage(QWidget):
         try:
             if not self._ensure_mover():
                 return
+            self._broken_trips = 0         # 使用者重新勾＝重新給補給機會
+            # ★ 上一趟補給的執行緒還活著（取消勾選作廢不了它）→ 先不開任何
+            #   流程，讓它自己跑完（各段有逾時，會結束）；結束後 _gather_tick
+            #   的看門狗會自己把採集接起來。現在開工＝兩邊同時搶走位。
+            if self._sup_thread is not None and self._sup_thread.is_alive():
+                self._note("⚠ 上一趟回程補給還在背景收尾 —— 等它結束會自動開工",
+                           warn=True)
+                return
+            # ★ 保證購買清單有天使之翼×50（使用者要求保留）：生產壞裝一定會觸發回程補給，
+            #   每趟都要用翼回城，清單有它 run_full_supply 的買水步驟才會補貨。只加翼、不開精靈旗標。
+            # ★ 並把天使精靈自己的「回城補給」觸發全關掉（使用者要求）——回程補給改跑我們自己的，
+            #   精靈別再自己回城跑一趟撞我們。
+            try:
+                robot.ensure_buy_item(self._mover, self.sc, recall.RECALL_ITEM,
+                                      robot.BUY_KEEP_WINGS)
+                robot.disable_return_supply(self._mover, self.sc)
+            except Exception:                          # noqa: BLE001
+                pass
             # ★ 開頭先看負重（使用者定的分支）：
             #     已經滿了 → 先試捐一次，還是滿的才跑回程那一趟
             #     沒滿     → 照舊直接開工
@@ -705,6 +738,12 @@ class CharProducePage(QWidget):
             if self._sup is not None:
                 self._supply_tick()
                 return
+            # ★ 補給逾時被放棄後執行緒可能**還活著、還在開車**（走位／傳送）——
+            #   這期間負重那一趟、壞裝重觸發、動中心點全都要讓開，不然就是
+            #   兩邊搶同一台角色。它跑完之後這裡的看門狗會自己把採集接回來。
+            if self._sup_thread is not None and self._sup_thread.is_alive():
+                self._note("⚠ 上一趟補給還在背景收尾 —— 等它結束再繼續", warn=True)
+                return
             # ★ 負重滿了（使用者：剩 5%）→ 交給「回程做半成品」那一趟。
             # ⚠ 讀不到負重就什麼都不做 —— 讀不到不等於滿了。
             pct = self._weight_pct()
@@ -794,12 +833,44 @@ class CharProducePage(QWidget):
             if not broken:                # None 或空清單都不動作
                 return False
             names = "、".join(i.name for i in broken[:3])
-        # 記下「回來要去哪」：現在這張地圖 ＋ 這張圖的定位點。
-        sid = scene.current_id(self.sc)
-        self._sup = {"t0": time.monotonic(), "step": "recall",
-                     "scene": sid, "spot": self._spot_here(sid),
-                     "jumped": 0.0}
-        self._note(f"⚠ 裝備壞了（{names}）→ 開始回程補給", warn=True)
+        # ★★★ 2026-08-14 改：回程補給改跑**我們自己**的 supply.run_full_supply
+        #   （存倉庫→修裝→買水→趴趴GO回原地），不再交給天使精靈。
+        #   ⚠ 補給時**先關掉自動採集**（使用者要求）——不然它會跟補給的走位互相打架。
+        me = self._my_pos()
+        tgt = self.target()
+        center = (tgt.x, tgt.y) if tgt else (me or (0.0, 0.0))
+        sid = scene.current_id(self.sc)    # 出發地圖：回來要驗「人真的回到這」
+        try:
+            robot.end_gather(self._mover, self.sc)
+        except Exception:                                     # noqa: BLE001
+            pass
+        # ★★ 採集狀態中**用不了天使之翼**（2026-08-12 使用者實測）—— 回程前先按
+        #   ESC 退出採集狀態；worker 開跑前再等一拍讓遊戲吃到。
+        #   ⚠ 這一步在改成背景執行緒時漏掉過（舊狀態機的 _escape_gather）——
+        #   少了它，正在採集當下觸發壞裝，翼會送出去但沒效果，整趟白跑。
+        try:
+            win.send_key(self.hwnd, self.VK_ESCAPE)
+        except Exception:                                     # noqa: BLE001
+            pass
+        sup = {"t0": time.monotonic(), "result": None,
+               "progress": "壞裝→回程補給", "center": center, "scene": sid}
+        self._sup = sup
+        mv, sc = self._mover, self.sc
+
+        def _worker():
+            try:
+                time.sleep(1.2)          # 等 ESC 生效（退出採集狀態）再用翼
+                res = supply.run_full_supply(
+                    mv, sc, say=lambda m: sup.__setitem__("progress", m))
+            except Exception as exc:                          # noqa: BLE001
+                res = (False, f"補給出錯：{exc}")
+            sup["result"] = res      # 寫進這一份 sup（就算 self._sup 已換人也無害）
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._sup_thread = t
+        t.start()
+        self._note(f"⚠ 裝備壞了（{names}）→ 關採集、按 ESC、開始回程補給"
+                   "（存倉庫→修裝→買水→趴趴GO回來）", warn=True)
         return True
 
     def _spot_here(self, sid) -> tuple[float, float] | None:
@@ -814,129 +885,64 @@ class CharProducePage(QWidget):
         return None
 
     def _supply_tick(self) -> None:
-        """補給那一趟的狀態機。5 秒一拍，每一拍只往前推一步。
+        """補給那一趟：**背景執行緒**跑我們自己的 `run_full_supply`（存倉庫→修裝→買水→
+        趴趴GO回原地），這裡只**輪詢完成**——回來了就**重開自動採集**、繼續採。
 
-        使用者指定的流程：
-            壞裝 → 用天使之翼回程 → **5 秒後**關自動採集 → 等 **2 分鐘**
-            → 天使趴趴GO 回原地圖 → 走到定位點 → 重新設定＋開自動採集
-        ⚠ 整趟有 SUPPLY_MAX_SECS 的兜底：卡住就放棄回到採集，並**大聲說**，
-          不要無聲無息地停在半路（frozen-tick-state-machines 那類坑）。
+        ⚠ 採集在 `_check_broken` 開跑時就已關掉（使用者要求），整趟精靈不插手。
+        ⚠ 有 SUPPLY_MAX_SECS 兜底：執行緒卡死就放棄，交回主 tick 自己把採集重開起來。
         """
         s = self._sup
         lasted = time.monotonic() - s["t0"]
+        # 背景執行緒跑完了 → 回到採集區，重開自動採集
+        if s["result"] is not None:
+            ok, msg = s["result"]
+            self._sup = None
+            # ★★ 補給回來裝備**還是壞的**？連續兩趟就大聲停 —— 那不是暫時性
+            #   失敗（該城沒維修商／修裝一直失敗），再重試只是每趟燒一張翼。
+            #   ⚠ worn_broken 的 None（讀不到）不算數：不加也不清（不確定就不動）。
+            worn = bag.worn_broken(self.sc)
+            if worn:
+                self._broken_trips += 1
+                if self._broken_trips >= 2:
+                    self._halt(self.run_cb,
+                               f"⚠ 連續 {self._broken_trips} 趟補給回來裝備還是"
+                               f"壞的（{msg}）—— 已停止自動生產：請確認回程那座城"
+                               "有維修商，或手動修一次再重勾")
+                    return
+            elif worn is not None:
+                self._broken_trips = 0
+            # ★ 先驗「人真的回到採集那張圖」再開採集（run_full_supply 會自己
+            #   等落地＋重送，正常會回到；還是沒回到＝傳送一直失敗）——
+            #   人在城裡就開＝把採集中心寫成「城的地圖＋練功區座標」，精靈迷路。
+            #   沒回到就走負重那套「back」腿（趴趴GO 重試不設上限→走回定位點
+            #   →重新設定→開採集→開主精靈）。
+            here = scene.current_id(self.sc)
+            if s.get("scene") is not None and (
+                    here is None or not scene.same_map(here, s["scene"])):
+                self._trip_start("back", f"補給結束但人不在採集圖（{msg}）"
+                                         "→ 傳回去再開工")
+                return
+            me = self._my_pos()
+            center = s["center"] or (me or (0.0, 0.0))
+            try:
+                notes = robot.begin_gather(self._mover, self.sc, center,
+                                           scene.current_id(self.sc),
+                                           self.wanted())
+            except Exception as exc:                          # noqa: BLE001
+                notes = [f"⚠ 重開採集失敗：{exc}"]
+            self._watch_reset()
+            self._note(f"補給完成：{msg} → 回來重開採集　" + "、".join(notes))
+            return
+        # 逾時兜底：作廢這一趟的結果。⚠ 執行緒殺不掉、可能還在開車 ——
+        #   _gather_tick 會看 _sup_thread.is_alive() 全程讓開，它真的結束後
+        #   看門狗才把採集接回來（不再像舊寫法立刻重開、跟殭屍搶角色）。
         if lasted > SUPPLY_MAX_SECS:
             self._sup = None
-            self._note(f"⚠ 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒回到位，"
-                       "放棄這一趟、直接繼續採集", warn=True)
+            self._note(f"⚠ 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒回來，"
+                       f"放棄等它（最後：{s['progress']}）——背景那趟收完"
+                       "才會重開採集", warn=True)
             return
-
-        step = s["step"]
-        if step == "recall":
-            if self._escape_gather(s):
-                return
-            # ⚠ `bag.head()` 回的是 (表頭, 格數)，do_recall 要的是**表頭**。
-            #   讀不到＝這一拍讀不到（載入中／換地圖），不是「沒有背包」——
-            #   等下一拍再試，不要拿 0 去送。
-            h = bag.head(self.sc)
-            if h is None:
-                self._note("讀不到背包（載入中？）—— 等一下再回程")
-                return
-            ok, why = robot.do_recall(self._mover, self.sc, h[0])
-            if ok is False:
-                self._sup = None
-                self._note(f"⚠ 回程失敗（{why}）→ 這趟取消，繼續採集", warn=True)
-                return
-            if ok is None:                        # 暫時性失敗，下一拍再試
-                self._note(f"回程重試中…（{why}）")
-                return
-            s["step"], s["recalled"] = "off", time.monotonic()
-            self._note("已用天使之翼回程，5 秒後關掉自動採集")
-
-        elif step == "off":
-            if time.monotonic() - s["recalled"] < RECALL_OFF_SECS:
-                return
-            robot.end_gather(self._mover, self.sc)
-            s["step"], s["off_t"] = "wait", time.monotonic()
-            self._note(f"已關掉自動採集，等 {SUPPLY_WAIT_SECS / 60:.0f} 分鐘"
-                       "讓精靈修裝補貨")
-
-        elif step == "wait":
-            left = SUPPLY_WAIT_SECS - (time.monotonic() - s["off_t"])
-            if left > 0:
-                self._note(f"補給中…還要等 {left:.0f} 秒")
-                return
-            s["step"] = "jump"
-
-        elif step == "jump":
-            here = scene.current_id(self.sc)
-            if here is None:
-                self._note("讀不到目前地圖（載入中？）—— 等一下再傳送")
-                return
-            if scene.same_map(here, s["scene"]):
-                s["step"] = "walk"                # 已經在原圖了
-                return
-            if time.monotonic() - s["jumped"] < JUMP_LAND_SECS:
-                self._note("✈ 趴趴GO 已送出，等著陸…")
-                return
-            spot = s["spot"] or (None, None)
-            e = jumpmap.nearest(s["scene"], spot[0], spot[1])
-            if e is None:
-                self._sup = None
-                self._note(f"⚠ 趴趴GO 沒有回{scene.scene_name(s['scene'])}"
-                           "的傳送點 → 這趟到此為止", warn=True)
-                return
-            ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
-            s["jumped"] = time.monotonic()
-            self._note(f"✈ 趴趴GO 回{scene.scene_name(s['scene'])}"
-                       + ("" if ok else f"（送不出去：{msg}，下一拍再試）"))
-
-        elif step == "walk":
-            me = self._my_pos()
-            spot = s["spot"]
-            if me is None:
-                return
-            if spot is None:                      # 沒設定位點 → 就地繼續
-                s["step"] = "resume"
-                return
-            d = ((me[0] - spot[0]) ** 2 + (me[1] - spot[1]) ** 2) ** 0.5
-            if d <= WALK_DONE:
-                self._nav.reset()
-                s["step"] = "resume"
-                return
-            # ★ 最後一段自己貼上去：Navigator 離目標 3 格（ARRIVE）就判定「到了」
-            #   不再走，若只靠它就會**卡在 1 格外一直說「還有 1 格」**（使用者
-            #   2026-08-12 回報：補給飛回來後卡在「走回定位…還有 1 格」）。定位點
-            #   是使用者站過的可走格，walk_exact 直接踩上去（跟 walk_spot 同一招）。
-            if d <= navigate.ARRIVE:
-                pf = move.pathfinder_this(self.sc)
-                if pf:
-                    self._mover.walk_exact(self.sc, pf + 8, spot[0], spot[1])
-                self._note(f"走回定位點…還有 {d:.1f} 格")
-                return
-            # ⚠ 跟 _trip 那邊同一個坑：遠距離**不能**用 mover.walk_route
-            #   （對目標本身尋路，遠了就回 0 個點＝一步都不走）。
-            note = self._walk_to(spot[0], spot[1])
-            if self._nav.stuck:
-                self._nav.reset()
-                s["step"] = "resume"
-                self._note("⛔ 走不到定位點，就地繼續採集", warn=True)
-                return
-            self._note(f"走回定位點…還有 {d:.0f} 格　{note}")
-
-        elif step == "resume":
-            # ★ 重新「設定」＋開採集 —— 就是生產面板那顆「設定」做的事，
-            #   但我們**不叫那支 UI handler**：它最後會 CreateStageMapWnd
-            #   把大地圖叫出來（使用者提醒過）。begin_gather 已經把它做的
-            #   事（中心點、地圖 ID、清 USED_TP_ITEM）全做了，地圖也就不會跳。
-            me = self._my_pos()
-            tgt = self.target()
-            center = (tgt.x, tgt.y) if tgt else (me or (0.0, 0.0))
-            notes = robot.begin_gather(self._mover, self.sc, center,
-                                       scene.current_id(self.sc),
-                                       self.wanted())
-            self._sup = None
-            self._watch_reset()
-            self._note("補給完成，回來繼續採集　" + "、".join(notes))
+        self._note(f"回程補給中…{s['progress']}（{lasted:.0f} 秒）")
 
     # ------------------------------------------------------------------
     # -- 負重滿了那一趟（流程是使用者定的）--------------------------------
@@ -1200,6 +1206,7 @@ class CharProducePage(QWidget):
             #   順序），這裡再要求「精靈要在執行中」就是自相矛盾 ——
             #   2026-08-12 實測卡在「天使精靈不在執行中，這趟取消」。
             #   我們只是自己用掉一張翼，不靠精靈帶回城。
+            frm = scene.current_id(self.sc)    # 出發地圖：land 步驗翼有沒有生效
             ok, why = robot.do_recall(self._mover, self.sc, h[0],
                                       need_robot=False)
             if ok is False:
@@ -1210,20 +1217,43 @@ class CharProducePage(QWidget):
                 self._note(f"回程重試中…（{why}）")
                 return
             s["step"], s["recalled"] = "land", time.monotonic()
+            s["recall_from"] = frm
             self._note("已用天使之翼回程，等著陸…")
             return
 
         if step == "land":
-            if time.monotonic() - s["recalled"] < RECALL_OFF_SECS:
+            waited = time.monotonic() - s["recalled"]
+            if waited < RECALL_OFF_SECS:
                 return
             here = scene.current_id(self.sc)
             if here is None:
                 self._note("讀不到目前地圖（載入中？）")
                 return
+            bsid = self._bench[2] if self._bench else None
+            bench_here = bsid is not None and scene.same_map(here, bsid)
+            frm = s.get("recall_from")
+            # ★★ 驗「翼真的生效了」（送出去≠有效）：地圖跟出發時一樣、又不是
+            #   「製作檯本來就在這張圖」→ 多半是翼沒送成（採集狀態沒退乾淨）。
+            #   先多等幾秒（慢電腦轉場慢）；還是沒變就重按 ESC 再用一張。
+            #   ⚠ 重試設 3 次上限，不走「不設上限」：練功區跟回程點**可能本來
+            #   就同一張圖**（那時地圖永遠不會變），無上限會把翼燒光。
+            #   3 次都沒動就照舊往下走 —— 同圖的話 to_bench 用走的照樣到。
+            if (frm is not None and scene.same_map(here, frm)
+                    and not bench_here):
+                if waited < RECALL_VERIFY_SECS:
+                    self._note("已用天使之翼回程，等傳送生效…")
+                    return
+                tries = s.get("recall_tries", 0)
+                if tries < 3:
+                    s["recall_tries"] = tries + 1
+                    s["esc"] = False       # 讓 recall 步重按一次 ESC
+                    s["step"] = "recall"
+                    self._note(f"⚠ 回程沒生效（地圖沒變）→ 第 {tries + 1} 次"
+                               "重試（先按 ESC 再用翼）", warn=True)
+                    return
             # ⚠ 記住的製作檯是哪張圖的，就只能在哪張圖用。天使之翼的落點不見得
             #   是那一張 —— 不比對就會在別的城裡走到一組不相干的座標。
             #   ★ 對不上**不停下來**：就地找（落地點附近點點看），找到再記新的。
-            bsid = self._bench[2] if self._bench else None
             if self._bench and bsid is not None and not scene.same_map(here,
                                                                        bsid):
                 self._note(f"⚠ 天使之翼落在{scene.scene_name(here)}，"
@@ -1368,16 +1398,14 @@ class CharProducePage(QWidget):
 
         if step == "resume":
             # ★ 順序照使用者說的：**設定 → 開自動採集 → 最後才開主精靈**。
-            #   所以這裡的 apply_prefs 不帶 main_switch（False ＝ 完全不碰它），
-            #   等採集設定好了再單獨把主開關打開 —— 精靈一開就會照設定跑，
-            #   先開它等於讓它拿舊設定動起來。
-            notes = robot.apply_prefs(self._mover, self.sc, supply=True)
+            # ⚠ 2026-08-14 拿掉 apply_prefs(supply=True)：回程補給改成我們自己的
+            #   run_full_supply，不再推精靈的補給頁設定。採集本身仍靠精靈（begin_gather）。
             me = self._my_pos()
             tgt = self.target()
             center = (tgt.x, tgt.y) if tgt else (me or (0.0, 0.0))
-            notes += robot.begin_gather(self._mover, self.sc, center,
-                                        scene.current_id(self.sc),
-                                        self.wanted())
+            notes = robot.begin_gather(self._mover, self.sc, center,
+                                       scene.current_id(self.sc),
+                                       self.wanted())
             ok, why = robot.set_run(self._mover, self.sc, True)
             if not ok:
                 # ⚠ 主開關沒開起來就**不要結束** —— 結束＝以為在跑其實沒跑。
@@ -1536,7 +1564,11 @@ class CharProducePage(QWidget):
             c["sig"], c["batch"] = None, None
         if c["idx"] >= len(c["plans"]):
             c["plans"] = None
-            if not recipes.plan(self.sc, have):
+            left_plans = recipes.plan(self.sc, have)
+            if left_plans is None:
+                return          # ⚠ 表讀不到 ≠ 做完了 —— 等下一拍再確認
+                                #   （None/[] 混在一起就是第七次 false-empty）
+            if not left_plans:
                 s["step"] = "dispose"
                 self._note(f"半成品做完了，一共 {c['made']} 個")
             return

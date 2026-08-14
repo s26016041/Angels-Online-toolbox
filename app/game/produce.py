@@ -4,12 +4,10 @@
     ok, msg = produce.craft_stop(mover, scanner)             # 停止製作
     ok, msg = produce.donate(mover, scanner, [(貢獻編號, 組數), …])
 
-⛔ **存倉庫這條路已刪除**（2026-08-11 使用者決定）。封包本身是解出來的
-   （代號 `0x2F`、動作碼 `0x11`、格號），但**開倉庫做不到**：要跟倉庫人員
-   對話選選項，而選項編號是伺服器當下發的清單位置、湊不出來，泛用送包的
-   代碼表裡也只有「關閉倉庫」沒有「開啟」。與其留一條永遠要人工開倉庫的
-   半自動路徑，不如不做 —— 沒選捐公會就做完停著不動。細節留在 memory 的
-   `craft-donate-storage-packets`，要撿回來再看那份。
+✅ **存倉庫已在 supply.py 打通**（2026-08-14；先前「開倉庫做不到」已推翻）：
+   選項碼其實是**選單位置碼**（我要用倉庫=11、自己的倉庫=10），不必湊
+   伺服器清單。生產這邊要存倉庫直接用 `supply.run_bank`，不在這裡重做；
+   細節見 memory `self-supply-buy` 的銀行段。
 
 兩包長什麼樣（都是反組譯遊戲自己那條路來的，沒有猜的欄位）
 ----------------------------------------------------------
@@ -188,9 +186,11 @@ def click(mover, scanner, prop) -> tuple[bool, str]:
 # ★ **不能靠工具箱自送 0x36**：只做得出第 1 個，之後伺服器拒收（跳「製作物品
 #   失敗」對話框），還會卡住遊戲訊息迴圈。要走這條「填清單→makestart→放手」。
 #
-# GET_CTRL(ecx=[0x9B669C+0xC], window, 控制項id) → 控制項指標（已 AOB 登記）。
+# GET_CTRL(ecx=[世界指標+0xC], window, 控制項id) → 控制項指標（已 AOB 登記）。
 GET_CTRL = 0x00624FCC
-WORLD_PTR = 0x009B669C
+# ★ 世界指標＝gather.WORLD_PTR（0x9B669C）。⚠ 不在這裡再寫一份位址 ——
+#   那個全域已登記 AOB（locate gather.WORLD_PTR，交叉驗證兩處），
+#   用時直接讀 gather.WORLD_PTR 拿 warm() 之後的值（同 supply.py 的做法）。
 # 三個控制項 id（UI 層常數，跟封包代號一樣屬「大更新改協定才會變」）：
 CTRL_RECIPES = 0xAFE          # 配方清單（選要做的配方）
 CTRL_QTY = 0xB03              # 數量輸入框
@@ -214,7 +214,8 @@ def _ctrl(mover, scanner, wnd: int, ctrl_id: int):
     """取製作面板裡某個控制項的指標。拿不到回 None。"""
     if not GET_CTRL:
         return None
-    thisptr = _u32(scanner, _u32(scanner, WORLD_PTR) + 0xC)
+    from app.game import gather
+    thisptr = _u32(scanner, _u32(scanner, gather.WORLD_PTR) + 0xC)
     if not _PTR_LO < (thisptr or 0) < _PTR_HI:
         return None
     ptr = mover.call_sync(GET_CTRL, wnd, ctrl_id, ecx=thisptr, timeout=_CALL_T)

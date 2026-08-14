@@ -33,6 +33,7 @@ import ctypes
 import math
 import struct
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -70,7 +71,7 @@ from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       itemname, jumpmap, locate, monsters, move, navigate,
                       player, quickbar, recall, revive, robot, scene,
-                      skillcost, skills, summon,
+                      skillcost, skills, summon, supply,
                       tablestamp, terrain)
 from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
 
@@ -1530,12 +1531,23 @@ class CharFarmPage(QWidget):
         self._hp_prev = -1         # 上一拍的 HP（偵測「正在被打」用）
         self._hp_drop_t = -1e9     # 上次觀測到 HP 下降的時刻（見 _under_attack）
         self._gear_t = 0.0         # 距離上次檢查裝備耐久過了多久
-        self._supply = False       # 正在讓天使精靈跑補給（我們完全讓開）
+        self._supply = False       # 正在跑「我們自己」的回程補給（背景執行緒，完全讓開）
         self._supply_t = 0.0       # 這一趟補給跑多久了
         self._supply_poll = 0.0    # 距離上次檢查補給進度過了多久
-        self._supply_scene = None  # 出發時人在哪張地圖（回到它才算補完）
+        # ★★★ 回程補給改成跑我們自己的 supply.run_full_supply（存倉庫→修裝→買水→趴趴GO回原地），
+        #   不再交給天使精靈。整趟阻塞式，放背景執行緒跑，_supply_tick 每拍輪詢完成。
+        self._supply_result = None  # 背景執行緒的結果 (ok, msg)；None = 還在跑
+        self._supply_progress = ""  # 背景執行緒的最新進度字串（run_full_supply 的 say 回報）
+        self._supply_scene = None  # 出發時人在哪張地圖（保留給死亡/顯示用）
         self._supply_left = False  # 已經離開過那張地圖了嗎
-        self._supply_pos = None    # 出發時站在哪（挑最近的傳送落點用）
+        self._supply_pos = None    # 出發時站在哪
+        # ★ 補給背景執行緒的把手：還活著就**絕不能**再開第二條（兩條會同時
+        #   搶走位、各燒各的翼）。逾時停機只作廢結果，殺不掉它 —— 使用者重開
+        #   掛機時要看這裡擋住（跟 produce_tab._sup_thread 同一套）。
+        self._supply_thread: threading.Thread | None = None
+        # 連續幾趟補給回來裝備**還是壞的**（≥2 就大聲停 —— 那不是暫時性失敗，
+        #   多半是該城沒維修商／修裝一直失敗，重試只會每趟燒一張翼）。
+        self._broken_trips = 0
         self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._recall_try = 0       # 回程第二段重試了幾次（見 _retry_recall）
@@ -2602,39 +2614,34 @@ class CharFarmPage(QWidget):
         return dry
 
     def _start_supply(self, why: str) -> bool:
-        """把控制權交給官方的天使守護精靈。接得起來才回 True。
+        """觸發回程補給：跑**我們自己**的 `supply.run_full_supply`（存倉庫→修裝→買水→
+        趴趴GO 回原地）。接得起來（開了背景執行緒）才回 True。
 
-        ★ 為什麼用官方的：回城→找 NPC→修裝→買東西→走回戰場這一整趟，
-          遊戲本來就會做，而且**細節是使用者在遊戲那一頁設好的**。
-          我們自己重做一份只是多一套要維護的東西。
-          精靈是 Lua 寫的、不送任何封包，所以只能這樣叫（見 app/game/lua.py）。
+        ★★★ 2026-08-14 改：**不再交給官方天使精靈**（官方補給有 BUG）。我們自己那套
+          （app/game/supply.py）整趟自成一趟：記錄地圖座標→天使之翼回城→銀行存標記儲存的物品→
+          維修商全修→補給商照清單買→趴趴GO 跳回原練功點。整趟是阻塞式、~數十秒到幾分鐘，
+          放**背景執行緒**跑、`_supply_tick` 每拍輪詢完成，不凍畫面。
+        ⚠ 天使精靈的自動戰鬥**不需要再打開**（使用者要求）——我們自己走位/銀行/買賣，精靈全程讓開。
         """
         if not self._ensure_mover():
             return False
-        miss = robot.missing_supply_settings(self._mover, self.sc)
-        if miss:
-            self._stop_with(f"🔧 {why}，但天使精靈的補給頁還缺："
-                            + "、".join(miss))
-            self.notify(f"{why}，但天使精靈的補給頁沒設好（缺 "
-                        + "、".join(miss) + "），掛機已停止。")
+        # ⚠ 上一趟的背景執行緒還活著就**絕不能**再開一條（逾時停機殺不掉它；
+        #   疊第二條會兩邊同時搶走位、各燒各的翼）。它真的收工才准開新趟。
+        t = self._supply_thread
+        if t is not None and t.is_alive():
+            self.status.setText(f"🔧 {why} → 上一趟補給的背景執行緒還沒收工，先等它")
             return False
-        # 沒有回程道具就別開始，免得把設定改了卻走不了
-        # ⚠ None 跟 () 是兩回事（見 robot.has_recall_item）：None = 陣列剛
-        #   搬家／被截斷，「讀不到」≠「沒有」—— 這一拍先不出發，觸發條件
-        #   還在，3 秒後的下一輪檢查會自己再試。以前混在一起會誤停機。
+        # 沒有回程道具（天使之翼）就別開始 —— run_full_supply 第一步就要用它回城。
+        # ⚠ None ≠ ()（見 robot.has_recall_item）：None = 陣列剛搬家/被截斷，「讀不到」≠「沒有」
+        #   —— 這一拍先不出發，觸發條件還在，下一輪再試（以前混在一起會誤停機）。
         have = robot.has_recall_item(self.sc, self.inv)
         if have is None:
             self.status.setText(f"🔧 {why} → 背包暫時讀不到，下一輪再試回程補給")
             return False
         if not have:
-            # ⚠ 講清楚**我們在找哪一件東西**：我們只認 `recall.RECALL_ITEM`
-            #   （天使之翼），身上放的是別種回城道具就會找不到 —— 名字寫出來，
-            #   一眼就看得出是「真的沒有」還是「認錯東西」。
-            #   ✅ 使用者 2026-08-09 確認他用的就是天使之翼，所以那次是讀取問題。
             item = itemname.label(recall.RECALL_ITEM)
-            # ⚠⚠ **不准第一次就停機**（見 NO_RECALL_TRIES 的說明）：那一次
-            #   剛換過地圖，穿著的裝備已經讀得到、整條容器卻還沒填完。
-            #   觸發條件（裝備壞了／水沒了）不會消失，下一輪自然會再走到這裡。
+            # ⚠⚠ **不准第一次就停機**（NO_RECALL_TRIES）：剛換地圖時容器還沒填完，
+            #   觸發條件不會消失，下一輪自然再走到這裡。
             self._no_recall += 1
             if self._no_recall < NO_RECALL_TRIES:
                 self.status.setText(
@@ -2643,57 +2650,51 @@ class CharFarmPage(QWidget):
                 return False
             self._stop_with(f"🔧 {why}，但背包裡找不到「{item}」（回程道具）"
                             f"——連續確認 {NO_RECALL_TRIES} 次都沒有")
-            self.notify(f"{why}，但背包裡找不到「{item}」（回程道具），"
-                        "掛機已停止。")
+            self.notify(f"{why}，但背包裡找不到「{item}」（回程道具），掛機已停止。")
             return False
         self._no_recall = 0            # 找到了 → 之前那幾次是空窗，重新計數
-        # ★ 記下現在這張地圖 —— 回到它才算補給結束（使用者要求）
-        # ⚠⚠ self._scene **本來就是場景編號（int）**，不是 Scene 物件 ——
-        #   寫成 `self._scene.id` 會在真的觸發補給的那一刻才炸
-        #   （AttributeError: 'int' object has no attribute 'id'，使用者實際遇到）。
-        #   會拖這麼久才發現，是因為平常沒有補給條件根本走不到這一行。
-        self._supply_scene = self._scene
+        self._supply_scene = self._scene    # 記一下出發地圖（顯示用）
         self._supply_left = False
         self._supply_pos = self.my_pos()
         self._supply_gen += 1
-        self._recall_try = 0
-        # ★ 趴趴GO回程的倒數就是從這裡開始算的（_supply_t）—— 跟「回程補給」
-        #   那列的倒數標籤同一個時鐘，畫面寫什麼就是程式在做什麼。
-        self._jump_n = 0
-        self._jump_sent = None
-        self._jump_off = ""
-        # ⚠ 這裡刻意**不**重驗「標記傳送捲軸」的設定 —— 開始掛機時關過一次
-        #   就夠了，之後使用者在遊戲裡改回去是他自己的決定（使用者明講）。
-        # ★ 第一段：調好開關 + 設中心點。第二段（回程）隔幾秒才送，
-        #   順序與間隔都不能省（見 robot.do_recall）。
-        notes = robot.begin_supply(self._mover, self.sc)
-        self._robot_ours = True
-        # 這一趟要讓「自動攻擊」開著（精靈在開車）→ 看門狗先讓開，
-        # 由 _schedule_af_off() 在回程送出後把期限改成 AF_HOLD_SECS。
-        self._af_free = float("inf")
-        # 我們自己要完全讓開：不送技能鍵、不寫目標
+        # 我們自己要完全讓開：不送技能鍵、不寫目標；看門狗照常把精靈自動攻擊關著
+        #   （run_full_supply 是我們在開車，精靈不該插手搶怪）。
         self._keys.set_on(False)
         self._atk.hold_off()
         self._cur = None
         self._supply = True
         self._supply_t = 0.0
         self._supply_poll = 0.0
-        self.status.setText(
-            f"🔧 {why} → 調整精靈設定："
-            + ("、".join(notes) if notes else "本來就都對")
-            + f"　{robot.SETUP_SETTLE:.0f} 秒後回程…")
-        QTimer.singleShot(int(robot.SETUP_SETTLE * 1000), self._fire_recall)
+        self._supply_result = None
+        self._supply_progress = why
+        # ★ 背景執行緒跑整趟補給。say 回報進度存進 _supply_progress，_supply_tick 顯示＋等完成。
+        mv, sc, gen = self._mover, self.sc, self._supply_gen
+
+        def _worker():
+            try:
+                res = supply.run_full_supply(
+                    mv, sc, say=lambda m: setattr(self, "_supply_progress", m))
+            except Exception as exc:                          # noqa: BLE001
+                res = (False, f"補給出錯：{exc}")
+            if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
+                self._supply_result = res
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._supply_thread = t
+        t.start()
+        self.status.setText(f"🔧 {why} → 開始跑補給（存倉庫→修裝→買水→趴趴GO回來）…")
         return True
 
     def _end_supply(self, why: str, stop: bool = False) -> None:
-        """收回控制權。stop=True 代表補給失敗，順便停掉掛機並通知。"""
+        """補給收工，恢復打怪。stop=True 代表補給失敗，順便停掉掛機並通知。
+
+        ⚠ 補給是我們自己的背景執行緒跑的（不碰精靈），這裡不必再 robot.end_supply。
+          `_supply_gen += 1` 讓還在跑的執行緒（若逾時停機）之後回來的結果自己作廢。
+        """
         self._supply = False
-        self._supply_gen += 1          # 這趟結束，排著的趴趴GO傳送作廢
-        if self._mover is not None and self._mover.active:
-            robot.end_supply(self._mover, self.sc)   # 只關自動攻擊
-        # ⚠ 上面那一行有可能整個沒跑到（跳板不在）—— 補給結束正是換完地圖、
-        #   跳板最容易掛不上的時候。所以這裡**一定要把看門狗放回來**，
-        #   由它負責真的關掉（見 _af_tick）。
+        self._supply_gen += 1          # 作廢還在跑的背景執行緒的結果
+        self._supply_result = None
+        # 看門狗放回來（掛機期間精靈自動攻擊一律關）。
         self._af_free = 0.0
         self._robot_ours = False
         # 補給跑完一定換過地圖，所有快取位址都要作廢
@@ -2715,22 +2716,9 @@ class CharFarmPage(QWidget):
           還沒送出、送出後等著陸幾秒、送了第幾次、或是根本走不通的原因。
         """
         txt = ""
-        if self._supply and self.sup_jump_cb.isChecked():
-            if self._jump_off:
-                txt = f"趴趴GO：{self._jump_off}"
-            elif self._supply_scene is None:
-                txt = "趴趴GO：不知道出發地圖"
-            else:
-                left = max(0.0, JUMP_BACK_SECS - self._supply_t)
-                if left > 0:
-                    txt = f"趴趴GO 倒數 {_mmss(left)}"
-                elif self._jump_sent is None:
-                    txt = "趴趴GO 準備傳送…"
-                else:
-                    wait = max(0.0, self._supply_t - self._jump_sent)
-                    txt = (f"趴趴GO 已送出 {wait:.0f} 秒，等著陸"
-                           + (f"（第 {self._jump_n} 次）"
-                              if self._jump_n > 1 else ""))
+        if self._supply:
+            # 補給是背景執行緒跑我們自己的整趟（含趴趴GO回程）→ 這裡顯示它回報的進度。
+            txt = f"補給：{self._supply_progress}" if self._supply_progress else "補給中…"
         elif self._death:
             left = max(0.0, DEATH_REVIVE_SECS - self._death_t)
             txt = (f"死亡回程 倒數 {_mmss(left)}" if left > 0
@@ -2741,53 +2729,43 @@ class CharFarmPage(QWidget):
     def _supply_tick(self, dt: float) -> bool:
         """補給進行中回 True（呼叫端要整個讓開）。
 
-        ★ **判完成看「回到原本那張地圖」**（使用者要求）：離開過、又回來了
-          就代表整趟跑完。比看耐久通用 —— 缺水那種觸發修不修裝都一樣。
-        ⚠ 一定要先「離開過」才算，不然剛觸發還沒傳送出去就會被判定完成。
+        ★ 補給整趟是背景執行緒在跑我們自己的 `run_full_supply`（存倉庫→修裝→買水→趴趴GO回來）。
+          這裡只做兩件事：**顯示進度** 與 **等執行緒回結果**（回來了就 `_end_supply` 恢復打怪）。
+        ⚠ 完成判斷不再看「回到原地圖」——run_full_supply 自己趴趴GO 跳回，跑完給結果就算完成。
         """
         if not self._supply:
             return False
         self._supply_t += dt
-        self._supply_poll += dt
-        if self._supply_t >= SUPPLY_MAX_SECS:
-            # ★ 把趴趴GO試了幾次一起講出來 —— 「送了 20 次都沒到」跟「精靈自己
-            #   走太慢」是兩件完全不同的事，訊息裡分不出來就沒辦法往下查。
-            self._end_supply(
-                f"🔧 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒完成 → 已停止掛機"
-                + (f"（趴趴GO 送了 {self._jump_n} 次都沒到，"
-                   "傳送費用不夠？等級不足？）" if self._jump_n else "")
-                + (f"（趴趴GO 沒用上：{self._jump_off}）"
-                   if self._jump_off else ""),
-                stop=True)
-            return True
-        if self._supply_poll >= SUPPLY_POLL:
-            self._supply_poll = 0.0
-            now = scene.current(self.sc, allow_scan=False)
-            here = now.id if now else None
-            # ⚠ 「離開／回來」都用 same_map 比對：趴趴GO 的落點在本流，
-            #   在分流（141/241…）掛機的人跳回來編號會對不上，拿編號硬比
-            #   會判成「一直沒回來」→ 白等 10 分鐘超時停機。
-            if self._supply_scene is not None and here is not None:
-                if not scene.same_map(here, self._supply_scene):
-                    self._supply_left = True
-                elif self._supply_left:
-                    # 回來了 → 順便報一下裝備修好了沒（讀不到就不提）
-                    bad = bag.worn_broken(self.sc)
-                    note = ("　⚠ 還有裝備壞著（"
-                            + "、".join(it.name for it in bad) + "）" if bad
-                            else "　裝備完好" if bad == [] else "")
+        # 背景執行緒跑完了 → 收工，恢復打怪
+        if self._supply_result is not None:
+            ok, msg = self._supply_result
+            self._supply_result = None
+            # ★★ 補給回來裝備**還是壞的**？連續兩趟就大聲停 —— 那不是暫時性
+            #   失敗（該城沒維修商／修裝一直失敗），再重試只是每趟燒一張翼
+            #   （跟 produce_tab 同一套煞車）。
+            #   ⚠ worn_broken 的 None（讀不到）不算數：不加也不清（不確定就不動）。
+            worn = bag.worn_broken(self.sc)
+            if worn:
+                self._broken_trips += 1
+                if self._broken_trips >= 2:
                     self._end_supply(
-                        f"🔧 補給完成，已回到{now}{note}　"
-                        f"共花 {_mmss(self._supply_t)}")
+                        f"⚠ 連續 {self._broken_trips} 趟補給回來裝備還是壞的"
+                        f"（{msg}）—— 已停止掛機：請確認回程那座城有維修商，"
+                        "或手動修一次再重開", stop=True)
                     return True
-            # ★ 趴趴GO回程（送 → 盯著地圖有沒有真的變 → 沒變就再送）。
-            #   放在完成判斷**之後**：已經回到原圖的話上面就 return 了。
-            jump = self._jump_step(here)
-            self.status.setText(
-                f"🔧 天使精靈補給中…（{_mmss(self._supply_t)}）"
-                + (f"　目前在 {now}" if now else "")
-                + ("" if robot.is_run(self.sc) else "　⚠ 精靈已停下")
-                + jump)
+            elif worn is not None:
+                self._broken_trips = 0
+            self._end_supply(f"🔧 補給完成：{msg}　共花 {_mmss(self._supply_t)}")
+            return True
+        # 逾時兜底：run_full_supply 內部各段都有逾時，正常會自己回結果；
+        #   這是「執行緒卡死/永不回」的最後保險 —— 大聲停機，別無聲卡住。
+        if self._supply_t >= SUPPLY_MAX_SECS:
+            self._end_supply(
+                f"🔧 補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒回來 → 已停止掛機"
+                f"（最後進度：{self._supply_progress}）", stop=True)
+            return True
+        self.status.setText(
+            f"🔧 回程補給中…{self._supply_progress}（{_mmss(self._supply_t)}）")
         return True
 
     # ------------------------------------------------------------------
@@ -3952,19 +3930,17 @@ class CharFarmPage(QWidget):
             self._atk.hold_off()
             self._cur = None
             self._death = False        # 死亡回程等到一半就作廢，別再傳送
-            # ⚠ 停掛機時如果正在讓精靈跑補給，一定要把精靈也關掉 ——
-            #   不然使用者以為停了，角色卻還在自己跑。
-            # ⚠ 精靈如果是我們開的（自動交棒或測試按鈕），停掛機時一定要把
-            #   自動攻擊關掉 —— 不然使用者以為停了，角色還在自己打。
-            # ⛔ 這裡**不再** reset 分身／召喚（2026-08-13）：它們獨立於掛機，
-            #   停掛機後照樣自己補（手動打王用）。要停就把勾拿掉 ——
-            #   _companion_tick 的 elif 會 reset。
-            if self._supply or self._robot_ours:
+            # ⚠ 停掛機時如果正在跑回程補給：作廢它（_supply_gen++ 讓背景執行緒回來的
+            #   結果自己失效、_supply=False 讓掛機不再讓開）。
+            #   ⚠⚠ 補給是背景執行緒跑我們自己的整趟，**沒法中途硬殺** —— 那一趟會自己
+            #   跑完（run_full_supply 各段都有逾時），跑完角色就停著。停掛機當下不會再
+            #   接手打怪。這是「背景阻塞式補給」的取捨（要能中途停得再改 run_full_supply 支援）。
+            # ⛔ 不再 reset 分身／召喚（2026-08-13，獨立於掛機）。
+            if self._supply:
                 self._supply = False
-                self._supply_gen += 1        # 排著的趴趴GO傳送就此作廢
-                if self._mover is not None and self._mover.active:
-                    robot.end_supply(self._mover, self.sc)
-                self._robot_ours = False
+                self._supply_gen += 1        # 作廢還在跑的補給執行緒結果
+                self._supply_result = None
+            self._robot_ours = False
             # 若是被 _stop_with() 停的（例如角色死亡），它會在這之後蓋上原因
             self.status.setText(f"已停止（累計擊殺 {self._kills} 隻）")
             return
@@ -3985,16 +3961,28 @@ class CharFarmPage(QWidget):
         self._ensure_mover()               # 選怪／移動都要用它的跳板
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
-        # ★ 開始自動戰鬥就把精靈調好：主開關一律開（使用者要求）；勾了
-        #   趴趴GO回地圖／死亡回程的話，把對應的精靈設定一起調到位。
-        #   每一項都先讀再動，平常（都已經是對的）只花幾次純記憶體讀取。
+        # ★ 開始自動戰鬥只把精靈「該關的」關掉：勾趴趴GO回地圖→關精靈的標記捲軸、
+        #   勾死亡回練功區→關精靈的陣亡自動復活（都由我們自己做，精靈搶先只會壞事）。
+        # ⚠ 2026-08-14 改：**不再開精靈主開關/自動戰鬥、也不推補給頁設定**——
+        #   回程補給改跑我們自己的 supply.run_full_supply，精靈全程讓開（使用者要求）。
         notes = []
         if self._mover is not None and self._mover.active:
             notes = robot.apply_prefs(
-                self._mover, self.sc, main_switch=True,
+                self._mover, self.sc,
                 jump_back=self.sup_jump_cb.isChecked(),
-                revive_mark=self.sup_revive_cb.isChecked(),
-                supply=self._supply_checked())
+                revive_mark=self.sup_revive_cb.isChecked())
+            # ★ 回程補給改跑我們自己的 → 把天使精靈自己的「回城補給」觸發全關掉
+            #   （使用者：「開始掛機把補給流程也關掉」），免得精靈也自己回城跑一趟撞我們。
+            notes += robot.disable_return_supply(self._mover, self.sc)
+            # ★ 勾了回程補給 → 保證購買清單裡有天使之翼×50（使用者要求保留）。
+            #   每趟補給都要用翼回城，清單有它 run_full_supply 的買水步驟才會補貨，
+            #   免得翼用完下一趟回不去。⚠ 只加翼、不開精靈的補給旗標。
+            if self._supply_checked():
+                note = robot.ensure_buy_item(
+                    self._mover, self.sc, recall.RECALL_ITEM,
+                    robot.BUY_KEEP_WINGS)
+                if note:
+                    notes.append(note)
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
@@ -4907,8 +4895,13 @@ class CharFarmPage(QWidget):
         notes = robot.apply_prefs(
             self._mover, self.sc,
             jump_back=self.sup_jump_cb.isChecked(),
-            revive_mark=self.sup_revive_cb.isChecked(),
-            supply=self._supply_checked())
+            revive_mark=self.sup_revive_cb.isChecked())
+        # ★ 勾了回程補給就保證購買清單有天使之翼×50（只加翼，不開精靈補給旗標）。
+        if self._supply_checked():
+            note = robot.ensure_buy_item(
+                self._mover, self.sc, recall.RECALL_ITEM, robot.BUY_KEEP_WINGS)
+            if note:
+                notes.append(note)
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 

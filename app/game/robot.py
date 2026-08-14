@@ -171,7 +171,7 @@ AS_BACK_BROKEN_EQ = 1502     # ★ 裝備損壞回城
 AS_BACK_NO_SPACE = 1504      # 背包滿了回城
 AS_IS_REPAIR = 1508          # ★ 回城後修理裝備
 # ⚠ 1509 是「使用**標記傳送捲軸**回練功點」，不是「補給完回去戰鬥」。
-#   （對照 SETTING/BASE/WND01.XML 控制項 10073 的 appdata。我一開始標錯過。）
+#   （對照 GAMEDATA/setting/BASE/WND01.XML 控制項 10073 的 appdata。我一開始標錯過。）
 #   關著的話精靈是**用走的**走回原練功點 —— 距離太遠或走不到就會停在城裡。
 AS_USE_RETURN_SCROLL = 1509
 AS_IS_BUY_ITEM = 1511        # 購買物品保持身上數量（⚠ 這**不是**回城觸發條件）
@@ -603,6 +603,32 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
                 set_bool(mover, scanner, var_id, False)
                 notes.append(f"關了「{label}」")
 
+    return notes
+
+
+# 天使精靈自己的「回城補給」觸發（勾了任何一個、精靈又在跑，它就會自己回城修裝買貨）。
+_RETURN_SUPPLY_TRIGGERS = (
+    (AS_BACK_BROKEN_EQ, "裝備損壞回城"),
+    (AS_BACK_NO_HP_ITEM, "HP藥水用完回城"),
+    (AS_BACK_NO_MP_ITEM, "MP藥水用完回城"),
+    (AS_BACK_NO_SPACE, "背包滿回城"),
+)
+
+
+def disable_return_supply(mover, scanner) -> list[str]:
+    """把天使精靈自己的「回城補給」觸發**全關掉**。回傳實際關了哪些。
+
+    ★ 2026-08-14：回程補給改跑我們自己的 `supply.run_full_supply`，所以要把精靈自己那套
+      回城觸發關掉——不然精靈（若主開關開著）也會自己回城跑一趟，跟我們的撞在一起。
+    ★ 只往「關」推：已經是關的完全不碰（純記憶體讀，成本趨近於零）。這是使用者明確要求
+      （「開始掛機把補給流程也關掉」），屬於 apply_prefs 那類「把精靈該讓開的關掉」的動作。
+    """
+    notes: list[str] = []
+    for var_id, label in _RETURN_SUPPLY_TRIGGERS:
+        ok, cur = get_bool(mover, scanner, var_id)
+        if ok and cur is not False:
+            set_bool(mover, scanner, var_id, False)
+            notes.append(f"關了精靈的「{label}」")
     return notes
 
 
@@ -1113,7 +1139,7 @@ def do_recall(mover, scanner, inv_head: int,
 def set_org_spot(mover, scanner) -> tuple[bool, object]:
     """按下面板上的「設定」鈕 —— 把**現在站的地方**記成搜尋中心／原練功點。
 
-    就是 `SETTING/BASE/WND01.XML` 控制項 10047 綁的那支 Lua 全域，0 個參數。
+    就是 `GAMEDATA/setting/BASE/WND01.XML` 控制項 10047 綁的那支 Lua 全域，0 個參數。
 
     ⚠⚠ **不設會半路停住**：黑狐記的原地圖是 125、人卻在 122，回城之後精靈
       不知道要回哪，就杵在城裡不動。
