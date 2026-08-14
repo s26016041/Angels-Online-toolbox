@@ -24,7 +24,7 @@
 表從哪來
 --------
 `assets/jumpmap.tsv`（120 筆）與 `assets/jumpmap_class.tsv`（14 個類別），
-`tools/build_jumpmap.py` 從遊戲資源包的 `SETTING/base/JumpMap.xml` ＋
+`tools/build_jumpmap.py` 從遊戲資源包的 `GAMEDATA/setting/base/JumpMap.xml` ＋
 `str_jumpmap.xml` ＋ `str_jumpmapclass.xml` 抽出來的。
 ⚠ 改版增減傳送點要重跑那支工具。
 

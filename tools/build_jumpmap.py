@@ -1,6 +1,6 @@
 """把遊戲資源包裡的「天使趴趴GO」傳送表抽成小檔，給 app/game/jumpmap.py 用。
 
-    py tools\\build_jumpmap.py [SETTING資料夾]
+    py tools\\build_jumpmap.py [GAMEDATA/setting資料夾]
 
 來源（`SYSTEM_GLOBAL.XML` 裡宣告的）：
     setting/base/JumpMap.xml                 跳地圖編號、場景編號、傳送座標、類別
@@ -35,7 +35,7 @@ TEXT = re.compile(r'(文字\d)="([^"]*)"')
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "SETTING"
+    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "GAMEDATA" / "setting"
 
     def find(*rel: str) -> Path:
         for r in rel:                       # 資料夾大小寫在不同版本不一致

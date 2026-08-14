@@ -1,6 +1,6 @@
 """把遊戲資源包的法術表抽成小檔，給 app/game/skills.py 用。
 
-    py tools\\build_skills.py [SETTING資料夾]
+    py tools\\build_skills.py [GAMEDATA/setting資料夾]
 
 來源：`setting/base/magic.xml`（3.5 MB、19312 個法術）
 只留自動補 buff 用得到的欄位，壓成幾十 KB。
@@ -26,7 +26,7 @@ ATTR = re.compile(r'([\w一-鿿]+)="([^"]*)"')
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "SETTING"
+    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "GAMEDATA" / "setting"
     src = None
     for rel in ("base/magic.xml", "BASE/MAGIC.XML"):
         if (setting / rel).is_file():

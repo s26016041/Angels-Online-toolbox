@@ -1,6 +1,6 @@
 """把每個技能的「射程」與「對象」抽成小表，給 app/game/skills.py 用。
 
-    py tools\\build_skill_range.py [SETTING資料夾]
+    py tools\\build_skill_range.py [GAMEDATA/setting資料夾]
 
 為什麼要獨立一張表：`assets/skills.tsv.gz` 只收**有持續時間**的技能（buff），
 攻擊技能全都不在裡面 —— 而掛機要知道的正是攻擊技能能打多遠。
@@ -25,7 +25,7 @@ ATTR = re.compile(r'([\w一-鿿]+)="([^"]*)"')
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "SETTING"
+    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "GAMEDATA" / "setting"
     src = None
     for rel in ("base/magic.xml", "BASE/MAGIC.XML"):
         if (setting / rel).is_file():

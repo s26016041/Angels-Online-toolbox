@@ -195,13 +195,13 @@ SAME_MAP_AS: dict[int, int] = {
 # 場景編號 → 中文地圖名
 #
 # 抄自遊戲資料，**不是**執行時解析出來的：
-#     SETTING/BASE/STAGE.XML             <場景 編號="105" 地圖檔="map\\map105.mpc"/>
-#     SETTING/BIG5/STRING/STR_STAGE.XML  <表格字串 編號="1290000105" 文字1="喧嘩雨林"/>
+#     GAMEDATA/setting/BASE/STAGE.XML             <場景 編號="105" 地圖檔="map\\map105.mpc"/>
+#     GAMEDATA/setting/BIG5/STRING/STR_STAGE.XML  <表格字串 編號="1290000105" 文字1="喧嘩雨林"/>
 # 對照關係是「表格字串編號 = 1290000000 + 場景編號」（已驗證）。
 #
 # ⚠ 跟 items.py 一樣是**寫死的遊戲資料**：改版新增地圖時這裡不會自動跟上，
 #   只會顯示成「場景 123」（不會顯示錯的名字）。要更新就重跑上面兩個 XML。
-#   那兩個檔在專案的 SETTING/ 底下，遊戲目錄那邊是打包在 .pak 裡的。
+#   那兩個檔在專案的 GAMEDATA/setting/ 底下，遊戲目錄那邊是打包在 .pak 裡的。
 # ---------------------------------------------------------------------------
 SCENE_NAMES: dict[int, str] = {
     2: "亂石海岸",

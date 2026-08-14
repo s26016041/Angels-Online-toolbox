@@ -1,10 +1,10 @@
 """把遊戲資源包裡的物品名稱抽成一個小檔，給 app/game/itemname.py 用。
 
-    py tools\\build_item_names.py [SETTING資料夾]
+    py tools\\build_item_names.py [GAMEDATA/setting資料夾]
 
 為什麼要先抽出來
 ----------------
-名稱在 `SETTING/BIG5/STRING/STR_ITEM*.XML`，七個檔加起來 **14MB** ——
+名稱在 `GAMEDATA/setting/BIG5/STRING/STR_ITEM*.XML`，七個檔加起來 **14MB** ——
 直接打包進 exe 太肥、每次啟動再解析也慢。這支把它壓成一個 gzip 的 TSV
 （約 300KB），放在 `assets/`，spec 已經整包收 assets 了。
 
@@ -55,7 +55,7 @@ def build(setting_dir: Path) -> dict[int, str]:
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "SETTING"
+    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "GAMEDATA" / "setting"
     names = build(setting)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     body = "".join(f"{k}\t{v}\n" for k, v in sorted(names.items()))

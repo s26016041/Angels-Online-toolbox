@@ -2,7 +2,7 @@
 
 ## 為什麼需要
 
-assets/ 底下有幾份從遊戲資源包（SETTING 解包）抽出來的寫死表：技能射程
+assets/ 底下有幾份從遊戲資源包（GAMEDATA/setting 解包）抽出來的寫死表：技能射程
 `skill_range.tsv.gz`、趴趴GO 地圖 `jumpmap.tsv`、技能／物品名稱等，加上
 程式裡的小表（`scene.SAME_MAP_AS`、`dailygift.REWARD_IDS`、`bag.FIRST_SLOT`…
 完整清單見 memory 的 items-table-maintenance）。遊戲改版動到內容時它們
@@ -16,7 +16,7 @@ pak-and-item-id-dead-ends），所以退而求其次：記住「這批表是對�
 
 ## 改版後的維護流程
 
-    1. 對新版 SETTING 解包重跑 tools/build_*.py，核對表有沒有變
+    1. 對新版 GAMEDATA/setting 解包重跑 tools/build_*.py，核對表有沒有變
     2. py tools\\stamp_tables.py   ← 對著開著的遊戲蓋章（寫 assets/table_stamp.json）
 
 ## 限制（要知道的兩件事）

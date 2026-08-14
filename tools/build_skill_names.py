@@ -1,6 +1,6 @@
 """把遊戲資源包的法術名稱抽成小檔，給 app/game/skills.py 的 name_of() 用。
 
-    py tools\\build_skill_names.py [SETTING資料夾]
+    py tools\\build_skill_names.py [GAMEDATA/setting資料夾]
 
 來源：`setting/big5/string/str_magic.xml` —— 名稱**不在** magic.xml 本體，
 在字串表：`表格字串 編號="1180000000+法術編號" 文字1="名稱"`
@@ -24,7 +24,7 @@ ROW = re.compile(r'<表格字串 編號="118(\d{7})" 文字1="([^"]*)"')
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "SETTING"
+    setting = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "GAMEDATA" / "setting"
     src = None
     for rel in ("big5/string/str_magic.xml", "BIG5/STRING/STR_MAGIC.XML"):
         if (setting / rel).is_file():

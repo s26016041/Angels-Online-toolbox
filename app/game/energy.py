@@ -28,7 +28,7 @@ cdecl、兩個整數、**沒有 this**，加解密與送出都由客戶端自己
 `0x589B27` 那個處理常式是**通用的 UI 送包指令**：從指令參數取出第 1、2 個
 token 當代碼與參數再送。所以 `(0x38, 1)` 是視窗定義帶進去的常數。
 
-遊戲裡的按鈕定義（`SETTING/BASE/WND04.XML`）：
+遊戲裡的按鈕定義（`GAMEDATA/setting/BASE/WND04.XML`）：
 
     id=24653 「能量晶化」    <OnCommand>OnClickEnergyRoll</OnCommand>
     id=24654 「我要晶能加倍」<OnCommand>OnClickEnergyDouble</OnCommand>
@@ -268,7 +268,7 @@ DECOMP_ITEMS = {
 
 # --- 「自動分解全部」：**不寫死名單，讀遊戲自己的欄位** -----------------
 #
-# ⚠⚠ 這裡原本做成一份 461 筆的寫死表（從 SETTING 抽出來的
+# ⚠⚠ 這裡原本做成一份 461 筆的寫死表（從 GAMEDATA/setting 抽出來的
 #   `assets/decomp_items.tsv`）。2026-08-08 把 `ItemData` 那張 Lua 綁定表
 #   逐支反組譯之後發現**判斷需要的三個欄位全都在記憶體裡**，所以整份表
 #   連同 `tools/build_decomp_items.py` 一起刪掉了 —— 照專案鐵則第一條，

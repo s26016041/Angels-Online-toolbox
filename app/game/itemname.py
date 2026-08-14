@@ -6,11 +6,11 @@
 表從哪來
 --------
 `assets/item_names.tsv.gz`（74127 筆、632KB），是 `tools/build_item_names.py`
-從遊戲資源包 `SETTING/BIG5/STRING/STR_ITEM*.XML` 抽出來的。
+從遊戲資源包 `GAMEDATA/setting/BIG5/STRING/STR_ITEM*.XML` 抽出來的。
 ⚠ **遊戲改版新增物品要重跑那支**，不然新物品只會顯示編號。
 
 ⚠ 這推翻了先前記的「物品 ID→名稱找不到」——那時只找過 .pak（真的加密），
-  沒去看使用者放進專案的 SETTING 資源包。
+  沒去看使用者放進專案的 GAMEDATA/setting 資源包。
 
 ★ **只在第一次要用到時才載入**（約 74000 筆、0.1 秒），之後整支程式共用同一份。
   查不到就回空字串 —— 呼叫端自己決定要不要退回顯示編號，絕不假裝知道。

@@ -39,5 +39,8 @@ reports/
 .DS_Store
 Thumbs.db
 
-# 遊戲自己的資料夾（從遊戲目錄複製進來的，不是專案的東西）
+# 遊戲自己的資料夾（從遊戲目錄複製／解包進來的，不是專案的東西）
+# ⚠ GAMEDATA/ 是 2026-08-14 改名後的家（setting＋map，約 2.9 GB）——
+#   沒擋住的話一個 git add -A 就把它整包塞進 repo。說明見 GAMEDATA.md（那份要進版控）。
 SETTING/
+GAMEDATA/
