@@ -393,8 +393,8 @@ class CharProducePage(QWidget):
         self.test_broken_btn = QPushButton("假裝裝備壞掉")
         self.test_broken_btn.setToolTip(
             "下一拍當成身上有裝備耐久剩 1 → 觸發回程補給那一趟：\n"
-            "天使之翼回程 → 5 秒後關自動採集 → 等 2 分鐘 →\n"
-            "趴趴GO 回原圖 → 走回定位點 → 重新設定＋開採集。\n"
+            "關自動採集＋ESC → 天使之翼回城 → 存倉庫 → 修裝 → 買水 →\n"
+            "趴趴GO 回原圖 → 走回標記點 → 重新設定＋開採集＋開主精靈。\n"
             "★ 只有這一次是假的。\n"
             "⚠ 要先勾「開始自動生產」才有作用。")
         self.test_broken_btn.clicked.connect(self._test_broken)
@@ -836,9 +836,6 @@ class CharProducePage(QWidget):
         # ★★★ 2026-08-14 改：回程補給改跑**我們自己**的 supply.run_full_supply
         #   （存倉庫→修裝→買水→趴趴GO回原地），不再交給天使精靈。
         #   ⚠ 補給時**先關掉自動採集**（使用者要求）——不然它會跟補給的走位互相打架。
-        me = self._my_pos()
-        tgt = self.target()
-        center = (tgt.x, tgt.y) if tgt else (me or (0.0, 0.0))
         sid = scene.current_id(self.sc)    # 出發地圖：回來要驗「人真的回到這」
         try:
             robot.end_gather(self._mover, self.sc)
@@ -852,8 +849,10 @@ class CharProducePage(QWidget):
             win.send_key(self.hwnd, self.VK_ESCAPE)
         except Exception:                                     # noqa: BLE001
             pass
+        # ⚠ 不記中心點：收尾一律走「back」腿，resume 那一步會照**生產頁當下的
+        #   設定**重算中心點（使用者要求「使用生產頁面的設定」）。
         sup = {"t0": time.monotonic(), "result": None,
-               "progress": "壞裝→回程補給", "center": center, "scene": sid}
+               "progress": "壞裝→回程補給", "scene": sid}
         self._sup = sup
         mv, sc = self._mover, self.sc
 
@@ -886,7 +885,8 @@ class CharProducePage(QWidget):
 
     def _supply_tick(self) -> None:
         """補給那一趟：**背景執行緒**跑我們自己的 `run_full_supply`（存倉庫→修裝→買水→
-        趴趴GO回原地），這裡只**輪詢完成**——回來了就**重開自動採集**、繼續採。
+        趴趴GO回原地），這裡只**輪詢完成**——回來了就交給「back」腿
+        （走回標記點→重新設定→開採集→最後開主精靈）。
 
         ⚠ 採集在 `_check_broken` 開跑時就已關掉（使用者要求），整趟精靈不插手。
         ⚠ 有 SUPPLY_MAX_SECS 兜底：執行緒卡死就放棄，交回主 tick 自己把採集重開起來。
@@ -922,16 +922,14 @@ class CharProducePage(QWidget):
                 self._trip_start("back", f"補給結束但人不在採集圖（{msg}）"
                                          "→ 傳回去再開工")
                 return
-            me = self._my_pos()
-            center = s["center"] or (me or (0.0, 0.0))
-            try:
-                notes = robot.begin_gather(self._mover, self.sc, center,
-                                           scene.current_id(self.sc),
-                                           self.wanted())
-            except Exception as exc:                          # noqa: BLE001
-                notes = [f"⚠ 重開採集失敗：{exc}"]
-            self._watch_reset()
-            self._note(f"補給完成：{msg} → 回來重開採集　" + "、".join(notes))
+            # ★★ 人已在採集圖也**一樣走 back 腿**（→walk_spot→resume）。
+            #   ⚠ 以前這裡在**趴趴GO落地點**就地 begin_gather ——落地點到採集區
+            #   常隔一大段，精靈自己的走位是遊戲尋路，距離一遠回 0 個路徑點＝
+            #   一步都不走 →「回到紀錄地圖後卡住」（2026-08-15 使用者回報；
+            #   跟 _walk_to 註解那個「卡在還有 60 格」同一型）。back 腿用
+            #   地形圖 A*（Navigator）走回標記點，到了才照生產頁設定重開。
+            self._trip_start("back", f"補給完成（{msg}）"
+                                     "→ 走回標記點、重新設定後開工")
             return
         # 逾時兜底：作廢這一趟的結果。⚠ 執行緒殺不掉、可能還在開車 ——
         #   _gather_tick 會看 _sup_thread.is_alive() 全程讓開，它真的結束後
