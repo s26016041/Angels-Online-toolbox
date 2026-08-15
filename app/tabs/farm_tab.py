@@ -73,7 +73,8 @@ from app.game import (aob, attack, bag, buff, channel, entity, inventory,
                       player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
-from app.tabs.base_tab import BaseTab, fit_list, fit_spin, no_elide
+from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list, fit_spin,
+                               no_elide)
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
 # 平常是關的 —— 從外面看不到「為什麼不走」，只能靠這個。
@@ -2886,7 +2887,7 @@ class CharFarmPage(QWidget):
         # ★ 分流數讀遊戲載進記憶體的伺服器清單，改版增減分流會自動跟上。
         #   ⚠ channel.count() 是**全記憶體掃描**（一次 0.3~1 秒）而這裡跑在
         #   GUI 執行緒 —— 所以只有第一次（_rot_max 還是 0）才掃，之後重用：
-        #   分流數一個 session 內不會變，重新偵測分身時分頁整個重建、
+        #   分流數一個 session 內不會變；分頁只在分身重開時重建、
         #   快取自然歸零。讀不到就整輪跳過 ——
         #   寧可不換，也不要拿猜的數字去送。
         n = self._rot_max or channel.count(self.sc, self.hwnd)
@@ -4067,7 +4068,7 @@ class CharFarmPage(QWidget):
         if self.sc.alive():
             return False
         self.halt("⚠ 這個遊戲視窗已經關閉 → 這台分身已停止"
-                  "（重開遊戲之後按上面的「重新偵測分身」）", gone=True)
+                  "（重開遊戲登入後會自動接上）", gone=True)
         return True
 
     def tick(self, dt: float) -> None:
@@ -5042,11 +5043,15 @@ class CharFarmPage(QWidget):
         self.status.setText(msg)
 
 
-class FarmTab(BaseTab):
+class FarmTab(ClientWatchMixin, BaseTab):
     """自動掛機。
 
     出手方式由頁面上的「攻擊型態」決定（遠程送封包、近戰按鍵），
     所以不需要兩個分頁 —— 之前那個「自動練功按鍵」分頁已經移除。
+
+    分身列表**背景自動對帳**（沒有「重新偵測分身」按鈕了）：關掉的收走、
+    新開的補上、沒動的分頁完全不碰 —— 掛機中的分頁絕不重建。
+    勾勾的意向記憶見 ClientWatchMixin（存程式記憶體，不進 config）。
     """
 
     TAB_TITLE = "自動掛機"
@@ -5056,20 +5061,16 @@ class FarmTab(BaseTab):
 
     def build_ui(self) -> None:
         self._pages: dict[int, CharFarmPage] = {}
-        self._scanners: list[MemoryScanner] = []
+        self._scanners: dict[int, MemoryScanner] = {}
         self._worker: ScanWorker | None = None
         self._inv: InvWorker | None = None    # 找物品陣列表頭（AOB 全掃，很慢）
-        self._keys: list[_Paced] = []         # 每個分身：寫入執行緒 + 送鍵執行緒
+        # 每個分身一對（寫入執行緒, 送鍵執行緒）—— 收掉那台時只停它自己的
+        self._keys: dict[int, tuple[_Paced, _Paced]] = {}
+        self._watch_init()
 
         root = QVBoxLayout(self)
 
         bar = QHBoxLayout()
-        self.rescan_btn = QPushButton("重新偵測分身")
-        # ★ 按鈕要 force_names=True：同一台登出換角色 pid 不變，
-        #   不強制重掃的話分頁標籤永遠是舊角色名。
-        self.rescan_btn.clicked.connect(
-            lambda: self.reload_instances(force_names=True))
-        bar.addWidget(self.rescan_btn)
         self.found = QLabel("尚未偵測")
         self.found.setStyleSheet("color: #9aa2b8;")
         bar.addWidget(self.found)
@@ -5119,8 +5120,7 @@ class FarmTab(BaseTab):
 
     # ------------------------------------------------------------------
     def on_show(self) -> None:
-        if not self._pages:
-            self.reload_instances()
+        self._watch_start()          # 第一次切過來才開始對帳（懶載入照舊）
         self._refresh_shown()
 
     def _refresh_shown(self) -> None:
@@ -5135,60 +5135,101 @@ class FarmTab(BaseTab):
         if isinstance(page, CharFarmPage):
             page._since_scan = SCAN_NOW
 
-    def reload_instances(self, force_names: bool = False) -> None:
-        # force_names：只有按「重新偵測分身」才 True。on_show 的自動載入
-        # 走快取，不然第一次切分頁又會卡好幾秒（preload 就是為此而生）。
-        self._teardown()
-        insts = []
-        seen = set()
-        for w in win.enumerate_windows(title_contains="Angels Online"):
-            if "_MIDAGEONL_" not in w.class_name or w.pid in seen:
-                continue
-            seen.add(w.pid)
-            sc = MemoryScanner()
-            try:
-                sc.open(w.pid)
-            except Exception:
-                continue
-            # ★ 接上第一台就用 AOB 掃一次，把所有寫死的遊戲位址換成當下正確的
-            #   —— 遊戲改版會讓它們整批位移（見 app/game/locate.py）。
-            #   只做一次（五台載的是同一份 angel.dat），失敗就保留原值。
-            try:
-                locate.warm(sc)
-                self._show_locate()
-            except Exception:                  # noqa: BLE001
-                pass                           # 定位是加分項，壞掉不能擋住掛機
-            self._scanners.append(sc)
-            insts.append((w.pid, w.hwnd, w.title, sc))
-        if not insts:
-            self.found.setText("找不到分身")
+    def _found_note(self) -> None:
+        self.found.setText(f"偵測到 {len(self._pages)} 個分身"
+                           if self._pages else "找不到分身")
+
+    def _ensure_workers(self) -> None:
+        """共用的兩條工作執行緒建一次就一直留著（分身歸零也不收 —— 閒著沒成本，
+        再開分身直接接上）。"""
+        if self._worker is None:
+            self._worker = ScanWorker()
+            self._worker.done.connect(self._on_scan_done)
+            # 掃描讓路給攻擊：掃描是大量記憶體讀取，攻擊只要準時。
+            self._worker.start(QThread.LowPriority)
+        if self._inv is None:
+            self._inv = InvWorker()
+            self._inv.found.connect(self._on_inv_found)
+            self._inv.start(QThread.LowestPriority)
+
+    def _client_new(self, w) -> None:
+        """接上一台新分身。開失敗就先跳過 —— 下一拍對帳會再試。"""
+        sc = MemoryScanner()
+        try:
+            sc.open(w.pid)
+        except Exception:                      # noqa: BLE001
             return
+        # ★ 接上就用 AOB 掃一次，把所有寫死的遊戲位址換成當下正確的
+        #   —— 遊戲改版會讓它們整批位移（見 app/game/locate.py）。
+        #   只做一次（五台載的是同一份 angel.dat），失敗就保留原值。
+        try:
+            locate.warm(sc)
+        except Exception:                      # noqa: BLE001
+            pass                               # 定位是加分項，壞掉不能擋住掛機
+        self._scanners[w.pid] = sc
+        self._ensure_workers()
+        tgt, keys = TargetWorker(sc), KeyWorker(w.hwnd, sc)
+        tgt.start(QThread.HighPriority)
+        keys.start(QThread.HighPriority)
+        self._keys[w.pid] = (tgt, keys)
+        acct = charname.account_from_title(w.title)
+        # ⚠ 只查預讀快取，**不要在這裡掃記憶體**（GUI 執行緒；全掃一台
+        #   1.1~1.8 秒）。新開的還在登入畫面讀不到名字 → 先用帳號當標籤，
+        #   mixin 的背景重讀解出真名後會自己換掉。見 app/core/preload.py。
+        nm = preload.name_of(w.pid, account=acct)
+        # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
+        page = CharFarmPage(w.pid, w.hwnd, w.title, sc, self._request_scan,
+                            tgt, keys, None, acct, nm,
+                            self.ATTACK_MODE, self.SETTINGS_PREFIX)
+        page._notifier.failed.connect(self.found.setText)
+        page.run_cb.clicked.connect(lambda _on, p=page: self._note_intent(p))
+        self._pages[w.pid] = page
+        self.tabs.addTab(page, nm or acct or str(w.pid))
         self._show_locate()
-        self._worker = ScanWorker()
-        self._worker.done.connect(self._on_scan_done)
-        # 掃描讓路給攻擊：掃描是大量記憶體讀取，攻擊只要準時。
-        self._worker.start(QThread.LowPriority)
-        self._inv = InvWorker()
-        self._inv.found.connect(self._on_inv_found)
-        self._inv.start(QThread.LowestPriority)
-        for pid, hwnd, title, sc in insts:
-            tgt, keys = TargetWorker(sc), KeyWorker(hwnd, sc)
-            tgt.start(QThread.HighPriority)
-            keys.start(QThread.HighPriority)
-            self._keys += [tgt, keys]
-            acct = charname.account_from_title(title)
-            # ⚠ 用預讀的快取，**不要叫 charname.read_character_name()** ——
-            #   那是全記憶體掃字串，一台 1.1~1.8 秒、五台就是七、八秒的凍結
-            #   （使用者回報「第一次切過去會卡一下」）。見 app/core/preload.py。
-            nm = preload.name_of(pid, sc, acct, force=force_names)
-            # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
-            page = CharFarmPage(pid, hwnd, title, sc, self._request_scan,
-                                tgt, keys, None, acct, nm,
-                                self.ATTACK_MODE, self.SETTINGS_PREFIX)
-            page._notifier.failed.connect(self.found.setText)
-            self._pages[pid] = page
-            self.tabs.addTab(page, nm)
-        self.found.setText(f"偵測到 {len(insts)} 個分身")
+        self._found_note()
+        self._maybe_resume(page)
+
+    def _client_gone(self, pid: int) -> None:
+        """收掉一台已關閉的分身（只動這一台；其他台的掛機完全不受影響）。
+
+        順序照 on_close 那套：放勾勾 → 還跳板 → 停警報 → 停它自己的兩條
+        執行緒 → 拆分頁 → 關 scanner（執行緒沒收乾淨就不關，理由同 on_close）。
+        """
+        page = self._pages.pop(pid)
+        try:
+            page.run_cb.setChecked(False)      # 遊戲已關，停止流程的讀寫會自己失敗
+        except Exception:                      # noqa: BLE001
+            pass
+        # ⚠ 一定要還掉移動 hook；用 release() 不要 stop()（PID 共用，見 move.acquire）
+        if page._mover is not None:
+            try:
+                move.release(page.pid, page)
+            except Exception:                  # noqa: BLE001
+                pass
+            page._mover = None
+        if page._notifier is not None:
+            try:
+                page._notifier.stop()
+            except Exception:                  # noqa: BLE001
+                pass
+        stuck = False
+        for th in self._keys.pop(pid, ()):
+            th.stop()
+            if not th.wait(5000):
+                stuck = True
+        i = self.tabs.indexOf(page)
+        if i >= 0:
+            self.tabs.removeTab(i)
+        page.deleteLater()
+        sc = self._scanners.pop(pid, None)
+        # ⚠ 執行緒沒停乾淨／背景還在讀名字 → scanner 不准關（控制碼會被回收
+        #   給別的物件用），寧可漏關，行程結束 OS 自然會收。
+        if sc is not None and not stuck and not self._sc_busy(pid):
+            try:
+                sc.close()
+            except Exception:                  # noqa: BLE001
+                pass
+        self._found_note()
 
     def _request_scan(self, pid: int, full: bool = False) -> bool:
         """把掃描請求排進工作執行緒。**回傳有沒有真的排進去**。
@@ -5268,13 +5309,16 @@ class FarmTab(BaseTab):
                 except Exception:                    # noqa: BLE001
                     pass
         stuck = False
-        for th in [t for t in (self._worker, self._inv) if t] + self._keys:
+        threads = [t for t in (self._worker, self._inv) if t]
+        for pair in self._keys.values():
+            threads += list(pair)
+        for th in threads:
             th.stop()
             if not th.wait(5000):
                 stuck = True
         self._worker = None
         self._inv = None
-        self._keys = []
+        self._keys = {}
         self.tabs.clear()
         self._pages = {}
         # ⚠⚠ 有執行緒沒收乾淨就**不要關控制碼**：牠可能正卡在
@@ -5282,15 +5326,18 @@ class FarmTab(BaseTab):
         #   最壞的情況是那個控制碼值被系統回收給別的物件用。
         #   寧可留著不關（行程結束時作業系統自然會收）。
         if stuck:
-            self._scanners = []
+            self._scanners = {}
             return
-        for sc in self._scanners:
+        for pid, sc in self._scanners.items():
+            if self._sc_busy(pid):             # 背景讀名字中，理由同上
+                continue
             try:
                 sc.close()
             except Exception:
                 pass
-        self._scanners = []
+        self._scanners = {}
 
     def on_close(self) -> None:
         self._timer.stop()
+        self._watch_stop()
         self._teardown()

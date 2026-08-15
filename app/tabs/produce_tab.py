@@ -149,7 +149,8 @@ from app.core.memory import MemoryScanner
 from app.game import (bag, entity, gather, itemname, jumpmap, locate, lua, move,
                       navigate, produce, recall, recipes, robot, scene, scenery,
                       supply)
-from app.tabs.base_tab import BaseTab, fit_list, no_elide
+from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list,
+                               no_elide)
 
 SETTINGS_PREFIX = "produce"
 # 採集動作還沒接上時，狀態列一定會附上的尾巴。
@@ -1918,25 +1919,22 @@ class CharProducePage(QWidget):
             self._mover = None
 
 
-class ProduceTab(BaseTab):
-    """自動生產。"""
+class ProduceTab(ClientWatchMixin, BaseTab):
+    """自動生產。分身列表**背景自動對帳**（沒有「重新偵測分身」按鈕了）：
+    關掉的收走、新開的補上、沒動的分頁完全不碰 —— 正在採集/生產的不會被打斷。
+    勾勾的意向記憶見 ClientWatchMixin（存程式記憶體，不進 config）。"""
 
     TAB_TITLE = "自動生產"
     ORDER = 6                        # 緊接在自動掛機（5）後面
 
     def build_ui(self) -> None:
         self._pages: dict[int, CharProducePage] = {}
-        self._scanners: list[MemoryScanner] = []
+        self._scanners: dict[int, MemoryScanner] = {}
+        self._watch_init()
 
         root = QVBoxLayout(self)
 
         bar = QHBoxLayout()
-        self.rescan_btn = QPushButton("重新偵測分身")
-        # ★ 按鈕要 force_names=True：同一台登出換角色 pid 不變，
-        #   不強制重掃的話分頁標籤永遠是舊角色名（見 app/core/preload.py）。
-        self.rescan_btn.clicked.connect(
-            lambda: self.reload_instances(force_names=True))
-        bar.addWidget(self.rescan_btn)
         self.found = QLabel("尚未偵測")
         self.found.setStyleSheet("color: #9aa2b8;")
         bar.addWidget(self.found)
@@ -1951,41 +1949,62 @@ class ProduceTab(BaseTab):
 
     # ------------------------------------------------------------------
     def on_show(self) -> None:
-        if not self._pages:
-            self.reload_instances()
+        self._watch_start()          # 第一次切過來才開始對帳（懶載入照舊）
 
-    def reload_instances(self, force_names: bool = False) -> None:
-        """重建分身子分頁。
+    def _found_note(self) -> None:
+        self.found.setText(f"偵測到 {len(self._pages)} 個分身"
+                           if self._pages else "找不到分身")
 
-        force_names：只有按「重新偵測分身」才 True。自動載入走預讀快取，
-        不然第一次切過來又要等好幾秒的全記憶體掃描（見 app/core/preload.py）。
-        """
-        self._teardown()
-        wins = preload.windows()
-        if not wins:
-            self.found.setText("找不到分身")
+    def _client_new(self, w) -> None:
+        """接上一台新分身。開失敗就先跳過 —— 下一拍對帳會再試。"""
+        acct = charname.account_from_title(w.title) or ""
+        sc = MemoryScanner()
+        try:
+            sc.open(w.pid)
+        except Exception:                      # noqa: BLE001
             return
-        for w in wins:
-            acct = charname.account_from_title(w.title) or ""
-            sc = MemoryScanner()
-            try:
-                sc.open(w.pid)
-            except Exception:                      # noqa: BLE001
-                continue
-            # ★ 接上就用 AOB 掃一次，把寫死的遊戲位址換成當下正確的
-            #   —— 遊戲改版會讓它們整批位移（見 app/game/locate.py）。
-            #   只會真的做一次（五台載的是同一份 angel.dat）。
-            try:
-                locate.warm(sc)
-            except Exception:                      # noqa: BLE001
-                pass                               # 定位是加分項，不能擋住分頁
-            self._scanners.append(sc)
-            nm = preload.name_of(w.pid, sc, acct, force=force_names)
-            page = CharProducePage(w.pid, w.hwnd, w.title, sc, acct, nm)
-            self._pages[w.pid] = page
-            self.tabs.addTab(page, nm)
+        # ★ 接上就用 AOB 掃一次，把寫死的遊戲位址換成當下正確的
+        #   —— 遊戲改版會讓它們整批位移（見 app/game/locate.py）。
+        #   只會真的做一次（五台載的是同一份 angel.dat）。
+        try:
+            locate.warm(sc)
+        except Exception:                      # noqa: BLE001
+            pass                               # 定位是加分項，不能擋住分頁
+        self._scanners[w.pid] = sc
+        # 只查預讀快取（開程式時已解過一輪）。新開的還在登入畫面讀不到名字
+        # → 先用帳號當標籤，mixin 的背景重讀解出真名後會自己換掉。
+        nm = preload.name_of(w.pid, account=acct)
+        page = CharProducePage(w.pid, w.hwnd, w.title, sc, acct, nm)
+        page.run_cb.clicked.connect(lambda _on, p=page: self._note_intent(p))
+        self._pages[w.pid] = page
+        self.tabs.addTab(page, nm or acct or str(w.pid))
         self._show_locate()
-        self.found.setText(f"偵測到 {len(self._pages)} 個分身")
+        self._found_note()
+        self._maybe_resume(page)
+
+    def _client_gone(self, pid: int) -> None:
+        """收掉一台已關閉的分身（只動這一台，其他分頁不受影響）。"""
+        page = self._pages.pop(pid)
+        try:
+            page.run_cb.setChecked(False)      # 停止流程；遊戲已關，讀寫會自己失敗
+        except Exception:                      # noqa: BLE001
+            pass
+        try:
+            page.close_page()
+        except Exception:                      # noqa: BLE001
+            pass
+        i = self.tabs.indexOf(page)
+        if i >= 0:
+            self.tabs.removeTab(i)
+        page.deleteLater()
+        sc = self._scanners.pop(pid, None)
+        # ⚠ 背景還在用這個 scanner 讀名字就不關（見 mixin 檔頭），OS 會收
+        if sc is not None and not self._sc_busy(pid):
+            try:
+                sc.close()
+            except Exception:                  # noqa: BLE001
+                pass
+        self._found_note()
 
     def _show_locate(self) -> None:
         """AOB 定位失敗要**大聲**：不講的話使用者只會看到「怪怪的」。"""
@@ -2003,18 +2022,18 @@ class ProduceTab(BaseTab):
         self.locate_lbl.setStyleSheet(f"color: {color};" if color else "")
 
     # ------------------------------------------------------------------
-    def _teardown(self) -> None:
+    def on_close(self) -> None:
+        self._watch_stop()
         for page in self._pages.values():
             page.run_cb.setChecked(False)
             page.close_page()
         self.tabs.clear()
         self._pages = {}
-        for sc in self._scanners:
+        for pid, sc in self._scanners.items():
+            if self._sc_busy(pid):             # 背景讀名字中，控制碼不准關
+                continue
             try:
                 sc.close()
-            except Exception:                      # noqa: BLE001
+            except Exception:                  # noqa: BLE001
                 pass
-        self._scanners = []
-
-    def on_close(self) -> None:
-        self._teardown()
+        self._scanners = {}
