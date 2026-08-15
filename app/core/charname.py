@@ -17,8 +17,17 @@ import re
 
 
 def account_from_title(title: str) -> str:
-    """'Angels Online Global - fred26016041(雅典娜-3)' → 'fred26016041'。"""
-    tail = title.split(" - ", 1)[1] if " - " in title else title
+    """'Angels Online Global - fred26016041(雅典娜-3)' → 'fred26016041'。
+
+    還沒登入的標題沒有「 - 」→ 回空字串。
+    ⚠ 防護一定要放在這裡面：以前只有呼叫端各自加「" - " in title」的檢查
+      （login_tab／master_tab／multi_tab 三份），沒加的地方（base_tab 對帳）
+      會把整個標題「Angels Online Global」當帳號用，
+      「登入後整頁重建」那條分支就永遠不會觸發。
+    """
+    if " - " not in title:
+        return ""
+    tail = title.split(" - ", 1)[1]
     return tail.split("(", 1)[0].strip()
 
 

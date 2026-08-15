@@ -83,6 +83,22 @@ class ClientWatchMixin:
     每 WATCH_MS 對一次帳（跟遊戲總控同節奏）：關掉的分身收走、新開的補上、
     **沒動的完全不碰**（正在掛機／生產的分頁絕不重建）。
 
+    ## 「沒動」要驗身分，不能只看 pid（2026-08-15 斷線事故的教訓）
+
+    斷網時所有分身退回登入畫面，pid 全都沒變；而一鍵登入是把帳號填進
+    「**第一台空著的**視窗」（login_tab 的 find_client），重登之後帳號跟視窗的
+    配對幾乎必然洗牌 —— 只認 pid 的對帳完全不會發現，結果就是拿 A 帳號的
+    設定去指揮 B 的角色（實際發生：黑狐的分頁指揮著雪狐在跑）。
+    所以每一拍都要拿**視窗標題裡的帳號**對身分：
+
+        標題帳號消失      → 記進 _relog（退回登入畫面；回來的可能是別人）
+        標題帳號 ≠ 頁帳號 → 整頁重建（設定照帳號存，舊頁整個不能用）
+        _relog 後同帳號回來 → 角色名重解（自動登入固定進第 1 隻角色，
+                              同帳號登回來的也可能是另一隻）
+
+    ⚠ 換人時 preload 的「pid→角色名」快取一定要 forget()：不清的話重建的頁
+      會從快取撿回上一個人的名字，而名字一旦解出就不再重讀（_name_ok）。
+
     子類別要提供：
         self._pages : dict[pid, page]，page 要有 account / char_name / run_cb / sc
         self.tabs   : QTabWidget（子分頁容器）
@@ -116,8 +132,12 @@ class ClientWatchMixin:
         self._watch_timer: QTimer | None = None
         self._intent: dict[str, bool] = {}      # 帳號 → 使用者最後一次親手勾/取消
         self._nm_busy: set[int] = set()         # 正在背景讀名字的 pid
-        self._nm_done: dict[int, str] = {}      # 背景讀完等 GUI 收的結果
+        # 背景讀完等 GUI 收的結果：pid → (當時的帳號, 角色名)。
+        # ⚠ 要帶帳號：讀到一半分頁被重建（換帳號）時，舊帳號的結果必須丟棄，
+        #   不然舊名字會黏到新帳號的分頁上、之後永遠不再重讀。
+        self._nm_done: dict[int, tuple[str, str]] = {}
         self._nm_next: dict[int, float] = {}    # pid → 下次允許重讀的時刻
+        self._relog: set[int] = set()           # 退回登入畫面過、等重新驗身分的 pid
 
     def _watch_start(self) -> None:
         """第一次切到分頁才開始跑（保持懶載入：沒開過這個分頁就完全不動）。
@@ -161,10 +181,13 @@ class ClientWatchMixin:
     # -- 對帳主迴圈 ----------------------------------------------------
     def _watch_tick(self) -> None:
         # 1. 收背景解出來的角色名（換標籤、補套意向）
-        for pid, nm in list(self._nm_done.items()):
+        for pid, (acct, nm) in list(self._nm_done.items()):
             self._nm_done.pop(pid, None)
             page = self._pages.get(pid)
-            if page is None or not nm or nm == page.char_name:
+            # 帳號對不上＝讀到一半這台換了人（分頁已重建）→ 結果作廢，
+            # 步驟 3 會用新帳號再讀一次。
+            if (page is None or acct != page.account
+                    or not nm or nm == page.char_name):
                 continue
             page.char_name = nm
             i = self.tabs.indexOf(page)
@@ -172,22 +195,41 @@ class ClientWatchMixin:
                 self.tabs.setTabText(i, nm)
             self._maybe_resume(page)
 
-        # 2. 視窗對帳：關掉的收走、新開的補上（沒動的不碰）
+        # 2. 視窗對帳：關掉的收走、新開的補上、**換了人的整頁重建**
         wins = {w.pid: w for w in preload.windows()}
         for pid in [p for p in list(self._pages) if p not in wins]:
+            self._relog.discard(pid)
             self._client_gone(pid)
         for pid, w in wins.items():
             page = self._pages.get(pid)
             if page is None:
                 self._client_new(w)
                 continue
-            # 開在登入畫面的分身，視窗標題裡的帳號是登入後才有的 ——
-            # 帳號一出現就整頁重建（設定是照帳號存的，空帳號那頁載不到）。
-            # 這台一定沒在跑（沒登入），重建不會打斷任何事。
             acct = charname.account_from_title(w.title)
-            if not page.account and acct:
+            if not acct:
+                # 退回登入畫面（斷線／登出）。標題帳號是登入後才有的，
+                # 現在什麼都不能斷定 —— 先記著，等有人登進來再驗身分。
+                if page.account:
+                    self._relog.add(pid)
+                continue
+            if acct != page.account:
+                # 同一台視窗換了帳號（斷線後一鍵登入把帳號填進「第一台空的」，
+                # 配對會洗牌；也涵蓋原本開在登入畫面、現在首次登入的頁）。
+                # 設定是照帳號存的 —— 舊頁整個不能用，重建。
+                # 重建會放掉勾勾，但意向照帳號記著，登入驗完名字會自動接回去。
+                self._relog.discard(pid)
+                preload.forget(pid)          # pid→角色名快取已是上一個人的
+                self._nm_next.pop(pid, None)  # 新頁的名字立刻重解，不等節流
                 self._client_gone(pid)
                 self._client_new(w)
+                continue
+            if pid in self._relog:
+                # 同帳號重新登入：角色可能換了（自動登入固定進第 1 隻）。
+                # 名字退回「未解出」讓步驟 3 重讀；解出後換標籤、補套意向。
+                self._relog.discard(pid)
+                preload.forget(pid)
+                page.char_name = page.account
+                self._nm_next.pop(pid, None)
 
         # 3. 名字還沒解出來的：丟背景執行緒重讀（節流、一個 pid 一條）
         now = time.monotonic()
@@ -208,5 +250,5 @@ class ClientWatchMixin:
         except Exception:                          # noqa: BLE001
             nm = ""
         # 先放結果再解除 busy —— 反過來的話 _client_gone 可能在空窗關掉 scanner
-        self._nm_done[pid] = nm or ""
+        self._nm_done[pid] = (acct, nm or "")
         self._nm_busy.discard(pid)

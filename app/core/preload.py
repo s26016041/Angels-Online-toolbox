@@ -129,6 +129,17 @@ def forget_state(pid: int) -> None:
     _states.pop(pid, None)
 
 
+def forget(pid: int) -> None:
+    """同一個 pid 裡**換了人**（斷線重登、登出換帳號）—— 名字、狀態快取全作廢。
+
+    ⚠ 不作廢的話，重建的分頁會用 `name_of()` 從快取撿回**上一個人**的名字，
+      而名字一旦「像是解出來了」就不會再重讀（見 base_tab 的 _name_ok），
+      舊名字就永遠黏在新帳號的分頁上。
+    """
+    _names.pop(pid, None)
+    _states.pop(pid, None)
+
+
 def _warm_libs() -> None:
     """把「第一次 import 要幾百毫秒」的第三方庫先載起來（keystone 組譯器 DLL）。
 
