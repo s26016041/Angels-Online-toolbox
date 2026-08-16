@@ -47,20 +47,31 @@ def main() -> None:
         # ★ 攻擊型：分辨「這招打不打得死人」。瞬移術、歃血狂暴、聖療術、
         #   復活術都不是攻擊型 —— 放進攻擊循環只會浪費甚至幫倒忙
         #   （實際踩到：黑狐勾了 F3 瞬移術，等於每 0.15 秒往怪的位置瞬移一次）。
+        # ★ 召喚型：`動態參數1` ＝召喚出來的**怪物範本編號**（實體的 type_id）。
+        #   實機對照：781 召喚噬魂怪Ⅰ → 5014（黑狐實測召喚物 type_id 正是 5014）；
+        #   150 召喚吸血鬼Ⅲ → 222 → str_monster 1200000222「死亡吸血鬼Ⅲ」。
+        #   自動召喚認養**不能**拿「技能名去掉『召喚』」去比名字 ——
+        #   吸血鬼系的召喚物就不叫「吸血鬼Ⅲ」，比名字＝永遠認不到＝每 6 秒白放
+        #   （朋友實掛踩到的 bug）。⚠ 非召喚型的 動態參數1 是別的意思，不能抽。
+        smn = (a.get("動態參數1", "") if a.get("召喚型") == "是" else "")
         rows.append((int(a["編號"]), int(float(rng or 0)), a.get("對象", ""),
-                     1 if a.get("攻擊型") == "是" else 0))
+                     1 if a.get("攻擊型") == "是" else 0,
+                     int(float(smn)) if smn else ""))
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    body = "".join(f"{i}\t{r}\t{t}\t{k}\n" for i, r, t, k in rows)
+    body = "".join(f"{i}\t{r}\t{t}\t{k}\t{s}\n" for i, r, t, k, s in rows)
     OUT.write_bytes(gzip.compress(body.encode("utf-8"), 9))
     print(f"技能 {len(rows)} 個 → {OUT}（{OUT.stat().st_size / 1024:.0f} KB）")
-    ground = sum(1 for _i, _r, t, _k in rows if t == "地面")
-    atk = sum(1 for _i, _r, _t, k in rows if k)
-    print(f"   其中對象=地面（要指定位置）{ground} 個、攻擊型 {atk} 個")
-    for probe in (737, 743, 257, 920, 330, 259):
+    ground = sum(1 for _i, _r, t, _k, _s in rows if t == "地面")
+    atk = sum(1 for _i, _r, _t, k, _s in rows if k)
+    smn_n = sum(1 for _i, _r, _t, _k, s in rows if s != "")
+    print(f"   其中對象=地面（要指定位置）{ground} 個、攻擊型 {atk} 個、"
+          f"召喚型 {smn_n} 個")
+    for probe in (737, 743, 257, 920, 330, 259, 150, 781):
         hit = next((r for r in rows if r[0] == probe), None)
         print(f"   驗證 {probe}（{probe:#x}）→ 射程 {hit[1] if hit else '?'}"
-              f" 對象 {hit[2] if hit else '?'} 攻擊型 {hit[3] if hit else '?'}")
+              f" 對象 {hit[2] if hit else '?'} 攻擊型 {hit[3] if hit else '?'}"
+              f" 召喚 {hit[4] if hit else '?'}")
 
 
 if __name__ == "__main__":

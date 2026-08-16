@@ -88,18 +88,24 @@ def name_of(skill_id: int) -> str:
 _ranges: dict[int, int] | None = None
 _targets: dict[int, str] | None = None
 _attacks: set[int] | None = None
+_summons: dict[int, int] | None = None
 
 GROUND = "地面"          # 對象＝地面：施放要指定位置（見 is_ground）
 
 
 def _load_ranges() -> None:
-    """射程／對象／攻擊型表（id \\t 射程 \\t 對象 \\t 攻擊型）。第一次用到才載入。"""
-    global _ranges, _targets, _attacks
+    """射程／對象／攻擊型／召喚表（id \\t 射程 \\t 對象 \\t 攻擊型 \\t 召喚怪）。
+
+    第一次用到才載入。第 5 欄可能不存在（舊版資料檔）——缺了就是查不到，
+    呼叫端（summon_of）自己退回安全預設。
+    """
+    global _ranges, _targets, _attacks, _summons
     if _ranges is not None:
         return
     rng: dict[int, int] = {}
     tgt: dict[int, str] = {}
     atk: set[int] = set()
+    smn: dict[int, int] = {}
     try:
         with gzip.open(resource(RANGE_FILE), "rt", encoding="utf-8") as f:
             for line in f:
@@ -110,9 +116,11 @@ def _load_ranges() -> None:
                     tgt[int(p[0])] = p[2]
                 if len(p) >= 4 and p[3] == "1":
                     atk.add(int(p[0]))
+                if len(p) >= 5 and p[4]:
+                    smn[int(p[0])] = int(p[4])
     except Exception:                                      # noqa: BLE001
-        rng, tgt, atk = {}, {}, set()
-    _ranges, _targets, _attacks = rng, tgt, atk
+        rng, tgt, atk, smn = {}, {}, set(), {}
+    _ranges, _targets, _attacks, _summons = rng, tgt, atk, smn
 
 
 def is_attack(skill_id: int) -> bool:
@@ -148,6 +156,21 @@ def is_ground(skill_id: int) -> bool:
       例：爆彈狙擊Ⅱ、麻痺荊棘Ⅱ、瞬移術Ⅳ。全表共 856 個。
     """
     return target_of(skill_id) == GROUND
+
+
+def summon_of(skill_id: int) -> int | None:
+    """召喚型技能召出來的**怪物範本編號**（＝實體的 type_id）；
+    不是召喚技能或查不到回 None（呼叫端要自己有退路）。
+
+    ★ 來源＝magic.xml 的 `召喚型="是"` 那些列的 `動態參數1`
+      （tools/build_skill_range.py 抽的第 5 欄）。實機對照：
+      781 召喚噬魂怪Ⅰ → 5014（黑狐實測召喚物 type_id 就是 5014）。
+    ★ 為什麼要有這張表：召喚物的名字**不等於**技能名去掉「召喚」——
+      150「召喚吸血鬼Ⅲ」召出來的叫「死亡吸血鬼Ⅲ」，比名字永遠對不上，
+      自動召喚就每 6 秒白放一次（實際踩到的 bug）。認養一律優先比 type_id。
+    """
+    _load_ranges()
+    return (_summons or {}).get(int(skill_id or 0))
 
 
 def range_of(skill_id: int) -> int | None:

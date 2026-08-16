@@ -21,8 +21,12 @@
 
 召喚物長什麼樣（2026-08-13 黑狐「召喚噬魂怪Ⅰ」實測，見 memory summon-creature）
 --------------------------------------------------------------------------
-* 召喚出來的怪就是一個一般實體（VT_ENTITY），名字＝技能名去掉「召喚」
-  （「召喚噬魂怪Ⅰ」→「噬魂怪Ⅰ」），OFF_KIND = 4。
+* 召喚出來的怪就是一個一般實體（VT_ENTITY），OFF_KIND = 4。
+  ⚠ 名字**不等於**技能名去掉「召喚」：「召喚噬魂怪Ⅰ」→「噬魂怪Ⅰ」剛好等，
+    但「召喚吸血鬼Ⅲ」召出來的叫「**死亡吸血鬼Ⅲ**」——靠名字全等認養
+    ＝永遠認不到＝每 6 秒白放循環（朋友實掛踩到）。正解＝比**範本編號**：
+    magic.xml 召喚型技能的 `動態參數1` 就是召喚物的 type_id
+    （781→5014 實機對照過），查 `skills.summon_of()`。
   ⚠ kind=4 **不是召喚物專屬**：擺攤中的玩家也是 4（天使學園實拍 22 隻全是
     玩家名），所以認召喚物不能只看 kind。
 * **物件裡沒有主人欄位**（+0x4E8 是交戰槽殘留，不可信）；
@@ -96,6 +100,11 @@ class AutoSummon:
     def __init__(self, skill_id: int | None = None) -> None:
         self.skill = skill_id or None
         self.expect: str | None = None       # 預期的召喚物名字；None = 不知道
+        # 預期的召喚物**範本編號**（＝實體 type_id，magic.xml 動態參數1）。
+        # ★ 這才是認養的正解：名字不可靠——「召喚吸血鬼Ⅲ」召出來的叫
+        #   「死亡吸血鬼Ⅲ」，用「技能名去掉召喚」比名字永遠對不上，
+        #   變成每 6 秒白放一次的循環（朋友實掛踩到）。
+        self.expect_tid: int | None = None
         self.page = PAGE                     # 讀到技能的那一頁（按鍵退路要用）
         # 「我的召喚物」槽驗證過了沒 —— 驗過才敢拿它當存在依據。
         # ⚠ 故意**不放進 reset()**：偏移對不對是這一版遊戲的性質，
@@ -121,14 +130,19 @@ class AutoSummon:
         """指定 F11 的技能編號（呼叫端從快捷欄讀到的）。
 
         跟分身不同：**不要求**在 buff 主表裡（召喚技能沒有持續時間資料，
-        skills.of(781) 實測就是 None）。名字查得到就順便記「預期的召喚物
-        名字」；查不到就靠「施放點附近新冒出來的 kind=4」認養。
+        skills.of(781) 實測就是 None）。認養身分的優先序：
+        ① `skills.summon_of()` 的怪物範本編號（比實體 type_id，最準）；
+        ② 名字退路（表查不到才用）：技能名去掉「召喚」後**包含**在實體名
+           裡就算（「死亡吸血鬼Ⅲ」⊇「吸血鬼Ⅲ」——全等比對踩過每 6 秒
+           白放的坑）；
+        ③ 都不知道就靠「施放點附近新冒出來的 kind=4」。
         """
         if not skill_id:
             return False
         self.page = page
         if self.skill != skill_id:
             self.skill = skill_id
+            self.expect_tid = skills.summon_of(skill_id)
             name = skills.name_of(skill_id)
             self.expect = (name[len(PREFIX):]
                            if name.startswith(PREFIX) and len(name) > len(PREFIX)
@@ -157,6 +171,23 @@ class AutoSummon:
         """目前有沒有一隻**確認還活著**的召喚物（給 UI／測試看）。"""
         return self._tracked is not None
 
+    def _is_mine_kind(self, e) -> bool:
+        """這隻實體像不像「這招召出來的那種怪」（種類比對，出生點另外驗）。
+
+        ① 範本編號最準：type_id == skills.summon_of(技能)（magic.xml 動態參數1）。
+        ② 名字退路：技能名去掉「召喚」後**包含**在實體名裡就算——
+           「召喚吸血鬼Ⅲ」召出來的叫「死亡吸血鬼Ⅲ」，全等比對永遠對不上，
+           下場是每 6 秒白放、把活的那隻不停換掉（朋友實掛踩到的 bug）。
+        ③ 編號、名字都不知道 → 不設限，靠出生點那兩道錨。
+        ⚠ ①②取**聯集**：萬一表過期（改版後動態參數1變了）名字這條還能救。
+          認錯會自己好（對方召喚物走遠→回收→重放），認不到的白放循環不會。
+        """
+        if self.expect_tid is not None and e.type_id == self.expect_tid:
+            return True
+        if self.expect and self.expect in e.name:
+            return True
+        return self.expect_tid is None and not self.expect
+
     def step(self, scanner, mover, player_obj: int | None,
              pets: list) -> str:
         """走一步。pets：最新掃描裡 kind=4 的實體（farm_tab 的 Scan.pets）。
@@ -177,8 +208,7 @@ class AutoSummon:
         #   場上有舊召喚物（上一輪的、手動放的）時這裡當場就驗完了。
         if not self._slot_ok and slot_v:
             for e in (pets or []):
-                if e.eid == slot_v and (self.expect is None
-                                        or e.name == self.expect):
+                if e.eid == slot_v and self._is_mine_kind(e):
                     self._slot_ok = True
                     break
 
@@ -283,8 +313,8 @@ class AutoSummon:
     def _adopt_new(self, pets: list) -> entity.Entity | None:
         """從最新掃描認養「我剛召喚出來的那隻」。
 
-        條件：kind=4、施放那一刻不存在（eid 是新的）、離施放點 NEAR 格內；
-        知道名字就再多一道名字比對。
+        條件：kind=4、施放那一刻不存在（eid 是新的）、離施放點 NEAR 格內、
+        種類對得上（`_is_mine_kind`：範本編號優先，名字「包含」當退路）。
         ★ **站在封包裡我們自己填的那一格的優先**（使用者點的做法）——
           實測召喚物正好出生在施放格，同職業在旁邊同拍施放也分得開；
           沒有正中的才退回「NEAR 格內取最近」（理由見 NEAR 的說明）。
@@ -294,7 +324,7 @@ class AutoSummon:
         px, py = self._cast_pos
         cand = [e for e in (pets or [])
                 if e.eid not in self._pre
-                and (self.expect is None or e.name == self.expect)
+                and self._is_mine_kind(e)
                 and (e.x - px) ** 2 + (e.y - py) ** 2 <= NEAR * NEAR]
         if not cand:
             return None
