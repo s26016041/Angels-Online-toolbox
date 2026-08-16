@@ -50,7 +50,8 @@ def read_version() -> str:
     p = ROOT / "VERSION"
     if not p.exists():
         die("找不到根目錄的 VERSION 檔。")
-    v = p.read_text(encoding="utf-8").strip()
+    # utf-8-sig：帶 BOM 的 VERSION 也照樣乾淨（2026-08-16 實踩過 tag 帶 U+FEFF）
+    v = p.read_text(encoding="utf-8-sig").strip()
     if not v:
         die("VERSION 檔是空的。")
     return v

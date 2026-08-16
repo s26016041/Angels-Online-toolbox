@@ -16,7 +16,10 @@ def _read_version() -> str:
     candidates.append(Path(__file__).resolve().parent.parent / "VERSION")  # 開發時：專案根目錄
     for p in candidates:
         try:
-            return p.read_text(encoding="utf-8").strip()
+            # utf-8-sig：VERSION 若被帶 BOM 的編輯器/指令碰過也照樣乾淨。
+            # 2026-08-16 實踩：PowerShell 5.1 的 Set-Content -Encoding utf8 會加
+            # BOM，而 strip() 不會去掉 U+FEFF → Release tag 變成 v﻿0.4.32。
+            return p.read_text(encoding="utf-8-sig").strip()
         except OSError:
             continue
     return "0.0.0"
