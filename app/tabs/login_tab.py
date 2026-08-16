@@ -77,7 +77,10 @@ ROW_PAD = 10
 
 STEP_MS = 400                 # 等待時每一拍的間隔
 LOGIN_SETTLE_MS = 1500        # 送出帳密 → 等分流清單送到（實測登入來回 < 1 秒）
-WAIT_BOOT_MS = 60000          # 等新開的遊戲跑到登入畫面（實測約 13 秒）
+# 等新開的遊戲跑到登入畫面。單獨開實測約 13 秒；但 2026-08-16 實測「四台分身
+# 開著時再開第五台」超過 60 秒（磁碟被搶＋開機期 find_screen 全掃特別慢）。
+# 逾時報失敗後那台會留著變成「空的分身」，下一輪會被撿回來用，所以放寬只有好處。
+WAIT_BOOT_MS = 120000
 WAIT_CHARS_MS = 20000         # 等選角色畫面
 WAIT_INGAME_MS = 25000        # 等真的進到遊戲裡
 
@@ -465,42 +468,80 @@ class LoginTab(BaseTab):
     # ------------------------------------------------------------------
     # 一鍵登入：QTimer 一拍做一步
     # ------------------------------------------------------------------
-    def _start_login(self) -> None:
-        picked = [a for a in self._accounts if a["selected"]]
-        if not picked:
-            QMessageBox.information(self, "沒勾帳號", "請先在清單勾「選擇」要登入的帳號。")
-            return
+    def _precheck(self) -> str:
+        """開工前的環境檢查。回錯誤訊息，一切就緒回空字串。"""
         game_dir = self._game_dir()
         if not game_dir or not os.path.isdir(game_dir):
-            QMessageBox.warning(self, "缺少設定",
-                                "請先在上面設定遊戲執行檔（用來找出遊戲資料夾）。")
-            return
+            return "請先在「自動登入」分頁設定遊戲執行檔（用來找出遊戲資料夾）。"
         if not os.path.isfile(os.path.join(game_dir, login.GAME_EXE)):
-            QMessageBox.warning(
-                self, "找不到遊戲",
-                f"在 {game_dir} 找不到 {login.GAME_EXE}。\n"
-                "請確認遊戲執行檔的路徑指到正確的資料夾。")
-            return
+            return (f"在 {game_dir} 找不到 {login.GAME_EXE}。"
+                    "請確認遊戲執行檔的路徑指到正確的資料夾。")
+        return ""
 
+    def _launch_job(self, picked: list[dict], cursor: bool) -> None:
+        """把這批帳號弄上線（手動與自動回連共用同一台狀態機）。
+
+        cursor: 手動按鈕才轉等待游標；自動回連在背景跑，
+                轉游標只會讓正在用別的分頁的使用者一頭霧水。
+        """
         online = {self._account_of(w.title) for w in self._game_windows()}
         online.discard("")
         queue = [a for a in picked if a["account"] not in online]
         already = [a["account"] for a in picked if a["account"] in online]
 
         self._job = {
-            "game_dir": game_dir, "queue": queue, "cur": None,
-            "ok": [], "failed": [], "already": already,
+            "game_dir": self._game_dir(), "queue": queue, "cur": None,
+            "ok": [], "failed": [], "already": already, "cursor": cursor,
             "step": "next", "since": time.monotonic(), "proc": None,
         }
         self.go_btn.setEnabled(False)
-        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
+        if cursor:
+            QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         self._timer.start(0)
+
+    def _start_login(self) -> None:
+        picked = [a for a in self._accounts if a["selected"]]
+        if not picked:
+            QMessageBox.information(self, "沒勾帳號", "請先在清單勾「選擇」要登入的帳號。")
+            return
+        err = self._precheck()
+        if err:
+            QMessageBox.warning(self, "還不能登入", err)
+            return
+        self._launch_job(picked, cursor=True)
+
+    # -- 給「自動回連」（分身總控）用的無人值守入口 ---------------------
+    def busy(self) -> bool:
+        """一鍵登入／自動回連的登入流程正在跑嗎？"""
+        return self._job is not None
+
+    def known_accounts(self) -> set[str]:
+        """帳號清單裡存了哪些帳號（存過帳密才有辦法自動回連）。"""
+        return {a["account"] for a in self._accounts}
+
+    def start_auto_login(self, accounts: list[str]) -> str:
+        """把這些帳號（用帳號名點名）弄上線。不跳任何對話框 ——
+        錯誤用回傳值講（空字串＝已開始跑）。呼叫端用 busy() 等它做完，
+        再自己數視窗標題驗收，不要信「開始跑了」＝「登回去了」。
+        """
+        if self._job is not None:
+            return "登入流程正在進行中，等它做完。"
+        err = self._precheck()
+        if err:
+            return err
+        have = {a["account"]: a for a in self._accounts}
+        picked = [have[x] for x in accounts if x in have]
+        if not picked:
+            return "帳號清單裡沒有存這些帳號的帳密。"
+        self._launch_job(picked, cursor=False)
+        return ""
 
     def _finish(self) -> None:
         job = self._job or {}
         self._job = None
         self._timer.stop()
-        QGuiApplication.restoreOverrideCursor()
+        if job.get("cursor"):
+            QGuiApplication.restoreOverrideCursor()
         self.go_btn.setEnabled(True)
         parts = []
         if job.get("ok"):

@@ -94,6 +94,41 @@ def enumerate_windows(
     return results
 
 
+def crash_dialogs(pids: set[int]) -> list[WindowInfo]:
+    """這些行程有沒有跳出系統對話框（class #32770，例如崩潰錯誤警告）。
+
+    遊戲的介面全是 DirectX 自己畫的，正常運作時遊戲行程**不會**有第二個原生
+    最上層視窗；一旦冒出 #32770，幾乎可以確定是崩潰處理器彈的錯誤視窗 ——
+    那時遊戲卡死、TCP 也還被握著，靠連線與視窗標題都偵測不到（實際發生過：
+    彈著錯誤警告掛整晚，監控一聲不吭）。
+
+    ⚠ 不走 enumerate_windows()：那支會把沒有標題的視窗全部略過，
+      而錯誤視窗的標題長什麼樣（甚至有沒有）我們沒有實錄，不能賭。
+    """
+    results: list[WindowInfo] = []
+    if not pids:
+        return results
+
+    def _callback(hwnd: int, _extra) -> bool:
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid not in pids:
+                return True
+            if win32gui.GetClassName(hwnd) != "#32770":
+                return True
+            results.append(WindowInfo(
+                hwnd=hwnd, pid=pid, title=win32gui.GetWindowText(hwnd),
+                class_name="#32770", rect=win32gui.GetWindowRect(hwnd)))
+        except Exception:                                  # noqa: BLE001
+            pass
+        return True
+
+    win32gui.EnumWindows(_callback, None)
+    return results
+
+
 def get_window_title(hwnd: int) -> str:
     """即時讀取指定視窗的目前標題；失敗 / 視窗已關回傳空字串。
 

@@ -93,6 +93,23 @@ def process_path(pid: int) -> str | None:
         _k32.CloseHandle(handle)
 
 
+def kill_process(pid: int) -> bool:
+    """把指定行程整個結束掉（連同它彈出的錯誤對話框一起消失）。
+
+    自動回連用：崩潰卡死的分身**不吃背景點擊**，錯誤視窗按不掉、行程也不會
+    自己退出，只能從外面終結再重開。TerminateProcess 是 OS 層的強制結束，
+    對已經崩潰的行程沒有「優雅關閉」可言 —— 它本來就死了。
+    回傳 False 代表開不到行程（權限不足或已經不在了）。
+    """
+    handle = _k32.OpenProcess(0x0001, False, pid)   # PROCESS_TERMINATE
+    if not handle:
+        return False
+    try:
+        return bool(_k32.TerminateProcess(handle, 1))
+    finally:
+        _k32.CloseHandle(handle)
+
+
 def _resolve_iat(exe_path: str, func: str) -> int | None:
     """從執行檔匯入表取出某函式的 IAT 位址（含 ImageBase 的 VA）。"""
     import pefile
