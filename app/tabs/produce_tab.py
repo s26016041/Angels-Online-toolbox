@@ -840,6 +840,12 @@ class CharProducePage(QWidget):
         sid = scene.current_id(self.sc)    # 出發地圖：回來要驗「人真的回到這」
         try:
             robot.end_gather(self._mover, self.sc)
+            # ★★ 主開關也關（2026-08-16）：補給整趟精靈不該插手，而且它開著
+            #   ＝每一幀都在跑自己的 Lua —— run_full_supply 沿路的 lua.call
+            #   （關倉庫那兩下）會跟它對撞（崩潰 dump 抓到的競態場景）。
+            #   兩個寫入都是純記憶體。回來的路（back 腿 resume／看門狗
+            #   begin_gather）本來就會把主開關重新開起來。
+            robot.set_run(self._mover, self.sc, False)
         except Exception:                                     # noqa: BLE001
             pass
         # ★★ 採集狀態中**用不了天使之翼**（2026-08-12 使用者實測）—— 回程前先按

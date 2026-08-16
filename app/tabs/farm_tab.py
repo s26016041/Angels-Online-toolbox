@@ -985,6 +985,16 @@ class KeyWorker(_Paced):
                 #   鎖本身（_open_eid/_opened）留著，回到射程內接著等就好。
                 self.open_wait = 0.0
                 return
+            # ★★★ 換圖／死亡復活／重連的實體重建空窗：這一拍**整輪不出手**
+            #   （2026-08-16，崩潰 dump 8/13＋8/15 定案）。遊戲的 usequickkey
+            #   拿「自己實體 id」查表、查不到不驗 NULL 就寫入 → 當場崩潰；
+            #   真人按不到鍵（載圖時吃不到），只有跳板照按。在這裡擋而不是
+            #   只靠 quickbar.use 裡那道閘 —— use 回 False 會落到「送鍵退路」
+            #   （_send_scan），等於換條路踩同一個地雷。純讀四個 u32，10Hz
+            #   下成本可忽略；空窗過了下一拍自然恢復。
+            if not quickbar.self_entity_ok(self.sc):
+                self.open_wait = 0.0
+                return
             # ◎ 每 QB_REFRESH 秒重讀快捷欄：使用者中途換鍵上的技能會自動
             #   跟上（純讀零副作用）。讀失敗**保留舊結果**——改版位移那種
             #   持續性失敗有 qb_ok 記著，暫時性讀失敗不該把打法歸零。

@@ -93,6 +93,36 @@ KIND_ITEM = 2
 
 VK_F1 = 0x70                  # F1~F12 = 0x70~0x7B
 
+# ★★★ 崩潰防護（2026-08-16，err*.dmp 8/13＋8/15 兩筆定案，技能 737）：
+#   usequickkey 核心（0x5B76C4）開頭是
+#       mov esi,[0x9B669C] / mov ecx,[esi+8] / push [ecx+0x2A90] / call 0x5045DE
+#   ＝拿「自己實體 id」查場景實體表；技能分支 0x5B7565 對查表結果**不驗
+#   NULL** 就 `mov [實體+0x464], al`。換地圖／死亡復活／重連的實體重建
+#   空窗裡查不到 → 往 NULL 寫 → 遊戲當場崩潰。真人按不到鍵（載圖時吃
+#   不到輸入），只有跳板照按 —— 所以按之前**自己先純讀驗一次**。
+#   （0x2A90 是世界物件內的結構偏移，屬「大更新才會壞」類；出處 0x5B76D5。）
+OWN_EID_OFF = 0x2A90
+
+
+def self_entity_ok(scanner) -> bool:
+    """「自己實體」現在查得到嗎（純讀重現 usequickkey 開頭那次查表）。
+
+    回 False ＝ 正處於換圖／重連的實體重建空窗 —— 這時叫 `use()` 遊戲會
+    NULL 崩潰（見 OWN_EID_OFF 的說明）。呼叫端這一拍**整輪別出手**
+    （含送鍵退路），下一拍再看。
+    ⚠ 讀不到也回 False：讀不到本身就是「世界正在拆建」的訊號 ——
+      寧可少打一拍（約 0.1 秒），也不要拿遊戲的命去賭。
+    """
+    from app.game import gather, move
+    mgr = _u32(scanner, gather.WORLD_PTR)
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000:
+        return False
+    world = _u32(scanner, mgr + 8)
+    if not world or not 0x10000 < world < 0x7FFF0000:
+        return False
+    eid = _u32(scanner, world + OWN_EID_OFF)
+    return bool(eid) and move.entity_alive(scanner, eid)
+
 
 @dataclass(frozen=True)
 class QuickSlot:
@@ -173,6 +203,12 @@ def use(mover, scanner, slot: int, page: int = 0, wait: bool = True) -> bool:
         return False
     mgr = _manager(scanner)
     if not mgr:
+        return False
+    # ★★ 自己實體查不到（換圖／重連空窗）就不按 —— 遊戲那頭不驗 NULL，
+    #   按下去就是 err*.dmp 那種當場崩潰（見 self_entity_ok）。
+    #   ⚠ 呼叫端（farm）自己也要先問 self_entity_ok 再進出手流程：
+    #     這裡回 False 會觸發它的「送鍵退路」，等於換條路踩同一個地雷。
+    if not self_entity_ok(scanner):
         return False
     if not wait:
         return mover.call(USE_FN, slot, page, USE_TARGETED, ecx=mgr)

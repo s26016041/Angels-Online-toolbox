@@ -20,10 +20,13 @@
     lua_getfield(L, idx, "名字")   idx: -10002 = 全域表、-1 = 堆疊頂
     lua_pcall(L, 參數數, 回傳數, 0)   回傳 0 = 成功、2 = 執行期錯誤
 
-參數**自己寫進 Lua 堆疊**（`lua_State + 8` 就是 top）：
+TValue = 16 bytes：值 8 + 型別 4 + 對齊 4；`lua_State + 8` 就是 top。
+型別：0 nil / 1 bool(int) / 3 數字(double) / 4 字串 / 5 表 / 6 函式
 
-    TValue = 16 bytes：值 8 + 型別 4 + 對齊 4
-    型別：0 nil / 1 bool(int) / 3 數字(double) / 4 字串 / 5 表 / 6 函式
+★★ 2026-08-16 起，整串操作（getfield 鏈→推參數→pcall→抄結果→還原 top）
+   由**原子序列 stub** 在遊戲主執行緒上一口氣做完（一次跳板呼叫）——
+   舊的「Python 分好幾步做、中間被遊戲自己的 Lua 插隊」是崩潰 dump 實證的
+   當機來源，詳見 `_seq_stub_asm` 上面那段說明。
 
 出錯時堆疊頂會留一個字串 —— 我們把它讀出來當診斷訊息。實際靠它解決過：
 `autofight.lua:201: bad argument #1 to 'ischeck' (number expected, got boolean)`
@@ -57,8 +60,8 @@ OFF_TOP = 0x08               # lua_State 裡的 top
 # Lua 5.1 的 lua_State：CommonHeader(6)+status(1)+對齊 → top 0x08、base 0x0C、
 # l_G 0x10、ci 0x14、savedpc 0x18、**stack_last 0x1C**、stack 0x20。
 # ⚠ 這個偏移是照 Lua 5.1 原始碼推的，**沒有像 OFF_TOP 那樣被實測驗證過**，
-#   所以 `_room_for()` 只在讀出來的值「看起來合理」時才採用，
-#   對不上就當作沒這道檢查（維持原本行為，不會因為推錯而讓功能失效）。
+#   所以 stub 的堆疊餘裕檢查只在讀出來的值「看起來合理」（stack_last > top）
+#   時才擋，對不上就當作沒這道檢查（不會因為推錯而讓功能失效）。
 OFF_STACK_LAST = 0x1C
 # ★ 出處：Lua 5.1 lstate.h —— hook(+0x44) 之後的 l_gt（x86 版面）；讀取端拿它驗版面。
 OFF_L_GT = 0x48              # lua_State 裡的全域表（拿來驗證版面）
@@ -70,22 +73,321 @@ OFF_TSTRING_LEN, OFF_TSTRING_DATA = 0x0C, 0x10
 
 CALL_TIMEOUT = 0.5           # Lua 可能跑一小段，比送封包寬鬆一點
 
+# ---------------------------------------------------------------------------
+# ★★★ 原子序列 stub（2026-08-16）：整串 Lua 操作在**一次**跳板呼叫裡做完
+# ---------------------------------------------------------------------------
+# 為什麼非這樣不可：舊寫法是 Python 這邊「叫 getfield → 讀 top → 自己寫
+# TValue → 寫回 top → 叫 pcall」，每一步之間遊戲主執行緒都在跑**自己的**
+# UI／精靈 Lua（同一個 lua_State）。我們的裸寫入撞上它正在執行的那一刻，
+# 堆疊就錯位 —— 崩潰 dump 實證（2026-08-16 解的 err*.dmp）：TValue 裡是
+# 字串內容 'numb'、是程式碼位址、EIP 跳到垃圾 —— 全是 VM 拿到爛 TValue 的
+# 死法。「只降不升」的還原只擋掉一半，**「最壞只回錯誤訊息」的舊評估是錯的**。
+#
+# 現在：把「getfield 鏈 → 驗是函式 → 推參數 → pcall → 抄結果 → 還原 top」
+# 全部寫成一小段機器碼，放進跳板頁的第二段程式碼區（mover.aux_code），
+# 用一次 call_sync 叫它 —— 整串都在遊戲主執行緒上一口氣做完，
+# 中間**不可能**有別的 Lua 插隊，還原 top 也因此可以無條件做。
+#
+# ⚠ 跟舊版相同的既有風險（沒有變好也沒有變壞）：getfield 中途遇到 nil
+#   會走 Lua 的錯誤路徑（longjmp）——但我們查的全域（game、視窗函式）
+#   一直都存在，舊程式同樣沒防這條。
+# ⚠ pcall 執行中若遊戲抽訊息重入跳板，_BUSY 閂會擋（見 move._stub_asm）。
+#
+# 參數區版面（P，放在 scratch + _SEQ_P_OFF）：
+#   +0x00 L                +0x04 getfield_fn      +0x08 pcall_fn
+#   +0x0C pushstring_fn    +0x10 n_names          +0x14 name_ptr[4]
+#   +0x24 n_args           +0x28 do_pcall(0=只讀值) +0x2C rc_out
+#   +0x30 結果 TValue(16B)  +0x40 結果字串長度      +0x44 結果字串內容(≤0xB8)
+#   +0x100 參數×8，每個 20B：+0 kind(0=現成TValue/1=字串指標) +4 內容(16B)
+# 字串池放在 scratch + _SEQ_STR_OFF（函式名 + 字串參數）。
+# ⚠ scratch 區段分配：lua 名字緩衝 0x000、jumpmap 0x100、sell 0x140、
+#   supply/exchange 0x180、team 0x1C0、produce 0x200；這裡佔 0x300~0x4A0（P）
+#   與 0x500~0x7F8（字串池），別人要加新區段請避開。
+_SEQ_P_OFF = 0x300
+_SEQ_STR_OFF = 0x500
+_SEQ_POOL_MAX = 0x2F0
+_SEQ_STR_MAX = 0xB8          # 結果字串最多抄這麼多（錯誤訊息夠用了）
+_RC_NOT_FUNCTION = 0xFFFFFFFE
+_RC_NO_ROOM = 0xFFFFFFFD
+_MAX_NAMES = 4
+_MAX_ARGS = 8
+
+
+def _seq_stub_asm() -> str:
+    """原子序列 stub 的組譯原文（keystone、位置無關：位址全走暫存器）。
+
+    暫存器約定：ebx=P、esi=L、edi=進場時抄下的 top（callee-saved，
+    getfield/pcall 不會動它們）。呼叫前 `mov ebp,esp`、呼叫後 `mov esp,ebp`
+    —— cdecl/stdcall 都安全（跟 move._stub_asm 同一招）。
+    回傳值（eax→跳板 _RET→call_sync 回傳）＝pcall 的 rc；
+    0xFFFFFFFE=查到的不是函式、0xFFFFFFFD=堆疊快滿不敢推。
+    ⚠ keystone 把無前綴數字當十六進位，所以一律寫 0x。
+    """
+    return """
+    mov ebx, dword ptr [esp+0x4]
+    mov esi, dword ptr [ebx]
+    mov edi, dword ptr [esi+0x8]
+    mov dword ptr [ebx+0x2C], 0x0
+    xor ecx, ecx
+    names_loop:
+    cmp ecx, dword ptr [ebx+0x10]
+    jge names_done
+    mov eax, 0xFFFFD8EE
+    test ecx, ecx
+    jz idx_ready
+    mov eax, 0xFFFFFFFF
+    idx_ready:
+    mov edx, dword ptr [ebx+ecx*4+0x14]
+    push ecx
+    mov ebp, esp
+    push edx
+    push eax
+    push esi
+    mov eax, dword ptr [ebx+0x4]
+    call eax
+    mov esp, ebp
+    pop ecx
+    inc ecx
+    jmp names_loop
+    names_done:
+    cmp dword ptr [ebx+0x28], 0x0
+    je copy_result
+    mov eax, dword ptr [esi+0x8]
+    cmp eax, edi
+    jbe fail_notfn
+    cmp dword ptr [eax-0x8], 0x6
+    jne fail_notfn
+    mov edx, dword ptr [esi+0x1C]
+    cmp edx, eax
+    jbe room_ok
+    mov ecx, dword ptr [ebx+0x24]
+    shl ecx, 0x4
+    add ecx, eax
+    add ecx, 0x20
+    cmp ecx, edx
+    ja fail_room
+    room_ok:
+    xor ecx, ecx
+    args_loop:
+    cmp ecx, dword ptr [ebx+0x24]
+    jge args_done
+    imul edx, ecx, 0x14
+    lea edx, [ebx+edx+0x100]
+    cmp dword ptr [edx], 0x1
+    je arg_string
+    mov eax, dword ptr [esi+0x8]
+    mov ebp, dword ptr [edx+0x4]
+    mov dword ptr [eax], ebp
+    mov ebp, dword ptr [edx+0x8]
+    mov dword ptr [eax+0x4], ebp
+    mov ebp, dword ptr [edx+0xC]
+    mov dword ptr [eax+0x8], ebp
+    mov ebp, dword ptr [edx+0x10]
+    mov dword ptr [eax+0xC], ebp
+    add eax, 0x10
+    mov dword ptr [esi+0x8], eax
+    jmp arg_next
+    arg_string:
+    mov edx, dword ptr [edx+0x4]
+    push ecx
+    mov ebp, esp
+    push edx
+    push esi
+    mov eax, dword ptr [ebx+0xC]
+    call eax
+    mov esp, ebp
+    pop ecx
+    arg_next:
+    inc ecx
+    jmp args_loop
+    args_done:
+    mov ebp, esp
+    push 0x0
+    push 0x1
+    push dword ptr [ebx+0x24]
+    push esi
+    mov eax, dword ptr [ebx+0x8]
+    call eax
+    mov esp, ebp
+    mov dword ptr [ebx+0x2C], eax
+    copy_result:
+    mov eax, dword ptr [esi+0x8]
+    cmp eax, edi
+    jbe restore
+    sub eax, 0x10
+    mov edx, dword ptr [eax]
+    mov dword ptr [ebx+0x30], edx
+    mov edx, dword ptr [eax+0x4]
+    mov dword ptr [ebx+0x34], edx
+    mov edx, dword ptr [eax+0x8]
+    mov dword ptr [ebx+0x38], edx
+    mov edx, dword ptr [eax+0xC]
+    mov dword ptr [ebx+0x3C], edx
+    cmp dword ptr [eax+0x8], 0x4
+    jne restore
+    mov edx, dword ptr [eax]
+    mov ecx, dword ptr [edx+0xC]
+    cmp ecx, 0xB8
+    jbe len_ok
+    mov ecx, 0xB8
+    len_ok:
+    mov dword ptr [ebx+0x40], ecx
+    push esi
+    push edi
+    lea esi, [edx+0x10]
+    lea edi, [ebx+0x44]
+    cld
+    rep movsb
+    pop edi
+    pop esi
+    restore:
+    mov dword ptr [esi+0x8], edi
+    mov eax, dword ptr [ebx+0x2C]
+    ret
+    fail_notfn:
+    mov dword ptr [ebx+0x2C], 0xFFFFFFFE
+    jmp restore
+    fail_room:
+    mov dword ptr [ebx+0x2C], 0xFFFFFFFD
+    jmp restore
+    """
+
+
+def _ensure_stub(mover) -> int:
+    """把原子序列 stub 裝進這份跳板的第二段程式碼區；回位址，裝不了回 0。
+
+    程式碼位置無關（位址全走 P），所以每份跳板只要寫一次；
+    寫失敗（遊戲沒了）回 0，呼叫端大聲失敗 —— **不退回舊的競態寫法**。
+    快取跟著區塊位址走：跳板換了一塊記憶體就重寫一次。
+    """
+    base, size = mover.aux_code()
+    if not base:
+        return 0
+    if getattr(mover, "_lua_seq_addr", 0) == base:
+        return base
+    with mover.lock:
+        if getattr(mover, "_lua_seq_addr", 0) == base:
+            return base
+        try:
+            import keystone
+            ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+            ks.syntax = keystone.KS_OPT_SYNTAX_INTEL
+            shell, _n = ks.asm(_seq_stub_asm(), addr=base)
+        except Exception:                                  # noqa: BLE001
+            return 0
+        if not shell or len(shell) > size:
+            return 0
+        if not mover.write(base, bytes(shell)):
+            return 0
+        mover._lua_seq_addr = base
+        return base
+
+
+def _seq_pack(L, parts, args, do_pcall, pool_base,
+              getfield_fn, pcall_fn, pushstring_fn):
+    """把（路徑, 參數）組成 stub 的字串池與參數區位元組。回 (池, P)；太長回 None。
+
+    純函式 —— **離線模擬測試（scratchpad/lua_stub_sim.py）用的就是這一份**，
+    版面改這裡測試就跟著測到，不會兩邊各寫一份然後假通過。
+    """
+    blob, name_ptrs = b"", []
+    for part in parts:
+        name_ptrs.append(pool_base + len(blob))
+        blob += part.encode("ascii") + b"\0"
+    entries = b""
+    for v in args:
+        if isinstance(v, str):
+            # ★ 字串交給遊戲的 lua_pushstring 建 TString（stub 裡呼叫）。
+            # ⚠⚠ UTF-8 不是 big5：寫 big5 遊戲比對不到，而且讀回來有 big5
+            #   退路、看起來「一致」，對帳抓不到（2026-08-11 踩過）。
+            entries += struct.pack("<II", 1, pool_base + len(blob)) + b"\0" * 12
+            blob += v.encode("utf-8") + b"\0"
+        else:
+            entries += struct.pack("<I", 0) + _tvalue(v)
+    if len(blob) > _SEQ_POOL_MAX:
+        return None
+    head = struct.pack("<4I", L, getfield_fn, pcall_fn, pushstring_fn)
+    head += struct.pack("<I", len(parts))
+    head += struct.pack("<4I", *(name_ptrs + [0] * (4 - len(name_ptrs))))
+    head += struct.pack("<3I", len(args), 1 if do_pcall else 0, 0)
+    head += b"\0" * 0x14                   # 結果 TValue + 字串長度清零
+    return blob, head + b"\0" * (0x100 - len(head)) + entries
+
+
+def _seq_run(mover, scanner, parts, args, do_pcall) -> tuple[int, object] | str:
+    """組 P、跑一次 stub。成功回 (rc, 結果值)，失敗回原因字串。
+
+    ⚠ 整段抓 mover.lock：P 與字串池是共用暫存區，寫參數→叫→讀結果
+      不能被別的呼叫切開（跟舊版抓鎖的理由相同，只是窗口小很多）。
+    """
+    if not (mover and mover.active):
+        return "跳板沒裝好"
+    if not (GETFIELD_FN and PCALL_FN):
+        return "Lua 函式定位失敗（遊戲改版？）—— 這個功能停用"
+    if len(parts) > _MAX_NAMES or len(args) > _MAX_ARGS:
+        return "路徑太深或參數太多"
+    if any(isinstance(v, str) for v in args) and not PUSHSTRING_FN:
+        return "pushstring 定位失敗（遊戲改版？）"
+    L = state(scanner)
+    if L is None:
+        return "找不到 lua_State（遊戲改版？）"
+    stub = _ensure_stub(mover)
+    if not stub:
+        return "Lua stub 裝不起來"
+    scratch = mover.scratch()
+    if not scratch:
+        return "沒有暫存區"
+    p, pool = scratch + _SEQ_P_OFF, scratch + _SEQ_STR_OFF
+    packed = _seq_pack(L, parts, args, do_pcall, pool,
+                       GETFIELD_FN, PCALL_FN, PUSHSTRING_FN or 0)
+    if packed is None:
+        return "字串太長"
+    blob, data = packed
+
+    with mover.lock:
+        if blob and not mover.write(pool, blob):
+            return "寫字串池失敗"
+        if not mover.write(p, data):
+            return "寫參數區失敗"
+        rc = mover.call_sync(stub, p, timeout=CALL_TIMEOUT)
+        if rc is None:
+            return "呼叫排不進去"
+        rc &= 0xFFFFFFFF
+        val = _seq_result(scanner, p)
+    return rc, val
+
+
+def _seq_result(scanner, p: int):
+    """讀 stub 抄回來的結果 TValue（字串內容 stub 已抄進 P，沒有 GC 競態）。"""
+    raw = scanner._read_bytes(p + 0x30, 0x14)
+    if not raw or len(raw) < 0x14:
+        return None
+    b = bytes(raw)
+    tt = struct.unpack_from("<i", b, 8)[0]
+    if tt == T_BOOL:
+        return bool(struct.unpack_from("<I", b, 0)[0])
+    if tt == T_NUMBER:
+        return struct.unpack_from("<d", b, 0)[0]
+    if tt == T_STRING:
+        n = min(struct.unpack_from("<I", b, 16)[0], _SEQ_STR_MAX)
+        s = scanner._read_bytes(p + 0x44, n) if n else b""
+        if not s:
+            return ""
+        # ⚠ 遊戲裡的 Lua 字串是 UTF-8（big5 留作舊資料退路，跟 globals_of 同）。
+        for enc in ("utf-8", "big5"):
+            try:
+                return bytes(s).decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return bytes(s).decode("utf-8", errors="replace")
+    if tt == T_NIL:
+        return None
+    return f"<型別 {tt}>"
+
 
 def _u32(scanner, addr: int) -> int:
     raw = scanner._read_bytes(addr, 4)
     return struct.unpack("<I", bytes(raw))[0] if raw else 0
-
-
-def _sync(mover, fn: int, *args, ecx: int = 0):
-    """呼叫遊戲函式一次。**不重試。**
-
-    ⚠⚠ 曾經加過「排不進去就重試 3 次」，那是錯的方向：問題是**呼叫太密**，
-      不是重試不夠。加了重試之後連打十幾輪，客戶端的訊息迴圈直接卡死
-      （白狐實測）—— 每一次 `lua.call` 都會動遊戲的 Lua 堆疊，硬塞只會更糟。
-      正確做法是**讓呼叫端少叫**（設定值快取起來，見 robot.potion_slots）。
-    ★ 讀失敗回 None，呼叫端要當「不知道」處理，**不可以當成「沒有」**。
-    """
-    return mover.call_sync(fn, *args, ecx=ecx, timeout=CALL_TIMEOUT)
 
 
 def state(scanner) -> int | None:
@@ -167,80 +469,10 @@ def globals_of(scanner, names) -> dict | None:
     return out
 
 
-def _room_for(scanner, L: int, top: int, n: int) -> bool:
-    """從 top 再推 n 個 TValue 還在堆疊裡面嗎？
-
-    ⚠ 我們是直接把 TValue 寫進遊戲的 Lua 堆疊陣列，正常應該先叫
-      `lua_checkstack`。沒得叫的話至少要自己看一下 `stack_last`，
-      不然堆疊剛好很滿的時候就是**寫爆遊戲的堆積**。
-
-    ★ `stack_last` 的偏移是推的（見 OFF_STACK_LAST），所以先做合理性檢查：
-      它必須在 top 之上、而且距離不能大得離譜。看起來不對就回 True
-      （＝不擋），維持跟以前一樣的行為 —— 寧可不擋，也不要因為偏移推錯
-      而讓整個 Lua 功能失效。
-    """
-    last = _u32(scanner, L + OFF_STACK_LAST)
-    if not (top < last < top + 0x100000):
-        return True                       # 值不合理 → 這道檢查不算數
-    return top + n * TVALUE <= last
-
-
-def _restore_top(mover, scanner, L: int, base_top: int) -> None:
-    """把 Lua 堆疊還原到我們動手之前的高度 —— ★★ **只降不升**。
-
-    ⚠⚠⚠ 以前是無條件 `write(L+top, base_top)`，那是**延遲當機的來源**。
-
-    `base_top` 是我們開始那一刻抄下來的，而中間每一次跳板呼叫回到遊戲的
-    訊息迴圈時，**遊戲自己的 UI Lua 也在跑同一個 L**（計時器、視窗回呼）。
-    所以還原的時候，遊戲的 top 可能已經比 base_top **低**了（它自己的框架
-    跑完收掉了）。這時把 top 寫回較高的 base_top，等於**把堆疊頂拉高、
-    蓋住一堆已經沒人維護的舊 TValue**。
-
-    Lua 5.1 的 GC 標記階段會把 `L->stack` 到 `L->top` 之間**每一格**都當成
-    活的物件去掃 —— 那些舊格子裡的型別標記說「我是可回收物件」，指標卻指向
-    早就被釋放的 GCObject。於是 GC 在**不知道多久以後**的某一輪掃到它，
-    直接讀爛記憶體。這正是「掛很久之後才當、而且完全看不出跟什麼有關」。
-
-    只降不升就沒有這個問題：
-      · top 比我們高 → 那是我們留下的東西，降回去（跟以前一樣）
-      · top 比我們低 → 那是遊戲自己收掉的，**不要碰**
-    """
-    now = _u32(scanner, L + OFF_TOP)
-    if now > base_top:
-        mover.write(L + OFF_TOP, struct.pack("<I", base_top))
-
-
 def _tvalue(v) -> bytes:
     if isinstance(v, bool):
         return struct.pack("<iiii", 1 if v else 0, 0, T_BOOL, 0)
     return struct.pack("<dii", float(v), T_NUMBER, 0)
-
-
-def _read_value(scanner, at: int):
-    """讀堆疊上的一個 TValue，轉成 Python 值（認不出來就回型別代號）。"""
-    tt = struct.unpack("<i", bytes(scanner._read_bytes(at + 8, 4)))[0]
-    if tt == T_NIL:
-        return None
-    if tt == T_BOOL:
-        return bool(_u32(scanner, at))
-    if tt == T_NUMBER:
-        return struct.unpack("<d", bytes(scanner._read_bytes(at, 8)))[0]
-    if tt == T_STRING:
-        ts = _u32(scanner, at)
-        n = min(_u32(scanner, ts + OFF_TSTRING_LEN), 400)
-        raw = scanner._read_bytes(ts + OFF_TSTRING_DATA, n)
-        if not raw:
-            return ""
-        # ⚠ 遊戲裡的 Lua 字串是 **UTF-8**，不是 big5。用 big5 解會變亂碼
-        #   （「天使趴趴GO」被解成「憭拐蝙頞渲韌GO」才發現的）。
-        #   big5 留作退路：舊資料檔偶爾還是 big5。
-        for enc in ("utf-8", "big5"):
-            try:
-                return bytes(raw).decode(enc)
-            except UnicodeDecodeError:
-                continue
-        return bytes(raw).decode("utf-8", errors="replace")
-    return f"<型別 {tt}>"
 
 
 def get_global(mover, scanner, name: str):
@@ -248,25 +480,16 @@ def get_global(mover, scanner, name: str):
 
     ★ 拿來讀遊戲自己的常數（視窗代號、控制項 id…），這樣就不必在我們這邊
       寫死 —— 官方改號碼我們會自動跟上。
+    ★ 2026-08-16 起走原子序列 stub（getfield＋抄結果＋還原 top 一口氣做完，
+      見檔案中段的說明）；只要讀**數字／布林**的話 `globals_of` 純讀更便宜。
     """
     if not (mover and mover.active):
         return None
-    L = state(scanner)
-    if L is None:
+    got = _seq_run(mover, scanner, [name], (), do_pcall=False)
+    if isinstance(got, str):
         return None
-    buf = mover.scratch()
-    if not buf:
-        return None
-    with mover.lock:
-        base_top = _u32(scanner, L + OFF_TOP)
-        try:
-            mover.write(buf, name.encode("ascii") + b"\0")
-            if _sync(mover, GETFIELD_FN, L, GLOBALSINDEX, buf) is None:
-                return None
-            top = _u32(scanner, L + OFF_TOP)
-            return _read_value(scanner, top - TVALUE) if top > base_top else None
-        finally:
-            _restore_top(mover, scanner, L, base_top)
+    _rc, val = got
+    return val
 
 
 def call(mover, scanner, path: str, *args) -> tuple[bool, object]:
@@ -274,68 +497,19 @@ def call(mover, scanner, path: str, *args) -> tuple[bool, object]:
 
     回傳 (成功嗎, 值)。失敗時值是 Lua 的錯誤訊息字串（可以直接顯示給人看）。
 
-    ⚠ 全程抓著 mover 的鎖：中間夾雜別的呼叫會弄亂 Lua 堆疊。
+    ★ 2026-08-16 起整串（getfield 鏈→驗是函式→推參數→pcall→抄結果→還原
+      top）在**一次**跳板呼叫裡由遊戲主執行緒一口氣做完（_seq_run）——
+      舊寫法分好幾步做、中間被遊戲自己的 Lua 插隊，是崩潰 dump 實證的
+      當機來源（詳見 _seq_stub_asm 上面那段說明）。
+    ⚠⚠ 「排不進去就重試」仍然是錯的方向：問題是**呼叫太密**，不是重試
+      不夠（白狐實測連打十幾輪把訊息迴圈弄卡死）。要少叫，不要硬塞。
     """
-    if not (mover and mover.active):
-        return False, "跳板沒裝好"
-    L = state(scanner)
-    if L is None:
-        return False, "找不到 lua_State（遊戲改版？）"
-    buf = mover.scratch()
-    if not buf:
-        return False, "沒有暫存區"
-
-    parts = path.split(".")
-    with mover.lock:
-        base_top = _u32(scanner, L + OFF_TOP)
-        try:
-            mover.write(buf, parts[0].encode("ascii") + b"\0")
-            if _sync(mover, GETFIELD_FN, L, GLOBALSINDEX, buf) is None:
-                return False, "呼叫排不進去"
-            for part in parts[1:]:
-                mover.write(buf, part.encode("ascii") + b"\0")
-                if _sync(mover, GETFIELD_FN, L, TOPINDEX, buf) is None:
-                    return False, "呼叫排不進去"
-
-            top = _u32(scanner, L + OFF_TOP)
-            tt = struct.unpack(
-                "<i", bytes(scanner._read_bytes(top - TVALUE + 8, 4)))[0]
-            if tt != T_FUNCTION:
-                return False, f"{path} 不是函式（型別 {tt}）"
-
-            if not _room_for(scanner, L, top, len(args)):
-                return False, "Lua 堆疊快滿了，這次不推參數"
-            for v in args:
-                if isinstance(v, str):
-                    # ★ 字串要交給遊戲自己推（`lua_pushstring` 會建 TString 並
-                    #   複製內容）—— 我們沒辦法從外面在 Lua 的字串池裡建物件。
-                    # ⚠ 它**自己會動 top**，所以先把我們手寫到一半的 top 落地，
-                    #   叫完再重讀，順序錯了參數就會被蓋掉。
-                    mover.write(L + OFF_TOP, struct.pack("<I", top))
-                    # ⚠⚠ **UTF-8，不是 big5**（跟 `_read_value` 同一件事，
-                    #   那邊的註解早就寫了）。2026-08-11 踩過：寫進「目標資源
-                    #   列表」的名字編成 big5，遊戲比對不到、面板也顯示不出來；
-                    #   使用者手動加一筆並排比對才看出來 —— 他那筆是
-                    #   `\xe5\xb0\x8f...`（UTF-8 的「小」），我那筆是 big5。
-                    # ⚠ 而且**對帳抓不到這種錯**：讀取端有 big5 退路，寫 big5
-                    #   讀回來照樣解得出同一個字，看起來「一致」。
-                    raw = v.encode("utf-8") + b"\0"
-                    mover.write(buf, raw)
-                    if _sync(mover, PUSHSTRING_FN, L, buf) is None:
-                        return False, "呼叫排不進去"
-                    top = _u32(scanner, L + OFF_TOP)
-                    continue
-                mover.write(top, _tvalue(v))
-                top += TVALUE
-            mover.write(L + OFF_TOP, struct.pack("<I", top))
-
-            rc = _sync(mover, PCALL_FN, L, len(args), 1, 0)
-            if rc is None:
-                return False, "呼叫排不進去"
-            now = _u32(scanner, L + OFF_TOP)
-            val = _read_value(scanner, now - TVALUE) if now > base_top else None
-            return (rc == 0), val
-        finally:
-            # ★ 不管成功失敗都把堆疊還原 —— 留東西在上面會慢慢漲爆
-            #   ⚠ 只降不升，理由見 _restore_top（這是延遲當機的來源）
-            _restore_top(mover, scanner, L, base_top)
+    got = _seq_run(mover, scanner, path.split("."), args, do_pcall=True)
+    if isinstance(got, str):
+        return False, got
+    rc, val = got
+    if rc == _RC_NOT_FUNCTION:
+        return False, f"{path} 不是函式"
+    if rc == _RC_NO_ROOM:
+        return False, "Lua 堆疊快滿了，這次不推參數"
+    return (rc == 0), val

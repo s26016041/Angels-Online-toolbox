@@ -203,6 +203,35 @@ def pathfinder_this(scanner) -> int | None:
     if not obj or u32(obj + MGR.OBJ_ID) != ident:
         return None
     return obj
+
+
+def entity_alive(scanner, eid: int) -> bool:
+    """實體 id 在場景實體表裡**現在**查不查得到（純讀，不呼叫遊戲）。
+
+    跟 `pathfinder_this()` 走同一條鏈（同一張 ID→物件表、同一組 bag 偏移；
+    那條鏈就是遊戲查表函式 `0x5045DE` 的純讀重現，見檔頭 MGR 的說明），
+    差別只是 id 由呼叫端給。查到、而且物件回存的 id 一致才算活著。
+
+    ★ 用途（2026-08-16）：`quickbar.self_entity_ok` 在按快捷鍵前驗
+      「自己實體」還查不查得到 —— 換地圖／重連的實體重建空窗裡查不到，
+      而遊戲的 usequickkey 對查表結果**不驗 NULL 就寫入**（崩潰 dump
+      EIP=0x5B75F0 ×2 定案）。讀不到一律回 False：讀不到本身就是
+      「世界正在拆建」的訊號。
+    """
+    def u32(a):
+        raw = scanner._read_bytes(a, 4)
+        return struct.unpack("<I", raw)[0] if raw else None
+
+    if not eid:
+        return False
+    mgr = u32(MGR_PTR)
+    if not mgr:
+        return False
+    tbl, mx = u32(mgr + MGR.TBL), u32(mgr + MGR.MAX)
+    if tbl is None or mx is None or not tbl or (eid & 0xFFFF) > mx:
+        return False
+    obj = u32(tbl + (eid & 0xFFFF) * 4)
+    return bool(obj) and u32(obj + MGR.OBJ_ID) == eid
 # 尋路／移動舉手之後，最多等這麼久拿指令槽。
 # 攻擊那邊看到有人舉手就會跳過一拍（約 50ms），所以這個時間綽綽有餘；
 # 而且是在 UI 執行緒上等，不能太長。
@@ -222,6 +251,10 @@ _CODE = 0x40
 # 我們叫的函式都是幾毫秒的東西，5 秒遠遠超過任何正常情況。
 _BUSY_STUCK_SECS = 5.0
 _SCRATCH = 0x800            # 配置的是 0x1000，程式碼用不到 0x100，這之後全空
+# 第二段程式碼區（lua.py 的「原子序列」stub 放這裡）：主 stub 在 _CODE(0x40)
+# 起、實測不到 0x100，所以 0x200 起到 _SCRATCH 之間整段是空的。
+_AUX_CODE = 0x200
+_AUX_CODE_MAX = _SCRATCH - _AUX_CODE
 
 
 def _stub_asm(block: int) -> str:
@@ -468,6 +501,17 @@ class Mover:
         ★ 這樣別的模組就不必去摸 `_block` / `_pm` 這些私有欄位。
         """
         return (self._block + _SCRATCH) if self._active else 0
+
+    def aux_code(self) -> tuple[int, int]:
+        """給**第二段程式碼**用的區段 (位址, 大小)；沒裝好回 (0, 0)。
+
+        lua.py 的「原子序列」stub 放這裡（_AUX_CODE=0x200 起、到 _SCRATCH
+        為止）。頁面是 pymem allocate 的預設 EXECUTE_READWRITE，
+        寫進去就能執行 —— 主 stub（_CODE=0x40）本來就是這樣跑的。
+        """
+        if not self._active:
+            return 0, 0
+        return self._block + _AUX_CODE, _AUX_CODE_MAX
 
     def write(self, addr: int, data: bytes) -> bool:
         """往遊戲行程寫一段位元組（給 scratch 區與 Lua 堆疊用）。"""

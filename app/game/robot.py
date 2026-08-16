@@ -676,15 +676,52 @@ def res_list(mover, scanner) -> list[str] | None:
     return out
 
 
+def _res_list_diff(scanner, names: list[str]) -> str | None:
+    """「目標資源列表」跟 `names` 對不對得上（純讀）。一致回 None，不一致回原因。
+
+    ★★ 比的是**記錄的原始位元組**，不走 Lua。兩個理由：
+      ⚠ Lua 的 `robotvar_getnum_list` 在 add 完**立刻問會回 0**（實測），
+        拿它對帳會誤報失敗、把設好的東西又當成沒設好。
+      ⚠⚠ 更重要：**比對解碼後的字串擋不住編碼錯誤** —— 讀取端有 big5
+        退路，名字編成 big5 寫進去，讀回來照樣解得出同一個字，看起來
+        「一致」。2026-08-11 就是這樣被騙過去：遊戲比對不到、面板顯示
+        不出來，我們卻回報「設好了」。所以比位元組，而遊戲存的是 UTF-8
+        （使用者手動加一筆並排比對確認的）。
+    """
+    rec = _find_var(scanner, AS_DESIGNATED_RES_LIST)
+    if not isinstance(rec, int):
+        return "找不到那筆記錄"
+    head = scanner._read_bytes(rec, _L_ELEMS)
+    if not head or head[_V_TYPE] != VAR_T_STRLIST:
+        return "那筆記錄不是字串清單"
+    n = struct.unpack_from("<i", bytes(head), _L_COUNT)[0]
+    if n != len(names):
+        return f"筆數對不上（要 {len(names)} 筆，記錄裡是 {n}）"
+    for i, name in enumerate(names):
+        ptr = _u32(scanner, rec + _L_ELEMS + i * 4)
+        raw = scanner._read_bytes(ptr, 128) if ptr else None
+        got = bytes(raw).split(b"\x00")[0] if raw else b""
+        if got != name.encode("utf-8"):
+            return f"「{name}」寫進去的位元組不對（{got!r}）"
+    return None
+
+
 def set_res_list(mover, scanner, names: list[str]) -> tuple[bool, str]:
     """把「目標資源列表」換成 `names`，**寫完讀回來對帳**。
 
     回傳 (成功嗎, 說明)。任何一步不成就回 False —— 呼叫端要**大聲**降級
     （不開「採集指定資源」），絕不能一邊說「只採魚藻」一邊讓精靈亂採。
 
-    ⚠ 走 Lua（唯一的路，見 AS_DESIGNATED_RES_LIST 的說明）。呼叫次數＝
-      1 + 名字數 + 對帳，只在按下開始時做一次，不放進心跳。
+    ★★★ 先對帳再寫（2026-08-16）：清單**已經是想要的內容就整段跳過**，
+      一個 Lua 呼叫都不做。生產分頁的看門狗每逢「精靈停了／換中心點／
+      卡住重指」都會經過這裡，而名單幾乎永遠沒變 —— 舊寫法每次都
+      clear＋逐筆 add 整輪 Lua，正好撞上精靈每幀都在跑的 Lua（崩潰 dump
+      實證的競態場景，見 memory game-crash-dump-analysis）。
+
+    ⚠ 真的要寫才走 Lua（唯一的路，見 AS_DESIGNATED_RES_LIST 的說明）。
     """
+    if _res_list_diff(scanner, names) is None:
+        return True, "清單已是想要的內容（免寫）"
     ok, why = lua.call(mover, scanner, "game.robotvar_clear_list",
                        AS_DESIGNATED_RES_LIST)
     if not ok:
@@ -694,29 +731,9 @@ def set_res_list(mover, scanner, names: list[str]) -> tuple[bool, str]:
                            AS_DESIGNATED_RES_LIST, name)
         if not ok:
             return False, f"加「{name}」失敗（{why}）"
-    # ★★ 對帳直接讀**記錄的原始位元組**，不走 Lua。兩個理由：
-    #   ⚠ Lua 的 `robotvar_getnum_list` 在 add 完**立刻問會回 0**（實測），
-    #     拿它對帳會誤報失敗、把設好的東西又當成沒設好。
-    #   ⚠⚠ 更重要：**比對解碼後的字串擋不住編碼錯誤** —— 讀取端有 big5
-    #     退路，名字編成 big5 寫進去，讀回來照樣解得出同一個字，看起來
-    #     「一致」。2026-08-11 就是這樣被騙過去：遊戲比對不到、面板顯示
-    #     不出來，我們卻回報「設好了」。所以比的是**位元組**，而遊戲存的
-    #     是 UTF-8（使用者手動加一筆並排比對確認的）。
-    rec = _find_var(scanner, AS_DESIGNATED_RES_LIST)
-    if not isinstance(rec, int):
-        return False, "寫完找不到那筆記錄"
-    head = scanner._read_bytes(rec, _L_ELEMS)
-    if not head or head[_V_TYPE] != VAR_T_STRLIST:
-        return False, "那筆記錄不是字串清單"
-    n = struct.unpack_from("<i", bytes(head), _L_COUNT)[0]
-    if n != len(names):
-        return False, f"筆數對不上（寫了 {len(names)} 筆，記錄裡是 {n}）"
-    for i, name in enumerate(names):
-        ptr = _u32(scanner, rec + _L_ELEMS + i * 4)
-        raw = scanner._read_bytes(ptr, 128) if ptr else None
-        got = bytes(raw).split(b"\x00")[0] if raw else b""
-        if got != name.encode("utf-8"):
-            return False, f"「{name}」寫進去的位元組不對（{got!r}）"
+    diff = _res_list_diff(scanner, names)
+    if diff is not None:
+        return False, diff
     return True, ""
 
 

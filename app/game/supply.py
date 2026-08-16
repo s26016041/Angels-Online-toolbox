@@ -279,12 +279,21 @@ def _talkaction(mover, scanner, code: int) -> bool:
 
 
 def _wnd_open(mover, scanner, name: str) -> bool:
-    """某個視窗真的開了嗎（讀它的執行期代號，非 0 = 開著）。讀不到當「沒開」。"""
+    """某個視窗真的開了嗎（讀它的執行期代號，非 0 = 開著）。讀不到當「沒開」。
+
+    ★ 2026-08-16 改**純讀**（`lua.globals_of` 走全域表雜湊節點，跟
+      `produce.panel_open` 同一招）：舊寫法走 `lua.get_global` 要動 Lua
+      堆疊，而補給一趟裡這支被叫十幾次、精靈主開關還開著 —— 正是崩潰
+      dump 抓到的 Lua 競態場景。mover 參數留著不用（呼叫點多，不動簽名）。
+    ⚠ 這裡「讀不到當沒開」是刻意的：呼叫端把「沒開」當成要重點 NPC 再試，
+      多試一次無害；當成「開著」才會跳過必要步驟。
+    """
+    _ = mover
     try:
-        v = lua.get_global(mover, scanner, name)
+        g = lua.globals_of(scanner, (name,))
     except Exception:                                      # noqa: BLE001
         return False
-    return isinstance(v, (int, float)) and int(v) != 0
+    return bool(g and g.get(name))
 
 
 def _ent_tile_f(scanner, ent: int):
