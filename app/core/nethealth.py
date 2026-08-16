@@ -11,7 +11,7 @@
 是同一種動作，不碰遊戲記憶體、不送任何遊戲封包。
 
 ⚠ 這些函式會**阻塞到逾時**（最多幾秒），不要在 UI 執行緒直接叫 ——
-  自動回連是包在背景執行緒裡用的（見 multi_tab 的 _ar_probe）。
+  自動回連是包在背景執行緒裡用的（見 login_tab 的 _kick_probe）。
 """
 from __future__ import annotations
 

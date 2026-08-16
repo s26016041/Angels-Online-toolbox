@@ -1,11 +1,14 @@
 """自動回連離線測試（不碰遊戲、不碰記憶體、不寫真的 config）。
 
-驗分身總控的自動回連狀態機：斷網全關等網重登、崩潰彈窗連兩拍才動手、
-視窗消失不重複殺、單台斷線寬限吃得下換頻瞬斷、維修閘門擋住白開遊戲、
+驗自動登入分頁的自動回連狀態機（0.4.33 起勾選與監看都住在 login_tab）：
+斷網全關等網重登、崩潰彈窗連兩拍才動手、視窗消失不重複殺、
+單台斷線寬限吃得下換頻瞬斷、維修閘門擋住白開遊戲、
 沒存帳密只報一次不無限重試、重登失敗退避重試、手動登入中不誤判。
 
 作法照 tools/watch_check.py：offscreen Qt＋假遊戲層＋假時鐘，
 假物件 patch 進**用到它的模組**的命名空間，探測改成同步跑。
+一鍵登入的狀態機不在受測範圍 —— 用假的（FakeLoginFlow）蓋掉分頁上的
+busy()/known_accounts()/start_auto_login()，只驗監看端怎麼指揮它。
 
 用法：py tools\\reconnect_check.py   （全 PASS 結尾印 OK，有 FAIL 結束碼 1）
 """
@@ -22,7 +25,8 @@ from PySide6.QtWidgets import QApplication            # noqa: E402
 
 from app.core import injector, nethealth, netstat, preload  # noqa: E402
 from app.core import window as win                    # noqa: E402
-from app.tabs import multi_tab                        # noqa: E402
+from app.game import login as game_login              # noqa: E402
+from app.tabs import login_tab                        # noqa: E402
 
 # --- 假遊戲層 ----------------------------------------------------------
 CLOCK = [1000.0]
@@ -63,7 +67,7 @@ def fake_kill(pid):
 
 
 class FakeConfig:
-    """MultiTab 只認 get/set/save；絕不能讓測試寫進真的 config.json。"""
+    """LoginTab 只認 get/set/save/（去）混淆；絕不能讓測試寫進真的 config.json。"""
 
     def __init__(self):
         self.data = {
@@ -81,8 +85,18 @@ class FakeConfig:
     def save(self):
         pass
 
+    @staticmethod
+    def obfuscate(s):
+        return s
 
-class FakeLoginTab:
+    @staticmethod
+    def deobfuscate(s):
+        return s
+
+
+class FakeLoginFlow:
+    """假的一鍵登入狀態機（受測的是監看端，不是登入流程本身）。"""
+
     def __init__(self):
         self.known = {"A", "B", "C"}
         self.calls: list[list[str]] = []
@@ -104,18 +118,26 @@ class FakeLoginTab:
 preload.windows = fake_windows
 netstat.established_pids = fake_est
 win.crash_dialogs = fake_dialogs
+# build_ui 會經 _game_windows 找分身（伺服器清單那條路）——不碰真系統
+win.enumerate_windows = lambda **kw: []
+# 伺服器清單給假的 —— 讀不到的話 _rebuild_table 會把帳號的 server 清空
+# （安全退化），連帶讓維修閘門拿不到端點；實機一定讀得到，測試也要讀得到。
+game_login.servers = lambda sc, gd: [("雅典娜", 5)]
 injector.kill_process = fake_kill
 nethealth.internet_up = lambda: NET_UP[0]
 nethealth.server_up = lambda addr: SRV_UP[0]
 nethealth.login_server_addr = lambda gd, name: ("1.2.3.4", 18111)
-multi_tab._spawn = lambda fn: fn()          # 探測同步跑，測試才是決定性的
-multi_tab.time = types.SimpleNamespace(monotonic=lambda: CLOCK[0])
-multi_tab.config = FakeConfig()
+login_tab._spawn = lambda fn: fn()          # 探測同步跑，測試才是決定性的
+login_tab.time = types.SimpleNamespace(monotonic=lambda: CLOCK[0])
+login_tab.config = FakeConfig()
 
 app = QApplication.instance() or QApplication([])
-TAB = multi_tab.MultiTab()
-LT = FakeLoginTab()
-TAB._login_tab = lambda: LT
+TAB = login_tab.LoginTab()
+LT = FakeLoginFlow()
+# 蓋掉分頁自己的登入流程入口 —— 監看端叫的是 self.busy() 等同名方法
+TAB.busy = LT.busy
+TAB.known_accounts = LT.known_accounts
+TAB.start_auto_login = LT.start_auto_login
 
 FAILS: list[str] = []
 
@@ -321,6 +343,19 @@ LT._busy = False
 tick()
 tick()
 check("結束後不誤判視窗消失", not TAB._ar_want and not KILLED)
+
+# ======================================================================
+print("S9 設定鍵搬家：舊的 multi.auto_reconnect 當預設值帶過來")
+old_cfg = login_tab.config
+try:
+    mig = FakeConfig()
+    mig.data["multi.auto_reconnect"] = True     # 0.4.32 勾過、新鍵還沒存在
+    login_tab.config = mig
+    tab2 = login_tab.LoginTab()
+    check("升級後勾選不見不掉", tab2.ar_box.isChecked())
+    tab2.on_close()
+finally:
+    login_tab.config = old_cfg
 
 # ======================================================================
 print()

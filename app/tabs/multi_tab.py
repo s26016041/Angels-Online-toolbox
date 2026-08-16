@@ -64,15 +64,12 @@ from __future__ import annotations
 
 import math
 import os
-import sys
-import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
@@ -87,8 +84,7 @@ from PySide6.QtWidgets import (
 
 from app import theme
 from app.config import config
-from app.core import charname, injector, nethealth, netstat, preload
-from app.core import window as win
+from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
 from app.game import (channel, entity, jumpmap, locate, login, move, navigate,
                       robot, scene, team, terrain)
@@ -139,36 +135,6 @@ WALK_SETTLE = 3.0
 # 「因為 xxx 所以不動」這種訊息在狀態列上撐多久（每一拍都會重寫狀態列，
 # 不撐著的話跳窗一關就被蓋掉了）。
 STICKY_SECS = 20.0
-
-# --- 自動回連 ---------------------------------------------------------------
-# 出事的三種樣子與對策（斷線分類的證據都是當場探測的，不是猜的）：
-#   斷網    全部在線分身同時沒了 TCP ＋ 本機連不上網際網路（實測探測）
-#           → 規格：全部分身關閉 → 等網路回來 → 一鍵登入弄回去
-#   崩潰    遊戲行程彈出 #32770 錯誤視窗（遊戲介面是 DirectX 畫的，正常
-#           不會有第二個原生視窗）／遊戲視窗直接消失
-#           → 關掉那台（視窗已消失就不用關）→ 一鍵登入弄回去
-#   單台斷線 連線消失超過寬限、網路又是通的（被踢、單線抽風）
-#           → 同崩潰處置。重登前先探登入伺服器的門 —— 維修中就等，
-#             不白開遊戲（伺服器端點讀 server.xml，見 app/core/nethealth.py）
-AR_TICK_MS = 2000        # 監看節奏。一拍＝列視窗＋查TCP表＋（必要時）發背景探測
-AR_DIALOG_TICKS = 2      # 連續幾拍看到錯誤對話框才算數（防一閃而過的正常視窗）
-# 單台連線消失多久才處置。換頻＝斷線重連（實測約 1 秒），寬限一定要吃得下它；
-# 30 秒也吃得下探測抖動。⚠ 這不是給使用者調的 —— 斷了就是斷了，寬限只是防瞬斷。
-AR_TCP_GRACE = 30.0
-AR_NET_STABLE = 8.0      # 斷網恢復後網路要連續通這麼久才重登（防一跳一跳的假恢復）
-AR_PROBE_GAP = 6.0       # 背景探測的最小間隔（探測本身會阻塞 2~3 秒，別疊著發）
-AR_PROBE_FRESH = 60.0    # 探測結果多久內算新鮮；過期就重探，不拿老黃曆做決定
-AR_RETRY_BASE = 30.0     # 重登沒全回來時的冷卻，每次翻倍（重試不設上限，勾選是出口）
-AR_RETRY_CAP = 300.0
-# 登入流程的看門狗：每帳號每一步都有自己的逾時（開遊戲 60s、進遊戲 25s…），
-# 五個帳號全走一遍也遠不到這個數。這道是「狀態機凍死」的最後保險，不是節奏控制。
-AR_LOGIN_WATCHDOG = 600.0
-
-
-def _spawn(fn) -> None:
-    """探測要開背景執行緒跑（會阻塞 2~3 秒）。獨立成函式讓離線測試可以換成同步跑。"""
-    threading.Thread(target=fn, daemon=True).start()
-
 
 def _acct(title: str) -> str:
     """視窗標題裡的帳號；**還沒登入的視窗回空字串**。
@@ -351,42 +317,6 @@ class MultiTab(BaseTab):
         bar4.addStretch(1)
         root.addLayout(bar4)
 
-        # --- 自動回連 -----------------------------------------------------
-        bar5 = QHBoxLayout()
-        self.ar_box = QCheckBox("自動回連")
-        self.ar_box.setToolTip(
-            "分身出事就自動弄回線上（斷線的三種樣子分開對症下藥）：\n"
-            "  · 斷網（全部同時掉線＋實測本機連不上網）→ 關閉全部分身，\n"
-            "    等網路回來再一鍵登入弄回去\n"
-            "  · 崩潰（彈出錯誤視窗／遊戲視窗消失）→ 關掉那台再登回去\n"
-            "  · 單台斷線（被踢）→ 同崩潰處置\n"
-            "重登走「自動登入」分頁的流程，所以帳號要先在那邊存過帳密；\n"
-            "重登前會先探登入伺服器 —— 維修中不會白開遊戲，等開門才動。\n"
-            "⚠ 開著這個時手動關遊戲會被它自動開回來，要自己關請先取消勾選。")
-        self.ar_box.setChecked(bool(config.get("multi.auto_reconnect", False)))
-        self.ar_box.toggled.connect(self._ar_toggled)
-        bar5.addWidget(self.ar_box)
-        self.ar_lbl = QLabel("")
-        self.ar_lbl.setWordWrap(True)
-        self.ar_lbl.setStyleSheet("color: #9aa2b8;")
-        bar5.addWidget(self.ar_lbl, 1)
-        root.addLayout(bar5)
-
-        # 自動回連的狀態（全部集中初始化，_ar_reset 也是清這一批）
-        self._ar_state = "idle"           # idle / wait_net / wait_login
-        self._ar_want: dict[str, str] = {}     # 帳號 -> 為什麼要回連
-        self._ar_dropped: set[str] = set()      # 沒存帳密、救不回來（只報一次）
-        self._ar_online: dict[str, int] = {}    # 上一拍在線的帳號 -> pid
-        self._ar_tcp_lost: dict[int, float] = {}  # pid -> 連線消失起算時間
-        self._ar_dialog: dict[int, int] = {}    # pid -> 連續幾拍看到錯誤視窗
-        # 背景探測結果（背景執行緒寫、這裡讀；單筆指派在 CPython 是原子的）
-        self._ar_net = {"ok": None, "ts": 0.0, "busy": False}
-        self._ar_srv = {"ok": None, "ts": 0.0, "busy": False}
-        self._ar_net_up_since: float | None = None
-        self._ar_retry_at = 0.0
-        self._ar_retry_gap = AR_RETRY_BASE
-        self._ar_login_started = 0.0
-
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -427,13 +357,6 @@ class MultiTab(BaseTab):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(REFRESH_MS)
-        # ⚠ 自動回連自己一顆計時器，**不吃**上面那顆的「分頁沒在看就跳過」——
-        #   人不在電腦前才最需要它，那時分頁多半根本沒開著。
-        self._ar_timer = QTimer(self)
-        self._ar_timer.timeout.connect(self._ar_tick)
-        self._ar_timer.start(AR_TICK_MS)
-        if self.ar_box.isChecked():
-            self._ar_status("監看中…")
 
     # ------------------------------------------------------------------
     def on_show(self) -> None:
@@ -443,7 +366,6 @@ class MultiTab(BaseTab):
 
     def on_close(self) -> None:
         self._timer.stop()
-        self._ar_timer.stop()
         self._job = None
         for pid in list(self._movers):
             self._drop_mover(pid)
@@ -1643,277 +1565,3 @@ class MultiTab(BaseTab):
                     else "（已經送出去的那幾包不會收回）")
             self.status.setText(why + tail)
 
-    # ==================================================================
-    # 自動回連（設計說明見檔頭 AR_* 常數那一段）
-    # ==================================================================
-    def _ar_toggled(self, on: bool) -> None:
-        config.set("multi.auto_reconnect", bool(on))
-        config.save()                      # ⚠ set() 不寫檔，一定要接 save()
-        self._ar_reset()
-        self._ar_status("監看中…" if on else "")
-
-    def _ar_reset(self) -> None:
-        """回到全新狀態。勾選切換時叫 —— 舊帳（要回連誰、探測結果）全部作廢。"""
-        self._ar_state = "idle"
-        self._ar_want.clear()
-        self._ar_dropped.clear()
-        self._ar_online.clear()
-        self._ar_tcp_lost.clear()
-        self._ar_dialog.clear()
-        self._ar_net_up_since = None
-        self._ar_retry_at = 0.0
-        self._ar_retry_gap = AR_RETRY_BASE
-
-    def _ar_status(self, text: str) -> None:
-        if self.ar_lbl.text() != text:
-            self.ar_lbl.setText(text)
-
-    def _ar_log(self, msg: str) -> None:
-        """處置動作都留一筆稽核紀錄（打包版 stderr 是 None，寫了會炸）。"""
-        if sys.stderr:
-            sys.stderr.write(f"[自動回連] {msg}\n")
-
-    def _login_tab(self):
-        """自動登入分頁的實體（重登借它那台實戰過的狀態機）。找不到回 None。"""
-        for t in getattr(self.window(), "_loaded_tabs", []):
-            if t.__class__.__name__ == "LoginTab":
-                return t
-        return None
-
-    def _ar_mark(self, acct: str, why: str) -> None:
-        """把帳號記進「要回連」名單。已有原因就不蓋（第一個原因才是根因）。"""
-        if acct and acct not in self._ar_dropped and acct not in self._ar_want:
-            self._ar_want[acct] = why
-            self._ar_log(f"{acct}：{why} → 排入回連")
-
-    def _kick_probe(self, holder: dict, fn) -> None:
-        """需要新證據就發一次背景探測（會阻塞 2~3 秒，不能在 UI 執行緒跑）。"""
-        now = time.monotonic()
-        if holder["busy"] or now - holder["ts"] < AR_PROBE_GAP:
-            return
-        holder["busy"] = True
-
-        def run():
-            try:
-                ok = bool(fn())
-            except Exception:                              # noqa: BLE001
-                ok = False       # 探測自己出錯當「不通」：寧可多等，不硬衝
-            holder["ok"] = ok
-            holder["ts"] = time.monotonic()
-            holder["busy"] = False
-
-        _spawn(run)
-
-    def _ar_fresh(self, holder: dict):
-        """探測結果夠新鮮才拿來做決定；過期回 None（＝還不知道）。"""
-        if holder["ok"] is None or time.monotonic() - holder["ts"] > AR_PROBE_FRESH:
-            return None
-        return holder["ok"]
-
-    def _ar_srv_addr(self) -> tuple[str, int] | None:
-        """要回連的帳號所屬伺服器的登入端點（探「維修結束了沒」用）。"""
-        accts = config.get("accounts", []) or []
-        names = {str(a.get("server") or "") for a in accts
-                 if a.get("account") in self._ar_want}
-        names.discard("")
-        exe = str(config.get("login.exe_path", "") or "")
-        if not names or not exe:
-            return None
-        return nethealth.login_server_addr(os.path.dirname(exe), sorted(names)[0])
-
-    def _ar_tick(self) -> None:
-        if not self.ar_box.isChecked():
-            return
-        try:
-            self._ar_step()
-        except Exception:                                  # noqa: BLE001
-            # 監看不能因為一拍出錯就死掉；記下來，下一拍重來。
-            if sys.stderr:
-                import traceback
-                traceback.print_exc()
-
-    def _ar_step(self) -> None:                       # noqa: C901
-        now = time.monotonic()
-        wins = preload.windows()
-        logged = {}                        # 帳號 -> WindowInfo（已登入的視窗）
-        for w in wins:
-            a = _acct(w.title)
-            if a:
-                logged[a] = w
-        lt = self._login_tab()
-
-        # ── 重登流程進行中：只等結果，不做偵測（登入中視窗開開關關全是假訊號）
-        if self._ar_state == "wait_login":
-            if (lt is not None and lt.busy()
-                    and now - self._ar_login_started < AR_LOGIN_WATCHDOG):
-                self._ar_status("正在重新登入：" + "、".join(sorted(self._ar_want)))
-                return
-            # 做完（或看門狗到）→ 用視窗標題驗收，不信流程自己說的成功
-            back = [a for a in list(self._ar_want) if a in logged]
-            for a in back:
-                self._ar_want.pop(a, None)
-                self._ar_log(f"{a}：已回到線上 ✅")
-            self._ar_online = {a: w.pid for a, w in logged.items()}
-            self._ar_state = "idle"
-            if not self._ar_want:
-                self._ar_retry_gap = AR_RETRY_BASE
-                self._ar_status("回連完成 ✅" if back else "監看中…")
-            else:
-                self._ar_retry_at = now + self._ar_retry_gap
-                self._ar_status(
-                    f"還有 {len(self._ar_want)} 個帳號沒回來"
-                    f"（{'、'.join(sorted(self._ar_want))}），"
-                    f"{int(self._ar_retry_gap)} 秒後再試")
-                self._ar_retry_gap = min(self._ar_retry_gap * 2, AR_RETRY_CAP)
-            return
-
-        # ── 使用者自己在跑一鍵登入 → 旁觀，並且不跨過這段做斷線判斷
-        if lt is not None and lt.busy():
-            self._ar_online = {a: w.pid for a, w in logged.items()}
-            return
-
-        # ── 斷網等待中：只盯網路，通了且穩定才放行去重登
-        if self._ar_state == "wait_net":
-            self._kick_probe(self._ar_net, nethealth.internet_up)
-            if self._ar_fresh(self._ar_net):
-                if self._ar_net_up_since is None:
-                    self._ar_net_up_since = now
-                if now - self._ar_net_up_since >= AR_NET_STABLE:
-                    self._ar_state = "idle"     # 落到下面的重登路徑
-                else:
-                    self._ar_status("網路回來了，確認穩定中…")
-                    return
-            else:
-                self._ar_net_up_since = None
-                self._ar_status("網路斷線中，等它回來…（分身已全部關閉）")
-                return
-
-        # ── 偵測 ─────────────────────────────────────────────
-        est = netstat.established_pids()
-        game_pids = {w.pid for w in wins}
-
-        # 1) 錯誤對話框（崩潰但行程還活著、視窗還在）
-        boxes = {d.pid: d for d in win.crash_dialogs(game_pids)}
-        for pid in list(self._ar_dialog):
-            if pid not in boxes:
-                self._ar_dialog.pop(pid)
-        for pid in boxes:
-            self._ar_dialog[pid] = self._ar_dialog.get(pid, 0) + 1
-        crashed = {pid for pid, n in self._ar_dialog.items()
-                   if n >= AR_DIALOG_TICKS}
-
-        # 2) 視窗直接消失（上一拍還在線、這一拍整個視窗沒了＝崩潰或被關）
-        for acct, pid in self._ar_online.items():
-            if acct not in logged and pid not in game_pids:
-                self._ar_mark(acct, "遊戲視窗消失（崩潰或被關閉）")
-
-        # 3) TCP 連線消失（只看已登入的 —— 停在登入畫面本來就沒有連線）
-        lost = {w.pid for w in logged.values() if w.pid not in est}
-        for pid in list(self._ar_tcp_lost):
-            if pid not in lost:
-                self._ar_tcp_lost.pop(pid)
-        for pid in lost:
-            self._ar_tcp_lost.setdefault(pid, now)
-
-        # 全部在線分身同時沒了連線 → 疑似斷網，發探測拿證據再動手
-        if logged and len(lost) == len(logged):
-            self._kick_probe(self._ar_net, nethealth.internet_up)
-            fresh = self._ar_fresh(self._ar_net)
-            if (fresh is False
-                    and self._ar_net["ts"] >= min(self._ar_tcp_lost.values())):
-                # 證據：連線是「斷了之後」實測連不上網際網路 → 斷網。
-                # 規格：全部天戀關閉（沒登入的、沒存帳密的也一起關）。
-                for acct, w in logged.items():
-                    self._ar_mark(acct, "斷網")
-                self._ar_log(f"斷網確認：關閉全部 {len(wins)} 台分身")
-                for w in wins:
-                    injector.kill_process(w.pid)
-                self._ar_online.clear()
-                self._ar_tcp_lost.clear()
-                self._ar_dialog.clear()
-                self._ar_state = "wait_net"
-                self._ar_net_up_since = None
-                self._ar_status("偵測到斷網：已關閉全部分身，等網路回來…")
-                return
-            if fresh is None:
-                self._ar_status("全部分身同時掉線，確認網路中…")
-                # 還不知道是不是斷網 → 這一拍先不動手（單台寬限照樣在數）
-
-        # 單台處置：崩潰彈窗立刻處理；連線消失要過寬限（吃下換頻瞬斷）
-        for acct, w in logged.items():
-            if w.pid in crashed:
-                self._ar_mark(acct, f"崩潰（錯誤視窗「{boxes[w.pid].title}」）")
-                self._ar_log(f"結束崩潰的分身 pid={w.pid}（{acct}）")
-                injector.kill_process(w.pid)
-            elif (w.pid in self._ar_tcp_lost
-                  and now - self._ar_tcp_lost[w.pid] >= AR_TCP_GRACE
-                  and self._ar_fresh(self._ar_net) is not False):
-                self._ar_mark(acct, "連線中斷（網路正常 → 被踢或伺服器端）")
-                self._ar_log(f"結束斷線凍住的分身 pid={w.pid}（{acct}）")
-                injector.kill_process(w.pid)
-        # 沒登入的視窗彈錯誤視窗：一樣關掉（它已經死了），但沒帳號可回連
-        for w in wins:
-            if w.pid in crashed and not _acct(w.title):
-                self._ar_log(f"結束崩潰的未登入分身 pid={w.pid}")
-                injector.kill_process(w.pid)
-
-        self._ar_online = {a: w.pid for a, w in logged.items()}
-
-        # ── 重登路徑 ─────────────────────────────────────────
-        if not self._ar_want:
-            if self._ar_state == "idle":
-                text = f"監看中（{len(logged)} 台在線）"
-                if self._ar_dropped:
-                    # 救不回來的要一直掛著，不能被「監看中」蓋掉一拍就沒了
-                    text += ("　⚠ 無法回連（帳號清單沒存帳密）："
-                             + "、".join(sorted(self._ar_dropped)))
-                self._ar_status(text)
-            return
-        if now < self._ar_retry_at:
-            return
-        # 閘門①：網路要通（單台被踢時多半本來就通，一拍就過）
-        self._kick_probe(self._ar_net, nethealth.internet_up)
-        net = self._ar_fresh(self._ar_net)
-        if net is None:
-            return                       # 探測還在跑，下一拍再看
-        if net is False:
-            self._ar_state = "wait_net"  # 想重登卻發現沒網路 → 轉斷網流程
-            self._ar_net_up_since = None
-            return
-        # 閘門②：登入伺服器要開門 —— 維修中不白開遊戲
-        addr = self._ar_srv_addr()
-        if addr is not None:
-            self._kick_probe(self._ar_srv, lambda: nethealth.server_up(addr))
-            srv = self._ar_fresh(self._ar_srv)
-            if srv is None:
-                return
-            if srv is False:
-                self._ar_status(
-                    f"登入伺服器 {addr[0]}:{addr[1]} 連不上"
-                    "（可能在維修）—— 等它開門再重登")
-                return
-        # 閘門③：帳號要在自動登入分頁存過帳密
-        if lt is None:
-            self._ar_status("⚠ 找不到「自動登入」分頁，無法自動重登")
-            return
-        known = lt.known_accounts()
-        gone = [a for a in self._ar_want if a not in known]
-        for a in gone:
-            self._ar_want.pop(a, None)
-            self._ar_dropped.add(a)
-            self._ar_log(f"{a}：自動登入分頁沒存這個帳號的帳密，救不回來")
-        if gone:
-            self._ar_status("⚠ 無法回連（帳號清單沒存帳密）："
-                            + "、".join(sorted(self._ar_dropped)))
-        if not self._ar_want:
-            return
-        err = lt.start_auto_login(sorted(self._ar_want))
-        if err:
-            self._ar_status(f"暫時無法重登：{err}")
-            self._ar_retry_at = now + 10.0
-            return
-        self._ar_state = "wait_login"
-        self._ar_login_started = now
-        self._ar_log("開始重登：" + "、".join(
-            f"{a}（{why}）" for a, why in sorted(self._ar_want.items())))
-        self._ar_status("正在重新登入：" + "、".join(sorted(self._ar_want)))
