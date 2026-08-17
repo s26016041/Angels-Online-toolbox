@@ -379,6 +379,11 @@ QB_REFRESH = 2.0
 #   遊戲自己有冷卻，還沒好的那一招送出去也只是不生效，不會出事。
 # ⚠ 執行緒節拍要比這個細，否則實際間隔會被量化成節拍的倍數。
 ROUND_GAP = 0.10
+# 首發送出後，等「受理回音」多久才准重送（8/18，使用者：不准重複施放首發）。
+# 伺服器受理的回音（環清單新節點）五台實測 0.2~1.6 秒才到；照 ROUND_GAP
+# 0.1 秒重送的話，回音抵達前可能被**多受理一發**（瞬移就多傳一次＝亂放）。
+# 確認是 40Hz 輪詢，回音一到立刻解鎖，不會等滿這個數。
+OPENER_RETRY = 2.0
 STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 # 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
 QUICKKEY_RANGE = 8
@@ -654,6 +659,8 @@ class KeyWorker(_Paced):
         self._ver_ring = False      # 「施放後鎖定」環清單（對地技能唯一訊號）
         self._ring_pre: set[int] = set()   # 上鎖當下環清單的節點位址快照
         self._open_verify = False   # 兩條通道至少一條活著（都死才「送一次就算」）
+        self._open_sent = False     # 這一隻的首發**送出去過**了嗎（沒送不看訊號）
+        self._open_next = 0.0       # 下一次准重送首發的時間（受理回音節流）
         self._open_since = 0.0
         self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
         self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
@@ -881,6 +888,8 @@ class KeyWorker(_Paced):
         self._ver_ring = marks is not None
         self._ring_pre = {a for a, _s in (marks or [])}
         self._open_verify = self._ver_field or self._ver_ring
+        self._open_sent = False
+        self._open_next = 0.0
 
     def _sp_blocked(self, sid: int) -> str:
         """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
@@ -950,21 +959,37 @@ class KeyWorker(_Paced):
         if self._opened:
             self.open_wait = 0.0
             return None
-        # 訊號①：欄位出現這個技能 ID（指向性技能）。
-        confirmed = (self._ver_field
-                     and player.read_last_skill(self.sc, self.stats) == sid)
-        # 訊號②：環清單長出**新**節點且技能 ID 吻合（對地技能唯一訊號）。
-        if not confirmed and self._ver_ring:
-            try:
-                marks = attack.casting_marks(self.sc)
-            except Exception:                      # noqa: BLE001
-                marks = None                       # 這一拍讀壞就當沒看到
-            confirmed = bool(marks) and any(
-                s == sid and a not in self._ring_pre for a, s in marks)
-        if confirmed:
-            self._opened = True                    # 遊戲受理了 → 其他招解鎖
+        # ⚠ 對地技能只有封包一條路：跳板不在＝根本放不出來，等下去是死結
+        #   → 大聲跳過這一隻（狀態列會講），不准安靜卡死。
+        if (skills.is_ground(sid)
+                and not (self.mover and getattr(self.mover, "active", False))):
+            self._opened = True
             self.open_wait = 0.0
+            self.open_note = (f"⚠ 移動跳板不在，對地首發"
+                              f"「{skills.name_of(sid) or sid}」放不出來，"
+                              "這一隻跳過")
             return None
+        # ★★ 還沒送出去之前**不看任何訊號**（8/18）：上一隻怪首發的受理
+        #   回音最慢 1.6 秒才到，殺得快時會落在**這一隻**上鎖之後 ——
+        #   沒有這道閘，遲到的舊回音會被當成「這一隻已放過」，首發被
+        #   安靜跳過（使用者抱怨的「沒有先放首次攻擊」其中一種成因）。
+        if self._open_sent:
+            # 訊號①：欄位出現這個技能 ID（指向性技能）。
+            confirmed = (self._ver_field
+                         and player.read_last_skill(self.sc, self.stats)
+                         == sid)
+            # 訊號②：環清單長出**新**節點且技能 ID 吻合（對地唯一訊號）。
+            if not confirmed and self._ver_ring:
+                try:
+                    marks = attack.casting_marks(self.sc)
+                except Exception:                  # noqa: BLE001
+                    marks = None                   # 這一拍讀壞就當沒看到
+                confirmed = bool(marks) and any(
+                    s == sid and a not in self._ring_pre for a, s in marks)
+            if confirmed:
+                self._opened = True                # 遊戲受理了 → 其他招解鎖
+                self.open_wait = 0.0
+                return None
         # ★ SP 不夠（或分不出來）→ 放行其他招，別站在那裡等一個不會好的條件。
         why = self._sp_blocked(sid)
         if why:
@@ -1077,6 +1102,14 @@ class KeyWorker(_Paced):
             opener = self._opener_gate(eid, bykey, now)
             if opener is not None:
                 usable = [opener]
+                # ★★ 受理回音節流（8/18，使用者：不准重複施放首發）：
+                #   送出一發之後先等 OPENER_RETRY 秒再重送——回音抵達前照
+                #   ROUND_GAP 重送，可能被伺服器**多受理一發**（瞬移就多傳
+                #   一次＝亂放）。確認是每拍輪詢（_opener_gate），回音一到
+                #   立刻解鎖，不會等滿。在 CD 中被拒＝沒有回音，時間到自然
+                #   重送 —— 「等 CD、等多久都等」的行為不變。
+                if now < self._open_next:
+                    return
             elif self.opener_vk in usable and len(usable) > 1:
                 # ★★ 首發只在**開頭放一次**（使用者 2026-08-17 指定）：放出去
                 #   之後的輪迴**不包含**首發鍵。之前首發鍵同時勾在技能鍵裡
@@ -1123,6 +1156,7 @@ class KeyWorker(_Paced):
             #   也不會因為某次例外就再也不出手。
             self._next_round = now + ROUND_GAP
             struck = False
+            sent_opener = False        # 這一輪首發**真的**送出去了嗎
             if mode == MODE_PACKET and packets and eid and mover is not None:
                 for k in usable:
                     sid = bykey.get(k)
@@ -1157,18 +1191,33 @@ class KeyWorker(_Paced):
                     else:
                         ok = False
                     struck = struck or ok
+                    if ok and k == opener:
+                        sent_opener = True
             if not struck:
                 # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵。
                 # ⚠ 送鍵一次要按住 40ms，一輪送一個就好（見 [[key-send-hold]]）。
-                vk = (usable or vks)[self._rot % len(usable or vks)]
-                _send_scan(self.hwnd, vk)
-                self._rot += 1
-                if self._learning:
-                    self._learn(vk)            # 剛按過鍵，順手讀一下
-            # 驗不了的那兩種情況（見 _opener_gate）：送出去就當首發完成。
-            # ⚠ 這一條就是「絕不會永遠站著不出手」的保險，別拿掉。
-            if opener is not None and not self._open_verify:
-                self._opened = True
+                # ⚠⚠ **對地技能絕不送鍵**（8/18）：按鍵會跳出「選範圍」游標
+                #   掛在畫面上等人點地板（對地一律走封包是使用者定的規則）。
+                #   這條退路以前沒過濾 —— 對地首發在射程邊緣走到這裡就會
+                #   一直彈游標，是「亂七八糟」的亂源之一。
+                pool = [k for k in (usable or vks)
+                        if not skills.is_ground(bykey.get(k) or 0)]
+                if pool:
+                    vk = pool[self._rot % len(pool)]
+                    _send_scan(self.hwnd, vk)
+                    self._rot += 1
+                    if vk == opener:
+                        sent_opener = True
+                    if self._learning:
+                        self._learn(vk)        # 剛按過鍵，順手讀一下
+            if opener is not None and sent_opener:
+                # 首發送出去了：開始等受理回音；重送要等 OPENER_RETRY。
+                self._open_sent = True
+                self._open_next = now + OPENER_RETRY
+                # 驗不了（兩條通道都死＝重建空窗）才「送出去就當首發完成」。
+                # ⚠ 這一條就是「絕不會永遠站著不出手」的保險，別拿掉。
+                if not self._open_verify:
+                    self._opened = True
         except Exception:                      # noqa: BLE001
             pass
 
@@ -4811,7 +4860,10 @@ class CharFarmPage(QWidget):
             self._stuck = 0.0
         # ★★ 還沒打傷牠之前，冒出更近的怪就改打那隻（使用者要求）。
         #   放在 15 秒耐心之前：能換就換，不必等它逾時。
-        if self._switch_closer(m, dist):
+        # ⚠⚠ **等首發期間不換**（8/18）：換一隻＝首發整套重來（清零、重送、
+        #   重等回音），等待中一直換目標就變成「首發亂放一通」——尤其瞬移
+        #   那種會改變距離排序的首發。首發放完（或跳過）之後照常換。
+        if not waiting_opener and self._switch_closer(m, dist):
             return
         # ★★ 「沒進展」要等多久才放棄，**打得到的時候要有耐心**。
         #   STUCK_SECS(10 秒) 是為「走不過去」設計的；套在交戰上剛好是災難：
