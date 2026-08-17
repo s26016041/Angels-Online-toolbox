@@ -909,9 +909,16 @@ class KeyWorker(_Paced):
           時欄位就是 946。所以**不必**為了首發去動「射程 < 8 送鍵、> 8 打封包」
           那條分流（那是使用者定的規則）—— 我一度那樣改，被退回來了。
 
-        ⚠ 只有一種情況驗不了，退化成「送出去就算數」——
+        ⚠ 兩種情況驗不了，退化成「送出去就算數」——
           寧可少一道保證，也**絕不能讓角色永遠站著不出手**：
-          角色屬性位址還沒定位／已失效（清零＋讀回驗證沒過）。
+          ① 角色屬性位址還沒定位／已失效（清零＋讀回驗證沒過）。
+          ② **對地技能**（對象＝地面，瞬移術那類）：2026-08-17 黑狐實測
+            首發瞬移術Ⅳ —— MP 每 ~1.5 秒扣 49（真的一直在放），
+            「最近使用的技能」欄位 12 秒 238 拍**全程不寫**
+            （reports/opener_spam_watch.txt）。上面 ★★「封包也驗得到」
+            只對**指向性**技能成立，對地的施放路徑不寫那個欄位。
+            等欄位＝永遠等不到 → cast_at 每 0.1 秒重送、MP 噴光、
+            「等首發」還凍住放棄計時器＝死循環（「瞬移術一直放個不停」）。
         """
         vk = self.opener_vk
         sid = bykey.get(vk) if vk else None
@@ -925,7 +932,9 @@ class KeyWorker(_Paced):
             self._open_eid = eid
             self._opened = False
             self._open_since = now
-            self._open_verify = self._arm_opener()
+            # 對地技能驗不了（見 docstring ②）→ 走「送一次就算數」那條保險。
+            self._open_verify = (self._arm_opener()
+                                 and not skills.is_ground(sid))
         if self._opened:
             self.open_wait = 0.0
             return None
@@ -1822,8 +1831,9 @@ class CharFarmPage(QWidget):
             "・那個鍵是空的／放物品／快捷欄讀不到 → 自動當作沒設定，照常打。\n"
             "\n"
             "・出手方式照原本的規則（射程 ≤ 8 送鍵、> 8 打封包），不受影響。\n"
-            "⚠ 角色屬性讀不到時無法確認有沒有放出去 → 那一隻送一次就放行\n"
-            "　（不會讓角色站在那裡永遠不出手）。")
+            "⚠ 角色屬性讀不到、或首發是**對地技能**（瞬移術那類）時，\n"
+            "　無法確認有沒有放出去 → 那一隻送一次就放行\n"
+            "　（不會讓角色站在那裡永遠不出手；狀態列會提醒）。")
         self.open_box.addItem("不指定", 0)
         for label, vk in SKILL_KEYS:
             self.open_box.addItem(label, vk)
@@ -4025,6 +4035,12 @@ class CharFarmPage(QWidget):
                 self._keys.opener_vk):
             skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} 上沒有技能"
                            "（空格／物品）→ 這次不生效")
+        elif self._keys.opener_vk and skills.is_ground(
+                self._keys.skills.get(self._keys.opener_vk) or 0):
+            # 對地技能放沒放成驗證不了（黑狐瞬移術實測，見 _opener_gate ②）
+            # → 每隻怪送一次就接輪迴，不等驗證。要講出來，不能安靜退化。
+            skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} 是對地技能，"
+                           "放沒放成驗證不了 → 每隻怪送一次就接著輪迴")
         elif (self._keys.opener_vk
               and [k for k in self._keys.vks if self._keys.skills.get(k)]
                   == [self._keys.opener_vk]):
