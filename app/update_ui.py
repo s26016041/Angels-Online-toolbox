@@ -1,8 +1,14 @@
-"""自動更新的介面：背景檢查、強制更新、下載進度、重新啟動。
+"""自動更新的介面：啟動時背景檢查、強制更新、下載進度、重新啟動。
 
 **強制更新，不詢問** —— 查到新版就直接下載、換檔、重啟。只顯示進度，沒有選項。
 理由是記憶體位址與物品對照表會隨遊戲改版而失效，舊版留在使用者手上只會顯示錯的
 資料或完全抓不到，讓人以為程式壞了。
+
+⚠⚠ **只在啟動時檢查一次，用到一半不重查**（2026-08-17 使用者定的規矩）：
+之前每 30 分鐘重查一次，發新版的當下所有開著的工具箱**幾分鐘內全部強制重啟**，
+掛機／自動生產做到一半被硬生生打斷。改成重開才會更新 —— 剛啟動那一刻什麼都
+還沒開始跑，強制換檔不會打斷任何事。代價（開著不關的人停在舊版直到重開）
+是使用者自己選的。
 
 檢查在背景執行緒做（連 GitHub 可能要幾秒），不擋住視窗開啟。
 沒網路 / 查不到 / 已是最新 → 完全安靜。
@@ -53,11 +59,11 @@ class DownloadThread(QThread):
 
 
 class UpdateManager:
-    """掛在主視窗上：開場檢查一次，有新版就問要不要更新。"""
+    """掛在主視窗上：**只在開場檢查一次**，有新版就直接更新（見檔頭）。
 
-    # 多久重查一次。這是掛機監控工具，使用者會開著好幾個小時不關 —— 只在啟動時
-    # 檢查的話，那些人永遠不會更新，「強制更新」等於形同虛設。
-    RECHECK_MS = 30 * 60 * 1000
+    ⛔ 別把「每 N 分鐘重查」加回來：發新版的當下會把所有開著的工具箱
+      （掛機／自動生產進行中）強制重啟，2026-08-17 使用者明確要求拿掉。
+    """
 
     def __init__(self, parent) -> None:
         self._parent = parent
@@ -65,7 +71,6 @@ class UpdateManager:
         self._dl: DownloadThread | None = None
         self._dlg: QProgressDialog | None = None
         self._info: dict | None = None
-        self._timer: QTimer | None = None
         # ⚠⚠ 收工的執行緒先擱這裡，**不要直接把參考丟掉**。
         #   `done` 是排隊送過來的，槽跑到時 run() 往往還在收尾；那一刻要是
         #   Python 把最後一個參考回收掉，C++ 端的 QThread 就在執行中被解構
@@ -86,9 +91,6 @@ class UpdateManager:
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return
         self._run_check()
-        self._timer = QTimer(self._parent)
-        self._timer.timeout.connect(self._run_check)
-        self._timer.start(self.RECHECK_MS)
 
     def _run_check(self) -> None:
         """查一次。上一輪還沒收完、或正在下載時就跳過這輪。"""
@@ -114,9 +116,6 @@ class UpdateManager:
 
     def stop(self) -> None:
         """關閉程式前呼叫：等背景執行緒收完，別讓 Qt 在解構時抱怨。"""
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
         for t in (self._check, self._dl, *self._retired):
             if t is not None and t.isRunning():
                 t.wait(3000)
