@@ -212,6 +212,10 @@ _CALL_T = 0.6
 # make_batch 專用回傳：開到的面板裡**沒有**這個配方（多半是別種生產的檯子）。
 # 呼叫端看到它就該「關掉這個面板、換下一個站台點」，而不是在原面板一直重試。
 WRONG_PANEL = "面板裡沒有這個配方（可能是別種生產的檯子）"
+# make_batch 專用回傳：makeadd 跑了但清單裡一個都沒排進去。makeadd 的前置
+# 檢查（材料／數量／等級／**負重．背包**）不合就不加、也不報錯 —— 呼叫端
+# 若「之前都做得出來、材料也夠」，看到這個就該先去把成品處理掉再回來。
+ADD_REFUSED = "makeadd 沒把配方排進去（材料不足／數量 0／等級不夠？）"
 
 
 def _ctrl(mover, scanner, wnd: int, ctrl_id: int):
@@ -245,6 +249,9 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
 
     ★ 「真的排進去的數量」可能**比要求的少**（makeadd 自己會依材料／負重
       ／背包裁掉）—— 呼叫端要拿這個數字當真相，不能拿自己要求的 qty。
+    ★ 清單裡**已經排著**這個配方時只補差額（makeadd 是往那列**累加**，
+      0x58F93E）——上一批被打斷後清單常還掛著沒做完的那截，照原數量再 add
+      會把批次疊大（2026-08-17 卡住實例）。已排數 ≥ qty 就只重送 makestart。
     ★ 控制項指標給呼叫端**監看進度**用：`make_left()` 純讀那列「還剩幾個」，
       那才是遊戲自己的進度（吃了製作加倍、被打斷都反映在上面）。
 
@@ -278,27 +285,38 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
     if not mover.write(target + ITEM_SEL_OFF, b"\x01"):
         return False, 0, mk_c, "選配方寫入失敗"
 
-    # ② 設數量：往數量框的字串緩衝寫窄 ASCII（makeadd 讀不到數字就不加）
-    sbuf = _u32(scanner, qty_c + QTY_STR_OFF)
-    if not (sbuf and _PTR_LO < sbuf < _PTR_HI):
-        return False, 0, mk_c, "數量框讀不到"
-    if not mover.write(sbuf, str(int(qty)).encode("ascii") + b"\0"):
-        return False, 0, mk_c, "設數量寫入失敗"
-
-    # ③ makeadd → 把（選中配方 + 數量）加進製作清單
+    # ①b 清單裡已經排著幾個？（makeadd 是**累加**，只補差額，見檔頭說明）
     from app.game import lua
-    ok, _v = lua.call(mover, scanner, "game.makeadd", wnd)
-    if not ok:
-        return False, 0, mk_c, f"makeadd 沒成功（{_v}）"
-    added = 0
+    already = 0
     for it in _rows(scanner, mk_c):
+        if not (it and _PTR_LO < it < _PTR_HI):
+            continue
         data = _u32(scanner, it + ITEM_DATA_OFF) or 0
         if (data >> 16) == recipe_id:
-            added = max(added, data & 0xFFFF)
-    if added <= 0:
-        # makeadd 有前置檢查（材料/等級/數量），不合就不加、也不報錯
-        return False, 0, mk_c, \
-            "makeadd 沒把配方排進去（材料不足／數量 0／等級不夠？）"
+            already = max(already, data & 0xFFFF)
+    added = already
+
+    if already < qty:
+        # ② 設數量：往數量框的字串緩衝寫窄 ASCII（makeadd 讀不到數字就不加）
+        sbuf = _u32(scanner, qty_c + QTY_STR_OFF)
+        if not (sbuf and _PTR_LO < sbuf < _PTR_HI):
+            return False, already, mk_c, "數量框讀不到"
+        if not mover.write(sbuf,
+                           str(int(qty - already)).encode("ascii") + b"\0"):
+            return False, already, mk_c, "設數量寫入失敗"
+
+        # ③ makeadd → 把（選中配方 + 差額數量）加進製作清單
+        ok, _v = lua.call(mover, scanner, "game.makeadd", wnd)
+        if not ok:
+            return False, already, mk_c, f"makeadd 沒成功（{_v}）"
+        for it in _rows(scanner, mk_c):
+            data = _u32(scanner, it + ITEM_DATA_OFF) or 0
+            if (data >> 16) == recipe_id:
+                added = max(added, data & 0xFFFF)
+        if added <= 0:
+            # makeadd 有前置檢查（材料/等級/數量/負重/背包），不合就不加、
+            # 也不報錯 —— 用常數讓呼叫端認得出這一種失敗
+            return False, 0, mk_c, ADD_REFUSED
 
     # ④ makestart → 送首包、客戶端接手續做整批
     ok, _v = lua.call(mover, scanner, "game.makestart", wnd)
@@ -337,6 +355,20 @@ def make_left(scanner, mk_ctrl: int, recipe_id: int) -> int | None:
         if (data >> 16) == recipe_id:
             left = max(left, data & 0xFFFF)
     return left
+
+
+def make_kick(mover, scanner, wnd: int) -> bool:
+    """清單還排著但停了 → 再叫一次 makestart 重新開工（**不** makeadd）。
+
+    ⚠ makestart 會把**做到一半的那一件**打斷重來 —— 只准在等超過單件製作
+      時間（呼叫端量的，等待隨重試加倍）還毫無進度時叫。停住批次唯一的解
+      就是再送一次首包，跟手動再按一次「開始製作」一樣。
+    """
+    if not (mover and mover.active):
+        return False
+    from app.game import lua
+    ok, _v = lua.call(mover, scanner, "game.makestart", wnd)
+    return bool(ok)
 
 
 def make_stop(mover, scanner) -> tuple[bool, str]:

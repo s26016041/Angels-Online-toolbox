@@ -98,8 +98,9 @@
 
 ⚠ 整趟與製作各有兜底逾時，卡住會**大聲**停並放掉勾勾，不會無聲無息停住
   （見 memory 的 frozen-tick-state-machines）。
-★ 這條路整條用假遊戲層離線推過 8 個情境（`scratchpad/trip_sim.py`），
-  含「沒記製作檯」「落錯地圖」「背包讀不到」「送了沒反應」四個壞情況。
+★ 這條路整條用假遊戲層離線推過 20 多個情境（`scratchpad/trip_sim.py`），
+  含「沒記製作檯」「落錯地圖」「背包讀不到」「送了沒反應」「慢配方」
+  「排了不做」「一個都不肯收」這些壞情況。
 
 ## 製作檯：**工具箱自己找、自己記**（2026-08-12 改成全自動）
 
@@ -193,9 +194,17 @@ CRAFT_RETRY_SECS = 6.0
 # 一批最多排幾個（makeadd 的數量）。客戶端會自己把整批做完，做完再開下一批。
 # ★ 開大一點＝少幾次 makeadd；材料不夠時 make_batch 只會排「做得出來的」那些。
 BATCH_MAX = 999
-# 一批開始後，多久沒看到進度（清單變少／材料變少）就當「卡住」→ 收掉重算。
-# 客戶端一個約 2.9 秒，8 秒留足伺服器延遲。
-BATCH_STALL_SECS = 8.0
+# 一批開始後，多久沒看到進度（清單變少／材料變少）才當「可能卡住」。
+# ⚠⚠ 單件製作時間**每個配方不一樣**（快的實測 ~2.9 秒，慢的幾十秒）——
+#   舊值 8 秒把「一件要做超過 8 秒」的配方**每次都打斷在半路**（判卡住→
+#   重開批次→makestart 把做到一半那件砍掉重來），2026-08-17 使用者朋友
+#   實例：「一直製作、中斷、一個都沒做」。所以：
+#   還不知道多慢時從這個值起跳，逾時只 `make_kick` 重踢一次、等待**加倍**
+#   （封頂 BATCH_STALL_MAX）；做出第一個之後改用**量到的單件時間 ×3**
+#   當門檻 —— 寧可多等，不要打斷。
+BATCH_STALL_SECS = 20.0
+# 重踢等待的封頂。真的卡死（怎麼踢都不做）由 TRIP_MAX_SECS 大聲收尾。
+BATCH_STALL_MAX = 600.0
 # 製作的兜底：**沒有進展**超過這麼久才算卡住（每做出一個就重新起算）。
 # ⚠⚠ 不能拿「總時長」當上限（2026-08-13 使用者實測踩到）：材料多的時候
 #   一趟做上萬個、好幾個小時是正常的 —— 舊寫法 30/60 分鐘總時長一到就把
@@ -209,8 +218,10 @@ CRAFT_MAX_SECS = 3600.0
 #   （直送目的地、**不套打怪用的 MIN_GAP**，那個下限會讓人永遠差一格多）。
 BENCH_DONE = 0.8
 # 整趟（回程→製作→捐→回標記點）的兜底：**沒有進展**超過這麼久才放棄。
-# ★ 製作有進展（清單變少／材料變少／開了新批）都會把起算點往後推 ——
+# ★ 製作有進展（清單變少／材料變少）都會把起算點往後推 ——
 #   見 CRAFT_MAX_SECS 的教訓：總時長上限會把大批製作砍在半路。
+# ⚠ 「開了新批」**不算**進展：零進度也能一直重開批（2026-08-17 卡死實例
+#   就是這樣把兩個看門狗都餵飽的），算進展的話這個兜底永遠不會響。
 TRIP_MAX_SECS = 1800.0
 # ★ 找製作檯：到了現場之後，多遠以內的佈景物件算「可能是檯子」。
 #   點東西伺服器會判距離，站在檯子前面的話它一定在幾格內；範圍開太大只是
@@ -1436,17 +1447,20 @@ class CharProducePage(QWidget):
             plans  這一輪的配方清單（材料用完就重算）
             total  總共要做幾個（給人看的進度；**每開一批就拿背包重算**）
             first  第一個做好的時間（拿來估「一個要多久」）
+            per    量到的**單件製作時間**（秒；做出東西才有）。判「卡住」的
+                   門檻用它 ×3 —— 寫死秒數就是「8 秒打斷慢配方」的根因
             props  這附近可點的**站台**（scenery.nearby 回的互動物；None=還沒掃）
             pi     現在點到第幾個候選
             poked  最後點中的那個候選（面板開起來就是它 → 記起來）
             wnd    製作面板 WND_MAKE 的值（開著才非 0）
             batch  這一批的狀態（None=還沒開批；開了＝{"added":遊戲排進去的
-                   數量, "mk":製作清單控制項指標, "left":清單還剩幾個}）
+                   數量, "mk":製作清單控制項指標, "left":清單還剩幾個,
+                   "kicks":逾時重踢了幾次（每踢一次等待加倍；有進度歸零）}）
             scene  開始做的時候在哪張圖（點到門被帶走時看得出來）
         """
         return {"idx": 0, "sig": None, "last_drop": 0.0, "made": 0,
                 "t0": time.monotonic(), "plans": None,
-                "total": None, "first": None,
+                "total": None, "first": None, "per": None,
                 "props": None, "pi": 0, "poked": None,
                 "wnd": None, "batch": None, "scene": None}
 
@@ -1512,7 +1526,9 @@ class CharProducePage(QWidget):
           脫鉤。清單讀不到才退回「材料變少」備援；清單空了**馬上**開下一批。
           「總共要做幾個」每開一批也拿當下的背包重算一次。
         ⚠ **不再自送 0x36**（舊寫法只做得出第一個就被伺服器拒、跳「製作物品
-          失敗」還卡住訊息迴圈）。一批停了 BATCH_STALL_SECS 沒進度就收掉重算：
+          失敗」還卡住訊息迴圈）。停太久沒進度時**只 `make_kick` 重踢**（等待
+          隨重試加倍、學到單件時間就用它 ×3 —— 重開批次會把做到一半那件打斷，
+          2026-08-17「一直製作中斷一個都沒做」的根因）；清單真的空了才收掉重算：
           材料還有就再開一批，換配方或做完就往下走。
         ⚠ 站錯地方／伺服器忙／背包滿都可能讓一批沒生效 → 收掉重來，**不設上限**
           （使用者的規矩），出口是取消勾選；CRAFT_MAX_SECS 是「沒有進展」的
@@ -1649,13 +1665,24 @@ class CharProducePage(QWidget):
                     c["wnd"], c["batch"], c["poked"] = None, None, None
                     self._note(f"這個檯子{msg} → 換下一個站台", warn=True)
                     return
+                if msg == produce.ADD_REFUSED and c["made"] > 0:
+                    # ★ 材料明明夠（makeable>0）、之前也做得出來，現在遊戲
+                    #   一個都不肯收 → 幾乎就是**負重／背包被做好的塞滿**。
+                    #   先去把成品處理掉（捐／存），下一趟再回來做剩下的 ——
+                    #   原地重試只會卡到看門狗響。
+                    s["step"] = "dispose"
+                    self._note("⚠ 遊戲一個都不肯再收（負重／背包滿？）"
+                               f"—— 先把做好的 {c['made']} 個處理掉", warn=True)
+                    return
                 # 其他失敗（面板剛開沒好/槽忙/材料檢查沒過）→ 重開面板再試
                 c["wnd"] = None
                 self._note(f"⚠ 開製作批次失敗（{msg}）→ 重試", warn=True)
                 return
-            c["batch"] = {"added": added, "mk": mk, "left": added}
+            c["batch"] = {"added": added, "mk": mk, "left": added, "kicks": 0}
             c["sig"], c["last_drop"] = sig, now
-            s["t0"] = c["t0"] = now                # 有進展 → 看門狗重新起算
+            # ⚠ 這裡**不重設** t0/s["t0"] —— 開批不算進展（零進度也能一直
+            #   重開批，算進展的話看門狗永遠不會響）；t0 只在真的做出東西
+            #   時往後推（2026-08-17 卡死實例）。
             if added < qty:
                 # ★ 遊戲排得比我們要的少（多半是負重／背包上限）——**大聲說**。
                 #   安靜吞掉就是「工具說 9000、遊戲做 999」那種脫鉤。
@@ -1674,8 +1701,13 @@ class CharProducePage(QWidget):
                 if po is True else None)
         if left is not None:
             if left < b["left"]:                   # 遊戲做掉了幾個
-                c["made"] += b["left"] - left
+                n = b["left"] - left
+                c["made"] += n
                 b["left"] = left
+                # 量單件時間：判「卡住」的門檻改用它 ×3（配方快慢差很多，
+                # 寫死秒數就是「8 秒打斷慢配方」那個 bug 的根因）
+                c["per"] = max(0.1, (now - c["last_drop"]) / n)
+                b["kicks"] = 0
                 c["sig"], c["last_drop"] = sig, now
                 if c["first"] is None:
                     c["first"] = now               # 從第一個做好才開始估時
@@ -1700,18 +1732,38 @@ class CharProducePage(QWidget):
             # ★ 清單模型也要跟著扣：不同步的話，等清單又讀得到時
             #   left < b["left"] 會把備援期間算過的又算一次（灌水）。
             b["left"] = max(0, b["left"] - n)
+            c["per"] = max(0.1, (now - c["last_drop"]) / n)
+            b["kicks"] = 0
             c["sig"], c["last_drop"] = sig, now
             if c["first"] is None:
                 c["first"] = now
             s["t0"] = c["t0"] = now
             self._note(self._craft_note(c, cur))
             return
-        # 停了 BATCH_STALL_SECS 沒進度＝這批卡住（或清單讀不到又沒材料訊號）
-        # → 收掉重算：材料還有 → 下一拍再開一批；材料用完 → 換配方；都做完
-        # → dispose。（清單讀得到時「做完」走上面 left==0 那條，不會等到這裡。）
-        if now - c["last_drop"] > BATCH_STALL_SECS:
-            c["batch"], c["sig"] = None, None
+        # ── 等超過門檻沒進度＝可能卡住。門檻：還沒做出第一個＝
+        # BATCH_STALL_SECS 起跳、每踢一次**加倍**（不知道這個配方一件要做
+        # 多久，寧可多等不要打斷）；做出過東西＝量到的單件時間 ×3。
+        base = max(BATCH_STALL_SECS, (c["per"] or 0.0) * 3.0)
+        wait = min(base * (2.0 ** b.get("kicks", 0)), BATCH_STALL_MAX)
+        if now - c["last_drop"] <= wait:
             return
+        if po is True and left is not None and left > 0:
+            # 清單還排著＝批次還掛在遊戲那邊 → **只重踢 makestart**，不重開
+            # 批次 —— 重開會 makeadd（數量往上疊）又 makestart（把做到一半
+            # 那件打斷重來），舊寫法就是這樣「一直製作、中斷、一個都沒做」。
+            b["kicks"] = b.get("kicks", 0) + 1
+            c["last_drop"] = now
+            produce.make_kick(self._mover, self.sc, c["wnd"])
+            nxt = min(base * (2.0 ** b["kicks"]), BATCH_STALL_MAX)
+            self._note(f"⚠ {wait:.0f} 秒沒做出東西 —— 重新開工"
+                       f"（第 {b['kicks']} 次），最多再等 {nxt:.0f} 秒",
+                       warn=True)
+            return
+        # 清單讀不到／清單空了卻沒走到「做完」→ 收掉重算：材料還有 →
+        # 下一拍再開一批；材料用完 → 換配方；都做完 → dispose。
+        # （清單讀得到時「做完」走上面 left==0 那條，不會等到這裡。）
+        c["batch"], c["sig"] = None, None
+        return
 
     @staticmethod
     def _craft_note(c: dict, cur) -> str:
