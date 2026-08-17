@@ -384,6 +384,15 @@ ROUND_GAP = 0.10
 # 0.1 秒重送的話，回音抵達前可能被**多受理一發**（瞬移就多傳一次＝亂放）。
 # 確認是 40Hz 輪詢，回音一到立刻解鎖，不會等滿這個數。
 OPENER_RETRY = 2.0
+# 位移類（非攻擊）對地首發的施放距離上限。出處：順移技能實測 ——
+# **8 格內誤差 0、12 格無效**。照怪的位置（掛機站 8~12 格）放瞬移，
+# 伺服器收包、MP 照扣，但人不動、客戶端不播動作、不留任何可驗的痕跡
+# ＝「瞬移一直放」死循環的根源。夾進有效距離，傳送才真的發生。
+TELEPORT_REACH = 8.0
+# 首發確認訊號③「座標瞬跳」的門檻：一拍位移超過這個格數＝被傳送了。
+# 實測走路一拍最多 ~0.4 格（reports/live_farm_ring_watch.txt 40Hz），
+# 1.5 格是走路的近 4 倍、傳送（最多 8 格）的一半以下，兩邊分得開。
+OPENER_JUMP = 1.5
 STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 # 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
 QUICKKEY_RANGE = 8
@@ -654,10 +663,15 @@ class KeyWorker(_Paced):
         self.opener_vk = 0
         self._open_eid = None       # 現在這道鎖是針對哪一隻（換怪就重新上鎖）
         self._opened = False        # 這一隻的首發已經**真的**放出去了
-        # 首發的兩條驗證通道（見 _opener_gate 的 docstring）：
-        self._ver_field = False     # 「最近使用的技能」欄位（指向性技能）
-        self._ver_ring = False      # 「施放後鎖定」環清單（對地技能唯一訊號）
-        self._ring_pre: set[int] = set()   # 上鎖當下環清單的節點位址快照
+        # 首發的驗證通道（見 _opener_gate 的 docstring）：
+        self._ver_field = False     # ①「最近使用的技能」欄位（指向性技能）
+        self._ver_ring = False      # ②「施放後鎖定」環清單讀得到嗎
+        # ② 用「條目從無到有」的**邊緣**判定，不比節點位址 ——
+        #   位址會被配置器回收重用（30 秒實測 18 個位址輪著用），
+        #   比位址會漏認，首發就永遠確認不了（8/18 踩到的坑）。
+        self._ring_seen = None      # 上一拍條目在不在（None=還沒讀到過）
+        self._last_me = None        # 上一拍自己的座標（訊號③「座標瞬跳」用）
+        self._terrain = None        # 位移類首發夾落點用的地形快取（懶載）
         self._open_verify = False   # 兩條通道至少一條活著（都死才「送一次就算」）
         self._open_sent = False     # 這一隻的首發**送出去過**了嗎（沒送不看訊號）
         self._open_next = 0.0       # 下一次准重送首發的時間（受理回音節流）
@@ -860,8 +874,8 @@ class KeyWorker(_Paced):
             self.skills = {**self.skills, vk: sid}
             self._learning = False
 
-    def _arm_opener(self) -> None:
-        """換到新的一隻怪 → 把兩條驗證通道都上膛。
+    def _arm_opener(self, sid: int) -> None:
+        """換到新的一隻怪 → 把驗證通道都上膛。
 
         ① 欄位通道：把「最近使用的技能」欄位清成 0，清完立刻讀回來驗證
           （讀到 0 才算數 —— 那同時證明角色屬性位址現在是有效的）。
@@ -869,9 +883,10 @@ class KeyWorker(_Paced):
             同一個技能 ID；不清就每一隻都當成「首發已經放過了」，
             整個功能會**安靜地失效**（雪狐把 F3 當成 F2 的同一個坑）。
           ⚠ `clear_last_skill` 內含 `base_ok` 驗證，位址過期時不會亂寫。
-        ② 環清單通道：把「施放後鎖定」清單現在的**節點位址**拍成快照 ——
-          之後只認「快照裡沒有的新節點」，上一發的殘留條目（還在後搖中）
-          不會被當成這一隻首發的證據。
+        ② 環清單通道：記下「這顆技能的條目現在在不在」——之後認的是
+          **從無到有的邊緣**（見 __init__ 的說明，不比節點位址）。
+          上鎖時條目還在＝上一發還在 CD／後搖中，閘門會**等它消失**
+          才送這一隻的首發（使用者字面要求：在 CD 中就等他好）。
         """
         ok = False
         if self.stats:
@@ -886,7 +901,9 @@ class KeyWorker(_Paced):
         except Exception:                          # noqa: BLE001
             marks = None
         self._ver_ring = marks is not None
-        self._ring_pre = {a for a, _s in (marks or [])}
+        self._ring_seen = (any(s == sid for _a, s in marks)
+                           if marks is not None else None)
+        self._last_me = None
         self._open_verify = self._ver_field or self._ver_ring
         self._open_sent = False
         self._open_next = 0.0
@@ -930,14 +947,21 @@ class KeyWorker(_Paced):
           （2026-08-10 五台實測：743 幻影刺殺Ⅳ／946 冰凍狙擊Ⅳ 走封包
           照樣寫入）。⚠ **對地技能走封包不寫**（2026-08-17 黑狐實測：
           瞬移術 MP 有扣、欄位 238 拍全空）—— 所以要有第二條。
-        ② 「施放後鎖定（進 CD）」環清單（attack.casting_marks）：伺服器
-          **受理**後 ~0.2-0.5 秒長出新節點、存活＝技能後置時間 ——
-          快捷鍵與封包對地路徑都驗過會長；後搖內被拒收**不長**、MP 不扣，
-          所以不會把拒收誤判成放出去。認「上鎖快照裡沒有的新節點」，
-          上一發的殘留條目不會誤判。這正是使用者說的「看他進 CD」。
+        ② 「施放後鎖定（進 CD）」環清單（attack.casting_marks）：受理後
+          ~0.2-1.6 秒長出條目、存活＝技能後置時間；被拒收**不長**、MP
+          不扣。認的是條目「**從無到有**」的邊緣（⛔ 不比節點位址 ——
+          位址被配置器回收重用，30 秒實測 18 個位址輪著用，比位址會漏認
+          ＝首發永遠確認不了）。⚠ 邊走邊放時客戶端不播施法動作、條目
+          會漏（live_farm_ring_watch 實錄），所以位移類還有訊號③。
+        ③ 「座標瞬跳」：位移類（非攻擊對地，瞬移術那類）首發的**效果
+          本身** —— 一拍位移 ≥ OPENER_JUMP ＝人真的被傳走了。前提是
+          落點夾進有效距離（見 _blink_target；照 12 格怪的位置放＝無效
+          位移，什麼痕跡都不會有）。
 
-        在 CD 中（遊戲拒收）→ 兩個訊號都不出現 → 這裡持續回鎖、每輪重試
-        首發，**等多久都等**（使用者指定；唯一例外是 SP 不夠，見下面）。
+        施放**前**若清單裡已有這顆技能的條目＝**他在 CD／後搖中 →
+        等他好**（把重送時間往後推，條目消失才送）。在 CD 中被拒 →
+        訊號都不出現 → 持續回鎖、隔 OPENER_RETRY 重試，**等多久都等**
+        （使用者指定；唯一例外是 SP 不夠，見下面）。
 
         ⚠ 只有**兩條通道同時死掉**（角色屬性讀不到＋實體解析不到 ——
           換圖／重連的重建空窗才會這樣）才退化成「送出去就算數」：
@@ -955,7 +979,7 @@ class KeyWorker(_Paced):
             self._open_eid = eid
             self._opened = False
             self._open_since = now
-            self._arm_opener()                     # 兩條驗證通道上膛
+            self._arm_opener(sid)                  # 驗證通道上膛
         if self._opened:
             self.open_wait = 0.0
             return None
@@ -969,27 +993,54 @@ class KeyWorker(_Paced):
                               f"「{skills.name_of(sid) or sid}」放不出來，"
                               "這一隻跳過")
             return None
+        # 「這顆技能現在在不在 CD／後搖中」＝環清單裡有沒有它的條目。
+        present = None
+        if self._ver_ring:
+            try:
+                marks = attack.casting_marks(self.sc)
+            except Exception:                      # noqa: BLE001
+                marks = None                       # 這一拍讀壞就當沒看到
+            if marks is not None:
+                present = any(s == sid for _a, s in marks)
+        # 訊號③的素材：自己這一拍的座標（一拍跳超過 OPENER_JUMP＝被傳送）。
+        me = entity.read_pos(self.sc, self.player) if self.player else None
+        jumped = bool(me and self._last_me
+                      and math.hypot(me[0] - self._last_me[0],
+                                     me[1] - self._last_me[1]) >= OPENER_JUMP)
+        if me:
+            self._last_me = me
         # ★★ 還沒送出去之前**不看任何訊號**（8/18）：上一隻怪首發的受理
         #   回音最慢 1.6 秒才到，殺得快時會落在**這一隻**上鎖之後 ——
         #   沒有這道閘，遲到的舊回音會被當成「這一隻已放過」，首發被
         #   安靜跳過（使用者抱怨的「沒有先放首次攻擊」其中一種成因）。
         if self._open_sent:
-            # 訊號①：欄位出現這個技能 ID（指向性技能）。
+            # 訊號①：欄位出現這個技能 ID（指向性技能，客戶端受理就寫）。
             confirmed = (self._ver_field
                          and player.read_last_skill(self.sc, self.stats)
                          == sid)
-            # 訊號②：環清單長出**新**節點且技能 ID 吻合（對地唯一訊號）。
-            if not confirmed and self._ver_ring:
-                try:
-                    marks = attack.casting_marks(self.sc)
-                except Exception:                  # noqa: BLE001
-                    marks = None                   # 這一拍讀壞就當沒看到
-                confirmed = bool(marks) and any(
-                    s == sid and a not in self._ring_pre for a, s in marks)
+            # 訊號②：條目**從無到有**＝這一發被受理、進了 CD。
+            #   （在 CD 中被拒＝條目不出現；邊走邊放客戶端不播動作時
+            #   這條會漏 —— 位移類還有訊號③兜著，其他的靠重試收斂。）
+            if not confirmed and present is not None:
+                confirmed = present and self._ring_seen is False
+            # 訊號③：座標瞬跳＝位移類首發真的把人傳走了（效果本身，
+            #   100% 不會誤判；只有位移類看這條，指向性技能被擊退之類
+            #   的位移不能拿來當首發證據）。
+            if (not confirmed and jumped and skills.is_ground(sid)
+                    and not skills.is_attack(sid)):
+                confirmed = True
             if confirmed:
                 self._opened = True                # 遊戲受理了 → 其他招解鎖
                 self.open_wait = 0.0
+                if present is not None:
+                    self._ring_seen = present
                 return None
+        elif present:
+            # 還沒送、條目卻在＝**他在 CD 中 → 等他好**（使用者字面要求）。
+            #   把重送時間往後推，等條目消失（CD 結束）才送這一隻的首發。
+            self._open_next = max(self._open_next, now + 0.3)
+        if present is not None:
+            self._ring_seen = present
         # ★ SP 不夠（或分不出來）→ 放行其他招，別站在那裡等一個不會好的條件。
         why = self._sp_blocked(sid)
         if why:
@@ -1002,6 +1053,37 @@ class KeyWorker(_Paced):
         #   會被當成「沒在等」。
         self.open_wait = max(now - self._open_since, 0.001)
         return vk
+
+    def _blink_target(self, me, target) -> tuple[float, float]:
+        """位移類（非攻擊對地）首發的落點：自己往怪方向 ≤TELEPORT_REACH
+        的可走格。
+
+        ★ 為什麼要夾（8/18 死循環根因）：順移實測 8 格內誤差 0、
+          **12 格無效** —— 照怪的位置（掛機站 8~12 格）放，伺服器收包、
+          MP 照扣，但人不動、不播動作、環清單不長條目＝一發永遠驗不到
+          的空放，首發就無限重送。夾進有效距離，傳送真的發生，
+          訊號②③才有東西可看。
+        怪已在有效距離內 → 直接用怪的位置。找不到可走格 → 退回自己
+        腳下（距離 0 必定有效：受理與後搖照樣發生，只是原地不動 ——
+        寧可放一發驗證得到的，也不要送一發永遠驗不到的）。
+        """
+        dx, dy = target[0] - me[0], target[1] - me[1]
+        dist = math.hypot(dx, dy)
+        if dist <= TELEPORT_REACH:
+            return target
+        if self._terrain is None:
+            self._terrain = terrain.Cache()
+        try:
+            grid = self._terrain.get(self.sc)
+        except Exception:                          # noqa: BLE001
+            grid = None
+        ux, uy = dx / dist, dy / dist
+        for back in (0.0, 1.0, 2.0, 3.0):          # 8 格起往回找可走格
+            t = TELEPORT_REACH - back
+            x, y = me[0] + ux * t, me[1] + uy * t
+            if grid is None or grid.walkable(int(x), int(y)):
+                return (x, y)
+        return (me[0], me[1])
 
     def step(self) -> None:
         # ⚠⚠ 先把 GUI 執行緒會改的欄位抄成區域變數，整拍只看這份快照。
@@ -1143,6 +1225,7 @@ class KeyWorker(_Paced):
             #   這裡只多讀一次玩家座標（微秒級），目標座標用 UI 上一拍給的。
             # ★ 順便把「現在離目標多遠」留下來：底下每一招要各自驗自己的射程。
             dist_now = None
+            me_now = None
             if self.player and pos != (0.0, 0.0):
                 me_now = entity.read_pos(self.sc, self.player)
                 if me_now:
@@ -1183,7 +1266,14 @@ class KeyWorker(_Paced):
                                  or (rng is not None
                                      and rng > QUICKKEY_RANGE))
                     if by_packet:
-                        ok = attack.cast_at(mover, sid, eid, *pos)
+                        tx, ty = pos
+                        if (k == opener and me_now
+                                and skills.is_ground(sid)
+                                and not skills.is_attack(sid)):
+                            # 位移類首發：落點夾進有效距離，傳送才會真的
+                            # 發生、才驗證得到（見 _blink_target）。
+                            tx, ty = self._blink_target(me_now, pos)
+                        ok = attack.cast_at(mover, sid, eid, tx, ty)
                     elif (quickbar.VK_F1 <= k
                             < quickbar.VK_F1 + quickbar.SLOTS):
                         ok = quickbar.use(mover, self.sc,
