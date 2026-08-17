@@ -64,6 +64,71 @@ ACTION_CODE = 1
 CALL_TIMEOUT = 0.12         # 每一包等它被主執行緒執行的上限（一幀約 16ms）
 
 
+# ── 「施放後鎖定（＝進 CD）」環狀清單 ──────────────────────────────
+# 位置：玩家實體（bag.player_entity 那個基準）+0x418。
+# 出處：usequickkey 的拒放檢查鏈 0x5B87C5 → 0x5B8666 → 0x549CD9 →
+#   實體 vtable+0x3C(0x507C10)，查的就是這條清單（清單裡有這個技能就拒放）。
+# 2026-08-17 黑狐受控實驗（reports/cast_trace_experiment.txt）：
+#   · 真條目：節點 +0x0C == 1、+0x10 == 技能ID、+0x14 == 15。
+#     伺服器**受理**後 ~0.2-0.5 秒出現，存活＝技能的後置時間
+#     （瞬移術Ⅳ 1400ms 分毫不差），到期自動消失。
+#   · 快捷鍵路徑、封包對地路徑（cast_at）都會長條目 ——
+#     **對地技能不寫「最近使用的技能」欄位（0x549CD9 那條），這是唯一訊號**。
+#   · 每一台都常駐一顆雜訊節點：+0x0C == 257(0x101)（五台盤點全中）——
+#     用 +0x0C == 1 過濾就乾淨。
+#   · 後搖內重複施放被伺服器拒收：MP 不扣、**不長新條目** ——
+#     所以「新條目出現」＝真的放出去了，拒收不會誤判。
+# ⚠ 這是會被遊戲同時改動的清單，走訪要逐跳驗指標、封頂節點數；
+#   讀壞這一拍就當「沒看到」，下一拍再讀（純讀，絕不影響遊戲）。
+RING_OFF = 0x418
+RING_FLAG_OFF = 0x0C        # == 1 才是真條目（常駐雜訊是 0x101）
+RING_SID_OFF = 0x10         # 技能 ID
+RING_MAX_NODES = 8
+
+
+def casting_marks(scanner) -> list[tuple[int, int]] | None:
+    """環清單裡現在的真條目 [(節點位址, 技能ID), …]；讀不到基準回 None。
+
+    純讀。回 None ＝「這一拍看不到」（實體重建空窗／改版），呼叫端
+    當「不知道」處理；回空清單＝真的沒有人在後搖中。
+    節點位址給呼叫端做「施放前快照 → 施放後看**新**節點」的邊緣偵測 ——
+    同一顆技能上一發的殘留條目（位址在快照裡）不會被當成這一發的證據。
+    """
+    import struct
+
+    from app.game import bag
+
+    ent = bag.player_entity(scanner)
+    if not ent:
+        return None
+
+    def u32(addr: int) -> int | None:
+        raw = scanner._read_bytes(addr, 4)
+        if not raw or len(raw) < 4:
+            return None
+        return struct.unpack("<I", bytes(raw[:4]))[0]
+
+    def sane(p: int | None) -> bool:
+        return p is not None and 0x10000 <= p < 0x7FFF0000
+
+    head = ent + RING_OFF
+    first = u32(head)
+    if not sane(first):
+        return None
+    out: list[tuple[int, int]] = []
+    node, hops = first, 0
+    while sane(node) and hops < RING_MAX_NODES and node != head:
+        flag = u32(node + RING_FLAG_OFF)
+        sid = u32(node + RING_SID_OFF)
+        if flag == 1 and sid is not None and 1 <= sid <= 0x61A8:
+            out.append((node, sid))
+        node = u32(node)                    # next 指標在節點開頭（std::list）
+        hops += 1
+        if node == first:
+            break
+    return out
+
+
 def _yield_now(mover) -> bool:
     """尋路／移動正在等指令槽 → 這一拍不打，把槽讓出去。
 

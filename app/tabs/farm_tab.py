@@ -649,7 +649,11 @@ class KeyWorker(_Paced):
         self.opener_vk = 0
         self._open_eid = None       # 現在這道鎖是針對哪一隻（換怪就重新上鎖）
         self._opened = False        # 這一隻的首發已經**真的**放出去了
-        self._open_verify = False   # 這一隻能不能驗證（見 _opener_gate）
+        # 首發的兩條驗證通道（見 _opener_gate 的 docstring）：
+        self._ver_field = False     # 「最近使用的技能」欄位（指向性技能）
+        self._ver_ring = False      # 「施放後鎖定」環清單（對地技能唯一訊號）
+        self._ring_pre: set[int] = set()   # 上鎖當下環清單的節點位址快照
+        self._open_verify = False   # 兩條通道至少一條活著（都死才「送一次就算」）
         self._open_since = 0.0
         self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
         self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
@@ -849,24 +853,34 @@ class KeyWorker(_Paced):
             self.skills = {**self.skills, vk: sid}
             self._learning = False
 
-    def _arm_opener(self) -> bool:
-        """換到新的一隻怪 → 把「最近使用的技能」欄位清成 0。
+    def _arm_opener(self) -> None:
+        """換到新的一隻怪 → 把兩條驗證通道都上膛。
 
-        回傳「等一下讀得準嗎」。清完立刻讀回來驗證：讀到 0（`read_last_skill`
-        回 None）才算數 —— 那同時證明角色屬性位址現在是有效的。
-
-        ⚠⚠ **一定要清零**。首發每隻怪都會放，欄位裡本來就留著上一隻的
-          同一個技能 ID；不清就每一隻都當成「首發已經放過了」，
-          整個功能會**安靜地失效**（跟當年雪狐把 F3 的技能當成 F2 同一個坑）。
-        ⚠ `clear_last_skill` 內含 `base_ok` 驗證，位址過期時不會亂寫別人的堆積。
+        ① 欄位通道：把「最近使用的技能」欄位清成 0，清完立刻讀回來驗證
+          （讀到 0 才算數 —— 那同時證明角色屬性位址現在是有效的）。
+          ⚠⚠ **一定要清零**。首發每隻怪都會放，欄位裡本來就留著上一隻的
+            同一個技能 ID；不清就每一隻都當成「首發已經放過了」，
+            整個功能會**安靜地失效**（雪狐把 F3 當成 F2 的同一個坑）。
+          ⚠ `clear_last_skill` 內含 `base_ok` 驗證，位址過期時不會亂寫。
+        ② 環清單通道：把「施放後鎖定」清單現在的**節點位址**拍成快照 ——
+          之後只認「快照裡沒有的新節點」，上一發的殘留條目（還在後搖中）
+          不會被當成這一隻首發的證據。
         """
-        if not self.stats:
-            return False
+        ok = False
+        if self.stats:
+            try:
+                player.clear_last_skill(self.sc, self.stats)
+                ok = player.read_last_skill(self.sc, self.stats) is None
+            except Exception:                      # noqa: BLE001
+                ok = False
+        self._ver_field = ok
         try:
-            player.clear_last_skill(self.sc, self.stats)
-            return player.read_last_skill(self.sc, self.stats) is None
+            marks = attack.casting_marks(self.sc)
         except Exception:                          # noqa: BLE001
-            return False
+            marks = None
+        self._ver_ring = marks is not None
+        self._ring_pre = {a for a, _s in (marks or [])}
+        self._open_verify = self._ver_field or self._ver_ring
 
     def _sp_blocked(self, sid: int) -> str:
         """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
@@ -895,30 +909,30 @@ class KeyWorker(_Paced):
     def _opener_gate(self, eid, bykey: dict, now: float) -> int | None:
         """首次攻擊的閘門：回傳「這一輪只准放這個鍵」，None = 沒鎖／已解鎖。
 
-        怎麼知道首發**真的**放出去了
-        ----------------------------
-        ⚠⚠ **不能看 `quickbar.use()` 的回傳值** —— 它只代表指令排進遊戲了；
-          技能還在冷卻時遊戲會自己拒絕，那支照樣回 True。
-        唯一的訊號是「最近使用的技能 ID」欄位（角色屬性 −0x50）：反組譯
-        `0x549CD9` 可以看到，遊戲是**所有檢查都過了**才寫那個欄位
-        （被冷卻／狀態擋下來就不寫），正好就是我們要的語意。
+        怎麼知道首發**真的**放出去了（＝使用者要的「施放後確認進 CD」）
+        ------------------------------------------------------------
+        ⚠⚠ **不能看 `quickbar.use()`／`cast_at()` 的回傳值** —— 那只代表
+          指令排進遊戲了；技能還在冷卻時遊戲／伺服器會自己拒絕，照樣回 True。
+        兩條訊號，**其一成立就算確認**（都是「所有檢查過了、真的放出去」
+        才會出現的痕跡；MP 一概不看 —— 使用者禁用）：
 
-        ★★ **走封包的技能（射程 > 8）一樣驗得到** —— 2026-08-10 五台實測
-          日誌打臉了我原本的假設：fred26016041 打 743（幻影刺殺Ⅳ，射程 12、
-          走封包）時欄位就是 743、s26016041 打 946（冰凍狙擊Ⅳ，同樣走封包）
-          時欄位就是 946。所以**不必**為了首發去動「射程 < 8 送鍵、> 8 打封包」
-          那條分流（那是使用者定的規則）—— 我一度那樣改，被退回來了。
+        ① 「最近使用的技能 ID」欄位（角色屬性 −0x50）：反組譯 `0x549CD9`，
+          遊戲**所有檢查都過了**才寫。指向性技能兩條出手路徑都會寫
+          （2026-08-10 五台實測：743 幻影刺殺Ⅳ／946 冰凍狙擊Ⅳ 走封包
+          照樣寫入）。⚠ **對地技能走封包不寫**（2026-08-17 黑狐實測：
+          瞬移術 MP 有扣、欄位 238 拍全空）—— 所以要有第二條。
+        ② 「施放後鎖定（進 CD）」環清單（attack.casting_marks）：伺服器
+          **受理**後 ~0.2-0.5 秒長出新節點、存活＝技能後置時間 ——
+          快捷鍵與封包對地路徑都驗過會長；後搖內被拒收**不長**、MP 不扣，
+          所以不會把拒收誤判成放出去。認「上鎖快照裡沒有的新節點」，
+          上一發的殘留條目不會誤判。這正是使用者說的「看他進 CD」。
 
-        ⚠ 兩種情況驗不了，退化成「送出去就算數」——
-          寧可少一道保證，也**絕不能讓角色永遠站著不出手**：
-          ① 角色屬性位址還沒定位／已失效（清零＋讀回驗證沒過）。
-          ② **對地技能**（對象＝地面，瞬移術那類）：2026-08-17 黑狐實測
-            首發瞬移術Ⅳ —— MP 每 ~1.5 秒扣 49（真的一直在放），
-            「最近使用的技能」欄位 12 秒 238 拍**全程不寫**
-            （reports/opener_spam_watch.txt）。上面 ★★「封包也驗得到」
-            只對**指向性**技能成立，對地的施放路徑不寫那個欄位。
-            等欄位＝永遠等不到 → cast_at 每 0.1 秒重送、MP 噴光、
-            「等首發」還凍住放棄計時器＝死循環（「瞬移術一直放個不停」）。
+        在 CD 中（遊戲拒收）→ 兩個訊號都不出現 → 這裡持續回鎖、每輪重試
+        首發，**等多久都等**（使用者指定；唯一例外是 SP 不夠，見下面）。
+
+        ⚠ 只有**兩條通道同時死掉**（角色屬性讀不到＋實體解析不到 ——
+          換圖／重連的重建空窗才會這樣）才退化成「送出去就算數」：
+          寧可少一道保證，也**絕不能讓角色永遠站著不出手**。
         """
         vk = self.opener_vk
         sid = bykey.get(vk) if vk else None
@@ -932,14 +946,22 @@ class KeyWorker(_Paced):
             self._open_eid = eid
             self._opened = False
             self._open_since = now
-            # 對地技能驗不了（見 docstring ②）→ 走「送一次就算數」那條保險。
-            self._open_verify = (self._arm_opener()
-                                 and not skills.is_ground(sid))
+            self._arm_opener()                     # 兩條驗證通道上膛
         if self._opened:
             self.open_wait = 0.0
             return None
-        if (self._open_verify
-                and player.read_last_skill(self.sc, self.stats) == sid):
+        # 訊號①：欄位出現這個技能 ID（指向性技能）。
+        confirmed = (self._ver_field
+                     and player.read_last_skill(self.sc, self.stats) == sid)
+        # 訊號②：環清單長出**新**節點且技能 ID 吻合（對地技能唯一訊號）。
+        if not confirmed and self._ver_ring:
+            try:
+                marks = attack.casting_marks(self.sc)
+            except Exception:                      # noqa: BLE001
+                marks = None                       # 這一拍讀壞就當沒看到
+            confirmed = bool(marks) and any(
+                s == sid and a not in self._ring_pre for a, s in marks)
+        if confirmed:
             self._opened = True                    # 遊戲受理了 → 其他招解鎖
             self.open_wait = 0.0
             return None
@@ -1831,9 +1853,11 @@ class CharFarmPage(QWidget):
             "・那個鍵是空的／放物品／快捷欄讀不到 → 自動當作沒設定，照常打。\n"
             "\n"
             "・出手方式照原本的規則（射程 ≤ 8 送鍵、> 8 打封包），不受影響。\n"
-            "⚠ 角色屬性讀不到、或首發是**對地技能**（瞬移術那類）時，\n"
-            "　無法確認有沒有放出去 → 那一隻送一次就放行\n"
-            "　（不會讓角色站在那裡永遠不出手；狀態列會提醒）。")
+            "・「放出去了」的認定＝**看它真的進入冷卻**（遊戲受理施放後留下\n"
+            "　 的鎖定痕跡；瞬移術那類對地技能也驗得到），不看 MP。\n"
+            "　 在冷卻中被拒絕 → 痕跡不會出現 → 繼續等、繼續重試。\n"
+            "⚠ 只有換圖／重連的重建空窗（什麼都讀不到）才退化成\n"
+            "　「那一隻送一次就放行」—— 不讓角色永遠站著不出手。")
         self.open_box.addItem("不指定", 0)
         for label, vk in SKILL_KEYS:
             self.open_box.addItem(label, vk)
@@ -4035,12 +4059,6 @@ class CharFarmPage(QWidget):
                 self._keys.opener_vk):
             skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} 上沒有技能"
                            "（空格／物品）→ 這次不生效")
-        elif self._keys.opener_vk and skills.is_ground(
-                self._keys.skills.get(self._keys.opener_vk) or 0):
-            # 對地技能放沒放成驗證不了（黑狐瞬移術實測，見 _opener_gate ②）
-            # → 每隻怪送一次就接輪迴，不等驗證。要講出來，不能安靜退化。
-            skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} 是對地技能，"
-                           "放沒放成驗證不了 → 每隻怪送一次就接著輪迴")
         elif (self._keys.opener_vk
               and [k for k in self._keys.vks if self._keys.skills.get(k)]
                   == [self._keys.opener_vk]):
