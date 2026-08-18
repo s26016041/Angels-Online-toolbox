@@ -670,6 +670,11 @@ class KeyWorker(_Paced):
         self._terrain = None        # 位移類首發夾落點用的地形快取（懶載）
         self.account = ""           # 這個分頁的帳號（首發日誌檔名用）
         self._op_state = ""         # 首發日誌去重鍵（同狀態不重複寫）
+        # ★★ 共 CD（使用者 8/18：這遊戲技能有共 CD；嵐狐實測 947 之後
+        #   0.6/1.0/1.5 秒放 946 全被拒收、2.0 秒＝兩顆後置的查表和才放
+        #   得出去）。記「上一次送出任何技能」，首發前要等
+        #   lockout(上一顆)+lockout(首發) 過完。
+        self._last_cast = None      # (時間, 技能ID)——輪迴與首發都算
         # 首發效果探針（**純日誌**，不進任何控制流程）：送出後 1 秒記
         # MP/SP 有沒有被扣＝這一發伺服器到底收了沒。（封包施放不轉快捷欄
         # CD、不播自己動作，畫面上看不出有沒有放 —— 8/18 嵐狐實驗定案。）
@@ -1007,24 +1012,35 @@ class KeyWorker(_Paced):
             self._oplog("skip-sp", why)
             return None
         # ── 等 CD 好 ──
-        # ① 環清單裡還有它的條目＝CD／後搖中 → 把送出時間往後推。
+        # ① 施放鎖定清單裡**還有任何條目**＝有技能在鎖定中 → 等。
+        #   （⚠ 不是只看首發那一顆：技能有**共 CD** —— 使用者 8/18 指出，
+        #   嵐狐實測輪迴的 947 會把首發 946 擋掉。清單是遊戲自己的鎖定
+        #   狀態，有東西就不送。）
         if now >= self._open_next:                 # （被推遲時不必再讀）
-            present = None
             try:
                 marks = attack.casting_marks(self.sc)
             except Exception:                      # noqa: BLE001
                 marks = None                       # 這一拍讀壞就當沒看到
-            if marks is not None:
-                present = any(s == sid for _a, s in marks)
-            if present:
+            if marks:
                 self._open_next = max(self._open_next, now + 0.3)
-                self._oplog("hold-cd", f"等CD：施放鎖定清單裡還有 {sid}")
-        # ② 查表的間隔保險：距離上一次送首發不到它的施放鎖定時間
-        #   （前置+後置，magic.xml 逐技能查表）就不送 —— 蓋住清單的盲區
-        #   （邊走邊放不留條目）。
+                self._oplog("hold-cd", "等CD：施放鎖定清單還有條目（共CD）"
+                            f" {[s for _a, s in marks]}")
+        # ② 共 CD 的查表等待：距離上一次送出**任何**技能，要滿
+        #   lockout(那一顆)+lockout(首發)（前置+後置的和，magic.xml 查表）。
+        #   嵐狐實測邊界：947→946 在 1.5s 仍被拒、2.0s（=1.0+1.0 的表和）
+        #   放得出去。清單的盲區（邊走邊放不留條目）也靠這條蓋住。
+        if self._last_cast is not None:
+            lt, lsid = self._last_cast
+            lk = ((skills.lockout_of(lsid) or 0)
+                  + (skills.lockout_of(sid) or 0)) or OPENER_GAP
+            if now - lt < lk:
+                self._open_next = max(self._open_next, lt + lk)
+                self._oplog("hold-shared",
+                            f"等共CD：{lsid} 後 {lk:.1f}s 內不送首發（查表）")
+        # ③ 首發自己的間隔保險（表缺值時的退路）。
         if now < self._open_cool:
             self._open_next = max(self._open_next, self._open_cool)
-            self._oplog("hold-gap", "等施放鎖定時間過（前置+後置，查表）")
+            self._oplog("hold-gap", "等首發自己的施放鎖定過（查表）")
         # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
         #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
         #   會被當成「沒在等」。
@@ -1262,6 +1278,8 @@ class KeyWorker(_Paced):
                     else:
                         ok = False
                     struck = struck or ok
+                    if ok:
+                        self._last_cast = (now, sid)   # 共CD計時（見閘門②）
                     if ok and k == opener:
                         sent_opener = True
                         self._oplog("sent", f"首發送出（{'封包' if by_packet else '快捷鍵'}）"
@@ -1281,6 +1299,7 @@ class KeyWorker(_Paced):
                     vk = pool[self._rot % len(pool)]
                     _send_scan(self.hwnd, vk)
                     self._rot += 1
+                    self._last_cast = (now, bykey.get(vk) or 0)
                     if vk == opener:
                         sent_opener = True
                         self._oplog("sent", "首發送出（送鍵退路）")
