@@ -383,16 +383,15 @@ ROUND_GAP = 0.10
 # 伺服器受理的回音（環清單新節點）五台實測 0.2~1.6 秒才到；照 ROUND_GAP
 # 0.1 秒重送的話，回音抵達前可能被**多受理一發**（瞬移就多傳一次＝亂放）。
 # 確認是 40Hz 輪詢，回音一到立刻解鎖，不會等滿這個數。
-OPENER_RETRY = 2.0
+OPENER_GAP = 2.5
+# ↑ 首發「送出一次之後，至少隔這麼久才准送下一次（下一隻怪）」的間隔
+#   保險。環清單看得到的 CD（條目在）會精確地等；這個間隔蓋的是清單的
+#   盲區 —— 邊走邊放的那一發不留條目（live_farm_ring_watch 實錄）。
+#   2.5 秒 > 全部技能的前置+後置上限（magic.xml 最大一級 ~2.1 秒）。
 # 位移類（非攻擊）對地首發的施放距離上限。出處：順移技能實測 ——
 # **8 格內誤差 0、12 格無效**。照怪的位置（掛機站 8~12 格）放瞬移，
-# 伺服器收包、MP 照扣，但人不動、客戶端不播動作、不留任何可驗的痕跡
-# ＝「瞬移一直放」死循環的根源。夾進有效距離，傳送才真的發生。
+# 伺服器收包、MP 照扣，但人不動＝白放。夾進有效距離，傳送才真的發生。
 TELEPORT_REACH = 8.0
-# 首發確認訊號③「座標瞬跳」的門檻：一拍位移超過這個格數＝被傳送了。
-# 實測走路一拍最多 ~0.4 格（reports/live_farm_ring_watch.txt 40Hz），
-# 1.5 格是走路的近 4 倍、傳送（最多 8 格）的一半以下，兩邊分得開。
-OPENER_JUMP = 1.5
 STRIKE_TICK = 0.025             # KeyWorker 的節拍：要能切出 0.1 秒
 # 射程多少以內用「叫遊戲的快捷鍵」，超過就送帶 ID＋座標的施放封包（使用者定的）。
 QUICKKEY_RANGE = 8
@@ -663,18 +662,11 @@ class KeyWorker(_Paced):
         self.opener_vk = 0
         self._open_eid = None       # 現在這道鎖是針對哪一隻（換怪就重新上鎖）
         self._opened = False        # 這一隻的首發已經**真的**放出去了
-        # 首發的驗證通道（見 _opener_gate 的 docstring）：
-        self._ver_field = False     # ①「最近使用的技能」欄位（指向性技能）
-        self._ver_ring = False      # ②「施放後鎖定」環清單讀得到嗎
-        # ② 用「條目從無到有」的**邊緣**判定，不比節點位址 ——
-        #   位址會被配置器回收重用（30 秒實測 18 個位址輪著用），
-        #   比位址會漏認，首發就永遠確認不了（8/18 踩到的坑）。
-        self._ring_seen = None      # 上一拍條目在不在（None=還沒讀到過）
-        self._last_me = None        # 上一拍自己的座標（訊號③「座標瞬跳」用）
+        # 首發＝「等 CD 好 → 開頭放一次 → 絕不重放」（見 _opener_gate）：
+        self._open_done_eid = None  # 首發**放過**的那一隻（重選同一隻不重放）
+        self._open_cool = 0.0       # 上一次送首發 + OPENER_GAP（間隔保險）
+        self._open_next = 0.0       # 這個時間之前不送首發（CD 中的等待）
         self._terrain = None        # 位移類首發夾落點用的地形快取（懶載）
-        self._open_verify = False   # 兩條通道至少一條活著（都死才「送一次就算」）
-        self._open_sent = False     # 這一隻的首發**送出去過**了嗎（沒送不看訊號）
-        self._open_next = 0.0       # 下一次准重送首發的時間（受理回音節流）
         self._open_since = 0.0
         self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
         self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
@@ -874,40 +866,6 @@ class KeyWorker(_Paced):
             self.skills = {**self.skills, vk: sid}
             self._learning = False
 
-    def _arm_opener(self, sid: int) -> None:
-        """換到新的一隻怪 → 把驗證通道都上膛。
-
-        ① 欄位通道：把「最近使用的技能」欄位清成 0，清完立刻讀回來驗證
-          （讀到 0 才算數 —— 那同時證明角色屬性位址現在是有效的）。
-          ⚠⚠ **一定要清零**。首發每隻怪都會放，欄位裡本來就留著上一隻的
-            同一個技能 ID；不清就每一隻都當成「首發已經放過了」，
-            整個功能會**安靜地失效**（雪狐把 F3 當成 F2 的同一個坑）。
-          ⚠ `clear_last_skill` 內含 `base_ok` 驗證，位址過期時不會亂寫。
-        ② 環清單通道：記下「這顆技能的條目現在在不在」——之後認的是
-          **從無到有的邊緣**（見 __init__ 的說明，不比節點位址）。
-          上鎖時條目還在＝上一發還在 CD／後搖中，閘門會**等它消失**
-          才送這一隻的首發（使用者字面要求：在 CD 中就等他好）。
-        """
-        ok = False
-        if self.stats:
-            try:
-                player.clear_last_skill(self.sc, self.stats)
-                ok = player.read_last_skill(self.sc, self.stats) is None
-            except Exception:                      # noqa: BLE001
-                ok = False
-        self._ver_field = ok
-        try:
-            marks = attack.casting_marks(self.sc)
-        except Exception:                          # noqa: BLE001
-            marks = None
-        self._ver_ring = marks is not None
-        self._ring_seen = (any(s == sid for _a, s in marks)
-                           if marks is not None else None)
-        self._last_me = None
-        self._open_verify = self._ver_field or self._ver_ring
-        self._open_sent = False
-        self._open_next = 0.0
-
     def _sp_blocked(self, sid: int) -> str:
         """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
 
@@ -935,37 +893,32 @@ class KeyWorker(_Paced):
     def _opener_gate(self, eid, bykey: dict, now: float) -> int | None:
         """首次攻擊的閘門：回傳「這一輪只准放這個鍵」，None = 沒鎖／已解鎖。
 
-        怎麼知道首發**真的**放出去了（＝使用者要的「施放後確認進 CD」）
-        ------------------------------------------------------------
-        ⚠⚠ **不能看 `quickbar.use()`／`cast_at()` 的回傳值** —— 那只代表
-          指令排進遊戲了；技能還在冷卻時遊戲／伺服器會自己拒絕，照樣回 True。
-        兩條訊號，**其一成立就算確認**（都是「所有檢查過了、真的放出去」
-        才會出現的痕跡；MP 一概不看 —— 使用者禁用）：
+        ★★★ 規格（使用者 2026-08-18 三退之後逐字定案）：
+          **等 CD 好 → 開頭放一次 → 立刻接技能循環；這一隻絕不再放。**
+          打下一隻之前一樣：等 CD 好，開頭放一次。
+        ⛔ **沒有「驗證→重試」迴圈**。v2/v3 都在「確認有沒有噴出去」上
+          重試，而每一條確認訊號都有實測的盲區（對地不寫欄位、環清單
+          位址回收＋邊走邊放不長條目、無效位移零痕跡）—— 盲區一踩到，
+          重試迴圈就變成使用者看到的「首發一直放」。他明確表示：
+          **寧可偶爾漏一發（伺服器吞包），也絕不准重複放。**
 
-        ① 「最近使用的技能 ID」欄位（角色屬性 −0x50）：反組譯 `0x549CD9`，
-          遊戲**所有檢查都過了**才寫。指向性技能兩條出手路徑都會寫
-          （2026-08-10 五台實測：743 幻影刺殺Ⅳ／946 冰凍狙擊Ⅳ 走封包
-          照樣寫入）。⚠ **對地技能走封包不寫**（2026-08-17 黑狐實測：
-          瞬移術 MP 有扣、欄位 238 拍全空）—— 所以要有第二條。
-        ② 「施放後鎖定（進 CD）」環清單（attack.casting_marks）：受理後
-          ~0.2-1.6 秒長出條目、存活＝技能後置時間；被拒收**不長**、MP
-          不扣。認的是條目「**從無到有**」的邊緣（⛔ 不比節點位址 ——
-          位址被配置器回收重用，30 秒實測 18 個位址輪著用，比位址會漏認
-          ＝首發永遠確認不了）。⚠ 邊走邊放時客戶端不播施法動作、條目
-          會漏（live_farm_ring_watch 實錄），所以位移類還有訊號③。
-        ③ 「座標瞬跳」：位移類（非攻擊對地，瞬移術那類）首發的**效果
-          本身** —— 一拍位移 ≥ OPENER_JUMP ＝人真的被傳走了。前提是
-          落點夾進有效距離（見 _blink_target；照 12 格怪的位置放＝無效
-          位移，什麼痕跡都不會有）。
+        「等 CD 好」怎麼判（都是實測過的讀法，不推測）：
+        ① 環清單（attack.casting_marks，實體+0x418）裡還有這顆技能的
+          條目＝還在 CD／後搖中 → 不送，等條目消失。
+          （條目存活＝後置時間；五台實測拒收不長、受理才長。）
+        ② ⚠ 邊走邊放的那一發不會留條目（live_farm_ringwatch 實錄），
+          所以另加**自己的間隔保險** `_open_cool`（OPENER_GAP 秒）：
+          距離上一次送首發不到這個間隔，一律不送。兩道都過才放。
 
-        施放**前**若清單裡已有這顆技能的條目＝**他在 CD／後搖中 →
-        等他好**（把重送時間往後推，條目消失才送）。在 CD 中被拒 →
-        訊號都不出現 → 持續回鎖、隔 OPENER_RETRY 重試，**等多久都等**
-        （使用者指定；唯一例外是 SP 不夠，見下面）。
+        同一隻怪**絕不重放**的兩道鎖：
+        · `_opened`：這一隻放過（或跳過）就一直開著。
+        · `_open_done_eid`：走不到／換目標又重選回**同一隻**時，
+          eid 相同直接視為放過 —— 這正是「頻率變低還是在放」的來源
+          （重選同一隻被當成新怪）。eid 不重複使用（重生必新 eid）。
 
-        ⚠ 只有**兩條通道同時死掉**（角色屬性讀不到＋實體解析不到 ——
-          換圖／重連的重建空窗才會這樣）才退化成「送出去就算數」：
-          寧可少一道保證，也**絕不能讓角色永遠站著不出手**。
+        跳過（不放、直接輪迴）只有使用者准許的三種＋一種硬故障：
+        沒選／鍵是空的（上面 `not sid` 那條）／SP 不足（等不到，死結）
+        ／跳板不在而首發是對地技能（根本送不出去，等下去也是死結）。
         """
         vk = self.opener_vk
         sid = bykey.get(vk) if vk else None
@@ -977,9 +930,9 @@ class KeyWorker(_Paced):
             return None
         if self._open_eid != eid:                  # 換了一隻 → 重新上鎖
             self._open_eid = eid
-            self._opened = False
+            # ★ 重選回同一隻不算新怪：這一隻已經放過就不再放（見 docstring）
+            self._opened = (eid == self._open_done_eid)
             self._open_since = now
-            self._arm_opener(sid)                  # 驗證通道上膛
         if self._opened:
             self.open_wait = 0.0
             return None
@@ -993,54 +946,6 @@ class KeyWorker(_Paced):
                               f"「{skills.name_of(sid) or sid}」放不出來，"
                               "這一隻跳過")
             return None
-        # 「這顆技能現在在不在 CD／後搖中」＝環清單裡有沒有它的條目。
-        present = None
-        if self._ver_ring:
-            try:
-                marks = attack.casting_marks(self.sc)
-            except Exception:                      # noqa: BLE001
-                marks = None                       # 這一拍讀壞就當沒看到
-            if marks is not None:
-                present = any(s == sid for _a, s in marks)
-        # 訊號③的素材：自己這一拍的座標（一拍跳超過 OPENER_JUMP＝被傳送）。
-        me = entity.read_pos(self.sc, self.player) if self.player else None
-        jumped = bool(me and self._last_me
-                      and math.hypot(me[0] - self._last_me[0],
-                                     me[1] - self._last_me[1]) >= OPENER_JUMP)
-        if me:
-            self._last_me = me
-        # ★★ 還沒送出去之前**不看任何訊號**（8/18）：上一隻怪首發的受理
-        #   回音最慢 1.6 秒才到，殺得快時會落在**這一隻**上鎖之後 ——
-        #   沒有這道閘，遲到的舊回音會被當成「這一隻已放過」，首發被
-        #   安靜跳過（使用者抱怨的「沒有先放首次攻擊」其中一種成因）。
-        if self._open_sent:
-            # 訊號①：欄位出現這個技能 ID（指向性技能，客戶端受理就寫）。
-            confirmed = (self._ver_field
-                         and player.read_last_skill(self.sc, self.stats)
-                         == sid)
-            # 訊號②：條目**從無到有**＝這一發被受理、進了 CD。
-            #   （在 CD 中被拒＝條目不出現；邊走邊放客戶端不播動作時
-            #   這條會漏 —— 位移類還有訊號③兜著，其他的靠重試收斂。）
-            if not confirmed and present is not None:
-                confirmed = present and self._ring_seen is False
-            # 訊號③：座標瞬跳＝位移類首發真的把人傳走了（效果本身，
-            #   100% 不會誤判；只有位移類看這條，指向性技能被擊退之類
-            #   的位移不能拿來當首發證據）。
-            if (not confirmed and jumped and skills.is_ground(sid)
-                    and not skills.is_attack(sid)):
-                confirmed = True
-            if confirmed:
-                self._opened = True                # 遊戲受理了 → 其他招解鎖
-                self.open_wait = 0.0
-                if present is not None:
-                    self._ring_seen = present
-                return None
-        elif present:
-            # 還沒送、條目卻在＝**他在 CD 中 → 等他好**（使用者字面要求）。
-            #   把重送時間往後推，等條目消失（CD 結束）才送這一隻的首發。
-            self._open_next = max(self._open_next, now + 0.3)
-        if present is not None:
-            self._ring_seen = present
         # ★ SP 不夠（或分不出來）→ 放行其他招，別站在那裡等一個不會好的條件。
         why = self._sp_blocked(sid)
         if why:
@@ -1048,6 +953,21 @@ class KeyWorker(_Paced):
             self.open_wait = 0.0
             self.open_note = why
             return None
+        # ── 等 CD 好 ──
+        # ① 環清單裡還有它的條目＝CD／後搖中 → 把送出時間往後推。
+        if now >= self._open_next:                 # （被推遲時不必再讀）
+            present = None
+            try:
+                marks = attack.casting_marks(self.sc)
+            except Exception:                      # noqa: BLE001
+                marks = None                       # 這一拍讀壞就當沒看到
+            if marks is not None:
+                present = any(s == sid for _a, s in marks)
+            if present:
+                self._open_next = max(self._open_next, now + 0.3)
+        # ② 自己的間隔保險：距離上一次送首發太近，一律不送。
+        if now < self._open_cool:
+            self._open_next = max(self._open_next, self._open_cool)
         # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
         #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
         #   會被當成「沒在等」。
@@ -1184,12 +1104,9 @@ class KeyWorker(_Paced):
             opener = self._opener_gate(eid, bykey, now)
             if opener is not None:
                 usable = [opener]
-                # ★★ 受理回音節流（8/18，使用者：不准重複施放首發）：
-                #   送出一發之後先等 OPENER_RETRY 秒再重送——回音抵達前照
-                #   ROUND_GAP 重送，可能被伺服器**多受理一發**（瞬移就多傳
-                #   一次＝亂放）。確認是每拍輪詢（_opener_gate），回音一到
-                #   立刻解鎖，不會等滿。在 CD 中被拒＝沒有回音，時間到自然
-                #   重送 —— 「等 CD、等多久都等」的行為不變。
+                # ★★ 首發還在「等 CD 好」（環清單條目還在／間隔保險沒過，
+                #   見 _opener_gate）→ 這一拍**什麼都不放**，站著等。
+                #   等好了下一拍自然放行。
                 if now < self._open_next:
                     return
             elif self.opener_vk in usable and len(usable) > 1:
@@ -1301,13 +1218,15 @@ class KeyWorker(_Paced):
                     if self._learning:
                         self._learn(vk)        # 剛按過鍵，順手讀一下
             if opener is not None and sent_opener:
-                # 首發送出去了：開始等受理回音；重送要等 OPENER_RETRY。
-                self._open_sent = True
-                self._open_next = now + OPENER_RETRY
-                # 驗不了（兩條通道都死＝重建空窗）才「送出去就當首發完成」。
-                # ⚠ 這一條就是「絕不會永遠站著不出手」的保險，別拿掉。
-                if not self._open_verify:
-                    self._opened = True
+                # ★★★ 首發＝**只放這一次**（使用者 8/18 逐字定案：開頭放，
+                #   之後不能再放）。送出去立刻解鎖接輪迴，**不驗證、不重試**
+                #   —— 每一條「確認訊號」都有實測盲區，卡在盲區上重試就是
+                #   之前「首發一直放」的根源。這一隻（eid）從此不再放；
+                #   下一隻要先等 CD（環清單）＋間隔保險（OPENER_GAP）。
+                self._opened = True
+                self._open_done_eid = eid
+                self._open_cool = now + OPENER_GAP
+                self.open_wait = 0.0
         except Exception:                      # noqa: BLE001
             pass
 
@@ -1977,26 +1896,25 @@ class CharFarmPage(QWidget):
         a.addWidget(QLabel("首次攻擊"))
         self.open_box = _NamedKeyBox(self._label_keys)
         self.open_box.setToolTip(
-            "每一隻怪的**第一下**一定要是這個鍵上的招，放出去之後才會開始\n"
-            "輪流放「技能鍵」勾選的那些。\n"
+            "每一隻怪的開頭：**等這一招 CD 好 → 放一次 → 接著開始輪流放**\n"
+            "「技能鍵」勾選的那些。\n"
             "\n"
-            "・首發只在**開頭放一次**：放出去之後的輪迴**不包含**這個鍵，\n"
-            "　 就算它同時勾在技能鍵裡也不會再放\n"
-            "　 （它是唯一有技能的鍵時例外，否則開場後就沒招可放）。\n"
-            "・那一招在冷卻 → **站著等它好**，等多久都等（其他招一個都不放）。\n"
-            "　 等待期間狀態列會顯示等了幾秒；要中斷就取消「開始掛機」。\n"
+            "・首發**只在開頭放一次，之後絕不再放**：輪迴不包含這個鍵\n"
+            "　 （就算它同時勾在技能鍵裡；它是唯一有技能的鍵時例外），\n"
+            "　 同一隻怪重新被選中也不會再放。\n"
+            "・放之前那一招還在冷卻 → **站著等它好**，等多久都等\n"
+            "　 （其他招一個都不放；狀態列會顯示等了幾秒）。\n"
             "・等待的那幾秒不算「沒進展」，不會因此被換掉去打別隻。\n"
             "・吃 SP（能量燈）的技能 SP 不夠 → **跳過**首發直接開始輪迴\n"
             "　 （SP 是打怪打出來的，站著等等不到）；狀態列會講。\n"
             "・這個鍵**不必**在上面勾選 —— 可以拿一招只當開場、不進輪替。\n"
             "・那個鍵是空的／放物品／快捷欄讀不到 → 自動當作沒設定，照常打。\n"
             "\n"
-            "・出手方式照原本的規則（射程 ≤ 8 送鍵、> 8 打封包），不受影響。\n"
-            "・「放出去了」的認定＝**看它真的進入冷卻**（遊戲受理施放後留下\n"
-            "　 的鎖定痕跡；瞬移術那類對地技能也驗得到），不看 MP。\n"
-            "　 在冷卻中被拒絕 → 痕跡不會出現 → 繼續等、繼續重試。\n"
-            "⚠ 只有換圖／重連的重建空窗（什麼都讀不到）才退化成\n"
-            "　「那一隻送一次就放行」—— 不讓角色永遠站著不出手。")
+            "・出手方式照原本的規則（射程 ≤ 8 送鍵、> 8 打封包）；\n"
+            "　 瞬移術那類位移技能的落點會夾在有效距離內（8 格），\n"
+            "　 傳送才會真的發生。\n"
+            "⚠ 每隻怪只送一次、不驗證不重試 —— 寧可極少數被伺服器吞包\n"
+            "　 而漏一發，也絕不重複施放（使用者定案）。")
         self.open_box.addItem("不指定", 0)
         for label, vk in SKILL_KEYS:
             self.open_box.addItem(label, vk)
