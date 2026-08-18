@@ -81,7 +81,8 @@ from app.game import attack, entity
 #   `entity.OFF_TARGET`／`team.MEMBERS_OFF` 那樣自動跟上。
 #   補償措施有兩道，**改版後它會大聲壞掉、不會安靜算錯**：
 #     ① 讀取端逐欄驗證（見 read()）：抽到的屬性只准 −1 或 0~11、每次點數
-#        只准 0 或 10、能量與點數不准是天文數字 —— 驗不過一律回 None。
+#        要是 10 的倍數（平常 10、加倍成功 20）、能量與點數不准是天文數字
+#        —— 驗不過一律回 None。
 #     ② `tools/verify_offsets.py` 會對真遊戲把這四欄再驗一次（改版後跑
 #        `/_patchCheck` 就會看到）。
 #
@@ -92,12 +93,16 @@ from app.game import attack, entity
 #   +0x60 起 12 格是各屬性累積點數（嵐狐 11042/17820/2182/74/…）。
 OFF_ENERGY = 0x54
 OFF_RESULT = OFF_ENERGY + 4       # 目前選中／剛抽到的屬性索引（0~11；−1 = 還沒抽）
-OFF_PER_ROLL = OFF_ENERGY + 8     # 每次獲得的點數（有資料時固定 10）
+OFF_PER_ROLL = OFF_ENERGY + 8     # 每次獲得的點數（平常 10；加倍成功後 20）
 OFF_POINTS = OFF_ENERGY + 12      # 各屬性累積點數，12 格 int32
 ATTR_COUNT = 12
 # 合理性上限（見上面②）。能量與單一屬性點數都不可能到千萬。
 MAX_ENERGY = 10_000_000
 MAX_POINTS = 100_000_000
+# 每次點數的合理上限。實測值只有 0（還沒同步）、10（平常）、20（加倍成功，
+# 2026-08-18 嵐狐實機讀到）。上限放寬到 200 是**版面驗證的容忍度**——
+# 就算遊戲哪天再疊倍也不會把合法狀態誤判成「欄位搬家」；不是說真會到 200。
+MAX_PER_ROLL = 200
 
 # 屬性名稱。**優先從記憶體讀**（見 attr_names()），這份只是讀不到時的後備。
 # 順序是從記憶體裡那一排連續字串抄的，跟遊戲畫面上的排列一致。
@@ -153,11 +158,15 @@ def read(scanner, state: int) -> EnergyState | None:
     energy, result, per = struct.unpack_from("<Iii", b, OFF_ENERGY)
     pts = struct.unpack_from(f"<{ATTR_COUNT}i", b, OFF_POINTS)
     # --- 版面驗證（改版搬家就擋在這裡）---
-    #   抽到的屬性：−1（還沒抽）或 0~11；每次點數：實測只有 0 或 10。
-    #   五台實測都符合；其它值代表這裡根本不是那幾個欄位。
+    #   抽到的屬性：−1（還沒抽）或 0~11；每次點數：10 的倍數（0=還沒同步、
+    #   10=平常、20=加倍成功）。
+    #   ⚠⚠ 這欄以前寫成白名單 `per in (0, 10)`，結果 2026-08-18 嵐狐加倍
+    #   成功後這欄變 20，被當成「版面搬家」整片打槍回 None —— 分頁顯示
+    #   讀不到資料、自動晶化停掉、還連帶 forget_state 白白重掃。
+    #   這條驗的是「這裡還是不是那個欄位」，不是業務值白名單，別再收緊。
     if not (result == -1 or 0 <= result < ATTR_COUNT):
         return None
-    if per not in (0, 10):
+    if not (0 <= per <= MAX_PER_ROLL and per % 10 == 0):
         return None
     if not 0 <= energy <= MAX_ENERGY:
         return None
