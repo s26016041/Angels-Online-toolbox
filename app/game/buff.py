@@ -12,6 +12,9 @@
 ⚠⚠ 驗證要**每 0.25 秒取樣**：MP 只低 2 秒就補回來了，隔 2.5 秒才看會什麼都
   看不到 —— 我第一次就是這樣誤判成「封包沒生效」，白繞了一圈。
 ★ 送封包**不必停下來**：走路中、打怪中都送得出去，不像按鍵會被當前動作吃掉。
+★ 2026-08-19 起補放要**確認**：送包後等 castwatch 的「施放廣播」（伺服器受理
+  才回、拒收不回，100% 訊號），等不到就照 RETRY 重放 —— 以前送出就當成功，
+  SP 不夠被拒收時會安靜地裸奔 20 分鐘。沒有監聽（裝不起來）才退回舊行為。
 
 技能編號怎麼來
 --------------
@@ -36,7 +39,7 @@ from __future__ import annotations
 
 import time
 
-from app.game import attack, player, skills
+from app.game import attack, bag, castwatch, player, skills
 
 # 剩幾秒就補（使用者指定 10 秒）
 LEAD = 10.0
@@ -44,6 +47,9 @@ LEAD = 10.0
 CONFIRM_WAIT = 1.2
 # 學不到／放不出來時，隔多久再試（別每一拍都狂送）
 RETRY = 8.0
+# 送包後等「施放廣播」（castwatch）確認多久；等不到＝伺服器沒受理。
+# 廣播實測一送就回（<1 秒），4 秒是給掉幀／網路抖動的餘裕。
+CAST_WAIT = 4.0
 
 
 class AutoBuff:
@@ -69,6 +75,10 @@ class AutoBuff:
         self._cast_at = 0.0
         self._sent_at = 0.0
         self._learning = False
+        # 施放廣播確認（castwatch）：送了包、還在等「伺服器受理」那一包
+        self._confirming = False
+        self._cw_since = 0       # 送包前記下的攔包計數（只看之後的廣播）
+        self._srv = 0            # 我的施法者伺服器ID（每次送包重讀，不快取）
         self.note = ""
         self.armed = False
         self.blocked = ""        # 那個鍵上根本沒有可用的技能 → 停手（見 block）
@@ -90,6 +100,7 @@ class AutoBuff:
         self._cast_at = 0.0                  # 還沒放過 → 下一拍就補一次
         self._sent_at = 0.0
         self._learning = False
+        self._confirming = False
         self.blocked = ""
         return True
 
@@ -109,6 +120,7 @@ class AutoBuff:
         self._cast_at = 0.0
         self._sent_at = 0.0
         self._learning = False
+        self._confirming = False
         self.armed = True
 
     def left(self) -> float:
@@ -117,12 +129,16 @@ class AutoBuff:
         return max(0.0, self.secs - (time.monotonic() - self._cast_at))
 
     def step(self, scanner, mover, hwnd, pf_this: int, my_id,
-             stats_base: int, send_key) -> str:
+             stats_base: int, send_key, cast_hook=None) -> str:
         """走一步。回傳給狀態列看的說明。
 
         my_id: 自己的實體 ID，**也可以傳一個 callable**，要用到時才呼叫。
             ★ 那個值要讀一次記憶體，但只有真的要送補分身封包（20 分鐘一次）
               才用得到 —— 掛機的心跳是 10ms 一拍，每拍都先算好等於白讀。
+        cast_hook: castwatch.CastHook（施放廣播監聽），None＝沒有。
+            有它才能 100% 確認「這一放真的被伺服器受理」——拒收不回、
+            受理才回（見 app/game/castwatch.py）。沒有就退回舊行為
+            （送出就當成功）。
         """
         if not self.armed:
             return self.note
@@ -143,6 +159,30 @@ class AutoBuff:
             self._cast_at = now                 # 那一下按鍵本身就是第一次施放
             self.note = (f"已放分身：技能 {info.id}"
                          f"（持續 {info.secs / 60:.0f} 分）")
+            return self.note
+
+        # ①.5 封包送出去了 → 等伺服器的「施放廣播」確認真的放出去
+        #   （castwatch，100% 訊號：受理才回、拒收不回）。
+        #   ⚠ 以前是「送出就當成功」：SP 不夠／被打斷時伺服器拒收，
+        #     我們卻以為補好了，接下來 20 分鐘裸奔。現在等不到廣播就
+        #     照 RETRY 節奏重放，直到真的放出去。
+        if self._confirming:
+            if (cast_hook is not None and cast_hook.active and self._srv
+                    and cast_hook.fired(self._cw_since, self._srv, self.skill)):
+                self._confirming = False
+                self._cast_at = self._sent_at    # 從送包那一刻起算（保守）
+                self.note = (f"已補分身：技能 {self.skill}"
+                             f"（伺服器已受理，持續 {self.secs / 60:.0f} 分）")
+                return self.note
+            if cast_hook is None or not cast_hook.active:
+                # 監聽中途被卸掉 → 沒訊號可等，退回「送出就當成功」
+                self._confirming = False
+                self._cast_at = self._sent_at
+                return self.note
+            if now - self._sent_at >= CAST_WAIT:
+                self._confirming = False        # _cast_at 不動 → 之後照 RETRY 重放
+                self.note = (f"⚠ 分身沒被伺服器受理（SP 不夠？被打斷？）"
+                             f"→ {RETRY:.0f} 秒後重放")
             return self.note
 
         # ② 時間還夠 → 什麼都不做
@@ -181,12 +221,30 @@ class AutoBuff:
             self.note = "⚠ 跳板沒裝上，補不了分身"
             self._sent_at = now
             return self.note
+        # ★ 確認用的兩個錨要在**送包前**先記：廣播可能一送就回來，送完才記
+        #   write_count 會把那一包漏掉。施法者ID每次重讀（換圖/重連會重建
+        #   玩家物件，快取的是舊值 → 永遠對不上）。
+        srv = since = 0
+        if cast_hook is not None and cast_hook.active:
+            try:
+                srv = castwatch.own_server_id(
+                    scanner, bag.player_entity(scanner)) or 0
+            except Exception:                              # noqa: BLE001
+                srv = 0
+            since = cast_hook.write_count()
         ok = mover.call(attack.CAST_FN, self.skill, mid, 0, 0, 0)
         self._sent_at = now
-        if ok:
+        if not ok:
+            self.note = "⚠ 補分身的封包排不進去"
+        elif srv:
+            # 有施放廣播監聽 → 先別當成功，等 ①.5 收到「我放出這招」才算
+            self._confirming = True
+            self._cw_since = since
+            self._srv = srv
+            self.note = "補分身：已送出，等伺服器受理…"
+        else:
+            # 沒有監聽（裝不起來／讀不到施法者ID）→ 退舊行為：送出就當成功
             self._cast_at = now
             self.note = (f"已用封包補分身：技能 {self.skill}"
                          f"（持續 {self.secs / 60:.0f} 分）")
-        else:
-            self.note = "⚠ 補分身的封包排不進去"
         return self.note

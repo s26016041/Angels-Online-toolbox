@@ -1603,7 +1603,8 @@ class CharFarmPage(QWidget):
         self._death_closed = False # 死亡選擇視窗已經關掉了（一次死亡只關一次）
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
-        self._castwatch = None       # 施放廣播監聽（首發 100% 確認用；有設首發才裝）
+        self._castwatch = None       # 施放廣播監聽（首發＋補分身的 100% 確認用）
+        self._cw_failed = False      # 裝失敗過就別每拍狂試（重開掛機會再試一次）
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）。
         # 每個點記 (x, y, 場景編號)；場景編號 None = 舊版存的、沒標記地圖。
@@ -1674,6 +1675,11 @@ class CharFarmPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        # ★ 垂直捲軸**永遠顯示**（2026-08-19 使用者回報「抖動」）：內容高度
+        #   剛好卡在「要不要捲軸」的邊界時（狀態字一長、提示列忽隱忽現），
+        #   捲軸出現→視口變窄→重新排版→捲軸消失→視口變寬→…來回振盪，
+        #   看起來就是整頁在抖。捲軸固定住，視口寬度恆定，回路就斷了。
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         body = QWidget()
         scroll.setWidget(body)
         outer.addWidget(scroll)
@@ -1690,13 +1696,11 @@ class CharFarmPage(QWidget):
         #   藥水用完和裝備壞掉；死亡回程卡住停機那種「掛機停了」才通知）。
         self.notify_cb = QCheckBox("啟用通知")
         self.notify_cb.setChecked(True)
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
+        #   設計理由寫在程式註解／memory，不放進提示。
         self.notify_cb.setToolTip(
-            "掛機的通知總開關。關掉之後這些都不會通知：\n"
-            "・裝備壞掉（耐久 ≤ 1）、藥水用完\n"
-            "・回程補給失敗、走不到巡邏點、死亡回程卡住\n"
-            "★ 只影響通知，掛機該停還是會停（狀態列照樣寫原因）。\n"
-            "★ 角色死亡本身不通知 —— 勾了「死亡自己回練功區」會自己"
-            "復活接回，沒勾就只停機（狀態列寫原因）。")
+            "通知總開關：裝備壞掉、藥水用完、掛機出狀況才通知。\n"
+            "關掉只是不通知，掛機該停還是會停。")
         self.notify_cb.toggled.connect(self._save_settings)
         nbar.addWidget(self.notify_cb)
         nbar.addSpacing(10)
@@ -1727,10 +1731,8 @@ class CharFarmPage(QWidget):
         self.run_cb = QCheckBox("開始掛機")
         self.run_cb.setStyleSheet("font-weight: bold;")
         self.run_cb.setToolTip(
-            "勾選後開始：把「選中怪物」裡離自己最近的一隻寫進遊戲的目前目標，"
-            "並持續送技能鍵。\n打死會自動接下一隻。取消勾選立刻停止。\n"
-            "★ 開始的當下會自動把天使精靈的主開關「開啟天使守護精靈」打開\n"
-            "　 （本來就開著就不動它；停止掛機也不會幫你關）。")
+            "自動打「選中怪物」裡的怪，打死接下一隻。\n"
+            "取消勾選立刻停止。")
         self.run_cb.toggled.connect(self._on_toggle)
         run_bar = QHBoxLayout()
         run_bar.addWidget(self.run_cb)
@@ -1775,12 +1777,8 @@ class CharFarmPage(QWidget):
         self.key_btn = QToolButton()
         self.key_btn.setPopupMode(QToolButton.InstantPopup)
         self.key_btn.setToolTip(
-            "要輪流使用的技能鍵（可勾多個）。\n"
-            "・攻擊時照 F1→F12 的順序輪流施放勾選的鍵。\n"
-            "・鍵上放什麼直接讀遊戲快捷欄：空的格、放物品的格自動略過，\n"
-            "　不會按下去（所以不會誤吃藥）。\n"
-            "・掛機中把快捷欄上的技能換掉，幾秒內自動跟上，不用重開掛機。\n"
-            "・一個都不勾＝用預設 F2；讀不到快捷欄（遊戲改版）就退回純按鍵。")
+            "勾要輪流放的技能鍵（可多選），照 F1→F12 順序施放。\n"
+            "放什麼直接讀遊戲快捷欄：空格、物品自動略過。")
         km = QMenu(self.key_btn)
         self._key_cbs: list[tuple[QCheckBox, int, str]] = []
         for label, vk in SKILL_KEYS:
@@ -1807,21 +1805,8 @@ class CharFarmPage(QWidget):
         a.addWidget(QLabel("首次攻擊"))
         self.open_box = _NamedKeyBox(self._label_keys)
         self.open_box.setToolTip(
-            "每一隻怪的**第一下**一定要是這個鍵上的招；**確認伺服器真的受理**\n"
-            "（收到施放廣播）之後，才開始輪流放「技能鍵」勾選的那些。\n"
-            "\n"
-            "・首發只在**開頭放一次**：確認之後的輪迴**不含這個鍵**，就算它\n"
-            "　 同時勾在技能鍵裡也不再放（修掉了「首發一直放」的舊 bug）。\n"
-            "・還沒收到廣播（在冷卻／共CD被拒） → **持續發射直到收到**，\n"
-            "　 其他招一個都不放；等待不算「沒進展」，不會被換去打別隻。\n"
-            "・吃 SP（能量燈）的技能 SP 不夠 → **跳過**首發直接輪迴\n"
-            "　（SP 是打怪打出來的，站著等等不到）。\n"
-            "・這個鍵**不必**在上面勾選 —— 可以拿一招只當開場、不進輪替。\n"
-            "・那個鍵是空的／放物品／快捷欄讀不到 → 自動當作沒設定，照常打。\n"
-            "\n"
-            "・確認靠攔伺服器的施放廣播（100%、連射也逐發分得出、不看 MP）。\n"
-            "⚠ 監聽裝不起來（遊戲改版）時 → 首發改『送一次就算』，\n"
-            "　 其餘掛機不受影響（狀態列會講）。")
+            "每隻怪的第一下固定先放這個鍵，確認放出去才輪其他招。\n"
+            "只當開場用，之後的輪迴不含它；SP 不夠會自動跳過。")
         self.open_box.addItem("不指定", 0)
         for label, vk in SKILL_KEYS:
             self.open_box.addItem(label, vk)
@@ -1841,59 +1826,25 @@ class CharFarmPage(QWidget):
         #   有 20 種怪同名卻一個是王一個不是（哥布林幹部 78 / 663王…）。
         self.boss_cb = QCheckBox("只打王")
         self.boss_cb.setToolTip(
-            "勾起來之後**不看左邊「選中怪物」的名字**，改成只打「王」。\n"
-            "等於自動把周圍所有的王加進選中清單，而且只加王。\n"
-            "\n"
-            "王是讀遊戲自己的怪物資料判斷的（種類 ID → 王旗標），\n"
-            "不是靠名字猜 —— 有 20 種怪同名卻一個是王一個不是。\n"
-            "\n"
-            "⚠ 不分等級：周圍出現的**任何**王都會打。真的很硬的王打不贏時，\n"
-            "　 角色一死掛機會自動停下來，但還是留意一下。")
+            "只打周圍的「王」，完全不看「選中怪物」名單。\n"
+            "⚠ 不分等級，多硬的王都會打。")
         a.addWidget(self.boss_cb)
         a.addSpacing(10)
         # ★ 自動分身：時間快到了自動補 F12
         self.buff_cb = QCheckBox("自動分身")
         self.buff_cb.setToolTip(
-            "⚠⚠ **技能要自己先放到遊戲的 F12**。\n"
-            "　　 這裡只認 F12，放在別的鍵不會動。\n"
-            "⚠　 F12 要放**對象是「自己」**的技能（按了就直接生效）；\n"
-            "　　 對象是「角色」的要先選人，這裡不處理。\n"
-            "★　 **不必開「開始掛機」**：單獨勾也會動（手動打王時自動補）。\n"
-            "\n"
-            f"時間到就自動補：剩不到 {buff.LEAD:.0f} 秒再放一次\n"
-            "（持續幾分鐘是查遊戲資料表的，每招不一樣）。\n"
-            "・剛勾起來（或開始掛機時還沒放過）會**先無腦放一次**，\n"
-            "　 不去偵測身上還有沒有。\n"
-            "・補的時候送**封包**，不占鍵盤、也不必停下腳步。\n"
-            "・持續時間讀遊戲資源包（黑狐的 F12 是技能 5424，20 分鐘）。\n"
-            "・只有**第一次**要按一下 F12 認技能編號，認到就記住，\n"
-            "　 之後連重開程式都不用再按。\n"
-            "\n"
-            "⚠ 被驅散或施法被打斷我們不會知道，最壞情況是斷到下次補的空窗。")
+            "把分身技能放在遊戲快捷欄的 F12（只認 F12）。\n"
+            "時間快到自動補放，並確認伺服器真的有受理。\n"
+            "不用開掛機，單獨勾也會動。")
         self.buff_cb.toggled.connect(self._save_settings)
         a.addWidget(self.buff_cb)
         a.addSpacing(10)
         # ★ 自動召喚：F11 的召喚物不見了／死了就自動重放（見 app/game/summon.py）
         self.summon_cb = QCheckBox("自動召喚")
         self.summon_cb.setToolTip(
-            "⚠⚠ **召喚技能要自己先放到遊戲的 F11**。\n"
-            "　　 這裡只認 F11，放在別的鍵不會動。\n"
-            "★　 **不必開「開始掛機」**：單獨勾也會動（手動打王時自動補）。\n"
-            "\n"
-            "召喚出來的怪會一直盯著：真的沒了就自動再召喚一次。\n"
-            "・「在不在」讀的是遊戲自己記的「我的召喚物」欄位 —— 走遠了、\n"
-            "　 換地圖牠自己跟過來的那段**不會**誤判成不見而白召\n"
-            "　（牠跟不上、真的消失超過 8 秒才重召）。\n"
-            "・召喚是送**封包**（座標填自己腳下），不占鍵盤、不必停下腳步。\n"
-            "・剛勾起來會**先放一次** —— 就算場上已經有一隻（手動放的），\n"
-            "　 也會直接換成新的一隻，因為召喚技能再放一次本來就是換一隻\n"
-            "　（實測），順便把它變成我們追蹤得到的。\n"
-            "・「是不是我的召喚物」認的是**施放後出生在封包裡那一格的**\n"
-            "　（座標是我們自己填的，實測召喚物正好出生在那格正中央）——\n"
-            "　 同職業的玩家貼著同時召喚也分得開：他的出生在他那一格。\n"
-            "　 萬一真的認錯也會自己好：他的召喚物跟著他走遠就讀不到了，\n"
-            "　 我們會自動再召一隻。\n"
-            "・放不出來（MP 不足等）會每 6 秒一直重試，直到把勾拿掉。")
+            "把召喚技能放在遊戲快捷欄的 F11（只認 F11）。\n"
+            "召喚物真的沒了才自動重召（走遠、換地圖不會誤判）。\n"
+            "不用開掛機，單獨勾也會動。")
         self.summon_cb.toggled.connect(self._save_settings)
         a.addWidget(self.summon_cb)
         a.addStretch(1)
@@ -1931,11 +1882,7 @@ class CharFarmPage(QWidget):
         r = QHBoxLayout()
         self.rot_cb = QCheckBox("自動換頻")
         self.rot_cb.setToolTip(
-            "從**目前這一頻**出發，依序換過每一頻再回到原本那一頻。\n"
-            "例：現在在 3 頻 → 4 → 5 → 1 → 2 → 3（共 5 次切換）。\n"
-            "\n"
-            "換頻道期間會暫停打怪幾秒（要等重連＋重新定位），\n"
-            "停留那段時間照常掛機。")
+            "依序換過每一頻再回到原本那一頻，停留期間照常掛機。")
         r.addWidget(self.rot_cb)
         r.addWidget(QLabel("每"))
         self.rot_every = QDoubleSpinBox()
@@ -1953,9 +1900,7 @@ class CharFarmPage(QWidget):
         self.rot_stay.setDecimals(0)
         self.rot_stay.setValue(60.0)
         fit_spin(self.rot_stay)
-        self.rot_stay.setToolTip(
-            "換到一頻之後待多久才換下一頻。這段時間照常打怪。\n"
-            "⚠ 最少 5 秒 —— 客戶端重連要 1~2 秒，太短會一直在換線。")
+        self.rot_stay.setToolTip("換到一頻之後待多久才換下一頻（照常打怪）。")
         r.addWidget(self.rot_stay)
         r.addWidget(QLabel("秒"))
         r.addStretch(1)
@@ -1975,30 +1920,10 @@ class CharFarmPage(QWidget):
         g_sup = QGroupBox("回程補給")
         sup_v = QVBoxLayout(g_sup)
         c = QHBoxLayout()
-        common = (
-            "\n\n觸發之後：停掉我們的自動戰鬥 → 開精靈 → 回程 →"
-            "\n它修裝買東西 → **回到原本那張地圖**就自動接回自動戰鬥。"
-            f"\n（每 {SUPPLY_POLL:.0f} 秒檢查一次回到原地圖了沒）"
-            "\n★ 開了自動攻擊之後如果發現地圖已經自己變了，代表客戶端"
-            "\n　 已經自己跑回程，我們就不再送一次，避免跟官方打架。"
-            "\n★ 勾了**任何一個**觸發，開始掛機時會自動把精靈補給頁的"
-            "\n　 「裝備損壞回城」「修理裝備」「購買物品保持身上數量」打開，"
-            "\n　 並把**天使之翼**加進購買清單、保持 50 個 ——"
-            "\n　 只加翼這一項，你原本設的購買都不動；"
-            "\n　 翼已經設得比 50 多也不會幫你改少。"
-            "\n　 掛機中才勾也會立刻調好；取消勾選不會幫你改回去。")
-        potion = (
-            "\n・藥水是哪一種，讀「天使輔助精靈」那頁你設的，換藥水自動跟著換"
-            "\n・同一組配了好幾格時要**全部**歸零才算（還有一格有貨就不算）"
-            "\n・數量是全背包加總（同一種水散在好幾格會加起來算）"
-            "\n・那格設成技能的話整組跳過 —— 用技能補本來就不吃藥水"
-            "\n⚠ 不看遊戲裡「補HP/MP物品用完自動回城」有沒有勾。"
-            "\n★ 水沒了一定會通知，**沒勾這裡也會通知**，只是不跑補給。")
         self.sup_gear_cb = QCheckBox("裝備壞掉")
         self.sup_gear_cb.setToolTip(
-            "身上穿的裝備**任何一件**耐久剩 1（或歸零）就跑回程補給。\n"
-            "・看的是全身穿著的（0~11 格），背包裡的東西不算\n"
-            "・是不是裝備看範本的耐久上限，藥水那種不會被誤判" + common)
+            "身上穿的任何一件裝備耐久剩 1 就自動回城補給，"
+            "補完飛回記錄點接著打。")
         # ★ 三個觸發開關走 _on_robot_pref（不是單純 _save_settings）——
         #   勾了任何一個就要把精靈補給頁的設定推到位（見 robot.apply_prefs
         #   的 supply），掛機中才勾也要立刻生效。
@@ -2009,35 +1934,23 @@ class CharFarmPage(QWidget):
         #   全歸零，MP 有沒有水完全不影響，反之亦然。
         self.sup_hp_cb = QCheckBox("HP 藥水沒了")
         self.sup_hp_cb.setToolTip(
-            "「天使輔助精靈」那頁設的 **HP 藥水整組**用完就跑回程補給。"
-            "\n（MP 有沒有水不影響這一項）" + potion + common)
+            "精靈那頁設的 HP 藥水整組用完就自動回城補給，"
+            "補完飛回記錄點接著打。")
         self.sup_hp_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_hp_cb)
         self.sup_mp_cb = QCheckBox("MP 藥水沒了")
         self.sup_mp_cb.setToolTip(
-            "「天使輔助精靈」那頁設的 **MP 藥水整組**用完就跑回程補給。"
-            "\n（HP 有沒有水不影響這一項）" + potion + common)
+            "精靈那頁設的 MP 藥水整組用完就自動回城補給，"
+            "補完飛回記錄點接著打。")
         self.sup_mp_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_mp_cb)
         c.addSpacing(10)
         # ★ 不等精靈自己走回來，時間到就用遊戲的「天使趴趴GO」直接傳回去。
         self.sup_jump_cb = QCheckBox("用天使趴趴GO回地圖")
         self.sup_jump_cb.setToolTip(
-            f"觸發回程補給之後 **{JUMP_BACK_SECS / 60:.0f} 分鐘**，直接用"
-            "「天使趴趴GO」傳回**記錄點**那張地圖（顯示在巡邏點下方），\n"
-            "不再等精靈自己走回來。\n"
-            "・傳完就照原本的流程接回自動戰鬥\n"
-            "・同一張地圖有好幾個落點時，挑**離記錄點最近**的那個\n"
-            "・時間到時如果人已經回到那張地圖了就不傳\n"
-            f"・送出去之後會**盯著地圖有沒有真的變**，{JUMP_LAND_SECS:.0f} 秒\n"
-            "　 還沒到就再送一次（不限次數，直到補給逾時為止）\n"
-            "⚠ 走的是遊戲自己的傳送封包，跟你手動開趴趴GO按下去完全一樣，\n"
-            "　 所以**傳送費用、等級限制**照樣算。\n"
-            "⚠ 那張地圖不在趴趴GO清單裡就不傳（會在狀態列說一聲）。\n"
-            "★ 勾了這個，**開始掛機時**會自動把精靈補給頁的\n"
-            "　 「使用標記傳送捲軸回練功點」**取消**掉 —— 回地圖已經由\n"
-            "　 趴趴GO負責，精靈再燒一張捲軸只是浪費道具。\n"
-            "　 之後你在遊戲裡改回去我們就不再管；取消勾選也不會幫你勾回去。")
+            f"補給後 {JUMP_BACK_SECS / 60:.0f} 分鐘直接用天使趴趴GO"
+            "飛回記錄點，不等走路。\n"
+            "傳送費用、等級限制跟手動用趴趴GO一樣。")
         self.sup_jump_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_jump_cb)
         c.addSpacing(10)
@@ -2048,24 +1961,8 @@ class CharFarmPage(QWidget):
         #   復活回城的話，「回標記點」就沒得點了。
         self.sup_revive_cb = QCheckBox("死亡自己回練功區")
         self.sup_revive_cb.setToolTip(
-            "角色死掉也不停止掛機，自動回來繼續打：\n"
-            f"・死亡 **{DEATH_REVIVE_SECS:.0f} 秒後**直接送遊戲的"
-            "「回標記點」封包復活\n"
-            "　（跟你在死亡視窗點「回標記點」完全一樣）\n"
-            "・復活後自動把死亡選擇視窗關掉\n"
-            "・復活後人在標記點（通常在城裡）→ 自動用**天使趴趴GO**\n"
-            "　 傳回**記錄點**那張地圖（見巡邏點下方；沒有記錄點\n"
-            "　 才用死掉時那張），回到就接回自動戰鬥\n"
-            "・開始掛機時自動把天使精靈「輔助」頁的\n"
-            "　「陣亡時自動復活」**關掉** —— 免得精靈搶先把人復活回城\n"
-            "・沒勾的話維持原樣：角色死亡就自動停止掛機\n"
-            "\n"
-            "・掛機中才勾也會立刻把精靈設定調好\n"
-            "・取消勾選不會幫你把遊戲裡的精靈設定改回來\n"
-            "⚠ 角色死亡**不會另外通知**；只有復活一直沒完成（逾時）\n"
-            "　 停機那一種才通知。\n"
-            "⚠ 精靈面板開著的話勾選框的**顯示**可能沒立刻跟上，\n"
-            "　 重開面板就會顯示對，實際行為一律以設定值為準。")
+            "死了自動復活（回標記點）再飛回記錄點接著打。\n"
+            "沒勾的話角色死亡就停止掛機。")
         self.sup_revive_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_revive_cb)
         c.addStretch(1)
@@ -2147,11 +2044,7 @@ class CharFarmPage(QWidget):
         #   不要一直刷。掛機中仍然自動刷新 —— 見 tick 裡那段說明。
         self.scan_btn = QPushButton("掃描周圍怪物")
         self.scan_btn.setToolTip(
-            "掃一次周圍有哪些怪（純讀記憶體，不會對遊戲做任何事）。\n"
-            "・沒在掛機時清單**不會自己更新**，要看最新的就按這顆\n"
-            "・切到這台分身時會自動掃一次，免得看到的是上次留下的清單\n"
-            "★ 掛機中不必按：那時清單本來就會一直自動刷新（要靠它接下一隻怪、"
-            "跟人搶怪）。")
+            "掃一次周圍有哪些怪。掛機中會自動刷新，不用按。")
         self.scan_btn.clicked.connect(self._scan_now)
         rv.addWidget(self.scan_btn)
         # 「周圍怪物」多一個「【王】」字首
@@ -2163,13 +2056,8 @@ class CharFarmPage(QWidget):
         # ★ 沒有開關（2026-08-13）：**有設點就會巡、不想巡就別設**。
         #   行為說明放在群組的滑鼠提示（原本在「沒怪去巡邏點」勾選框上）。
         spot.setToolTip(
-            "掛機時完全沒有選中的怪，就依序走這些點找怪；\n"
-            "清單是空的就原地不動。**不想巡邏就把點全部刪掉。**\n"
-            "・追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
-            "・只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
-            "　 同一張圖的不同分流算同一張，會照走。\n"
-            "・在點上按右鍵：用天使趴趴GO飛到那個點所在的地圖，\n"
-            "　 記錄點也會跟著改成那個點。")
+            "沒怪打時依序走這些點找怪；不想巡邏就把點全部刪掉。\n"
+            "只走目前這張地圖的點。在點上按右鍵可用趴趴GO飛過去。")
         # 每一列是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
         # （專家級遺落之地／史萊姆晴空牧場）—— 太窄會被切掉。
         sv = QVBoxLayout(spot)
@@ -2186,9 +2074,7 @@ class CharFarmPage(QWidget):
         # ⚠ 字別太長：主題給按鈕的 padding 是左右各 14px，
         #   「加入目前位置」要 108px，加上 X 鈕就超出區塊寬度被切掉（踩過）。
         add_btn = QPushButton("加入位置")
-        add_btn.setToolTip(
-            "把角色現在站的位置加進巡邏點，並記下是哪一張地圖。\n"
-            "掛機時只會走「目前這張地圖」的點 —— 換到別張圖就不會亂跑。")
+        add_btn.setToolTip("把角色現在站的位置加進巡邏點。")
         add_btn.clicked.connect(self._add_spot)
         srow.addWidget(add_btn)
         # 用 ASCII 的 X，不要用 ✕（部分中文字型沒有那個字形會變豆腐）
@@ -2202,10 +2088,8 @@ class CharFarmPage(QWidget):
         # ★ 記錄點顯示（2026-08-18 使用者要求）：回程補給／死亡回程飛回這裡。
         self.home_lab = QLabel("記錄點：－")
         self.home_lab.setToolTip(
-            "回程補給／死亡回練功區，最後用天使趴趴GO飛回這個點所在的地圖。\n"
-            "・按「開始掛機」時取**巡邏點**：目前地圖有點就用目前地圖的\n"
-            "　 第一個，沒有就用清單第一個；完全沒設巡邏點才用當下站的位置。\n"
-            "・在巡邏點上按右鍵「飛到這張圖」，記錄點也會跟著改成那個點。")
+            "回程補給／死亡回程最後會飛回這個點的地圖。\n"
+            "開始掛機時取巡邏點；右鍵「飛到這張圖」也會更新它。")
         sv.addWidget(self.home_lab)
         # 「巡邏點」每列是「編號. 地圖名 (x, y)」，地圖名最長 7 個字
         # （專家級遺落之地／史萊姆晴空牧場），座標最多各 3 位數
@@ -3018,8 +2902,7 @@ class CharFarmPage(QWidget):
             self.spot_list.item(n).setToolTip(
                 f"{where}　格子 ({x:.1f}, {y:.1f})\n"
                 + (f"場景編號 {sid}" if sid is not None else
-                   "舊版存的點，沒有記地圖 —— 在任何地圖都會走，"
-                   "想要地圖比對請刪掉重加。"))
+                   "舊版的點沒記地圖，建議刪掉重加。"))
 
     def _forget_routes(self) -> None:
         """巡邏點清單一動 → 導航整個重來（正在走的那一段的目標可能換人了）。
@@ -3159,25 +3042,36 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
             return False
 
-    def _ensure_castwatch(self) -> None:
-        """有設首次攻擊 → 掛施放廣播監聽（首發 100% 確認）。沒設就不裝。
+    def _want_castwatch(self) -> bool:
+        """誰需要施放廣播監聽：①掛機中有設首次攻擊（首發逐發確認）
+        ②自動分身學到技能（補放要確認伺服器受理）。都不要就不該裝著。"""
+        return bool((self.run_cb.isChecked() and self._keys.opener_vk)
+                    or (self.buff_cb.isChecked() and self._buff.skill))
 
-        ⚠ inline hook 熱路徑：裝不起來（AOB 對不上／改版）castwatch.acquire 回
-          None，首發自動退化成「送一次就算」（見 _opener_gate），不會卡死。
+    def _sync_castwatch(self) -> None:
+        """照需求裝／卸施放廣播監聽（inline hook 熱路徑：沒人用就別放進遊戲）。
+
+        ⚠ 裝不起來（AOB 對不上／改版）castwatch.acquire 回 None → 記住失敗
+          別每拍狂試；首發退化成「送一次就算」（_opener_gate）、補分身退化成
+          「送出就當成功」（buff.step），都不會卡死。
         """
-        if not self._keys.opener_vk:
-            return                             # 沒設首發 → 不裝（零風險）
-        if self._castwatch is not None and self._castwatch.active:
+        if self._want_castwatch():
+            if self._castwatch is not None and self._castwatch.active:
+                self._keys.castwatch = self._castwatch
+                return
+            if self._cw_failed:
+                return
+            try:
+                self._castwatch = castwatch.acquire(self.pid, self)
+            except Exception:                  # noqa: BLE001
+                self._castwatch = None
             self._keys.castwatch = self._castwatch
+            if self._castwatch is None:
+                self._cw_failed = True
+                self.status.setText("⚠ 施放廣播監聽裝不起來（改版？）→ "
+                                    "首發/補分身改『送出就算』，其餘不受影響")
             return
-        try:
-            self._castwatch = castwatch.acquire(self.pid, self)
-        except Exception:                      # noqa: BLE001
-            self._castwatch = None
-        self._keys.castwatch = self._castwatch
-        if self._castwatch is None:
-            self.status.setText("⚠ 施放廣播監聽裝不起來（改版？）→ 首發改"
-                                "『送一次就算』，其餘掛機不受影響")
+        self._release_castwatch()
 
     def _release_castwatch(self) -> None:
         """卸施放廣播監聽（最後一個使用者還完才真的卸 hook）。"""
@@ -3994,12 +3888,16 @@ class CharFarmPage(QWidget):
             #   一條 GUI 執行緒），狀態列也被錯誤訊息一直蓋掉。
             if not self._buff.skill:
                 self._adopt_buff_skill()
+            # ★ 補放要確認伺服器受理 → 需要施放廣播監聽（學到技能才裝；
+            #   _sync_castwatch 已裝／失敗過會直接返回，每拍呼叫沒成本）。
+            self._sync_castwatch()
             # ⚠ `_my_id` 傳的是**函式本身**不是值：它要讀一次記憶體，而只有
             #   真的要補分身（20 分鐘一次）才用得到，心跳每 10ms 一拍先算好
             #   等於每秒白讀 100 次。
             note = self._buff.step(
                 self.sc, self._mover, self.hwnd, self._keys.pf,
-                self._my_id, self.stats, win.send_key)
+                self._my_id, self.stats, win.send_key,
+                cast_hook=self._castwatch)
             if note and self._buff_note != note:
                 self._buff_note = note
                 self.status.setText(f"✨ {note}")
@@ -4008,6 +3906,7 @@ class CharFarmPage(QWidget):
         elif self._buff.armed:
             self._buff.reset()            # 勾拿掉＝停手（重勾會重新無腦放一次）
             self._buff_note = ""
+            self._sync_castwatch()        # 分身不用了 → 首發也不要就卸監聽
 
         # ── 自動召喚：F11 的召喚物不見了／死了就重放（app/game/summon.py）──
         if self.summon_cb.isChecked():
@@ -4088,7 +3987,8 @@ class CharFarmPage(QWidget):
             self._keys.stop_learning()
             self._keys.eid = None
             self._atk.hold_off()
-            self._release_castwatch()      # 卸施放廣播監聽（inline hook）
+            # 施放廣播監聽：首發不再需要，但自動分身可能還要 → 照需求同步
+            self._sync_castwatch()
             self._cur = None
             self._death = False        # 死亡回程等到一半就作廢，別再傳送
             # ⚠ 停掛機時如果正在跑回程補給：作廢它（_supply_gen++ 讓背景執行緒回來的
@@ -4124,8 +4024,9 @@ class CharFarmPage(QWidget):
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
         # ★★ 首次攻擊要 100% 確認「有沒有放出去」→ 掛施放廣播監聽（castwatch）。
-        #   只在有設首發時才裝（inline hook 熱路徑，沒用到就別放進遊戲）。
-        self._ensure_castwatch()
+        #   照需求裝（首發／自動分身其一要就裝）；重開掛機重置失敗記憶再試一次。
+        self._cw_failed = False
+        self._sync_castwatch()
         # ★ 開始自動戰鬥只把精靈「該關的」關掉：勾趴趴GO回地圖→關精靈的標記捲軸、
         #   勾死亡回練功區→關精靈的陣亡自動復活（都由我們自己做，精靈搶先只會壞事）。
         # ⚠ 2026-08-14 改：**不再開精靈主開關/自動戰鬥、也不推補給頁設定**——
@@ -5135,12 +5036,8 @@ class CharFarmPage(QWidget):
         self._keys.opener_vk = int(self.open_box.currentData() or 0)
         self._keys._open_eid = None
         self._keys.open_wait = 0.0
-        # 掛機中臨時設了首發 → 補裝施放廣播監聽；改成不指定就卸掉。
-        if self.run_cb.isChecked():
-            if self._keys.opener_vk:
-                self._ensure_castwatch()
-            else:
-                self._release_castwatch()
+        # 掛機中臨時設／取消首發 → 照需求裝卸（自動分身要用的話不會被卸掉）
+        self._sync_castwatch()
         self._save_settings()
 
     def _sync_key_btn(self) -> None:
