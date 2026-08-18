@@ -311,7 +311,12 @@ class EnergyTab(BaseTab):
         self.log.setFixedHeight(LOG_HEIGHT)
         hh = self.log.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.Stretch)
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        # ⚠ 時間欄以前開 ResizeToContents：每 setItem 一次就重量**整欄**，
+        #   紀錄堆到幾百列後每記一筆都卡一下（qt-ui-pitfalls 的老坑）。
+        #   內容固定是 HH:MM:SS，寬度照字體算一次釘死就好。
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        hh.resizeSection(
+            0, self.log.fontMetrics().horizontalAdvance("00:00:00") + 24)
         root.addWidget(self.log)
 
         self.status = QLabel("尚未選擇分身")
@@ -550,6 +555,13 @@ class EnergyTab(BaseTab):
 
         ⚠ 每個分身各自一份，不混在一起（使用者要求）—— 混著看根本分不出
           「精準 +20」是誰的。切分身時整張表換成那一台的。
+        ★ 表格用**插一列**更新，不整張重畫 —— 以前每記一筆就 `_show_log`
+          全表重建（LOG_MAX=500 列 × 5 欄）：自動晶化一次抽記兩筆（晶化＋
+          加倍）、自動分解一拍最多記 30 筆，紀錄堆滿後 GUI 執行緒每筆卡
+          一下，使用者回報「抽到後面會很卡」。全表重畫只留給換分身。
+          （_log 一定是記到**目前顯示中**的分身 —— pid 就是取
+          who.currentData()，兩個 singleShot 回呼也都先驗過沒換分身 ——
+          所以直接動表格不會畫到別人的紀錄上。）
         """
         pid = self.who.currentData()
         if pid is None:
@@ -559,7 +571,11 @@ class EnergyTab(BaseTab):
         rows = self._logs.setdefault(int(pid), [])
         rows.insert(0, row)
         del rows[LOG_MAX:]
-        self._show_log(int(pid))
+        self.log.insertRow(0)
+        for c, text in enumerate(row):
+            self.log.setItem(0, c, QTableWidgetItem(text))
+        while self.log.rowCount() > LOG_MAX:
+            self.log.removeRow(self.log.rowCount() - 1)
 
     def _show_log(self, pid: int | None) -> None:
         """把某個分身的歷史畫進表格。pid 為 None 就清空。"""
