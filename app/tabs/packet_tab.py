@@ -199,10 +199,7 @@ class PacketTab(BaseTab):
         self.fold_chk = QCheckBox("摺疊連續重複")
         self.fold_chk.setChecked(True)
         self.fold_chk.setToolTip(
-            "把**連續**送出、來源與長度都相同的封包併成一列，標成「×N」。\n"
-            "★ 跟上面的『依呼叫鏈分組』不一樣：那個會把整份打散重排、看不出\n"
-            "　 先後順序；這個**保留順序**，只是把重複的疊起來 ——\n"
-            "　 狂按同一個鍵時，順序才是你要看的東西。")
+            "連續且相同的封包併成一列標「×N」，順序保留。")
         self.fold_chk.toggled.connect(self._rebuild_table)
         ctrl2.addWidget(self.fold_chk)
         self.copy_btn = QPushButton("複製全部")

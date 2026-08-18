@@ -288,35 +288,10 @@ class CharProducePage(QWidget):
         # ★ 一個主開關（使用者要求把「開始生產」與「開始自動採集」合成一個）。
         self.run_cb = QCheckBox("開始自動生產")
         self.run_cb.setStyleSheet("font-weight: bold;")
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
         self.run_cb.setToolTip(
-            "勾選後做兩件事：\n"
-            "\n"
-            "① 把天使守護精靈調到位\n"
-            "　・主開關「開啟天使守護精靈」→ 開\n"
-            "　・補給頁「裝備損壞回城」「修理裝備」「購買物品保持身上數量」→ 開\n"
-            f"　・購買清單的天使之翼補到 {robot.BUY_KEEP_WINGS} 個\n"
-            "　・關掉自動攻擊（採集跟打怪互斥，遊戲自己也是這樣）\n"
-            "\n"
-            "② 開始採集\n"
-            "　・「要採集的」有勾 → 寫進遊戲的「目標資源列表」並開\n"
-            "　　「採集指定資源」，**只採你選的那幾種**\n"
-            "　・一個都沒勾 → 附近全部種類都採\n"
-            "　・中心點放在要採的那種資源上；走過去、採、採完換下一個\n"
-            "　　都是精靈做的\n"
-            "\n"
-            "★ 每 5 秒檢查一次：精靈被關掉會重開、這一片採光了會換地方、\n"
-            "　 卡住 15 秒會重新指一次。\n"
-            "\n"
-            f"③ 負重到 {FULL_PCT:.0f}% 就自己回去做半成品\n"
-            "　・關主精靈 → 天使之翼回程 → 走到你記的製作檯\n"
-            "　・身上資源全做成半成品（可捐公會的先做）\n"
-            "　・依上面選的：全捐公會／做完就停著\n"
-            "　・回標記點 → 設定 → 開自動採集 → 最後開主精靈\n"
-            "　★ 勾選當下就已經滿的話：先試捐一次，還是滿才跑這一趟\n"
-            "\n"
-            "★ 每一項都先讀再動，本來就對的完全不碰。\n"
-            "★ 取消勾選只關「自動採集」，其他設定不會被改回去；\n"
-            "　 正在做半成品的話也會就地停下（重試不設上限，這就是出口）。")
+            "自動採集（勾了什麼採什麼，都沒勾就全採）。\n"
+            f"負重到 {FULL_PCT:.0f}% 自動回去做半成品、捐公會，再回來繼續採。")
         self.run_cb.toggled.connect(self._on_toggle)
 
         run_bar = QHBoxLayout()
@@ -347,9 +322,7 @@ class CharProducePage(QWidget):
         rv.addWidget(self.near)
         # ★ 使用者要求：**按按鈕才掃**，不要一直刷。
         self.scan_btn = QPushButton("掃描周圍")
-        self.scan_btn.setToolTip(
-            "掃一次周圍有哪些採集品（純讀記憶體，不會對遊戲做任何事）。\n"
-            "掃到的是遊戲自己那份資源清單，怪物、NPC、玩家都不會出現。")
+        self.scan_btn.setToolTip("掃一次周圍有哪些採集品。")
         self.scan_btn.clicked.connect(self._scan_near)
         rv.addWidget(self.scan_btn)
         fit_list(right, self.near, "小天使草花叢 ×12（最近 6.9 格）")
@@ -366,9 +339,7 @@ class CharProducePage(QWidget):
         srow = QHBoxLayout()
         # ⚠ 字別太長：主題給按鈕的 padding 是左右各 14px（掛機頁踩過）。
         add_btn = QPushButton("加入位置")
-        add_btn.setToolTip(
-            "把角色現在站的位置記下來，並記下是哪一張地圖。\n"
-            "⚠ 現在只是記錄，製作動作接上之後才會用到。")
+        add_btn.setToolTip("把角色現在站的位置加進定位點。")
         add_btn.clicked.connect(self._add_spot)
         srow.addWidget(add_btn)
         # 用 ASCII 的 X，不要用 ✕（部分中文字型沒有那個字形會變豆腐）
@@ -394,21 +365,14 @@ class CharProducePage(QWidget):
         test_bar.addWidget(test_lbl)
         self.test_full_btn = QPushButton("假裝負重 96%")
         self.test_full_btn.setToolTip(
-            "下一拍當成負重 96%（超過 95%）→ 觸發「回去做半成品」那一整趟：\n"
-            "關主精靈 → 天使之翼 → 走到製作檯 → 做半成品 → 捐公會／停 →\n"
-            "趴趴GO 回來 → 走回標記點 → 設定 → 開採集 → 開主精靈。\n"
-            "★ 只有這一次是假的，後面每一步（包括「捐完還滿不滿」）\n"
-            "　 讀到的都是真負重。\n"
-            "⚠ 要先勾「開始自動生產」才有作用。")
+            "假裝負重超標一次，測試整趟「回去做半成品」流程。\n"
+            "要先勾「開始自動生產」。")
         self.test_full_btn.clicked.connect(self._test_full)
         test_bar.addWidget(self.test_full_btn)
         self.test_broken_btn = QPushButton("假裝裝備壞掉")
         self.test_broken_btn.setToolTip(
-            "下一拍當成身上有裝備耐久剩 1 → 觸發回程補給那一趟：\n"
-            "關自動採集＋ESC → 天使之翼回城 → 存倉庫 → 修裝 → 買水 →\n"
-            "趴趴GO 回原圖 → 走回標記點 → 重新設定＋開採集＋開主精靈。\n"
-            "★ 只有這一次是假的。\n"
-            "⚠ 要先勾「開始自動生產」才有作用。")
+            "假裝裝備壞掉一次，測試整趟回程補給流程。\n"
+            "要先勾「開始自動生產」。")
         self.test_broken_btn.clicked.connect(self._test_broken)
         test_bar.addWidget(self.test_broken_btn)
         test_bar.addStretch(1)
@@ -448,22 +412,14 @@ class CharProducePage(QWidget):
         self.dispose = QComboBox()
         for key, text in DISPOSE_LABELS:
             self.dispose.addItem(text, key)
-        self.dispose.setToolTip(
-            "半成品做好之後怎麼處理：\n"
-            "・全部捐公會 —— 公會貢獻沒有上限、隨時可捐，一次一「組」\n"
-            "　（一組幾個看遊戲自己的貢獻品表，多數是 200）\n"
-            "・做完就停著 —— 東西留在背包，不做任何處理\n"
-            "\n"
-            "⛔「存進倉庫」已拿掉：開倉庫要選 NPC 的對話選項，而選項編號是\n"
-            "　 伺服器當下發的清單位置、我們湊不出來，也沒有「開倉庫」的封包。\n"
-            "　 與其留一條每次都要你自己開倉庫的半自動路徑，不如不做。")
+        # ⛔「存進倉庫」選項已拿掉：開倉庫要選 NPC 對話選項，選項編號是
+        #   伺服器當下發的清單位置、我們湊不出來，也沒有「開倉庫」封包。
+        self.dispose.setToolTip("半成品做好之後：捐公會，或留在背包不動。")
         self.dispose.currentIndexChanged.connect(lambda _i: self._save_settings())
         top.addWidget(self.dispose)
         top.addSpacing(12)
         self.donate_log_btn = QPushButton("捐獻紀錄")
-        self.donate_log_btn.setToolTip(
-            "看這台分身捐給公會的歷史：每次捐了什麼、加了多少名聲（貢獻點數）。\n"
-            "★ 名聲是照遊戲自己的貢獻品表算的（每組的點數 × 捐的組數）。")
+        self.donate_log_btn.setToolTip("看捐獻歷史：捐了什麼、加了多少名聲。")
         self.donate_log_btn.clicked.connect(self._show_donate_log)
         top.addWidget(self.donate_log_btn)
         top.addStretch(1)
@@ -480,11 +436,8 @@ class CharProducePage(QWidget):
         #   4 個主號職業不同、製作檯不同各標各的。沒手動標的話仍會自動學（備援）。
         self.mark_bench_btn = QPushButton("記下製作檯位置")
         self.mark_bench_btn.setToolTip(
-            "把角色**現在站的位置**記成這台分身的製作檯位置。\n"
-            "★ 站在你**走得到**的好位置再按（製作檯旁邊一格就好）——\n"
-            "　 別站在檯子那一格上：那一格遊戲的走路踩不上去，回程會卡住。\n"
-            "★ 4 個主號職業不同、製作檯不同，各自站好各自按一次。\n"
-            "　 之後每一趟回程就走到你記的這一點，再點旁邊的檯子開工。")
+            "站在製作檯旁邊一格按這顆，把這裡記成回程要走到的點。\n"
+            "⚠ 別站在檯子那一格上，走路踩不上去。")
         self.mark_bench_btn.clicked.connect(self._mark_bench)
         row.addWidget(self.mark_bench_btn)
         self.bench_lbl = QLabel("")
@@ -544,10 +497,8 @@ class CharProducePage(QWidget):
             self.bench_lbl.setText("製作檯：還沒標（站到檯子旁按「記下製作檯位置」）")
             self.bench_lbl.setStyleSheet("color: #9aa2b8;")
             self.bench_lbl.setToolTip(
-                "建議：走到製作檯**旁邊一格**（走得到的位置）站好，\n"
-                "按「記下製作檯位置」記起來，以後每趟回程就走到這一點。\n"
-                "沒標的話工具箱也會在回程時自己找（備援），但自己找到的\n"
-                "位置有時會落在檯子那格、走路踩不上去 —— 手動標最保險。")
+                "還沒標製作檯：站到檯子旁邊一格按「記下製作檯位置」。\n"
+                "沒標也會自動找，但手動標最準。")
             return
         x, y, sid = self._bench[0], self._bench[1], self._bench[2]
         where = scene.scene_name(sid) if sid is not None else "未標記地圖"
@@ -555,8 +506,7 @@ class CharProducePage(QWidget):
         self.bench_lbl.setText(text)
         self.bench_lbl.setStyleSheet("color: #9aa2b8;")
         self.bench_lbl.setToolTip(
-            text + "　（要換位置就站到新位置再按「記下製作檯位置」）"
-            + (f"\n場景編號 {sid}" if sid is not None else "\n沒記到地圖"))
+            text + "　（要換位置就站到新位置再按一次）")
 
     # ------------------------------------------------------------------
     def _have(self) -> dict[int, int] | None:

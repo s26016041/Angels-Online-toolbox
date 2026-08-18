@@ -77,13 +77,8 @@ class MasterTab(BaseTab):
         self.cb_unfreeze = QCheckBox("畫面凍結解除")
         self.cb_unfreeze.setChecked(self._unfreeze_on)
         self.cb_unfreeze.setToolTip(
-            "天戀失焦（點到別的視窗）時畫面本來會凍住 —— 打開這個就不會凍，"
-            "失焦也繼續更新畫面。\n"
-            "改的是遊戲視窗程序 8 個位元組：失焦時不去停畫面、"
-            "點回視窗時把輸入裝置重設回來\n"
-            "（v2：修掉了舊版「開著防凍、切回來後手動放技能會失靈」的問題）；\n"
-            "不注入程式碼、不搶前景、不影響邏輯與網路。關掉就還原。\n"
-            "⚠ 最小化仍然會停（那是 Windows 自己收掉，不在這裡管）。")
+            "遊戲點到別的視窗時畫面不凍住，繼續更新。關掉就還原。\n"
+            "⚠ 最小化仍然會停。")
         self.cb_unfreeze.toggled.connect(self._on_unfreeze_toggled)
         lay.addWidget(self.cb_unfreeze)
         desc = QLabel(

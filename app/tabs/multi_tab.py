@@ -184,29 +184,22 @@ class MultiTab(BaseTab):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("目標頻道"))
         self.chan = QComboBox()
-        self.chan.setToolTip(
-            "這個伺服器實際有幾個分流，是從遊戲載進記憶體的伺服器清單讀出來的，\n"
-            "官方增減分流會自動跟上。讀不到時這裡會是空的，換頻也會停用 ——\n"
-            "寧可不換，也不拿猜的編號送給伺服器。")
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
+        self.chan.setToolTip("要換到第幾頻（分流數是從遊戲讀出來的）。")
         bar.addWidget(self.chan)
         self.go_btn = QPushButton("換頻")
         self.go_btn.setProperty("primary", True)
         self.go_btn.setToolTip(
-            "把所有勾選的分身一次換到上面選的頻道。\n"
-            "  · 已經在那一頻的會跳過（免得白白斷線重連一次）\n"
-            "  · 還沒進遊戲、或那台伺服器沒有這一頻的會跳過並標示原因\n"
-            "  · 排不進指令槽或換頻逾時會自動重試，要停請按「停止」")
+            "把勾選的分身一次換到選的頻道（已在那頻的跳過）。")
         self.go_btn.clicked.connect(self._do_switch)
         bar.addWidget(self.go_btn)
         self.stop_btn = QPushButton("停止")
-        self.stop_btn.setToolTip("停掉正在進行的換頻與重試。已經送出去的那幾包不會收回。")
+        self.stop_btn.setToolTip("停掉正在進行的換頻／傳送重試。")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(lambda: self._stop("已停止"))
         bar.addWidget(self.stop_btn)
         reload_btn = QPushButton("重新整理")
-        reload_btn.setToolTip(
-            "重新找一次分身，並重讀角色名。\n"
-            "同一台登出換角色時 pid 不會變，要按這顆才會更新成新角色的名字。")
+        reload_btn.setToolTip("重新找分身、重讀角色名（登出換角色後按這顆）。")
         reload_btn.clicked.connect(self._hard_refresh)
         bar.addWidget(reload_btn)
         bar.addStretch(1)
@@ -216,25 +209,15 @@ class MultiTab(BaseTab):
         bar2 = QHBoxLayout()
         self.team_btn = QPushButton("自動組隊")
         self.team_btn.setToolTip(
-            "把勾選的角色組成一隊，順序是：\n"
-            "  ① 全部關掉天使守護精靈總開關\n"
-            "  ② 已經有隊伍的通通退組（等隊員名單真的清空）\n"
-            "  ③ 第一個勾選的當隊長，一個一個邀請其他人\n"
-            "  ④ 被邀請的送出同意，等隊長的隊員名單真的出現他才換下一個\n"
-            "  ⑤ 全部重新打開天使守護精靈總開關\n"
-            "\n"
-            "⚠ 勾選的分身**必須在同一頻**，不然邀請送不到 ——\n"
-            "　 不同頻會直接擋下來並告訴你，請先用上面的「換頻」弄到同一頻。\n"
-            "⚠ 已經跟別人（不是這裡勾的角色）組隊的，也會被退組。")
+            "把勾選的角色組成一隊（第一個勾的當隊長）。\n"
+            "⚠ 要先在同一頻；原本的隊伍會先退組。")
         self.team_btn.clicked.connect(self._do_team)
         bar2.addWidget(self.team_btn)
         bar2.addWidget(QLabel("分配方式"))
         self.share = QComboBox()
         self.share.addItem("均分制", team.SHARE_EVEN)
         self.share.addItem("獨享制", team.SHARE_SOLO)
-        self.share.setToolTip(
-            "送出邀請時帶的分配方式，跟你在遊戲裡選的是同一個欄位。\n"
-            "均分制＝隊伍均分，獨享制＝各自撿各自的。")
+        self.share.setToolTip("均分制＝隊伍均分，獨享制＝各自撿各自的。")
         i = self.share.findData(int(config.get("multi.share", team.SHARE_EVEN)))
         self.share.setCurrentIndex(max(i, 0))
         self.share.currentIndexChanged.connect(self._save_share)
@@ -246,16 +229,11 @@ class MultiTab(BaseTab):
         bar3 = QHBoxLayout()
         bar3.addWidget(QLabel("趴趴GO"))
         self.jclass = QComboBox()
-        self.jclass.setToolTip(
-            "傳送點的分類，跟遊戲趴趴GO視窗左邊那排是同一份資料。\n"
-            "⚠ 一個傳送點可能同時掛在好幾個分類底下（遊戲本來就這樣分），\n"
-            "　 所以在不同分類看到同一個地點是正常的。")
+        self.jclass.setToolTip("傳送點分類，跟遊戲趴趴GO視窗左邊那排一樣。")
         self.jclass.currentIndexChanged.connect(self._fill_jumps)
         bar3.addWidget(self.jclass)
         self.jump = QComboBox()
-        self.jump.setToolTip(
-            "要傳送到哪裡。名稱與落點座標是從遊戲資源包抽出來的，\n"
-            "送出的封包跟你在趴趴GO視窗點下去完全一樣。")
+        self.jump.setToolTip("要傳送到哪裡（跟趴趴GO視窗點下去一樣）。")
         # ⚠ 主視窗是**固定 940 寬**的。下拉的預設策略會照「最長的那一筆」
         #   決定寬度 —— 120 筆地圖名裡只要有一個特別長，整排就被撐開跑版
         #   （見 memory 的 qt-ui-pitfalls）。這裡把控制項本身的寬度釘在
@@ -272,11 +250,8 @@ class MultiTab(BaseTab):
         bar3.addWidget(self.jump, 1)
         self.jump_btn = QPushButton("傳送")
         self.jump_btn.setToolTip(
-            "把所有勾選的分身傳送到選定的地點。\n"
-            "  · 送出的是遊戲自己的傳送封包，不會去碰趴趴GO那個視窗\n"
-            "  · 傳送完會等**目前地圖真的變成目的地**才算成功\n"
-            "  · 排不進指令槽或逾時會自動重試，要停請按「停止」\n"
-            "⚠ 到不到得看伺服器（等級不足、任務未完成之類會被拒絕）。")
+            "把勾選的分身傳送到選定的地點。\n"
+            "⚠ 等級不足、任務未完成會被伺服器拒絕。")
         self.jump_btn.clicked.connect(self._do_jump)
         bar3.addWidget(self.jump_btn)
         root.addLayout(bar3)
@@ -306,9 +281,7 @@ class MultiTab(BaseTab):
         self.wy.valueChanged.connect(self._save_walk)
         bar4.addWidget(self.wy)
         self.here_btn = QPushButton("帶入目前位置")
-        self.here_btn.setToolTip(
-            "把**第一個勾選的分身**現在站的格子填進左邊兩格。\n"
-            "先把某一台走到你要的位置，再按這顆，其他分身就能一起過去。")
+        self.here_btn.setToolTip("把第一個勾選的分身現在站的格子填進左邊。")
         self.here_btn.clicked.connect(self._fill_here)
         bar4.addWidget(self.here_btn)
         self.walk_btn = QPushButton("移動")
@@ -1085,16 +1058,10 @@ class MultiTab(BaseTab):
         ok, why = self._walk_state()
         self._walk_ok, self._walk_why = ok, why
         self.walk_btn.setEnabled(ok and self._job is None)
-        tip = (
-            "把所有勾選的分身走到左邊那個座標。\n"
-            "  · 路是**讀遊戲的地形圖自己算的**（A* 最短路），會繞過障礙物\n"
-            "  · 那個座標不存在、是障礙物、或算不出路 → 跳警告不動\n"
-            "  · 走到一半換了地圖的那一台會立刻停手\n"
-            "⚠ 勾選的分身必須都在同一張地圖，不然這顆是灰的。\n"
-            "⚠ 正在掛機的分身請先停掛機 —— 掛機自己也會下移動指令，"
-            "兩邊會互相打斷。")
+        tip = ("把勾選的分身走到左邊那個座標（自己算路、會繞障礙）。\n"
+               "⚠ 要在同一張地圖；正在掛機的請先停掛機。")
         if not ok:
-            tip = f"⛔ 現在不能按：{why}\n\n{tip}"
+            tip = f"⛔ 現在不能按：{why}\n{tip}"
         if self.walk_btn.toolTip() != tip:
             self.walk_btn.setToolTip(tip)
 

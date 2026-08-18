@@ -134,11 +134,10 @@ class EnergyTab(BaseTab):
             lambda: self.reload_instances(force_names=True))
         bar.addWidget(refresh)
         sync = QPushButton("同步資料")
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
         sync.setToolTip(
-            "跟伺服器要一次晶化資料（＝遊戲裡打開晶能視窗時送的那包）。\n"
-            "剛上線時伺服器還沒把資料同步下來，這裡讀到的全是 0 ——\n"
-            "按這顆就不用進遊戲開視窗，約半秒後數字自己出現。\n"
-            "⚠ 遊戲裡可能會跳出晶能視窗，直接關掉即可。")
+            "跟伺服器要一次晶化資料（剛上線全是 0 時按這顆）。\n"
+            "遊戲裡跳出晶能視窗直接關掉即可。")
         sync.clicked.connect(self._sync)
         bar.addWidget(sync)
         bar.addSpacing(16)
@@ -155,14 +154,8 @@ class EnergyTab(BaseTab):
         drow = QHBoxLayout()
         self.decomp_btn = QPushButton("自動分解小背包")
         self.decomp_btn.setToolTip(
-            "每 3 秒把背包裡的「充能-小背包(20)/(30)」**一次全部**拆解成晶能\n"
-            "（＝遊戲分解分頁那顆「拆解」鈕）。\n"
-            "★ 拆完**不會停**，繼續盯著背包 —— 掛機掉出新的下一拍就拆掉，\n"
-            "　 要停請按旁邊的「暫停」。\n"
-            f"一拍最多 {energy.MAX_PER_TICK} 顆，更多的下一拍接著拆。\n"
-            "⚠⚠ **只認這兩種**，其他東西一律不碰 —— 送包前還會當場重讀\n"
-            "　 背包逐格再驗一次。\n"
-            "⚠ 進行中請不要手動搬動背包物品。")
+            "一直盯著背包，把「充能-小背包(20)/(30)」自動拆成晶能（只認這兩種）。\n"
+            "要停按旁邊的「暫停」；進行中別手動搬背包。")
         self.decomp_btn.clicked.connect(lambda: self._start_decomp(False))
         drow.addWidget(self.decomp_btn)
         # ⚠ 紅字（使用者指定）：這顆會把一般背包裡**所有**可分解的東西拆掉，
@@ -175,24 +168,13 @@ class EnergyTab(BaseTab):
             f"QPushButton {{ color: {theme.DANGER}; font-weight: bold; }}"
             "QPushButton:disabled { color: #6b7288; }")
         self.decomp_all_btn.setToolTip(
-            "⚠⚠ 把**一般背包裡所有遊戲允許分解的東西**每 3 秒一次全部拆成晶能。\n"
-            "　 條件照抄遊戲自己的判斷、而且是**現場讀記憶體**：\n"
-            "　 分類是紙娃娃、分解值 > 0、沒有時限（限時道具遊戲不讓拆）。\n"
-            "\n"
-            "★ 只動一般背包（遊戲分區的「背包的slot」）。你的裝扮收在\n"
-            "　 「紙娃娃隨身包」那一區，這顆碰不到，穿在身上的也碰不到。\n"
-            "⚠⚠ 但**點裝／造型只要放在一般背包裡就會被拆掉**（水藍搖滾裝、\n"
-            "　 水之補師 那類都在名單內，分解值只有 1~12 點）。\n"
-            "　 開跑前請先確認一般背包裡沒有捨不得的裝扮。\n"
-            "\n"
-            "★ 拆完**不會停**，繼續盯著背包，要停請按旁邊的「暫停」。\n"
-            f"一拍最多 {energy.MAX_PER_TICK} 件，更多的下一拍接著拆。")
+            "⚠ 把一般背包裡所有能分解的東西全部拆成晶能。\n"
+            "點裝／造型放在一般背包也會被拆掉，開跑前先收好。\n"
+            "要停按旁邊的「暫停」。")
         self.decomp_all_btn.clicked.connect(lambda: self._start_decomp(True))
         drow.addWidget(self.decomp_all_btn)
         self.pause_btn = QPushButton("暫停")
-        self.pause_btn.setToolTip(
-            "停下自動分解 —— 這是唯一的出口（不然它會一直盯著背包拆下去）。\n"
-            "已經送出去的那幾顆不會收回。")
+        self.pause_btn.setToolTip("停下自動分解。")
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(lambda: self._stop_decomp("手動暫停"))
         drow.addWidget(self.pause_btn)
@@ -216,18 +198,12 @@ class EnergyTab(BaseTab):
         row = QHBoxLayout()
         self.auto_cb = QCheckBox("抽到勾選的就自動加倍")
         self.auto_cb.setChecked(True)
-        self.auto_cb.setToolTip(
-            "按下「能量晶化」之後，等結果寫進記憶體（約 0.1 秒）再判斷。\n"
-            "抽到的屬性有勾起來 → 自動送一次「我要晶能加倍」。\n"
-            "沒勾任何屬性就等於不會自動加倍。")
+        self.auto_cb.setToolTip("晶化抽到勾選的屬性時，自動按一次「我要晶能加倍」。")
         self.auto_cb.toggled.connect(self._save)
         row.addWidget(self.auto_cb)
         row.addSpacing(16)
         self.roll_btn = QPushButton("能量晶化")
-        self._roll_tip = (
-            "送出一次能量晶化（遊戲裡那顆按鈕）。\n"
-            "⚠ 每 1 點能量可進行 1 次，屬性隨機 —— 按幾次由你決定，"
-            "程式不會自動連按。")
+        self._roll_tip = "送出一次能量晶化（1 點能量 1 次，屬性隨機）。"
         self.roll_btn.setToolTip(self._roll_tip)
         self.roll_btn.clicked.connect(self._roll)
         row.addWidget(self.roll_btn)
@@ -242,10 +218,8 @@ class EnergyTab(BaseTab):
         arow = QHBoxLayout()
         self.auto_roll_cb = QCheckBox("自動晶化")
         self.auto_roll_cb.setToolTip(
-            "照下面的間隔一直按「能量晶化」，抽到勾選的屬性照樣自動加倍。\n"
-            "\n"
-            "會自動停下來的情況：能量歸零、按到設定的次數、\n"
-            "換分身、取消勾選、關掉分頁。")
+            "照設定的間隔一直晶化，抽到勾選的屬性自動加倍。\n"
+            "能量歸零或按滿次數就自動停。")
         self.auto_roll_cb.toggled.connect(self._toggle_auto)
         arow.addWidget(self.auto_roll_cb)
         arow.addWidget(QLabel("每"))
@@ -257,10 +231,7 @@ class EnergyTab(BaseTab):
         # ⚠ 單位文字一律放框外的 QLabel，不要用 setSuffix() —— 那會把文字塞進
         #   輸入框裡（使用者反映「輸入框應該只有數字」）。
         fit_spin(self.interval)
-        self.interval.setToolTip(
-            f"兩次晶化之間隔多久。最少 {MIN_INTERVAL} 秒 —— 一輪要「晶化 → "
-            "等 0.3 秒讀結果 → 可能再送加倍」，\n太密會塞爆指令槽（只有一個），"
-            "送不出去的那次就白按了。")
+        self.interval.setToolTip(f"兩次晶化之間隔多久（最少 {MIN_INTERVAL} 秒）。")
         self.interval.valueChanged.connect(self._save)
         arow.addWidget(self.interval)
         arow.addWidget(QLabel("秒一次，最多"))
@@ -274,19 +245,12 @@ class EnergyTab(BaseTab):
         self.limit.setValue(DEFAULT_LIMIT)
         fit_spin(self.limit)
         self.limit.setToolTip(
-            "按幾次就自動停。\n"
-            "⚠ 最大值會自動跟著目前能量走 —— 打不進比能量還大的數字。\n"
-            "　 要用完全部能量請勾右邊的「晶化全部能量」。")
+            "按幾次就自動停（要用完全部能量勾右邊那個）。")
         self.limit.valueChanged.connect(self._save)
         arow.addWidget(self.limit)
         arow.addWidget(QLabel("次"))
         self.all_cb = QCheckBox("晶化全部能量")
-        self.all_cb.setToolTip(
-            "勾起來就**不看上面的次數**，一路按到能量歸零為止。\n"
-            "\n"
-            "⚠ 能量多的時候這會花掉全部 —— 嵐狐現在有一千多點，"
-            "按完就是一千多次。\n"
-            "　 真正的開關還是「自動晶化」，那個每次開工具箱都是關的。")
+        self.all_cb.setToolTip("不看次數，一路晶化到能量歸零。")
         self.all_cb.toggled.connect(self._on_all_toggled)
         arow.addWidget(self.all_cb)
         self.auto_lbl = QLabel("")

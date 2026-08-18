@@ -301,9 +301,9 @@ class CharCard(QFrame):
         # 累計：從按下「開始計算」到現在總共賺了多少
         self.total_lbl = QLabel("")
         self.total_lbl.setStyleSheet(f"color: {TEXT};")
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
         self.total_lbl.setToolTip(
-            "從按下「開始計算」到現在的累計。\n"
-            "經驗後面的百分比 = 這段時間賺到的經驗相當於本級所需經驗的幾成。")
+            "從「開始計算」起的累計；經驗百分比＝相當於本級所需的幾成。")
         root.addWidget(self.total_lbl)
         self.eta_lbl = QLabel("")
         self.eta_lbl.setStyleSheet(f"color: {TEXT_MUT};")
@@ -581,18 +581,13 @@ class ProfitTab(BaseTab):
         watch = QHBoxLayout()
         watch.addWidget(QLabel("監控項目："))
         self.cb_ball = QCheckBox("技能球滿")
-        self.cb_ball.setToolTip(
-            "球的數值達到上限就通知（直接比對數值，不用計時猜）。\n"
-            "⚠ 上限不在對照表裡的球沒辦法判斷滿不滿，不會通知。")
+        self.cb_ball.setToolTip("經驗球滿了就通知。")
         self.cb_death = QCheckBox("死亡監控")
         self.cb_death.setToolTip("角色 HP 掉到 0 就通知。復活後再死會再通知一次。")
         self.cb_disc = QCheckBox("斷線監控")
         self.cb_disc.setToolTip(
-            "兩種都算斷線：\n"
-            "  • 遊戲視窗消失（被關閉或崩潰）→ 立刻通知\n"
-            f"  • 跟伺服器的 TCP 連線斷掉 → 約 {int(DISCONNECT_GRACE_SECS)} 秒後通知\n\n"
-            "斷線時視窗還在、記憶體也照樣讀得到，只是數值全部凍住，\n"
-            "所以只能靠連線狀態判斷（實測過，見 app/core/netstat.py）。")
+            "遊戲視窗消失立刻通知；"
+            f"斷線約 {int(DISCONNECT_GRACE_SECS)} 秒後通知。")
         for cb, key in ((self.cb_ball, "ball"), (self.cb_death, "death"),
                         (self.cb_disc, "disconnect")):
             cb.setChecked(bool(config.get(f"profit.watch_{key}", True)))
@@ -606,13 +601,9 @@ class ProfitTab(BaseTab):
         row.addWidget(QLabel("通知方式："))
         self.rb_sound = QRadioButton("音效警報")
         self.rb_sound.setToolTip(
-            "在這台電腦上循環播放警報聲，並跳出視窗列出是哪幾台出事，\n"
-            "按「停止警報」才會停。適合人就在電腦前的時候。")
+            "在這台電腦播警報聲＋跳視窗，按「停止警報」才停。")
         self.rb_tg = QRadioButton("Telegram 通知")
-        self.rb_tg.setToolTip(
-            "只送 Telegram，**不出聲、也不跳視窗**。\n"
-            "適合人不在電腦前：不會擋住畫面，也不會留一個視窗等別人幫你按掉。\n"
-            "（沒填群組/房間 ID 就送不出去，那時仍會跳視窗，但不會出聲。）")
+        self.rb_tg.setToolTip("只送 Telegram，不出聲、不跳視窗。")
         grp = QButtonGroup(self)
         grp.addButton(self.rb_sound)
         grp.addButton(self.rb_tg)

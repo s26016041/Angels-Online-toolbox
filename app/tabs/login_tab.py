@@ -224,13 +224,10 @@ class LoginTab(BaseTab):
         btn_row = QHBoxLayout()
         self.go_btn = QPushButton("一鍵登入")
         self.go_btn.setProperty("primary", True)   # 主要動作 → 主色（見 app/theme.py）
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
         self.go_btn.setToolTip(
-            "把勾選的帳號全部弄上線：\n"
-            "  · 已經登入的帳號直接跳過\n"
-            "  · 有開著沒登入的分身就拿來用\n"
-            f"  · 不夠就自己開遊戲（最多 {MAX_CLIENTS} 台）\n"
-            "  · 每台都做完 切伺服器 → 帳密登入 → 選頻道 → 進入遊戲\n"
-            "全程背景，不會動到你的鍵盤滑鼠。")
+            "把勾選的帳號全部弄上線（已登入的跳過、不夠就自己開遊戲）。\n"
+            "全程背景，不動你的鍵盤滑鼠。")
         self.go_btn.clicked.connect(self._start_login)
         btn_row.addWidget(self.go_btn)
         btn_row.addStretch(1)
@@ -240,16 +237,9 @@ class LoginTab(BaseTab):
         ar_row = QHBoxLayout()
         self.ar_box = QCheckBox("自動回連")
         self.ar_box.setToolTip(
-            "分身出事就自動弄回線上（斷線的三種樣子分開對症下藥）：\n"
-            "  · 斷網（全部同時掉線＋實測本機連不上網）→ 關閉全部分身，\n"
-            "    等網路回來再一鍵登入弄回去\n"
-            "  · 崩潰（彈出錯誤視窗／遊戲視窗消失）→ 關掉那台再登回去\n"
-            "  · 單台斷線（被踢）→ 同崩潰處置\n"
-            "  · 官方維修（掉線但登入伺服器沒開門）→ 只彈警告視窗，\n"
-            "    不關遊戲、不重登，等開門後才自動接手\n"
-            "重登走上面「一鍵登入」的流程，所以帳號要先在清單存過帳密；\n"
-            "重登前會先探登入伺服器 —— 維修中不會白開遊戲，等開門才動。\n"
-            "⚠ 開著這個時手動關遊戲會被它自動開回來，要自己關請先取消勾選。")
+            "分身斷線／崩潰／斷網就自動重新登回去（帳密要先存在清單）。\n"
+            "官方維修中只警告不重登，等開門才動。\n"
+            "⚠ 開著時手動關遊戲會被開回來，要自己關請先取消勾選。")
         # 設定鍵搬家：0.4.32 存在 multi.auto_reconnect（那時勾選在分身總控），
         # 舊鍵當預設值讀進來，使用者升級後勾選不會不見。
         self.ar_box.setChecked(bool(config.get(
@@ -258,8 +248,7 @@ class LoginTab(BaseTab):
         ar_row.addWidget(self.ar_box)
         self.ar_hist_btn = QPushButton("紀錄")
         self.ar_hist_btn.setToolTip(
-            "從程式開啟以來的自動回連事件：哪個帳號（角色）在幾點\n"
-            "斷線／斷網／崩潰、有沒有救回來。關閉程式就清空。")
+            "看自動回連的事件歷史（誰、幾點、有沒有救回來）。")
         self.ar_hist_btn.clicked.connect(self._ar_show_history)
         ar_row.addWidget(self.ar_hist_btn)
         self.ar_lbl = QLabel("")

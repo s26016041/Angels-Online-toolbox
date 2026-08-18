@@ -111,20 +111,16 @@ class DailyTab(BaseTab):
 
         bar = QHBoxLayout()
         self.claim_btn = QPushButton("領取在線獎勵")
+        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
         self.claim_btn.setToolTip(
-            "對每一台分身送出 6 格的領取（在線 0~60 分鐘那六格）。\n"
-            "還沒到時間或已經領過的格子，判定本來就在伺服器，多送不會有影響。")
+            "對每一台分身把 6 格在線獎勵全領一次（重複送沒影響）。")
         self.claim_btn.clicked.connect(self._start_claim)
         bar.addWidget(self.claim_btn)
 
         self.ex_btn = QPushButton("全部換取翔宇聖翼")
         self.ex_btn.setToolTip(
-            "把每一台身上的「勤奮在線獎勵卷」全部換成翔宇聖翼。\n"
-            "券有幾張就換幾次；一張都沒有的分身會直接跳過。\n"
-            "⚠ 券是在線獎勵發的，放著會過期（1 天），所以是「全部換掉」。\n"
-            "\n"
-            "過程中遊戲會跳出兌換商店視窗（伺服器不先開店就不受理兌換），\n"
-            "換完會自動幫你關掉。")
+            "把每台身上的「勤奮在線獎勵卷」全部換成翔宇聖翼（券 1 天過期）。\n"
+            "過程中跳出的兌換商店視窗會自動關掉。")
         self.ex_btn.clicked.connect(self._start_exchange)
         bar.addWidget(self.ex_btn)
 
@@ -132,10 +128,7 @@ class DailyTab(BaseTab):
         self.pause_btn = QPushButton("暫停")
         self.pause_btn.setEnabled(False)
         self.pause_btn.setToolTip(
-            "先停在原地，不再送任何東西。\n"
-            "伺服器忙的時候工具會一直重試（沒有次數上限），覺得等太久就按這顆。\n"
-            "按「繼續」從停的地方接著做；或直接再按左邊的按鈕整輪重新開始\n"
-            "（重送是安全的：領獎伺服器會擋重複、兌換每次都重新數券，不會多換）。")
+            "先停在原地；按「繼續」從停的地方接著做（重送是安全的）。")
         self.pause_btn.clicked.connect(self._toggle_pause)
         bar.addWidget(self.pause_btn)
         bar.addStretch(1)
