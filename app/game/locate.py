@@ -632,6 +632,18 @@ SIGS: tuple[Sig, ...] = (
         "?? ?? EB 02 B0 01 88 45 E0 88 43 0C 3A C1 ?? ?? ?? ?? ?? ??"
         " 8B 03 8B CB FF 75 E0 FF 50 50",
         0x0070CC5A),
+    # ── 施放廣播監聽的 hook 點（見 app/game/castwatch.py）──────────────
+    # 「入向訊息入佇列」函式 0x7122b0 的進入點 —— 每一包解密後明文的唯一咽喉。
+    # castwatch inline-hook 它讀施放廣播（op=0x1d、子類型 0x0301、技能ID @8）。
+    # 骨架很獨特：`push ebp / mov ebp,esp / push ebx / mov bl,[ebp+0x10]（8A 5D 10）
+    # / push esi / push edi / mov edi,[ebp+0xc]（8B 7D 0C）/ mov esi,ecx（8B F1）/
+    # push 0xc / call new(rel32 遮) / mov edx,eax / add esp,4 / test edx,edx / jne`。
+    # ⚠ castwatch.start() **裝前還會再驗前 7 bytes**（55 8B EC 53 8A 5D 10），
+    #   對不上就拒裝退舊行為 —— 熱路徑對錯位址寫 jmp 會當場崩潰。
+    Sig("castwatch", "INBOUND_FN", "fn", None,
+        "55 8B EC 53 8A 5D 10 56 57 8B 7D 0C 8B F1 6A 0C E8 ?? ?? ?? ??"
+        " 8B D0 83 C4 04 85 D2 75 07",
+        0x007122B0),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。

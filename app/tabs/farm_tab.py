@@ -68,9 +68,9 @@ from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, bag, buff, channel, entity, inventory,
-                      itemname, jumpmap, locate, monsters, move, navigate,
-                      player, quickbar, recall, revive, robot, scene,
+from app.game import (aob, attack, bag, buff, castwatch, channel, entity,
+                      inventory, itemname, jumpmap, locate, monsters, move,
+                      navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
 from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list, fit_spin,
@@ -646,8 +646,12 @@ class KeyWorker(_Paced):
         #   0 = 不指定（照舊直接輪流放）。
         self.opener_vk = 0
         self._open_eid = None       # 現在這道鎖是針對哪一隻（換怪就重新上鎖）
-        self._opened = False        # 這一隻的首發已經**真的**放出去了
-        self._open_verify = False   # 這一隻能不能驗證（見 _opener_gate）
+        self._opened = False        # 這一隻的首發已經**真的**放出去了（收到廣播）
+        # ★★ 首發確認靠「施放廣播監聽」（castwatch，100% 訊號）——
+        #   收到「我(srv_id)放出這一招」的伺服器廣播才算數，拒收不會有。
+        self.castwatch = None       # CastHook（分頁 acquire 後塞進來；None=退舊行為）
+        self._srv_id = None         # 我的施法者伺服器ID＝[玩家實體+0x1D0]（每隻重讀）
+        self._cast_since = 0        # 上鎖當下 castwatch 的攔包計數（只看之後的廣播）
         self._open_since = 0.0
         self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
         self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
@@ -847,25 +851,6 @@ class KeyWorker(_Paced):
             self.skills = {**self.skills, vk: sid}
             self._learning = False
 
-    def _arm_opener(self) -> bool:
-        """換到新的一隻怪 → 把「最近使用的技能」欄位清成 0。
-
-        回傳「等一下讀得準嗎」。清完立刻讀回來驗證：讀到 0（`read_last_skill`
-        回 None）才算數 —— 那同時證明角色屬性位址現在是有效的。
-
-        ⚠⚠ **一定要清零**。首發每隻怪都會放，欄位裡本來就留著上一隻的
-          同一個技能 ID；不清就每一隻都當成「首發已經放過了」，
-          整個功能會**安靜地失效**（跟當年雪狐把 F3 的技能當成 F2 同一個坑）。
-        ⚠ `clear_last_skill` 內含 `base_ok` 驗證，位址過期時不會亂寫別人的堆積。
-        """
-        if not self.stats:
-            return False
-        try:
-            player.clear_last_skill(self.sc, self.stats)
-            return player.read_last_skill(self.sc, self.stats) is None
-        except Exception:                          # noqa: BLE001
-            return False
-
     def _sp_blocked(self, sid: int) -> str:
         """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
 
@@ -893,23 +878,23 @@ class KeyWorker(_Paced):
     def _opener_gate(self, eid, bykey: dict, now: float) -> int | None:
         """首次攻擊的閘門：回傳「這一輪只准放這個鍵」，None = 沒鎖／已解鎖。
 
-        怎麼知道首發**真的**放出去了
-        ----------------------------
-        ⚠⚠ **不能看 `quickbar.use()` 的回傳值** —— 它只代表指令排進遊戲了；
-          技能還在冷卻時遊戲會自己拒絕，那支照樣回 True。
-        唯一的訊號是「最近使用的技能 ID」欄位（角色屬性 −0x50）：反組譯
-        `0x549CD9` 可以看到，遊戲是**所有檢查都過了**才寫那個欄位
-        （被冷卻／狀態擋下來就不寫），正好就是我們要的語意。
+        規格（使用者 2026-08-18）：選了首次攻擊、而且不是空鍵、也不是 SP 不夠
+        → **持續發射到收到自己的施放廣播**，收到後轉技能鍵輪迴（首發只放這次、
+        輪迴不含它，見 step 的排除）。
 
-        ★★ **走封包的技能（射程 > 8）一樣驗得到** —— 2026-08-10 五台實測
-          日誌打臉了我原本的假設：fred26016041 打 743（幻影刺殺Ⅳ，射程 12、
-          走封包）時欄位就是 743、s26016041 打 946（冰凍狙擊Ⅳ，同樣走封包）
-          時欄位就是 946。所以**不必**為了首發去動「射程 < 8 送鍵、> 8 打封包」
-          那條分流（那是使用者定的規則）—— 我一度那樣改，被退回來了。
+        怎麼 100% 確定「這一招真的被伺服器受理」
+        --------------------------------------
+        ⚠⚠ 不能看 `quickbar.use()`／`cast_at()` 的回傳值（只代表送出了）；
+          不能看 SP/MP 扣款（連射時糊在一起分不出）；不能看最近技能欄位
+          （對地技能不寫）；不能看 +0x418 清單（邊走邊放會漏）。
+        ★★★ 唯一可靠訊號＝**施放廣播**（castwatch，見 app/game/castwatch.py）：
+          伺服器對每一次受理的施放回一包「施法者ID＋技能ID」，拒收不回、
+          連射逐發、對地也有。上鎖時記下攔包計數 `_cast_since`，之後只要出現
+          「施法者==我(`[玩家實體+0x1D0]`)、技能==首發那招」就是確認。
 
-        ⚠ 只有一種情況驗不了，退化成「送出去就算數」——
-          寧可少一道保證，也**絕不能讓角色永遠站著不出手**：
-          角色屬性位址還沒定位／已失效（清零＋讀回驗證沒過）。
+        跳過只有使用者准的三種＋一種硬故障：沒選／空鍵（上面 not sid）、
+        SP 不夠（等不到，見 _sp_blocked）、castwatch 裝不起來（退化「送一次
+        就算」保險，絕不讓角色永遠站著不出手；狀態列會講）。
         """
         vk = self.opener_vk
         sid = bykey.get(vk) if vk else None
@@ -923,13 +908,20 @@ class KeyWorker(_Paced):
             self._open_eid = eid
             self._opened = False
             self._open_since = now
-            self._open_verify = self._arm_opener()
+            # ★ 伺服器施法者ID 每隻重讀（換圖/重連會重建玩家物件，不能快取）。
+            self._srv_id = (castwatch.own_server_id(
+                self.sc, bag.player_entity(self.sc))
+                if self.castwatch else None)
+            # 只看「上鎖之後」的廣播（避免上一隻的遲到廣播誤判）。
+            self._cast_since = (self.castwatch.write_count()
+                                if self.castwatch else 0)
         if self._opened:
             self.open_wait = 0.0
             return None
-        if (self._open_verify
-                and player.read_last_skill(self.sc, self.stats) == sid):
-            self._opened = True                    # 遊戲受理了 → 其他招解鎖
+        # ★★★ 100% 確認：收到「我放出這一招」的施放廣播 → 解鎖接輪迴。
+        if (self.castwatch and self._srv_id
+                and self.castwatch.fired(self._cast_since, self._srv_id, sid)):
+            self._opened = True
             self.open_wait = 0.0
             return None
         # ★ SP 不夠（或分不出來）→ 放行其他招，別站在那裡等一個不會好的條件。
@@ -939,6 +931,15 @@ class KeyWorker(_Paced):
             self.open_wait = 0.0
             self.open_note = why
             return None
+        # ⚠ castwatch 裝不起來（AOB 對不上／改版／拒裝）→ 沒有可靠確認訊號，
+        #   退化成「送一次就算」：**這一拍先送首發**（回 vk）、標記已開，
+        #   下一拍就轉輪迴。絕不讓角色永遠站著不出手（大聲講）。
+        if not (self.castwatch and self._srv_id):
+            self._opened = True
+            self.open_wait = 0.0
+            self.open_note = ("⚠ 施放廣播監聽不可用（改版？）→ 首發送一次就"
+                              "接輪迴（無法逐發確認）")
+            return vk
         # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
         #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
         #   會被當成「沒在等」。
@@ -1044,6 +1045,14 @@ class KeyWorker(_Paced):
             opener = self._opener_gate(eid, bykey, now)
             if opener is not None:
                 usable = [opener]
+            elif self.opener_vk in usable and len(usable) > 1:
+                # ★★ 修 bug（2026-08-18 使用者回報「首發技能被加進輪迴一直放」）：
+                #   首發**只在開頭放一次**，收到廣播後的輪迴**不含首發鍵** ——
+                #   就算它同時勾在技能鍵裡也不再放。
+                # ⚠ 它是唯一有技能的鍵時**例外保留**（len>1 這個條件擋住）：
+                #   濾掉整輪就空了、開場後角色永遠不出手；那種每隻怪就靠
+                #   換怪重新上鎖各放一次首發（等於它自己就是輪迴），可接受。
+                usable = [k for k in usable if k != self.opener_vk]
             # ★★★ 出手方式**依射程分流**（使用者定的）：
             #   射程 ≤ QUICKKEY_RANGE(8) → 叫遊戲的快捷鍵（quickbar.use，
             #     等同按 F2）。⚠⚠ 自己送施放封包**只打得出普攻**：實測 MP
@@ -1122,10 +1131,8 @@ class KeyWorker(_Paced):
                 self._rot += 1
                 if self._learning:
                     self._learn(vk)            # 剛按過鍵，順手讀一下
-            # 驗不了的那兩種情況（見 _opener_gate）：送出去就當首發完成。
-            # ⚠ 這一條就是「絕不會永遠站著不出手」的保險，別拿掉。
-            if opener is not None and not self._open_verify:
-                self._opened = True
+            # ⚠ 首發的「已放出去」現在只由 _opener_gate 靠施放廣播判定
+            #   （送出≠受理，絕不在這裡把送出當完成 —— 那正是舊「一直放」的病根）。
         except Exception:                      # noqa: BLE001
             pass
 
@@ -1592,6 +1599,7 @@ class CharFarmPage(QWidget):
         self._death_closed = False # 死亡選擇視窗已經關掉了（一次死亡只關一次）
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
+        self._castwatch = None       # 施放廣播監聽（首發 100% 確認用；有設首發才裝）
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）。
         # 每個點記 (x, y, 場景編號)；場景編號 None = 舊版存的、沒標記地圖。
@@ -1795,18 +1803,21 @@ class CharFarmPage(QWidget):
         a.addWidget(QLabel("首次攻擊"))
         self.open_box = _NamedKeyBox(self._label_keys)
         self.open_box.setToolTip(
-            "每一隻怪的**第一下**一定要是這個鍵上的招，放出去之後才會開始\n"
-            "輪流放「技能鍵」勾選的那些。\n"
+            "每一隻怪的**第一下**一定要是這個鍵上的招；**確認伺服器真的受理**\n"
+            "（收到施放廣播）之後，才開始輪流放「技能鍵」勾選的那些。\n"
             "\n"
-            "・那一招在冷卻 → **站著等它好**，等多久都等（其他招一個都不放）。\n"
-            "　 等待期間狀態列會顯示等了幾秒；要中斷就取消「開始掛機」。\n"
-            "・等待的那幾秒不算「沒進展」，不會因此被換掉去打別隻。\n"
+            "・首發只在**開頭放一次**：確認之後的輪迴**不含這個鍵**，就算它\n"
+            "　 同時勾在技能鍵裡也不再放（修掉了「首發一直放」的舊 bug）。\n"
+            "・還沒收到廣播（在冷卻／共CD被拒） → **持續發射直到收到**，\n"
+            "　 其他招一個都不放；等待不算「沒進展」，不會被換去打別隻。\n"
+            "・吃 SP（能量燈）的技能 SP 不夠 → **跳過**首發直接輪迴\n"
+            "　（SP 是打怪打出來的，站著等等不到）。\n"
             "・這個鍵**不必**在上面勾選 —— 可以拿一招只當開場、不進輪替。\n"
             "・那個鍵是空的／放物品／快捷欄讀不到 → 自動當作沒設定，照常打。\n"
             "\n"
-            "・出手方式照原本的規則（射程 ≤ 8 送鍵、> 8 打封包），不受影響。\n"
-            "⚠ 角色屬性讀不到時無法確認有沒有放出去 → 那一隻送一次就放行\n"
-            "　（不會讓角色站在那裡永遠不出手）。")
+            "・確認靠攔伺服器的施放廣播（100%、連射也逐發分得出、不看 MP）。\n"
+            "⚠ 監聽裝不起來（遊戲改版）時 → 首發改『送一次就算』，\n"
+            "　 其餘掛機不受影響（狀態列會講）。")
         self.open_box.addItem("不指定", 0)
         for label, vk in SKILL_KEYS:
             self.open_box.addItem(label, vk)
@@ -3040,6 +3051,36 @@ class CharFarmPage(QWidget):
             self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
             return False
 
+    def _ensure_castwatch(self) -> None:
+        """有設首次攻擊 → 掛施放廣播監聽（首發 100% 確認）。沒設就不裝。
+
+        ⚠ inline hook 熱路徑：裝不起來（AOB 對不上／改版）castwatch.acquire 回
+          None，首發自動退化成「送一次就算」（見 _opener_gate），不會卡死。
+        """
+        if not self._keys.opener_vk:
+            return                             # 沒設首發 → 不裝（零風險）
+        if self._castwatch is not None and self._castwatch.active:
+            self._keys.castwatch = self._castwatch
+            return
+        try:
+            self._castwatch = castwatch.acquire(self.pid, self)
+        except Exception:                      # noqa: BLE001
+            self._castwatch = None
+        self._keys.castwatch = self._castwatch
+        if self._castwatch is None:
+            self.status.setText("⚠ 施放廣播監聽裝不起來（改版？）→ 首發改"
+                                "『送一次就算』，其餘掛機不受影響")
+
+    def _release_castwatch(self) -> None:
+        """卸施放廣播監聽（最後一個使用者還完才真的卸 hook）。"""
+        if self._castwatch is not None:
+            try:
+                castwatch.release(self.pid, self)
+            except Exception:                  # noqa: BLE001
+                pass
+            self._castwatch = None
+        self._keys.castwatch = None
+
     def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
         """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
 
@@ -3939,6 +3980,7 @@ class CharFarmPage(QWidget):
             self._keys.stop_learning()
             self._keys.eid = None
             self._atk.hold_off()
+            self._release_castwatch()      # 卸施放廣播監聽（inline hook）
             self._cur = None
             self._death = False        # 死亡回程等到一半就作廢，別再傳送
             # ⚠ 停掛機時如果正在跑回程補給：作廢它（_supply_gen++ 讓背景執行緒回來的
@@ -3972,6 +4014,9 @@ class CharFarmPage(QWidget):
         self._ensure_mover()               # 選怪／移動都要用它的跳板
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
+        # ★★ 首次攻擊要 100% 確認「有沒有放出去」→ 掛施放廣播監聽（castwatch）。
+        #   只在有設首發時才裝（inline hook 熱路徑，沒用到就別放進遊戲）。
+        self._ensure_castwatch()
         # ★ 開始自動戰鬥只把精靈「該關的」關掉：勾趴趴GO回地圖→關精靈的標記捲軸、
         #   勾死亡回練功區→關精靈的陣亡自動復活（都由我們自己做，精靈搶先只會壞事）。
         # ⚠ 2026-08-14 改：**不再開精靈主開關/自動戰鬥、也不推補給頁設定**——
@@ -4034,6 +4079,13 @@ class CharFarmPage(QWidget):
         self._keys.stop_learning()
         self._keys.eid = None
         self._atk.hold_off()
+        # ⚠ 遊戲沒了就別再對它的 IAT 動手（castwatch.release 會寫回原位元組）：
+        #   gone=True 時行程已不在，寫入會炸 —— 直接丟掉引用即可。
+        if not gone:
+            self._release_castwatch()
+        else:
+            self._castwatch = None
+            self._keys.castwatch = None
         self._cur = None
         self._death = False
         # 位址全部作廢：行程沒了的話它們早就沒有意義，
@@ -4974,6 +5026,12 @@ class CharFarmPage(QWidget):
         self._keys.opener_vk = int(self.open_box.currentData() or 0)
         self._keys._open_eid = None
         self._keys.open_wait = 0.0
+        # 掛機中臨時設了首發 → 補裝施放廣播監聽；改成不指定就卸掉。
+        if self.run_cb.isChecked():
+            if self._keys.opener_vk:
+                self._ensure_castwatch()
+            else:
+                self._release_castwatch()
         self._save_settings()
 
     def _sync_key_btn(self) -> None:
