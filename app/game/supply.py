@@ -924,12 +924,17 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
     return best <= NEAR_ENOUGH
 
 
-def run_full_supply(mover, scanner, say=None) -> tuple[bool, str]:
+def run_full_supply(mover, scanner, say=None,
+                    back_to=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
     照清單買 → 趴趴GO 跳回原練功點。順序＝**銀行 → 修裝 → 買**（使用者要求）。
     回 (整趟有沒有成功, 說明)。
+
+    back_to=(x, y, 場景編號) 可選：回程改跳回這個指定點，而不是出發當下站的
+    地方 —— 掛機分頁的「記錄點」（＝巡邏點，2026-08-18 使用者要求）用這個；
+    None ＝ 原行為（生產分頁照舊）。
     """
     def note(m):
         if say:
@@ -939,10 +944,17 @@ def run_full_supply(mover, scanner, say=None) -> tuple[bool, str]:
         return False, "跳板沒裝好"
 
     # 1. 記錄練功點（地圖 + 座標，回程要跳回這裡）
-    start_map = scene.current_id(scanner)
-    if start_map is None:
+    # ⚠ here 是「現在人在哪」，只給回城的地圖變化偵測用；回程目標是
+    #   start_map/start_pos —— back_to 指定時兩者可以不同張圖，不能混用
+    #   （混用的話：人不在 start_map 上，_wait_map_change 第一拍就以為到城了）。
+    here = scene.current_id(scanner)
+    if here is None:
         return False, "讀不到目前地圖"
+    start_map = here
     _, start_pos = _player_tile(scanner)
+    if back_to is not None:
+        start_map = int(back_to[2])
+        start_pos = (float(back_to[0]), float(back_to[1]))
     back = jumpmap.nearest(start_map,
                            start_pos[0] if start_pos else None,
                            start_pos[1] if start_pos else None)
@@ -956,7 +968,7 @@ def run_full_supply(mover, scanner, say=None) -> tuple[bool, str]:
     if not recall.use_item(mover, slot):
         return False, "回程道具送不出去"
     note("用天使之翼回城中…")
-    home = _wait_map_change(scanner, start_map, WING_WAIT)
+    home = _wait_map_change(scanner, here, WING_WAIT)
     if home is None:
         return False, "回城後地圖沒變（回程可能失敗）"
     note(f"回到 {scene.scene_name(home)}")

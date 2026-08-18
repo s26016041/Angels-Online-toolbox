@@ -1556,9 +1556,13 @@ class CharFarmPage(QWidget):
         #   不再交給天使精靈。整趟阻塞式，放背景執行緒跑，_supply_tick 每拍輪詢完成。
         self._supply_result = None  # 背景執行緒的結果 (ok, msg)；None = 還在跑
         self._supply_progress = ""  # 背景執行緒的最新進度字串（run_full_supply 的 say 回報）
-        self._supply_scene = None  # 出發時人在哪張地圖（保留給死亡/顯示用）
+        self._supply_scene = None  # 回程要跳回的地圖（記錄點；沒記錄點＝出發當下）
         self._supply_left = False  # 已經離開過那張地圖了嗎
-        self._supply_pos = None    # 出發時站在哪
+        self._supply_pos = None    # 回程要跳回的座標（同上）
+        # ★ 記錄點（回程補給／死亡回程最後要飛回的練功點）：(x, y, 場景編號)。
+        #   按「開始掛機」時取**巡邏點**（_pick_home，2026-08-18 使用者要求，
+        #   以前是記按下當下的地圖）；右鍵巡邏點「飛到這張圖」也會跟著改。
+        self._home: tuple[float, float, int] | None = None
         # ★ 補給背景執行緒的把手：還活著就**絕不能**再開第二條（兩條會同時
         #   搶走位、各燒各的翼）。逾時停機只作廢結果，殺不掉它 —— 使用者重開
         #   掛機時要看這裡擋住（跟 produce_tab._sup_thread 同一套）。
@@ -1589,7 +1593,7 @@ class CharFarmPage(QWidget):
         self._death = False        # 進行中（我們完全讓開，等復活）
         self._death_t = 0.0        # 死了多久（倒數 DEATH_REVIVE_SECS、超時判斷共用）
         self._death_poll = 0.0     # 距離上次檢查過了多久
-        self._death_scene = None   # 死在哪張地圖（活回這張圖才接回自動戰鬥）
+        self._death_scene = None   # 要活回哪張地圖才接回自動戰鬥（記錄點優先）
         self._death_pos = None     # 死在哪（同圖多落點時挑最近的）
         self._death_try = 0.0      # 死亡滿幾秒才（再）送「回標記點」
         self._death_sent = False   # 至少送出去過一次了（狀態列顯示用）
@@ -2020,10 +2024,11 @@ class CharFarmPage(QWidget):
         self.sup_jump_cb = QCheckBox("用天使趴趴GO回地圖")
         self.sup_jump_cb.setToolTip(
             f"觸發回程補給之後 **{JUMP_BACK_SECS / 60:.0f} 分鐘**，直接用"
-            "「天使趴趴GO」傳回原本那張地圖，不再等精靈自己走回來。\n"
+            "「天使趴趴GO」傳回**記錄點**那張地圖（顯示在巡邏點下方），\n"
+            "不再等精靈自己走回來。\n"
             "・傳完就照原本的流程接回自動戰鬥\n"
-            "・同一張地圖有好幾個落點時，挑**離你出發位置最近**的那個\n"
-            "・時間到時如果人已經回到原地圖了就不傳\n"
+            "・同一張地圖有好幾個落點時，挑**離記錄點最近**的那個\n"
+            "・時間到時如果人已經回到那張地圖了就不傳\n"
             f"・送出去之後會**盯著地圖有沒有真的變**，{JUMP_LAND_SECS:.0f} 秒\n"
             "　 還沒到就再送一次（不限次數，直到補給逾時為止）\n"
             "⚠ 走的是遊戲自己的傳送封包，跟你手動開趴趴GO按下去完全一樣，\n"
@@ -2049,7 +2054,8 @@ class CharFarmPage(QWidget):
             "　（跟你在死亡視窗點「回標記點」完全一樣）\n"
             "・復活後自動把死亡選擇視窗關掉\n"
             "・復活後人在標記點（通常在城裡）→ 自動用**天使趴趴GO**\n"
-            "　 傳回死掉時那張地圖，回到就接回自動戰鬥\n"
+            "　 傳回**記錄點**那張地圖（見巡邏點下方；沒有記錄點\n"
+            "　 才用死掉時那張），回到就接回自動戰鬥\n"
             "・開始掛機時自動把天使精靈「輔助」頁的\n"
             "　「陣亡時自動復活」**關掉** —— 免得精靈搶先把人復活回城\n"
             "・沒勾的話維持原樣：角色死亡就自動停止掛機\n"
@@ -2162,7 +2168,8 @@ class CharFarmPage(QWidget):
             "・追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
             "・只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
             "　 同一張圖的不同分流算同一張，會照走。\n"
-            "・在點上按右鍵：用天使趴趴GO飛到那個點所在的地圖。")
+            "・在點上按右鍵：用天使趴趴GO飛到那個點所在的地圖，\n"
+            "　 記錄點也會跟著改成那個點。")
         # 每一列是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
         # （專家級遺落之地／史萊姆晴空牧場）—— 太窄會被切掉。
         sv = QVBoxLayout(spot)
@@ -2192,6 +2199,14 @@ class CharFarmPage(QWidget):
         rm_btn.clicked.connect(self._remove_spots)
         srow.addWidget(rm_btn)
         sv.addLayout(srow)
+        # ★ 記錄點顯示（2026-08-18 使用者要求）：回程補給／死亡回程飛回這裡。
+        self.home_lab = QLabel("記錄點：－")
+        self.home_lab.setToolTip(
+            "回程補給／死亡回練功區，最後用天使趴趴GO飛回這個點所在的地圖。\n"
+            "・按「開始掛機」時取**巡邏點**：目前地圖有點就用目前地圖的\n"
+            "　 第一個，沒有就用清單第一個；完全沒設巡邏點才用當下站的位置。\n"
+            "・在巡邏點上按右鍵「飛到這張圖」，記錄點也會跟著改成那個點。")
+        sv.addWidget(self.home_lab)
         # 「巡邏點」每列是「編號. 地圖名 (x, y)」，地圖名最長 7 個字
         # （專家級遺落之地／史萊姆晴空牧場），座標最多各 3 位數
         fit_list(spot, self.spot_list, "10. 專家級遺落之地 (242, 178)")
@@ -2462,15 +2477,18 @@ class CharFarmPage(QWidget):
 
         流程很短：等 `DEATH_REVIVE_SECS` 秒（讓死亡視窗出來）→ 送
         「回標記點」封包（revive.to_mark，跟手點那顆按鈕完全一樣）→
-        人活回死掉那張地圖就接回自動戰鬥。
+        人活回**記錄點**那張地圖就接回自動戰鬥（沒有記錄點才用死掉那張）。
         精靈的「陣亡時自動復活」在開始掛機時已經被**關掉**
         （見 robot.apply_prefs）—— 它搶先把人復活回城反而壞事。
         """
         self._death = True
         self._death_t = 0.0
         self._death_poll = 0.0
-        self._death_scene = self._scene
-        self._death_pos = self.my_pos()      # 屍體的位置還讀得到，拿來挑落點
+        # 回哪張圖＝記錄點（巡邏點，見 _pick_home）；沒有記錄點才用死掉當下
+        home = self._home
+        self._death_scene = home[2] if home else self._scene
+        # 挑落點用的座標：記錄點的座標；沒有才讀屍體位置（死了還讀得到）
+        self._death_pos = (home[0], home[1]) if home else self.my_pos()
         self._death_try = DEATH_REVIVE_SECS
         self._death_sent = False
         self._death_jumped = None
@@ -2679,9 +2697,11 @@ class CharFarmPage(QWidget):
             self.notify(f"{why}，但背包裡找不到「{item}」（回程道具），掛機已停止。")
             return False
         self._no_recall = 0            # 找到了 → 之前那幾次是空窗，重新計數
-        self._supply_scene = self._scene    # 記一下出發地圖（顯示用）
+        # 回程目標＝記錄點（巡邏點，見 _pick_home）；沒有記錄點才記出發當下
+        home = self._home
+        self._supply_scene = home[2] if home else self._scene
         self._supply_left = False
-        self._supply_pos = self.my_pos()
+        self._supply_pos = (home[0], home[1]) if home else self.my_pos()
         self._supply_gen += 1
         # 我們自己要完全讓開：不送技能鍵、不寫目標；看門狗照常把精靈自動攻擊關著
         #   （run_full_supply 是我們在開車，精靈不該插手搶怪）。
@@ -2699,7 +2719,8 @@ class CharFarmPage(QWidget):
         def _worker():
             try:
                 res = supply.run_full_supply(
-                    mv, sc, say=lambda m: setattr(self, "_supply_progress", m))
+                    mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
+                    back_to=home)      # 回程跳回記錄點（None＝出發當下，原行為）
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
@@ -3035,6 +3056,33 @@ class CharFarmPage(QWidget):
         self._refresh_spots()
         self._save_settings()
 
+    def _set_home(self, x: float, y: float, sid: int) -> None:
+        """換記錄點（回程補給／死亡回程要飛回的練功點）並更新顯示。"""
+        self._home = (float(x), float(y), int(sid))
+        self.home_lab.setText(
+            f"記錄點：{scene.scene_name(sid)} ({x:.0f}, {y:.0f})")
+
+    def _pick_home(self) -> None:
+        """按「開始掛機」時定記錄點：**巡邏點優先**，不是人站的地方。
+
+        2026-08-18 使用者要求：以前等於記「按開始當下的地圖」——在城裡按
+        開始，補給／死亡回程就飛回城。改成：
+          1. 目前地圖有巡邏點 → 目前地圖的第一個巡邏點；
+          2. 否則 → 清單第一個有記地圖的巡邏點；
+          3. 完全沒設巡邏點 → 當下位置（原行為）；讀不到就保留舊記錄點。
+        """
+        here = self.cur_scene()
+        spots = [s for s in self._spots if s[2] is not None]
+        if spots:
+            pick = next((s for s in spots
+                         if here is not None and scene.same_map(s[2], here)),
+                        spots[0])
+            self._set_home(pick[0], pick[1], pick[2])
+            return
+        pos = self.my_pos()
+        if pos is not None and here is not None:
+            self._set_home(pos[0], pos[1], here)
+
     def _spot_menu(self, pos) -> None:
         """巡邏點清單的右鍵選單：用天使趴趴GO飛到那個點所在的地圖。
 
@@ -3049,7 +3097,7 @@ class CharFarmPage(QWidget):
             return                      # 清單跟資料不同步就寧可不出選單
         x, y, sid = self._spots[row]
         menu = QMenu(self.spot_list)
-        act = menu.addAction("✈ 用天使趴趴GO飛到這張圖")
+        act = menu.addAction("✈ 用天使趴趴GO飛到這張圖（記錄點跟著改）")
         # 飛不了的原因直接寫在選單項上（QMenu 的滑鼠提示預設不顯示）
         if sid is None:
             act.setEnabled(False)
@@ -3087,7 +3135,9 @@ class CharFarmPage(QWidget):
         # 傳送會換地圖：快取位址全作廢＋導航重來（跟 _jump_step 同一套）。
         self._drop_cached_addrs()
         self._forget_routes()
-        self.status.setText(f"✈ {msg}")
+        # 飛過去＝記錄點也跟著過去（2026-08-18 使用者要求）
+        self._set_home(x, y, sid)
+        self.status.setText(f"✈ {msg}（記錄點已改成這個巡邏點）")
 
     def _ensure_mover(self) -> bool:
         """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。
@@ -4064,6 +4114,7 @@ class CharFarmPage(QWidget):
         self._killed.clear()
         self._since_scan = SCAN_NOW        # 清單裡挑不到的話，立刻重掃
         self._cur = None
+        self._pick_home()                  # 記錄點：巡邏點優先（見 _pick_home）
         # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
         #   學法：直讀快捷欄那格（quickbar.py），通常當場拿到；讀不到才退回
         #   「清零→按鍵→讀殘留」。學到之前用按鍵攻擊（本來就有效），不會空等。
