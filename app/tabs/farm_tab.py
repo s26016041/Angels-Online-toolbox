@@ -670,6 +670,10 @@ class KeyWorker(_Paced):
         self._terrain = None        # 位移類首發夾落點用的地形快取（懶載）
         self.account = ""           # 這個分頁的帳號（首發日誌檔名用）
         self._op_state = ""         # 首發日誌去重鍵（同狀態不重複寫）
+        # 首發效果探針（**純日誌**，不進任何控制流程）：送出後 1 秒記
+        # MP/SP 有沒有被扣＝這一發伺服器到底收了沒。（封包施放不轉快捷欄
+        # CD、不播自己動作，畫面上看不出有沒有放 —— 8/18 嵐狐實驗定案。）
+        self._open_probe = None     # (送出時間, MP, SP)
         self._open_since = 0.0
         self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
         self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
@@ -940,6 +944,30 @@ class KeyWorker(_Paced):
         沒選／鍵是空的（上面 `not sid` 那條）／SP 不足（等不到，死結）
         ／跳板不在而首發是對地技能（根本送不出去，等下去也是死結）。
         """
+        # 效果探針收割（純日誌）：送出 1 秒後看 MP/SP 有沒有被扣。
+        if self._open_probe and now - self._open_probe[0] >= 1.0:
+            t0p, mp0, sp0 = self._open_probe
+            self._open_probe = None
+            try:
+                st = player.read(self.sc, self.stats) if self.stats else None
+                mp1 = st.mp if st else None
+                sp1 = skillcost.sp_now(self.sc,
+                                       bag.player_entity(self.sc) or 0,
+                                       mp1 or 0)
+                dmp = (mp0 - mp1) if (mp0 is not None
+                                      and mp1 is not None) else None
+                dsp = (sp0 - sp1) if (sp0 is not None
+                                      and sp1 is not None) else None
+                fired = (dmp or 0) > 0 or (dsp or 0) > 0
+                self._oplog("probe", "首發效果：MP "
+                            + (f"−{dmp}" if dmp and dmp > 0 else "沒動")
+                            + "　SP "
+                            + (f"−{dsp}" if dsp and dsp > 0 else "沒動")
+                            + ("" if fired else
+                               "　⚠ 沒被扣＝伺服器拒收（目標已有同類效果"
+                               "／封包被吞）"))
+            except Exception:                      # noqa: BLE001
+                pass
         vk = self.opener_vk
         sid = bykey.get(vk) if vk else None
         if not sid:
@@ -1276,6 +1304,16 @@ class KeyWorker(_Paced):
                 self._open_cool = now + (lock_s if lock_s else OPENER_GAP)
                 self.open_wait = 0.0
                 self._oplog("done", "首發完成→接輪迴")
+                # 效果探針（純日誌）：記下送出當下的 MP/SP，1 秒後對帳。
+                try:
+                    st = player.read(self.sc, self.stats) \
+                        if self.stats else None
+                    mp0 = st.mp if st else None
+                    sp0 = skillcost.sp_now(
+                        self.sc, bag.player_entity(self.sc) or 0, mp0 or 0)
+                    self._open_probe = (now, mp0, sp0)
+                except Exception:                  # noqa: BLE001
+                    self._open_probe = None
         except Exception:                      # noqa: BLE001
             pass
 
