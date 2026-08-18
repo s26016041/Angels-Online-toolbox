@@ -635,13 +635,19 @@ SIGS: tuple[Sig, ...] = (
     # ── 施放廣播監聽的 hook 點（見 app/game/castwatch.py）──────────────
     # 「入向訊息入佇列」函式 0x7122b0 的進入點 —— 每一包解密後明文的唯一咽喉。
     # castwatch inline-hook 它讀施放廣播（op=0x1d、子類型 0x0301、技能ID @8）。
-    # 骨架很獨特：`push ebp / mov ebp,esp / push ebx / mov bl,[ebp+0x10]（8A 5D 10）
-    # / push esi / push edi / mov edi,[ebp+0xc]（8B 7D 0C）/ mov esi,ecx（8B F1）/
-    # push 0xc / call new(rel32 遮) / mov edx,eax / add esp,4 / test edx,edx / jne`。
-    # ⚠ castwatch.start() **裝前還會再驗前 7 bytes**（55 8B EC 53 8A 5D 10），
-    #   對不上就拒裝退舊行為 —— 熱路徑對錯位址寫 jmp 會當場崩潰。
+    # ⚠⚠ **開頭 7 bytes（55 8B EC 53 8A 5D 10）一定要遮成 ??**：那正是
+    #   castwatch 裝 hook 時蓋成 jmp 的區段。工具箱上一次沒收乾淨（崩潰、
+    #   舊版關閉時沒還原）時遊戲裡留著我們的 jmp，特徵含這 7 bytes 就會
+    #   掃不到自己 → 定位失敗 → 自我監察誤判改版把程式關掉
+    #   （2026-08-19 使用者實際踩到）。跟 unfreeze 的 PATCH_ADDR 同一條
+    #   紀律：patch 前後都要定位得到。
+    # 錨改用 hook 不會碰的後段骨架：`push esi / push edi /
+    # mov edi,[ebp+0xc]（8B 7D 0C）/ mov esi,ecx（8B F1）/ push 0xc /
+    # call new(rel32 遮) / mov edx,eax / add esp,4 / test edx,edx / jne +7`。
+    # ⚠ castwatch.start() 裝前仍會驗前 7 bytes 是原始 prologue 或自家殘留
+    #   jmp（修復後重驗），其他樣子一律拒裝 —— 對錯位址寫 jmp 會當場崩潰。
     Sig("castwatch", "INBOUND_FN", "fn", None,
-        "55 8B EC 53 8A 5D 10 56 57 8B 7D 0C 8B F1 6A 0C E8 ?? ?? ?? ??"
+        "?? ?? ?? ?? ?? ?? ?? 56 57 8B 7D 0C 8B F1 6A 0C E8 ?? ?? ?? ??"
         " 8B D0 83 C4 04 85 D2 75 07",
         0x007122B0),
 )

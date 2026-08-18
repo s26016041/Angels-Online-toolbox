@@ -23,6 +23,10 @@ opcode。施放廣播的版面（實測 944/945/946/947，跨兩台不同施法�
   （「掛機＋首次攻擊」或「自動分身要確認補放」，見 farm_tab._sync_castwatch），
   沒人用就卸；auto-login 會接崩潰。裝前**驗 prologue 位元組**，AOB 對不上就
   **拒裝**（呼叫端退回「送出就算」），絕不對錯位址寫 jmp。
+  例外：認得是**自家殘留的 jmp**（上次工具箱沒收乾淨）就先寫回原 prologue
+  再重裝（`_repair_stale`，三道認定）；配套是 locate.SIGS 的特徵把會被蓋的
+  前 7 bytes 遮成 ??（hook 裝著也定位得到），與 farm_tab 關閉/收分身時
+  無條件 release（_teardown/_client_gone）。
 - 位址 `INBOUND_FN` 登記進 `locate.SIGS`，改版自動跟上；定位失敗 fn=0 → 拒裝。
 - 純攔讀：stub 只把每包前 16 bytes 抄進自己的環狀緩衝，不改遊戲任何狀態、
   執行完偷來的 7 bytes 再跳回原函式，對遊戲完全透明。
@@ -139,6 +143,8 @@ class CastHook:
         #   對錯位址寫 jmp = 當場崩潰。對不上寧可不裝。
         cur = bytes(pm.read_bytes(INBOUND_FN, STOLEN))
         if cur != _EXPECT_PROLOGUE:
+            cur = self._repair_stale(pm, cur)
+        if cur != _EXPECT_PROLOGUE:
             return False
 
         block = pm.allocate(0x8000)
@@ -163,6 +169,32 @@ class CastHook:
         self._ring = ring
         self._active = True
         return True
+
+    def _repair_stale(self, pm, cur: bytes) -> bytes:
+        """認得「上一次工具箱沒收乾淨留下的自家 hook」就修復，回修復後的位元組。
+
+        會發生在：工具箱崩潰、被強關，或 0.4.39 的關閉洩漏 bug（teardown 沒還
+        castwatch → 遊戲裡留著 jmp → 下次開工具箱 AOB 掃不到、hook 也裝不回）。
+        認定三道全過才動手：①開頭是 E9 rel32；②補位是我們寫的兩個 NOP；
+        ③jmp 目標第一個 byte 是 pushad(0x60)＝我們 stub 的固定開頭。
+        別人的 patch（樣式不同）一律不碰、照樣拒裝。
+        位址身分不靠這 7 bytes —— AOB 特徵錨在後面沒被蓋的骨架（locate.SIGS
+        已把這 7 bytes 遮成 ??），命中即確定是這支函式，寫回原始 prologue 安全。
+        ⚠ 舊 session 在遊戲裡配的 stub 記憶體（32KB）救不回來，就留著（洩漏
+        一次性、無害）；修復後照常走全新安裝。
+        """
+        if len(cur) != STOLEN or cur[0] != 0xE9 or cur[5:] != b"\x90\x90":
+            return cur
+        rel = int.from_bytes(cur[1:5], "little", signed=True)
+        target = INBOUND_FN + 5 + rel
+        try:
+            head = bytes(pm.read_bytes(target, 1))
+        except Exception:                      # noqa: BLE001
+            return cur
+        if head != b"\x60":                    # pushad —— 我們 stub 的第一個 byte
+            return cur
+        self._patch(pm, _EXPECT_PROLOGUE)
+        return bytes(pm.read_bytes(INBOUND_FN, STOLEN))
 
     def _patch(self, pm, data: bytes) -> None:
         old = wintypes.DWORD()

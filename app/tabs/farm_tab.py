@@ -5281,6 +5281,9 @@ class FarmTab(ClientWatchMixin, BaseTab):
             except Exception:                  # noqa: BLE001
                 pass
             page._mover = None
+        # castwatch 也要收（行程已不在，寫回會失敗被吞掉 —— 重點是把
+        # per-pid 共用表裡這個 pid 的項目清掉，免得 PID 重用時借到殭屍 hook）
+        page._release_castwatch()
         if page._notifier is not None:
             try:
                 page._notifier.stop()
@@ -5375,6 +5378,12 @@ class FarmTab(ClientWatchMixin, BaseTab):
             if page._mover is not None:
                 move.release(page.pid, page)
                 page._mover = None
+            # ⚠⚠ castwatch 的 inline hook 也**必須**還（無條件，不走
+            #   _sync_castwatch —— 自動分身勾著的話它會判定「還要」而留著）。
+            #   不還原的話遊戲裡留著我們的 jmp，下次開工具箱 AOB 掃不到
+            #   INBOUND_FN → 自我監察誤當改版把程式關掉
+            #   （2026-08-19 使用者實際踩到，0.4.39 的回歸）。
+            page._release_castwatch()
             # ⚠ 警報也要停：BeepThread／QMediaPlayer 還在響的話，物件被回收
             #   時等於「執行緒還在跑就被解構」，而且聲音會一直放到關掉程式。
             if page._notifier is not None:
