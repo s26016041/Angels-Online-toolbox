@@ -675,6 +675,13 @@ class KeyWorker(_Paced):
         #   得出去）。記「上一次送出任何技能」，首發前要等
         #   lockout(上一顆)+lockout(首發) 過完。
         self._last_cast = None      # (時間, 技能ID)——輪迴與首發都算
+        # ★★★ 共 CD 的**正確時鐘**（8/18 使用者退回「無腦等 2 秒」後改）：
+        #   施放鎖定清單「最近一次變空」的時間。條目消失＝最後一發**被受理
+        #   的**技能後搖結束（被拒收的送出不長條目、不重置時鐘）——
+        #   清單清空後再等首發自己的 前置+後置（查表）就可以放。
+        #   嵐狐實測：947 條目消失後 1.0s（=946 表值）946 就放得出去。
+        #   走路換怪的空檔本來就在消化這段時間，多數情況到位即放。
+        self._ring_free = 0.0       # 變空的時間；None＝現在還有條目
         # 首發效果探針（**純日誌**，不進任何控制流程）：送出後 1 秒記
         # MP/SP 有沒有被扣＝這一發伺服器到底收了沒。（封包施放不轉快捷欄
         # CD、不播自己動作，畫面上看不出有沒有放 —— 8/18 嵐狐實驗定案。）
@@ -895,6 +902,29 @@ class KeyWorker(_Paced):
         except OSError:
             pass
 
+    def _track_ring(self, now: float):
+        """盯施放鎖定清單：回傳目前條目（讀不到回 None），並記錄
+        「最近一次變空」的時間（_ring_free）。
+
+        ★ 這是共 CD 的**正確時鐘起點**：條目消失＝最後一發被受理的技能
+          後搖結束。被拒收的送出不長條目、不會重置它——用「最後送出
+          時間」當起點會把輪迴收尾那串被拒的連發也算進去，多等最多
+          一秒（使用者抱怨「不流暢」的來源）。
+        走路換怪的空檔也要持續盯（step 的無目標／不在射程分支會呼叫），
+        時鐘才不會漏掉「清單其實早就空了」。
+        """
+        try:
+            marks = attack.casting_marks(self.sc)
+        except Exception:                          # noqa: BLE001
+            marks = None
+        if marks is None:
+            return None
+        if marks:
+            self._ring_free = None
+        elif self._ring_free is None:
+            self._ring_free = now
+        return marks
+
     def _sp_blocked(self, sid: int) -> str:
         """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
 
@@ -1011,36 +1041,38 @@ class KeyWorker(_Paced):
             self.open_note = why
             self._oplog("skip-sp", why)
             return None
-        # ── 等 CD 好 ──
-        # ① 施放鎖定清單裡**還有任何條目**＝有技能在鎖定中 → 等。
-        #   （⚠ 不是只看首發那一顆：技能有**共 CD** —— 使用者 8/18 指出，
-        #   嵐狐實測輪迴的 947 會把首發 946 擋掉。清單是遊戲自己的鎖定
-        #   狀態，有東西就不送。）
-        if now >= self._open_next:                 # （被推遲時不必再讀）
-            try:
-                marks = attack.casting_marks(self.sc)
-            except Exception:                      # noqa: BLE001
-                marks = None                       # 這一拍讀壞就當沒看到
+        # ── 等 CD 好（盯遊戲自己的鎖定狀態，**好了立刻放** ——
+        #    使用者 8/18：不准無腦等固定秒數）──
+        marks = self._track_ring(now)
+        if marks is not None:
             if marks:
-                self._open_next = max(self._open_next, now + 0.3)
-                self._oplog("hold-cd", "等CD：施放鎖定清單還有條目（共CD）"
+                # 有條目＝有技能在鎖定中（共 CD 覆蓋全部技能，不只首發
+                # 那顆——輪迴的 947 就會擋 946）→ 等它消失，每拍重看。
+                self._open_next = max(self._open_next, now + 0.05)
+                self._oplog("hold-cd", "等CD：鎖定清單還有條目（共CD）"
                             f" {[s for _a, s in marks]}")
-        # ② 共 CD 的查表等待：距離上一次送出**任何**技能，要滿
-        #   lockout(那一顆)+lockout(首發)（前置+後置的和，magic.xml 查表）。
-        #   嵐狐實測邊界：947→946 在 1.5s 仍被拒、2.0s（=1.0+1.0 的表和）
-        #   放得出去。清單的盲區（邊走邊放不留條目）也靠這條蓋住。
-        if self._last_cast is not None:
-            lt, lsid = self._last_cast
-            lk = ((skills.lockout_of(lsid) or 0)
-                  + (skills.lockout_of(sid) or 0)) or OPENER_GAP
-            if now - lt < lk:
-                self._open_next = max(self._open_next, lt + lk)
-                self._oplog("hold-shared",
-                            f"等共CD：{lsid} 後 {lk:.1f}s 內不送首發（查表）")
-        # ③ 首發自己的間隔保險（表缺值時的退路）。
-        if now < self._open_cool:
-            self._open_next = max(self._open_next, self._open_cool)
-            self._oplog("hold-gap", "等首發自己的施放鎖定過（查表）")
+            else:
+                # 清單空＝最後一發**受理**的後搖已結束 → 再等首發自己的
+                # 前置+後置（查表）就緒。嵐狐實測：條目消失後 1.0s
+                # （=946 表值）就放得出去（總長 2.0s＝實測邊界吻合）。
+                lk = skills.lockout_of(sid) or OPENER_GAP
+                ready = self._ring_free + lk
+                if now < ready:
+                    self._open_next = max(self._open_next, ready)
+                    self._oplog("hold-shared",
+                                f"共CD：清單清空後再等 {lk:.1f}s（查表）")
+        else:
+            # 清單讀不到（重建空窗）→ 退回保守計時：距上一次送出任何
+            # 技能要滿 lockout(那顆)+lockout(首發)（查表和）。
+            if self._last_cast is not None:
+                lt, lsid = self._last_cast
+                lk = ((skills.lockout_of(lsid) or 0)
+                      + (skills.lockout_of(sid) or 0)) or OPENER_GAP
+                if now - lt < lk:
+                    self._open_next = max(self._open_next, lt + lk)
+                    self._oplog("hold-shared", "共CD（清單讀不到，保守計時）")
+            if now < self._open_cool:
+                self._open_next = max(self._open_next, self._open_cool)
         # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
         #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
         #   會被當成「沒在等」。
@@ -1093,6 +1125,8 @@ class KeyWorker(_Paced):
                 self._sel = None       # 沒目標了，下一隻要重新送「選定」
                 self._open_eid = None  # 首發：下一隻重新上鎖
                 self.open_wait = 0.0
+                if self.opener_vk:     # 換怪空檔也要盯共CD時鐘（見 _track_ring）
+                    self._track_ring(time.perf_counter())
                 # ★★★ **沒有目標就絕對不出手。**
                 #   底下那條「快捷欄叫不動就送鍵」的退路（`_send_scan`）
                 #   不看 eid，而按 F 鍵放技能時**遊戲會自己挑一隻最近的敵人
@@ -1117,6 +1151,8 @@ class KeyWorker(_Paced):
                 #   （被 early return 餓死的狀態機，見 [[frozen-tick-state-machines]]）。
                 #   鎖本身（_open_eid/_opened）留著，回到射程內接著等就好。
                 self.open_wait = 0.0
+                if self.opener_vk:     # 走過去的空檔也要盯共CD時鐘
+                    self._track_ring(time.perf_counter())
                 return
             # ★★★ 換圖／死亡復活／重連的實體重建空窗：這一拍**整輪不出手**
             #   （2026-08-16，崩潰 dump 8/13＋8/15 定案）。遊戲的 usequickkey
