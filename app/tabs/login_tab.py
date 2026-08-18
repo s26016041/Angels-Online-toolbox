@@ -99,6 +99,10 @@ WAIT_INGAME_MS = 25000        # 等真的進到遊戲裡
 #   單台斷線 連線消失超過寬限、網路又是通的（被踢、單線抽風）
 #           → 同崩潰處置。重登前先探登入伺服器的門 —— 維修中就等，
 #             不白開遊戲（伺服器端點讀 server.xml，見 app/core/nethealth.py）
+#   官方維修 有分身掉線、網路實測是通的、登入伺服器的門卻關著（端口不應答）
+#           → 只彈一次「官方維修」警告視窗，分身不關、也不重登 ——
+#             使用者指定（2026-08-18）。門重新開了才恢復上面的正常處置
+#             （凍住的分身那時才會被關掉、自動登回去）。
 AR_TICK_MS = 2000        # 監看節奏。一拍＝列視窗＋查TCP表＋（必要時）發背景探測
 AR_DIALOG_TICKS = 2      # 連續幾拍看到錯誤對話框才算數（防一閃而過的正常視窗）
 # 單台連線消失多久才處置。換頻＝斷線重連（實測約 1 秒），寬限一定要吃得下它；
@@ -237,6 +241,8 @@ class LoginTab(BaseTab):
             "    等網路回來再一鍵登入弄回去\n"
             "  · 崩潰（彈出錯誤視窗／遊戲視窗消失）→ 關掉那台再登回去\n"
             "  · 單台斷線（被踢）→ 同崩潰處置\n"
+            "  · 官方維修（掉線但登入伺服器沒開門）→ 只彈警告視窗，\n"
+            "    不關遊戲、不重登，等開門後才自動接手\n"
             "重登走上面「一鍵登入」的流程，所以帳號要先在清單存過帳密；\n"
             "重登前會先探登入伺服器 —— 維修中不會白開遊戲，等開門才動。\n"
             "⚠ 開著這個時手動關遊戲會被它自動開回來，要自己關請先取消勾選。")
@@ -259,6 +265,8 @@ class LoginTab(BaseTab):
         self._ar_online: dict[str, int] = {}    # 上一拍在線的帳號 -> pid
         self._ar_tcp_lost: dict[int, float] = {}  # pid -> 連線消失起算時間
         self._ar_dialog: dict[int, int] = {}    # pid -> 連續幾拍看到錯誤視窗
+        self._ar_maint = False           # 官方維修中：只警告，不殺分身不重登
+        self._ar_maint_box: QMessageBox | None = None
         # 背景探測結果（背景執行緒寫、這裡讀；單筆指派在 CPython 是原子的）
         self._ar_net = {"ok": None, "ts": 0.0, "busy": False}
         self._ar_srv = {"ok": None, "ts": 0.0, "busy": False}
@@ -804,6 +812,7 @@ class LoginTab(BaseTab):
         self._ar_online.clear()
         self._ar_tcp_lost.clear()
         self._ar_dialog.clear()
+        self._ar_maint = False
         self._ar_net_up_since = None
         self._ar_retry_at = 0.0
         self._ar_retry_gap = AR_RETRY_BASE
@@ -847,15 +856,35 @@ class LoginTab(BaseTab):
             return None
         return holder["ok"]
 
-    def _ar_srv_addr(self) -> tuple[str, int] | None:
-        """要回連的帳號所屬伺服器的登入端點（探「維修結束了沒」用）。"""
+    def _ar_srv_addr(self, accts=None) -> tuple[str, int] | None:
+        """帳號所屬伺服器的登入端點（探「門開著沒＝維修結束了沒」用）。
+
+        accts 不給＝看要回連的名單（重登閘門用）；給的話看指定帳號
+        （維修偵測要看的是「正在掉線」的帳號，那時還沒進回連名單）。"""
+        pool = set(self._ar_want if accts is None else accts)
         names = {str(a.get("server") or "") for a in self._accounts
-                 if a["account"] in self._ar_want}
+                 if a["account"] in pool}
         names.discard("")
         game_dir = self._game_dir()
         if not names or not game_dir:
             return None
         return nethealth.login_server_addr(game_dir, sorted(names)[0])
+
+    def _ar_maint_warn(self, addr: tuple[str, int]) -> None:
+        """官方維修的警告視窗。⚠ 只能 show() 不能 exec()：這裡在監看
+        計時器的節拍裡，強制回應會把監看跟整個 UI 一起卡住。"""
+        if self._ar_maint_box is not None and self._ar_maint_box.isVisible():
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("官方維修")
+        box.setText(
+            f"偵測到官方維修：登入伺服器 {addr[0]}:{addr[1]} 沒開門。\n\n"
+            "分身不會被關閉、也不會自動重登。\n"
+            "等伺服器重新開門後，自動回連才會接手把帳號登回去。")
+        box.show()
+        box.raise_()
+        self._ar_maint_box = box
 
     def _ar_tick(self) -> None:
         if not self.ar_box.isChecked():
@@ -974,6 +1003,38 @@ class LoginTab(BaseTab):
                 self._ar_status("全部分身同時掉線，確認網路中…")
                 # 還不知道是不是斷網 → 這一拍先不動手（單台寬限照樣在數）
 
+        # ── 官方維修：有分身掉線、網路實測是通的、登入伺服器的門卻關著 ──
+        # 只彈一次警告視窗，分身不關、也不重登（使用者指定 2026-08-18）；
+        # 門重新開了才恢復下面的正常處置。維修 vs 伺服器故障從外面分不
+        # 出來，一律當維修。door：True＝開門／探不到端點（照舊處置）、
+        # False＝關著、None＝探測還沒回來（這一拍先不動手）。
+        door = True
+        addr = None
+        if lost:
+            self._kick_probe(self._ar_net, nethealth.internet_up)
+            if self._ar_fresh(self._ar_net):
+                addr = self._ar_srv_addr(
+                    a for a, w in logged.items() if w.pid in lost)
+                if addr is not None:
+                    self._kick_probe(self._ar_srv,
+                                     lambda: nethealth.server_up(addr))
+                    door = self._ar_fresh(self._ar_srv)
+        elif self._ar_maint:
+            self._ar_maint = False    # 沒有分身在掉線＝維修已與我們無關
+        if door is False:
+            if not self._ar_maint:
+                self._ar_maint = True
+                self._ar_log(f"官方維修：登入伺服器 {addr[0]}:{addr[1]} "
+                             "沒開門 —— 分身不關、不重登，等開門")
+                self._ar_maint_warn(addr)
+            self._ar_status(f"⚠ 官方維修中（登入伺服器 {addr[0]}:{addr[1]} "
+                            "沒開門）—— 不關遊戲、不重登，開門後自動接手")
+            self._ar_online = {a: w.pid for a, w in logged.items()}
+            return
+        if door is True and self._ar_maint:
+            self._ar_maint = False
+            self._ar_log("登入伺服器開門了 —— 維修結束，恢復正常處置")
+
         # 單台處置：崩潰彈窗立刻處理；連線消失要過寬限（吃下換頻瞬斷）
         for acct, w in logged.items():
             if w.pid in crashed:
@@ -982,7 +1043,8 @@ class LoginTab(BaseTab):
                 injector.kill_process(w.pid)
             elif (w.pid in self._ar_tcp_lost
                   and now - self._ar_tcp_lost[w.pid] >= AR_TCP_GRACE
-                  and self._ar_fresh(self._ar_net) is not False):
+                  and self._ar_fresh(self._ar_net) is not False
+                  and door is not None):   # None＝維修探測還沒回來，先不殺
                 self._ar_mark(acct, "連線中斷（網路正常 → 被踢或伺服器端）")
                 self._ar_log(f"結束斷線凍住的分身 pid={w.pid}（{acct}）")
                 injector.kill_process(w.pid)

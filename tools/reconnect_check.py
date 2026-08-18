@@ -3,7 +3,8 @@
 驗自動登入分頁的自動回連狀態機（0.4.33 起勾選與監看都住在 login_tab）：
 斷網全關等網重登、崩潰彈窗連兩拍才動手、視窗消失不重複殺、
 單台斷線寬限吃得下換頻瞬斷、維修閘門擋住白開遊戲、
-沒存帳密只報一次不無限重試、重登失敗退避重試、手動登入中不誤判。
+沒存帳密只報一次不無限重試、重登失敗退避重試、手動登入中不誤判、
+官方維修只彈一次警告不殺不重登、開門後才接手。
 
 作法照 tools/watch_check.py：offscreen Qt＋假遊戲層＋假時鐘，
 假物件 patch 進**用到它的模組**的命名空間，探測改成同步跑。
@@ -356,6 +357,40 @@ try:
     tab2.on_close()
 finally:
     login_tab.config = old_cfg
+
+# ======================================================================
+print("S10 官方維修：掉線但門關著 → 彈警告、不殺不重登；開門後才接手")
+reset()
+WARNED: list = []
+_real_warn = TAB._ar_maint_warn
+TAB._ar_maint_warn = lambda addr: WARNED.append(addr)
+try:
+    put(91, "A")
+    put(92, "B")
+    tick()                      # 學會目前在線名單
+    SRV_UP[0] = False           # 維修：門關了
+    EST.clear()                 # 全部被踢，網路是通的
+    tick(secs=2.0, n=20)        # 40 秒，遠超過單台寬限
+    check("維修中不殺任何分身", not KILLED, f"KILLED={KILLED}")
+    check("維修中不重登", not LT.calls, f"calls={LT.calls}")
+    check("警告視窗只彈一次", len(WARNED) == 1, f"WARNED={WARNED}")
+    check("狀態寫官方維修", "官方維修" in TAB.ar_lbl.text(), TAB.ar_lbl.text())
+    check("分身視窗都還在", 91 in WINDOWS and 92 in WINDOWS)
+    SRV_UP[0] = True            # 維修結束、開門
+    tick(secs=61.0)             # 舊探測過期 → 重探 → 開門 → 恢復正常處置
+    tick(secs=7.0)
+    check("開門後才關掉凍住的分身", sorted(KILLED) == [91, 92],
+          f"KILLED={KILLED}")
+    check("開門後才重登", LT.calls and LT.calls[-1] == ["A", "B"],
+          f"calls={LT.calls}")
+finally:
+    TAB._ar_maint_warn = _real_warn
+
+# 真的開一次警告視窗（非強制回應、offscreen 下不會卡）——驗 Qt 呼叫不會炸
+_real_warn(("1.2.3.4", 18111))
+check("警告視窗開得出來", TAB._ar_maint_box is not None
+      and TAB._ar_maint_box.isVisible())
+TAB._ar_maint_box.close()
 
 # ======================================================================
 print()
