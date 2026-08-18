@@ -2161,7 +2161,8 @@ class CharFarmPage(QWidget):
             "清單是空的就原地不動。**不想巡邏就把點全部刪掉。**\n"
             "・追怪不限距離 —— 只要周圍還有選中的怪，多遠都會走過去打。\n"
             "・只走「目前這張地圖」的巡邏點；這張圖一個點都沒有就原地不動。\n"
-            "　 同一張圖的不同分流算同一張，會照走。")
+            "　 同一張圖的不同分流算同一張，會照走。\n"
+            "・在點上按右鍵：用天使趴趴GO飛到那個點所在的地圖。")
         # 每一列是「編號. 地圖名 (x, y)」，最長的地圖名有 7 個字
         # （專家級遺落之地／史萊姆晴空牧場）—— 太窄會被切掉。
         sv = QVBoxLayout(spot)
@@ -2170,6 +2171,9 @@ class CharFarmPage(QWidget):
         self.spot_list.setMaximumHeight(NEAR_MAX)
         self.spot_list.setSelectionMode(QListWidget.ExtendedSelection)
         no_elide(self.spot_list)
+        # ★ 右鍵選單：「用天使趴趴GO飛到這張圖」（2026-08-18 使用者要求）。
+        self.spot_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.spot_list.customContextMenuRequested.connect(self._spot_menu)
         sv.addWidget(self.spot_list)
         srow = QHBoxLayout()
         # ⚠ 字別太長：主題給按鈕的 padding 是左右各 14px，
@@ -3030,6 +3034,60 @@ class CharFarmPage(QWidget):
         self._forget_routes()          # 編號整個位移了，舊路線全部作廢
         self._refresh_spots()
         self._save_settings()
+
+    def _spot_menu(self, pos) -> None:
+        """巡邏點清單的右鍵選單：用天使趴趴GO飛到那個點所在的地圖。
+
+        ⚠ 落點是趴趴GO在那張圖的傳送點（挑離巡邏點最近的），不是巡邏點
+          本身 —— 掛機開著的話，落地掃不到怪自己會走去巡邏點。
+        """
+        it = self.spot_list.itemAt(pos)
+        if it is None:
+            return
+        row = self.spot_list.row(it)
+        if not 0 <= row < len(self._spots):
+            return                      # 清單跟資料不同步就寧可不出選單
+        x, y, sid = self._spots[row]
+        menu = QMenu(self.spot_list)
+        act = menu.addAction("✈ 用天使趴趴GO飛到這張圖")
+        # 飛不了的原因直接寫在選單項上（QMenu 的滑鼠提示預設不顯示）
+        if sid is None:
+            act.setEnabled(False)
+            act.setText("✈ 這個點沒記地圖，不能飛（刪掉重加）")
+        elif jumpmap.nearest(sid, x, y) is None:
+            # 表裡沒這張圖的落點（或 jumpmap.tsv 缺檔）→ 拒絕動作，不猜
+            act.setEnabled(False)
+            act.setText(f"✈ 趴趴GO沒有去{scene.scene_name(sid)}的傳送點")
+        # pos 是 viewport 座標（QListWidget 的右鍵事件發在 viewport 上）
+        if menu.exec(self.spot_list.viewport().mapToGlobal(pos)) is act:
+            self._fly_to_spot(row)
+
+    def _fly_to_spot(self, row: int) -> None:
+        """真的送趴趴GO傳送包（右鍵選單觸發）。
+
+        跟回程補給的 `_jump_step` 同一套路（nearest → teleport），但這是
+        使用者手點的一次性動作：送不出去就把原因寫在狀態列，**不重試**
+        （要重試再點一次右鍵就好，不值得掛計時器）。
+        ⚠ teleport 只保證「封包送出去了」，到不到得看伺服器。
+        """
+        x, y, sid = self._spots[row]
+        if sid is None:
+            return
+        e = jumpmap.nearest(sid, x, y)
+        if e is None:
+            self.status.setText(f"⚠ 趴趴GO沒有去{scene.scene_name(sid)}的傳送點")
+            return
+        if not self._ensure_mover():
+            self.status.setText("⚠ 無法啟用移動，趴趴GO送不出去")
+            return
+        ok, msg = jumpmap.teleport(self._mover, self.sc, e.jump_id)
+        if not ok:
+            self.status.setText(f"⚠ 趴趴GO送不出去（{msg}）")
+            return
+        # 傳送會換地圖：快取位址全作廢＋導航重來（跟 _jump_step 同一套）。
+        self._drop_cached_addrs()
+        self._forget_routes()
+        self.status.setText(f"✈ {msg}")
 
     def _ensure_mover(self) -> bool:
         """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。
