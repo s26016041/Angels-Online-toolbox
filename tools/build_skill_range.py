@@ -54,32 +54,24 @@ def main() -> None:
         #   吸血鬼系的召喚物就不叫「吸血鬼Ⅲ」，比名字＝永遠認不到＝每 6 秒白放
         #   （朋友實掛踩到的 bug）。⚠ 非召喚型的 動態參數1 是別的意思，不能抽。
         smn = (a.get("動態參數1", "") if a.get("召喚型") == "是" else "")
-        # ★ 第 6/7 欄：前置時間／後置時間（毫秒）——「施放鎖定」的長度。
-        #   magic.xml **沒有**冷卻時間欄，前後搖就是這遊戲的技能 CD；
-        #   掛機首發拿它當「打下一隻前要等多久」的查表值（skills.lockout_of）。
         rows.append((int(a["編號"]), int(float(rng or 0)), a.get("對象", ""),
                      1 if a.get("攻擊型") == "是" else 0,
-                     int(float(smn)) if smn else "",
-                     int(float(a.get("前置時間") or 0)),
-                     int(float(a.get("後置時間") or 0))))
+                     int(float(smn)) if smn else ""))
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    body = "".join(f"{i}\t{r}\t{t}\t{k}\t{s}\t{pre}\t{post}\n"
-                   for i, r, t, k, s, pre, post in rows)
+    body = "".join(f"{i}\t{r}\t{t}\t{k}\t{s}\n" for i, r, t, k, s in rows)
     OUT.write_bytes(gzip.compress(body.encode("utf-8"), 9))
     print(f"技能 {len(rows)} 個 → {OUT}（{OUT.stat().st_size / 1024:.0f} KB）")
-    ground = sum(1 for row in rows if row[2] == "地面")
-    atk = sum(1 for row in rows if row[3])
-    smn_n = sum(1 for row in rows if row[4] != "")
-    lock_n = sum(1 for row in rows if row[5] or row[6])
+    ground = sum(1 for _i, _r, t, _k, _s in rows if t == "地面")
+    atk = sum(1 for _i, _r, _t, k, _s in rows if k)
+    smn_n = sum(1 for _i, _r, _t, _k, s in rows if s != "")
     print(f"   其中對象=地面（要指定位置）{ground} 個、攻擊型 {atk} 個、"
-          f"召喚型 {smn_n} 個、有前置/後置 {lock_n} 個")
-    for probe in (737, 743, 257, 920, 330, 259, 150, 781, 946):
+          f"召喚型 {smn_n} 個")
+    for probe in (737, 743, 257, 920, 330, 259, 150, 781):
         hit = next((r for r in rows if r[0] == probe), None)
         print(f"   驗證 {probe}（{probe:#x}）→ 射程 {hit[1] if hit else '?'}"
               f" 對象 {hit[2] if hit else '?'} 攻擊型 {hit[3] if hit else '?'}"
-              f" 召喚 {hit[4] if hit else '?'}"
-              f" 前置 {hit[5] if hit else '?'} 後置 {hit[6] if hit else '?'}")
+              f" 召喚 {hit[4] if hit else '?'}")
 
 
 if __name__ == "__main__":
