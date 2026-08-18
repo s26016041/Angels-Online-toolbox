@@ -384,10 +384,11 @@ ROUND_GAP = 0.10
 # 0.1 秒重送的話，回音抵達前可能被**多受理一發**（瞬移就多傳一次＝亂放）。
 # 確認是 40Hz 輪詢，回音一到立刻解鎖，不會等滿這個數。
 OPENER_GAP = 2.5
-# ↑ 首發「送出一次之後，至少隔這麼久才准送下一次（下一隻怪）」的間隔
-#   保險。環清單看得到的 CD（條目在）會精確地等；這個間隔蓋的是清單的
-#   盲區 —— 邊走邊放的那一發不留條目（live_farm_ring_watch 實錄）。
-#   2.5 秒 > 全部技能的前置+後置上限（magic.xml 最大一級 ~2.1 秒）。
+# ↑ 首發間隔保險的**退路值**：正常走 `skills.lockout_of(技能)`＝magic.xml
+#   的 前置+後置（毫秒，逐技能查表 —— 使用者 8/18 指定：不做技能客製化、
+#   不准猜、查表可以）。表裡查不到那一筆才用這個保守值
+#   （> 全部技能的前置+後置上限 ~2.1 秒）。環清單看得到的 CD（條目在）
+#   會精確地等；間隔保險蓋的是清單盲區 —— 邊走邊放不留條目。
 # 位移類（非攻擊）對地首發的施放距離上限。出處：順移技能實測 ——
 # **8 格內誤差 0、12 格無效**。照怪的位置（掛機站 8~12 格）放瞬移，
 # 伺服器收包、MP 照扣，但人不動＝白放。夾進有效距離，傳送才真的發生。
@@ -667,6 +668,8 @@ class KeyWorker(_Paced):
         self._open_cool = 0.0       # 上一次送首發 + OPENER_GAP（間隔保險）
         self._open_next = 0.0       # 這個時間之前不送首發（CD 中的等待）
         self._terrain = None        # 位移類首發夾落點用的地形快取（懶載）
+        self.account = ""           # 這個分頁的帳號（首發日誌檔名用）
+        self._op_state = ""         # 首發日誌去重鍵（同狀態不重複寫）
         self._open_since = 0.0
         self.open_wait = 0.0        # 已經等了幾秒（GUI 讀：0 = 沒在等）
         self.open_note = ""         # 跳過首發的原因（GUI 取走後自己清掉）
@@ -866,6 +869,23 @@ class KeyWorker(_Paced):
             self.skills = {**self.skills, vk: sid}
             self._learning = False
 
+    def _oplog(self, key: str, msg: str) -> None:
+        """首發決策日誌（**永遠開著**、只記轉折）：farm_opener_{帳號}.log。
+
+        為什麼常開不用環境變數：首發的錯幾乎都是「安靜地沒放／多放」，
+        事後只能用猜的（這一輪已經猜錯四次）。一隻怪只寫幾行
+        （上鎖→等待原因→送出／跳過），量極小；同一個狀態不重複寫。
+        """
+        if key == self._op_state:
+            return
+        self._op_state = key
+        try:
+            with open(f"farm_opener_{self.account or 'unknown'}.log", "a",
+                      encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except OSError:
+            pass
+
     def _sp_blocked(self, sid: int) -> str:
         """首發這一招現在放不出來，而且**等下去也不會好** → 回傳跳過的原因。
 
@@ -933,6 +953,9 @@ class KeyWorker(_Paced):
             # ★ 重選回同一隻不算新怪：這一隻已經放過就不再放（見 docstring）
             self._opened = (eid == self._open_done_eid)
             self._open_since = now
+            self._op_state = ""
+            self._oplog("lock", f"上鎖 eid={eid:#x} 首發技能={sid}"
+                        + ("（同一隻重選→不重放）" if self._opened else ""))
         if self._opened:
             self.open_wait = 0.0
             return None
@@ -945,6 +968,7 @@ class KeyWorker(_Paced):
             self.open_note = (f"⚠ 移動跳板不在，對地首發"
                               f"「{skills.name_of(sid) or sid}」放不出來，"
                               "這一隻跳過")
+            self._oplog("skip-mover", self.open_note)
             return None
         # ★ SP 不夠（或分不出來）→ 放行其他招，別站在那裡等一個不會好的條件。
         why = self._sp_blocked(sid)
@@ -952,6 +976,7 @@ class KeyWorker(_Paced):
             self._opened = True
             self.open_wait = 0.0
             self.open_note = why
+            self._oplog("skip-sp", why)
             return None
         # ── 等 CD 好 ──
         # ① 環清單裡還有它的條目＝CD／後搖中 → 把送出時間往後推。
@@ -965,9 +990,13 @@ class KeyWorker(_Paced):
                 present = any(s == sid for _a, s in marks)
             if present:
                 self._open_next = max(self._open_next, now + 0.3)
-        # ② 自己的間隔保險：距離上一次送首發太近，一律不送。
+                self._oplog("hold-cd", f"等CD：施放鎖定清單裡還有 {sid}")
+        # ② 查表的間隔保險：距離上一次送首發不到它的施放鎖定時間
+        #   （前置+後置，magic.xml 逐技能查表）就不送 —— 蓋住清單的盲區
+        #   （邊走邊放不留條目）。
         if now < self._open_cool:
             self._open_next = max(self._open_next, self._open_cool)
+            self._oplog("hold-gap", "等施放鎖定時間過（前置+後置，查表）")
         # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
         #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
         #   會被當成「沒在等」。
@@ -1157,6 +1186,7 @@ class KeyWorker(_Paced):
             self._next_round = now + ROUND_GAP
             struck = False
             sent_opener = False        # 這一輪首發**真的**送出去了嗎
+            opener_blocked = False     # 首發被自己的射程擋下（等走近）
             if mode == MODE_PACKET and packets and eid and mover is not None:
                 for k in usable:
                     sid = bykey.get(k)
@@ -1171,6 +1201,12 @@ class KeyWorker(_Paced):
                     #   「站得遠、叫快捷鍵讓遊戲自己走過去」（見 client_walk）。
                     if (not self.client_walk and dist_now is not None
                             and dist_now > self.reach_of(sid)):
+                        # ★★ 首發被自己的射程擋下＝**這一輪 hold**，等走近
+                        #   （8/18 嵐狐：接戰常落在射程邊緣，這裡以前會漏到
+                        #   送鍵退路按一下無效鍵、還把首發標成「送過了」→
+                        #   開場沒放首發就進輪迴）。
+                        if k == opener:
+                            opener_blocked = True
                         continue
                     # 依射程分流（使用者定的）：≤ QUICKKEY_RANGE 叫遊戲的
                     # 快捷鍵，超過就送帶 ID＋座標的施放封包；對地技能一律封包。
@@ -1200,8 +1236,12 @@ class KeyWorker(_Paced):
                     struck = struck or ok
                     if ok and k == opener:
                         sent_opener = True
-            if not struck:
+                        self._oplog("sent", f"首發送出（{'封包' if by_packet else '快捷鍵'}）"
+                                    f"技能={sid} 距離="
+                                    f"{'?' if dist_now is None else round(dist_now, 1)}")
+            if not struck and not opener_blocked:
                 # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵。
+                # ⚠ 首發被射程擋下的那一輪**不走退路**（見上面 hold）。
                 # ⚠ 送鍵一次要按住 40ms，一輪送一個就好（見 [[key-send-hold]]）。
                 # ⚠⚠ **對地技能絕不送鍵**（8/18）：按鍵會跳出「選範圍」游標
                 #   掛在畫面上等人點地板（對地一律走封包是使用者定的規則）。
@@ -1215,18 +1255,27 @@ class KeyWorker(_Paced):
                     self._rot += 1
                     if vk == opener:
                         sent_opener = True
+                        self._oplog("sent", "首發送出（送鍵退路）")
                     if self._learning:
                         self._learn(vk)        # 剛按過鍵，順手讀一下
+            if opener is not None and opener_blocked and not sent_opener:
+                self._oplog("hold-reach", "等走近：首發超出自己的射程 距離="
+                            f"{'?' if dist_now is None else round(dist_now, 1)}")
             if opener is not None and sent_opener:
                 # ★★★ 首發＝**只放這一次**（使用者 8/18 逐字定案：開頭放，
                 #   之後不能再放）。送出去立刻解鎖接輪迴，**不驗證、不重試**
                 #   —— 每一條「確認訊號」都有實測盲區，卡在盲區上重試就是
                 #   之前「首發一直放」的根源。這一隻（eid）從此不再放；
-                #   下一隻要先等 CD（環清單）＋間隔保險（OPENER_GAP）。
+                #   下一隻要先等 CD：環清單條目＋這顆技能自己的施放鎖定
+                #   時間（前置+後置，magic.xml **逐技能查表**——使用者
+                #   8/18 指定：不做技能客製化、不准猜，但查表可以）。
                 self._opened = True
                 self._open_done_eid = eid
-                self._open_cool = now + OPENER_GAP
+                osid = bykey.get(opener)
+                lock_s = skills.lockout_of(osid or 0)
+                self._open_cool = now + (lock_s if lock_s else OPENER_GAP)
                 self.open_wait = 0.0
+                self._oplog("done", "首發完成→接輪迴")
         except Exception:                      # noqa: BLE001
             pass
 
@@ -4076,6 +4125,7 @@ class CharFarmPage(QWidget):
         #   學法：直讀快捷欄那格（quickbar.py），通常當場拿到；讀不到才退回
         #   「清零→按鍵→讀殘留」。學到之前用按鍵攻擊（本來就有效），不會空等。
         self._keys.stats = self.stats          # 清零要用，先確保是最新的
+        self._keys.account = self.account      # 首發決策日誌的檔名用
         self._keys.begin_learning()
         self._ensure_mover()               # 選怪／移動都要用它的跳板
         self._keys.mover = self._mover if (

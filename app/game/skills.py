@@ -89,6 +89,7 @@ _ranges: dict[int, int] | None = None
 _targets: dict[int, str] | None = None
 _attacks: set[int] | None = None
 _summons: dict[int, int] | None = None
+_lockouts: dict[int, float] | None = None
 
 GROUND = "地面"          # 對象＝地面：施放要指定位置（見 is_ground）
 
@@ -99,9 +100,10 @@ def _load_ranges() -> None:
     第一次用到才載入。第 5 欄可能不存在（舊版資料檔）——缺了就是查不到，
     呼叫端（summon_of）自己退回安全預設。
     """
-    global _ranges, _targets, _attacks, _summons
+    global _ranges, _targets, _attacks, _summons, _lockouts
     if _ranges is not None:
         return
+    lck: dict[int, float] = {}
     rng: dict[int, int] = {}
     tgt: dict[int, str] = {}
     atk: set[int] = set()
@@ -118,9 +120,26 @@ def _load_ranges() -> None:
                     atk.add(int(p[0]))
                 if len(p) >= 5 and p[4]:
                     smn[int(p[0])] = int(p[4])
+                # 第 6/7 欄：前置時間／後置時間（毫秒，magic.xml 抄的）。
+                # 舊版資料檔沒有這兩欄 —— 缺了就是查不到（lockout_of 回 None）。
+                if len(p) >= 7 and (p[5] or p[6]):
+                    lck[int(p[0])] = (int(p[5] or 0) + int(p[6] or 0)) / 1000.0
     except Exception:                                      # noqa: BLE001
-        rng, tgt, atk, smn = {}, {}, set(), {}
-    _ranges, _targets, _attacks, _summons = rng, tgt, atk, smn
+        rng, tgt, atk, smn, lck = {}, {}, set(), {}, {}
+    _ranges, _targets, _attacks, _summons, _lockouts = rng, tgt, atk, smn, lck
+
+
+def lockout_of(skill_id: int) -> float | None:
+    """這一招的「施放鎖定時間」（前置+後置，**秒**）；查不到回 None。
+
+    出處：magic.xml 的 前置時間／後置時間 欄（毫秒，tools/build_skill_range.py
+    抄進 skill_range.tsv.gz 第 6/7 欄）。⚠ magic.xml **沒有**「冷卻時間」欄
+    （377 欄逐一確認過）——這遊戲的技能 CD 就是前後搖這一段；掛機首發拿它
+    當「打下一隻前要等多久才准再放」的查表依據（使用者指定：不做技能
+    客製化、不准猜，查表可以）。
+    """
+    _load_ranges()
+    return (_lockouts or {}).get(int(skill_id or 0))
 
 
 def is_attack(skill_id: int) -> bool:
