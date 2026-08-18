@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -116,6 +117,9 @@ AR_RETRY_CAP = 300.0
 # 登入流程的看門狗：每帳號每一步都有自己的逾時（開遊戲 60s、進遊戲 25s…），
 # 五個帳號全走一遍也遠不到這個數。這道是「狀態機凍死」的最後保險，不是節奏控制。
 AR_LOGIN_WATCHDOG = 600.0
+# 「紀錄」視窗的欄位與保留筆數（從程式開啟以來，記憶體裡，關程式就沒了）。
+AR_HIST_COLS = ("時間", "帳號", "角色", "事件")
+AR_HISTORY_MAX = 500
 
 
 def _spawn(fn) -> None:
@@ -252,6 +256,12 @@ class LoginTab(BaseTab):
             "login.auto_reconnect", config.get("multi.auto_reconnect", False))))
         self.ar_box.toggled.connect(self._ar_toggled)
         ar_row.addWidget(self.ar_box)
+        self.ar_hist_btn = QPushButton("紀錄")
+        self.ar_hist_btn.setToolTip(
+            "從程式開啟以來的自動回連事件：哪個帳號（角色）在幾點\n"
+            "斷線／斷網／崩潰、有沒有救回來。關閉程式就清空。")
+        self.ar_hist_btn.clicked.connect(self._ar_show_history)
+        ar_row.addWidget(self.ar_hist_btn)
         self.ar_lbl = QLabel("")
         self.ar_lbl.setWordWrap(True)
         self.ar_lbl.setStyleSheet("color: #9aa2b8;")
@@ -274,6 +284,14 @@ class LoginTab(BaseTab):
         self._ar_retry_at = 0.0
         self._ar_retry_gap = AR_RETRY_BASE
         self._ar_login_started = 0.0
+        # 「紀錄」的事件歷史（時間, 帳號, 角色, 事件），最新的在最前面。
+        # ⚠ 不在 _ar_reset 裡清：那是稽核紀錄，切個勾選不該把歷史洗掉。
+        self._ar_history: list[tuple[str, str, str, str]] = []
+        # 帳號 -> 最後一次看到的角色名。掉線之後記憶體讀不到了，所以要在
+        # 在線的每一拍順手記下來（純查 preload 快取，不掃記憶體）。
+        self._ar_names: dict[str, str] = {}
+        self._ar_hist_dlg: QDialog | None = None
+        self._ar_hist_table: QTableWidget | None = None
 
         self.status_label = QLabel("就緒")
         self.status_label.setStyleSheet("color: #9aa2b8;")
@@ -831,6 +849,67 @@ class LoginTab(BaseTab):
         if acct and acct not in self._ar_dropped and acct not in self._ar_want:
             self._ar_want[acct] = why
             self._ar_log(f"{acct}：{why} → 排入回連")
+            self._ar_record(acct, why)
+
+    def _ar_record(self, acct: str, event: str) -> None:
+        """記一筆進「紀錄」視窗的歷史（時間／帳號／角色／事件）。
+
+        ★ 只記**事件**（斷網、崩潰、被踢、回連成功、維修…），處置細節
+          （殺哪個 pid）留在 stderr 的稽核 log —— 這張表是給使用者看
+          「昨晚誰出了什麼事」，不是給工程師追 bug 的。
+        ★ 視窗開著時**插一列**更新，不整張重畫（qt-ui-pitfalls 5d：
+          追加式紀錄表全表重畫會越記越卡）。
+        """
+        row = (time.strftime("%m/%d %H:%M:%S"), acct,
+               self._ar_names.get(acct, ""), event)
+        self._ar_history.insert(0, row)
+        del self._ar_history[AR_HISTORY_MAX:]
+        tbl = self._ar_hist_table
+        if tbl is not None and self._ar_hist_dlg is not None \
+                and self._ar_hist_dlg.isVisible():
+            tbl.insertRow(0)
+            for c, text in enumerate(row):
+                tbl.setItem(0, c, QTableWidgetItem(text))
+            while tbl.rowCount() > AR_HISTORY_MAX:
+                tbl.removeRow(tbl.rowCount() - 1)
+
+    def _ar_show_history(self) -> None:
+        """「紀錄」鈕：開（或叫回）事件歷史視窗。非強制回應，開著照樣監看。"""
+        if self._ar_hist_dlg is not None and self._ar_hist_dlg.isVisible():
+            self._ar_hist_dlg.raise_()
+            self._ar_hist_dlg.activateWindow()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("自動回連紀錄")
+        dlg.resize(720, 340)
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(f"從程式開啟以來的自動回連事件，最新的在最上面"
+                      f"（最多保留 {AR_HISTORY_MAX} 筆，關閉程式就清空）。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9aa2b8;")
+        lay.addWidget(hint)
+        tbl = QTableWidget(0, len(AR_HIST_COLS))
+        tbl.setHorizontalHeaderLabels(AR_HIST_COLS)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.NoSelection)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setAlternatingRowColors(True)
+        hh = tbl.horizontalHeader()
+        # ⚠ 不開 ResizeToContents（qt-ui-pitfalls 5d）：前三欄內容寬度可預期，
+        #   照字寬釘一次；「事件」吃剩下的寬度。
+        fm = tbl.fontMetrics()
+        hh.setSectionResizeMode(QHeaderView.Stretch)
+        for col, sample in ((0, "00/00 00:00:00"), (1, "w" * 14), (2, "字" * 6)):
+            hh.setSectionResizeMode(col, QHeaderView.Fixed)
+            hh.resizeSection(col, fm.horizontalAdvance(sample) + 24)
+        tbl.setRowCount(len(self._ar_history))
+        for r, cells in enumerate(self._ar_history):
+            for c, text in enumerate(cells):
+                tbl.setItem(r, c, QTableWidgetItem(text))
+        lay.addWidget(tbl)
+        self._ar_hist_dlg = dlg
+        self._ar_hist_table = tbl
+        dlg.show()
 
     def _kick_probe(self, holder: dict, fn) -> None:
         """需要新證據就發一次背景探測（會阻塞 2~3 秒，不能在 UI 執行緒跑）。"""
@@ -905,6 +984,11 @@ class LoginTab(BaseTab):
             a = self._account_of(w.title)
             if a:
                 logged[a] = w
+                # 角色名要趁在線時記：掉線後記憶體讀不到。純查 preload 快取
+                # （不帶 scanner 不會掃記憶體），沒快取時回傳帳號 → 不記。
+                nm = preload.name_of(w.pid, account=a)
+                if nm and nm != a:
+                    self._ar_names[a] = nm
 
         # ── 重登流程進行中：只等結果，不做偵測（登入中視窗開開關關全是假訊號）
         if self._ar_state == "wait_login":
@@ -917,6 +1001,7 @@ class LoginTab(BaseTab):
             for a in back:
                 self._ar_want.pop(a, None)
                 self._ar_log(f"{a}：已回到線上 ✅")
+                self._ar_record(a, "回連成功 ✅")
             self._ar_online = {a: w.pid for a, w in logged.items()}
             self._ar_state = "idle"
             if not self._ar_want:
@@ -990,6 +1075,9 @@ class LoginTab(BaseTab):
                 for acct, w in logged.items():
                     self._ar_mark(acct, "斷網")
                 self._ar_log(f"斷網確認：關閉全部 {len(wins)} 台分身")
+                self._ar_record("（全部）",
+                                f"斷網確認：關閉全部 {len(wins)} 台分身，"
+                                "等網路回來")
                 for w in wins:
                     injector.kill_process(w.pid)
                 self._ar_online.clear()
@@ -1026,6 +1114,8 @@ class LoginTab(BaseTab):
                 self._ar_maint = True
                 self._ar_log(f"官方維修：登入伺服器 {addr[0]}:{addr[1]} "
                              "沒開門 —— 分身不關、不重登，等開門")
+                self._ar_record("—", f"官方維修：登入伺服器 {addr[0]}:"
+                                     f"{addr[1]} 沒開門（不關遊戲、不重登）")
                 self._ar_maint_warn(addr)
             self._ar_status(f"⚠ 官方維修中（登入伺服器 {addr[0]}:{addr[1]} "
                             "沒開門）—— 不關遊戲、不重登，開門後自動接手")
@@ -1034,6 +1124,7 @@ class LoginTab(BaseTab):
         if door is True and self._ar_maint:
             self._ar_maint = False
             self._ar_log("登入伺服器開門了 —— 維修結束，恢復正常處置")
+            self._ar_record("—", "維修結束：登入伺服器開門了，恢復正常處置")
 
         # 單台處置：崩潰彈窗立刻處理；連線消失要過寬限（吃下換頻瞬斷）
         for acct, w in logged.items():
@@ -1052,6 +1143,8 @@ class LoginTab(BaseTab):
         for w in wins:
             if w.pid in crashed and not self._account_of(w.title):
                 self._ar_log(f"結束崩潰的未登入分身 pid={w.pid}")
+                self._ar_record("（未登入）", "崩潰（錯誤視窗）：已結束，"
+                                             "沒登入所以不用回連")
                 injector.kill_process(w.pid)
 
         self._ar_online = {a: w.pid for a, w in logged.items()}
@@ -1096,6 +1189,7 @@ class LoginTab(BaseTab):
             self._ar_want.pop(a, None)
             self._ar_dropped.add(a)
             self._ar_log(f"{a}：帳號清單沒存這個帳號的帳密，救不回來")
+            self._ar_record(a, "⚠ 無法回連：帳號清單沒存帳密")
         if gone:
             self._ar_status("⚠ 無法回連（帳號清單沒存帳密）："
                             + "、".join(sorted(self._ar_dropped)))
@@ -1110,6 +1204,7 @@ class LoginTab(BaseTab):
         self._ar_login_started = now
         self._ar_log("開始重登：" + "、".join(
             f"{a}（{why}）" for a, why in sorted(self._ar_want.items())))
+        self._ar_record("—", "開始重登：" + "、".join(sorted(self._ar_want)))
         self._ar_status("正在重新登入：" + "、".join(sorted(self._ar_want)))
 
     # ------------------------------------------------------------------

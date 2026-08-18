@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time as real_time
 import types
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -129,7 +130,10 @@ nethealth.internet_up = lambda: NET_UP[0]
 nethealth.server_up = lambda addr: SRV_UP[0]
 nethealth.login_server_addr = lambda gd, name: ("1.2.3.4", 18111)
 login_tab._spawn = lambda fn: fn()          # 探測同步跑，測試才是決定性的
-login_tab.time = types.SimpleNamespace(monotonic=lambda: CLOCK[0])
+# ⚠ strftime 要直通真的：假時鐘只控制 monotonic（流逝時間的判斷），
+#   「紀錄」視窗的顯示時間戳用哪一刻無所謂，但函式本身要存在。
+login_tab.time = types.SimpleNamespace(monotonic=lambda: CLOCK[0],
+                                       strftime=real_time.strftime)
 login_tab.config = FakeConfig()
 
 app = QApplication.instance() or QApplication([])
