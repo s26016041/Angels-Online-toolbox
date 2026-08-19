@@ -1570,7 +1570,10 @@ class CharFarmPage(QWidget):
         # 連續幾趟補給回來裝備**還是壞的**（≥2 就大聲停 —— 那不是暫時性失敗，
         #   多半是該城沒維修商／修裝一直失敗，重試只會每趟燒一張翼）。
         self._broken_trips = 0
-        self._dry = ""             # 哪一組藥水正見底（門閂：空著的期間只通知一次）
+        # 連續幾趟補給回來藥水**還是見底**（≥2 就大聲停 —— 買水一直買不進來
+        #   多半是金幣不夠／背包滿，重試只會每趟燒一張翼；跟壞裝煞車同一套）。
+        self._dry_trips = 0
+        self._dry = ""             # 哪一組藥水正見底（門閂：見底期間只通知一次）
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._recall_try = 0       # 回程第二段重試了幾次（見 _retry_recall）
         # 連續幾輪說「背包裡沒有回程道具」了（見 NO_RECALL_TRIES）。
@@ -1651,7 +1654,7 @@ class CharFarmPage(QWidget):
         #   「我用這程式是想練等快速，但如果需要休息、水跟不上，
         #     是不是不該打這裡」＋「我發現幾乎所有 BUG 都在這個坐下休息」。
         #   ★ 血魔跟不上有兩條既有的路接住，不必坐下：精靈自己吃藥水、
-        #     藥水整組用完就跑回程補給。
+        #     藥水見底（≤robot.POTION_LOW）就自動跑回程補給。
         #   ⚠ **不要因為「以防萬一」把它加回來**：那條路上實際查到的失效模式
         #     至少三個 —— 收尾階段的正回饋循環（誤判有怪打我 → 不准坐 →
         #     繼續打 → 被反擊 → 更不准坐）、坐著被咬死、血量百分比被
@@ -1868,7 +1871,8 @@ class CharFarmPage(QWidget):
         #   但如果需要休息、水跟不上，是不是不該打這裡」。
         #   ★ 血魔真的跟不上有兩條既有的路接住，不需要坐下：
         #     · 精靈自己會吃補血／補魔藥水（「天使輔助精靈」那頁設的）
-        #     · 藥水整組用完 → 回程補給（右邊「回程補給」的 HP／MP 觸發）
+        #     · 藥水見底（≤robot.POTION_LOW）→ 自動回程補給（2026-08-19 起
+        #       全自動，沒有 HP／MP 勾選）
         #   ⚠ 使用者回報「幾乎所有 BUG 都在坐下休息」，實際查到的至少三個都在
         #     那條路上（收尾正回饋循環、坐著被咬、血量百分比被上限暫態騙），
         #     移除等於一次收掉一整類失效模式。
@@ -1913,10 +1917,10 @@ class CharFarmPage(QWidget):
         grid.addWidget(g_rot, 1, 0, 1, 2)
 
         # ── 回程補給（整列）─────────────────────────────────
-        # ★ 條件到了就交棒給官方的天使守護精靈跑補給（回城→修裝→買水→回戰場），
-        #   補完再自己接回來。打怪還是我們的掛機在做。
-        # ★ 三個獨立的觸發開關。**不看遊戲裡精靈自己的回城勾選**
-        #   （使用者要求），這樣我們的觸發跟官方互相獨立。
+        # ★ 條件到了就跑我們自己的 supply.run_full_supply（回城→存倉→修裝→
+        #   買水→回戰場），補完再自己接回來。打怪還是我們的掛機在做。
+        # ★ 觸發開關**不看遊戲裡精靈自己的回城勾選**（使用者要求），
+        #   這樣我們的觸發跟官方互相獨立。
         g_sup = QGroupBox("回程補給")
         sup_v = QVBoxLayout(g_sup)
         c = QHBoxLayout()
@@ -1924,26 +1928,22 @@ class CharFarmPage(QWidget):
         self.sup_gear_cb.setToolTip(
             "身上穿的任何一件裝備耐久剩 1 就自動回城補給，"
             "補完飛回記錄點接著打。")
-        # ★ 三個觸發開關走 _on_robot_pref（不是單純 _save_settings）——
-        #   勾了任何一個就要把精靈補給頁的設定推到位（見 robot.apply_prefs
+        # ★ 這幾個開關走 _on_robot_pref（不是單純 _save_settings）——
+        #   勾了就要把精靈補給頁的設定推到位（見 robot.apply_prefs
         #   的 supply），掛機中才勾也要立刻生效。
         self.sup_gear_cb.toggled.connect(self._on_robot_pref)
         c.addWidget(self.sup_gear_cb)
         c.addSpacing(10)
-        # ★ HP / MP **分開兩個開關**（使用者要求）：勾 HP 就只看 HP 那一組
-        #   全歸零，MP 有沒有水完全不影響，反之亦然。
-        self.sup_hp_cb = QCheckBox("HP 藥水沒了")
-        self.sup_hp_cb.setToolTip(
-            "精靈那頁設的 HP 藥水整組用完就自動回城補給，"
-            "補完飛回記錄點接著打。")
-        self.sup_hp_cb.toggled.connect(self._on_robot_pref)
-        c.addWidget(self.sup_hp_cb)
-        self.sup_mp_cb = QCheckBox("MP 藥水沒了")
-        self.sup_mp_cb.setToolTip(
-            "精靈那頁設的 MP 藥水整組用完就自動回城補給，"
-            "補完飛回記錄點接著打。")
-        self.sup_mp_cb.toggled.connect(self._on_robot_pref)
-        c.addWidget(self.sup_mp_cb)
+        # ★ 藥水補給**全自動、沒有開關**（2026-08-19 使用者要求；原本的
+        #   「HP 藥水沒了」「MP 藥水沒了」兩個勾選框已刪）：精靈頁放的藥水
+        #   剩 ≤robot.POTION_LOW 顆就回城，買到負重 95%、HP/MP 數量對齊；
+        #   補給店沒賣的藥水見底 → 通知＋天使之翼回城＋停止掛機（_dry_stop）。
+        pot_lbl = QLabel(f"藥水剩 ≤{robot.POTION_LOW} 顆自動補給")
+        pot_lbl.setToolTip(
+            f"精靈頁放的藥水剩 {robot.POTION_LOW} 顆以下就自動回城補給。\n"
+            "買到負重 95%，HP/MP 數量差不多。\n"
+            "商店沒賣的藥水（如活動藥水）：通知＋天使之翼回城＋停止掛機。")
+        c.addWidget(pot_lbl)
         c.addSpacing(10)
         # ★ 不等精靈自己走回來，時間到就用遊戲的「天使趴趴GO」直接傳回去。
         self.sup_jump_cb = QCheckBox("用天使趴趴GO回地圖")
@@ -2511,12 +2511,12 @@ class CharFarmPage(QWidget):
     # ------------------------------------------------------------------
     # -- 回程補給（判斷 → 交棒 → 回到原地圖再接回來）-----------------------
     def _check_dry(self) -> list | None:
-        """藥水見底就通知一聲 —— **跟有沒有勾「藥水觸發」無關**（使用者要求）。
+        """藥水見底（剩 ≤robot.POTION_LOW 顆）就通知一聲。
 
-        ★ 用門閂（self._dry）：空著的那段期間只叫一次，補到貨才重新武裝。
+        ★ 用門閂（self._dry）：見底的那段期間只叫一次，補到貨才重新武裝。
           少了它每 GEAR_CHECK_GAP 秒就會吵一次。
-        ★ 只通知不停機：水沒了照樣打得動，血低了本來就有「坐下休息」擋著。
-          裝備壞掉才是真的打不下去，那個維持停機。
+        ★ 只通知不停機：接下來怎麼處置由 tick 決定 —— 買得到就回程補給、
+          買不到才走 _dry_stop（通知＋翼回城＋停機）。
 
         回傳算出來的見底清單（兩組都算），讓同一拍的補給判斷直接拿去用，
         不必再走一次物品陣列；沒算成就回 None。
@@ -2530,16 +2530,34 @@ class CharFarmPage(QWidget):
             return None                                # 讀不到就當沒事，別擋掛機
         key = "|".join(w for w, _ in dry)
         if dry and key != self._dry:
-            on = {"HP": self.sup_hp_cb.isChecked(),
-                  "MP": self.sup_mp_cb.isChecked()}
-            # 見底的那幾組裡，有勾觸發的才會跑補給
-            will = [w for w, _ in dry if on[w]]
-            self.notify(
-                "、".join(d for _, d in dry) + "用完了。"
-                + ("即將跑回程補給。" if will
-                   else "（沒勾這一項的觸發，掛機繼續）"))
+            # ★ 2026-08-19：藥水補給全自動（沒有勾選）——見底一律接著處置：
+            #   買得到 → 回程補給；買不到 → _dry_stop（那邊自己再通知一次停機原因）。
+            self.notify("、".join(d for _, d in dry)
+                        + f"快用完了（剩 ≤{robot.POTION_LOW} 顆）。")
         self._dry = key
         return dry
+
+    def _dry_stop(self, bad: list[str]) -> None:
+        """藥水見底但**補給店沒賣那種藥水**（活動藥水這類非賣品）→
+        通知＋天使之翼回城＋停止掛機（2026-08-19 使用者要求：
+        買不到就不跑補給，直接收工）。
+
+        ⚠ 翼回城是順手把人送回安全的城裡，送不出去也照樣停機 ——
+          停機才是重點，訊息會標明人留在原地。
+        """
+        got = robot.has_recall_item(self.sc, self.inv) if self.inv else None
+        wing = "背包找不到天使之翼，人留在原地"
+        if got:
+            if (self._mover is not None and self._mover.active
+                    and recall.use_item(self._mover, got[0])):
+                wing = "已用天使之翼回城"
+            else:
+                wing = "天使之翼送不出去，人留在原地"
+        extra = "" if supply.SHOP_TABLE else "（補給店販售表載不到，全當買不到）"
+        msg = (f"🧪 {'、'.join(bad)}快用完了，但補給店沒賣這種藥水{extra}"
+               f" → {wing}，掛機已停止")
+        self._stop_with(msg)
+        self.notify(msg)
 
     def _start_supply(self, why: str) -> bool:
         """觸發回程補給：跑**我們自己**的 `supply.run_full_supply`（存倉庫→修裝→買水→
@@ -2597,6 +2615,10 @@ class CharFarmPage(QWidget):
         self._supply_poll = 0.0
         self._supply_result = None
         self._supply_progress = why
+        # ★ 藥水買到負重 95%（2026-08-19 使用者要求）：出發前在主執行緒把
+        #   精靈頁放的藥水種類抓下來帶給補給那趟（potion_slots 可能走 Lua，
+        #   別讓背景執行緒去碰）。讀不到＝None → 那趟就不買藥水，安全退化。
+        plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
         # ★ 背景執行緒跑整趟補給。say 回報進度存進 _supply_progress，_supply_tick 顯示＋等完成。
         mv, sc, gen = self._mover, self.sc, self._supply_gen
 
@@ -2604,7 +2626,8 @@ class CharFarmPage(QWidget):
             try:
                 res = supply.run_full_supply(
                     mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
-                    back_to=home)      # 回程跳回記錄點（None＝出發當下，原行為）
+                    back_to=home,      # 回程跳回記錄點（None＝出發當下，原行為）
+                    potions=plan)      # 藥水買到負重 95%（生產分頁不帶＝不買）
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
@@ -2686,6 +2709,26 @@ class CharFarmPage(QWidget):
                     return True
             elif worn is not None:
                 self._broken_trips = 0
+            # ★★ 補給回來藥水**還是見底**？連續兩趟就大聲停 —— 買水那步一直
+            #   買不進來（金幣不夠／背包滿）不是暫時性失敗，重試只會每趟燒
+            #   一張翼（跟上面壞裝煞車同一套）。讀不到＝不確定 → 不加也不清。
+            dry_after = None
+            if self.inv and self._mover is not None and self._mover.active:
+                try:
+                    dry_after = robot.potions_out(self._mover, self.sc,
+                                                  self.inv, self.pid)
+                except Exception:                          # noqa: BLE001
+                    dry_after = None
+            if dry_after:
+                self._dry_trips += 1
+                if self._dry_trips >= 2:
+                    self._end_supply(
+                        f"⚠ 連續 {self._dry_trips} 趟補給回來藥水還是見底"
+                        f"（{msg}）—— 已停止掛機：金幣夠嗎？背包滿了嗎？",
+                        stop=True)
+                    return True
+            elif dry_after is not None:
+                self._dry_trips = 0
             self._end_supply(f"🔧 補給完成：{msg}　共花 {_mmss(self._supply_t)}")
             return True
         # 逾時兜底：run_full_supply 內部各段都有逾時，正常會自己回結果；
@@ -4040,15 +4083,15 @@ class CharFarmPage(QWidget):
             # ★ 回程補給改跑我們自己的 → 把天使精靈自己的「回城補給」觸發全關掉
             #   （使用者：「開始掛機把補給流程也關掉」），免得精靈也自己回城跑一趟撞我們。
             notes += robot.disable_return_supply(self._mover, self.sc)
-            # ★ 勾了回程補給 → 保證購買清單裡有天使之翼×50（使用者要求保留）。
-            #   每趟補給都要用翼回城，清單有它 run_full_supply 的買水步驟才會補貨，
-            #   免得翼用完下一趟回不去。⚠ 只加翼、不開精靈的補給旗標。
-            if self._supply_checked():
-                note = robot.ensure_buy_item(
-                    self._mover, self.sc, recall.RECALL_ITEM,
-                    robot.BUY_KEEP_WINGS)
-                if note:
-                    notes.append(note)
+            # ★ 保證購買清單裡有天使之翼×50（使用者要求保留）。藥水補給現在
+            #   全自動（2026-08-19，沒有勾選可看）——一律確保：每趟補給都要用
+            #   翼回城，清單有它 run_full_supply 的買水步驟才會補貨，免得翼
+            #   用完下一趟回不去。⚠ 只加翼、不開精靈的補給旗標。
+            note = robot.ensure_buy_item(
+                self._mover, self.sc, recall.RECALL_ITEM,
+                robot.BUY_KEEP_WINGS)
+            if note:
+                notes.append(note)
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
@@ -4320,8 +4363,9 @@ class CharFarmPage(QWidget):
         #   —— buff／召喚斷掉的損失比少打一下大。
         self._companion_tick()
 
-        # ★ 該不該回去補給。勾了「回程補給」就照觸發開關判斷（壞裝、藥水
-        #   見底）；沒勾就只看裝備壞掉並停機通知。幾秒看一次就夠。
+        # ★ 該不該回去補給。壞裝照勾選；藥水**全自動**（2026-08-19 使用者要求，
+        #   沒有勾選）：見底（≤robot.POTION_LOW）→ 店裡買得到就跑回程補給、
+        #   買不到就通知＋翼回城＋停機。幾秒看一次就夠。
         # ★ 裝備壞掉看**全身穿著的**（0~11 格，不含背包）：任何一件耐久 ≤ 1
         #   就算（使用者 2026-08-07 要求，以前只看武器）。走 bag.py 那條
         #   遊戲自己的容器路徑，**不需要 self.inv**（那是藥水/回程在用的）。
@@ -4331,17 +4375,27 @@ class CharFarmPage(QWidget):
             # None = 讀不到容器（換地圖中…）→ 不觸發也不解除，下次再看
             broken = bag.worn_broken(self.sc)
             gear = self.sup_gear_cb.isChecked()
-            hp_on = self.sup_hp_cb.isChecked()
-            mp_on = self.sup_mp_cb.isChecked()
-            # ★ 水沒了一律通知（使用者要求），跟觸發開關無關。
-            #   放在觸發判斷**之前** —— 勾了觸發的話，這一拍就會接著跑補給，
-            #   通知要先發出去才不會被 return 吃掉。
+            # ★ 水快用完一律先通知（使用者要求）——放在觸發判斷**之前**，
+            #   通知要先發出去才不會被底下的 return 吃掉。
             dry = self._check_dry()
-            if (gear or hp_on or mp_on) and self._ensure_mover():
+            # ★ 見底那幾組裡有「補給店沒賣」的（精靈頁放活動藥水這類非賣品）
+            #   → 買不到，跑補給也是白燒一張翼：通知＋翼回城＋直接停機。
+            #   設定暫時讀不到（plan=None）或那組讀成空清單就先照常跑補給
+            #   （買水那步會再對一次帳；一直買不進來有 _dry_trips 煞車兜底）。
+            if dry and self._ensure_mover():
+                plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
+                bad = [d for w, d in dry
+                       if plan is not None and plan.get(w)
+                       and not any(supply.shop_sells(t)
+                                   for t in plan.get(w, ()))]
+                if bad:
+                    self._dry_stop(bad)
+                    return
+            if (gear or dry) and self._ensure_mover():
                 # ★ 壞裝與見底清單都是這一拍剛算好的，直接傳進去別再算一次
                 #   （各要走一趟容器，上百次記憶體讀取）。
                 why = robot.supply_needed(self._mover, self.sc, self.inv,
-                                          gear, hp_on, mp_on, self.pid,
+                                          gear, True, True, self.pid,
                                           broken=broken, dry=dry)
                 if why and self._start_supply(why):
                     return
@@ -4915,11 +4969,8 @@ class CharFarmPage(QWidget):
         self.summon_cb.setChecked(bool(g(self._key("auto_summon"), False)))
         self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
         self.sup_gear_cb.setChecked(bool(g(self._key("supply_gear"), False)))
-        # 「藥水觸發」拆成 HP／MP 兩個之前存的舊值，兩邊都吃 ——
-        # 不然使用者原本設好的會憑空變成沒勾。
-        old_potion = bool(g(self._key("supply_potion"), False))
-        self.sup_hp_cb.setChecked(bool(g(self._key("supply_hp"), old_potion)))
-        self.sup_mp_cb.setChecked(bool(g(self._key("supply_mp"), old_potion)))
+        # ⛔ 舊的 supply_potion / supply_hp / supply_mp 不再讀：藥水補給
+        #    全自動（2026-08-19 使用者要求，勾選框已刪）。
         self.sup_jump_cb.setChecked(bool(g(self._key("supply_jump"), False)))
         self.sup_revive_cb.setChecked(
             bool(g(self._key("supply_revive"), False)))
@@ -4948,14 +4999,8 @@ class CharFarmPage(QWidget):
             self.rb_tg.setChecked(True)
         self.tg_id.setText(str(g(self._key("tg_id"), "") or ""))
 
-    def _supply_checked(self) -> bool:
-        """有勾**任何一個**回程補給觸發嗎？（壞裝／HP水／MP水）"""
-        return (self.sup_gear_cb.isChecked() or self.sup_hp_cb.isChecked()
-                or self.sup_mp_cb.isChecked())
-
     def _on_robot_pref(self, _on: bool) -> None:
-        """會連動精靈設定的勾選變動（趴趴GO回地圖／死亡回練功區／
-        三個回程補給觸發）。
+        """會連動精靈設定的勾選變動（趴趴GO回地圖／死亡回練功區／壞裝觸發）。
 
         一改就存；**掛機中**勾上還會立刻把精靈設定調到位，不必重開掛機。
         取消勾選只代表「我們不再管」—— 不會把遊戲裡的設定改回去。
@@ -4969,12 +5014,12 @@ class CharFarmPage(QWidget):
             self._mover, self.sc,
             jump_back=self.sup_jump_cb.isChecked(),
             revive_mark=self.sup_revive_cb.isChecked())
-        # ★ 勾了回程補給就保證購買清單有天使之翼×50（只加翼，不開精靈補給旗標）。
-        if self._supply_checked():
-            note = robot.ensure_buy_item(
-                self._mover, self.sc, recall.RECALL_ITEM, robot.BUY_KEEP_WINGS)
-            if note:
-                notes.append(note)
+        # ★ 保證購買清單有天使之翼×50（只加翼，不開精靈補給旗標）。
+        #   藥水補給全自動（2026-08-19）→ 不再看勾選，一律確保。
+        note = robot.ensure_buy_item(
+            self._mover, self.sc, recall.RECALL_ITEM, robot.BUY_KEEP_WINGS)
+        if note:
+            notes.append(note)
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 
@@ -5074,8 +5119,7 @@ class CharFarmPage(QWidget):
         s(self._key("auto_summon"), self.summon_cb.isChecked())
         s(self._key("rotate"), self.rot_cb.isChecked())
         s(self._key("supply_gear"), self.sup_gear_cb.isChecked())
-        s(self._key("supply_hp"), self.sup_hp_cb.isChecked())
-        s(self._key("supply_mp"), self.sup_mp_cb.isChecked())
+        # ⛔ supply_hp / supply_mp 不再存：藥水補給全自動（勾選框已刪）。
         s(self._key("supply_jump"), self.sup_jump_cb.isChecked())
         s(self._key("supply_revive"), self.sup_revive_cb.isChecked())
         s(self._key("rot_every"), float(self.rot_every.value()))

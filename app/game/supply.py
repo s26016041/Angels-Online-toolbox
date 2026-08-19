@@ -133,6 +133,37 @@ def _load_npc_table() -> dict[int, dict[str, tuple[int, int, int]]]:
 NPC_TABLE = _load_npc_table()
 
 
+# ★ 補給店販售表（tools/build_supply_shop.py 從 GAMEDATA 的 shop.xml＋item*.xml
+#   自動抽，不手打）：{種類id: (單顆重量, 單顆價格)}。用途：
+#   ① 掛機藥水見底時分辨「回城買不買得到」（買不到 → 通知＋停機，見 farm_tab）；
+#   ② run_potion_fill 拿重量算「買到負重 95%」該買幾顆、拿價格做金幣封頂。
+#   ⚠ NPC 販售清單不在可被動讀取的記憶體（開店時伺服器現送、只存 UI 視窗），
+#     Item 範本的重量欄位偏移也還沒有反組譯出處 —— 照 CLAUDE.md 第 3 級規矩
+#     走 build 工具；讀取端每輪拿實際負重／背包對帳，表過期只會買太少＋大聲說。
+def _load_shop_table() -> dict[int, tuple[int, int]]:
+    import json
+    from pathlib import Path
+    f = Path(__file__).resolve().parents[2] / "assets" / "supply_shop.json"
+    try:
+        raw = json.loads(f.read_text(encoding="utf-8"))
+        return {int(k): (int(v["w"]), int(v["p"]))
+                for k, v in raw["items"].items()}
+    except Exception:                                      # noqa: BLE001
+        return {}
+
+
+SHOP_TABLE = _load_shop_table()
+
+
+def shop_sells(tid: int) -> bool:
+    """補給店（藥水雜貨商人）賣不賣這種東西。
+
+    表載不到（assets 缺檔）一律 False＝當「買不到」：安全退化 —— 寧可見底時
+    通知＋停機，也不跑一趟注定買不到的補給（farm_tab 的訊息會標明表載不到）。
+    """
+    return int(tid) in SHOP_TABLE
+
+
 def _u32(scanner, addr: int) -> int:
     raw = scanner._read_bytes(addr, 4)
     return struct.unpack("<I", bytes(raw))[0] if raw else 0
@@ -789,6 +820,180 @@ def run_buy(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# 藥水買到負重 95%（2026-08-19 使用者要求）
+# ---------------------------------------------------------------------------
+# 掛機的回程補給不再看「購買清單」買藥水，改成：照精靈頁**放的那幾種藥水**，
+# 在補給商這裡買到**負重 95%**，而且 HP／MP 補完的總數對齊同一個目標（差不多數量）。
+FILL_PCT = 0.95            # 買到負重的這個比例（使用者指定 95%）
+# 買→對帳 最多幾輪。⚠ 這只是「防空轉」的保險 —— 真正的出口是「買到目標」
+#   或「這一輪零進貨」（買了背包沒動就大聲停手）。要買到 95% 負重常是幾百顆，
+#   伺服器若限單筆數量就得靠多輪慢慢補，輪數不能小氣（離線模擬踩過：
+#   單筆限 50 顆時 8 輪只補到 76%）。
+FILL_ROUNDS = 40
+PROBE_N = 10               # 第一輪先小買這麼多顆，實測「一顆多重」再放量 ——
+                           #   表的重量若過期，一輪大買可能把人買到超載（超載走不動）
+FILL_HARD_CAP = 5000       # 目標數量防呆上限（不是遊戲常數）：重量/金幣都封不住
+                           #   時（單顆重量 0 又讀不到金幣）別無限上綱
+
+
+def _fill_target(budget: int, gold, groups: list[tuple[int, int, int]]) -> int:
+    """算「補完之後每組各有幾顆」的目標 T（HP/MP 用同一個 T＝差不多數量）。
+
+    groups = [(現有數量, 單顆重量, 單顆價格), …]（1~2 組）。找最大的整數 T 使
+    Σ max(0, T−現有)×重量 ≤ budget 且 Σ max(0, T−現有)×價格 ≤ gold。
+    gold=None＝金幣讀不到就不封頂 —— 買不起伺服器自然少賣，對帳看得到。
+    """
+    def fits(t: int) -> bool:
+        if sum(max(0, t - h) * w for h, w, _ in groups) > budget:
+            return False
+        if gold is not None and \
+                sum(max(0, t - h) * p for h, _, p in groups) > gold:
+            return False
+        return True
+
+    top = max(h for h, _, _ in groups)
+    ws = [w for _, w, _ in groups if w > 0]
+    hi = min(top + (budget // min(ws) + 1 if ws else FILL_HARD_CAP),
+             top + FILL_HARD_CAP)
+    lo = 0
+    while lo < hi:                         # fits 對 T 單調遞減 → 二分找最大可行
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def run_potion_fill(mover, scanner, npc_id: int, fallback,
+                    plan: dict, say=None) -> tuple[bool, str]:
+    """把精靈頁放的藥水**買到負重 95%**。假設角色已在補給商附近（跟 run_buy 同一站）。
+
+    plan = {"HP": [種類id…], "MP": […]}（robot.potion_buy_ids 給的，只含「真藥水」）。
+    每組挑**第一個補給店有賣**的種類來買；數量用 SHOP_TABLE 的重量算，但
+    **第一輪只小買 PROBE_N 顆、實測 Δ負重÷Δ數量**之後才放量（表過期不會把人
+    買到超載）；每輪重讀負重／背包／金幣對帳，買了沒進背包就大聲停手。
+    """
+    def note(m):
+        if say:
+            say(m)
+
+    if not (mover and mover.active):
+        return False, "跳板沒裝好"
+
+    groups = []            # (標籤, 買哪種, 這組算「現有幾顆」要看的全部種類)
+    skipped = []
+    for what in ("HP", "MP"):
+        ids = [int(t) for t in (plan or {}).get(what, [])]
+        if not ids:
+            continue
+        buy_id = next((t for t in ids
+                       if t in SHOP_TABLE and SHOP_TABLE[t][0] > 0), None)
+        if buy_id is None:
+            skipped.append(f"{what}藥水店裡沒賣（"
+                           + "、".join(itemname.label(t) for t in ids) + "）")
+            continue
+        groups.append((what, buy_id, ids))
+    if not groups:
+        return (not skipped), ("；".join(skipped) if skipped else
+                               "精靈頁沒放藥水，跳過")
+
+    pf = move.pathfinder_this(scanner)
+    if not pf:
+        return False, "找不到玩家物件（負重讀不到），先不買"
+
+    ids_of = {what: ids for what, _, ids in groups}
+    w_est: dict[int, float] = {}     # 買哪種 → 實測單顆重量（Δ負重÷Δ數量）
+    bought = {what: 0 for what, _, _ in groups}
+    left_note = ""
+    for _ in range(FILL_ROUNDS):
+        wgt = entity.weight(scanner, pf + 8)
+        if wgt is None:
+            return False, "負重讀不到，先不買（避免超載）"
+        cur, cap = wgt
+        budget = int(cap * FILL_PCT) - cur
+        have = bag_counts(scanner)
+        if have is None:
+            return False, "背包讀不到，先不買"
+        gold = bag.gold(scanner)
+        counts = {what: sum(have.get(t, 0) for t in ids)
+                  for what, _, ids in groups}
+        # 重量用實測值優先（第一輪過後就有）；還沒實測才用表
+        trip = [(counts[what],
+                 int(round(w_est.get(bid, SHOP_TABLE[bid][0]))),
+                 SHOP_TABLE[bid][1]) for what, bid, _ in groups]
+        target = _fill_target(max(0, budget), gold, trip)
+        need = []
+        for what, bid, _ in groups:
+            n = target - counts[what]
+            if n > 0:
+                # 這種還沒實測過重量 → 先小買一批當探針
+                need.append((what, bid, n if bid in w_est else min(n, PROBE_N)))
+        if budget <= 0 or not need:
+            left_note = ""
+            break
+        left_note = "、".join(f"{what}還缺 {n}" for what, _, n in need)
+
+        if not _engage_npc(mover, scanner, npc_id, fallback,
+                           [TALK_BUY], WND_SALE):
+            return False, "開交易失敗（靠不夠近或對話碼不對）"
+        time.sleep(0.2)
+        moved = False
+        for what, bid, qty in need:
+            before_n = counts[what]
+            ok, msg = buy(mover, scanner, [(bid, qty)])
+            if not ok:
+                return False, "藥水購買送不出去：" + msg
+            time.sleep(SETTLE)
+            after = bag_counts(scanner)
+            wgt2 = entity.weight(scanner, pf + 8)
+            if after is None:
+                return False, "買完背包讀不到，先停手"
+            got = sum(after.get(t, 0) for t in ids_of[what]) - before_n
+            if got > 0:
+                moved = True
+                bought[what] += got
+                # 實測單顆重量（要買同一包前後的負重都讀得到才算）
+                if wgt2 is not None and wgt2[0] > cur:
+                    w_est[bid] = (wgt2[0] - cur) / got
+            if wgt2 is not None:
+                cur = wgt2[0]            # 下一種接著算（同一輪連買兩種）
+        if not moved:
+            # 送了但一顆都沒進來：金幣不夠／背包滿／其實沒賣 —— 別空轉燒輪次
+            return False, ("藥水買了但背包數量沒動（金幣不夠？背包滿？）"
+                           "——先停手" + ("；" + "；".join(skipped)
+                                        if skipped else ""))
+        note("補藥水中…" + "、".join(
+            f"{what}+{bought[what]}" for what, _, _ in groups))
+    else:
+        # 輪次用完（沒 break）→ 最後一輪買完的帳還沒對，重算一次再回報缺額
+        wgt = entity.weight(scanner, pf + 8)
+        have = bag_counts(scanner)
+        left_note = ""
+        if wgt is not None and have is not None:
+            budget = int(wgt[1] * FILL_PCT) - wgt[0]
+            counts = {what: sum(have.get(t, 0) for t in ids)
+                      for what, _, ids in groups}
+            trip = [(counts[what],
+                     int(round(w_est.get(bid, SHOP_TABLE[bid][0]))),
+                     SHOP_TABLE[bid][1]) for what, bid, _ in groups]
+            target = _fill_target(max(0, budget), bag.gold(scanner), trip)
+            left_note = "、".join(
+                f"{what}還缺 {target - counts[what]}" for what, _, _ in groups
+                if target - counts[what] > 0)
+
+    wgt = entity.weight(scanner, pf + 8)
+    pct = f"，負重 {wgt[0] * 100 // wgt[1]}%" if wgt else ""
+    msg = "、".join(f"{what}藥水+{bought[what]}" for what, _, _ in groups) + pct
+    if left_note:
+        msg += f"（{FILL_ROUNDS} 輪後{left_note}）"
+    if skipped:
+        msg += "；" + "；".join(skipped)
+    # 有組別買不到、或幾輪都沒補齊 → 整段算失敗（呼叫端要看得到）
+    return (not skipped and not left_note), msg
+
+
+# ---------------------------------------------------------------------------
 # 完整流程：記錄練功點 → 天使之翼回城 → 查表走到商人 → 買 → 趴趴GO 跳回
 # ---------------------------------------------------------------------------
 # 買/修 商人的編號＋位置 = NPC_TABLE（模組頂端從 assets/supply_merchants.json 載入，
@@ -925,7 +1130,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
 
 
 def run_full_supply(mover, scanner, say=None,
-                    back_to=None) -> tuple[bool, str]:
+                    back_to=None, potions=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
@@ -935,6 +1140,11 @@ def run_full_supply(mover, scanner, say=None,
     back_to=(x, y, 場景編號) 可選：回程改跳回這個指定點，而不是出發當下站的
     地方 —— 掛機分頁的「記錄點」（＝巡邏點，2026-08-18 使用者要求）用這個；
     None ＝ 原行為（生產分頁照舊）。
+
+    potions={"HP": [種類id…], "MP": […]} 可選（robot.potion_buy_ids 給的）：
+    買完購買清單後，照精靈頁放的藥水**買到負重 95%**（run_potion_fill，
+    2026-08-19 使用者要求）。None＝不買藥水 —— 生產分頁**一定要留 None**，
+    採集的負重就是產能，塞滿藥水等於廢了它。
     """
     def note(m):
         if say:
@@ -1051,6 +1261,15 @@ def run_full_supply(mover, scanner, say=None,
         bought_ok, bmsg = run_buy(mover, scanner, bid, (bx, by))
         note(bmsg)
         results.append("購買:" + bmsg)
+        # ★ 藥水買到負重 95%（2026-08-19 使用者要求）：排在清單購買**之後**，
+        #   翼那 50 張先佔掉的重量會自動算進去（每輪都重讀實際負重）。
+        if potions and any(potions.get(w) for w in ("HP", "MP")):
+            note("補藥水到負重 95%…")
+            pok, pmsg = run_potion_fill(mover, scanner, bid, (bx, by),
+                                        potions, say=note)
+            note("藥水：" + pmsg)
+            results.append("藥水:" + pmsg)
+            bought_ok = bought_ok and pok
     else:
         results.append("這城沒補給商（不賣天使之翼）")
 

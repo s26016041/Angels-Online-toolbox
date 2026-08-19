@@ -948,15 +948,33 @@ def potion_slots(mover, scanner, pid: int, force: bool = False) -> dict:
     return out
 
 
+# ★ 藥水「見底」門檻：一組（全部種類加總）剩這個數以下就觸發回程補給。
+#   2026-08-19 使用者從「全部歸零」改成 ≤5 —— 等真的歸零才回城，
+#   路上那幾拍就沒藥吃了。
+POTION_LOW = 5
+
+
+def _is_potion(tid) -> bool:
+    """名字含「藥水」才算藥水（2026-08-19 使用者：精靈格放的不是藥水就無視）。
+
+    名字表查不到（過期／缺檔）→ 當不是藥水＝忽略：安全退化 ——
+    寧可那一格不觸發補給，也不拿認不得的東西去數數／去買。
+    """
+    return "藥水" in itemname.of(tid)
+
+
 def _potion_out(slots_info: dict, scanner, inv_head: int,
                 slots) -> list[int] | None:
-    """這一組（紅水或藍水）的藥水**全部歸零**了嗎？是的話回傳那些種類 ID。
+    """這一組（紅水或藍水）的藥水**見底（加總 ≤ POTION_LOW）**了嗎？
+    是的話回傳那些種類 ID。
 
-    ⚠⚠ **要「全部」歸零才算，不是「任何一格」**：有人紅水配兩格，第一格
-      用完但第二格還有，角色明明還補得到血 —— 那時把人拉回城是錯的。
+    ⚠⚠ **整組加總**，不是「任何一格」：有人紅水配兩格，第一格用完但
+      第二格還很多，角色明明還補得到血 —— 那時把人拉回城是錯的。
     ★ 設成「技能」的格子代表**不靠藥水補**（白狐紅水1 就是技能 64），
       這一組只要有技能格就直接當「不缺」，不觸發。
-    ★ 一格都沒設、或設定讀不到，就無從判斷，也不觸發。
+    ★ 放的不是藥水（名字不含「藥水」）→ 無視那一格（2026-08-19 使用者要求，
+      連數量都不算 —— 一格餅乾 300 個不代表血補得上）。
+    ★ 一格都沒設（或放的都不是藥水）、或設定讀不到，就無從判斷，也不觸發。
     """
     from app.game import bag, inventory               # 避免循環相依
 
@@ -967,16 +985,18 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
             return None                    # 有技能可補，不算缺藥水
         if kind != SKILLITEM_TYPE_ITEM or not tid:
             continue
+        if not _is_potion(tid):
+            continue                       # 放的不是藥水 → 無視這一格
         items.append(tid)
     if not items:
-        return None                        # 一格都沒設
+        return None                        # 一格都沒設（或放的都不是藥水）
     # ⚠ 判定跟 count_by_type 一樣是「同種類全部加總」：藥水會散成好幾疊
     #   （黑狐的 4837 分在 8 格）。差別是**一趟走完**同時累加所有種類 ——
     #   以前每種各走一整條陣列（各 300~400 次系統呼叫），而這裡在 GUI 執行緒。
     total, complete = inventory.count_by_types(scanner, inv_head, items)
-    if any(v > 0 for v in total.values()):
-        return None                        # 還有一格有貨就不算用完
-    # ★★ 數到「全部歸零」才需要嚴格把關 —— 這個結論會觸發通知／回程補給：
+    if sum(total.values()) > POTION_LOW:
+        return None                        # 加總還夠（> POTION_LOW）就不算見底
+    # ★★ 數到「見底」才需要嚴格把關 —— 這個結論會觸發通知／回程補給：
     #   ① 沒走完整條（截斷）→「沒看到」不是「用完了」；
     #   ② 表頭重驗不過 → 陣列剛搬家（換地圖、物品增減都可能重配置），
     #     剛剛數的是死掉的舊副本（實測舊副本還殘留幾個像物品的指標）。
@@ -996,12 +1016,12 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
 
 def potions_out(mover, scanner, inv_head: int, pid: int = 0,
                 hp: bool = True, mp: bool = True) -> list[tuple[str, str]]:
-    """哪幾組藥水見底了 → `[('HP', 'HP藥水（高效紅藥水(活動)）'), …]`。
+    """哪幾組藥水見底（加總 ≤ POTION_LOW）→ `[('HP', 'HP藥水（高效紅藥水(活動)）'), …]`。
 
-    ★ **HP 和 MP 完全分開**（使用者要求）：勾 HP 就只看 HP 那一組全歸零，
-      MP 那組有沒有水完全不影響，反之亦然。
-    ★ 拆出來是因為**通知和觸發是兩回事**：使用者要求「水沒了也要通知」，
-      所以通知會兩組都看，觸發只看勾起來的那組。
+    ★ **HP 和 MP 完全分開**（使用者要求）：HP 那一組見底跟 MP 那組
+      有沒有水完全不相干，反之亦然。
+    ★ hp / mp 參數留著給呼叫端挑組別（通知和觸發是兩回事）；
+      2026-08-19 起掛機的藥水補給全自動，兩組都看（都傳 True）。
     """
     if not inv_head:
         return []
@@ -1035,6 +1055,26 @@ def potions_out(mover, scanner, inv_head: int, pid: int = 0,
     return out
 
 
+def potion_buy_ids(mover, scanner, pid: int = 0) -> dict[str, list[int]] | None:
+    """精靈頁 HP/MP 格放的**藥水**種類 ID（照格子順序）→ `{"HP": […], "MP": […]}`。
+
+    給回程補給用（2026-08-19 使用者要求）：supply.run_potion_fill 照這份買到
+    負重 95%；farm_tab 見底時拿它問 supply.shop_sells「店裡買不買得到」。
+    只認「型別=道具、名字含『藥水』」的格子 —— 技能格、空格、非藥水一律忽略
+    （使用者：放的不是藥水就無視）。設定讀不到回 None（≠「沒放」的空清單）。
+    """
+    info = potion_slots(mover, scanner, pid)
+    if not info:
+        return None
+    out: dict[str, list[int]] = {"HP": [], "MP": []}
+    for what, slots in (("HP", HP_ITEM_SLOTS), ("MP", MP_ITEM_SLOTS)):
+        for base in slots:
+            kind, tid = info.get(base, (None, None))
+            if kind == SKILLITEM_TYPE_ITEM and tid and _is_potion(tid):
+                out[what].append(int(tid))
+    return out
+
+
 _UNSET = object()      # 「這個參數沒給」——用來跟「給了但值是 None」區分
 
 
@@ -1051,15 +1091,16 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
         `dry` 是**兩組都算過**的完整清單，這裡只挑有勾的那幾組
         （`_potion_out` 各組獨立計算，挑出來跟重算完全一樣）。
 
-    ⚠⚠ **要不要判斷由呼叫端的三個開關決定，不看遊戲裡精靈的回城勾選**
+    ⚠⚠ **要不要判斷由呼叫端的開關決定，不看遊戲裡精靈的回城勾選**
       （使用者要求：「不要管他遊戲裡面有沒有設定」）。這樣我們的觸發跟
       官方的觸發互相獨立，不會因為他在遊戲裡沒勾就變成不動。
 
     · `on_broken` → **身上穿的裝備**任何一件耐久 ≤ 1（`bag.worn_broken()`；
       使用者 2026-08-07 要求：以前只看武器，改成全身、不含背包）
-    · `on_hp` → **HP 藥水那一組**全部歸零（見 `_potion_out`）
-    · `on_mp` → **MP 藥水那一組**全部歸零
-      ★ 兩組各判各的：勾 HP 就只看 HP 那三格，MP 有沒有水完全不影響。
+    · `on_hp` → **HP 藥水那一組**見底（加總 ≤ POTION_LOW，見 `_potion_out`）
+    · `on_mp` → **MP 藥水那一組**見底
+      ★ 兩組各判各的，互不影響。2026-08-19 起掛機的藥水補給全自動，
+        兩個都傳 True（勾選框已刪）。
 
     藥水是哪一種還是讀「天使輔助精靈」那頁設的（見 `HP_ITEM_SLOTS`），
     所以換藥水會自動跟著換，不必寫死。
@@ -1086,7 +1127,7 @@ def supply_needed(mover, scanner, inv_head: int, on_broken: bool,
         want = ({"HP"} if on_hp else set()) | ({"MP"} if on_mp else set())
         dry = [(w, text) for w, text in dry if w in want]
     if dry:
-        return "、".join(d for _, d in dry) + "用完了"
+        return "、".join(d for _, d in dry) + f"剩 ≤{POTION_LOW} 顆"
     return None
 
 
