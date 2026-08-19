@@ -955,11 +955,16 @@ MAX_ROUNDS = 6             # 買完對帳、還缺就再買幾輪（伺服器可
 SETTLE = 0.8              # 送出後等背包更新再對帳
 
 
-def run_buy(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
+def run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, str]:
     """跑一次「商人購買」：讀清單 → 開交易 → 把不足的買到目標數量。
 
     npc_id: 這城補給商（藥水雜貨商人）的確切編號（NPC_TABLE 給）；fallback: .MPC 表座標。
     回傳 (有沒有全部補齊, 給人看的說明)。假設角色**已經在補給商附近**（走到了）。
+
+    ledger(種類id, 實收數量) 可選：購買記帳（掛機頁「購買紀錄」，2026-08-20）。
+    ⚠ 回報的是**下一輪對帳時背包的實測差額**，不是送出的數量 ——
+      送 50 只進 30 就記 30（金幣不夠／限量時兩者會不同）。
+      中途「背包讀不到」提早返回的那一輪沒得對帳＝不記（寧可少記不亂記）。
     """
     if not (mover and mover.active):
         return False, "跳板沒裝好"
@@ -971,10 +976,23 @@ def run_buy(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
         return True, "購買清單是空的，沒東西要買"
 
     lines = []
+    last_need = last_have = None   # 上一輪送出的單、送出前的背包（記帳對帳用）
+
+    def _settle(have_now: dict) -> None:
+        """上一輪買的到帳了多少 → 記帳。跟「還缺多少」的對帳同一份資料。"""
+        nonlocal last_need, last_have
+        if ledger is not None and last_need:
+            for tid, _q in last_need:
+                got = have_now.get(tid, 0) - (last_have or {}).get(tid, 0)
+                if got > 0:
+                    ledger(tid, got)
+        last_need = last_have = None
+
     for _ in range(MAX_ROUNDS):
         have = bag_counts(scanner)
         if have is None:
             return False, "背包讀不到，先不動（避免把「讀不到」當成「沒有」）"
+        _settle(have)
         need = [(tid, keep - have.get(tid, 0))
                 for tid, keep in want if keep - have.get(tid, 0) > 0]
         if not need:
@@ -991,10 +1009,12 @@ def run_buy(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
             return False, msg + "（" + "；".join(lines) + "）" if lines else msg
         lines.append("買 " + "、".join(
             f"{itemname.label(t)}×{q}" for t, q in need))
+        last_need, last_have = need, have
         time.sleep(SETTLE)
 
     # 幾輪之後還沒補齊：回報現況（可能商人沒賣、或每次限量）
     have = bag_counts(scanner) or {}
+    _settle(have)                  # 最後一輪買的也要記帳
     short = [f"{itemname.label(t)} 還缺 {keep - have.get(t, 0)}"
              for t, keep in want if keep - have.get(t, 0) > 0]
     return (not short), ("；".join(lines) + "；" + "、".join(short)
@@ -1048,13 +1068,16 @@ def _fill_target(budget: int, gold, groups: list[tuple[int, int, int]]) -> int:
 
 
 def run_potion_fill(mover, scanner, npc_id: int, fallback,
-                    plan: dict, say=None) -> tuple[bool, str]:
+                    plan: dict, say=None, ledger=None) -> tuple[bool, str]:
     """把精靈頁放的藥水**買到負重 95%**。假設角色已在補給商附近（跟 run_buy 同一站）。
 
     plan = {"HP": [種類id…], "MP": […]}（robot.potion_buy_ids 給的，只含「真藥水」）。
     每組挑**第一個補給店有賣**的種類來買；數量用 SHOP_TABLE 的重量算，但
     **第一輪只小買 PROBE_N 顆、實測 Δ負重÷Δ數量**之後才放量（表過期不會把人
     買到超載）；每輪重讀負重／背包／金幣對帳，買了沒進背包就大聲停手。
+
+    ledger(種類id, 實收數量) 可選：購買記帳（同 run_buy —— 記的是本來就在算的
+    `got`＝背包實測差額，不是送出量）。
     """
     def note(m):
         if say:
@@ -1135,6 +1158,8 @@ def run_potion_fill(mover, scanner, npc_id: int, fallback,
             if got > 0:
                 moved = True
                 bought[what] += got
+                if ledger is not None:
+                    ledger(bid, got)   # 記帳：實收差額（跟 bought 同一個數）
                 # 實測單顆重量（要買同一包前後的負重都讀得到才算）
                 if wgt2 is not None and wgt2[0] > cur:
                     w_est[bid] = (wgt2[0] - cur) / got
@@ -1313,7 +1338,8 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
 
 def run_full_supply(mover, scanner, say=None,
                     back_to=None, potions=None,
-                    potion_only: bool = False) -> tuple[bool, str]:
+                    potion_only: bool = False,
+                    ledger=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
@@ -1333,6 +1359,10 @@ def run_full_supply(mover, scanner, say=None,
     不去維修商（2026-08-19「自動練技」使用者指定：水用完那趟只有藥水商人
     的部分）。清單購買留著是因為同一個 NPC 順手把天使之翼補回 50 張 ——
     每趟回城都燒一張翼，不補的話練技幾趟後就回不了城。
+
+    ledger(商人標籤, 種類id, 實收數量) 可選：購買記帳（掛機頁「購買紀錄」，
+    2026-08-20 使用者要求）。標籤這裡組好（「某某城補給商」），數量由
+    run_buy／run_potion_fill 的背包對帳回報 —— 記的是真的進來幾個。
     """
     def note(m):
         if say:
@@ -1450,8 +1480,13 @@ def run_full_supply(mover, scanner, say=None,
     bought_ok = True
     if buy_npc:
         bid, bx, by = buy_npc
+        # 記帳的商人標籤在這裡組好（哪座城的補給商）；數量由買的兩步對帳回報。
+        lg = None
+        if ledger is not None:
+            _shop = f"{scene.scene_name(home)}補給商"
+            lg = (lambda tid, qty: ledger(_shop, tid, qty))
         note(f"走去補給商 ({bx},{by}) 開店購買…")
-        bought_ok, bmsg = run_buy(mover, scanner, bid, (bx, by))
+        bought_ok, bmsg = run_buy(mover, scanner, bid, (bx, by), ledger=lg)
         note(bmsg)
         results.append("購買:" + bmsg)
         # ★ 藥水買到負重 95%（2026-08-19 使用者要求）：排在清單購買**之後**，
@@ -1459,7 +1494,7 @@ def run_full_supply(mover, scanner, say=None,
         if potions and any(potions.get(w) for w in ("HP", "MP")):
             note("補藥水到負重 95%…")
             pok, pmsg = run_potion_fill(mover, scanner, bid, (bx, by),
-                                        potions, say=note)
+                                        potions, say=note, ledger=lg)
             note("藥水：" + pmsg)
             results.append("藥水:" + pmsg)
             bought_ok = bought_ok and pok

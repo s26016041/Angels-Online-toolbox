@@ -106,11 +106,13 @@ class FakeSupply:
         return self.sell
 
     def run_full_supply(self, mv, sc, say=None, back_to=None, potions=None,
-                        potion_only=False):
+                        potion_only=False, ledger=None):
         self.trips.append({"back_to": back_to, "potions": potions,
                            "potion_only": potion_only})
         if say:
             say("補藥水中…")
+        if ledger is not None:                 # 模擬買到 40 顆 4836
+            ledger("聖光城補給商", 4836, 40)
         return True, "HP藥水+40"
 
 
@@ -214,6 +216,21 @@ check("收工：離開補給狀態", page._train_supply is False)
 check("回來主開關開回去", ROBOT.run is True)
 check("煞車歸零", page._train_dry_trips == 0)
 page.inv = 0x1000                       # _drop_cached_addrs 清掉了，補回來
+
+print("④b 購買紀錄：補給買到的有記帳、表單畫得出來")
+check("記了一筆", len(page._purchases) == 1)
+if page._purchases:
+    _ts, _who, _tid, _qty, _cost = page._purchases[0]
+    check("商人／物品／數量對", (_who, _tid, _qty) == ("聖光城補給商", 4836, 40))
+    check("花費＝販售表單價×數量", _cost == 40 * 30,
+          f"實得 {_cost}（表 {SUPPLY.SHOP_TABLE}）")
+dlg = page._purchases_dialog()
+check("表單列數對", dlg._tbl.rowCount() == len(page._purchases))
+check("總額顯示在上面", "1,200" in dlg._head.text(), f"實得 {dlg._head.text()}")
+dlg.deleteLater()
+_empty = build_page()._purchases_dialog()
+check("沒紀錄時說「還沒有」", "還沒有" in _empty._head.text())
+_empty.deleteLater()
 
 print("⑤ 非商店藥水 → 通知＋自動關閉")
 SUPPLY.sell = False

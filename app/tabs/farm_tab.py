@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -56,6 +57,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -162,6 +165,9 @@ TRAIN_GAP = 3.0
 # 自己建 —— Lua 呼叫是全專案風險最高的動作（會動遊戲的 Lua 堆疊），
 # 看門狗絕不能每 3 秒撞一次，失敗至少隔這麼久才再試。
 TRAIN_LUA_GAP = 30.0
+# 「購買紀錄」在記憶體裡最多留幾筆（跟自動回連的事件歷史同一套：session 狀態，
+# 工具箱重開清空）。一趟補給通常 2~5 筆，500 筆夠看好幾天。
+PURCHASE_CAP = 500
 # ★★ 「背包裡找不到回程道具」要**連續確認幾次**才准停機（每次間隔就是
 #   GEAR_CHECK_GAP）。⚠ 不可以改回「第一次就停機」：換頻道／傳送後重連時，
 #   容器與內容是**分批到齊**的 —— 使用者 2026-08-09 回報「裝備壞掉卻說我
@@ -1607,6 +1613,11 @@ class CharFarmPage(QWidget):
         self._train_dry_trips = 0    # 連續幾趟回來藥水還是見底（≥2 大聲停）
         self._train_no_wing = 0      # 連續幾次確認沒回程道具（NO_RECALL_TRIES）
         self._train_lua_t = 0.0      # 上次為了建練習技能記錄退 Lua 的時刻
+        # ── 購買紀錄（2026-08-20 使用者要求）──
+        # 每筆 = (時間戳, 商人標籤, 種類id, 實收數量, 花費或 None)。
+        # 補給背景執行緒 append（純資料、不碰 Qt），按「購買紀錄」鈕時才畫表。
+        # session 狀態不進 config（跟擊殺數、事件歷史同一類）。
+        self._purchases: list[tuple[float, str, int, int, int | None]] = []
         # ⛔ 舊的 self._dry 通知門閂已刪：買得到的藥水見底**不通知**
         #   （2026-08-19 使用者：會自動補給還通知是吵人），只剩 _dry_stop
         #   那種「店裡沒賣、要停機」才通知，而停機本身就不會重複。
@@ -1804,6 +1815,19 @@ class CharFarmPage(QWidget):
             "精靈頁放的是商店沒賣的藥水：通知並自動關閉。")
         self.train_cb.toggled.connect(self._on_train_toggle)
         run_bar.addWidget(self.train_cb)
+        # ★ 購買紀錄（2026-08-20 使用者要求）：回程補給跟商人買了什麼的流水帳，
+        #   按了開一張表（時間／商人／物品／數量／花費＋總額）。
+        run_bar.addSpacing(24)
+        self.buy_log_btn = QPushButton("購買紀錄")
+        self.buy_log_btn.setToolTip(
+            "回程補給跟商人買了什麼：時間、物品、數量、花費與總額。\n"
+            "只記這次開著工具箱期間的（重開清空）。")
+        # 跟「歸零」同一套量法：照字型量寬高，別讓原生按鈕邊框把字切掉。
+        fm2 = self.buy_log_btn.fontMetrics()
+        self.buy_log_btn.setFixedSize(
+            fm2.horizontalAdvance("購買紀錄") + 32, fm2.height() + 8)
+        self.buy_log_btn.clicked.connect(self._show_purchases)
+        run_bar.addWidget(self.buy_log_btn)
         run_bar.addStretch(1)
         root.addLayout(run_bar)
 
@@ -2666,7 +2690,8 @@ class CharFarmPage(QWidget):
                 res = supply.run_full_supply(
                     mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
                     back_to=home,      # 回程跳回記錄點（None＝出發當下，原行為）
-                    potions=plan)      # 藥水買到負重 95%（生產分頁不帶＝不買）
+                    potions=plan,      # 藥水買到負重 95%（生產分頁不帶＝不買）
+                    ledger=self._record_purchase)   # 購買紀錄（純資料 append）
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
@@ -2931,7 +2956,8 @@ class CharFarmPage(QWidget):
                     say=lambda m: setattr(self, "_train_progress", m),
                     back_to=home,          # 回練技的原地圖（不是巡邏點）
                     potions=plan,          # 藥水買到負重 95%
-                    potion_only=True)      # 只跑補給商：不存倉、不修裝
+                    potion_only=True,      # 只跑補給商：不存倉、不修裝
+                    ledger=self._record_purchase)   # 購買紀錄（純資料 append）
             except Exception as exc:                      # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._train_gen:     # 這一趟還沒被作廢才收結果
@@ -3022,6 +3048,74 @@ class CharFarmPage(QWidget):
             return
         self._train_start_supply(
             "、".join(d for _, d in dry) + f"剩 ≤{robot.POTION_LOW} 顆")
+
+    # ------------------------------------------------------------------
+    # -- 購買紀錄（回程補給跟商人買了什麼；2026-08-20 使用者要求）--------
+    def _record_purchase(self, merchant: str, tid: int, qty: int) -> None:
+        """補給那趟買到一筆 → 記帳。**背景執行緒呼叫**：只碰純資料，不碰 Qt。
+
+        數量是 run_buy／run_potion_fill 的背包對帳差額（真的進來幾個）。
+        花費＝補給店販售表的單價 × 數量 —— 表是 build_supply_shop.py 從遊戲
+        資源包抽的（有 tablestamp 過期偵測）；表裡沒有這一項就記 None，
+        表單顯示「—」並排除在總額外（不猜價錢）。
+        """
+        price = supply.SHOP_TABLE.get(int(tid), (0, 0))[1]
+        cost = int(price) * int(qty) if price else None
+        self._purchases.append(
+            (time.time(), merchant, int(tid), int(qty), cost))
+        if len(self._purchases) > PURCHASE_CAP:
+            del self._purchases[:-PURCHASE_CAP]
+
+    def _purchases_dialog(self) -> QDialog:
+        """把購買紀錄畫成一張表（新的在上面），總額掛在表的上方。
+
+        跟 exec 拆開是為了離線測試能只建表不進事件迴圈（train_check.py）。
+        ⚠ 一次性快照：開的當下有什麼畫什麼，要看新的關掉重開（不做即時
+          刷新 —— 高頻改表是 qt-ui-pitfalls 的坑，這裡不需要）。
+        """
+        rows = list(self._purchases)[::-1]        # 新的在上面
+        total = sum(c for *_x, c in rows if c is not None)
+        unknown = sum(1 for *_x, c in rows if c is None)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"購買紀錄 — {self.char_name or self.account or self.pid}")
+        v = QVBoxLayout(dlg)
+        if rows:
+            head = f"總花費 {total:,} 金幣（共 {len(rows)} 筆）"
+            if unknown:
+                head += (f"，另有 {unknown} 筆單價不明未計入"
+                         "（不在補給店販售表 —— 表過期？）")
+        else:
+            head = "還沒有購買紀錄 —— 回程補給跟商人買到東西時會記在這裡。"
+        lab = QLabel(head)
+        lab.setStyleSheet("font-weight: bold;")
+        v.addWidget(lab)
+
+        tbl = QTableWidget(len(rows), 5)
+        tbl.setHorizontalHeaderLabels(["時間", "商人", "物品", "數量", "花費(金幣)"])
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        for i, (ts, merchant, tid, qty, cost) in enumerate(rows):
+            cells = (time.strftime("%m/%d %H:%M:%S", time.localtime(ts)),
+                     merchant, itemname.label(tid), str(qty),
+                     f"{cost:,}" if cost is not None else "—")
+            for col, text in enumerate(cells):
+                it = QTableWidgetItem(text)
+                if col >= 3:                      # 數量／花費靠右對齊
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                tbl.setItem(i, col, it)
+        # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
+        for col, w in enumerate((115, 130, 170, 55)):
+            tbl.setColumnWidth(col, w)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(tbl, 1)
+        dlg.resize(640, 420)
+        # 給離線測試摸得到（不重跑排版邏輯就能驗內容）
+        dlg._head, dlg._tbl = lab, tbl
+        return dlg
+
+    def _show_purchases(self) -> None:
+        self._purchases_dialog().exec()
 
     # ------------------------------------------------------------------
     # -- 血/魔不足時坐下回復 ---------------------------------------------
