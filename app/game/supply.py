@@ -72,9 +72,12 @@ WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（
 # ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**，調位置＝沿「自己→NPC」方向
 #   一路往 NPC 身上靠、甚至穿過他站到另一側（0＝踩上 NPC 本格、正數＝超過他幾格）。
 NUDGE_STEPS = (0.0, 1.5, 3.0)
-# ★ 8/14 實測：站著不動（腳沒剛動過）在 1~3 格內點 NPC ~50% 開不了；剛走近點＝4/4。
-#   → 進場時人已在這距離內又還沒動過腳，先向前穿過 NPC 再點，把「50% 白站」換成走路。
-FLAKY_NEAR = 3.5
+# ★★ 使用者 8/19 晚實機回報的 bug：**太遠就發互動包 → 人還沒走到對話框先開**，
+#   這時送「我要買東西」伺服器不理（人不在旁邊）→ 販售頁開著卻買不了。
+#   → 規則：**先自己走進 CLICK_RANGE 內才發互動包**；對話開了還要過 TALK_RANGE
+#   的「人真的到了」閘門才送選項。
+CLICK_RANGE = 2.5          # 發互動包前，先自己走到離 NPC 這麼近
+TALK_RANGE = 4.0           # 送對話選項前，人必須停著且離 NPC 這麼近（櫃檯後 NPC 留裕度）
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
 #   開倉庫序列（跟買/修同一套點 NPC → talkaction，只差選項碼）：
@@ -447,9 +450,11 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     **銀行／修裝／買東西共用這一支**，只差 `talk_codes` 與 `wnd_name`。
 
     ★★★ 流程（2026-08-19 使用者定調：點一次→確認沒開對話→往 NPC 身上靠再點，不准退）：
-      ① NPC 看得到就**直接點**——`0x54A520` 自己會走到 NPC 旁開對話（8/14 借白狐跳板
-         實測從 3 格外點下去就成功）。⚠ 例外：人已貼身（< FLAKY_NEAR）又沒剛動過腳，
-         站著點 ~50% 開不了、白站一秒＝「在 NPC 前面發呆」→ 先向前穿過 NPC 再點。
+      ① **先走到位才發互動包**（使用者 8/19 晚實機定調）：離 NPC > CLICK_RANGE 就先
+         自己走進去——太遠發包會「人沒到對話先開」，對話開著不能移動、選項也沒人理，
+         販售頁開著卻買不了。已在距離內但站著沒動過腳＝點了 ~50% 開不了（8/14 flaky
+         實測）→ 先向前穿過 NPC 製造「剛走近」再點。
+         對話開了還有 `_wait_arrival` 到位閘門：人沒停在 TALK_RANGE 內絕不送選項。
       ② 點完**輪詢對話框**（_wait_dialog 邊沿偵測）：開了馬上送 talkaction，不睡固定秒數。
       ③ **確認沒開**（全域讀得到但值沒變）→ talkaction 必然無效（要先開真對話），
          **跳過選項直接調位置**：`_nudge_toward` 沿自己→NPC 方向踩上他本格、再不行
@@ -468,7 +473,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     #   對話框晚一拍才到，下一輪 _wait_dialog 看到「值已經變了」立刻接上，不重等。
     base = _dialog_token(scanner)
     fails = 0        # 「點了確認沒開」的次數（決定 nudge 步伐階梯）
-    walked = False   # 這一趟 engage 動過腳沒（點擊要跟在移動後面才穩，見 FLAKY_NEAR）
+    walked = False   # 這一趟 engage 動過腳沒（點擊要跟在移動後面才穩，8/14 flaky 實測）
     for _ in range(tries):
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
@@ -478,13 +483,22 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         if fails > 0:                                # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
             _nudge_toward(mover, scanner, npc_id,
                           NUDGE_STEPS[min(fails - 1, len(NUDGE_STEPS) - 1)])
+            walked = True
             found = find_npc(scanner, npc_id) or found
-        elif not walked:
+        else:
             gap = _npc_gap(scanner, npc_id)
-            if gap is not None and gap < FLAKY_NEAR:
-                # 站著沒動就點＝~50% 開不了、白站一秒（8/14）→ 先向前穿過 NPC
-                # 製造「剛走近」再點（一樣是往前靠，不是退）。
+            if gap is not None and gap > CLICK_RANGE:
+                # ★★ 人還沒到位，**不准發互動包**（使用者 8/19 晚實機回報：太遠發包
+                #   「人沒到對話先開」→ 對話開著不能移動、我要買東西也沒人理）
+                #   → 先自己走進 CLICK_RANGE 內。
+                _approach_npc(mover, scanner, npc_id)
+                walked = True
+                found = find_npc(scanner, npc_id) or found
+            elif not walked and gap is not None:
+                # 已在點擊距離內但站著沒動＝點了 ~50% 開不了、白站一秒（8/14
+                # flaky 實測）→ 先向前穿過 NPC 製造「剛走近」再點（往前靠，不是退）。
                 _nudge_toward(mover, scanner, npc_id, NUDGE_STEPS[1])
+                walked = True
                 found = find_npc(scanner, npc_id) or found
         walked = True
         npc_ent, _ = found
@@ -495,7 +509,10 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _wait_still(scanner, timeout=12.0)
             time.sleep(TALK_GAP)
         elif _wait_dialog(scanner, base):
-            time.sleep(0.2)                          # 對話框剛冒出來，緩一小拍再送選項
+            if not _wait_arrival(scanner, npc_id):
+                fails += 1                           # 對話開了但人沒到位（被擋/太遠）
+                continue                             # → 絕不送購買選項，調位置重來
+            time.sleep(0.2)                          # 人到位了，緩一小拍再送選項
         else:
             fails += 1
             continue                                 # 確認沒開對話 → 馬上調位置重點
@@ -550,6 +567,54 @@ def _nudge_toward(mover, scanner, npc_id: int, step: float) -> bool:
         _, now = _player_tile(scanner)
         if now and math.hypot(now[0] - here[0], now[1] - here[1]) > 0.5:
             return True                                     # 真的換到新站位
+    return False
+
+
+def _approach_npc(mover, scanner, npc_id: int, timeout: float = 20.0) -> None:
+    """★ 先自己走進 NPC 旁（CLICK_RANGE 內）**再讓呼叫端發互動包**。
+
+    使用者 8/19 晚實機回報：太遠發 0x54A520，人還沒走到對話框就先開 → 之後
+    「我要買東西」沒人理、販售頁開著買不了。所以互動包只准在走進之後發。
+    走**遊戲尋路** walk_route（stop_short 留 1.5 免撞 NPC 本格）；長距離一包
+    走不完就重送；回 0（貼身坑或算不出）→ walk_near 直走貼近。
+    順便天然滿足「點擊要跟在移動後面」（8/14 剛走近才穩）。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        gap = _npc_gap(scanner, npc_id)
+        if gap is None or gap <= CLICK_RANGE:
+            return
+        found = find_npc(scanner, npc_id)
+        nt = _ent_tile_f(scanner, found[0]) if found else None
+        pf, _here = _player_tile(scanner)
+        if nt is None or pf is None:
+            return
+        if mover.walk_route(scanner, pf + 8, nt[0], nt[1],
+                            stop_short=1.5) <= 0:
+            mover.walk_near(scanner, pf + 8, nt[0], nt[1], move.MIN_GAP)
+        _wait_move_done(scanner, timeout=8.0)
+
+
+def _wait_arrival(scanner, npc_id: int, timeout: float = 8.0) -> bool:
+    """對話框開了之後、送選項之前的**到位閘門**：等「人停下且離 NPC ≤ TALK_RANGE」。
+
+    ★ 使用者 8/19 晚實機回報的 bug 的第二道保險：對話框比人先到時，這裡把
+      「我要買東西」擋住等人走完；停了卻還離很遠（被擋住沒走到）＝這輪失敗，
+      讓呼叫端調位置重來，**絕不對著遠方的商人送購買選項**。
+    讀不到距離時放行（安全退化＝照舊送，跟舊版行為一致）。
+    """
+    pf = move.pathfinder_this(scanner)
+    t0 = time.time()
+    still_since = None
+    while time.time() - t0 < timeout:
+        if pf and entity.is_walking(scanner, pf + 8):
+            still_since = None
+        else:
+            still_since = still_since or time.time()
+            if time.time() - still_since > 0.5:          # 停穩了（不是走路中的頓拍）
+                gap = _npc_gap(scanner, npc_id)
+                return gap is None or gap <= TALK_RANGE
+        time.sleep(0.1)
     return False
 
 
