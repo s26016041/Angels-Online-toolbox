@@ -65,7 +65,8 @@ LEAVE_NPC_CODE = 0x22
 #   讀不到時走安全退化（等停下＋固定等待照送）。
 DIALOG_WND = "WND_MESSAGE"
 DIALOG_TIMEOUT = 12.0      # 點 NPC 後等對話框的上限（0x54A520 會自己走過去，邊走邊等）
-DIALOG_STILL_GRACE = 2.0   # 角色停住這麼久還沒開對話框＝這次點沒成功，早退去調位置
+DIALOG_STILL_GRACE = 1.0   # 角色停住這麼久還沒開對話框＝這次點沒成功，馬上去調位置
+                           # （判太早無害：基準只記一次，晚到的對話下一輪立刻接上）
 TALK_GAP = 1.2             # 對話選項之間的間隔——太快送對話會沒作用（8/14 實測）
 WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
 # ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**，調位置＝沿「自己→NPC」方向
@@ -431,6 +432,9 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         return False
     if _wnd_open(mover, scanner, wnd_name):          # 已經開著就別重點
         return True
+    # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早（1s）也無害——
+    #   對話框晚一拍才到，下一輪 _wait_dialog 看到「值已經變了」立刻接上，不重等。
+    base = _dialog_token(scanner)
     for i in range(tries):
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
@@ -441,7 +445,6 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                           NUDGE_STEPS[min(i - 1, len(NUDGE_STEPS) - 1)])
             found = find_npc(scanner, npc_id) or found
         npc_ent, _ = found
-        base = _dialog_token(scanner)                # 點之前先記現值（邊沿偵測的基準）
         if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話（一次一發）
             time.sleep(0.5)
             continue
@@ -458,40 +461,29 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         _talkaction(mover, scanner, talk_codes[-1])
         if _wait_wnd(mover, scanner, wnd_name, WND_TIMEOUT):
             return True
+        # 對話框有開但最終視窗沒開（假邊沿/選項沒吃到）→ 刷新基準，下一輪要求新變化，
+        # 免得同一個舊值一直當「已開」空轉送選項。
+        base = _dialog_token(scanner)
     return _wnd_open(mover, scanner, wnd_name)
-
-
-def _walk_route_to(mover, scanner, tx: float, ty: float, want: float,
-                   timeout: float, stop_short: float = 0.0) -> bool:
-    """用遊戲尋路 walk_route 走到 (tx,ty) 到 want 格內。到了回 True。"""
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        pf, here = _player_tile(scanner)
-        if pf is None or here is None:
-            time.sleep(0.3)
-            continue
-        if abs(here[0] - tx) + abs(here[1] - ty) <= want:
-            return True
-        mover.walk_route(scanner, pf + 8, float(tx), float(ty),
-                         stop_short=stop_short)
-        time.sleep(0.4)
-    return False
 
 
 def _nudge_toward(mover, scanner, npc_id: int, step: float) -> bool:
     """調位置：沿「自己→NPC」方向朝 NPC **身上**靠，`step`>0 就**穿過他**到另一側 step 格。
 
     ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**（舊「退4格再走近」又晃又慢，已刪），
-      就一直往 NPC 靠近、必要時踩上他本格／穿過他，換個站位再點一次。
+      就一直往 NPC 靠近、必要時踩上他本格／穿過他，換個站位再點一次；中間**不准發呆**。
     ⚠ 目標格先用**遊戲尋路** `path_to` 驗「走得到」才送（別點到不能走的位置）：
-      地形圖在櫃檯附近會誤判，path_to 才是準的（8/14 實測 NPC 本格與周圍全回 1）；
-      理想格不可走就試它四鄰 ±1 格，全不可走回 False（呼叫端就地再點）。
-    ⚠ 貼身移動一律遊戲尋路 walk_route，不走地形圖（8/14 鐵則）。
+      地形圖在櫃檯附近會誤判，path_to 才是準的（8/14 實測 NPC 本格與周圍全回 1）。
+    ⚠⚠ 這 1~3 格的貼身移動 **walk_route 會發呆**——尋路到貼身目標**一定回 0**、
+      一步都不走（move.walk_near 檔頭記的坑；8/19 實機「發呆一下」就是這個＋舊版
+      _walk_route_to 每 0.4s 重送空轉 8s）→ 尋路回 0 就改 `walk_near` **直走**。
+    ★ 走完驗「真的有動」（>0.5 格）：沒動（端點被伺服器退回等）就換下一個候選格，
+      全滅回 False（呼叫端就地再點，下一輪步伐加碼自然換方向）。
     """
     found = find_npc(scanner, npc_id)
     nt = _ent_tile_f(scanner, found[0]) if found else None
-    _, here = _player_tile(scanner)
-    if nt is None or here is None:
+    pf, here = _player_tile(scanner)
+    if nt is None or here is None or pf is None:
         return False
     dx, dy = nt[0] - here[0], nt[1] - here[1]
     dist = math.hypot(dx, dy)
@@ -499,8 +491,22 @@ def _nudge_toward(mover, scanner, npc_id: int, step: float) -> bool:
     tx, ty = nt[0] + ux * step, nt[1] + uy * step
     for ox, oy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
         cx, cy = tx + ox, ty + oy
-        if mover.path_to(scanner, cx, cy) > 0:
-            return _walk_route_to(mover, scanner, cx, cy, 0.8, 8.0)
+        # wait=0.3：背景執行緒可以等指令槽，別把好格子當不可走跳掉（-1=槽忙）
+        if mover.path_to(scanner, cx, cy, wait=0.3) <= 0:
+            continue
+        if mover.walk_route(scanner, pf + 8, cx, cy) <= 0:
+            # 貼身尋路回 0 → walk_near 直走。⚠ 它會把 keep 鉗到 MIN_GAP(1.4) 且停在
+            # 目標「我這一側」→ 把虛擬目標沿「我→目標」再推 1.4 格，實際落點＝(cx,cy)。
+            vdx, vdy = cx - here[0], cy - here[1]
+            vd = math.hypot(vdx, vdy) or 1.0
+            mover.walk_near(scanner, pf + 8,
+                            cx + vdx / vd * move.MIN_GAP,
+                            cy + vdy / vd * move.MIN_GAP, move.MIN_GAP)
+        time.sleep(0.35)                                    # 讓它開始走
+        _wait_still(scanner, timeout=4.0)
+        _, now = _player_tile(scanner)
+        if now and math.hypot(now[0] - here[0], now[1] - here[1]) > 0.5:
+            return True                                     # 真的換到新站位
     return False
 
 
