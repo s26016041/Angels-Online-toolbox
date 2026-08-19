@@ -65,13 +65,16 @@ LEAVE_NPC_CODE = 0x22
 #   讀不到時走安全退化（等停下＋固定等待照送）。
 DIALOG_WND = "WND_MESSAGE"
 DIALOG_TIMEOUT = 12.0      # 點 NPC 後等對話框的上限（0x54A520 會自己走過去，邊走邊等）
-DIALOG_STILL_GRACE = 1.0   # 角色停住這麼久還沒開對話框＝這次點沒成功，馬上去調位置
+DIALOG_STILL_GRACE = 0.8   # 角色停住這麼久還沒開對話框＝這次點沒成功，馬上去調位置
                            # （判太早無害：基準只記一次，晚到的對話下一輪立刻接上）
 TALK_GAP = 1.2             # 對話選項之間的間隔——太快送對話會沒作用（8/14 實測）
 WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
 # ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**，調位置＝沿「自己→NPC」方向
 #   一路往 NPC 身上靠、甚至穿過他站到另一側（0＝踩上 NPC 本格、正數＝超過他幾格）。
 NUDGE_STEPS = (0.0, 1.5, 3.0)
+# ★ 8/14 實測：站著不動（腳沒剛動過）在 1~3 格內點 NPC ~50% 開不了；剛走近點＝4/4。
+#   → 進場時人已在這距離內又還沒動過腳，先向前穿過 NPC 再點，把「50% 白站」換成走路。
+FLAKY_NEAR = 3.5
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
 #   開倉庫序列（跟買/修同一套點 NPC → talkaction，只差選項碼）：
@@ -347,15 +350,21 @@ def _ent_tile_f(scanner, ent: int):
     return (x / 32.0, y / 32.0)
 
 
-def _dist_to_npc(scanner, npc_id: int):
-    """角色現在離某 NPC 幾格（給失敗訊息用，方便對距離）；算不出回 '?'。"""
+def _npc_gap(scanner, npc_id: int):
+    """自己到某 NPC 的直線距離（格）；讀不到回 None。"""
     pf = move.pathfinder_this(scanner)
     here = entity.read_pos(scanner, pf + 8) if pf else None
     found = find_npc(scanner, npc_id)
     nt = _ent_tile_f(scanner, found[0]) if found else None
     if not here or not nt:
-        return "?"
-    return round(abs(here[0] - nt[0]) + abs(here[1] - nt[1]), 1)
+        return None
+    return math.hypot(here[0] - nt[0], here[1] - nt[1])
+
+
+def _dist_to_npc(scanner, npc_id: int):
+    """角色現在離某 NPC 幾格（給失敗訊息用，方便對距離）；算不出回 '?'。"""
+    gap = _npc_gap(scanner, npc_id)
+    return "?" if gap is None else round(gap, 1)
 
 
 def _dialog_token(scanner):
@@ -396,7 +405,7 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT) -> bool:
             last_walk = time.time()
         elif time.time() - last_walk > DIALOG_STILL_GRACE:
             return False
-        time.sleep(0.25)
+        time.sleep(0.1)
     return False
 
 
@@ -406,8 +415,30 @@ def _wait_wnd(mover, scanner, name: str, timeout: float) -> bool:
     while time.time() - t0 < timeout:
         if _wnd_open(mover, scanner, name):
             return True
-        time.sleep(0.25)
+        time.sleep(0.1)
     return False
+
+
+def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> None:
+    """等「一段走位」真的結束。
+
+    ⚠ 先等它**開始**走：下指令後 ~0.46s 狀態才變 Run（move.is_walking 檔頭實測），
+      太早看是「還沒動」不是「走完了」——直接 _wait_still 會誤判已停、把同一步
+      再走一次（看起來抖一下）。start_grace 內都沒開始走就直接返回，
+      讓呼叫端用位移判斷這步到底有沒有生效。
+    """
+    pf = move.pathfinder_this(scanner)
+    if not pf:
+        return
+    t0 = time.time()
+    while time.time() - t0 < start_grace:            # 等開始走
+        if entity.is_walking(scanner, pf + 8):
+            break
+        time.sleep(0.05)
+    while time.time() - t0 < timeout:                # 等走完
+        if not entity.is_walking(scanner, pf + 8):
+            return
+        time.sleep(0.1)
 
 
 def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str,
@@ -417,7 +448,8 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
 
     ★★★ 流程（2026-08-19 使用者定調：點一次→確認沒開對話→往 NPC 身上靠再點，不准退）：
       ① NPC 看得到就**直接點**——`0x54A520` 自己會走到 NPC 旁開對話（8/14 借白狐跳板
-         實測從 3 格外點下去就成功）。
+         實測從 3 格外點下去就成功）。⚠ 例外：人已貼身（< FLAKY_NEAR）又沒剛動過腳，
+         站著點 ~50% 開不了、白站一秒＝「在 NPC 前面發呆」→ 先向前穿過 NPC 再點。
       ② 點完**輪詢對話框**（_wait_dialog 邊沿偵測）：開了馬上送 talkaction，不睡固定秒數。
       ③ **確認沒開**（全域讀得到但值沒變）→ talkaction 必然無效（要先開真對話），
          **跳過選項直接調位置**：`_nudge_toward` 沿自己→NPC 方向踩上他本格、再不行
@@ -432,18 +464,29 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         return False
     if _wnd_open(mover, scanner, wnd_name):          # 已經開著就別重點
         return True
-    # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早（1s）也無害——
+    # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早也無害——
     #   對話框晚一拍才到，下一輪 _wait_dialog 看到「值已經變了」立刻接上，不重等。
     base = _dialog_token(scanner)
-    for i in range(tries):
+    fails = 0        # 「點了確認沒開」的次數（決定 nudge 步伐階梯）
+    walked = False   # 這一趟 engage 動過腳沒（點擊要跟在移動後面才穩，見 FLAKY_NEAR）
+    for _ in range(tries):
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
             _walk_to_npc(mover, scanner, npc_id, fallback, 30.0)
+            walked = True
             continue
-        if i > 0:                                    # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
+        if fails > 0:                                # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
             _nudge_toward(mover, scanner, npc_id,
-                          NUDGE_STEPS[min(i - 1, len(NUDGE_STEPS) - 1)])
+                          NUDGE_STEPS[min(fails - 1, len(NUDGE_STEPS) - 1)])
             found = find_npc(scanner, npc_id) or found
+        elif not walked:
+            gap = _npc_gap(scanner, npc_id)
+            if gap is not None and gap < FLAKY_NEAR:
+                # 站著沒動就點＝~50% 開不了、白站一秒（8/14）→ 先向前穿過 NPC
+                # 製造「剛走近」再點（一樣是往前靠，不是退）。
+                _nudge_toward(mover, scanner, npc_id, NUDGE_STEPS[1])
+                found = find_npc(scanner, npc_id) or found
+        walked = True
         npc_ent, _ = found
         if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話（一次一發）
             time.sleep(0.5)
@@ -452,8 +495,9 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _wait_still(scanner, timeout=12.0)
             time.sleep(TALK_GAP)
         elif _wait_dialog(scanner, base):
-            time.sleep(0.3)                          # 對話框剛冒出來，緩一拍再送選項
+            time.sleep(0.2)                          # 對話框剛冒出來，緩一小拍再送選項
         else:
+            fails += 1
             continue                                 # 確認沒開對話 → 馬上調位置重點
         for code in talk_codes[:-1]:
             _talkaction(mover, scanner, code)
@@ -502,8 +546,7 @@ def _nudge_toward(mover, scanner, npc_id: int, step: float) -> bool:
             mover.walk_near(scanner, pf + 8,
                             cx + vdx / vd * move.MIN_GAP,
                             cy + vdy / vd * move.MIN_GAP, move.MIN_GAP)
-        time.sleep(0.35)                                    # 讓它開始走
-        _wait_still(scanner, timeout=4.0)
+        _wait_move_done(scanner)
         _, now = _player_tile(scanner)
         if now and math.hypot(now[0] - here[0], now[1] - here[1]) > 0.5:
             return True                                     # 真的換到新站位
