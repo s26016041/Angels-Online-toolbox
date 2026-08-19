@@ -12,9 +12,12 @@
 ⚠⚠ 驗證要**每 0.25 秒取樣**：MP 只低 2 秒就補回來了，隔 2.5 秒才看會什麼都
   看不到 —— 我第一次就是這樣誤判成「封包沒生效」，白繞了一圈。
 ★ 送封包**不必停下來**：走路中、打怪中都送得出去，不像按鍵會被當前動作吃掉。
-★ 2026-08-19 起補放要**確認**：送包後等 castwatch 的「施放廣播」（伺服器受理
-  才回、拒收不回，100% 訊號），等不到就照 RETRY 重放 —— 以前送出就當成功，
-  SP 不夠被拒收時會安靜地裸奔 20 分鐘。沒有監聽（裝不起來）才退回舊行為。
+★ 2026-08-19 起補放送包後等 castwatch 的「施放廣播」：看到＝100% 確認受理。
+  ⚠⚠ 2026-08-20 實機翻案：**等不到 ≠ 被拒收** —— 廣播只在攻擊技上實測過，
+  分身這種自我 buff 會不會廣播沒驗過。舊版把等不到當拒收、每 8 秒重放，
+  實機就是「無法分身、一直重複補發」（同類重放會被拒收，白繞）。
+  現在等不到＝「驗不了」：當作已補、這招之後跳過確認（_cw_skip）。
+  沒有監聽（裝不起來）一樣退回「送出就當成功」。
 
 技能編號怎麼來
 --------------
@@ -79,6 +82,8 @@ class AutoBuff:
         self._confirming = False
         self._cw_since = 0       # 送包前記下的攔包計數（只看之後的廣播）
         self._srv = 0            # 我的施法者伺服器ID（每次送包重讀，不快取）
+        # ★ 這招的廣播「驗不了」（等過一次沒等到）→ 之後跳過確認（見 ①.5）
+        self._cw_skip = False
         self.note = ""
         self.armed = False
         self.blocked = ""        # 那個鍵上根本沒有可用的技能 → 停手（見 block）
@@ -101,6 +106,7 @@ class AutoBuff:
         self._sent_at = 0.0
         self._learning = False
         self._confirming = False
+        self._cw_skip = False                # 換了技能 → 廣播驗不驗得到重新試
         self.blocked = ""
         return True
 
@@ -162,10 +168,14 @@ class AutoBuff:
             return self.note
 
         # ①.5 封包送出去了 → 等伺服器的「施放廣播」確認真的放出去
-        #   （castwatch，100% 訊號：受理才回、拒收不回）。
-        #   ⚠ 以前是「送出就當成功」：SP 不夠／被打斷時伺服器拒收，
-        #     我們卻以為補好了，接下來 20 分鐘裸奔。現在等不到廣播就
-        #     照 RETRY 節奏重放，直到真的放出去。
+        #   （castwatch）。看到＝100% 確認受理。
+        #   ⚠⚠ 但**等不到 ≠ 被拒收**（2026-08-20 使用者實機回報翻案）：
+        #     施放廣播只在攻擊技 944~947 上實測過，分身這種自我 buff 會不會
+        #     廣播從沒驗證過。8/19 版把「等不到」當「被拒收」每 8 秒重放，
+        #     實機症狀＝「無法分身、一直重複補發」——同類技能重放會被伺服器
+        #     拒收（skill-data-and-buff 實測），重放只是白繞，還可能把已在場
+        #     的分身收掉。→ 等不到改判「**驗不了**」：當作已補（退回 8/19 前
+        #     的行為），並記住這招跳過確認（_cw_skip），不再白等也不再重放。
         if self._confirming:
             if (cast_hook is not None and cast_hook.active and self._srv
                     and cast_hook.fired(self._cw_since, self._srv, self.skill)):
@@ -180,9 +190,12 @@ class AutoBuff:
                 self._cast_at = self._sent_at
                 return self.note
             if now - self._sent_at >= CAST_WAIT:
-                self._confirming = False        # _cast_at 不動 → 之後照 RETRY 重放
-                self.note = (f"⚠ 分身沒被伺服器受理（SP 不夠？被打斷？）"
-                             f"→ {RETRY:.0f} 秒後重放")
+                self._confirming = False
+                self._cw_skip = True             # 這招驗不了，之後不再等廣播
+                self._cast_at = self._sent_at    # 當作已補（送出就算）
+                self.note = (f"已補分身：技能 {self.skill}（沒看到施放廣播——"
+                             f"這招可能不廣播，改回送出就算；"
+                             f"持續 {self.secs / 60:.0f} 分）")
             return self.note
 
         # ② 時間還夠 → 什麼都不做
@@ -224,8 +237,9 @@ class AutoBuff:
         # ★ 確認用的兩個錨要在**送包前**先記：廣播可能一送就回來，送完才記
         #   write_count 會把那一包漏掉。施法者ID每次重讀（換圖/重連會重建
         #   玩家物件，快取的是舊值 → 永遠對不上）。
+        # ★ _cw_skip＝上次等過廣播沒等到（這招可能不廣播）→ 不再白等 4 秒。
         srv = since = 0
-        if cast_hook is not None and cast_hook.active:
+        if cast_hook is not None and cast_hook.active and not self._cw_skip:
             try:
                 srv = castwatch.own_server_id(
                     scanner, bag.player_entity(scanner)) or 0
