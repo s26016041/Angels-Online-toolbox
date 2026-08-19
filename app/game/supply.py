@@ -59,8 +59,14 @@ REPAIR_CLOSE_FN = 0x005906CB
 #   0x5D29C1 就是 attack.SELECT_FN（泛用送包 0x5D3D97）8/11 改版後的新位址
 #   （reports/patch_doctor.txt 實證），AOB 特徵早就有，直接用 attack.SELECT_FN。
 LEAVE_NPC_CODE = 0x22
-DIALOG_WAIT = 1.3          # 點 NPC 後等對話框跳出來
-SALE_WAIT = 0.8            # talkaction 後等販售頁/伺服器交易開起來
+# ★ 出處：實測序列①的結果——0x54A520 互動成功時客戶端開的對話框視窗（Lua 全域名）。
+#   ⚠ 只能做「值變了」的邊沿偵測，不能當「非 0＝開著」（見 _dialog_token）；
+#   讀不到時走安全退化（等停下＋固定等待照送）。
+DIALOG_WND = "WND_MESSAGE"
+DIALOG_TIMEOUT = 12.0      # 點 NPC 後等對話框的上限（0x54A520 會自己走過去，邊走邊等）
+DIALOG_STILL_GRACE = 3.0   # 角色停住這麼久還沒開對話框＝這次點沒成功，早退去調位置
+TALK_GAP = 1.2             # 對話選項之間的間隔——太快送對話會沒作用（8/14 實測）
+WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
 #   開倉庫序列（跟買/修同一套點 NPC → talkaction，只差選項碼）：
@@ -347,17 +353,72 @@ def _dist_to_npc(scanner, npc_id: int):
     return round(abs(here[0] - nt[0]) + abs(here[1] - nt[1]), 1)
 
 
+def _dialog_token(scanner):
+    """讀 DIALOG_WND 全域**現值**（純讀）。讀不到表／名字不存在回 None。
+
+    ⚠ 這個值**不能**當「開著沒有」用：8/19 掃 5 台分身，3 台掛機中沒在跟 NPC
+      互動 WND_MESSAGE 也非 0（關窗殘值不歸零，跟 WND_NPCSALE 那批不同）。
+      只能拿來當 `_wait_dialog` 的基準值做「變化」偵測。
+    """
+    try:
+        g = lua.globals_of(scanner, (DIALOG_WND,))
+    except Exception:                                      # noqa: BLE001
+        return None
+    if not g or DIALOG_WND not in g:
+        return None
+    return g[DIALOG_WND]
+
+
+def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT) -> bool:
+    """點 NPC 後等對話框**真的開了**：DIALOG_WND 變成「非 0 且 ≠ baseline」才算。
+
+    ★ 用「值變了」不用「非 0」（見 _dialog_token 的坑）；視窗代號是遞增配號
+      （同一視窗各台代號都不同），重開必拿新值，所以「和點之前不同」＝真開了新框。
+    0x54A520 會自己把角色走到 NPC 旁才開對話 → 還在走就耐心等；
+    停下來 DIALOG_STILL_GRACE 秒還沒開＝這次點沒成功（站著點的 flaky 案例），
+    早點回 False 讓呼叫端調位置重點，不用傻等滿 timeout。
+    """
+    if baseline is None:                 # 讀不到基準（改版把全域名換了？）→ 交給呼叫端安全退化
+        return False
+    pf = move.pathfinder_this(scanner)
+    t0 = time.time()
+    last_walk = t0
+    while time.time() - t0 < timeout:
+        now = _dialog_token(scanner)
+        if now is not None and now != baseline and now != 0:
+            return True
+        if pf and entity.is_walking(scanner, pf + 8):
+            last_walk = time.time()
+        elif time.time() - last_walk > DIALOG_STILL_GRACE:
+            return False
+        time.sleep(0.25)
+    return False
+
+
+def _wait_wnd(mover, scanner, name: str, timeout: float) -> bool:
+    """輪詢等某視窗開；開了馬上回 True（取代「睡滿固定秒數再看一眼」）。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if _wnd_open(mover, scanner, name):
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str,
                 tries: int = 4) -> bool:
-    """點 NPC 開對話、送對話選項、**確認對應視窗開了**；沒開就重試。
+    """點 NPC 開對話、送對話選項、**確認對應視窗開了**；沒開才調位置重試。
     **銀行／修裝／買東西共用這一支**，只差 `talk_codes` 與 `wnd_name`。
 
-    ★★★ 關鍵（2026-08-14 借白狐跳板逐步實測定案）：**`0x54A520` 自己會走到 NPC 旁開對話**
-      （實測從 3 格外點下去就走過去、開對話框），所以**我們不該再自己算貼身格走位**——
-      先前自己用 path_to 探點＋走位反而把角色移動干擾了開對話（實測那版 _engage 回 False 跑 68s，
-      而「站著不動只 click→talk11→talk10」一次就開）。
-    ⚠ **時序要放夠**：click 後要等 0x54A520 把角色走到、對話框冒出來（~1.5s）才送 talkaction；
-      talkaction 之間也要等夠（~1.2s）——太快送對話會沒作用（實測）。
+    ★★★ 流程（2026-08-19 重排：以「視窗有沒有真的開」為準，不再每輪先跳退位舞）：
+      ① NPC 看得到就**直接點**——`0x54A520` 自己會走到 NPC 旁開對話（8/14 借白狐跳板
+         實測從 3 格外點下去就成功），第一輪不做「退 4 格再走近」，人就不會在商人旁邊晃。
+      ② 點完**輪詢對話框**（_wait_dialog）：開了馬上送 talkaction，不睡固定秒數。
+      ③ 對話框沒開（站著點的 flaky 案例，實測 ~50%）→ 這輪才 `_walk_close`
+         退 ~4 格再走近製造「剛走近」狀態、重點一次；直到成功或 tries 用完。
+    ⚠ 對話框輪詢超時**仍照送 talkaction 再驗最終視窗**（安全退化）：萬一改版把
+      DIALOG_WND 全域名換掉，行為退回舊版「等停下＋固定等待」，不會整條斷掉。
+    ⚠ talkaction 之間的間隔（TALK_GAP）不能省——太快送對話會沒作用（8/14 實測）。
     ⚠⚠ 跨地圖回城後交易是「冷」的：**一定要先用 0x54A520 開真對話**，talkaction 才有效。
     talk_codes: 依序送的對話碼（買=[10]、修=[10]、銀行「我要用倉庫→自己的倉庫」=[11,10]）。
     """
@@ -365,24 +426,29 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         return False
     if _wnd_open(mover, scanner, wnd_name):          # 已經開著就別重點
         return True
-    for _ in range(tries):
+    for i in range(tries):
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
             _walk_to_npc(mover, scanner, npc_id, fallback, 30.0)
             continue
-        _walk_close(mover, scanner, npc_id)          # ★ 遊戲尋路貼到 NPC ~1 格（見下）
-        found = find_npc(scanner, npc_id) or found
+        if i > 0:                                    # 上輪沒開到視窗 → 調位置（退~4格再走近）
+            _walk_close(mover, scanner, npc_id)
+            found = find_npc(scanner, npc_id) or found
         npc_ent, _ = found
+        base = _dialog_token(scanner)                # 點之前先記現值（邊沿偵測的基準）
         if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話
             time.sleep(0.5)
             continue
-        time.sleep(0.6)                              # 讓 0x54A520 開始走
-        _wait_still(scanner, timeout=12.0)           # 等它走到 NPC 旁停下
-        time.sleep(1.2)                              # ★ 等對話框冒出來（太快送 talkaction 會沒用）
-        for code in talk_codes:
+        if _wait_dialog(scanner, base):
+            time.sleep(0.3)                          # 對話框剛冒出來，緩一拍再送選項
+        else:                                        # 安全退化：走舊版盲等路徑照送
+            _wait_still(scanner, timeout=12.0)
+            time.sleep(TALK_GAP)
+        for code in talk_codes[:-1]:
             _talkaction(mover, scanner, code)
-            time.sleep(1.2)                          # ★ 每個對話選項之間等夠
-        if _wnd_open(mover, scanner, wnd_name):
+            time.sleep(TALK_GAP)                     # ★ 選項之間等夠（太快送會沒作用）
+        _talkaction(mover, scanner, talk_codes[-1])
+        if _wait_wnd(mover, scanner, wnd_name, WND_TIMEOUT):
             return True
     return _wnd_open(mover, scanner, wnd_name)
 
@@ -407,6 +473,8 @@ def _walk_route_to(mover, scanner, tx: float, ty: float, want: float,
 def _walk_close(mover, scanner, npc_id: int, want: float = 1.6,
                 timeout: float = 15.0) -> bool:
     """★★★ 用**遊戲自己的尋路** `walk_route` 貼到 NPC 旁 ~1 格，**確保是「剛走近」狀態**。到了回 True。
+
+    ★ 現在只當 `_engage_npc` 的「調位置」步驟：第一輪直接點沒開到對話框，才呼叫這支重製狀態。
 
     ⚠⚠ 兩個實測鐵則（2026-08-14 借白狐跳板逐步定案）：
     ① **不用地形圖（terrain.py）走貼身**：地形圖在 NPC 櫃檯附近會誤判「走不到」、只停在 2~4 格外；
