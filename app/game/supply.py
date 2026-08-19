@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import math
 import struct
 import time
 
@@ -64,9 +65,12 @@ LEAVE_NPC_CODE = 0x22
 #   讀不到時走安全退化（等停下＋固定等待照送）。
 DIALOG_WND = "WND_MESSAGE"
 DIALOG_TIMEOUT = 12.0      # 點 NPC 後等對話框的上限（0x54A520 會自己走過去，邊走邊等）
-DIALOG_STILL_GRACE = 3.0   # 角色停住這麼久還沒開對話框＝這次點沒成功，早退去調位置
+DIALOG_STILL_GRACE = 2.0   # 角色停住這麼久還沒開對話框＝這次點沒成功，早退去調位置
 TALK_GAP = 1.2             # 對話選項之間的間隔——太快送對話會沒作用（8/14 實測）
 WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
+# ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**，調位置＝沿「自己→NPC」方向
+#   一路往 NPC 身上靠、甚至穿過他站到另一側（0＝踩上 NPC 本格、正數＝超過他幾格）。
+NUDGE_STEPS = (0.0, 1.5, 3.0)
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
 #   開倉庫序列（跟買/修同一套點 NPC → talkaction，只差選項碼）：
@@ -410,14 +414,15 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     """點 NPC 開對話、送對話選項、**確認對應視窗開了**；沒開才調位置重試。
     **銀行／修裝／買東西共用這一支**，只差 `talk_codes` 與 `wnd_name`。
 
-    ★★★ 流程（2026-08-19 重排：以「視窗有沒有真的開」為準，不再每輪先跳退位舞）：
+    ★★★ 流程（2026-08-19 使用者定調：點一次→確認沒開對話→往 NPC 身上靠再點，不准退）：
       ① NPC 看得到就**直接點**——`0x54A520` 自己會走到 NPC 旁開對話（8/14 借白狐跳板
-         實測從 3 格外點下去就成功），第一輪不做「退 4 格再走近」，人就不會在商人旁邊晃。
-      ② 點完**輪詢對話框**（_wait_dialog）：開了馬上送 talkaction，不睡固定秒數。
-      ③ 對話框沒開（站著點的 flaky 案例，實測 ~50%）→ 這輪才 `_walk_close`
-         退 ~4 格再走近製造「剛走近」狀態、重點一次；直到成功或 tries 用完。
-    ⚠ 對話框輪詢超時**仍照送 talkaction 再驗最終視窗**（安全退化）：萬一改版把
-      DIALOG_WND 全域名換掉，行為退回舊版「等停下＋固定等待」，不會整條斷掉。
+         實測從 3 格外點下去就成功）。
+      ② 點完**輪詢對話框**（_wait_dialog 邊沿偵測）：開了馬上送 talkaction，不睡固定秒數。
+      ③ **確認沒開**（全域讀得到但值沒變）→ talkaction 必然無效（要先開真對話），
+         **跳過選項直接調位置**：`_nudge_toward` 沿自己→NPC 方向踩上他本格、再不行
+         穿過他到另一側（NUDGE_STEPS 逐輪加碼），換站位重點；直到成功或 tries 用完。
+    ⚠ 安全退化：DIALOG_WND 全域**讀不到**（改版換名？）才走舊版「等停下＋固定等待」
+      照送 talkaction 再驗最終視窗——名字失效只會變慢，不會整條斷掉。
     ⚠ talkaction 之間的間隔（TALK_GAP）不能省——太快送對話會沒作用（8/14 實測）。
     ⚠⚠ 跨地圖回城後交易是「冷」的：**一定要先用 0x54A520 開真對話**，talkaction 才有效。
     talk_codes: 依序送的對話碼（買=[10]、修=[10]、銀行「我要用倉庫→自己的倉庫」=[11,10]）。
@@ -431,19 +436,22 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
             _walk_to_npc(mover, scanner, npc_id, fallback, 30.0)
             continue
-        if i > 0:                                    # 上輪沒開到視窗 → 調位置（退~4格再走近）
-            _walk_close(mover, scanner, npc_id)
+        if i > 0:                                    # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
+            _nudge_toward(mover, scanner, npc_id,
+                          NUDGE_STEPS[min(i - 1, len(NUDGE_STEPS) - 1)])
             found = find_npc(scanner, npc_id) or found
         npc_ent, _ = found
         base = _dialog_token(scanner)                # 點之前先記現值（邊沿偵測的基準）
-        if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話
+        if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話（一次一發）
             time.sleep(0.5)
             continue
-        if _wait_dialog(scanner, base):
-            time.sleep(0.3)                          # 對話框剛冒出來，緩一拍再送選項
-        else:                                        # 安全退化：走舊版盲等路徑照送
+        if base is None:                             # 安全退化：全域讀不到才走盲等照送
             _wait_still(scanner, timeout=12.0)
             time.sleep(TALK_GAP)
+        elif _wait_dialog(scanner, base):
+            time.sleep(0.3)                          # 對話框剛冒出來，緩一拍再送選項
+        else:
+            continue                                 # 確認沒開對話 → 馬上調位置重點
         for code in talk_codes[:-1]:
             _talkaction(mover, scanner, code)
             time.sleep(TALK_GAP)                     # ★ 選項之間等夠（太快送會沒作用）
@@ -470,39 +478,30 @@ def _walk_route_to(mover, scanner, tx: float, ty: float, want: float,
     return False
 
 
-def _walk_close(mover, scanner, npc_id: int, want: float = 1.6,
-                timeout: float = 15.0) -> bool:
-    """★★★ 用**遊戲自己的尋路** `walk_route` 貼到 NPC 旁 ~1 格，**確保是「剛走近」狀態**。到了回 True。
+def _nudge_toward(mover, scanner, npc_id: int, step: float) -> bool:
+    """調位置：沿「自己→NPC」方向朝 NPC **身上**靠，`step`>0 就**穿過他**到另一側 step 格。
 
-    ★ 現在只當 `_engage_npc` 的「調位置」步驟：第一輪直接點沒開到對話框，才呼叫這支重製狀態。
-
-    ⚠⚠ 兩個實測鐵則（2026-08-14 借白狐跳板逐步定案）：
-    ① **不用地形圖（terrain.py）走貼身**：地形圖在 NPC 櫃檯附近會誤判「走不到」、只停在 2~4 格外；
-       **遊戲尋路 path_to 說 NPC 周圍每格都走得到**，walk_route 能穩定貼到 1 格。stop_short 留一點免撞 NPC 本格。
-    ② **點 NPC 開對話要在「角色剛走近」時送才穩定**（站著不動時點＝flaky，實測 ~50%；先退4格再走近＝4/4）。
-       → 若角色已經太近（沒有 approach 動作），**先退到 ~4 格再走回來**，製造「剛走近」狀態。
+    ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**（舊「退4格再走近」又晃又慢，已刪），
+      就一直往 NPC 靠近、必要時踩上他本格／穿過他，換個站位再點一次。
+    ⚠ 目標格先用**遊戲尋路** `path_to` 驗「走得到」才送（別點到不能走的位置）：
+      地形圖在櫃檯附近會誤判，path_to 才是準的（8/14 實測 NPC 本格與周圍全回 1）；
+      理想格不可走就試它四鄰 ±1 格，全不可走回 False（呼叫端就地再點）。
+    ⚠ 貼身移動一律遊戲尋路 walk_route，不走地形圖（8/14 鐵則）。
     """
     found = find_npc(scanner, npc_id)
     nt = _ent_tile_f(scanner, found[0]) if found else None
-    if nt is None:
+    _, here = _player_tile(scanner)
+    if nt is None or here is None:
         return False
-    _, here = _player_tile(scanner)
-    # ② 已經太近（沒 approach 動作）→ 先退到 ~4 格（挑 path_to 走得到的方向）
-    if here and abs(here[0] - nt[0]) + abs(here[1] - nt[1]) < 3.5:
-        for ox, oy in ((4, 0), (0, 4), (-4, 0), (0, -4),
-                       (4, 4), (-4, -4), (4, -4), (-4, 4)):
-            bx, by = nt[0] + ox, nt[1] + oy
-            if mover.path_to(scanner, bx, by) > 0:
-                _walk_route_to(mover, scanner, bx, by, 1.2, 8.0)
-                break
-    # 走近（fresh approach）到 want 格內
-    if _walk_route_to(mover, scanner, nt[0], nt[1], want, timeout, stop_short=1.5):
-        return True
-    _, here = _player_tile(scanner)
-    found = find_npc(scanner, npc_id)
-    nt = _ent_tile_f(scanner, found[0]) if found else None
-    return (here is not None and nt is not None
-            and abs(here[0] - nt[0]) + abs(here[1] - nt[1]) <= want + 0.6)
+    dx, dy = nt[0] - here[0], nt[1] - here[1]
+    dist = math.hypot(dx, dy)
+    ux, uy = (dx / dist, dy / dist) if dist > 0.3 else (0.0, 0.0)
+    tx, ty = nt[0] + ux * step, nt[1] + uy * step
+    for ox, oy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+        cx, cy = tx + ox, ty + oy
+        if mover.path_to(scanner, cx, cy) > 0:
+            return _walk_route_to(mover, scanner, cx, cy, 0.8, 8.0)
+    return False
 
 
 def _repair_all(mover, scanner) -> bool:
@@ -780,7 +779,8 @@ def run_bank_here(mover, scanner, say=None) -> tuple[bool, str]:
     bkid, bkx, bky = bank_npc
     note(f"背包有 {len(pend)} 件要存，走去銀行 ({bkx},{bky}) 開倉庫…")
     # ⚠ 不在這裡先用地形圖 _walk_to_npc（它在銀行櫃檯區會誤判「走不到」）——
-    #   run_bank 內的 _engage_npc→_walk_close 會用**遊戲尋路**貼到 NPC 旁，那才走得到。
+    #   run_bank 內的 _engage_npc 直接點（0x54A520 自帶走近），沒開到對話才
+    #   _nudge_toward 用**遊戲尋路**往 NPC 身上靠，那才走得到。
     return run_bank(mover, scanner, bkid, (bkx, bky))
 
 
@@ -1287,8 +1287,9 @@ def run_full_supply(mover, scanner, say=None,
     # 4. 先存銀行（★排在修裝前面——使用者要求）：有銀行 + 背包有「處理列表標記儲存」
     #    的物品 → 走去存。**沒有要存的就不去銀行**（使用者要求）。
     # ⚠ 各步驟**不在這裡先用地形圖 _walk_to_npc**（它在 NPC 櫃檯區會誤判「走不到」）——
-    #   run_bank/run_repair/run_buy 內的 _engage_npc→_walk_close 會用**遊戲尋路**貼到 NPC 旁，
-    #   遠距離則由 _engage 自己在 NPC 沒串流時退回地形圖靠近。
+    #   run_bank/run_repair/run_buy 內的 _engage_npc 直接點（0x54A520 自帶走近），沒開到
+    #   對話才 _nudge_toward 用**遊戲尋路**往 NPC 身上靠；遠距離則由 _engage 自己在
+    #   NPC 沒串流時退回地形圖靠近。
     bank_npc = entry.get("bank")
     if bank_npc:
         _bank_targets = deposit_targets(scanner)
