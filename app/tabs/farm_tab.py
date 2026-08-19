@@ -278,6 +278,14 @@ STUCK_EPS = 4.0
 #   那條用「離錨點的淨位移」判斷有沒有前進，走路中會自己歸零，不會誤觸。
 #   ⚠ 別把 15 秒那條也拿掉：「怪一直刷新去打最近的」救不了擋線呆站，
 #     因為那時候**卡住我們的那隻自己就是最近的**，永遠排第一。
+# ★★ 「站定了卻零傷害」的正解（2026-08-19 使用者指定）：怪在障礙物對面、
+#   數字上在攻擊範圍內 → 要**繞過障礙物過去打**，不是隔著障礙物空放到
+#   15 秒換怪。跟被刪的 4 秒快篩差在**只在站定時計時** —— 直接沿用
+#   _stuck（離錨點的淨位移，走路中自己歸零），繞遠路、趕路中都不會誤觸；
+#   貼身 ≤3 格的空揮也照舊排除（NO_PATH_NEED）。觸發後**不換怪**：
+#   keep 壓到 MELEE_RANGE 貼身走過去，邊走邊照打，擋線一消失傷害就進來、
+#   一掉血就解除。真的走不進去仍由 STUCK_ENGAGED(15 秒) 收尾換怪。
+PUSH_IN_SECS = 3.0
 # ★★ 「趕路途中冒出更近的怪就改打牠」（使用者要求 2026-08-10）。
 #   周圍怪物本來就每 0.15 秒刷新一次（見 [[farm-scan-refresh-tiers]]），
 #   所以不必另外掃描，拿現成的清單照同一套規則重排一次就好。
@@ -396,11 +404,14 @@ MODE_PACKET = "packet"
 # ⛔ 不要用「補按技能鍵」來讓角色接近（試過，使用者實測還是會卡住）。
 #    走過去打是客戶端的行為，但補按鍵會讓客戶端和我們的移動指令互相打架，
 #    角色反而鎖著遠處的怪站著不動。接近一律用我們自己的尋路（見下面的 tick）。
-# ★★ 比這個近就**不問尋路、也不算走不到**。
-#   尋路到「貼在自己身上的怪」等於算路徑到自己腳下那一格，一定回 0，
-#   而 0 在 tick 裡的意思是「走不過去」。近戰每打一隻都會貼上去，
-#   於是每隻都被冷凍，只好去追遠處打不到的（實拍：周圍 1.2 格有怪，
-#   卻鎖著 16.0 格外的那隻）。取 3.0：實拍貼身距離落在 1.0~2.1 格。
+# ★★ 比這個近就**不算走不到**（放棄與零傷害貼身繞打都拿它當排除門檻）。
+#   「貼在身上的怪」當年連尋路都跳過：**遊戲的**尋路對貼身目標一定回 0，
+#   0 又被當「走不過去」，近戰每打一隻都貼上去 → 每隻都被冷凍（實拍：
+#   周圍 1.2 格有怪，卻鎖著 16.0 格外的那隻）。2026-08-19 起貼身改問
+#   **我們自己的地形圖**（它對相鄰格照樣算得出路，起終點同格回單點路徑，
+#   不存在「回 0 被當走不到」的問題），才抓得到「怪在薄牆對面 2~3 格」
+#   要繞過去的情況；「貼身不算走不到」這半條保留。
+#   取 3.0：實拍貼身距離落在 1.0~2.1 格。
 NO_PATH_NEED = 3.0
 # ★★ 比這個近就**不尋路**，直接朝目標走（見 _walk_toward 的說明）。
 #   尋路到貼身的目標一定回 0，於是「只差 0.2 格」也走不過去 ——
@@ -1529,6 +1540,7 @@ class CharFarmPage(QWidget):
         self._way: list[tuple[float, float]] = []   # 上次算出的繞路路徑點
         self._unreach = 0          # 連續幾次尋路算不出路徑
         self._hurt = False         # 這隻有沒有被我們打傷過（打傷了就不准換目標）
+        self._push_in = False      # 打得到卻零傷害 → 正在貼身繞打（見 PUSH_IN_SECS）
         self._switch_t = 0.0       # 下一次可以評估「有沒有更近的怪」的時間
         # ★★ 我站的這一塊連通區有哪些格（terrain.Grid.reachable 泛洪的結果）。
         #   挑目標時用它把「對岸／島上／牆裡」的怪整個排除掉。
@@ -3152,12 +3164,12 @@ class CharFarmPage(QWidget):
         #   walk_near 是直線走，中間有障礙就會撞牆原地不動。判斷依據有兩個，
         #   都要顧到：
         #     ① 上一次尋路說要繞路（_path_pts > 1）→ 直接走 walk_route
-        #     ② 尋路只在 dist > NO_PATH_NEED 時才更新，**3 格以內那個判斷是舊的**
+        #     ② 擋線判斷每 _path_gap(0.2s) 才更新（2026-08-19 起貼身也走真的
+        #        地形圖，不再一律當可通），節奏之間仍可能是舊的
         #        → 所以再加一道實測保險：連續走了兩次都沒真的位移，就改用尋路
         # ⚠ 再加一個條件 `self._line_clear`（2026-08-10）：`_path_pts <= 1` 在
         #   「地形圖讀不到」時也成立（那時它是 0），等於在沒有任何擋線判斷的
-        #   情況下走直線。3 格以內的貼身微調不受影響 —— 那個距離上面那段
-        #   本來就直接把 _line_clear 設成 True。
+        #   情況下走直線。
         if (gd < NEAR_WALK and self._path_pts <= 1 and self._near_fail < 2
                 and self._line_clear):
             # 上一次 walk_near 之後到底有沒有動？沒動就記一次失敗。
@@ -3797,6 +3809,7 @@ class CharFarmPage(QWidget):
         self._way = []
         self._unreach = 0
         self._hurt = False           # 換了新目標 → 又回到「還沒打傷，可以再換」
+        self._push_in = False        # 貼身繞打是跟上一隻綁的，換目標歸零
         self._switch_t = 0.0
         self._handoff_fail = False   # 這一隻的「交棒給客戶端」失敗過了嗎
         self._handoff_t = 0.0
@@ -4524,13 +4537,16 @@ class CharFarmPage(QWidget):
         #   隔著地形，攻擊距離縮成 2 格，於是 3~10 格的怪既不打、也走不到，
         #   一路卡到 10 秒逾時（監控實際抓到的距離 3.6 / 5.4 / 9.6 / 10.2）。
         # 怪會走動，所以每 PATH_GAP 重算一次，不是只在「還不知道」時算。
-        # ⚠ 貼身（≤3 格）一律當直線可通：那個距離不存在擋線問題，
-        #   而舊的「要繞路」判定殘留下來會把攻擊距離壓成 2 格（實錄過）。
+        # ⛔ 「貼身（≤3 格）一律當直線可通」的捷徑 2026-08-19 拿掉了（使用者
+        #   回報：怪在障礙物對面卻站在對面隔牆打）。薄牆／柵欄隔開 2~3 格的
+        #   兩格是存在的，硬當可通＝walk_near 直線推牆＋站著空放到逾時換怪。
+        #   貼身照樣走下面的地形圖判斷：真的可通（絕大多數貼身）行為跟以前
+        #   一樣；真被薄牆隔開時 _way 會給出繞過去的路。
+        #   當年設捷徑防的「殘留舊判斷把攻擊距離壓成 2 格」已經不存在 ——
+        #   blocked 現在只決定走多近（keep），攻擊距離看各招自己的射程。
+        #   成本也沒變：同樣是 _path_gap（0.2 秒）節奏才碰地形圖。
         self._path_t += dt
-        if dist is not None and dist <= NO_PATH_NEED:
-            self._path_pts, self._way, self._unreach = 1, [], 0
-            self._line_clear = True
-        elif (self._path_t >= self._path_gap and mp is not None and me
+        if (self._path_t >= self._path_gap and mp is not None and me
                 and dist is not None):
             self._path_t = 0.0
             plan_t0 = time.perf_counter()
@@ -4642,8 +4658,9 @@ class CharFarmPage(QWidget):
         #   根因（2026-08-07 黑狐實錄兩段）：沙漠這種小凸起多的地形尋路很常
         #   回多點，但「路徑要繞」跟「技能被擋線」是兩回事 —— 射程 12 的
         #   黑狐被判「打不到」，只走路不出手，追到 2 格又卡進 [2,3) 死區呆
-        #   10 秒。現在：一邊走近一邊照打；真的被牆擋線（零傷害）交給
-        #   STUCK_ENGAGED(15 秒) 換怪 —— 打不打得到只有目標的血知道（實錘）。
+        #   10 秒。現在：一邊走近一邊照打；真的被牆擋線（零傷害）先由
+        #   PUSH_IN_SECS(3 秒) 貼身繞打自救，最後 STUCK_ENGAGED(15 秒)
+        #   換怪收尾 —— 打不打得到只有目標的血知道（實錘）。
         #   ⚠ 這裡以前寫「交給 4 秒零傷害快篩」，那條 2026-08-10 刪了（見它的說明）。
         # 「打得到嗎」＝**有沒有任何一招打得到**（每一招各自比自己的射程）。
         # ⚠ 交棒那一輪例外：那時候本來就是「站得遠、叫快捷鍵讓遊戲自己走過去」，
@@ -4675,7 +4692,9 @@ class CharFarmPage(QWidget):
         #   完全分開 —— 後者是每一招各自判斷的，這裡不代表任何一招的射程。
         reach_keep = HANDOFF_RANGE if handoff else reach_walk
         margin = 2.0 if reach_keep >= 6.0 else 0.6
-        keep = (MELEE_RANGE if blocked
+        # ⚠ `self._push_in` ＝ 站定打了 PUSH_IN_SECS 秒零傷害（技能被地形
+        #   擋線的實錘症狀）→ 跟「隔著地形」同款處置：貼身走過去打。
+        keep = (MELEE_RANGE if (blocked or self._push_in)
                 else min(max(reach_keep - margin, move.MIN_GAP),
                          reach_keep - 0.5))
 
@@ -4779,7 +4798,9 @@ class CharFarmPage(QWidget):
         if in_range and dist is not None and dist <= keep:
             self._why = ""
         elif in_range:
-            self._why = f"打得到，同時走近到 {keep:.1f} 格"
+            self._why = (f"⛰ 零傷害疑似擋線 → 繞過去貼身（停 {keep:.1f} 格）"
+                         if self._push_in
+                         else f"打得到，同時走近到 {keep:.1f} 格")
         elif dist is None:
             self._why = "⚠ 讀不到座標"
         elif self._mover is None or not self._mover.active:
@@ -4814,6 +4835,7 @@ class CharFarmPage(QWidget):
                         f"停 {keep:.1f} 打得到={in_range} "
                         f"路徑點={self._path_pts} 走不到次數={self._unreach} "
                         f"要走={need_walk} 走成功={self._walked_ok} "
+                        f"貼身繞打={int(self._push_in)} "
                         f"移動中={self._moving} 卡住={self._stuck:.1f}s "
                         f"血={hp} 冷卻中={len(self._killed)} "
                         f"｜{self._why or '正常攻擊中'}\n")
@@ -4834,6 +4856,7 @@ class CharFarmPage(QWidget):
         #   這是**唯一**不必知道各角色射程、也不必量測的辦法。
         if 0 < hp < self._last_hp:
             self._hurt = True          # 打傷過的怪就不要再放棄（見上面）
+            self._push_in = False      # 傷害進得來＝沒被擋線，不必再貼身繞打
         # ⚠⚠ **用「離錨點的淨位移」判斷有沒有前進**，不要用 self._moving。
         #   撞牆時角色會原地抖動（實測約 0.5~0.6 格），而 self._moving 讀的是
         #   遊戲的動畫狀態 —— 撞著牆它照樣是 'Run'，那個計時器就永遠歸零，
@@ -4872,6 +4895,24 @@ class CharFarmPage(QWidget):
         # ⚠ 冷卻也要換成短的（NOHP_MEMORY）：這不是「走不到」，用遞增冷卻
         #   會把整片打得到的怪一隻隻凍起來，越打越沒得打。
         engaged = bool(in_range and self._keys.selected)
+        # ★★ 站定 PUSH_IN_SECS 秒、打得到、選定也送了、血卻一滴不掉 ——
+        #   十之八九是技能被地形擋線（怪在障礙物對面）。別傻站到 15 秒換怪：
+        #   改成**繞過去貼身打**（keep 壓到 MELEE_RANGE，下一拍起照 blocked
+        #   同款走位：有 _way 走 _way 繞，直線可走就直走；邊走邊照打，
+        #   擋線一消失第一發就有傷害、掉血就解除）。詳見 PUSH_IN_SECS。
+        # ⚠ 交棒中不觸發：那時走位是客戶端自己在走，我們再下移動指令會打架
+        #   （交棒走不動自有 HANDOFF_WAIT 3 秒收回來，收回來之後這裡才接手）。
+        # ⚠ dist 要驗 None：in_range_of_any(None) 刻意回 True（讀不到座標
+        #   不代表打不到），engaged 不保證有距離。
+        if (engaged and not self._push_in and not handoff
+                and self._stuck >= PUSH_IN_SECS
+                and dist is not None and dist > NO_PATH_NEED):
+            self._push_in = True
+            self.status.setText(
+                f"「{m.name}」打得到卻 {PUSH_IN_SECS:.0f} 秒零傷害"
+                f"（隔著障礙物？）→ 繞過去貼身打")
+            self._dbg(f"零傷害 {PUSH_IN_SECS:.0f} 秒（{dist:.1f} 格）"
+                      f"→ 貼身繞打「{m.name}」eid={m.eid:#x}")
         limit = STUCK_ENGAGED if engaged else STUCK_SECS
         if self._stuck >= limit:
             if engaged:
