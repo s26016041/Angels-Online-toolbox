@@ -1573,7 +1573,9 @@ class CharFarmPage(QWidget):
         # 連續幾趟補給回來藥水**還是見底**（≥2 就大聲停 —— 買水一直買不進來
         #   多半是金幣不夠／背包滿，重試只會每趟燒一張翼；跟壞裝煞車同一套）。
         self._dry_trips = 0
-        self._dry = ""             # 哪一組藥水正見底（門閂：見底期間只通知一次）
+        # ⛔ 舊的 self._dry 通知門閂已刪：買得到的藥水見底**不通知**
+        #   （2026-08-19 使用者：會自動補給還通知是吵人），只剩 _dry_stop
+        #   那種「店裡沒賣、要停機」才通知，而停機本身就不會重複。
         self._supply_gen = 0       # 第幾趟補給（讓上一趟排的計時器自己作廢）
         self._recall_try = 0       # 回程第二段重試了幾次（見 _retry_recall）
         # 連續幾輪說「背包裡沒有回程道具」了（見 NO_RECALL_TRIES）。
@@ -2511,31 +2513,21 @@ class CharFarmPage(QWidget):
     # ------------------------------------------------------------------
     # -- 回程補給（判斷 → 交棒 → 回到原地圖再接回來）-----------------------
     def _check_dry(self) -> list | None:
-        """藥水見底（剩 ≤robot.POTION_LOW 顆）就通知一聲。
+        """算「哪幾組藥水見底（剩 ≤robot.POTION_LOW 顆）」，**不通知**。
 
-        ★ 用門閂（self._dry）：見底的那段期間只叫一次，補到貨才重新武裝。
-          少了它每 GEAR_CHECK_GAP 秒就會吵一次。
-        ★ 只通知不停機：接下來怎麼處置由 tick 決定 —— 買得到就回程補給、
-          買不到才走 _dry_stop（通知＋翼回城＋停機）。
+        ⚠ 2026-08-19 使用者定：**買得到的藥水見底不通知**（會自動回城補給，
+          「補給後又通知」是吵人）——藥水的通知只剩一種：補給店沒賣、
+          要停機的那種，由 _dry_stop 自己發。
 
-        回傳算出來的見底清單（兩組都算），讓同一拍的補給判斷直接拿去用，
+        回傳見底清單（兩組都算），讓同一拍的補給判斷直接拿去用，
         不必再走一次物品陣列；沒算成就回 None。
         """
         if not (self.inv and self._mover is not None and self._mover.active):
             return None
         try:
-            # 兩組都要看：**通知不看勾選**，勾選只決定要不要跑補給。
-            dry = robot.potions_out(self._mover, self.sc, self.inv, self.pid)
+            return robot.potions_out(self._mover, self.sc, self.inv, self.pid)
         except Exception:                              # noqa: BLE001
             return None                                # 讀不到就當沒事，別擋掛機
-        key = "|".join(w for w, _ in dry)
-        if dry and key != self._dry:
-            # ★ 2026-08-19：藥水補給全自動（沒有勾選）——見底一律接著處置：
-            #   買得到 → 回程補給；買不到 → _dry_stop（那邊自己再通知一次停機原因）。
-            self.notify("、".join(d for _, d in dry)
-                        + f"快用完了（剩 ≤{robot.POTION_LOW} 顆）。")
-        self._dry = key
-        return dry
 
     def _dry_stop(self, bad: list[str]) -> None:
         """藥水見底但**補給店沒賣那種藥水**（活動藥水這類非賣品）→
@@ -4375,8 +4367,8 @@ class CharFarmPage(QWidget):
             # None = 讀不到容器（換地圖中…）→ 不觸發也不解除，下次再看
             broken = bag.worn_broken(self.sc)
             gear = self.sup_gear_cb.isChecked()
-            # ★ 水快用完一律先通知（使用者要求）——放在觸發判斷**之前**，
-            #   通知要先發出去才不會被底下的 return 吃掉。
+            # ★ 藥水見底清單（不通知——買得到會自動補給，通知只在
+            #   _dry_stop 那種「店裡沒賣、要停機」才發；2026-08-19 使用者定）。
             dry = self._check_dry()
             # ★ 見底那幾組裡有「補給店沒賣」的（精靈頁放活動藥水這類非賣品）
             #   → 買不到，跑補給也是白燒一張翼：通知＋翼回城＋直接停機。
