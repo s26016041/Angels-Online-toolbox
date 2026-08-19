@@ -1286,6 +1286,28 @@ def force_autofight_off(scanner) -> bool:
     return _write_var(scanner, AF_IS_AUTO_FIGHT, VAR_T_BOOL, 0)
 
 
+def exercise_on(scanner) -> bool | None:
+    """輔助頁「原地重複練習技能」（AS_EXERCISE_SKILL）現在是開的嗎？
+    **純記憶體讀，不碰 Lua、不用跳板**（同 autofight_on 那對）。
+
+    讀不到（樹還沒載好／位址失效）回 None —— 呼叫端不准當成「關著」。
+    ⚠ 記錄不存在（從沒在遊戲裡勾過）會回 False —— 跟遊戲的 getter 一致。
+    """
+    return _read_var(scanner, AS_EXERCISE_SKILL, VAR_T_BOOL)
+
+
+def force_exercise(scanner, on: bool) -> bool:
+    """開／關「原地重複練習技能」，**純記憶體、不需要跳板**；成了才回 True。
+
+    ⚠ 給「自動練技」的看門狗用（farm_tab._train_push）：遊戲重開會自己把
+      這一項關掉（使用者實測），所以跟 force_autofight_off 一樣是「要一直
+      維持的狀態」——失敗就下一輪再推，不設上限。
+    ⚠ 記錄不存在時寫不了（_write_var 對 _MISSING 回 False）——那時只能退
+      Lua 讓遊戲自己建記錄（呼叫端用 set_bool，要有跳板）。
+    """
+    return _write_var(scanner, AS_EXERCISE_SKILL, VAR_T_BOOL, 1 if on else 0)
+
+
 def missing_supply_settings(mover, scanner) -> list[str]:
     """補給那一趟缺了哪些必要設定（回傳中文項目名；全都設好就是空清單）。
 

@@ -1312,7 +1312,8 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
 
 
 def run_full_supply(mover, scanner, say=None,
-                    back_to=None, potions=None) -> tuple[bool, str]:
+                    back_to=None, potions=None,
+                    potion_only: bool = False) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
@@ -1327,6 +1328,11 @@ def run_full_supply(mover, scanner, say=None,
     買完購買清單後，照精靈頁放的藥水**買到負重 95%**（run_potion_fill，
     2026-08-19 使用者要求）。None＝不買藥水 —— 生產分頁**一定要留 None**，
     採集的負重就是產能，塞滿藥水等於廢了它。
+
+    potion_only=True：**只跑補給商那一站**（清單購買＋藥水），不去銀行、
+    不去維修商（2026-08-19「自動練技」使用者指定：水用完那趟只有藥水商人
+    的部分）。清單購買留著是因為同一個 NPC 順手把天使之翼補回 50 張 ——
+    每趟回城都燒一張翼，不補的話練技幾趟後就回不了城。
     """
     def note(m):
         if say:
@@ -1405,6 +1411,8 @@ def run_full_supply(mover, scanner, say=None,
     #   對話才 _nudge_toward 用**遊戲尋路**往 NPC 身上靠；遠距離則由 _engage 自己在
     #   NPC 沒串流時退回地形圖靠近。
     bank_npc = entry.get("bank")
+    if potion_only:
+        bank_npc = None          # 自動練技那趟：不去銀行（使用者指定）
     if bank_npc:
         _bank_targets = deposit_targets(scanner)
         _bank_pend = (pending_deposits(scanner, _bank_targets)
@@ -1425,7 +1433,9 @@ def run_full_supply(mover, scanner, say=None,
     #   觸發下一趟（又燒一張翼）——呼叫端要看得到 False 才能踩煞車。
     rep = entry.get("repair")
     repair_ok = True
-    if rep:
+    if potion_only:
+        pass                     # 自動練技那趟：不修裝（使用者指定），也不用警告沒維修商
+    elif rep:
         rid, rx, ry = rep
         note(f"走去維修商 ({rx},{ry}) 全修…")
         repair_ok, rmsg = run_repair(mover, scanner, rid, (rx, ry))

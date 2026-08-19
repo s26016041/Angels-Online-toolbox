@@ -154,6 +154,14 @@ GEAR_CHECK_GAP = 3.0            # 多久看一次裝備耐久（掉得很慢，�
 #   它一開著，精靈就會自己挑怪打，而且**完全不看我們的「選中怪物」名單**。
 #   純記憶體讀（紅黑樹 0.3ms 級），是關的就什麼都不做。
 AF_WATCH_GAP = 3.0
+# ★「自動練技」的心跳間隔（見 CharFarmPage._train_tick）：開關收斂＋藥水
+#   見底檢查共用一個計時。開關那半是純記憶體讀（是開的就什麼都不做）；
+#   藥水那半跟 GEAR_CHECK_GAP 的補給判斷同一套成本。
+TRAIN_GAP = 3.0
+# 練習技能的記錄還沒建（角色從沒在遊戲裡勾過那個框）時才需要退 Lua 讓遊戲
+# 自己建 —— Lua 呼叫是全專案風險最高的動作（會動遊戲的 Lua 堆疊），
+# 看門狗絕不能每 3 秒撞一次，失敗至少隔這麼久才再試。
+TRAIN_LUA_GAP = 30.0
 # ★★ 「背包裡找不到回程道具」要**連續確認幾次**才准停機（每次間隔就是
 #   GEAR_CHECK_GAP）。⚠ 不可以改回「第一次就停機」：換頻道／傳送後重連時，
 #   容器與內容是**分批到齊**的 —— 使用者 2026-08-09 回報「裝備壞掉卻說我
@@ -1585,6 +1593,20 @@ class CharFarmPage(QWidget):
         # 連續幾趟補給回來藥水**還是見底**（≥2 就大聲停 —— 買水一直買不進來
         #   多半是金幣不夠／背包滿，重試只會每趟燒一張翼；跟壞裝煞車同一套）。
         self._dry_trips = 0
+        # ── 自動練技（_train_tick；跟掛機互斥，見 _on_train_toggle）──
+        # 練技的「原地」：(x, y, 場景)。開練技後第一次讀到位置就記下來，
+        # 補給那趟回程一律跳回這張圖 —— 不能記「出發當下」：上一趟若失敗把
+        # 人留在城裡，下一趟就會把城當成原地（run_full_supply 預設行為的坑）。
+        self._train_home: tuple[float, float, int] | None = None
+        self._train_t = 0.0          # 練技心跳計時（TRAIN_GAP 一拍）
+        self._train_supply = False   # 練技的補給趟進行中（背景執行緒）
+        self._train_supply_t = 0.0   # 這趟跑多久了（SUPPLY_MAX_SECS 兜底）
+        self._train_result = None    # 背景執行緒的結果 (ok, msg)；None=還在跑
+        self._train_progress = ""    # 背景執行緒的最新進度（say 回報）
+        self._train_gen = 0          # 第幾趟（作廢晚回來的結果）
+        self._train_dry_trips = 0    # 連續幾趟回來藥水還是見底（≥2 大聲停）
+        self._train_no_wing = 0      # 連續幾次確認沒回程道具（NO_RECALL_TRIES）
+        self._train_lua_t = 0.0      # 上次為了建練習技能記錄退 Lua 的時刻
         # ⛔ 舊的 self._dry 通知門閂已刪：買得到的藥水見底**不通知**
         #   （2026-08-19 使用者：會自動補給還通知是吵人），只剩 _dry_stop
         #   那種「店裡沒賣、要停機」才通知，而停機本身就不會重複。
@@ -1769,6 +1791,19 @@ class CharFarmPage(QWidget):
         self.kills_reset_btn.clicked.connect(self._reset_kills)
         run_bar.addSpacing(4)
         run_bar.addWidget(self.kills_reset_btn)
+        # ★ 自動練技（2026-08-19 使用者要求）：練技本體交給官方精靈的
+        #   「原地重複練習技能」，我們只看藥水、跑補給、把開關顧好。
+        #   跟「開始掛機」互斥（都要指揮同一隻角色）；放主開關同一列 ——
+        #   它跟掛機一樣是整頁層級的模式，而且這一列有現成的空位（不加高）。
+        run_bar.addSpacing(24)
+        self.train_cb = QCheckBox("自動練技")
+        self.train_cb.setToolTip(
+            "開精靈主開關＋輔助頁「原地重複練習技能」原地練技。\n"
+            f"藥水剩 ≤{robot.POTION_LOW} 顆自動回城買水（只找補給商），"
+            "買完飛回原地圖續練。\n"
+            "精靈頁放的是商店沒賣的藥水：通知並自動關閉。")
+        self.train_cb.toggled.connect(self._on_train_toggle)
+        run_bar.addWidget(self.train_cb)
         run_bar.addStretch(1)
         root.addLayout(run_bar)
 
@@ -2677,6 +2712,10 @@ class CharFarmPage(QWidget):
         if self._supply:
             # 補給是背景執行緒跑我們自己的整趟（含趴趴GO回程）→ 這裡顯示它回報的進度。
             txt = f"補給：{self._supply_progress}" if self._supply_progress else "補給中…"
+        elif self._train_supply:
+            # 自動練技的補給趟（只跑補給商）也顯示在同一格。
+            txt = (f"練技補給：{self._train_progress}"
+                   if self._train_progress else "練技補給中…")
         elif self._death:
             left = max(0.0, DEATH_REVIVE_SECS - self._death_t)
             txt = (f"死亡回程 倒數 {_mmss(left)}" if left > 0
@@ -2745,6 +2784,244 @@ class CharFarmPage(QWidget):
         self.status.setText(
             f"🔧 回程補給中…{self._supply_progress}（{_mmss(self._supply_t)}）")
         return True
+
+    # ------------------------------------------------------------------
+    # -- 自動練技（跟掛機互斥；練技本體是官方精靈在跑）--------------------
+    def _on_train_toggle(self, on: bool) -> None:
+        """「自動練技」開關（2026-08-19 使用者要求）。
+
+        開：開精靈主開關＋輔助頁「原地重複練習技能」，之後 _train_tick 顧著。
+        關：把**我們開的**關回去（主開關＋練習技能）—— 這個勾選的語意就是
+            「練技進行中」，關掉＝停止練技；跟 apply_prefs 那種「使用者自己
+            的設定不碰」是兩回事。
+        ⚠ 跟「開始掛機」互斥：兩邊都要指揮同一隻角色（精靈練技 vs 我們打
+          怪、兩套補給），同時開只會互相踩。
+        """
+        if not on:
+            if self._train_supply:
+                self._train_supply = False
+                self._train_gen += 1       # 作廢還在跑的補給執行緒結果
+                self._train_result = None
+            if self._halted:
+                return                     # 遊戲已經不在了，別再寫記憶體
+            try:
+                if robot.is_run(self.sc):
+                    robot.set_run(self._mover, self.sc, False)
+                # 純記憶體關；記錄不存在＝本來就是關的。關不成也只是
+                # 練習技能留著開 —— 主開關已關，精靈不會動作。
+                if robot.exercise_on(self.sc):
+                    robot.force_exercise(self.sc, False)
+            except Exception:                          # noqa: BLE001
+                pass                       # 分身剛被關掉：寫失敗無所謂
+            self.status.setText("自動練技已停止（精靈主開關已關）")
+            return
+
+        if self.run_cb.isChecked():
+            self.run_cb.setChecked(False)  # 互斥：練技接手，掛機停
+        self._train_home = None
+        self._train_dry_trips = 0
+        self._train_no_wing = 0
+        self._train_t = TRAIN_GAP          # 下一拍立刻推開關＋記原地
+        notes: list[str] = []
+        if self._ensure_mover():
+            # 精靈自己的「回城補給」觸發全關掉 —— 補給那趟是我們在開車
+            # （跟掛機開始時同一套，見 _on_toggle）。
+            notes += robot.disable_return_supply(self._mover, self.sc)
+            # 購買清單保證有天使之翼×50：每趟補給都燒一張翼回城，
+            # 清單有它補給商那站才會補貨，不然練技幾趟後就回不了城。
+            note = robot.ensure_buy_item(self._mover, self.sc,
+                                         recall.RECALL_ITEM,
+                                         robot.BUY_KEEP_WINGS)
+            if note:
+                notes.append(note)
+            self._train_push()             # 立刻把主開關＋練習技能開起來
+        self.status.setText(
+            "🥋 自動練技中：精靈原地重複練習技能"
+            f"（藥水剩 ≤{robot.POTION_LOW} 顆會自動回城買水）"
+            + ("　" + "、".join(notes) if notes else ""))
+
+    def _train_push(self) -> None:
+        """看門狗：把「精靈主開關＋原地重複練習技能」往**開**推。
+
+        ⚠⚠ 開著是一個要一直維持的狀態，不是做過就算的動作：遊戲重開會自己
+          把練習技能關掉（使用者實測）、斷網重登／被踢也一樣 —— 所以每
+          TRAIN_GAP 收斂一次，推不成下一輪再推、不設上限
+          （[[transient-failure-auto-retry]]）。讀寫都純記憶體，
+          是開的就什麼都不做，平常成本趨近於零。
+        """
+        if not robot.is_run(self.sc):
+            ok, why = robot.set_run(self._mover, self.sc, True)
+            if not ok:
+                # 還沒進遊戲／精靈子系統沒好：正常路過，別吵（_dbg 有記）
+                self._dbg(f"練技：主開關開不起來（{why}）→ 下一輪再開")
+        cur = robot.exercise_on(self.sc)
+        if cur is None:
+            return          # 樹讀不到（登入中／改版）→ 不猜、不動作（同 _af_tick）
+        if cur is True:
+            return
+        if robot.force_exercise(self.sc, True):
+            self._dbg("練技：開回「原地重複練習技能」")
+            return
+        # 寫不動＝記錄還沒建（角色從沒勾過那個框）→ 只能退 Lua 讓遊戲自己建。
+        # ⚠ Lua 是全專案風險最高的動作，節流 TRAIN_LUA_GAP 才試一次。
+        now = time.monotonic()
+        if (now - self._train_lua_t >= TRAIN_LUA_GAP
+                and self._mover is not None and self._mover.active):
+            self._train_lua_t = now
+            robot.set_bool(self._mover, self.sc,
+                           robot.AS_EXERCISE_SKILL, True)
+
+    def _train_stop(self, msg: str) -> None:
+        """大聲停用自動練技：放掉勾勾（收尾在 _on_train_toggle）＋通知。"""
+        self.train_cb.setChecked(False)
+        self.status.setText(msg)
+        self.notify(msg)
+
+    def _train_start_supply(self, why: str) -> None:
+        """練技的補給趟：關精靈主開關 → 背景執行緒跑**只有補給商那站**的
+        run_full_supply（potion_only，不存倉不修裝）→ 回標記地圖。
+
+        跟 _start_supply 平行的一套，差在：不動 KeyWorker/TargetWorker
+        （練技時它們本來就沒在跑）、回程點固定是 _train_home（練技的原地，
+        不是巡邏點 —— 使用者指定這功能不走巡邏點）。
+        """
+        # ⚠ 背景執行緒的把手跟掛機補給共用（同一隻角色只准有一趟在路上）。
+        t = self._supply_thread
+        if t is not None and t.is_alive():
+            self.status.setText(f"🥋 {why} → 上一趟補給的背景執行緒還沒收工，先等它")
+            return
+        if self._train_home is None:
+            # 還沒記到練技位置就不出發 —— 這時讓 run_full_supply 記「出發
+            # 當下」等於把回程點交給運氣（見 _train_home 的說明）。
+            self.status.setText(f"🥋 {why} → 還沒記到練技位置（座標讀不到），下一輪再出發")
+            return
+        have = robot.has_recall_item(self.sc, self.inv)
+        if have is None:
+            self.status.setText(f"🥋 {why} → 背包暫時讀不到，下一輪再試")
+            return
+        if not have:
+            item = itemname.label(recall.RECALL_ITEM)
+            self._train_no_wing += 1
+            if self._train_no_wing < NO_RECALL_TRIES:
+                self.status.setText(
+                    f"🥋 {why} → 找不到「{item}」，{TRAIN_GAP:.0f} 秒後再確認"
+                    f"（第 {self._train_no_wing}/{NO_RECALL_TRIES} 次）")
+                return
+            self._train_stop(f"🥋 {why}，但背包裡找不到「{item}」（回程道具）"
+                             "→ 自動練技已停止")
+            return
+        self._train_no_wing = 0
+        # 藥水種類在主執行緒抓（potion_slots 可能走 Lua，背景執行緒不准碰）。
+        plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
+        # ★ 出發前關精靈主開關（使用者指定）：路上精靈不能再原地施法。
+        if robot.is_run(self.sc):
+            robot.set_run(self._mover, self.sc, False)
+        self._train_supply = True
+        self._train_supply_t = 0.0
+        self._train_result = None
+        self._train_progress = why
+        self._train_gen += 1
+        mv, sc, gen = self._mover, self.sc, self._train_gen
+        home = self._train_home
+
+        def _worker():
+            try:
+                res = supply.run_full_supply(
+                    mv, sc,
+                    say=lambda m: setattr(self, "_train_progress", m),
+                    back_to=home,          # 回練技的原地圖（不是巡邏點）
+                    potions=plan,          # 藥水買到負重 95%
+                    potion_only=True)      # 只跑補給商：不存倉、不修裝
+            except Exception as exc:                      # noqa: BLE001
+                res = (False, f"補給出錯：{exc}")
+            if gen == self._train_gen:     # 這一趟還沒被作廢才收結果
+                self._train_result = res
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._supply_thread = t
+        t.start()
+        self.status.setText(f"🥋 {why} → 關精靈主開關，回城找補給商買藥水"
+                            "（不存倉、不修裝）…")
+
+    def _train_tick(self, dt: float) -> None:
+        """自動練技的心跳（只在**沒掛機**時被 tick 呼叫；兩者互斥）。
+
+        練技本體是官方精靈在跑（原地重複練習技能），這裡只做三件事：
+          ① 看門狗把「主開關＋練習技能」往開推（_train_push）
+          ② 藥水見底（兩組加總各 ≤POTION_LOW）→ 練技補給趟（_train_start_supply）
+          ③ 見底的那組放的是**店裡沒賣**的藥水 → 通知＋自動關閉（使用者指定）
+        """
+        if not self.train_cb.isChecked():
+            return
+        # ── 補給趟進行中：只等結果／逾時。開關看門狗暫停 ——
+        #    主開關是我們**刻意**關的，這時推回去等於邊跑補給邊施法。
+        if self._train_supply:
+            self._train_supply_t += dt
+            if self._train_result is not None:
+                ok, msg = self._train_result
+                self._train_result = None
+                self._train_supply = False
+                # ★ 回來還是見底？連續兩趟就大聲停 —— 一直買不進來
+                #   （金幣不夠／背包滿）不是暫時性失敗，重試只會每趟燒一張翼
+                #   （跟掛機補給的 _dry_trips 煞車同一套）。
+                # ⚠ 要在 _drop_cached_addrs **之前**算：它會把 self.inv 清成
+                #   None，之後 _check_dry 只會回「讀不到」，煞車永遠數不到
+                #   （potions_out 自帶表頭驗證，拿舊表頭算是安全的 ——
+                #   驗不過就回不觸發，跟掛機補給那邊同一個順序）。
+                dry_after = self._check_dry()
+                self._drop_cached_addrs()  # 補給跑完換過地圖，快取位址作廢
+                self._train_push()         # 回來了 → 主開關＋練習技能開回去
+                if dry_after:
+                    self._train_dry_trips += 1
+                    if self._train_dry_trips >= 2:
+                        self._train_stop(
+                            f"⚠ 連續 {self._train_dry_trips} 趟補給回來藥水"
+                            f"還是見底（{msg}）→ 自動練技已停止："
+                            "金幣夠嗎？背包滿了嗎？")
+                        return
+                elif dry_after is not None:
+                    self._train_dry_trips = 0
+                self.status.setText(
+                    f"🥋 練技補給完成：{msg}　共花 {_mmss(self._train_supply_t)}"
+                    "（主開關已開回，練技繼續）")
+                return
+            if self._train_supply_t >= SUPPLY_MAX_SECS:
+                # run_full_supply 各段都有逾時，這是執行緒卡死的最後保險。
+                self._train_stop(
+                    f"⚠ 練技補給超過 {SUPPLY_MAX_SECS / 60:.0f} 分鐘還沒回來"
+                    f"（最後進度：{self._train_progress}）→ 自動練技已停止")
+            return
+
+        self._train_t += dt
+        if self._train_t < TRAIN_GAP:
+            return
+        self._train_t = 0.0
+        if not self._ensure_mover():
+            return                          # 跳板還沒好：下一輪再來（會自動重試）
+        # 記「練技的原地」：第一次讀到位置才記（補給回程要跳回這張圖）。
+        if self._train_home is None:
+            here = self.cur_scene()
+            pos = self.my_pos()
+            if here is not None and pos is not None:
+                self._train_home = (pos[0], pos[1], here)
+        self._train_push()
+        # 藥水見底？（HP/MP 兩組都看，判定跟掛機同一套 —— _check_dry）
+        dry = self._check_dry()
+        if not dry:
+            return
+        # 見底的那組放的是店裡沒賣的藥水（活動藥水這類）→ 買不到，
+        # 跑補給也是白燒一張翼：通知＋自動關閉（使用者指定）。
+        plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
+        bad = [d for w, d in dry
+               if plan is not None and plan.get(w)
+               and not any(supply.shop_sells(t) for t in plan.get(w, ()))]
+        if bad:
+            extra = "" if supply.SHOP_TABLE else "（補給店販售表載不到，全當買不到）"
+            self._train_stop(f"🥋 {'、'.join(bad)}快用完了，"
+                             f"但補給店沒賣這種藥水{extra} → 自動練技已關閉")
+            return
+        self._train_start_supply(
+            "、".join(d for _, d in dry) + f"剩 ≤{robot.POTION_LOW} 顆")
 
     # ------------------------------------------------------------------
     # -- 血/魔不足時坐下回復 ---------------------------------------------
@@ -4022,6 +4299,10 @@ class CharFarmPage(QWidget):
 
     def _on_toggle(self, on: bool) -> None:
         if on:
+            # ★ 跟「自動練技」互斥（都要指揮同一隻角色）：掛機接手，練技停
+            #   （setChecked 會走 _on_train_toggle 的收尾把精靈主開關關掉）。
+            if self.train_cb.isChecked():
+                self.train_cb.setChecked(False)
             # ★ 開自動戰鬥時把分身／召喚叫起來。**已經 armed 就不重來** ——
             #   2026-08-13 起兩個功能獨立於掛機（_companion_tick），使用者
             #   可能已經在「沒掛機」狀態下跑著它們：分身的計時是查表來的，
@@ -4158,6 +4439,9 @@ class CharFarmPage(QWidget):
         try:
             if self.run_cb.isChecked():
                 self.run_cb.setChecked(False)  # 走既有的停止流程
+            if self.train_cb.isChecked():
+                # _on_train_toggle 看到 _halted 只收旗標、不再寫記憶體
+                self.train_cb.setChecked(False)
             if gone and self._mover is not None:
                 # 行程都沒了，IAT 還不還得回去無所謂 —— 重點是別再有人拿著它。
                 # （move.release → stop() 內部本來就整段包在 try 裡。）
@@ -4233,12 +4517,15 @@ class CharFarmPage(QWidget):
         #   自己就會越過 SCAN_NOW 的門檻，又變回會自動掃。
         asked = self._since_scan >= SCAN_NOW
         if not self.run_cb.isChecked():
-            if self.buff_cb.isChecked() or self.summon_cb.isChecked():
+            if (self.buff_cb.isChecked() or self.summon_cb.isChecked()
+                    or self.train_cb.isChecked()):
                 # ★ 自動分身／自動召喚**不開掛機也要動**（使用者 2026-08-13
                 #   改的規則：手動打王時要它們自己補）。它們靠掃描拿玩家物件
                 #   ／屬性／kind=4 清單，所以這時恢復慢檔自動掃。
                 #   不牴觸「掃周圍怪物改成按鈕」那條要求 —— 純看清單、兩個都
                 #   沒勾時照樣完全不自動掃。
+                # ★ 自動練技也一樣：藥水見底判斷要物品陣列表頭（InvWorker
+                #   跟著掃描走）、記練技原地要玩家座標 —— 都靠這檔慢掃。
                 gap = IDLE_SCAN_GAP
             else:
                 if not asked:
@@ -4272,6 +4559,9 @@ class CharFarmPage(QWidget):
             #   不開掛機也要能補）。補給／死亡回程／巡迴換頻是掛機才有的
             #   狀態，這條路不會經過，所以不必讓路。
             self._companion_tick()
+            # ★ 自動練技也獨立於掛機（互斥）：開關看門狗＋藥水見底＋補給趟
+            #   全在它自己的心跳裡（見 _train_tick）。
+            self._train_tick(dt)
             return
 
         # ★ 死亡回程要在最前面：死亡／復活／傳送期間 state 常常是 None、
@@ -5218,6 +5508,11 @@ class FarmTab(ClientWatchMixin, BaseTab):
         # 每個分身一對（寫入執行緒, 送鍵執行緒）—— 收掉那台時只停它自己的
         self._keys: dict[int, tuple[_Paced, _Paced]] = {}
         self._watch_init()
+        # ★「自動練技」的意向記憶（帳號→bool），跟 run_cb 的 _intent 同一套
+        #   規則：只記使用者親手點的、不進 config、登入驗完名字自動接回去 ——
+        #   遊戲重開會把「原地重複練習技能」關掉，靠這條把練技整包接回來
+        #   （接回後 _train_push 看門狗會把練習技能推回開）。
+        self._train_intent: dict[str, bool] = {}
 
         root = QVBoxLayout(self)
 
@@ -5303,6 +5598,33 @@ class FarmTab(ClientWatchMixin, BaseTab):
             self._inv.found.connect(self._on_inv_found)
             self._inv.start(QThread.LowestPriority)
 
+    # -- 意向記憶（掛機＋練技，兩者互斥所以要一起記）---------------------
+    def _note_farm_intent(self, page) -> None:
+        """使用者親手點「開始掛機」→ 記掛機意向；勾上時練技會被互斥放掉，
+        練技意向也要跟著清 —— 不清的話重連後兩個都想接手，練技後接手會把
+        使用者剛開的掛機又關掉。"""
+        self._note_intent(page)
+        if page.run_cb.isChecked() and page.account:
+            self._train_intent[page.account] = False
+
+    def _note_train_intent(self, page) -> None:
+        """使用者親手點「自動練技」→ 記練技意向；同上，勾上時清掛機意向。"""
+        if page.account:
+            self._train_intent[page.account] = page.train_cb.isChecked()
+            if page.train_cb.isChecked():
+                self._intent[page.account] = False
+
+    def _maybe_resume(self, page) -> None:
+        """接回意向：先讓 mixin 接掛機，再接練技。
+
+        兩個意向互斥地記（見上面兩支 note），所以不會同時為 True；
+        真的都 True（不該發生）也是後接手的練技贏 —— toggle 會把掛機放掉。
+        """
+        super()._maybe_resume(page)
+        if (self._train_intent.get(page.account) and self._name_ok(page)
+                and not page.train_cb.isChecked()):
+            page.train_cb.setChecked(True)
+
     def _client_new(self, w) -> None:
         """接上一台新分身。開失敗就先跳過 —— 下一拍對帳會再試。"""
         sc = MemoryScanner()
@@ -5333,7 +5655,9 @@ class FarmTab(ClientWatchMixin, BaseTab):
                             tgt, keys, None, acct, nm,
                             self.ATTACK_MODE, self.SETTINGS_PREFIX)
         page._notifier.failed.connect(self.found.setText)
-        page.run_cb.clicked.connect(lambda _on, p=page: self._note_intent(p))
+        page.run_cb.clicked.connect(lambda _on, p=page: self._note_farm_intent(p))
+        page.train_cb.clicked.connect(
+            lambda _on, p=page: self._note_train_intent(p))
         self._pages[w.pid] = page
         self.tabs.addTab(page, nm or acct or str(w.pid))
         self._show_locate()
@@ -5349,6 +5673,10 @@ class FarmTab(ClientWatchMixin, BaseTab):
         page = self._pages.pop(pid)
         try:
             page.run_cb.setChecked(False)      # 遊戲已關，停止流程的讀寫會自己失敗
+        except Exception:                      # noqa: BLE001
+            pass
+        try:
+            page.train_cb.setChecked(False)    # 練技收尾的寫入失敗也會被吞掉
         except Exception:                      # noqa: BLE001
             pass
         # ⚠ 一定要還掉移動 hook；用 release() 不要 stop()（PID 共用，見 move.acquire）
