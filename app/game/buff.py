@@ -1,23 +1,39 @@
-"""自動分身：開自動戰鬥時無腦放一次，之後時間到就用**封包**補。
+"""自動分身：開自動戰鬥時無腦放一次，之後時間到就補放。
 
 怎麼放
 ------
-`attack.CAST_FN(技能ID, 自己的實體ID, 0, 0, 0)` —— 一包就夠。
-照使用者攔到的 F12 封包原樣重做：
+★★★ 走**客戶端自己的快捷鍵函式**（`quickbar.use` ＝ usequickkey，跟真按
+  F12 同一支），快捷欄整個讀不到（改版位移）才退回真送鍵。
 
-    0x664517(0x1530, 0x47B403C2, 0, 0, 0)
-             ↑技能5424  ↑自己的實體ID   ↑座標填 0，不是實際位置
+## 2026-08-20 嵐狐實機三路對照（reports/lanfox_*_probe.txt）
 
-★ 實測扣魔驗證：MP 4729 → 4699（正好 30，就是技能 5424 的消耗）。
-⚠⚠ 驗證要**每 0.25 秒取樣**：MP 只低 2 秒就補回來了，隔 2.5 秒才看會什麼都
-  看不到 —— 我第一次就是這樣誤判成「封包沒生效」，白繞了一圈。
-★ 送封包**不必停下來**：走路中、打怪中都送得出去，不像按鍵會被當前動作吃掉。
-★ 2026-08-19 起補放送包後等 castwatch 的「施放廣播」：看到＝100% 確認受理。
-  ⚠⚠ 2026-08-20 實機翻案：**等不到 ≠ 被拒收** —— 廣播只在攻擊技上實測過，
-  分身這種自我 buff 會不會廣播沒驗過。舊版把等不到當拒收、每 8 秒重放，
-  實機就是「無法分身、一直重複補發」（同類重放會被拒收，白繞）。
-  現在等不到＝「驗不了」：當作已補、這招之後跳過確認（_cw_skip）。
-  沒有監聽（裝不起來）一樣退回「送出就當成功」。
+技能 5471 雙體分身Ⅰ 的 magic.xml：**對象＝自己、消耗MP＝51、持續 300 秒、
+魔法狀態＝分身攻擊加成、後置時間 2000**。⚠ 它是**自我 buff，不生成實體** ——
+「實體清單裡看不到分身」不是失敗的證據（before/after 差分：新出現 0 個）。
+
+三條路**都成功施放**，測到的東西一模一樣：
+    A 裸包 attack.CAST_FN　B 真按 F12（send_key）　C quickbar.use
+    → 每條都 MP −51（＝magic.xml 的消耗，2 秒後回滿）
+    → 每條都收到伺服器廣播 0x0301＋0x0401（帶 300000ms＝300 秒時長）
+⚠⚠ **MP 一定要 0.25 秒取樣**：我第一次只看 6 秒後的數字（已回滿），
+  誤判成「封包不扣魔」，差點把好的那條路砍掉 —— 這正是檔頭早就寫過的坑。
+
+為什麼還是選 C（快捷鍵路徑）：它跟使用者親手按 F12 是同一支函式，
+**客戶端側的效果（施法動作、快捷欄 CD、畫面上的分身）也會一起發生**；
+裸包只有伺服器端生效、客戶端什麼都不演（[[skill-data-and-buff]] 實測），
+而使用者的抱怨正是「看不到分身」。代價：後置時間 2 秒的硬直（5 分鐘一次）。
+⚠ 記憶體層面兩條等價 —— 若日後證明畫面效果與此無關，換回裸包也不算錯。
+## ★★★ 使用者實機回報「無法分身、一直重複卡補發」的真根因（2026-08-20 修）
+
+2026-08-19 起補放後等 castwatch 的「施放廣播」：看到＝確認受理。
+⚠⚠ 但舊版把**等不到廣播**判成「被拒收」→ 每 RETRY(8) 秒重放一次、
+  `_cast_at` 永遠不記 → **無限補發迴圈**，狀態列一直刷「補發」。
+  嵐狐實測證明廣播本來就會回（閒置時 0.4 秒內收到），所以真實情境裡
+  fired() 會失敗的原因不是拒收，而是**沒接到那一包**：環形緩衝只有 512 槽，
+  掛機打怪時入向封包洪流幾秒就繞一圈，那一包早被蓋掉。
+✅ 修法：等不到＝「**驗不了**」→ 當作已補（回到 8/19 以前一直正常的行為）
+  ＋這招之後跳過確認（`_cw_skip`），**絕不重放**。真的收到廣播時照樣
+  回報「伺服器已受理」。沒有監聽（裝不起來）一樣退回「按出就當成功」。
 
 技能編號怎麼來
 --------------
@@ -42,7 +58,7 @@ from __future__ import annotations
 
 import time
 
-from app.game import attack, bag, castwatch, player, skills
+from app.game import bag, castwatch, player, quickbar, skills
 
 # 剩幾秒就補（使用者指定 10 秒）
 LEAD = 10.0
@@ -65,6 +81,7 @@ class AutoBuff:
 
     def __init__(self, vk: int, skill_id: int | None = None) -> None:
         self.vk = vk
+        self._rd: quickbar.Reader | None = None   # 讀「目前頁碼」用（懶建）
         # ⚠ 存檔帶回來的技能編號也要**重新過表**（跟 adopt() 同一道門檻）：
         #   查不到持續時間就不收、當沒學過，讓快捷欄那條路重新學。
         #   不擋的話 secs=0 → left() 恆為 0 → 每 RETRY(8) 秒盲補一次，
@@ -138,9 +155,8 @@ class AutoBuff:
              stats_base: int, send_key, cast_hook=None) -> str:
         """走一步。回傳給狀態列看的說明。
 
-        my_id: 自己的實體 ID，**也可以傳一個 callable**，要用到時才呼叫。
-            ★ 那個值要讀一次記憶體，但只有真的要送補分身封包（20 分鐘一次）
-              才用得到 —— 掛機的心跳是 10ms 一拍，每拍都先算好等於白讀。
+        my_id / pf_this: ⛔ 補放改走快捷鍵路徑後**不再使用**（2026-08-20，
+            見檔頭）——參數留著是為了呼叫端簽名不動；別拿掉，也別再依賴。
         cast_hook: castwatch.CastHook（施放廣播監聽），None＝沒有。
             有它才能 100% 確認「這一放真的被伺服器受理」——拒收不回、
             受理才回（見 app/game/castwatch.py）。沒有就退回舊行為
@@ -167,15 +183,12 @@ class AutoBuff:
                          f"（持續 {info.secs / 60:.0f} 分）")
             return self.note
 
-        # ①.5 封包送出去了 → 等伺服器的「施放廣播」確認真的放出去
-        #   （castwatch）。看到＝100% 確認受理。
-        #   ⚠⚠ 但**等不到 ≠ 被拒收**（2026-08-20 使用者實機回報翻案）：
-        #     施放廣播只在攻擊技 944~947 上實測過，分身這種自我 buff 會不會
-        #     廣播從沒驗證過。8/19 版把「等不到」當「被拒收」每 8 秒重放，
-        #     實機症狀＝「無法分身、一直重複補發」——同類技能重放會被伺服器
-        #     拒收（skill-data-and-buff 實測），重放只是白繞，還可能把已在場
-        #     的分身收掉。→ 等不到改判「**驗不了**」：當作已補（退回 8/19 前
-        #     的行為），並記住這招跳過確認（_cw_skip），不再白等也不再重放。
+        # ①.5 按出去了 → 等伺服器的「施放廣播」確認真的放出去（castwatch）。
+        #   看到＝確認受理。⚠⚠ 但**等不到 ≠ 被拒收**（2026-08-20 實機翻案，
+        #   見檔頭）：嵐狐閒置實測廣播 0.4 秒內就回，所以真實情境等不到多半是
+        #   **沒接到那一包**（環形緩衝 512 槽，打怪時封包洪流幾秒就繞一圈）。
+        #   舊版把等不到當拒收、每 8 秒重放 → 無限補發迴圈（使用者實機症狀）。
+        #   → 改判「驗不了」：當作已補、記住這招跳過確認（_cw_skip），不再重放。
         if self._confirming:
             if (cast_hook is not None and cast_hook.active and self._srv
                     and cast_hook.fired(self._cw_since, self._srv, self.skill)):
@@ -193,8 +206,8 @@ class AutoBuff:
                 self._confirming = False
                 self._cw_skip = True             # 這招驗不了，之後不再等廣播
                 self._cast_at = self._sent_at    # 當作已補（送出就算）
-                self.note = (f"已補分身：技能 {self.skill}（沒看到施放廣播——"
-                             f"這招可能不廣播，改回送出就算；"
+                self.note = (f"已補分身：技能 {self.skill}（沒接到施放廣播——"
+                             f"改回按出就算，不重放；"
                              f"持續 {self.secs / 60:.0f} 分）")
             return self.note
 
@@ -228,13 +241,34 @@ class AutoBuff:
             self.note = "第一次啟用：按 F12 學技能編號…"
             return self.note
 
-        # ④ 已經知道技能編號 → 用封包補（不必停下來、不占鍵盤）
-        mid = my_id() if callable(my_id) else my_id
-        if not (mover is not None and mover.active and pf_this and mid):
+        # ④ 已經知道技能編號 → 走**客戶端自己的快捷鍵路徑**補
+        #   （quickbar.use＝usequickkey，跟真按 F12 同一支，含「自己實體
+        #   NULL 就不按」的崩潰閘門）。裸 CAST_FN 在記憶體層面等價（都扣
+        #   51 MP、都有廣播），差別在客戶端側效果會不會演——見檔頭實測。
+        if not (mover is not None and mover.active):
             self.note = "⚠ 跳板沒裝上，補不了分身"
             self._sent_at = now
             return self.note
-        # ★ 確認用的兩個錨要在**送包前**先記：廣播可能一送就回來，送完才記
+        slot = self.vk - quickbar.VK_F1
+        if self._rd is None or self._rd._sc is not scanner:
+            self._rd = quickbar.Reader(scanner)
+        page = self._rd.page()               # F12 作用在「目前顯示的頁」
+        try:
+            cells = quickbar.read_page(scanner, page)
+        except Exception:                              # noqa: BLE001
+            cells = None
+        cell = (cells[slot] if cells is not None and 0 <= slot < len(cells)
+                else None)
+        if cells is not None and (cell is None or not cell.is_skill
+                                  or cell.value != self.skill):
+            # 目前頁的那一格不是學到的這招（使用者翻頁／換了技能）→ 這輪
+            # 不放（硬按等於亂放別的東西）；呼叫端的 adopt 每 2 秒重讀一次
+            # 快捷欄，自己會收斂到新技能。
+            self.note = (f"⚠ 快捷欄目前頁第 {slot + 1} 格不是分身技能"
+                         f"（翻頁/換技能？）→ {RETRY:.0f} 秒後再看")
+            self._sent_at = now
+            return self.note
+        # ★ 確認用的兩個錨要在**按下去前**先記：廣播可能一送就回來，送完才記
         #   write_count 會把那一包漏掉。施法者ID每次重讀（換圖/重連會重建
         #   玩家物件，快取的是舊值 → 永遠對不上）。
         # ★ _cw_skip＝上次等過廣播沒等到（這招可能不廣播）→ 不再白等 4 秒。
@@ -246,19 +280,26 @@ class AutoBuff:
             except Exception:                              # noqa: BLE001
                 srv = 0
             since = cast_hook.write_count()
-        ok = mover.call(attack.CAST_FN, self.skill, mid, 0, 0, 0)
+        if cells is not None:
+            ok = quickbar.use(mover, scanner, slot, page)
+        else:
+            # 快捷欄整個讀不到（改版位移）→ 跟人按鍵同一條路保底。
+            send_key(hwnd, self.vk)
+            ok = True
         self._sent_at = now
         if not ok:
-            self.note = "⚠ 補分身的封包排不進去"
+            # use() 回 False＝換圖空窗（自己實體 NULL）／指令槽忙——都是
+            # 暫時性的，照 RETRY 節奏再試（transient-failure-auto-retry）。
+            self.note = f"⚠ 補分身這一下沒按成（換圖中？）→ {RETRY:.0f} 秒後再試"
         elif srv:
             # 有施放廣播監聽 → 先別當成功，等 ①.5 收到「我放出這招」才算
             self._confirming = True
             self._cw_since = since
             self._srv = srv
-            self.note = "補分身：已送出，等伺服器受理…"
+            self.note = "補分身：已按出，等伺服器受理…"
         else:
-            # 沒有監聽（裝不起來／讀不到施法者ID）→ 退舊行為：送出就當成功
+            # 沒有監聽（裝不起來／讀不到施法者ID）→ 按出就當成功
             self._cast_at = now
-            self.note = (f"已用封包補分身：技能 {self.skill}"
-                         f"（持續 {self.secs / 60:.0f} 分）")
+            self.note = (f"已補分身：技能 {self.skill}（快捷鍵路徑，"
+                         f"持續 {self.secs / 60:.0f} 分）")
         return self.note
