@@ -1,11 +1,16 @@
 """領取每日分頁。
 
-兩顆按鈕，都是**不必選分身**，按下去對目前開著的每一台各做一輪：
+動作鈕都是**不必選分身**，按下去對目前開著的每一台各做一輪：
 
   · 領取在線獎勵     —— 6 格全送（`0x5D3D97(0x48, 獎勵編號)`）
   · 全部換取翔宇聖翼 —— 身上有幾張「勤奮在線獎勵卷」就換幾次
                         （先 `0x5D3D97(0x49, 群組)` 開商店，再送封包 0x148，
                          換完叫遊戲自己的開關函式把商店視窗關掉）
+  · 全部換取導引之翼 —— 同一套流程，只是券換的獎賞改成導引之翼
+                        （兌換編號一樣用 exchange.find() 內容反查，找不到拒送）
+
+另外有一顆「當前翅膀數量」——純讀背包，不送任何封包：跳出一張表，
+列出每台分身身上導引之翼／翔宇聖翼各有幾個（讀不到就說讀不到，不報 0）。
 
 背後是 `app/game/dailygift.py` 與 `app/game/exchange.py`，
 兩邊都是呼叫遊戲自己的函式組包、送出，加解密由客戶端處理。
@@ -38,6 +43,7 @@ import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -75,15 +81,17 @@ READ_TRIES = 8            # ⚠ 讀不到背包（還在讀取畫面／換地圖
 LOG_COLS = ("時間", "分身", "動作", "結果")
 LOG_MAX = 200
 
-# ★ 這兩個道具編號是唯二寫死的遊戲資料，但**不會安靜地換錯東西**：
-#   `exchange.find()` 要求「獎賞＝翔宇聖翼」且「材料＝兌換券」兩邊都對得上
-#   才算數，改版把編號動了就會找不到 → 我們拒絕送出（見下面 _ex_scan）。
+# ★ 這三個道具編號是唯三寫死的遊戲資料（出處：assets/item_names.tsv.gz，
+#   tools/build_* 從資源包自動抽的），但**不會安靜地換錯東西**：
+#   `exchange.find()` 要求「獎賞＝這個」且「材料＝兌換券」兩邊都對得上
+#   才算數，編號錯／改版動過就會找不到 → 我們拒絕送出（見下面 _ex_scan）。
 WING_ITEM = 25832         # 翔宇聖翼
+GUIDE_ITEM = 82050        # 導引之翼
 TOKEN_ITEM = 5346         # 勤奮在線獎勵卷(1天) —— 在線獎勵發的就是這個
 
-# 找到的兌換項目。★ 資料表是資源包來的，每台分身內容都一樣，所以整個工具箱
-# 只掃一台就夠（掃一次 ~0.8 秒，之後都是瞬間）。
-_entry: exchange.Entry | None = None
+# 找到的兌換項目（key＝獎賞編號）。★ 資料表是資源包來的，每台分身內容都一樣，
+# 所以整個工具箱每種獎賞只掃一台一次就夠（掃一次 ~0.8 秒，之後都是瞬間）。
+_entries: dict[int, exchange.Entry] = {}
 
 
 class DailyTab(BaseTab):
@@ -99,8 +107,11 @@ class DailyTab(BaseTab):
         self._sent: dict[int, int] = {}           # pid -> 這一輪送出幾包
         self._done = 0                            # 完成幾台（收尾訊息用）
         self._find_gen = None                     # 分次掃描的產生器
+        self._ex_target = WING_ITEM               # 這一輪兌換的獎賞編號
         self._paused = False
         self._summary = None                      # 全部做完時的收尾訊息
+        self._wing_dlg = None                     # 「當前翅膀數量」視窗（單例）
+        self._wing_table = None
 
         root = QVBoxLayout(self)
         hint = QLabel(
@@ -121,8 +132,24 @@ class DailyTab(BaseTab):
         self.ex_btn.setToolTip(
             "把每台身上的「勤奮在線獎勵卷」全部換成翔宇聖翼（券 1 天過期）。\n"
             "過程中跳出的兌換商店視窗會自動關掉。")
-        self.ex_btn.clicked.connect(self._start_exchange)
+        self.ex_btn.clicked.connect(
+            lambda _=False: self._start_exchange(WING_ITEM))
         bar.addWidget(self.ex_btn)
+
+        self.ex_guide_btn = QPushButton("全部換取導引之翼")
+        self.ex_guide_btn.setToolTip(
+            "把每台身上的「勤奮在線獎勵卷」全部換成導引之翼（券 1 天過期）。\n"
+            "過程中跳出的兌換商店視窗會自動關掉。")
+        self.ex_guide_btn.clicked.connect(
+            lambda _=False: self._start_exchange(GUIDE_ITEM))
+        bar.addWidget(self.ex_guide_btn)
+
+        # 純讀背包不送封包，所以做事中也不用鎖灰
+        self.wings_btn = QPushButton("當前翅膀數量")
+        self.wings_btn.setToolTip(
+            "跳出一張表：每台分身身上導引之翼／翔宇聖翼各有幾個。只讀不送。")
+        self.wings_btn.clicked.connect(self._show_wing_counts)
+        bar.addWidget(self.wings_btn)
 
         # 重試不設上限，這顆就是「嫌太久」的出口
         self.pause_btn = QPushButton("暫停")
@@ -231,8 +258,12 @@ class DailyTab(BaseTab):
         self._sent.clear()
         self._done = 0
         self._paused = False
+        # ⚠ 換掉上一輪掃到一半的產生器 —— 兩顆兌換鈕找的是不同獎賞，
+        #   沿用舊產生器會把「翔宇聖翼那筆」存成「導引之翼的兌換」送出去。
+        self._find_gen = None
         self.claim_btn.setEnabled(False)
         self.ex_btn.setEnabled(False)
+        self.ex_guide_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("暫停")
         self._tick()
@@ -256,6 +287,7 @@ class DailyTab(BaseTab):
         self._timer.stop()
         self.claim_btn.setEnabled(True)
         self.ex_btn.setEnabled(True)
+        self.ex_guide_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("暫停")
         self._paused = False
@@ -276,6 +308,7 @@ class DailyTab(BaseTab):
             self.pause_btn.setText("繼續")
             self.claim_btn.setEnabled(True)
             self.ex_btn.setEnabled(True)
+            self.ex_guide_btn.setEnabled(True)
             self.status.setText(
                 "⏸ 已暫停 —— 按「繼續」接著做，或再按左邊的按鈕整輪重新開始")
         else:
@@ -283,7 +316,22 @@ class DailyTab(BaseTab):
             self.pause_btn.setText("暫停")
             self.claim_btn.setEnabled(False)
             self.ex_btn.setEnabled(False)
+            self.ex_guide_btn.setEnabled(False)
             self._tick()
+
+    def _abort(self, msg: str) -> int:
+        """整輪喊停並**留住警告** —— 收工訊息不准把它蓋掉。
+
+        ⚠⚠ 以前只是 `_steps.clear()` + 寫 status：清空步驟後下一拍就進 _finish，
+          收尾訊息「兌換完成：0 台換到東西」立刻把警告洗掉，看起來像正常收工
+          （2026-08-20 daily_check 抓到）。失效要大聲，所以這裡連 summary 一起收掉，
+          並且在紀錄表也留一列，捲上去還看得到。
+        """
+        self._steps.clear()
+        self._summary = None
+        self.status.setText(msg)
+        self._log("—", self._ex_act(), msg)
+        return 0
 
     def _retry(self, fn, tries: int, patience: int) -> None:
         """把重試排回隊伍 —— 重試**不設上限**，只決定排哪裡。
@@ -354,13 +402,15 @@ class DailyTab(BaseTab):
         return 0
 
     # ------------------------------------------------------------------
-    # -- 全部換取翔宇聖翼 ------------------------------------------------
-    def _start_exchange(self) -> None:
+    # -- 全部換取翔宇聖翼／導引之翼 --------------------------------------
+    def _start_exchange(self, target: int) -> None:
+        """把每台的獎勵券全換成 target（翔宇聖翼或導引之翼），流程同一套。"""
         clients = self._clients()
         if not clients:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")
             return
         self._jobs = clients
+        self._ex_target = target
         steps = [self._ex_scan]                        # 先確認兌換項目
         for pid, label in clients:
             steps.append(lambda p=pid, l=label: self._ex_begin(p, l))
@@ -369,36 +419,36 @@ class DailyTab(BaseTab):
             f"兌換完成：{self._done} 台換到東西"
             + (f"，{m - self._done} 台沒換" if self._done < m else "")))
 
+    def _ex_act(self) -> str:
+        """記錄欄「動作」名：換翔宇聖翼／換導引之翼。"""
+        return f"換{self._name(self._ex_target)}"
+
     def _ex_scan(self) -> int:
-        """分次掃描找「券 → 翔宇聖翼」那筆兌換。找到才會排後面的步驟。
+        """分次掃描找「券 → 目標獎賞」那筆兌換。找到才會排後面的步驟。
 
         ⚠ 找不到就把整輪取消 —— 群組 580 裡有幾十筆同樣「1 張券」的兌換，
           編號猜錯不會失敗，只會換到別的東西。寧可不送。
         """
-        global _entry
-        if _entry is not None:
+        target = self._ex_target
+        if _entries.get(target) is not None:
             return 0
         if self._find_gen is None:
             sc = next((s for s in (self._scanner(p) for p, _ in self._jobs)
                        if s is not None), None)
             if sc is None:
-                self._steps.clear()
-                self.status.setText("⚠ 讀不到遊戲記憶體，沒有送出任何東西")
-                return 0
-            self._find_gen = exchange.finder(sc, WING_ITEM, TOKEN_ITEM)
+                return self._abort("⚠ 讀不到遊戲記憶體，沒有送出任何東西")
+            self._find_gen = exchange.finder(sc, target, TOKEN_ITEM)
         try:
             got = next(self._find_gen)
         except StopIteration:
-            self._steps.clear()
-            self.status.setText(
+            return self._abort(
                 f"⚠ 在遊戲裡找不到「{self._name(TOKEN_ITEM)} → "
-                f"{self._name(WING_ITEM)}」這筆兌換 —— 沒有送出任何東西"
+                f"{self._name(target)}」這筆兌換 —— 沒有送出任何東西"
                 "（改版動過兌換表？）")
-            return 0
         if got is None:
             self._steps.insert(0, self._ex_scan)       # 還沒掃完，下一拍繼續
             return 0
-        _entry = got
+        _entries[target] = got
         r_id, r_n = got.reward
         m_id, m_n = got.material
         self.status.setText(
@@ -406,8 +456,23 @@ class DailyTab(BaseTab):
             f"{r_n} 個{self._name(r_id)}（編號 {got.id}／商店 {got.group}）")
         return 0
 
+    @staticmethod
+    def _tally(sc, ids: tuple[int, ...]) -> tuple[dict[int, int], int] | None:
+        """數容器裡 ids 各有幾個：({編號: 數量}, 讀到幾件)；讀不到回 None。
+
+        共用給兌換流程與「當前翅膀數量」—— 讀不到≠沒有的守則見 _count。
+        """
+        items, ok = bag.scan(sc, 0, bag.MAX_SLOTS)
+        if not ok:
+            return None
+        counts = dict.fromkeys(ids, 0)
+        for it in items:
+            if it.type_id in counts:
+                counts[it.type_id] += it.count
+        return counts, len(items)
+
     def _count(self, sc) -> tuple[int, int, int] | None:
-        """(券, 翔宇聖翼, 讀到幾件)；**讀不到背包回 None**（≠ 沒有券）。
+        """(券, 這一輪的獎賞, 讀到幾件)；**讀不到背包回 None**（≠ 沒有券）。
 
         ⚠⚠ 這支以前是 `bag.items()` 直接加總 —— 讀不到時它回空清單，於是
           「還在讀取畫面／換地圖／位址定位失敗」全被講成「你沒有獎勵券」。
@@ -420,12 +485,11 @@ class DailyTab(BaseTab):
           道具欄那種非背包格照樣換得掉 —— 反而漏數會變成「明明有券卻說沒有」。
           （容器裡的東西本來就都是自己的；倉庫不在這個容器裡，不會多算。）
         """
-        items, ok = bag.scan(sc, 0, bag.MAX_SLOTS)
-        if not ok:
+        got = self._tally(sc, (TOKEN_ITEM, self._ex_target))
+        if got is None:
             return None
-        return (sum(it.count for it in items if it.type_id == TOKEN_ITEM),
-                sum(it.count for it in items if it.type_id == WING_ITEM),
-                len(items))
+        counts, seen = got
+        return counts[TOKEN_ITEM], counts[self._ex_target], seen
 
     def _unreadable(self, sc, label: str, reads: int, again) -> int:
         """背包讀不到時的共同處理：先重試幾次，試完大聲說讀不到。
@@ -445,10 +509,10 @@ class DailyTab(BaseTab):
             self._steps.insert(0, again)
             return RETRY_MS
         if bag.player_entity(sc) is None:
-            self._log(label, "換翔宇聖翼",
+            self._log(label, self._ex_act(),
                       "這台還沒進遊戲（登入畫面／選角／讀取中？）—— 跳過")
         else:
-            self._log(label, "換翔宇聖翼",
+            self._log(label, self._ex_act(),
                       "⚠ 進遊戲了卻讀不到背包 —— 這台沒換，"
                       "請跑 tools\\selfcheck.py 看是不是位址失效")
         return 0
@@ -464,11 +528,12 @@ class DailyTab(BaseTab):
         cycle 是「開店→兌換→驗背包」第幾輪重來（見 _ex_check），
         tries 是這一輪裡開店包排不進指令槽重試了幾次。
         """
-        if _entry is None:
+        ent = _entries.get(self._ex_target)
+        if ent is None:
             return 0
         sc = self._scanner(pid)
         if sc is None:
-            self._log(label, "換翔宇聖翼", "⚠ 讀不到記憶體")
+            self._log(label, self._ex_act(), "⚠ 讀不到記憶體")
             return 0
         got = self._count(sc)
         if got is None:
@@ -476,18 +541,18 @@ class DailyTab(BaseTab):
                 sc, label, reads,
                 lambda: self._ex_begin(pid, label, cycle, tries, reads + 1))
         have, wings, seen = got
-        times = _entry.times_for(have)
+        times = ent.times_for(have)
         if times <= 0:
             # ★ 講「背包 N 件裡沒有」不講「沒有」—— 讀得到才敢下這個結論，
             #   件數也讓使用者一眼看出是不是讀到半份（見 _count）。
-            self._log(label, "換翔宇聖翼",
+            self._log(label, self._ex_act(),
                       f"背包 {seen} 件裡沒有{self._name(TOKEN_ITEM)}")
             return 0
         mv = self._mover(pid)
         if mv is None:
-            self._log(label, "換翔宇聖翼", "⚠ 無法安裝跳板（視窗關了？）")
+            self._log(label, self._ex_act(), "⚠ 無法安裝跳板（視窗關了？）")
             return 0
-        if not exchange.open_shop(mv, _entry.group):
+        if not exchange.open_shop(mv, ent.group):
             # 指令槽忙 → 自己等、自己重試，試到送出去為止。
             # 重送＝再點一次 NPC，安全。
             self.status.setText(
@@ -511,7 +576,8 @@ class DailyTab(BaseTab):
           前一發其實有送到、券已被扣走，這裡會自動變 0 次，不會多換。
         """
         sc, mv = self._scanners.get(pid), self._movers.get(pid)
-        if sc is None or mv is None or _entry is None:
+        ent = _entries.get(self._ex_target)
+        if sc is None or mv is None or ent is None:
             return 0
         got = self._count(sc)
         if got is None:
@@ -525,14 +591,14 @@ class DailyTab(BaseTab):
                 self._steps.insert(0, lambda: self._ex_close(pid, label))
             return delay
         have, wings, _seen = got
-        times = _entry.times_for(have)
+        times = ent.times_for(have)
         if times <= 0:
             # 開店時還有券、現在沒了 —— 幾乎一定是前一發其實成功了
             # （逾時≠沒送出）。交給驗背包那步對帳，翅膀有變多就算成功。
             self._steps.insert(0, lambda: self._ex_check(
                 pid, label, have0, wings0, cycle, CHECK_TRIES - 1))
             return 0
-        ok, why = exchange.confirm(mv, sc, _entry.id, times)
+        ok, why = exchange.confirm(mv, sc, ent.id, times)
         if ok:
             self._steps.insert(0, lambda: self._ex_check(
                 pid, label, have, wings, cycle))
@@ -575,8 +641,8 @@ class DailyTab(BaseTab):
         used, got = have - now_tok, now_wing - wings
         if got > 0:
             self._done += 1
-            self._log(label, "換翔宇聖翼",
-                      f"★ 換到 {got} 個{self._name(WING_ITEM)}"
+            self._log(label, self._ex_act(),
+                      f"★ 換到 {got} 個{self._name(self._ex_target)}"
                       f"（用掉 {used} 張券，還剩 {now_tok} 張）")
         elif probes + 1 < CHECK_TRIES:
             self.status.setText(
@@ -603,6 +669,75 @@ class DailyTab(BaseTab):
         if not ok and why != "視窗沒開著":
             self._log(label, "關兌換視窗", f"⚠ 關不掉（{why}）—— 請自己關")
         return 0
+
+    # ------------------------------------------------------------------
+    # -- 當前翅膀數量 ----------------------------------------------------
+    def _show_wing_counts(self) -> None:
+        """跳出翅膀數量表 —— 純讀背包，不送封包、不動指令槽，做事中也能看。"""
+        if self._wing_dlg is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("當前翅膀數量")
+            dlg.resize(460, 320)
+            lay = QVBoxLayout(dlg)
+            table = QTableWidget(0, 3, dlg)
+            table.setHorizontalHeaderLabels(
+                ("分身", self._name(GUIDE_ITEM), self._name(WING_ITEM)))
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.setSelectionMode(QTableWidget.NoSelection)
+            table.verticalHeader().setVisible(False)
+            table.setAlternatingRowColors(True)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            lay.addWidget(table)
+            refresh = QPushButton("重新整理", dlg)
+            refresh.clicked.connect(self._fill_wing_counts)
+            lay.addWidget(refresh)
+            self._wing_dlg, self._wing_table = dlg, table
+        self._fill_wing_counts()
+        self._wing_dlg.show()
+        self._wing_dlg.raise_()
+        self._wing_dlg.activateWindow()
+
+    def _fill_wing_counts(self) -> None:
+        """重讀每台的背包填進表。
+
+        ⚠ 讀不到就寫「讀不到」——**不准寫 0**（讀不到≠沒有，
+          見 _count 與 memory bag-false-empty-guards）。
+        """
+        table = self._wing_table
+        if table is None:
+            return
+        clients = self._clients()
+        if not clients:
+            table.setRowCount(1)
+            self._set_row(table, 0, ("找不到分身 —— 遊戲開著嗎？", "—", "—"))
+            return
+        table.setRowCount(len(clients) + 1)          # +1 給合計列
+        total = {GUIDE_ITEM: 0, WING_ITEM: 0}
+        for r, (pid, label) in enumerate(clients):
+            sc = self._scanner(pid)
+            got = self._tally(sc, (GUIDE_ITEM, WING_ITEM)) if sc else None
+            if got is None:
+                # 分兩種講（同 _unreadable）：沒進遊戲＝正常；進了卻讀不到＝要查
+                if sc is not None and bag.player_entity(sc) is None:
+                    cells = (label, "未進遊戲", "未進遊戲")
+                else:
+                    cells = (label, "⚠ 讀不到", "⚠ 讀不到")
+            else:
+                counts, _seen = got
+                for k in total:
+                    total[k] += counts[k]
+                cells = (label,
+                         str(counts[GUIDE_ITEM]), str(counts[WING_ITEM]))
+            self._set_row(table, r, cells)
+        self._set_row(table, len(clients),
+                      ("合計", str(total[GUIDE_ITEM]), str(total[WING_ITEM])))
+
+    @staticmethod
+    def _set_row(table, row: int, cells: tuple[str, ...]) -> None:
+        for c, text in enumerate(cells):
+            it = QTableWidgetItem(text)
+            it.setToolTip(text)
+            table.setItem(row, c, it)
 
     @staticmethod
     def _name(type_id: int) -> str:
