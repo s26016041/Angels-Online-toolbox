@@ -168,12 +168,21 @@ check("這招已標驗不了", b._cw_skip is True)
 b.adopt(9999)
 check("adopt 後重置", b._cw_skip is False)
 
-print("⑤ 目前頁那一格不是學到的技能（翻頁）→ 不放")
+print("⑤ F12 換了另一招（設定檔舊編號的實機根因）→ 當場收下、照放")
 b, mv, hook = new_buff(), FakeMover(), FakeHook()
-QB.cell_skill = 777                     # 使用者翻頁：F12 變別的技能
+check("起點是設定檔帶進來的舊編號", b.skill == 5424)
+QB.cell_skill = 5471                    # 實機：設定 5424、F12 其實是 5471
+u0 = QB.uses
+step(b, mv, hook)
+check("改放 F12 現在那一招", b.skill == 5471, f"實得 {b.skill}")
+check("有按出去（不是卡住）", QB.uses == u0 + 1)
+
+print("⑤b F12 是空格／物品 → 不亂按")
+b, mv, hook = new_buff(), FakeMover(), FakeHook()
+QB.cell_skill = None                    # 空格
 u0 = QB.uses
 note = step(b, mv, hook)
-check("不按、說清楚", QB.uses == u0 and "不是分身技能" in note, f"實得 {note}")
+check("不按、說清楚", QB.uses == u0 and "沒有技能" in note, f"實得 {note}")
 QB.cell_skill = 5424
 
 print("⑥ 快捷欄讀不到 → 退回真送鍵保底")

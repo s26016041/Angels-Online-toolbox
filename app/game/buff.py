@@ -259,13 +259,22 @@ class AutoBuff:
             cells = None
         cell = (cells[slot] if cells is not None and 0 <= slot < len(cells)
                 else None)
-        if cells is not None and (cell is None or not cell.is_skill
-                                  or cell.value != self.skill):
-            # 目前頁的那一格不是學到的這招（使用者翻頁／換了技能）→ 這輪
-            # 不放（硬按等於亂放別的東西）；呼叫端的 adopt 每 2 秒重讀一次
-            # 快捷欄，自己會收斂到新技能。
-            self.note = (f"⚠ 快捷欄目前頁第 {slot + 1} 格不是分身技能"
-                         f"（翻頁/換技能？）→ {RETRY:.0f} 秒後再看")
+        if cells is not None and cell is not None and cell.is_skill \
+                and cell.value != self.skill:
+            # ★★ 那一格換了另一招（使用者換技能／設定檔存的是舊編號）→
+            #   **當場收下現況**，不要卡住。2026-08-20 實機根因就是這個：
+            #   設定裡 5424、F12 上其實是 5471，舊版一路放不存在的那招 →
+            #   分身放不出來又永遠等不到廣播 → 無限補發。
+            #   ⚠ adopt() 自己會過 skills.of 那道門檻（不是 buff 就不收）。
+            if not self.adopt(cell.value):
+                self.note = (f"⚠ 快捷欄第 {slot + 1} 格的技能 {cell.value}"
+                             f"不是 buff（查不到持續時間）→ 先不補")
+                self._sent_at = now
+                return self.note
+        if cells is not None and (cell is None or not cell.is_skill):
+            # 空格／物品 —— 硬按等於亂用東西。呼叫端每 2 秒重讀，放上去就接手。
+            self.note = (f"⚠ 快捷欄目前頁第 {slot + 1} 格沒有技能"
+                         f"（翻頁？）→ {RETRY:.0f} 秒後再看")
             self._sent_at = now
             return self.note
         # ★ 確認用的兩個錨要在**按下去前**先記：廣播可能一送就回來，送完才記

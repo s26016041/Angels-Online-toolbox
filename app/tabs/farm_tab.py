@@ -4210,6 +4210,13 @@ class CharFarmPage(QWidget):
         """自動分身的技能編號：**直接讀快捷欄的 F12 那一格**，不必按鍵。
 
         ★ 讀得到技能 → `adopt()` 收下並存進設定，之後全走封包。
+        ⚠⚠ **每 2 秒都要重讀，不是「還沒學過才讀」**（2026-08-20 實機根因）：
+          舊版只在 `not self._buff.skill` 時呼叫，設定檔存的舊編號會**永遠**
+          蓋住現況 —— 北極狐設定裡是 5424 單體分身Ⅳ、F12 上其實是 5471
+          雙體分身Ⅰ，於是工具一路在放一招他 F12 上根本沒有的技能：分身當然
+          不會出現，而且**永遠等不到那一招的施放廣播**，就一直重放
+          （使用者回報「無法分身、一直重複卡補發」的真根因）。
+          自動召喚那邊本來就是無條件重讀的（`_adopt_summon_skill`），這裡跟上。
         ⚠ 那一格是空的／放物品／放的不是 buff（查不到持續時間）→ `block()`
           停手並在狀態列說清楚。**不要無限重試按鍵**：那是確定的狀態，
           不是暫時性失敗，而且每按一次就在 GUI 執行緒 sleep 40ms
@@ -4229,11 +4236,15 @@ class CharFarmPage(QWidget):
             return                           # 讀不到 → 走舊的按鍵保底法
         slot = BUFF_KEY - quickbar.VK_F1
         c = cells[slot] if 0 <= slot < len(cells) else None
+        before = self._buff.skill
         if c is not None and c.is_skill and self._buff.adopt(c.value):
-            self._save_settings()
-            self.status.setText(
-                f"✨ 自動分身：F12 = {skills.name_of(c.value) or c.value}"
-                f"（持續 {self._buff.secs / 60:.0f} 分）")
+            # ⚠ 只有**真的換了**才存設定＋報告：這支現在每 2 秒跑一次，
+            #   每次都寫檔／蓋狀態列會把別的訊息洗掉（tooltip/狀態列規則）。
+            if self._buff.skill != before:
+                self._save_settings()
+                self.status.setText(
+                    f"✨ 自動分身：F12 = {skills.name_of(c.value) or c.value}"
+                    f"（持續 {self._buff.secs / 60:.0f} 分）")
             return
         if c is None:
             why = "⚠ 自動分身：F12 上沒有技能 → 先不補（放上去就會自動接手）"
@@ -4305,8 +4316,9 @@ class CharFarmPage(QWidget):
             #   2026-08-10 白狐實機：F12 是空的 → 舊的按鍵學習法永遠學不到，
             #   每 8 秒按一次、每次在 GUI 執行緒 sleep 40ms（五台分頁共用
             #   一條 GUI 執行緒），狀態列也被錯誤訊息一直蓋掉。
-            if not self._buff.skill:
-                self._adopt_buff_skill()
+            # ⚠⚠ **無條件呼叫**（自帶 2 秒節流）：以前只在「還沒學過」時讀，
+            #   設定檔的舊編號會永遠蓋住現況（2026-08-20 實機根因，見那支的說明）。
+            self._adopt_buff_skill()
             # ★ 補放要確認伺服器受理 → 需要施放廣播監聽（學到技能才裝；
             #   _sync_castwatch 已裝／失敗過會直接返回，每拍呼叫沒成本）。
             self._sync_castwatch()
