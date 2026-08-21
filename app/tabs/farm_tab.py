@@ -3199,17 +3199,25 @@ class CharFarmPage(QWidget):
             self.notify(msg)
 
     def _test_ball_swap(self) -> None:
-        """臨時測試鈕：當場把整條流程跑一遍並攤開來給使用者看。
+        """臨時測試鈕：**假裝球已經滿了**，把真正的流程原封不動跑一次。
 
-        ⚠ 這顆是**驗證用**的（memory 的 test-via-button）：三種封包都是
-          2026-08-21 離線反組譯挖出來的。
+        使用者 2026-08-21 要求：不要再做「左右對調」那種代用測試，直接
+        「背包有沒滿的就換上去、沒有就去買」—— 也就是跟 `_ball_tick` 觸發時
+        完全同一條路（`_ball_run`），只差**跳過「全部都滿了」那道閘門**。
+
+        ⚠ 這顆是驗證用的（memory 的 test-via-button）。三種封包都是
+          2026-08-21 離線反組譯挖出來的：
           ✅ 換球 0x12、領取 0x2F/0x16 已實機驗證（嵐狐）。
-          ⚠ 買 0x12B 還沒 —— 驗它要真的花點數，所以另外問一次才送。
+          ⚠ 買 0x12B 只有花點數才驗得到 → 要買之前**一定另外問一次**，
+            問句寫明買什麼、幾點，而且預設鈕是「否」。
           三包都驗過之後這顆鈕就可以拆了。
         """
         sc = self.sc
         if sc is None or not sc.attached:
             QMessageBox.warning(self, "測試換球", "還沒接上這台遊戲。")
+            return
+        if self._ball_busy:
+            QMessageBox.information(self, "測試換球", "上一次還在跑，等它跑完。")
             return
         got = balls.worn(sc)
         pool = balls.spares(sc)
@@ -3229,90 +3237,79 @@ class CharFarmPage(QWidget):
             "讀不到" if pool is None else
             "、".join(f"{b.name} {b.value:,}/{b.cap:,}（第 {b.slot} 格）"
                       for b in pool) or "一顆都沒有"))
-        # 商城賣什麼（純讀，不買）
-        for b in cur[:1]:
-            g = mall.cheapest(sc, b.type_id)
-            lines.append("　商城："
-                         + (f"編號 {g.mall_id}　{g.name}×{g.count}　{g.price} 點"
-                            if g else "查不到這顆球（或表讀不到）"))
         if not cur:
+            lines.append("\n飾品欄沒有球 —— 真流程也不會動作（使用者定的規則）。")
+            QMessageBox.information(self, "測試換球", "\n".join(lines))
+            return
+        if pool is None:
+            lines.append("\n背包讀不到 —— 真流程這時候不動作。")
             QMessageBox.information(self, "測試換球", "\n".join(lines))
             return
 
-        # ★ 順便**免費**驗「從商城倉庫領取」那包（0x2F/0x16）——
-        #   倉庫裡本來就有東西的時候領一件出來不花任何點數，是唯一
-        #   不用先買就能驗的機會。⚠ 會真的動到東西，所以先問過。
-        st = mall.storage(sc)
-        if st:
-            names = "、".join(f"{itemname.label(t)}×{n}" for _s, t, n in st)
-            ask = QMessageBox.question(
-                self, "測試換球",
-                f"商城倉庫裡有：{names}\n\n"
-                f"要順便測「領取到背包」嗎？（不花點數，東西會進背包）")
-            if ask == QMessageBox.Yes:
-                if not self._ensure_mover():
-                    lines.append("\n⚠ 跳板沒接上，無法送封包。")
-                    QMessageBox.warning(self, "測試換球", "\n".join(lines))
-                    return
-                tok, tmsg = mall.take(self._mover, sc, st[0][0], st[0][1])
-                lines.append(f"\n【領取測試】"
-                             f"{'✔ ' if tok else '⛔ '}{tmsg}")
+        # 先算一次配對，讓使用者知道待會會做什麼；要花點數就問清楚再送。
+        pairs, missing = balls.pick_spares(pool, cur)
+        plan = [f"　換上背包第 {sp.slot} 格的「{sp.name}」"
+                f"→ {inventory.slot_side(old.slot)}飾品" for old, sp in pairs]
+        cost = 0
+        for b in missing:
+            g = mall.cheapest(sc, b.type_id)
+            if g is None:
+                plan.append(f"　⛔ 商城查不到「{b.name}」，這一格補不到")
+                continue
+            cost += g.price
+            plan.append(f"　去商城買 {g.name}×{g.count}"
+                        f"（編號 {g.mall_id}，{g.price} 點）→ 領進背包 → 換上"
+                        f"{inventory.slot_side(b.slot)}飾品")
+        lines.append("\n【假裝兩顆都滿了，接下來會做】")
+        lines += plan or ["　（沒有可做的事）"]
 
-        # ★ 「買」那包（0x12B）**只有花點數才驗得到**，所以一定要另外問一次，
-        #   而且把價錢寫在問句裡。⚠ 預設是「否」—— 不小心按到不會扣點。
-        #   （換球 0x12 與領取 0x2F/0x16 已於 2026-08-21 實機驗證。）
-        buy = mall.cheapest(sc, cur[0].type_id) if cur else None
-        if buy is not None:
-            ask = QMessageBox.question(
-                self, "測試換球",
-                f"要順便測「商城購買」嗎？\n\n"
-                f"會買：{buy.name}×{buy.count}"
-                f"（商城編號 {buy.mall_id}）\n"
-                f"⚠ 這會真的花掉 {buy.price} 點。",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if ask == QMessageBox.Yes:
-                if not self._ensure_mover():
-                    lines.append("\n⚠ 跳板沒接上，無法送封包。")
-                    QMessageBox.warning(self, "測試換球", "\n".join(lines))
-                    return
-                bok, bmsg = mall.buy(self._mover, sc, buy)
-                lines.append(f"\n【購買測試】{'✔ ' if bok else '⛔ '}{bmsg}")
-                if bok:
-                    st2 = mall.storage(sc) or []
-                    mine = [r for r in st2 if r[1] == buy.type_id]
-                    if mine:
-                        tok, tmsg = mall.take(self._mover, sc,
-                                              mine[0][0], buy.type_id)
-                        lines.append(f"【接著領取】"
-                                     f"{'✔ ' if tok else '⛔ '}{tmsg}")
-
-        # 真正的流程只有「全滿」才會跑；測試鈕讓使用者能在沒滿的時候也驗封包，
-        # 所以沒滿時退而求其次：把左右兩顆對調（純驗證 0x12 通不通）。
-        all_full = bool(cur) and all(b.full for b in cur)
+        ask_text = "\n".join(lines) + "\n\n要現在跑一次嗎？"
+        if cost:
+            ask_text += f"\n⚠ 其中會**真的花掉 {cost} 點**商城點數。"
+        if QMessageBox.question(
+                self, "測試換球", ask_text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
         if not self._ensure_mover():
-            lines.append("\n⚠ 跳板沒接上，無法送封包。")
-            QMessageBox.warning(self, "測試換球", "\n".join(lines))
+            QMessageBox.warning(self, "測試換球", "跳板沒接上，無法送封包。")
             return
-        if all_full:
-            lines.append("\n【動作】跑真流程（全滿 → 配對／補貨 → 一起換）")
-            ok, msg = self._ball_run(sc, cur, pool)
-        elif len(cur) >= 2:
-            lines.append("\n【動作】還沒全滿 → 改把左右兩顆對調"
-                         "（純驗證換球封包，再按一次會換回來）")
-            ok, msg = balls.swap(self._mover, sc, cur[0].slot, cur[1].slot)
-        else:
-            lines.append("\n沒有可以試的組合（飾品欄要有兩顆球）。")
-            QMessageBox.information(self, "測試換球", "\n".join(lines))
-            return
-        lines.append(f"【結果】{'✔ ' if ok else '⛔ '}{msg}")
-        after = balls.worn(sc)
+
+        # ⚠ 整條流程會等伺服器（買／領各最多 8 秒、每次換球最多 3 秒），
+        #   放 UI 執行緒上會把畫面凍住 —— 跟真流程一樣丟背景執行緒。
+        self._ball_busy = True
+        self.ball_test_btn.setEnabled(False)
+        self.status.setText("測試換球：跑真流程中…")
+
+        def _worker() -> None:
+            try:
+                ok, msg = self._ball_run(sc, cur, pool)
+            except Exception as exc:                 # noqa: BLE001
+                ok, msg = False, f"{exc!r}"
+            QTimer.singleShot(0, lambda: self._test_ball_done(lines, ok, msg))
+
+        threading.Thread(target=_worker, daemon=True,
+                         name=f"balltest-{self.pid}").start()
+
+    def _test_ball_done(self, lines: list, ok: bool, msg: str) -> None:
+        """測試鈕的收尾（UI 執行緒）：把結果與換完之後的狀態攤開來。"""
+        self._ball_busy = False
+        self.ball_test_btn.setEnabled(True)
+        out = list(lines)
+        out.append(f"\n【結果】{'✔ ' if ok else '⛔ '}{msg}")
+        after = balls.worn(self.sc) if self.sc is not None else None
         if after is not None:
-            lines.append("\n【換完之後】")
+            out.append("\n【跑完之後】")
             for b in after[0]:
-                lines.append(f"　{inventory.slot_side(b.slot)}飾品"
-                             f"（第 {b.slot} 格）　{b.name}"
-                             f"　{b.value:,}/{b.cap:,}")
-        QMessageBox.information(self, "測試換球", "\n".join(lines))
+                out.append(f"　{inventory.slot_side(b.slot)}飾品"
+                           f"（第 {b.slot} 格）　{b.name}"
+                           f"　{b.value:,}/{b.cap:,}")
+            spare = balls.spares(self.sc)
+            out.append("　背包備球：" + (
+                "讀不到" if spare is None else
+                "、".join(f"{b.name} {b.value:,}/{b.cap:,}" for b in spare)
+                or "一顆都沒有"))
+        QMessageBox.information(self, "測試換球", "\n".join(out))
         self.status.setText(f"測試換球：{'成功' if ok else '失敗'}　{msg}")
 
     def _ball_restock(self, sc, need: list) -> tuple[bool, str]:

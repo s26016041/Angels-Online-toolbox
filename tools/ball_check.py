@@ -182,10 +182,12 @@ class FakeBox:
     # attached 被寫成方法那次的教訓）。
     Ok = 1
 
+    answer = None            # 問句要回什麼（預設「否」，測試才不會亂送封包）
+
     @staticmethod
     def question(_p, _t, text, _buttons=None, _default=None):
         FakeBox.said.append(text)
-        return FakeBox.No
+        return FakeBox.answer if FakeBox.answer is not None else FakeBox.No
 
 
 class FakeSC:
@@ -390,19 +392,18 @@ tick(page, 3)
 check("停用後不再重試", len(BALLS.swaps) == 1, f"實得 {BALLS.swaps}")
 BALLS.result = (True, "已換上")
 
-print("⑧ 「測試換球」鈕：不論狀態都不能炸（真的踩過 sc.attached 誤當方法）")
+print("⑧ 「測試換球」鈕：假裝滿了跑真流程；不論狀態都不能炸")
+ALL_SAID = []
 for label, worn, spare in (
-        ("兩顆沒滿", ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True),
-         [FakeBall(30, 4937, 0)]),
-        ("兩顆都滿有備球", ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)],
-                            True), [FakeBall(30, 4937, 0),
-                                    FakeBall(31, 4937, 0)]),
+        ("兩顆沒滿有備球", ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True),
+         [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]),
+        ("沒備球（要買）", ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True),
+         []),
         ("飾品欄沒球", ([], True), []),
         ("飾品欄讀不到", None, []),
         ("背包讀不到", ([FakeBall(8, 4937, 10)], True), None)):
     page = build_page()
     BALLS.worn_out, BALLS.spare_out = worn, spare
-    MALL.store.append((999, 2017, 1))       # 倉庫有東西 → 會問「順便測領取嗎」
     FakeBox.said.clear()
     try:
         page._test_ball_swap()
@@ -410,15 +411,43 @@ for label, worn, spare in (
     except Exception as exc:                # noqa: BLE001
         ok, why = False, repr(exc)
     check(f"{label} → 不丟例外", ok, why)
-    if ok and worn is not None and worn[0]:
+    if ok:
         check(f"{label} → 有畫面可看", bool(FakeBox.said), "一句話都沒說")
-check("問了『要不要順便測領取』就不會擅自送包（回否 → 沒領）",
-      MALL.takes == [], f"實得 {MALL.takes}")
-check("『要不要測購買』也是回否就不扣點（沒送過購買）",
-      MALL.buys == [], f"實得 {MALL.buys}")
-check("購買問句有把價錢寫進去",
-      any("點" in t and "商城編號" in t for t in FakeBox.said),
-      f"實得 {FakeBox.said}")
+    ALL_SAID += FakeBox.said
+
+check("問句回『否』就什麼都不送（不換、不買）",
+      BALLS.swaps == [] and MALL.buys == [],
+      f"實得 {BALLS.swaps} {MALL.buys}")
+check("沒備球時問句寫明要花幾點",
+      any("真的花掉" in t and "點" in t for t in ALL_SAID),
+      f"實得 {ALL_SAID}")
+check("有備球時問句寫明要換上哪一顆",
+      any("換上背包第" in t for t in ALL_SAID), f"實得 {ALL_SAID}")
+check("飾品欄沒球 → 講明真流程也不會動作",
+      any("飾品欄沒有球" in t for t in ALL_SAID), f"實得 {ALL_SAID}")
+
+print("⑧ 按「是」→ 真的把整條流程跑完（沒備球就買、買完領、領完換）")
+FakeBox.answer = FakeBox.Yes
+page = build_page()
+BALLS.worn_out = ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True)
+BALLS.spare_out = []
+nxt2 = [50]
+
+
+def _restock2(type_id):
+    BALLS.spare_out.append(FakeBall(nxt2[0], type_id, 0))
+    nxt2[0] += 1
+
+
+MALL.on_take = _restock2
+page._test_ball_swap()
+check("買了兩顆", len(MALL.buys) == 2, f"實得 {MALL.buys}")
+check("都領進背包了", len(MALL.takes) == 2, f"實得 {MALL.takes}")
+check("兩格都換上了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
+check("結果視窗講得出花了幾點",
+      any("點）" in t for t in FakeBox.said), f"實得 {FakeBox.said}")
+MALL.on_take = None
+FakeBox.answer = FakeBox.No
 
 print()
 if FAILS:
