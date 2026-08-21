@@ -276,9 +276,8 @@ tick(page)
 check("去商城買了一次", MALL.buys == [363], f"實得 {MALL.buys}")
 check("有從商城倉庫領出來", len(MALL.takes) == 1, f"實得 {MALL.takes}")
 check("補完就換了兩顆", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
-check("通知講了花幾點",
-      any("點" in m for m in page.notices) or any("已換上" in m
-                                                 for m in page.notices),
+check("通知同時講了花幾點與換上什麼",
+      any("點）" in m and "已換上" in m for m in page.notices),
       f"實得 {page.notices}")
 MALL.on_take = None
 

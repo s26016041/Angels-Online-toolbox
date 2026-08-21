@@ -3322,25 +3322,31 @@ class CharFarmPage(QWidget):
         if pool is None:
             return False, "背包讀不到，這輪不動作"
         pairs, missing = balls.pick_spares(pool, cur)
+        # ★ 花掉的點數一定要跟著結果講出來（通知＋狀態列都吃這句）——
+        #   自動花錢的功能不准安靜地花。
+        spent_note = ""
         if missing:
             ok, msg = self._ball_restock(sc, missing)
             if not ok:
                 return False, (f"經驗球都滿了，但{msg} —— "
                                f"還缺 {len(missing)} 顆備球，請手動處理。")
+            spent_note = msg + "；"
             pool = balls.spares(sc)
             if pool is None:
-                return False, "補貨完背包讀不到，下一輪再換"
+                return False, spent_note + "補貨完背包讀不到，下一輪再換"
             pairs, missing = balls.pick_spares(pool, cur)
             if missing:
-                return False, f"補貨完備球還是不夠（差 {len(missing)} 顆）"
+                return False, (spent_note
+                               + f"補貨完備球還是不夠（差 {len(missing)} 顆）")
         names = []
         for old, new in pairs:
             ok, msg = balls.swap(self._mover, sc, new.slot, old.slot)
             if not ok:
-                return False, (f"{inventory.slot_side(old.slot)}飾品換球失敗："
-                               f"{msg}")
+                return False, (spent_note
+                               + f"{inventory.slot_side(old.slot)}飾品換球失敗："
+                               + msg)
             names.append(new.name)
-        return True, ("經驗球都滿了 → 已換上「"
+        return True, (spent_note + "經驗球都滿了 → 已換上「"
                       + "」、「".join(names) + f"」共 {len(names)} 顆。")
 
     def _ball_tick(self, dt: float) -> None:
