@@ -72,13 +72,14 @@ from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (aob, attack, bag, balls, buff, castwatch, channel, entity,
+from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
+                      channel, entity,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
 from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list, fit_spin,
-                               no_elide)
+                               mall_buys_dialog, no_elide, record_mall_buy)
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
 # 平常是關的 —— 從外面看不到「為什麼不走」，只能靠這個。
@@ -3024,6 +3025,11 @@ class CharFarmPage(QWidget):
         """
         if not self.train_cb.isChecked():
             return
+        # ⚠⚠ 換球正在跑：整支讓路。它會**刻意把主開關關掉**（練技中遊戲不給
+        #   換裝，見 app/game/ballswap.py），這時看門狗把主開關推回去
+        #   就是跟它打架 —— 換完它自己會開回來。
+        if self._ball_busy:
+            return
         # ── 補給趟進行中：只等結果／逾時。開關看門狗暫停 ——
         #    主開關是我們**刻意**關的，這時推回去等於邊跑補給邊施法。
         if self._train_supply:
@@ -3215,131 +3221,28 @@ class CharFarmPage(QWidget):
         QTimer.singleShot(0, lambda: self.status.setText(f"經驗球：{text}"))
 
     def _record_mall_buy(self, g) -> None:
-        """商城買到一筆 → 記帳。**背景執行緒呼叫**：只碰純資料，不碰 Qt。
-
-        ⚠ 花的是**點數**，所以跟商店那張（金幣）分開兩份，見「商城紀錄」鈕。
-          單價不必猜 —— `mall.Goods.price` 就是遊戲商品表裡的售價。
-        """
-        self._mall_buys.append(
-            (time.time(), int(g.mall_id), int(g.type_id),
-             int(g.count), int(g.price)))
-        if len(self._mall_buys) > PURCHASE_CAP:
-            del self._mall_buys[:-PURCHASE_CAP]
+        """商城買到一筆 → 記帳（**背景執行緒**呼叫，只碰純資料）。"""
+        record_mall_buy(self._mall_buys, g)
 
     def _mall_buys_dialog(self) -> QDialog:
-        """商城購買紀錄（新的在上面），總額掛在表的上方。
-
-        跟商店那張一模一樣的做法，只差**幣別是點數**、多一欄商城編號。
-        跟 exec 拆開是為了離線測試能只建表不進事件迴圈。
-        """
-        rows = list(self._mall_buys)[::-1]
-        total = sum(r[4] for r in rows)
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(
-            f"商城購買紀錄 — {self.char_name or self.account or self.pid}")
-        v = QVBoxLayout(dlg)
-        head = (f"總花費 {total:,} 點（共 {len(rows)} 筆）" if rows else
-                "還沒有商城購買紀錄 —— 自動換球買不到備球時會記在這裡。")
-        lab = QLabel(head)
-        lab.setStyleSheet("font-weight: bold;")
-        v.addWidget(lab)
-
-        tbl = QTableWidget(len(rows), 5)
-        tbl.setHorizontalHeaderLabels(
-            ["時間", "商城編號", "商品", "數量", "花費(點數)"])
-        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        tbl.verticalHeader().setVisible(False)
-        for i, (ts, mid, tid, qty, cost) in enumerate(rows):
-            cells = (time.strftime("%m/%d %H:%M:%S", time.localtime(ts)),
-                     str(mid), itemname.label(tid), str(qty), f"{cost:,}")
-            for col, text in enumerate(cells):
-                it = QTableWidgetItem(text)
-                if col in (1, 3, 4):          # 編號／數量／花費靠右
-                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                tbl.setItem(i, col, it)
-        # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
-        for col, w in enumerate((115, 80, 200, 55)):
-            tbl.setColumnWidth(col, w)
-        tbl.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(tbl, 1)
-        dlg.resize(640, 420)
-        dlg._head, dlg._tbl = lab, tbl       # 給離線測試摸得到
-        return dlg
+        return mall_buys_dialog(
+            self, self._mall_buys,
+            self.char_name or self.account or str(self.pid))
 
     def _show_mall_buys(self) -> None:
         self._mall_buys_dialog().exec()
 
-    def _ball_restock(self, sc, need: list) -> tuple[bool, str]:
-        """去商城把缺的備球補齊（買 → 從商城倉庫領進背包）。
-
-        ⚠⚠ **會花真的點數**，所以每一步都驗結果：買完要看商城倉庫真的多一筆、
-          領完要看那一筆真的離開商城倉庫。任何一步失敗就整個停手回報。
-        ⚠ 每一包送出前都會等滿官方的節流（`actiongate.ACTION_GAP`），
-          所以補兩顆球大概要跑 30 秒 —— 進度會即時寫在狀態列。
-        """
-        spent = 0
-        bought = 0
-        for cur in need:
-            g = mall.cheapest(sc, cur.type_id)
-            if g is None:
-                return False, f"商城查不到「{cur.name}」，補不到備球"
-            ok, msg = mall.buy(self._mover, sc, g, say=self._ball_say)
-            if not ok:
-                return False, f"商城購買「{g.name}」失敗：{msg}"
-            spent += g.price
-            bought += g.count
-            # ★ 商城買的記進**自己那張表**（「商城紀錄」鈕）。⚠ 不可以跟商店
-            #   那張混：商店花金幣、商城花點數，混在一起總額就是錯的
-            #   （使用者 2026-08-21 要求分開）。
-            self._record_mall_buy(g)
-            # 買到的東西在商城倉庫，要領進背包才換得上
-            st = mall.storage(sc)
-            if st is None:
-                return False, "商城倉庫讀不到，領不出來（東西已經買了）"
-            mine = [r for r in st if r[1] == g.type_id]
-            if not mine:
-                return False, f"商城倉庫裡找不到剛買的「{g.name}」"
-            ok, msg = mall.take(self._mover, sc, mine[0][0], g.type_id,
-                                say=self._ball_say)
-            if not ok:
-                return False, f"從商城倉庫領「{g.name}」失敗：{msg}"
-        return True, f"已從商城補 {bought} 顆備球（花費 {spent} 點）"
-
     def _ball_run(self, sc, cur: list, pool) -> tuple[bool, str]:
-        """整條換球流程（會 block，一定要在背景執行緒上跑）。"""
-        if pool is None:
-            return False, "背包讀不到，這輪不動作"
-        pairs, missing = balls.pick_spares(pool, cur)
-        # ★ 花掉的點數一定要跟著結果講出來（通知＋狀態列都吃這句）——
-        #   自動花錢的功能不准安靜地花。
-        spent_note = ""
-        if missing:
-            ok, msg = self._ball_restock(sc, missing)
-            if not ok:
-                return False, (f"經驗球都滿了，但{msg} —— "
-                               f"還缺 {len(missing)} 顆備球，請手動處理。")
-            spent_note = msg + "；"
-            pool = balls.spares(sc)
-            if pool is None:
-                return False, spent_note + "補貨完背包讀不到，下一輪再換"
-            pairs, missing = balls.pick_spares(pool, cur)
-            if missing:
-                return False, (spent_note
-                               + f"補貨完備球還是不夠（差 {len(missing)} 顆）")
-        names = []
-        for old, new in pairs:
-            self._ball_say(f"換上「{new.name}」→ "
-                           f"{inventory.slot_side(old.slot)}飾品")
-            ok, msg = balls.swap(self._mover, sc, new.slot, old.slot,
-                                 say=self._ball_say)
-            if not ok:
-                return False, (spent_note
-                               + f"{inventory.slot_side(old.slot)}飾品換球失敗："
-                               + msg)
-            names.append(new.name)
-        return True, (spent_note + "經驗球都滿了 → 已換上「"
-                      + "」、「".join(names) + f"」共 {len(names)} 顆。")
+        """整條換球流程（會 block，一定要在背景執行緒上跑）。
+
+        ★ 規則本體在 `app/game/balls.py`、「先讓精靈停手」在
+          `app/game/ballswap.py` —— 自動生產那邊走的是**同一份**。
+        ⚠ 自動練技時精靈是開著的，遊戲不給換裝 → `swap_with_pause` 會
+          先關主開關＋按 ESC，換完再開回去（`_train_tick` 看 `_ball_busy` 讓路）。
+        """
+        return ballswap.swap_with_pause(
+            self._mover, sc, cur, pool,
+            say=self._ball_say, on_buy=self._record_mall_buy, hwnd=self.hwnd)
 
     def _ball_tick(self, dt: float) -> None:
         """自動換球的心跳（BALL_GAP 一拍）。

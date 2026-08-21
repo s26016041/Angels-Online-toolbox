@@ -1,4 +1,4 @@
-"""自動換球離線測試 —— offscreen Qt＋假遊戲層，驗 farm_tab 的換球流程。
+"""自動換球離線測試 —— offscreen Qt＋假遊戲層，驗**掛機頁與生產頁**的換球。
 
 驗的規格（2026-08-21 使用者定）：
     ① **飾品欄裝著的球全部都滿了才動**，一次全換掉；
@@ -10,6 +10,11 @@
     ⑤ 讀不到（飾品欄沒讀完／背包沒讀完／上限讀不到）→ 什麼都不做、不通知
     ⑥ 球的上限走遊戲的範本 +0x10C（`bag.Item.ball_cap`），不是寫死表
     ⑦ 換裝函式定位失敗 → 大聲停用（通知＋不再重試）
+    ⑧ 商城購買記在**自己那張表**（點數），不汙染商店那張（金幣）
+    ⑨⑩⑪ 官方 5 秒動作節流＋「沒成功就補送」（含指令槽忙碌那種沒送出去的）
+    ⑫ **精靈開著**（自動練技／自動採集）→ 先關主開關＋按 ESC，換完開回去；
+       精靈沒開就一個開關都不要動；中途炸掉也一定要把主開關還回去
+    ⑬ 自動生產那一頁走**同一套**規則與同一份程式碼
 
 用法：py tools\\ball_check.py   （全 PASS 結尾印 OK，有 FAIL 結束碼 1）
 """
@@ -30,7 +35,9 @@ from app.game import bag                            # noqa: E402
 from app.game import balls as real_balls            # noqa: E402
 from app.game import mall as real_mall              # noqa: E402
 from app.game import actiongate                     # noqa: E402
+from app.game import ballswap                       # noqa: E402
 from app.tabs import farm_tab                       # noqa: E402
+from app.tabs import produce_tab                    # noqa: E402
 
 FAILS: list[str] = []
 
@@ -164,7 +171,25 @@ class InlineThread:
 
 
 class FakeTimer:
-    """QTimer.singleShot(0, f) → 直接叫 f（測試裡沒有事件迴圈在轉）。"""
+    """QTimer 替身。
+
+    · `singleShot(0, f)` → 直接叫 f（測試裡沒有事件迴圈在轉）
+    · 也要能**當類別用**（`QTimer(self)` + `.timeout.connect` + `start/stop`）
+      —— produce_tab 的看門狗就是這樣建的；替身少一半介面就建不出頁面。
+    """
+
+    class _Sig:
+        def connect(self, fn):
+            pass
+
+    def __init__(self, *a, **k):
+        self.timeout = FakeTimer._Sig()
+
+    def start(self, *a):
+        pass
+
+    def stop(self):
+        pass
 
     @staticmethod
     def singleShot(_ms, fn):
@@ -216,9 +241,29 @@ class FakeSC:
 
 BALLS = FakeBalls()
 MALL = FakeMall()
-# ⚠ 假物件要 patch 進「用到它的模組」的命名空間（farm_tab）
-farm_tab.balls = BALLS
-farm_tab.mall = MALL
+# ★★ 假的只換**碰遊戲的那幾支**（讀飾品欄／背包、送封包、買、領），
+#    配對與整條流程（`balls.pick_spares` / `run_swap` / `restock`、
+#    `ballswap.swap_with_pause`）一律跑**真的** —— 那才是要驗的東西。
+#    ⚠ 上一版把整個模組換成替身，重構之後就變成「只測到替身」（21 項假綠）。
+_REAL_SWAP = real_balls.swap
+real_balls.worn = BALLS.worn
+real_balls.spares = BALLS.spares
+real_balls.swap = BALLS.swap
+real_mall.cheapest = MALL.cheapest
+real_mall.buy = MALL.buy
+real_mall.storage = MALL.storage
+real_mall.take = MALL.take
+# 精靈：預設沒開（純掛機）；要驗「練技／採集要先停精靈」時再打開。
+ROBOT = types.SimpleNamespace(
+    run=False, calls=[],
+    is_run=lambda sc: ROBOT.run,
+    set_run=lambda mv, sc, on: (ROBOT.calls.append(("set_run", bool(on))),
+                                setattr(ROBOT, "run", bool(on)),
+                                (True, ""))[2])
+ballswap.robot = ROBOT
+ballswap.win = types.SimpleNamespace(
+    send_key=lambda hwnd, vk: ROBOT.calls.append(("esc", vk)))
+ballswap.time = types.SimpleNamespace(sleep=lambda s: None)
 farm_tab.threading = types.SimpleNamespace(Thread=InlineThread)
 farm_tab.QTimer = FakeTimer
 farm_tab.QMessageBox = FakeBox
@@ -245,6 +290,10 @@ def build_page():
     MALL.store.clear()
     MALL.buy_ok = MALL.take_ok = True
     BALLS.result = (True, "已換上")
+    real_balls.swap = BALLS.swap     # ⑩ 會換成真的那支，這裡換回來
+    page.hwnd = 4242                 # 有視窗才送得出 ESC
+    ROBOT.run = False
+    ROBOT.calls.clear()
     return page
 
 
@@ -580,6 +629,7 @@ class FakeMover:
 
 # ⚠ 換裝的身分是**序號**不是指標（實機量過：指標不動、內容互換）。
 #   替身要照著模擬，不然又會測到一個「跟真的不一樣」的世界。
+real_balls.swap = _REAL_SWAP                  # ⑩ 驗的是**真的** swap
 PTRS = {8: 111, 9: 222, 30: 333, 31: 444}
 SERIALS = {8: 900008, 9: 900009, 30: 900030, 31: 900031}
 real_balls._ptr_of = lambda sc, slot: PTRS.get(slot)
@@ -658,6 +708,116 @@ real_mall.jumpmap.BUILD_FN = 0
 st, why = real_mall._send(SendMover(), SendSC(), 0x12B, 7, bytes(5))
 real_mall.jumpmap.BUILD_FN = _keep
 check("位址沒定位要回 STOP（重送沒意義）", st == actiongate.STOP, f"實得 {st!r}")
+
+print("⑫ 精靈開著（自動練技／自動採集）→ 先關主開關＋按 ESC，換完開回去")
+page = build_page()
+ROBOT.run = True                     # 模擬練技／採集中
+ROBOT.calls.clear()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+tick(page)
+check("換球前把主開關關掉", ("set_run", False) in ROBOT.calls,
+      f"實得 {ROBOT.calls}")
+check("有按 ESC 退出採集／製作狀態",
+      ("esc", ballswap.VK_ESCAPE) in ROBOT.calls, f"實得 {ROBOT.calls}")
+check("兩格都換了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
+check("換完把主開關開回去", ROBOT.calls[-1] == ("set_run", True),
+      f"實得 {ROBOT.calls}")
+check("關在換之前、開在換之後（順序對）",
+      ROBOT.calls.index(("set_run", False)) < ROBOT.calls.index(("esc", 0x1B))
+      < len(ROBOT.calls) - 1, f"實得 {ROBOT.calls}")
+
+print("⑫ 精靈沒開（純掛機）→ 一個開關都不要動")
+page = build_page()
+ROBOT.run = False
+ROBOT.calls.clear()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0)]
+tick(page)
+check("沒碰精靈開關、也沒按 ESC", ROBOT.calls == [], f"實得 {ROBOT.calls}")
+check("照樣換好了", len(BALLS.swaps) == 1, f"實得 {BALLS.swaps}")
+
+print("⑫ 換球中途炸掉，也一定要把主開關還回去（finally）")
+page = build_page()
+ROBOT.run = True
+ROBOT.calls.clear()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0)]
+_boom = BALLS.swap
+BALLS.swap = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("模擬爆炸"))
+real_balls.swap = BALLS.swap
+try:
+    tick(page)
+except Exception:                    # noqa: BLE001
+    pass
+check("例外之後主開關仍被開回去", ("set_run", True) in ROBOT.calls,
+      f"實得 {ROBOT.calls}")
+BALLS.swap = _boom
+real_balls.swap = _boom
+
+print("⑬ 自動生產那一頁：同一套規則、但要先停精靈按 ESC")
+produce_tab.threading = types.SimpleNamespace(Thread=InlineThread)
+produce_tab.QTimer = FakeTimer
+
+
+def build_prod():
+    page = produce_tab.CharProducePage(
+        1234, 4242, "t", FakeSC(), "acct", "小狐")
+    page._ensure_mover = lambda: True
+    page._mover = types.SimpleNamespace(active=True)
+    page._loading = False
+    page.ball_cb.setChecked(True)
+    BALLS.swaps.clear()
+    MALL.buys.clear()
+    MALL.takes.clear()
+    MALL.store.clear()
+    MALL.buy_ok = MALL.take_ok = True
+    BALLS.result = (True, "已換上")
+    real_balls.swap = BALLS.swap
+    ROBOT.run = True                 # 採集中＝精靈開著
+    ROBOT.calls.clear()
+    return page
+
+
+page = build_prod()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+took = page._ball_tick()
+check("接手這一拍（回 True，_gather_tick 後面別做了）", took is True)
+check("先關精靈主開關", ("set_run", False) in ROBOT.calls, f"實得 {ROBOT.calls}")
+check("有按 ESC", ("esc", ballswap.VK_ESCAPE) in ROBOT.calls,
+      f"實得 {ROBOT.calls}")
+check("兩格都換了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
+check("換完把精靈開回去", ROBOT.calls[-1] == ("set_run", True),
+      f"實得 {ROBOT.calls}")
+check("跑完把 _ball_busy 放掉", page._ball_busy is False)
+
+page = build_prod()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, 5)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+check("只有一顆滿 → 不接手、不動精靈",
+      page._ball_tick() is False and ROBOT.calls == [],
+      f"實得 {ROBOT.calls}")
+
+page = build_prod()
+BALLS.worn_out = None
+check("飾品欄讀不到 → 不接手", page._ball_tick() is False)
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = None
+check("背包讀不到 → 不接手、更不會去買",
+      page._ball_tick() is False and MALL.buys == [], f"實得 {MALL.buys}")
+
+page = build_prod()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = []
+MALL.on_take = lambda tid: BALLS.spare_out.append(FakeBall(60 + len(BALLS.spare_out), tid, 0))
+page._ball_tick()
+check("沒備球 → 去商城買兩顆並記帳", len(page._mall_buys) == 2,
+      f"實得 {page._mall_buys}")
+check("商城紀錄是點數（45×2）", sum(r[4] for r in page._mall_buys) == 90)
+dlg = produce_tab.mall_buys_dialog(page, page._mall_buys, "小狐")
+check("生產頁的商城表跟掛機頁同一份", dlg._tbl.rowCount() == 2)
+MALL.on_take = None
 
 print()
 if FAILS:

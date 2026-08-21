@@ -279,3 +279,85 @@ def swap(mover, scanner, src_slot: int, dst_slot: int, say=None
     return actiongate.retry(scanner, _done, _build, say,
                             f"換上第 {dst_slot} 格",
                             wait=SWAP_CONFIRM_SECS, gaps=SWAP_GAPS)
+
+
+# ----------------------------------------------------------------------
+# -- 整條「補貨 → 一起換」的流程 ----------------------------------------
+#
+# ★ 放在這裡而不是各分頁自己一份：自動掛機與自動生產**都要換球**，
+#   規則（同族、沒滿、兩格一起、缺的去商城買）只能有一份定義。
+#   分頁只負責「什麼時候可以動手」（掛機隨時可以；生產要先停精靈按 ESC）。
+def restock(mover, scanner, need: list, say=None, on_buy=None
+            ) -> tuple[bool, str]:
+    """去商城把缺的備球補齊（買 → 從商城倉庫領進背包）。
+
+    · `say(text)`     進度回報（會被丟到分頁的狀態列）
+    · `on_buy(goods)` 每買成一筆就叫一次，給分頁記帳用（商城紀錄）
+
+    ⚠⚠ **會花真的點數**，所以每一步都驗結果：買完要看商城倉庫真的多一筆、
+      領完要看那一筆真的離開商城倉庫。任何一步失敗就整個停手回報。
+    ⚠ 每一包送出前都會等滿官方的節流（`actiongate.ACTION_GAP`），
+      所以補兩顆球大概要跑半分鐘 —— 進度靠 `say` 讓使用者看得到。
+    """
+    from app.game import mall              # 這裡才 import：避免模組載入期繞圈
+
+    spent = bought = 0
+    for cur in need:
+        g = mall.cheapest(scanner, cur.type_id)
+        if g is None:
+            return False, f"商城查不到「{cur.name}」，補不到備球"
+        ok, msg = mall.buy(mover, scanner, g, say=say)
+        if not ok:
+            return False, f"商城購買「{g.name}」失敗：{msg}"
+        spent += g.price
+        bought += g.count
+        if on_buy:
+            on_buy(g)
+        # 買到的東西在商城倉庫，要領進背包才換得上
+        st = mall.storage(scanner)
+        if st is None:
+            return False, "商城倉庫讀不到，領不出來（東西已經買了）"
+        mine = [r for r in st if r[1] == g.type_id]
+        if not mine:
+            return False, f"商城倉庫裡找不到剛買的「{g.name}」"
+        ok, msg = mall.take(mover, scanner, mine[0][0], g.type_id, say=say)
+        if not ok:
+            return False, f"從商城倉庫領「{g.name}」失敗：{msg}"
+    return True, f"已從商城補 {bought} 顆備球（花費 {spent} 點）"
+
+
+def run_swap(mover, scanner, cur: list, pool, say=None, on_buy=None
+             ) -> tuple[bool, str]:
+    """把 `cur`（飾品欄上要換掉的球）全部換成備球，缺的先去商城補。
+
+    **會 block 幾秒到幾十秒，一定要在背景執行緒上跑。**
+    """
+    if pool is None:
+        return False, "背包讀不到，這輪不動作"
+    pairs, missing = pick_spares(pool, cur)
+    # ★ 花掉的點數一定要跟著結果講出來 —— 自動花錢的功能不准安靜地花。
+    spent_note = ""
+    if missing:
+        ok, msg = restock(mover, scanner, missing, say=say, on_buy=on_buy)
+        if not ok:
+            return False, (f"經驗球都滿了，但{msg} —— "
+                           f"還缺 {len(missing)} 顆備球，請手動處理。")
+        spent_note = msg + "；"
+        pool = spares(scanner)
+        if pool is None:
+            return False, spent_note + "補貨完背包讀不到，下一輪再換"
+        pairs, missing = pick_spares(pool, cur)
+        if missing:
+            return False, (spent_note
+                           + f"補貨完備球還是不夠（差 {len(missing)} 顆）")
+    names = []
+    for old, new in pairs:
+        if say:
+            say(f"換上「{new.name}」→ {inventory.slot_side(old.slot)}飾品")
+        ok, msg = swap(mover, scanner, new.slot, old.slot, say=say)
+        if not ok:
+            return False, (spent_note
+                           + f"{inventory.slot_side(old.slot)}飾品換球失敗：{msg}")
+        names.append(new.name)
+    return True, (spent_note + "經驗球都滿了 → 已換上「"
+                  + "」、「".join(names) + f"」共 {len(names)} 顆。")

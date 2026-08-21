@@ -147,11 +147,13 @@ from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (bag, entity, gather, itemname, jumpmap, locate, lua, move,
+from app.game import (bag, balls, ballswap, entity, gather, itemname,
+                      jumpmap, locate, lua, move,
                       navigate, produce, recall, recipes, robot, scene, scenery,
                       supply)
 from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list,
-                               no_elide)
+                               no_elide, mall_buys_dialog,
+                               record_mall_buy)
 
 SETTINGS_PREFIX = "produce"
 # 採集動作還沒接上時，狀態列一定會附上的尾巴。
@@ -246,6 +248,13 @@ class CharProducePage(QWidget):
         self._mover: move.Mover | None = None
         self._mover_failed = False
         self._loading = True
+        # ── 自動換球（見 _ball_tick）──
+        self._ball_busy = False    # 換球背景執行緒進行中（看門狗要讓路）
+        self._ball_said = False    # 這次「都滿了」已經花過點數（擋重複購買）
+        self._ball_told = False    # 這次「都滿了」已經講過失敗（擋重複吵）
+        self._ball_off = ""        # 大聲停用的原因（有字就不再試）
+        # 商城購買紀錄（「商城紀錄」鈕）。⚠ 點數，跟金幣的表分開。
+        self._mall_buys: list[tuple[float, int, int, int, int]] = []
         # (x, y, 場景編號)；場景編號讀不到時是 None（那個點不做地圖比對）
         self._spots: list[tuple[float, float, int | None]] = []
         # ★★ 走遠路一律走 Navigator（讀地形圖自己算 A*），**不要**用
@@ -294,8 +303,29 @@ class CharProducePage(QWidget):
             f"負重到 {FULL_PCT:.0f}% 自動回去做半成品、捐公會，再回來繼續採。")
         self.run_cb.toggled.connect(self._on_toggle)
 
+        # ★ 自動換球（2026-08-21 使用者要求）：跟掛機同一套規則，只是這裡
+        #   要先讓精靈停手＋按 ESC（採集／製作中遊戲不給換裝）。
+        self.ball_cb = QCheckBox("自動換球")
+        self.ball_cb.setToolTip(
+            "飾品欄兩顆經驗球都滿了才一起換（只有一顆滿不動作）。\n"
+            "會先暫停精靈、按 ESC，換完再開回去繼續採集／製作。\n"
+            "背包備球不夠會去天使商城買（花點數）。")
+        self.ball_cb.toggled.connect(self._on_ball_toggle)
+        self.mall_log_btn = QPushButton("商城紀錄")
+        self.mall_log_btn.setToolTip(
+            "自動換球去天使商城買了什麼：時間、商品、數量、花費（點數）與總額。\n"
+            "只記這次開著工具箱期間的（重開清空）。")
+        fmm = self.mall_log_btn.fontMetrics()
+        self.mall_log_btn.setFixedSize(
+            fmm.horizontalAdvance("商城紀錄") + 32, fmm.height() + 8)
+        self.mall_log_btn.clicked.connect(self._show_mall_buys)
+
         run_bar = QHBoxLayout()
         run_bar.addWidget(self.run_cb)
+        run_bar.addSpacing(24)
+        run_bar.addWidget(self.ball_cb)
+        run_bar.addSpacing(4)
+        run_bar.addWidget(self.mall_log_btn)
         run_bar.addStretch(1)
         root.addLayout(run_bar)
 
@@ -693,6 +723,11 @@ class CharProducePage(QWidget):
         try:
             if self._mover is None or not self._mover.active:
                 return
+            # ⚠⚠ 換球正在跑：整支讓路。它會**刻意把精靈主開關關掉**（採集／
+            #   製作中遊戲不給換裝），這時看門狗①把精靈重新開起來就是跟它
+            #   打架 —— 換完它自己會開回來。
+            if self._ball_busy:
+                return
             # ★ 有哪一趟在跑就全權交給它 —— 這期間不要再去碰中心點／自動
             #   採集，不然兩邊會互相打斷（掛機那邊踩過同樣的坑）。
             if self._trip is not None:
@@ -714,6 +749,11 @@ class CharProducePage(QWidget):
                                  f"⚠ 負重 {pct:.0f}% → 回程做半成品")
                 return
             if self._check_broken():
+                return
+            # ★ 換球只在**穩定採集中**做（上面所有「有一趟在跑」的關卡都過了）。
+            #   ⚠ 刻意不去打斷回程／製作那一趟：球滿了只是不再累積，等它跑完
+            #   再換沒有任何損失，硬插進去卻可能把狀態機弄亂。
+            if self._ball_tick():
                 return
             me = self._my_pos()
             if me is None:
@@ -1747,6 +1787,99 @@ class CharProducePage(QWidget):
         return head + pos + eta
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # -- 自動換球（2026-08-21 使用者要求，跟自動掛機同一套規則）----------
+    #
+    # 規則本體在 `app/game/balls.py`（同族、沒滿、兩格一起、缺的去商城買），
+    # 「先讓精靈停手」在 `app/game/ballswap.py` —— 掛機那邊走的是**同一份**。
+    #
+    # ⚠⚠ 這一頁比掛機麻煩的地方（使用者實機說明）：**採集／製作中遊戲不給
+    #   換裝**，要先按 ESC 取消。所以 `swap_with_pause` 會：
+    #       關精靈主開關 → 按 ESC → 換球 → 主開關開回去
+    #   其他旗標（自動採集、中心點、目標資源清單）不用管 —— `_gather_tick`
+    #   的看門狗①下一拍就會把精靈重新開起來。
+    # ⚠ 換球期間 `_gather_tick` 整支讓路（見 `_ball_busy`），不然看門狗會在
+    #   中途把精靈又打開，跟我們打架。
+    def _on_ball_toggle(self, on: bool) -> None:
+        """「自動換球」開關。純粹換一組狀態，不動採集。"""
+        self._save_settings()
+        self._ball_said = self._ball_told = False
+        self._ball_off = ""
+        if on:
+            self._note("自動換球已開啟：兩顆經驗球都滿了會暫停精靈換球")
+
+    def _ball_say(self, text: str) -> None:
+        """背景流程的進度 → 狀態列。**背景執行緒呼叫**，要繞回 UI 執行緒。"""
+        QTimer.singleShot(0, lambda: self._note(f"經驗球：{text}"))
+
+    def _record_mall_buy(self, g) -> None:
+        """商城買到一筆 → 記帳（背景執行緒呼叫，只碰純資料）。"""
+        record_mall_buy(self._mall_buys, g)
+
+    def _show_mall_buys(self) -> None:
+        mall_buys_dialog(self, self._mall_buys,
+                         self.char_name or self.account or str(self.pid)).exec()
+
+    def _ball_done(self, ok: bool, msg: str) -> None:
+        """換球背景執行緒的收尾（UI 執行緒）。"""
+        self._ball_busy = False
+        self._note(("經驗球：" if ok else "⚠ 自動換球：") + msg, warn=not ok)
+        if ok:
+            return
+        if "定位失敗" in msg:
+            self._ball_off = msg          # 改版把函式搬走了 → 大聲停用
+        # 同一個「都滿了」事件的失敗只講一次（狀態列已經寫了，不必再吵）。
+        self._ball_told = True
+
+    def _ball_tick(self) -> bool:
+        """自動換球。回 True＝這一拍交給它，`_gather_tick` 後面都別做了。
+
+        ⚠⚠ 「讀不到就不下結論」（[[bag-false-empty-guards]]）：飾品欄沒讀完、
+          背包沒讀完、上限讀不到 → 這輪什麼都不做，更不准去花點數買。
+        """
+        if not self.ball_cb.isChecked() or self._ball_off:
+            return False
+        sc = self.sc
+        if sc is None or not sc.attached:
+            return False
+        got = balls.worn(sc)
+        if got is None:
+            return False                             # 讀不到 → 不下結論
+        cur = got[0]
+        # ★ 跟掛機同一條規則：**裝著的球全部都滿了**才動；只有一顆滿、
+        #   或根本沒裝球 → 什麼都不做也不通知。
+        if not cur or not all(b.full for b in cur):
+            self._ball_said = self._ball_told = False
+            return False
+        pool = balls.spares(sc)
+        if pool is None:
+            return False                             # 讀不到 → 不下結論
+        # 備球不夠就要花點數 —— 決定的當下先閂上，一個「滿了」事件只買一輪。
+        _, missing = balls.pick_spares(pool, cur)
+        if missing and self._ball_said:
+            return False
+        if missing:
+            self._ball_said = True
+        if not self._ensure_mover():
+            return False
+
+        self._ball_busy = True
+        self._note("經驗球都滿了 → 暫停精靈、按 ESC、換球…")
+        mover, hwnd = self._mover, self.hwnd
+
+        def _worker() -> None:
+            try:
+                ok, msg = ballswap.swap_with_pause(
+                    mover, sc, cur, pool, say=self._ball_say,
+                    on_buy=self._record_mall_buy, hwnd=hwnd)
+            except Exception as exc:                 # noqa: BLE001
+                ok, msg = False, f"{exc!r}"
+            QTimer.singleShot(0, lambda: self._ball_done(ok, msg))
+
+        threading.Thread(target=_worker, daemon=True,
+                         name=f"ballswap-{self.pid}").start()
+        return True
+
     def _ensure_mover(self) -> bool:
         """需要叫遊戲函式時才裝跳板 —— 沒用到就不要在遊戲裡放程式碼。
 
@@ -1901,6 +2034,7 @@ class CharProducePage(QWidget):
                            int(b[2]) if len(b) > 2 and b[2] is not None else None,
                            int(b[3]) if len(b) > 3 and b[3] is not None else 0)
         self._refresh_bench()
+        self.ball_cb.setChecked(bool(config.get(self._key("auto_ball"), False)))
 
     def _save_settings(self) -> None:
         if self._loading:
@@ -1911,6 +2045,7 @@ class CharProducePage(QWidget):
         config.set(self._key("dispose"), self.dispose.currentData())
         config.set(self._key("bench"),
                    list(self._bench) if self._bench else None)
+        config.set(self._key("auto_ball"), self.ball_cb.isChecked())
         config.save()
 
     # ------------------------------------------------------------------

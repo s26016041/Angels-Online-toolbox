@@ -10,9 +10,20 @@ import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import (
+    QDialog,
+    QLabel,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.core import charname, preload
+from app.game import itemname
+
+# 商城購買紀錄在記憶體裡最多留幾筆（session 狀態，工具箱重開清空）。
+MALL_LOG_CAP = 500
 
 
 def fit_spin(spin) -> None:
@@ -252,3 +263,58 @@ class ClientWatchMixin:
         # 先放結果再解除 busy —— 反過來的話 _client_gone 可能在空窗關掉 scanner
         self._nm_done[pid] = (acct, nm or "")
         self._nm_busy.discard(pid)
+
+
+def mall_buys_dialog(parent, rows: list, who: str) -> QDialog:
+    """「商城紀錄」表：時間／商城編號／商品／數量／花費(點數)＋總額。
+
+    ★ 自動掛機與自動生產**共用這一份** —— 兩邊各畫一次的話，改欄位就會有
+      一邊漏掉。每筆 = `(時間戳, 商城編號, 種類id, 數量, 點數)`。
+    ⚠⚠ **不可以跟「商店紀錄」合併**：商店花金幣、商城花點數，
+      幣別不同混在同一張表，總額就是錯的（使用者 2026-08-21 要求分開）。
+    ⚠ 一次性快照：開的當下有什麼畫什麼（高頻改表是 qt-ui-pitfalls 的坑）。
+    """
+    rows = list(rows)[::-1]                     # 新的在上面
+    total = sum(r[4] for r in rows)
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(f"商城購買紀錄 — {who}")
+    v = QVBoxLayout(dlg)
+    head = (f"總花費 {total:,} 點（共 {len(rows)} 筆）" if rows else
+            "還沒有商城購買紀錄 —— 自動換球買不到備球時會記在這裡。")
+    lab = QLabel(head)
+    lab.setStyleSheet("font-weight: bold;")
+    v.addWidget(lab)
+
+    tbl = QTableWidget(len(rows), 5)
+    tbl.setHorizontalHeaderLabels(
+        ["時間", "商城編號", "商品", "數量", "花費(點數)"])
+    tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+    tbl.verticalHeader().setVisible(False)
+    for i, (ts, mid, tid, qty, cost) in enumerate(rows):
+        cells = (time.strftime("%m/%d %H:%M:%S", time.localtime(ts)),
+                 str(mid), itemname.label(tid), str(qty), f"{cost:,}")
+        for col, text in enumerate(cells):
+            it = QTableWidgetItem(text)
+            if col in (1, 3, 4):                # 編號／數量／花費靠右
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            tbl.setItem(i, col, it)
+    # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
+    for col, w in enumerate((115, 80, 200, 55)):
+        tbl.setColumnWidth(col, w)
+    tbl.horizontalHeader().setStretchLastSection(True)
+    v.addWidget(tbl, 1)
+    dlg.resize(640, 420)
+    dlg._head, dlg._tbl = lab, tbl              # 給離線測試摸得到
+    return dlg
+
+
+def record_mall_buy(rows: list, g) -> None:
+    """商城買到一筆 → 記進 `rows`。**背景執行緒呼叫**：只碰純資料，不碰 Qt。
+
+    單價不必猜 —— `mall.Goods.price` 就是遊戲商品表裡的售價。
+    """
+    rows.append((time.time(), int(g.mall_id), int(g.type_id),
+                 int(g.count), int(g.price)))
+    if len(rows) > MALL_LOG_CAP:
+        del rows[:-MALL_LOG_CAP]
