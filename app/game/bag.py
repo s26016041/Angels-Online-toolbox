@@ -126,6 +126,13 @@ TMPL_SPAN = 0x134
 #   （344 件物品、23 種分類跟 item.xml 的「物品類別」1:1 零衝突）。
 KIND_DOLL = 46
 
+# ★★ 經驗球的三個分類代號（同一份對照表：範本 +0x18 → item.xml「物品類別」）。
+#   68 經驗球（角色）／69 技能經驗球／70 寵物經驗球 —— 全遊戲共 32 種，
+#   三族都裝飾品欄（item.xml 全部 `飾品裝備="是"`），只是累積的經驗種類不同。
+#   ⚠ **不可以用名字判斷**（「經驗球」是「技能經驗球」的子字串），一律看分類。
+#   球的累積上限在 `TMPL_PARAM2`（動態資料2），見 `Item.ball_cap`。
+KIND_BALLS = (68, 69, 70)
+
 # ★★ 「這是不是裝備／武器」＝ 範本 +0xDC（耐久上限）> 0。
 # ✅ 拿 `setting/base/item*.xml` 的「耐久」欄整張對帳：**32476 筆 100.00% 吻合**
 #   （其他候選欄位最高只有 78%）。
@@ -245,6 +252,24 @@ class Item:
         ⚠ 一樣要 `is_gear`（範本耐久上限 > 0）才算，藥水那種現值 0/1 不會誤判。
         """
         return self.is_gear and self.dura <= 1
+
+    @property
+    def is_ball(self) -> bool:
+        """是不是經驗球（角色／技能／寵物三族）。看記憶體分類，不是看名字。"""
+        return self.kind in KIND_BALLS
+
+    @property
+    def ball_cap(self) -> int:
+        """球的累積上限（範本 +0x10C ＝ item.xml 的「動態資料2」）。
+
+        ★ 同一個欄位對紙娃娃是**分解值**（`decomp_value`），對球是**上限** ——
+          遊戲自己就是這樣共用 `getparam2()` 的，所以判斷前一定要先看分類。
+        ✅ 2026-08-21 實機：三階技能經驗球（4937）讀到 120,000，
+          與 `item.xml 動態資料2="120000"` 吻合。
+        ⚠ 不是球、或讀不到範本 → 0；呼叫端要把 0 當「不知道上限」，
+          **不准**拿來判斷滿沒滿（見 `balls.Ball.known`）。
+        """
+        return self.decomp_value if self.is_ball else 0
 
     @property
     def is_doll(self) -> bool:

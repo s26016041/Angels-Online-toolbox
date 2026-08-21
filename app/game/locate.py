@@ -171,6 +171,17 @@ SIGS: tuple[Sig, ...] = (
         " 74 1E 8B 0D ?? ?? ?? ?? 50 8B 49 0C E8 ?? ?? ?? ?? 85 C0 74 0B"
         " 6A 00 6A 22 E8 ?? ?? ?? ?? 59 59 33 C0 C3",
         0x005906CB),
+    # 「換格子」本體（UI 指令 changeitemslot 0x59134E 呼叫的那支）：
+    #   SWAP_FN(來源格號, 目標格號) → 封包 0x12、內文 6 bytes。
+    #   自動換球就是拿它把背包的備球換到飾品欄（見 app/game/balls.py）。
+    # 錨在 push 6 / push 0x12（內文長度＋封包代號，這對是跟其他送包函式分家的關鍵，
+    #   同 attack.SELECT_FN 的做法）＋把兩個參數寫進 +2/+4 的那四道 66-前綴搬移。
+    #   兩個 call 的 rel32 與連線全域放萬用（`_auto_mask` 會遮掉 0x9B6660）。
+    Sig("balls", "SWAP_FN", "fn", None,
+        "55 8B EC 83 EC 10 6A 06 6A 12 8D 4D F0 E8 ?? ?? ?? ?? 8B 4D F4"
+        " 66 8B 45 08 FF 75 FC 66 89 41 02 66 8B 45 0C 66 89 41 04"
+        " FF 35 ?? ?? ?? ?? E8 ?? ?? ?? ?? 59 59 C9 C3",
+        0x005D23C3),
     Sig("lua", "GETFIELD_FN", "fn", None,
         "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
         " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"
