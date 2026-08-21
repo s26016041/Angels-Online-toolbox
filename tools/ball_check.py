@@ -29,6 +29,7 @@ APP = QApplication.instance() or QApplication([])
 from app.game import bag                            # noqa: E402
 from app.game import balls as real_balls            # noqa: E402
 from app.game import mall as real_mall              # noqa: E402
+from app.game import actiongate                     # noqa: E402
 from app.tabs import farm_tab                       # noqa: E402
 
 FAILS: list[str] = []
@@ -78,7 +79,7 @@ class FakeBalls:
     def spares(self, sc):
         return self.spare_out
 
-    def swap(self, mover, sc, src, dst):
+    def swap(self, mover, sc, src, dst, say=None):
         """記帳並把假背包／假飾品欄照著換。
 
         兩種來源都要支援：背包備球 → 飾品欄（真流程），以及飾品欄左右對調
@@ -115,8 +116,8 @@ class FakeMall:
       替身少一個屬性，真的跑起來就是 AttributeError。
     """
 
-    ACTION_GAP = real_mall.ACTION_GAP
-    ACTION_TRIES = real_mall.ACTION_TRIES
+    ACTION_GAP = actiongate.ACTION_GAP
+    ACTION_TRIES = actiongate.TRIES
 
     def __init__(self):
         self.sells = {4937: FakeGoods(363, 4937, 1, 45)}
@@ -457,7 +458,7 @@ check("結果視窗講得出花了幾點",
 MALL.on_take = None
 FakeBox.answer = FakeBox.No
 
-print("⑨ 商城節流（官方兩次動作要隔 5 秒）＋失敗重送")
+print("⑨ 動作節流（官方兩次動作要隔 5 秒）＋失敗重送")
 
 
 class FakeClock:
@@ -480,23 +481,23 @@ class ScanStub:
 
 
 CLOCK = FakeClock()
-real_mall.time = CLOCK
-real_mall._last_action.clear()
+actiongate.time = CLOCK
+actiongate._last.clear()
 SC = ScanStub()
 
 # ①「隔太近」要被擋著等 —— 第一發不等，第二發要等滿 ACTION_GAP
-real_mall._gate(SC)
+actiongate.gate(SC)
 first = list(CLOCK.slept)
-real_mall._gate(SC)
+actiongate.gate(SC)
 check("第一次動作不用等", first == [], f"實得 {first}")
-check(f"第二次要等滿 {real_mall.ACTION_GAP} 秒",
-      CLOCK.slept and abs(CLOCK.slept[-1] - real_mall.ACTION_GAP) < 0.01,
+check(f"第二次要等滿 {actiongate.ACTION_GAP} 秒",
+      CLOCK.slept and abs(CLOCK.slept[-1] - actiongate.ACTION_GAP) < 0.01,
       f"實得 {CLOCK.slept}")
 check("官方常數就是『超過 5 秒』，我們取 6 留裕度",
-      real_mall.ACTION_GAP > 5.0)
+      actiongate.ACTION_GAP > 5.0)
 
 # ② 重送之前一定先確認「上一發其實沒成功」（不然買東西會重複扣點）
-real_mall._last_action.clear()
+actiongate._last.clear()
 sent = []
 state = {"done": False}
 
@@ -511,44 +512,97 @@ def _build_ok():
     return True, "", lambda: "成功"
 
 
-ok, msg = real_mall._retry(SC, _done_true_after_first, _build_ok, None, "測試")
+ok, msg = actiongate.retry(SC, _done_true_after_first, _build_ok, None, "測試")
 check("送一次就成功", ok and len(sent) == 1, f"實得 {ok} {sent}")
 
-real_mall._last_action.clear()
+actiongate._last.clear()
 sent.clear()
 state["done"] = True                          # 呼叫前就已經完成了
-ok, msg = real_mall._retry(SC, _done_true_after_first,
+ok, msg = actiongate.retry(SC, _done_true_after_first,
                            lambda: (sent.append(1), (True, "", lambda: "x"))[1],
                            None, "測試")
 check("動手前發現已經完成 → 一包都不送（重試安全的關鍵）",
       ok and sent == [], f"實得 {ok} {sent}")
 
 # ③ 一直沒生效 → 送滿 ACTION_TRIES 次才放棄
-real_mall._last_action.clear()
+actiongate._last.clear()
 sent.clear()
-ok, msg = real_mall._retry(SC, lambda: False,
+ok, msg = actiongate.retry(SC, lambda: False,
                            lambda: (sent.append(1), (True, "", lambda: "x"))[1],
                            None, "測試")
-check(f"沒生效就重送，共 {real_mall.ACTION_TRIES} 次",
-      not ok and len(sent) == real_mall.ACTION_TRIES, f"實得 {ok} {sent}")
+check(f"沒生效就重送，共 {actiongate.TRIES} 次",
+      not ok and len(sent) == actiongate.TRIES, f"實得 {ok} {sent}")
 
 # ④「讀不到」不算成功也不算失敗
-real_mall._last_action.clear()
+actiongate._last.clear()
 sent.clear()
-ok, msg = real_mall._retry(SC, lambda: None,
+ok, msg = actiongate.retry(SC, lambda: None,
                            lambda: (sent.append(1), (True, "", lambda: "x"))[1],
                            None, "測試")
 check("done() 回 None（讀不到）不會被當成成功", not ok, f"實得 {ok} {msg}")
 
 # ⑤ 連送都送不出去（不是節流）→ 立刻回報，不要白等三輪
-real_mall._last_action.clear()
+actiongate._last.clear()
 sent.clear()
-ok, msg = real_mall._retry(SC, lambda: False,
+ok, msg = actiongate.retry(SC, lambda: False,
                            lambda: (sent.append(1),
                                     (False, "跳板沒接上", None))[1],
                            None, "測試")
 check("送不出去就立刻回報（只試一次）",
       not ok and len(sent) == 1 and "跳板" in msg, f"實得 {ok} {sent} {msg}")
+
+print("⑩ 換球被擋就重送；已經換好的**不准再送**（再送一次會換回去）")
+
+
+class FakeMover:
+    """跳板替身：記下送出的 (來源, 目標)，並依腳本決定第幾發才生效。"""
+
+    active = True
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    lock = _Lock()
+
+    def __init__(self, effective_on=1):
+        self.sent = []
+        self.effective_on = effective_on      # 第幾發才真的生效
+
+    def call_sync(self, fn, a=0, b=0, ecx=0, timeout=0.0):
+        self.sent.append((a, b))
+        if len(self.sent) >= self.effective_on:
+            PTRS[b] = PTRS.get(b, 0) + 1000   # 目標格的物品指標換人＝換好了
+        return 1
+
+
+PTRS = {8: 111, 9: 222, 30: 333, 31: 444}
+real_balls._ptr_of = lambda sc, slot: PTRS.get(slot)
+
+actiongate._last.clear()
+mv = FakeMover(effective_on=1)                # 第一發就成功
+ok, msg = real_balls.swap(mv, SC, 30, 8)
+check("一發就成功 → 只送一包（不會再送把它換回去）",
+      ok and len(mv.sent) == 1, f"實得 {ok} {mv.sent}")
+
+actiongate._last.clear()
+PTRS.update({9: 222})
+mv = FakeMover(effective_on=2)                # 第一發被丟掉，第二發才生效
+ok, msg = real_balls.swap(mv, SC, 31, 9)
+check("第一發被擋 → 重送後成功（就是『只換了左飾品』那個 bug）",
+      ok and len(mv.sent) == 2, f"實得 {ok} {mv.sent}")
+
+actiongate._last.clear()
+mv = FakeMover(effective_on=99)               # 怎麼送都不生效
+ok, msg = real_balls.swap(mv, SC, 30, 8)
+check(f"一直不生效就送滿 {actiongate.TRIES} 次才放棄",
+      not ok and len(mv.sent) == len(real_balls.SWAP_GAPS),
+      f"實得 {ok} {mv.sent}")
+check("換球跟商城共用同一條隊伍（重送要等滿官方間隔）",
+      real_balls.SWAP_GAPS[1] == actiongate.ACTION_GAP)
 
 print()
 if FAILS:

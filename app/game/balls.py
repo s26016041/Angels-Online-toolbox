@@ -42,7 +42,7 @@ from __future__ import annotations
 import struct
 import time
 
-from app.game import bag, inventory
+from app.game import actiongate, bag, inventory
 
 # ★ AOB 定位（locate.py balls.SWAP_FN）。定位失敗會被清成 0，`Mover.call()` 擋下。
 SWAP_FN = 0x005D23C3
@@ -51,7 +51,13 @@ SWAP_FN = 0x005D23C3
 CALL_TIMEOUT = 0.5
 # 送出後等伺服器把新的飾品欄推回來的上限（實測換裝是即時的，留裕度）。
 SWAP_CONFIRM_SECS = 3.0
-SWAP_POLL = 0.15
+# ★★ 兩顆球是**一起換的**，所以會連送兩包 0x12。第一包成功、第二包被伺服器
+#   當成「操作太快」丟掉 —— 使用者 2026-08-21 實機回報「只有左飾品換了」。
+#   → 走 `actiongate`（跟商城共用同一條隊伍，見那支的檔頭）：
+#     第一發只等一下下（前一個動作多半已經隔很久），沒生效的重送才等滿
+#     官方的間隔 —— 會走到重送就代表**很可能就是被節流擋掉的**。
+SWAP_FIRST_GAP = 1.0
+SWAP_GAPS = (SWAP_FIRST_GAP, actiongate.ACTION_GAP, actiongate.ACTION_GAP)
 
 # 飾品欄兩格（借 inventory.py 那一份，不在這裡再寫一次）
 ACCESSORY_SLOTS = inventory.SLOT_ACCESSORY
@@ -207,12 +213,15 @@ def pick_spares(pool: list[Ball], worn_balls: list[Ball]
     return pairs, missing
 
 
-def swap(mover, scanner, src_slot: int, dst_slot: int) -> tuple[bool, str]:
+def swap(mover, scanner, src_slot: int, dst_slot: int, say=None
+         ) -> tuple[bool, str]:
     """把 `src_slot` 的東西換到 `dst_slot`（＝遊戲的 changeitemslot）。
 
     ⚠⚠ **送出前當場重讀重驗**（CLAUDE.md 鐵則，`energy.decompose` 是範本）：
       背包會在我們思考的這幾百毫秒內變動（撿到東西、賣掉、補給塞進來），
       拿上一拍讀到的格號送出去就是「安靜地送錯格」。
+    ⚠⚠ **重送之前一定要先確認上一發沒生效**（`actiongate.retry` 就是這樣做的）
+      —— 換裝是「對調」，對已經換好的再送一次會把它換回去。
     """
     if not (mover and mover.active):
         return False, "跳板沒接上"
@@ -221,21 +230,25 @@ def swap(mover, scanner, src_slot: int, dst_slot: int) -> tuple[bool, str]:
     if src_slot == dst_slot:
         return False, "來源與目標是同一格"
 
+    # 「換好了」＝目標格的**物品指標換人**。基準只認一次，重送也拿它比。
     before = _ptr_of(scanner, dst_slot)
-    src_ptr = _ptr_of(scanner, src_slot)
-    if src_ptr is None:
-        return False, f"第 {src_slot} 格現在是空的（背包剛剛變動過）"
 
-    with mover.lock:
-        if mover.call_sync(SWAP_FN, src_slot, dst_slot,
-                           timeout=CALL_TIMEOUT) is None:
-            return False, "換裝指令排不進去"
-
-    # 伺服器受理才算數：飾品欄那格的**物品指標換人**就是換成功了。
-    end = time.monotonic() + SWAP_CONFIRM_SECS
-    while time.monotonic() < end:
-        time.sleep(SWAP_POLL)
+    def _done():
         now = _ptr_of(scanner, dst_slot)
-        if now and now != before:
-            return True, "已換上"
-    return False, "送出了但飾品欄沒變（伺服器沒受理？）"
+        if now is None:
+            return None                    # 讀不到 → 不下結論
+        return now != before
+
+    def _build():
+        # ★ 格號每一次都重讀重驗：背包在等待的這幾秒可能已經變動。
+        if _ptr_of(scanner, src_slot) is None:
+            return False, f"第 {src_slot} 格現在是空的（背包剛剛變動過）", None
+        with mover.lock:
+            if mover.call_sync(SWAP_FN, src_slot, dst_slot,
+                               timeout=CALL_TIMEOUT) is None:
+                return False, "換裝指令排不進去", None
+        return True, "", lambda: "已換上"
+
+    return actiongate.retry(scanner, _done, _build, say,
+                            f"換上第 {dst_slot} 格",
+                            wait=SWAP_CONFIRM_SECS, gaps=SWAP_GAPS)

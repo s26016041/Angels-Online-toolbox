@@ -3387,7 +3387,8 @@ class CharFarmPage(QWidget):
         for old, new in pairs:
             self._ball_say(f"換上「{new.name}」→ "
                            f"{inventory.slot_side(old.slot)}飾品")
-            ok, msg = balls.swap(self._mover, sc, new.slot, old.slot)
+            ok, msg = balls.swap(self._mover, sc, new.slot, old.slot,
+                                 say=self._ball_say)
             if not ok:
                 return False, (spent_note
                                + f"{inventory.slot_side(old.slot)}飾品換球失敗："

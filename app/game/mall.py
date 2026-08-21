@@ -55,16 +55,18 @@
     的堆疊值**（0x592552 只 push 了一個參數給 ret 8 的函式）—— 我們不學它，
     照 `dropmallitem` 那條**版面正確**的路走：明確給一個空背包格號。
 
-✅ **2026-08-21 實機驗證**：嵐狐把商城倉庫裡的經驗加倍卡（流水號 1636596）
-   領進背包成功。⚠ **「買」那包（0x12B）還沒有人實機送過** —— 驗它要真的
-   花點數，所以留給「測試換球」鈕上那顆要另外確認的選項。
+✅ **2026-08-21 實機驗證（三包全通）**：
+   · 領取：嵐狐把商城倉庫裡的經驗加倍卡（流水號 1636596）領進背包成功。
+   · 購買：嵐狐跑補球流程買下兩顆三階技能經驗球（商城編號 363，各 45 點），
+     商城倉庫清空、背包多出兩顆備球。
+   ⚠ 同一趟也暴露了節流問題（連送被擋），修法見 app/game/actiongate.py。
 """
 from __future__ import annotations
 
 import struct
 import time
 
-from app.game import bag, gather, itemname, jumpmap, supply
+from app.game import actiongate, bag, gather, itemname, jumpmap, supply
 
 # ★ 商城商品表的全域指標。AOB 定位（locate.py mall.TABLE_PTR）。
 TABLE_PTR = 0x0098BCA8
@@ -103,39 +105,11 @@ CALL_TIMEOUT = 0.5
 WAIT_SECS = 8.0
 POLL = 0.25
 
-# ★★★ 官方自己的節流：**兩次商城／倉庫動作之間必須超過 5 秒**。
-#   出處是客戶端自己那支節流函式（反組譯 0x6112B7，thiscall）：
-#       now = time()                      ; 0x746358＝Unix 秒（FILETIME 換算）
-#       elapsed = now - [this+8]          ; 64-bit
-#       if elapsed <= 5:  顯示字串 2369「操作太快。」→ 回 0（擋下）
-#       else:             [this+8] = now  → 回 1（放行）
-#   而 `0x6115AF` 就是「節流過了才送 0x5D2A93」的包裝 —— 0x5D2A93 正是
-#   **0x2F 那一族**（存倉／領商城倉庫）的送包函式，也就是我們的 `take()`。
-#   ⚠⚠ 我們是自己建包直送，**繞過了客戶端這道檢查**，但伺服器照樣擋
-#   （2026-08-21 使用者實機回報「動作太快，請等 X 秒」，整條流程卡住）。
-#   → 所以**自己排隊**：照遊戲自己的規則，兩次動作之間隔滿這麼久才送。
-#   5 秒是「必須大於」，取 6 留裕度（時鐘只有秒解析度，差 1 秒就被擋）。
-ACTION_GAP = 6.0
-# 被擋下來（驗不到結果）時再送幾次。★ 重試是安全的：被拒的購買**不扣點**，
-#   而且每次重試前都會**重新確認結果還沒出現**才送（見 `_retry`）。
-ACTION_TRIES = 3
-
-# 每個遊戲行程各自記「上一次送商城動作的時刻」（節流是伺服器對每個帳號算的）。
-_last_action: dict[int, float] = {}
-
-
-def _gate(scanner, say=None) -> None:
-    """等到離「這台上一次商城動作」滿 `ACTION_GAP` 秒。
-
-    ⚠ 這支會 sleep，只能在背景執行緒上呼叫（呼叫端都是背景流程）。
-    """
-    pid = scanner.pid or 0
-    wait = ACTION_GAP - (time.monotonic() - _last_action.get(pid, -999.0))
-    if wait > 0:
-        if say:
-            say(f"等商城冷卻 {wait:.0f} 秒（官方限制兩次動作要隔 5 秒以上）")
-        time.sleep(wait)
-    _last_action[pid] = time.monotonic()
+# ★★★ 官方的動作節流（兩次動作要隔 5 秒以上）**整套搬到 app/game/actiongate.py**
+#   —— 那裡有反組譯出處，而且計時表是**跨模組共用**的：伺服器對帳號算，
+#   商城購買／領取／換裝全部同一條隊伍，各留一份就等於沒排隊。
+ACTION_GAP = actiongate.ACTION_GAP     # 給畫面算「大概要跑幾秒」用
+ACTION_TRIES = actiongate.TRIES
 
 
 class Goods:
@@ -280,37 +254,6 @@ def _send(mover, scanner, opcode: int, body: int,
     return True, ""
 
 
-def _retry(scanner, done, build, say, what: str) -> tuple[bool, str]:
-    """「排隊 → 送 → 驗結果 → 沒成就再送」的共用骨架。
-
-    · `done()`  → True / False / **None（讀不到，不下結論）**
-    · `build()` → (ok, why, 成功訊息)：真正去送那一包
-    ★ 每一次送之前都先 `done()` 一次 —— 上一發其實成功了、只是我們沒等到，
-      再送一發就是重複動作（買東西會**再扣一次點**）。這道檢查是重試安全的
-      前提，不可以拿掉。
-    ★ 送之前一定經過 `_gate()`：官方兩次動作要隔 5 秒以上，連送必被擋。
-    """
-    last = ""
-    for attempt in range(ACTION_TRIES):
-        if done() is True:
-            return True, f"{what}已完成"
-        _gate(scanner, say)
-        if say:
-            say(f"{what}（第 {attempt + 1} 次）")
-        ok, why, good = build()
-        if not ok:
-            return False, why                    # 連送都送不出去 → 不是節流
-        end = time.monotonic() + WAIT_SECS
-        while time.monotonic() < end:
-            time.sleep(POLL)
-            got = done()
-            if got is True:
-                return True, good()
-        last = f"{what}沒有生效"
-    return False, (f"{last}（送了 {ACTION_TRIES} 次都沒反應"
-                   "—— 點數不足／背包滿／被伺服器擋？）")
-
-
 def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
     """買一份商品。成功 ＝ **商城倉庫真的多出一筆這個道具**。
 
@@ -346,7 +289,8 @@ def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
                                  f"{got[0][2] if got else g.count}"
                                  f"（{g.price} 點）")
 
-    return _retry(scanner, _done, _build, say, f"購買「{g.name}」")
+    return actiongate.retry(scanner, _done, _build, say,
+                            f"購買「{g.name}」", wait=WAIT_SECS)
 
 
 def take(mover, scanner, serial: int, type_id: int, say=None
@@ -374,4 +318,5 @@ def take(mover, scanner, serial: int, type_id: int, say=None
                                     serial & 0xFFFFFFFF, slot & 0xFFFFFFFF))
         return ok, why, lambda: f"已把「{name}」領進背包"
 
-    return _retry(scanner, _done, _build, say, f"領取「{name}」")
+    return actiongate.retry(scanner, _done, _build, say,
+                            f"領取「{name}」", wait=WAIT_SECS)
