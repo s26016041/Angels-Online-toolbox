@@ -3265,7 +3265,13 @@ class CharFarmPage(QWidget):
 
         ask_text = "\n".join(lines) + "\n\n要現在跑一次嗎？"
         if cost:
-            ask_text += f"\n⚠ 其中會**真的花掉 {cost} 點**商城點數。"
+            ask_text += f"\n⚠ 其中會真的花掉 {cost} 點商城點數。"
+        if missing:
+            # 官方限制兩次商城動作要隔 5 秒以上（mall.ACTION_GAP），所以
+            # 補球一定會慢 —— 先講清楚，不然又會被當成當掉。
+            secs = int(len(missing) * 2 * mall.ACTION_GAP)
+            ask_text += (f"\n（官方限制商城動作要間隔 {int(mall.ACTION_GAP)} 秒，"
+                         f"補球至少要跑 {secs} 秒，進度看狀態列）")
         if QMessageBox.question(
                 self, "測試換球", ask_text,
                 QMessageBox.Yes | QMessageBox.No,
@@ -3312,11 +3318,22 @@ class CharFarmPage(QWidget):
         QMessageBox.information(self, "測試換球", "\n".join(out))
         self.status.setText(f"測試換球：{'成功' if ok else '失敗'}　{msg}")
 
+    def _ball_say(self, text: str) -> None:
+        """把背景流程的進度丟回狀態列。**背景執行緒呼叫**，所以要繞回 UI 執行緒。
+
+        ⚠ 沒有這個的話，整條流程（官方兩次商城動作要隔 5 秒以上，見
+          `mall.ACTION_GAP`）跑起來會靜默好幾十秒，看起來就像當掉
+          —— 使用者 2026-08-21 回報的「卡住了」有一半是這個。
+        """
+        QTimer.singleShot(0, lambda: self.status.setText(f"經驗球：{text}"))
+
     def _ball_restock(self, sc, need: list) -> tuple[bool, str]:
         """去商城把缺的備球補齊（買 → 從商城倉庫領進背包）。
 
         ⚠⚠ **會花真的點數**，所以每一步都驗結果：買完要看商城倉庫真的多一筆、
           領完要看那一筆真的離開商城倉庫。任何一步失敗就整個停手回報。
+        ⚠ 每一包送出前 `mall` 那邊都會等滿官方的 5 秒節流（`mall.ACTION_GAP`），
+          所以補兩顆球大概要跑 30 秒 —— 進度會即時寫在狀態列。
         """
         spent = 0
         bought = 0
@@ -3324,7 +3341,7 @@ class CharFarmPage(QWidget):
             g = mall.cheapest(sc, cur.type_id)
             if g is None:
                 return False, f"商城查不到「{cur.name}」，補不到備球"
-            ok, msg = mall.buy(self._mover, sc, g)
+            ok, msg = mall.buy(self._mover, sc, g, say=self._ball_say)
             if not ok:
                 return False, f"商城購買「{g.name}」失敗：{msg}"
             spent += g.price
@@ -3339,7 +3356,8 @@ class CharFarmPage(QWidget):
             mine = [r for r in st if r[1] == g.type_id]
             if not mine:
                 return False, f"商城倉庫裡找不到剛買的「{g.name}」"
-            ok, msg = mall.take(self._mover, sc, mine[0][0], g.type_id)
+            ok, msg = mall.take(self._mover, sc, mine[0][0], g.type_id,
+                                say=self._ball_say)
             if not ok:
                 return False, f"從商城倉庫領「{g.name}」失敗：{msg}"
         return True, f"已從商城補 {bought} 顆備球（花費 {spent} 點）"
@@ -3367,6 +3385,8 @@ class CharFarmPage(QWidget):
                                + f"補貨完備球還是不夠（差 {len(missing)} 顆）")
         names = []
         for old, new in pairs:
+            self._ball_say(f"換上「{new.name}」→ "
+                           f"{inventory.slot_side(old.slot)}飾品")
             ok, msg = balls.swap(self._mover, sc, new.slot, old.slot)
             if not ok:
                 return False, (spent_note

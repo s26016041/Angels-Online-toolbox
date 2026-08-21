@@ -28,6 +28,7 @@ APP = QApplication.instance() or QApplication([])
 
 from app.game import bag                            # noqa: E402
 from app.game import balls as real_balls            # noqa: E402
+from app.game import mall as real_mall              # noqa: E402
 from app.tabs import farm_tab                       # noqa: E402
 
 FAILS: list[str] = []
@@ -108,7 +109,14 @@ class FakeGoods:
 
 
 class FakeMall:
-    """商城層替身：賣什麼、買不買得成、領不領得出來都由測試腳本擺。"""
+    """商城層替身：賣什麼、買不買得成、領不領得出來都由測試腳本擺。
+
+    ⚠ 常數也要跟真的模組一致（畫面會拿 ACTION_GAP 算「大概要跑幾秒」）——
+      替身少一個屬性，真的跑起來就是 AttributeError。
+    """
+
+    ACTION_GAP = real_mall.ACTION_GAP
+    ACTION_TRIES = real_mall.ACTION_TRIES
 
     def __init__(self):
         self.sells = {4937: FakeGoods(363, 4937, 1, 45)}
@@ -123,7 +131,7 @@ class FakeMall:
     def cheapest(self, sc, type_id):
         return self.sells.get(type_id)
 
-    def buy(self, mover, sc, g):
+    def buy(self, mover, sc, g, say=None):
         self.buys.append(g.mall_id)
         if not self.buy_ok:
             return False, "送出了但商城倉庫沒有多出東西（點數不足？）"
@@ -134,7 +142,7 @@ class FakeMall:
     def storage(self, sc):
         return list(self.store)
 
-    def take(self, mover, sc, serial, type_id):
+    def take(self, mover, sc, serial, type_id, say=None):
         self.takes.append(serial)
         if not self.take_ok:
             return False, "送出了但東西還在商城倉庫（背包滿了？）"
@@ -448,6 +456,99 @@ check("結果視窗講得出花了幾點",
       any("點）" in t for t in FakeBox.said), f"實得 {FakeBox.said}")
 MALL.on_take = None
 FakeBox.answer = FakeBox.No
+
+print("⑨ 商城節流（官方兩次動作要隔 5 秒）＋失敗重送")
+
+
+class FakeClock:
+    """把 time.sleep 換成「時鐘直接跳」，測試才不用真的等 6 秒。"""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, secs):
+        self.slept.append(secs)
+        self.now += secs
+
+
+class ScanStub:
+    pid = 4321
+
+
+CLOCK = FakeClock()
+real_mall.time = CLOCK
+real_mall._last_action.clear()
+SC = ScanStub()
+
+# ①「隔太近」要被擋著等 —— 第一發不等，第二發要等滿 ACTION_GAP
+real_mall._gate(SC)
+first = list(CLOCK.slept)
+real_mall._gate(SC)
+check("第一次動作不用等", first == [], f"實得 {first}")
+check(f"第二次要等滿 {real_mall.ACTION_GAP} 秒",
+      CLOCK.slept and abs(CLOCK.slept[-1] - real_mall.ACTION_GAP) < 0.01,
+      f"實得 {CLOCK.slept}")
+check("官方常數就是『超過 5 秒』，我們取 6 留裕度",
+      real_mall.ACTION_GAP > 5.0)
+
+# ② 重送之前一定先確認「上一發其實沒成功」（不然買東西會重複扣點）
+real_mall._last_action.clear()
+sent = []
+state = {"done": False}
+
+
+def _done_true_after_first():
+    return state["done"]
+
+
+def _build_ok():
+    sent.append(1)
+    state["done"] = True                     # 這一發其實成功了
+    return True, "", lambda: "成功"
+
+
+ok, msg = real_mall._retry(SC, _done_true_after_first, _build_ok, None, "測試")
+check("送一次就成功", ok and len(sent) == 1, f"實得 {ok} {sent}")
+
+real_mall._last_action.clear()
+sent.clear()
+state["done"] = True                          # 呼叫前就已經完成了
+ok, msg = real_mall._retry(SC, _done_true_after_first,
+                           lambda: (sent.append(1), (True, "", lambda: "x"))[1],
+                           None, "測試")
+check("動手前發現已經完成 → 一包都不送（重試安全的關鍵）",
+      ok and sent == [], f"實得 {ok} {sent}")
+
+# ③ 一直沒生效 → 送滿 ACTION_TRIES 次才放棄
+real_mall._last_action.clear()
+sent.clear()
+ok, msg = real_mall._retry(SC, lambda: False,
+                           lambda: (sent.append(1), (True, "", lambda: "x"))[1],
+                           None, "測試")
+check(f"沒生效就重送，共 {real_mall.ACTION_TRIES} 次",
+      not ok and len(sent) == real_mall.ACTION_TRIES, f"實得 {ok} {sent}")
+
+# ④「讀不到」不算成功也不算失敗
+real_mall._last_action.clear()
+sent.clear()
+ok, msg = real_mall._retry(SC, lambda: None,
+                           lambda: (sent.append(1), (True, "", lambda: "x"))[1],
+                           None, "測試")
+check("done() 回 None（讀不到）不會被當成成功", not ok, f"實得 {ok} {msg}")
+
+# ⑤ 連送都送不出去（不是節流）→ 立刻回報，不要白等三輪
+real_mall._last_action.clear()
+sent.clear()
+ok, msg = real_mall._retry(SC, lambda: False,
+                           lambda: (sent.append(1),
+                                    (False, "跳板沒接上", None))[1],
+                           None, "測試")
+check("送不出去就立刻回報（只試一次）",
+      not ok and len(sent) == 1 and "跳板" in msg, f"實得 {ok} {sent} {msg}")
 
 print()
 if FAILS:

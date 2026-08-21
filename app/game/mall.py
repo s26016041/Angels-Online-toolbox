@@ -103,6 +103,40 @@ CALL_TIMEOUT = 0.5
 WAIT_SECS = 8.0
 POLL = 0.25
 
+# ★★★ 官方自己的節流：**兩次商城／倉庫動作之間必須超過 5 秒**。
+#   出處是客戶端自己那支節流函式（反組譯 0x6112B7，thiscall）：
+#       now = time()                      ; 0x746358＝Unix 秒（FILETIME 換算）
+#       elapsed = now - [this+8]          ; 64-bit
+#       if elapsed <= 5:  顯示字串 2369「操作太快。」→ 回 0（擋下）
+#       else:             [this+8] = now  → 回 1（放行）
+#   而 `0x6115AF` 就是「節流過了才送 0x5D2A93」的包裝 —— 0x5D2A93 正是
+#   **0x2F 那一族**（存倉／領商城倉庫）的送包函式，也就是我們的 `take()`。
+#   ⚠⚠ 我們是自己建包直送，**繞過了客戶端這道檢查**，但伺服器照樣擋
+#   （2026-08-21 使用者實機回報「動作太快，請等 X 秒」，整條流程卡住）。
+#   → 所以**自己排隊**：照遊戲自己的規則，兩次動作之間隔滿這麼久才送。
+#   5 秒是「必須大於」，取 6 留裕度（時鐘只有秒解析度，差 1 秒就被擋）。
+ACTION_GAP = 6.0
+# 被擋下來（驗不到結果）時再送幾次。★ 重試是安全的：被拒的購買**不扣點**，
+#   而且每次重試前都會**重新確認結果還沒出現**才送（見 `_retry`）。
+ACTION_TRIES = 3
+
+# 每個遊戲行程各自記「上一次送商城動作的時刻」（節流是伺服器對每個帳號算的）。
+_last_action: dict[int, float] = {}
+
+
+def _gate(scanner, say=None) -> None:
+    """等到離「這台上一次商城動作」滿 `ACTION_GAP` 秒。
+
+    ⚠ 這支會 sleep，只能在背景執行緒上呼叫（呼叫端都是背景流程）。
+    """
+    pid = scanner.pid or 0
+    wait = ACTION_GAP - (time.monotonic() - _last_action.get(pid, -999.0))
+    if wait > 0:
+        if say:
+            say(f"等商城冷卻 {wait:.0f} 秒（官方限制兩次動作要隔 5 秒以上）")
+        time.sleep(wait)
+    _last_action[pid] = time.monotonic()
+
 
 class Goods:
     """商城的一筆商品。"""
@@ -246,11 +280,42 @@ def _send(mover, scanner, opcode: int, body: int,
     return True, ""
 
 
-def buy(mover, scanner, g: Goods) -> tuple[bool, str]:
+def _retry(scanner, done, build, say, what: str) -> tuple[bool, str]:
+    """「排隊 → 送 → 驗結果 → 沒成就再送」的共用骨架。
+
+    · `done()`  → True / False / **None（讀不到，不下結論）**
+    · `build()` → (ok, why, 成功訊息)：真正去送那一包
+    ★ 每一次送之前都先 `done()` 一次 —— 上一發其實成功了、只是我們沒等到，
+      再送一發就是重複動作（買東西會**再扣一次點**）。這道檢查是重試安全的
+      前提，不可以拿掉。
+    ★ 送之前一定經過 `_gate()`：官方兩次動作要隔 5 秒以上，連送必被擋。
+    """
+    last = ""
+    for attempt in range(ACTION_TRIES):
+        if done() is True:
+            return True, f"{what}已完成"
+        _gate(scanner, say)
+        if say:
+            say(f"{what}（第 {attempt + 1} 次）")
+        ok, why, good = build()
+        if not ok:
+            return False, why                    # 連送都送不出去 → 不是節流
+        end = time.monotonic() + WAIT_SECS
+        while time.monotonic() < end:
+            time.sleep(POLL)
+            got = done()
+            if got is True:
+                return True, good()
+        last = f"{what}沒有生效"
+    return False, (f"{last}（送了 {ACTION_TRIES} 次都沒反應"
+                   "—— 點數不足／背包滿／被伺服器擋？）")
+
+
+def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
     """買一份商品。成功 ＝ **商城倉庫真的多出一筆這個道具**。
 
-    ⚠⚠ 這裡花的是真的點數：驗不到就回失敗，讓呼叫端閂住別再買
-      —— 「送出了但沒看到」很可能是點數不夠被伺服器打回，重送只會一直打回。
+    ⚠⚠ 這裡花的是真的點數。重試之所以安全，是因為每次重送前都會先確認
+      「商城倉庫還沒多出東西」（見 `_retry`）—— 被伺服器擋掉的購買不扣點。
     """
     if not (mover and mover.active):
         return False, "跳板沒接上"
@@ -262,48 +327,51 @@ def buy(mover, scanner, g: Goods) -> tuple[bool, str]:
     if len(before) >= STORAGE_SLOTS:
         return False, f"商城倉庫滿了（{STORAGE_SLOTS} 格），請先領取"
     seen = {s for s, _, _ in before}
+    got: list = []
 
-    ok, why = _send(mover, scanner, BUY_OPCODE, BUY_BODY,
-                    struct.pack("<IB", g.mall_id & 0xFFFFFFFF, 0))
-    if not ok:
-        return False, why
-
-    end = time.monotonic() + WAIT_SECS
-    while time.monotonic() < end:
-        time.sleep(POLL)
+    def _done():
         now = storage(scanner)
         if now is None:
-            continue
+            return None                          # 讀不到 → 不下結論
         new = [r for r in now if r[0] not in seen and r[1] == g.type_id]
         if new:
-            return True, f"已買到「{g.name}」×{new[0][2]}（{g.price} 點）"
-    return False, "送出了但商城倉庫沒有多出東西（點數不足？）"
+            got[:] = new
+            return True
+        return False
+
+    def _build():
+        ok, why = _send(mover, scanner, BUY_OPCODE, BUY_BODY,
+                        struct.pack("<IB", g.mall_id & 0xFFFFFFFF, 0))
+        return ok, why, lambda: (f"已買到「{g.name}」×"
+                                 f"{got[0][2] if got else g.count}"
+                                 f"（{g.price} 點）")
+
+    return _retry(scanner, _done, _build, say, f"購買「{g.name}」")
 
 
-def take(mover, scanner, serial: int, type_id: int) -> tuple[bool, str]:
+def take(mover, scanner, serial: int, type_id: int, say=None
+         ) -> tuple[bool, str]:
     """把商城倉庫某一筆領進背包。成功 ＝ **那一筆從商城倉庫消失**。
 
-    ⚠ 目標背包格號**當場重找**（背包會在這幾百毫秒內變動）。
+    ⚠ 目標背包格號**每一次送之前都當場重找**（背包會在這幾秒內變動）。
     """
     if not (mover and mover.active):
         return False, "跳板沒接上"
-    slot = free_slot(scanner)
-    if slot is None:
-        return False, "背包沒有空格（或整袋讀不到）"
+    name = itemname.of(type_id) or f"物品 {type_id}"
 
-    ok, why = _send(mover, scanner, TAKE_OPCODE, TAKE_BODY,
-                    struct.pack("<BII", TAKE_ACTION,
-                                serial & 0xFFFFFFFF, slot & 0xFFFFFFFF))
-    if not ok:
-        return False, why
-
-    end = time.monotonic() + WAIT_SECS
-    while time.monotonic() < end:
-        time.sleep(POLL)
+    def _done():
         now = storage(scanner)
         if now is None:
-            continue
-        if not any(s == serial for s, _, _ in now):
-            name = itemname.of(type_id) or f"物品 {type_id}"
-            return True, f"已把「{name}」領進背包"
-    return False, "送出了但東西還在商城倉庫（背包滿了？）"
+            return None
+        return not any(s == serial for s, _, _ in now)
+
+    def _build():
+        slot = free_slot(scanner)                # ★ 現找，不用上一發那個
+        if slot is None:
+            return False, "背包沒有空格（或整袋讀不到）", None
+        ok, why = _send(mover, scanner, TAKE_OPCODE, TAKE_BODY,
+                        struct.pack("<BII", TAKE_ACTION,
+                                    serial & 0xFFFFFFFF, slot & 0xFFFFFFFF))
+        return ok, why, lambda: f"已把「{name}」領進背包"
+
+    return _retry(scanner, _done, _build, say, f"領取「{name}」")
