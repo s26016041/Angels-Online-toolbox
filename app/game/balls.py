@@ -183,6 +183,28 @@ def pick_spare(pool: list[Ball], like: Ball) -> Ball | None:
     return sorted(pool2, key=lambda b: (-b.cap, b.value, b.slot))[0]
 
 
+def pick_spares(pool: list[Ball], worn_balls: list[Ball]
+                ) -> tuple[list[tuple[Ball, Ball]], list[Ball]]:
+    """一次幫**每一顆**要換的球各配一顆備球。
+
+    回傳 `(配好的 [(要換下來的, 要換上去的)], 沒配到的那幾顆)`。
+
+    ★ 使用者 2026-08-21 定：飾品欄兩格是**一起換的**，所以配對要一次算完 ——
+      同一顆備球不能被兩格重複認領（那會送出兩包搶同一格，第二包必然失敗）。
+    """
+    left = list(pool)
+    pairs: list[tuple[Ball, Ball]] = []
+    missing: list[Ball] = []
+    for cur in worn_balls:
+        got = pick_spare(left, cur)
+        if got is None:
+            missing.append(cur)
+            continue
+        pairs.append((cur, got))
+        left = [b for b in left if b is not got]
+    return pairs, missing
+
+
 def swap(mover, scanner, src_slot: int, dst_slot: int) -> tuple[bool, str]:
     """把 `src_slot` 的東西換到 `dst_slot`（＝遊戲的 changeitemslot）。
 

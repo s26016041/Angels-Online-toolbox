@@ -182,6 +182,13 @@ SIGS: tuple[Sig, ...] = (
         " 66 8B 45 08 FF 75 FC 66 89 41 02 66 8B 45 0C 66 89 41 04"
         " FF 35 ?? ?? ?? ?? E8 ?? ?? ?? ?? 59 59 C9 C3",
         0x005D23C3),
+    # 商城商品表的全域指標（見 app/game/mall.py）。錨在遊戲自己的查表函式
+    #   0x552566：`商城編號-1 <= 0x9C3F` 才 `[[TABLE_PTR] + 編號*4]`。
+    #   那個上界常數 0x9C3F 與 `8B 04 B0`（eax + esi*4）就是骨架，位址本身放萬用。
+    Sig("mall", "TABLE_PTR", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 3F 9C 00 00 77 0A"
+        " A1 A8 BC 98 00 8B 04 B0 EB",
+        0x0098BCA8),
     Sig("lua", "GETFIELD_FN", "fn", None,
         "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
         " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"

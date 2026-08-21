@@ -73,7 +73,7 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, balls, buff, castwatch, channel, entity,
-                      inventory, itemname, jumpmap, locate, monsters, move,
+                      inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
@@ -1622,10 +1622,11 @@ class CharFarmPage(QWidget):
         self._ball_t = 0.0           # 心跳計時（BALL_GAP 一拍）
         self._ball_busy = False      # 換球背景執行緒進行中（換一次要等伺服器）
         self._ball_result = None     # 背景執行緒的結果 (成功?, 訊息, 球名, 左右)
-        # 「背包沒有備球」的通知門閂：**每一格各一個**。通知過就閂住，
-        # 那一格換上沒滿的球（或球被拿下）之後自動重新武裝 —— 跟收益監控
-        # 那邊「情況恢復就重新武裝」同一套，不會每 5 秒吵一次。
-        self._ball_said: set[int] = set()
+        # 「備球不夠」的門閂。★ 它同時擋兩件事：重複通知、以及**重複花點數**
+        #   —— 一個「都滿了」事件最多買一輪。球真的被換下去（不再全滿）
+        #   之後自動重新武裝，跟收益監控「情況恢復就重新武裝」同一套。
+        self._ball_said = False    # 這次「都滿了」已經花過點數（擋重複購買）
+        self._ball_told = False    # 這次「都滿了」已經通知過失敗（擋重複吵）
         self._ball_off = ""          # 大聲停用的原因（有字就不再試，狀態列看得到）
         # ── 購買紀錄（2026-08-20 使用者要求）──
         # 每筆 = (時間戳, 商人標籤, 種類id, 實收數量, 花費或 None)。
@@ -1848,8 +1849,9 @@ class CharFarmPage(QWidget):
         run_bar.addSpacing(24)
         self.ball_cb = QCheckBox("自動換球")
         self.ball_cb.setToolTip(
-            "飾品欄的經驗球滿了就自動換上背包裡沒滿的同族球。\n"
-            "背包沒有備球只通知一次，掛機照常繼續。")
+            "飾品欄兩顆經驗球都滿了才一起換（只有一顆滿不動作）。\n"
+            "背包備球不夠會去天使商城買，花點數，每次都通知。\n"
+            "買不到只通知一次，掛機照常繼續。")
         self.ball_cb.toggled.connect(self._on_ball_toggle)
         run_bar.addWidget(self.ball_cb)
         # ★ 臨時測試鈕（memory 的 test-via-button）：換球封包還沒實機驗過，
@@ -3156,41 +3158,52 @@ class CharFarmPage(QWidget):
     # ------------------------------------------------------------------
     # -- 自動換球（2026-08-21 使用者要求）--------------------------------
     #
-    # 規則（使用者定）：
-    #   · 飾品欄**兩格都管**，各自換各自的（哪一格滿了就換哪一格）。
-    #   · 背包沒有備球 → **通知一次就好，掛機繼續**（球滿只是不再累積，
-    #     不影響打怪收益，沒必要停機）。
-    #   · 換上去的必須是**同一族**（技能／角色／寵物）而且**沒滿**的球，
-    #     族與上限都讀遊戲自己的資料（見 app/game/balls.py）。
+    # 規則（使用者定，2026-08-21 兩次澄清）：
+    #   ★★ **飾品欄上「裝著的球」全部都滿了才動作，而且一次全換掉。**
+    #      只有一顆滿 → **什麼都不做、也不通知**（使用者原話：「只有一顆滿
+    #      不出發任何流程」）。他的玩法是兩顆一起換，換一顆等於浪費一次。
+    #      飾品欄**根本沒裝球** → 一樣什麼都不做（使用者原話：「原本就沒
+    #      用球那就不用管了，只有用球並滿了我們才會觸發流程」）。
+    #   · 換上去的必須是**同族**（技能／角色／寵物）而且**沒滿**的球；
+    #     兩格一起配對，同一顆備球不會被兩格重複認領。
+    #   · 備球不夠 → **去商城買到夠**（買完自動從商城倉庫領進背包），
+    #     然後下一輪自然就換上了。
+    #   · 商城沒賣／買不到（點數不足…）→ 通知**一次**，掛機照常繼續。
+    #   ⚠⚠ 買東西花的是真的點數，所以「這一次都滿了」最多只買一輪：
+    #      決定要買的當下就把門閂閂上，等球真的被換下去（不再是滿的）
+    #      才重新武裝。這樣一個「滿了」事件最多花一次點數。
     def _on_ball_toggle(self, on: bool) -> None:
         """「自動換球」開關。純粹是換一組狀態，不動掛機。"""
         self._save_settings()
         self._ball_t = BALL_GAP            # 勾起來就馬上看一次，不等一輪
-        self._ball_said.clear()
+        self._ball_said = self._ball_told = False
         self._ball_off = ""
         if on:
-            self.status.setText("自動換球已開啟：經驗球滿了會換上背包的備球")
+            self.status.setText("自動換球已開啟：兩顆經驗球都滿了會一起換")
 
-    def _ball_swap_done(self, ok: bool, msg: str, side: str,
-                        name: str) -> None:
-        """換球背景執行緒的收尾（在 UI 執行緒上跑，見 _ball_tick）。"""
+    def _ball_done(self, ok: bool, msg: str) -> None:
+        """換球／補貨背景執行緒的收尾（在 UI 執行緒上跑）。"""
         self._ball_busy = False
+        self.status.setText(("經驗球：" if ok else "⚠ 自動換球：") + msg)
         if ok:
-            self.status.setText(f"經驗球滿了 → 已換上「{name}」（{side}飾品）")
-            self.notify(f"經驗球滿了 → 已換上「{name}」（{side}飾品）。")
-        else:
-            # ⚠ 換不成不閂住：可能只是那一拍背包剛好在變動，下一輪會再試。
-            #   **但定位失敗要大聲停用**——那是改版把函式搬走了，重試沒有意義。
-            self.status.setText(f"⚠ 換球失敗（{side}飾品）：{msg}")
-            if "定位失敗" in msg:
-                self._ball_off = msg
-                self.notify(f"自動換球已停用：{msg}")
+            self.notify(msg)
+            return
+        # ⚠ 定位失敗＝改版把函式搬走了，重試沒有意義 → 大聲停用。
+        if "定位失敗" in msg:
+            self._ball_off = msg
+            self.notify(f"自動換球已停用：{msg}")
+        elif not self._ball_told:
+            # ★ 同一個「都滿了」事件的失敗只講一次（換球那種暫時性失敗下一輪
+            #   還是會再試，只是不再吵人）。球被換下去之後門閂自動重新武裝。
+            self._ball_told = True
+            self.notify(msg)
 
     def _test_ball_swap(self) -> None:
-        """臨時測試鈕：當場換一次球並把前後狀況攤開來給使用者看。
+        """臨時測試鈕：當場把整條流程跑一遍並攤開來給使用者看。
 
-        ⚠ 這顆是**驗證用**的（memory 的 test-via-button）：換球封包 0x12 是
-          2026-08-21 離線反組譯挖出來的，還沒有人在真遊戲上按過。驗過就拆。
+        ⚠ 這顆是**驗證用**的（memory 的 test-via-button）：換球封包 0x12、
+          商城買 0x12B、領取 0x2F/0x16 都是 2026-08-21 離線反組譯挖出來的，
+          還沒有人在真遊戲上按過。驗過就拆。
         """
         sc = self.sc
         if sc is None or not sc.attached():
@@ -3206,54 +3219,137 @@ class CharFarmPage(QWidget):
         lines = ["【現況】"]
         for b in cur:
             lines.append(f"　{inventory.slot_side(b.slot)}飾品（第 {b.slot} 格）"
-                         f"　{b.name}　{b.value:,}/{b.cap:,}")
+                         f"　{b.name}　{b.value:,}/{b.cap:,}"
+                         + ("　★滿了" if b.full else ""))
         if not cur:
             lines.append("　飾品欄兩格都沒有經驗球")
         lines.append("　背包備球：" + (
             "讀不到" if pool is None else
             "、".join(f"{b.name} {b.value:,}/{b.cap:,}（第 {b.slot} 格）"
                       for b in pool) or "一顆都沒有"))
-
-        # 挑這次要送什麼：有備球就走真流程，沒有就左右對調（純驗證封包）。
-        src = dst = None
-        how = ""
-        if cur and pool:
-            for b in cur:
-                s = balls.pick_spare(pool, b)
-                if s is not None:
-                    src, dst, how = s.slot, b.slot, f"把背包的「{s.name}」換上去"
-                    break
-        if src is None and len(cur) >= 2:
-            src, dst = cur[0].slot, cur[1].slot
-            how = "把左右兩顆對調（再按一次會換回來）"
-        if src is None:
-            lines.append("\n沒有可以試的組合（要有備球，或飾品欄兩格都有球）。")
+        # 商城賣什麼（純讀，不買）
+        for b in cur[:1]:
+            g = mall.cheapest(sc, b.type_id)
+            lines.append("　商城："
+                         + (f"編號 {g.mall_id}　{g.name}×{g.count}　{g.price} 點"
+                            if g else "查不到這顆球（或表讀不到）"))
+        if not cur:
             QMessageBox.information(self, "測試換球", "\n".join(lines))
             return
+
+        # ★ 順便**免費**驗「從商城倉庫領取」那包（0x2F/0x16）——
+        #   倉庫裡本來就有東西的時候領一件出來不花任何點數，是唯一
+        #   不用先買就能驗的機會。⚠ 會真的動到東西，所以先問過。
+        st = mall.storage(sc)
+        if st:
+            names = "、".join(f"{itemname.label(t)}×{n}" for _s, t, n in st)
+            ask = QMessageBox.question(
+                self, "測試換球",
+                f"商城倉庫裡有：{names}\n\n"
+                f"要順便測「領取到背包」嗎？（不花點數，東西會進背包）")
+            if ask == QMessageBox.Yes:
+                if not self._ensure_mover():
+                    lines.append("\n⚠ 跳板沒接上，無法送封包。")
+                    QMessageBox.warning(self, "測試換球", "\n".join(lines))
+                    return
+                tok, tmsg = mall.take(self._mover, sc, st[0][0], st[0][1])
+                lines.append(f"\n【領取測試】"
+                             f"{'✔ ' if tok else '⛔ '}{tmsg}")
+
+        # 真正的流程只有「全滿」才會跑；測試鈕讓使用者能在沒滿的時候也驗封包，
+        # 所以沒滿時退而求其次：把左右兩顆對調（純驗證 0x12 通不通）。
+        all_full = bool(cur) and all(b.full for b in cur)
         if not self._ensure_mover():
             lines.append("\n⚠ 跳板沒接上，無法送封包。")
             QMessageBox.warning(self, "測試換球", "\n".join(lines))
             return
-
-        lines.append(f"\n【動作】{how}（第 {src} 格 → 第 {dst} 格）")
-        ok, msg = balls.swap(self._mover, sc, src, dst)
+        if all_full:
+            lines.append("\n【動作】跑真流程（全滿 → 配對／補貨 → 一起換）")
+            ok, msg = self._ball_run(sc, cur, pool)
+        elif len(cur) >= 2:
+            lines.append("\n【動作】還沒全滿 → 改把左右兩顆對調"
+                         "（純驗證換球封包，再按一次會換回來）")
+            ok, msg = balls.swap(self._mover, sc, cur[0].slot, cur[1].slot)
+        else:
+            lines.append("\n沒有可以試的組合（飾品欄要有兩顆球）。")
+            QMessageBox.information(self, "測試換球", "\n".join(lines))
+            return
         lines.append(f"【結果】{'✔ ' if ok else '⛔ '}{msg}")
         after = balls.worn(sc)
         if after is not None:
             lines.append("\n【換完之後】")
             for b in after[0]:
-                lines.append(f"　{inventory.slot_side(b.slot)}飾品（第 {b.slot} 格）"
-                             f"　{b.name}　{b.value:,}/{b.cap:,}")
+                lines.append(f"　{inventory.slot_side(b.slot)}飾品"
+                             f"（第 {b.slot} 格）　{b.name}"
+                             f"　{b.value:,}/{b.cap:,}")
         QMessageBox.information(self, "測試換球", "\n".join(lines))
         self.status.setText(f"測試換球：{'成功' if ok else '失敗'}　{msg}")
+
+    def _ball_restock(self, sc, need: list) -> tuple[bool, str]:
+        """去商城把缺的備球補齊（買 → 從商城倉庫領進背包）。
+
+        ⚠⚠ **會花真的點數**，所以每一步都驗結果：買完要看商城倉庫真的多一筆、
+          領完要看那一筆真的離開商城倉庫。任何一步失敗就整個停手回報。
+        """
+        spent = 0
+        bought = 0
+        for cur in need:
+            g = mall.cheapest(sc, cur.type_id)
+            if g is None:
+                return False, f"商城查不到「{cur.name}」，補不到備球"
+            ok, msg = mall.buy(self._mover, sc, g)
+            if not ok:
+                return False, f"商城購買「{g.name}」失敗：{msg}"
+            spent += g.price
+            bought += g.count
+            # ⚠ 刻意**不**寫進「購買紀錄」那張表：那張表的花費欄是**金幣**
+            #   （單價來自補給店販售表），把點數混進去總額就是錯的。
+            #   商城花了幾點改成每次都在通知與狀態列明講。
+            # 買到的東西在商城倉庫，要領進背包才換得上
+            st = mall.storage(sc)
+            if st is None:
+                return False, "商城倉庫讀不到，領不出來（東西已經買了）"
+            mine = [r for r in st if r[1] == g.type_id]
+            if not mine:
+                return False, f"商城倉庫裡找不到剛買的「{g.name}」"
+            ok, msg = mall.take(self._mover, sc, mine[0][0], g.type_id)
+            if not ok:
+                return False, f"從商城倉庫領「{g.name}」失敗：{msg}"
+        return True, f"已從商城補 {bought} 顆備球（花費 {spent} 點）"
+
+    def _ball_run(self, sc, cur: list, pool) -> tuple[bool, str]:
+        """整條換球流程（會 block，一定要在背景執行緒上跑）。"""
+        if pool is None:
+            return False, "背包讀不到，這輪不動作"
+        pairs, missing = balls.pick_spares(pool, cur)
+        if missing:
+            ok, msg = self._ball_restock(sc, missing)
+            if not ok:
+                return False, (f"經驗球都滿了，但{msg} —— "
+                               f"還缺 {len(missing)} 顆備球，請手動處理。")
+            pool = balls.spares(sc)
+            if pool is None:
+                return False, "補貨完背包讀不到，下一輪再換"
+            pairs, missing = balls.pick_spares(pool, cur)
+            if missing:
+                return False, f"補貨完備球還是不夠（差 {len(missing)} 顆）"
+        names = []
+        for old, new in pairs:
+            ok, msg = balls.swap(self._mover, sc, new.slot, old.slot)
+            if not ok:
+                return False, (f"{inventory.slot_side(old.slot)}飾品換球失敗："
+                               f"{msg}")
+            names.append(new.name)
+        return True, ("經驗球都滿了 → 已換上「"
+                      + "」、「".join(names) + f"」共 {len(names)} 顆。")
 
     def _ball_tick(self, dt: float) -> None:
         """自動換球的心跳（BALL_GAP 一拍）。
 
-        ⚠⚠ 三個「讀不到就不下結論」的關卡（[[bag-false-empty-guards]]）：
+        ⚠⚠ 「讀不到就不下結論」的關卡（[[bag-false-empty-guards]]）：
           ① 飾品欄整段沒讀完 → 這輪跳過（不是「沒裝球」）
           ② 球的上限讀不到（`Ball.known` False）→ 不判斷滿沒滿
-          ③ 背包沒讀完 → 不准說「沒有備球」（那句話會發通知）
+          ③ 背包沒讀完 → 不准說「沒有備球」（那句話會發通知、還會去買東西）
         """
         if not self.ball_cb.isChecked() or self._ball_off or self._ball_busy:
             return
@@ -3268,52 +3364,36 @@ class CharFarmPage(QWidget):
         got = balls.worn(sc)
         if got is None:
             return                                   # ① 讀不到 → 不下結論
-        full = [b for b in got[0] if b.full]
-        # 沒滿的那幾格把「沒備球」的門閂放掉 —— 換好球（或把球拿下來）之後
-        # 再滿一次要能再通知一次。
-        for b in got[0]:
-            if not b.full:
-                self._ball_said.discard(b.slot)
-        if not full:
+        cur = got[0]
+        # ★★ 使用者定：**全部都滿了才動**。只有一顆滿＝什麼都不做也不通知。
+        if not cur or not all(b.full for b in cur):
+            # 情況恢復（換上新球了）→ 兩個門閂都重新武裝
+            self._ball_said = self._ball_told = False
             return
-
         pool = balls.spares(sc)
         if pool is None:
             return                                   # ③ 讀不到 → 不下結論
-
-        for cur in full:
-            side = inventory.slot_side(cur.slot) or f"第{cur.slot}格"
-            spare = balls.pick_spare(pool, cur)
-            if spare is None:
-                if cur.slot in self._ball_said:
-                    continue
-                self._ball_said.add(cur.slot)
-                self.status.setText(
-                    f"⚠ {side}飾品的經驗球已滿（{cur.name} "
-                    f"{cur.value:,}/{cur.cap:,}），背包沒有備球")
-                self.notify(
-                    f"經驗球滿了：{side}飾品「{cur.name}」"
-                    f"{cur.value:,}/{cur.cap:,}，背包沒有備球可換。")
-                continue
-            if not self._ensure_mover():
-                return
-            # 一拍只換一格：換球要等伺服器回，另一格下一輪再處理。
-            self._ball_busy = True
-            src, dst, name = spare.slot, cur.slot, spare.name
-            mover = self._mover
-
-            def _worker() -> None:
-                try:
-                    ok, msg = balls.swap(mover, sc, src, dst)
-                except Exception as exc:             # noqa: BLE001
-                    ok, msg = False, f"{exc!r}"
-                # ⚠ 回 UI 執行緒才碰 Qt（背景執行緒直接改元件會炸）。
-                QTimer.singleShot(
-                    0, lambda: self._ball_swap_done(ok, msg, side, name))
-
-            threading.Thread(target=_worker, daemon=True,
-                             name=f"ballswap-{self.pid}").start()
+        # 備球不夠就要去商城買 —— 決定的當下先閂上，一個「滿了」事件只買一輪。
+        _, missing = balls.pick_spares(pool, cur)
+        if missing and self._ball_said:
             return
+        if missing:
+            self._ball_said = True
+        if not self._ensure_mover():
+            return
+
+        self._ball_busy = True
+
+        def _worker() -> None:
+            try:
+                ok, msg = self._ball_run(sc, cur, pool)
+            except Exception as exc:                 # noqa: BLE001
+                ok, msg = False, f"{exc!r}"
+            # ⚠ 回 UI 執行緒才碰 Qt（背景執行緒直接改元件會炸）。
+            QTimer.singleShot(0, lambda: self._ball_done(ok, msg))
+
+        threading.Thread(target=_worker, daemon=True,
+                         name=f"ballswap-{self.pid}").start()
 
     # ------------------------------------------------------------------
     # -- 血/魔不足時坐下回復 ---------------------------------------------
