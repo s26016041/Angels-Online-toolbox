@@ -105,11 +105,11 @@ CALL_TIMEOUT = 0.5
 WAIT_SECS = 8.0
 POLL = 0.25
 
-# ★★★ 官方的動作節流（兩次動作要隔 5 秒以上）**整套搬到 app/game/actiongate.py**
+# ★★★ 官方的動作節流（兩次動作要隔 5 秒以上）**整套在 app/game/actiongate.py**
 #   —— 那裡有反組譯出處，而且計時表是**跨模組共用**的：伺服器對帳號算，
 #   商城購買／領取／換裝全部同一條隊伍，各留一份就等於沒排隊。
-ACTION_GAP = actiongate.ACTION_GAP     # 給畫面算「大概要跑幾秒」用
-ACTION_TRIES = actiongate.TRIES
+#   ⚠ 這裡刻意**不留別名**：要用就直接 `actiongate.ACTION_GAP`，
+#     免得將來有人以為這是另一個可以獨立調的旋鈕。
 
 
 class Goods:
