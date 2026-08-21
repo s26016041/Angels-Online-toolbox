@@ -78,13 +78,26 @@ class FakeBalls:
         return self.spare_out
 
     def swap(self, mover, sc, src, dst):
+        """記帳並把假背包／假飾品欄照著換。
+
+        兩種來源都要支援：背包備球 → 飾品欄（真流程），以及飾品欄左右對調
+        （測試鈕在球還沒滿的時候用的那條）。
+        """
         self.swaps.append((src, dst))
-        if self.result[0]:
-            worn, _ = self.worn_out
-            spare = next(b for b in self.spare_out if b.slot == src)
+        if not self.result[0]:
+            return self.result
+        worn = list(self.worn_out[0])
+        spare = next((b for b in self.spare_out if b.slot == src), None)
+        if spare is not None:                      # 背包 → 飾品欄
             self.worn_out = ([spare if b.slot == dst else b for b in worn], True)
             spare.slot = dst
             self.spare_out = [b for b in self.spare_out if b is not spare]
+            return self.result
+        a = next((b for b in worn if b.slot == src), None)
+        b2 = next((b for b in worn if b.slot == dst), None)
+        if a is not None and b2 is not None:       # 飾品欄左右對調
+            a.slot, b2.slot = dst, src
+            self.worn_out = (worn, True)
         return self.result
 
 
@@ -149,10 +162,35 @@ class FakeTimer:
         fn()
 
 
+class FakeBox:
+    """QMessageBox 替身：記下講了什麼，問句一律回「否」（測試不送封包）。"""
+
+    Yes = "YES"
+    No = "NO"
+    said: list[str] = []
+
+    @staticmethod
+    def warning(_p, _t, text):
+        FakeBox.said.append(text)
+
+    @staticmethod
+    def information(_p, _t, text):
+        FakeBox.said.append(text)
+
+    @staticmethod
+    def question(_p, _t, text):
+        FakeBox.said.append(text)
+        return FakeBox.No
+
+
 class FakeSC:
     def _read_bytes(self, addr, n):
         return None
 
+    # ⚠ MemoryScanner.attached 是 **property** 不是方法 —— 假物件寫成方法
+    #   的話，程式碼裡誤寫成 `sc.attached()` 也照樣過測試，真的跑才炸
+    #   （2026-08-21 實際踩到：TypeError: 'bool' object is not callable）。
+    @property
     def attached(self):
         return True
 
@@ -167,6 +205,7 @@ farm_tab.balls = BALLS
 farm_tab.mall = MALL
 farm_tab.threading = types.SimpleNamespace(Thread=InlineThread)
 farm_tab.QTimer = FakeTimer
+farm_tab.QMessageBox = FakeBox
 
 TICK = farm_tab.BALL_GAP + 0.1
 
@@ -345,6 +384,31 @@ check("有停用通知", any("已停用" in m for m in page.notices),
 tick(page, 3)
 check("停用後不再重試", len(BALLS.swaps) == 1, f"實得 {BALLS.swaps}")
 BALLS.result = (True, "已換上")
+
+print("⑧ 「測試換球」鈕：不論狀態都不能炸（真的踩過 sc.attached 誤當方法）")
+for label, worn, spare in (
+        ("兩顆沒滿", ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True),
+         [FakeBall(30, 4937, 0)]),
+        ("兩顆都滿有備球", ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)],
+                            True), [FakeBall(30, 4937, 0),
+                                    FakeBall(31, 4937, 0)]),
+        ("飾品欄沒球", ([], True), []),
+        ("飾品欄讀不到", None, []),
+        ("背包讀不到", ([FakeBall(8, 4937, 10)], True), None)):
+    page = build_page()
+    BALLS.worn_out, BALLS.spare_out = worn, spare
+    MALL.store.append((999, 2017, 1))       # 倉庫有東西 → 會問「順便測領取嗎」
+    FakeBox.said.clear()
+    try:
+        page._test_ball_swap()
+        ok, why = True, ""
+    except Exception as exc:                # noqa: BLE001
+        ok, why = False, repr(exc)
+    check(f"{label} → 不丟例外", ok, why)
+    if ok and worn is not None and worn[0]:
+        check(f"{label} → 有畫面可看", bool(FakeBox.said), "一句話都沒說")
+check("問了『要不要順便測領取』就不會擅自送包（回否 → 沒領）",
+      MALL.takes == [], f"實得 {MALL.takes}")
 
 print()
 if FAILS:

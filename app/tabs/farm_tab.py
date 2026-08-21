@@ -3206,7 +3206,7 @@ class CharFarmPage(QWidget):
           還沒有人在真遊戲上按過。驗過就拆。
         """
         sc = self.sc
-        if sc is None or not sc.attached():
+        if sc is None or not sc.attached:
             QMessageBox.warning(self, "測試換球", "還沒接上這台遊戲。")
             return
         got = balls.worn(sc)
@@ -3364,7 +3364,7 @@ class CharFarmPage(QWidget):
             return
         self._ball_t = 0.0
         sc = self.sc
-        if sc is None or not sc.attached():
+        if sc is None or not sc.attached:
             return
 
         got = balls.worn(sc)
