@@ -401,44 +401,9 @@ tick(page, 3)
 check("停用後不再重試", len(BALLS.swaps) == 1, f"實得 {BALLS.swaps}")
 BALLS.result = (True, "已換上")
 
-print("⑧ 「測試換球」鈕：假裝滿了跑真流程；不論狀態都不能炸")
-ALL_SAID = []
-for label, worn, spare in (
-        ("兩顆沒滿有備球", ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True),
-         [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]),
-        ("沒備球（要買）", ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True),
-         []),
-        ("飾品欄沒球", ([], True), []),
-        ("飾品欄讀不到", None, []),
-        ("背包讀不到", ([FakeBall(8, 4937, 10)], True), None)):
-    page = build_page()
-    BALLS.worn_out, BALLS.spare_out = worn, spare
-    FakeBox.said.clear()
-    try:
-        page._test_ball_swap()
-        ok, why = True, ""
-    except Exception as exc:                # noqa: BLE001
-        ok, why = False, repr(exc)
-    check(f"{label} → 不丟例外", ok, why)
-    if ok:
-        check(f"{label} → 有畫面可看", bool(FakeBox.said), "一句話都沒說")
-    ALL_SAID += FakeBox.said
-
-check("問句回『否』就什麼都不送（不換、不買）",
-      BALLS.swaps == [] and MALL.buys == [],
-      f"實得 {BALLS.swaps} {MALL.buys}")
-check("沒備球時問句寫明要花幾點",
-      any("真的花掉" in t and "點" in t for t in ALL_SAID),
-      f"實得 {ALL_SAID}")
-check("有備球時問句寫明要換上哪一顆",
-      any("換上背包第" in t for t in ALL_SAID), f"實得 {ALL_SAID}")
-check("飾品欄沒球 → 講明真流程也不會動作",
-      any("飾品欄沒有球" in t for t in ALL_SAID), f"實得 {ALL_SAID}")
-
-print("⑧ 按「是」→ 真的把整條流程跑完（沒備球就買、買完領、領完換）")
-FakeBox.answer = FakeBox.Yes
+print("⑧ 商城購買紀錄：跟商店那張分開，幣別是點數")
 page = build_page()
-BALLS.worn_out = ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 20)], True)
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
 BALLS.spare_out = []
 nxt2 = [50]
 
@@ -449,14 +414,26 @@ def _restock2(type_id):
 
 
 MALL.on_take = _restock2
-page._test_ball_swap()
+tick(page)
 check("買了兩顆", len(MALL.buys) == 2, f"實得 {MALL.buys}")
 check("都領進背包了", len(MALL.takes) == 2, f"實得 {MALL.takes}")
 check("兩格都換上了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
-check("結果視窗講得出花了幾點",
-      any("點）" in t for t in FakeBox.said), f"實得 {FakeBox.said}")
+check("商城紀錄記了兩筆", len(page._mall_buys) == 2,
+      f"實得 {page._mall_buys}")
+check("記的是點數（45×2）", sum(r[4] for r in page._mall_buys) == 90,
+      f"實得 {page._mall_buys}")
+check("⚠ 沒有汙染商店那張（金幣）", page._purchases == [],
+      f"實得 {page._purchases}")
+dlg = page._mall_buys_dialog()
+check("商城表列數對", dlg._tbl.rowCount() == 2, f"實得 {dlg._tbl.rowCount()}")
+check("總額用『點』不是金幣",
+      "點" in dlg._head.text() and "金幣" not in dlg._head.text(),
+      f"實得 {dlg._head.text()}")
+check("表頭有商城編號那一欄",
+      dlg._tbl.horizontalHeaderItem(1).text() == "商城編號")
+_empty = build_page()._mall_buys_dialog()
+check("沒紀錄時也畫得出來（空表不當掉）", _empty._tbl.rowCount() == 0)
 MALL.on_take = None
-FakeBox.answer = FakeBox.No
 
 print("⑨ 動作節流（官方兩次動作要隔 5 秒）＋失敗重送")
 
@@ -509,7 +486,7 @@ def _done_true_after_first():
 def _build_ok():
     sent.append(1)
     state["done"] = True                     # 這一發其實成功了
-    return True, "", lambda: "成功"
+    return actiongate.SENT, "", lambda: "成功"
 
 
 ok, msg = actiongate.retry(SC, _done_true_after_first, _build_ok, None, "測試")
@@ -519,7 +496,7 @@ actiongate._last.clear()
 sent.clear()
 state["done"] = True                          # 呼叫前就已經完成了
 ok, msg = actiongate.retry(SC, _done_true_after_first,
-                           lambda: (sent.append(1), (True, "", lambda: "x"))[1],
+                           lambda: (sent.append(1), (actiongate.SENT, "", lambda: "x"))[1],
                            None, "測試")
 check("動手前發現已經完成 → 一包都不送（重試安全的關鍵）",
       ok and sent == [], f"實得 {ok} {sent}")
@@ -528,7 +505,7 @@ check("動手前發現已經完成 → 一包都不送（重試安全的關鍵�
 actiongate._last.clear()
 sent.clear()
 ok, msg = actiongate.retry(SC, lambda: False,
-                           lambda: (sent.append(1), (True, "", lambda: "x"))[1],
+                           lambda: (sent.append(1), (actiongate.SENT, "", lambda: "x"))[1],
                            None, "測試")
 check(f"沒生效就重送，共 {actiongate.TRIES} 次",
       not ok and len(sent) == actiongate.TRIES, f"實得 {ok} {sent}")
@@ -537,7 +514,7 @@ check(f"沒生效就重送，共 {actiongate.TRIES} 次",
 actiongate._last.clear()
 sent.clear()
 ok, msg = actiongate.retry(SC, lambda: None,
-                           lambda: (sent.append(1), (True, "", lambda: "x"))[1],
+                           lambda: (sent.append(1), (actiongate.SENT, "", lambda: "x"))[1],
                            None, "測試")
 check("done() 回 None（讀不到）不會被當成成功", not ok, f"實得 {ok} {msg}")
 
@@ -546,10 +523,31 @@ actiongate._last.clear()
 sent.clear()
 ok, msg = actiongate.retry(SC, lambda: False,
                            lambda: (sent.append(1),
-                                    (False, "跳板沒接上", None))[1],
+                                    (actiongate.STOP, "跳板沒接上", None))[1],
                            None, "測試")
-check("送不出去就立刻回報（只試一次）",
+check("『沒救』就立刻回報（只試一次）",
       not ok and len(sent) == 1 and "跳板" in msg, f"實得 {ok} {sent} {msg}")
+
+# ⑥ 指令槽忙碌那種「根本沒送出去」→ 要重送，不能放棄（使用者 2026-08-21 定）
+actiongate._last.clear()
+sent.clear()
+tries = {"n": 0}
+
+
+def _busy_then_ok():
+    tries["n"] += 1
+    sent.append(1)
+    if tries["n"] < 2:
+        return actiongate.RETRY, "換裝指令排不進去（指令槽忙碌）", None
+    state["done"] = True
+    return actiongate.SENT, "", lambda: "成功"
+
+
+state["done"] = False
+ok, msg = actiongate.retry(SC, _done_true_after_first, _busy_then_ok,
+                           None, "測試")
+check("指令槽忙碌（根本沒送出去）→ 下一輪重送，最後成功",
+      ok and len(sent) == 2, f"實得 {ok} {sent} {msg}")
 
 print("⑩ 換球被擋就重送；已經換好的**不准再送**（再送一次會換回去）")
 
@@ -575,12 +573,17 @@ class FakeMover:
     def call_sync(self, fn, a=0, b=0, ecx=0, timeout=0.0):
         self.sent.append((a, b))
         if len(self.sent) >= self.effective_on:
-            PTRS[b] = PTRS.get(b, 0) + 1000   # 目標格的物品指標換人＝換好了
+            # 遊戲換裝＝把兩格的**內容**互換（指標不動）
+            SERIALS[a], SERIALS[b] = SERIALS.get(b), SERIALS.get(a)
         return 1
 
 
+# ⚠ 換裝的身分是**序號**不是指標（實機量過：指標不動、內容互換）。
+#   替身要照著模擬，不然又會測到一個「跟真的不一樣」的世界。
 PTRS = {8: 111, 9: 222, 30: 333, 31: 444}
+SERIALS = {8: 900008, 9: 900009, 30: 900030, 31: 900031}
 real_balls._ptr_of = lambda sc, slot: PTRS.get(slot)
+real_balls._serial_of = lambda sc, slot: SERIALS.get(slot)
 
 actiongate._last.clear()
 mv = FakeMover(effective_on=1)                # 第一發就成功
@@ -589,7 +592,6 @@ check("一發就成功 → 只送一包（不會再送把它換回去）",
       ok and len(mv.sent) == 1, f"實得 {ok} {mv.sent}")
 
 actiongate._last.clear()
-PTRS.update({9: 222})
 mv = FakeMover(effective_on=2)                # 第一發被丟掉，第二發才生效
 ok, msg = real_balls.swap(mv, SC, 31, 9)
 check("第一發被擋 → 重送後成功（就是『只換了左飾品』那個 bug）",
@@ -603,6 +605,59 @@ check(f"一直不生效就送滿 {actiongate.TRIES} 次才放棄",
       f"實得 {ok} {mv.sent}")
 check("換球跟商城共用同一條隊伍（重送要等滿官方間隔）",
       real_balls.SWAP_GAPS[1] == actiongate.ACTION_GAP)
+
+print("⑪ 送包函式回的是三態字串，不是 bool（回 bool 會被當成沒送出去 → 重買）")
+
+
+class SendMover:
+    """_send() 用得到的最小跳板替身。"""
+
+    active = True
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    lock = _Lock()
+
+    def __init__(self, busy=False):
+        self.busy = busy
+        self.calls = 0
+
+    def scratch(self):
+        return 0x20000
+
+    def write(self, addr, data):
+        return True
+
+    def call_sync(self, fn, a=0, b=0, ecx=0, timeout=0.0):
+        self.calls += 1
+        return None if self.busy else 1
+
+
+class SendSC:
+    pid = 4321
+
+    def _read_bytes(self, addr, n):
+        import struct as _s
+        return bytearray(_s.pack("<I", 0x30000))      # 都當成合理指標
+
+
+st, why = real_mall._send(SendMover(), SendSC(), 0x12B, 7, bytes(5))
+check("送成功要回 actiongate.SENT（不是 True）", st == actiongate.SENT,
+      f"實得 {st!r}")
+check("⚠ 不可以是 bool（bool 會讓每一發都被當成沒送出去）",
+      not isinstance(st, bool), f"實得 {type(st).__name__}")
+st, why = real_mall._send(SendMover(busy=True), SendSC(), 0x12B, 7, bytes(5))
+check("指令槽忙碌要回 RETRY", st == actiongate.RETRY, f"實得 {st!r}")
+_keep = real_mall.jumpmap.BUILD_FN
+real_mall.jumpmap.BUILD_FN = 0
+st, why = real_mall._send(SendMover(), SendSC(), 0x12B, 7, bytes(5))
+real_mall.jumpmap.BUILD_FN = _keep
+check("位址沒定位要回 STOP（重送沒意義）", st == actiongate.STOP, f"實得 {st!r}")
 
 print()
 if FAILS:

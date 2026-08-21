@@ -1628,6 +1628,10 @@ class CharFarmPage(QWidget):
         self._ball_said = False    # 這次「都滿了」已經花過點數（擋重複購買）
         self._ball_told = False    # 這次「都滿了」已經通知過失敗（擋重複吵）
         self._ball_off = ""          # 大聲停用的原因（有字就不再試，狀態列看得到）
+        # 商城購買紀錄（「商城紀錄」鈕）。每筆 = (時間戳, 商城編號, 種類id, 數量, 點數)。
+        # ⚠ 跟商店那張（`_purchases`，金幣）**分開兩份** —— 幣別不同，
+        #   混在一起總額就是錯的（使用者 2026-08-21 要求）。
+        self._mall_buys: list[tuple[float, int, int, int, int]] = []
         # ── 購買紀錄（2026-08-20 使用者要求）──
         # 每筆 = (時間戳, 商人標籤, 種類id, 實收數量, 花費或 None)。
         # 補給背景執行緒 append（純資料、不碰 Qt），按「購買紀錄」鈕時才畫表。
@@ -1832,17 +1836,29 @@ class CharFarmPage(QWidget):
         run_bar.addWidget(self.train_cb)
         # ★ 購買紀錄（2026-08-20 使用者要求）：回程補給跟商人買了什麼的流水帳，
         #   按了開一張表（時間／商人／物品／數量／花費＋總額）。
+        # ★★ 2026-08-21 使用者要求**商店與商城分兩張表**：花的錢根本不同種
+        #   （商店＝金幣、商城＝點數），混在同一張表總額就是錯的。
         run_bar.addSpacing(24)
-        self.buy_log_btn = QPushButton("購買紀錄")
+        self.buy_log_btn = QPushButton("商店紀錄")
         self.buy_log_btn.setToolTip(
-            "回程補給跟商人買了什麼：時間、物品、數量、花費與總額。\n"
+            "回程補給跟商人買了什麼：時間、物品、數量、花費（金幣）與總額。\n"
             "只記這次開著工具箱期間的（重開清空）。")
         # 跟「歸零」同一套量法：照字型量寬高，別讓原生按鈕邊框把字切掉。
         fm2 = self.buy_log_btn.fontMetrics()
         self.buy_log_btn.setFixedSize(
-            fm2.horizontalAdvance("購買紀錄") + 32, fm2.height() + 8)
+            fm2.horizontalAdvance("商店紀錄") + 32, fm2.height() + 8)
         self.buy_log_btn.clicked.connect(self._show_purchases)
         run_bar.addWidget(self.buy_log_btn)
+        self.mall_log_btn = QPushButton("商城紀錄")
+        self.mall_log_btn.setToolTip(
+            "自動換球去天使商城買了什麼：時間、商品、數量、花費（點數）與總額。\n"
+            "只記這次開著工具箱期間的（重開清空）。")
+        fmm = self.mall_log_btn.fontMetrics()
+        self.mall_log_btn.setFixedSize(
+            fmm.horizontalAdvance("商城紀錄") + 32, fmm.height() + 8)
+        self.mall_log_btn.clicked.connect(self._show_mall_buys)
+        run_bar.addSpacing(4)
+        run_bar.addWidget(self.mall_log_btn)
         # ★ 自動換球（2026-08-21 使用者要求）：飾品欄的經驗球滿了就自動換上
         #   背包裡的備球，沒備球就通知一次。判斷全走遊戲自己的資料
         #   （範本分類＋上限），三族 32 種球都認得 —— 見 app/game/balls.py。
@@ -1854,18 +1870,9 @@ class CharFarmPage(QWidget):
             "買不到只通知一次，掛機照常繼續。")
         self.ball_cb.toggled.connect(self._on_ball_toggle)
         run_bar.addWidget(self.ball_cb)
-        # ★ 臨時測試鈕（memory 的 test-via-button）：換球封包還沒實機驗過，
-        #   給使用者當場按一下確認。驗過就可以拆掉這顆。
-        self.ball_test_btn = QPushButton("測試換球")
-        self.ball_test_btn.setToolTip(
-            "當場試一次換球，結果直接顯示。\n"
-            "背包有備球就真的換上；沒有就把左右兩顆對調（再按一次會換回來）。")
-        fm3 = self.ball_test_btn.fontMetrics()
-        self.ball_test_btn.setFixedSize(
-            fm3.horizontalAdvance("測試換球") + 32, fm3.height() + 8)
-        self.ball_test_btn.clicked.connect(self._test_ball_swap)
-        run_bar.addSpacing(4)
-        run_bar.addWidget(self.ball_test_btn)
+        # ⛔ 臨時的「測試換球」鈕已拆掉（2026-08-21 三包實機驗證完成：
+        #   換球 0x12、商城買 0x12B、領取 0x2F/0x16 —— 五個帳號跑過，
+        #   買 2 包／領 2 包／換 2 包，一包都沒多送，兩格都換上）。
         run_bar.addStretch(1)
         root.addLayout(run_bar)
 
@@ -3198,134 +3205,70 @@ class CharFarmPage(QWidget):
             self._ball_told = True
             self.notify(msg)
 
-    def _test_ball_swap(self) -> None:
-        """臨時測試鈕：**假裝球已經滿了**，把真正的流程原封不動跑一次。
-
-        使用者 2026-08-21 要求：不要再做「左右對調」那種代用測試，直接
-        「背包有沒滿的就換上去、沒有就去買」—— 也就是跟 `_ball_tick` 觸發時
-        完全同一條路（`_ball_run`），只差**跳過「全部都滿了」那道閘門**。
-
-        ⚠ 這顆是驗證用的（memory 的 test-via-button）。三種封包都是
-          2026-08-21 離線反組譯挖出來的：
-          ✅ 換球 0x12、領取 0x2F/0x16 已實機驗證（嵐狐）。
-          ⚠ 買 0x12B 只有花點數才驗得到 → 要買之前**一定另外問一次**，
-            問句寫明買什麼、幾點，而且預設鈕是「否」。
-          三包都驗過之後這顆鈕就可以拆了。
-        """
-        sc = self.sc
-        if sc is None or not sc.attached:
-            QMessageBox.warning(self, "測試換球", "還沒接上這台遊戲。")
-            return
-        if self._ball_busy:
-            QMessageBox.information(self, "測試換球", "上一次還在跑，等它跑完。")
-            return
-        got = balls.worn(sc)
-        pool = balls.spares(sc)
-        if got is None:
-            QMessageBox.warning(self, "測試換球",
-                                "飾品欄讀不到（還沒進場？）—— 沒有動作。")
-            return
-        cur = got[0]
-        lines = ["【現況】"]
-        for b in cur:
-            lines.append(f"　{inventory.slot_side(b.slot)}飾品（第 {b.slot} 格）"
-                         f"　{b.name}　{b.value:,}/{b.cap:,}"
-                         + ("　★滿了" if b.full else ""))
-        if not cur:
-            lines.append("　飾品欄兩格都沒有經驗球")
-        lines.append("　背包備球：" + (
-            "讀不到" if pool is None else
-            "、".join(f"{b.name} {b.value:,}/{b.cap:,}（第 {b.slot} 格）"
-                      for b in pool) or "一顆都沒有"))
-        if not cur:
-            lines.append("\n飾品欄沒有球 —— 真流程也不會動作（使用者定的規則）。")
-            QMessageBox.information(self, "測試換球", "\n".join(lines))
-            return
-        if pool is None:
-            lines.append("\n背包讀不到 —— 真流程這時候不動作。")
-            QMessageBox.information(self, "測試換球", "\n".join(lines))
-            return
-
-        # 先算一次配對，讓使用者知道待會會做什麼；要花點數就問清楚再送。
-        pairs, missing = balls.pick_spares(pool, cur)
-        plan = [f"　換上背包第 {sp.slot} 格的「{sp.name}」"
-                f"→ {inventory.slot_side(old.slot)}飾品" for old, sp in pairs]
-        cost = 0
-        for b in missing:
-            g = mall.cheapest(sc, b.type_id)
-            if g is None:
-                plan.append(f"　⛔ 商城查不到「{b.name}」，這一格補不到")
-                continue
-            cost += g.price
-            plan.append(f"　去商城買 {g.name}×{g.count}"
-                        f"（編號 {g.mall_id}，{g.price} 點）→ 領進背包 → 換上"
-                        f"{inventory.slot_side(b.slot)}飾品")
-        lines.append("\n【假裝兩顆都滿了，接下來會做】")
-        lines += plan or ["　（沒有可做的事）"]
-
-        ask_text = "\n".join(lines) + "\n\n要現在跑一次嗎？"
-        if cost:
-            ask_text += f"\n⚠ 其中會真的花掉 {cost} 點商城點數。"
-        if missing:
-            # 官方限制兩次商城動作要隔 5 秒以上（mall.ACTION_GAP），所以
-            # 補球一定會慢 —— 先講清楚，不然又會被當成當掉。
-            secs = int(len(missing) * 2 * mall.ACTION_GAP)
-            ask_text += (f"\n（官方限制商城動作要間隔 {int(mall.ACTION_GAP)} 秒，"
-                         f"補球至少要跑 {secs} 秒，進度看狀態列）")
-        if QMessageBox.question(
-                self, "測試換球", ask_text,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No) != QMessageBox.Yes:
-            return
-        if not self._ensure_mover():
-            QMessageBox.warning(self, "測試換球", "跳板沒接上，無法送封包。")
-            return
-
-        # ⚠ 整條流程會等伺服器（買／領各最多 8 秒、每次換球最多 3 秒），
-        #   放 UI 執行緒上會把畫面凍住 —— 跟真流程一樣丟背景執行緒。
-        self._ball_busy = True
-        self.ball_test_btn.setEnabled(False)
-        self.status.setText("測試換球：跑真流程中…")
-
-        def _worker() -> None:
-            try:
-                ok, msg = self._ball_run(sc, cur, pool)
-            except Exception as exc:                 # noqa: BLE001
-                ok, msg = False, f"{exc!r}"
-            QTimer.singleShot(0, lambda: self._test_ball_done(lines, ok, msg))
-
-        threading.Thread(target=_worker, daemon=True,
-                         name=f"balltest-{self.pid}").start()
-
-    def _test_ball_done(self, lines: list, ok: bool, msg: str) -> None:
-        """測試鈕的收尾（UI 執行緒）：把結果與換完之後的狀態攤開來。"""
-        self._ball_busy = False
-        self.ball_test_btn.setEnabled(True)
-        out = list(lines)
-        out.append(f"\n【結果】{'✔ ' if ok else '⛔ '}{msg}")
-        after = balls.worn(self.sc) if self.sc is not None else None
-        if after is not None:
-            out.append("\n【跑完之後】")
-            for b in after[0]:
-                out.append(f"　{inventory.slot_side(b.slot)}飾品"
-                           f"（第 {b.slot} 格）　{b.name}"
-                           f"　{b.value:,}/{b.cap:,}")
-            spare = balls.spares(self.sc)
-            out.append("　背包備球：" + (
-                "讀不到" if spare is None else
-                "、".join(f"{b.name} {b.value:,}/{b.cap:,}" for b in spare)
-                or "一顆都沒有"))
-        QMessageBox.information(self, "測試換球", "\n".join(out))
-        self.status.setText(f"測試換球：{'成功' if ok else '失敗'}　{msg}")
-
     def _ball_say(self, text: str) -> None:
         """把背景流程的進度丟回狀態列。**背景執行緒呼叫**，所以要繞回 UI 執行緒。
 
         ⚠ 沒有這個的話，整條流程（官方兩次商城動作要隔 5 秒以上，見
-          `mall.ACTION_GAP`）跑起來會靜默好幾十秒，看起來就像當掉
+          `actiongate.ACTION_GAP`）跑起來會靜默幾十秒，看起來就像當掉
           —— 使用者 2026-08-21 回報的「卡住了」有一半是這個。
         """
         QTimer.singleShot(0, lambda: self.status.setText(f"經驗球：{text}"))
+
+    def _record_mall_buy(self, g) -> None:
+        """商城買到一筆 → 記帳。**背景執行緒呼叫**：只碰純資料，不碰 Qt。
+
+        ⚠ 花的是**點數**，所以跟商店那張（金幣）分開兩份，見「商城紀錄」鈕。
+          單價不必猜 —— `mall.Goods.price` 就是遊戲商品表裡的售價。
+        """
+        self._mall_buys.append(
+            (time.time(), int(g.mall_id), int(g.type_id),
+             int(g.count), int(g.price)))
+        if len(self._mall_buys) > PURCHASE_CAP:
+            del self._mall_buys[:-PURCHASE_CAP]
+
+    def _mall_buys_dialog(self) -> QDialog:
+        """商城購買紀錄（新的在上面），總額掛在表的上方。
+
+        跟商店那張一模一樣的做法，只差**幣別是點數**、多一欄商城編號。
+        跟 exec 拆開是為了離線測試能只建表不進事件迴圈。
+        """
+        rows = list(self._mall_buys)[::-1]
+        total = sum(r[4] for r in rows)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            f"商城購買紀錄 — {self.char_name or self.account or self.pid}")
+        v = QVBoxLayout(dlg)
+        head = (f"總花費 {total:,} 點（共 {len(rows)} 筆）" if rows else
+                "還沒有商城購買紀錄 —— 自動換球買不到備球時會記在這裡。")
+        lab = QLabel(head)
+        lab.setStyleSheet("font-weight: bold;")
+        v.addWidget(lab)
+
+        tbl = QTableWidget(len(rows), 5)
+        tbl.setHorizontalHeaderLabels(
+            ["時間", "商城編號", "商品", "數量", "花費(點數)"])
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        for i, (ts, mid, tid, qty, cost) in enumerate(rows):
+            cells = (time.strftime("%m/%d %H:%M:%S", time.localtime(ts)),
+                     str(mid), itemname.label(tid), str(qty), f"{cost:,}")
+            for col, text in enumerate(cells):
+                it = QTableWidgetItem(text)
+                if col in (1, 3, 4):          # 編號／數量／花費靠右
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                tbl.setItem(i, col, it)
+        # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
+        for col, w in enumerate((115, 80, 200, 55)):
+            tbl.setColumnWidth(col, w)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(tbl, 1)
+        dlg.resize(640, 420)
+        dlg._head, dlg._tbl = lab, tbl       # 給離線測試摸得到
+        return dlg
+
+    def _show_mall_buys(self) -> None:
+        self._mall_buys_dialog().exec()
 
     def _ball_restock(self, sc, need: list) -> tuple[bool, str]:
         """去商城把缺的備球補齊（買 → 從商城倉庫領進背包）。
@@ -3346,9 +3289,10 @@ class CharFarmPage(QWidget):
                 return False, f"商城購買「{g.name}」失敗：{msg}"
             spent += g.price
             bought += g.count
-            # ⚠ 刻意**不**寫進「購買紀錄」那張表：那張表的花費欄是**金幣**
-            #   （單價來自補給店販售表），把點數混進去總額就是錯的。
-            #   商城花了幾點改成每次都在通知與狀態列明講。
+            # ★ 商城買的記進**自己那張表**（「商城紀錄」鈕）。⚠ 不可以跟商店
+            #   那張混：商店花金幣、商城花點數，混在一起總額就是錯的
+            #   （使用者 2026-08-21 要求分開）。
+            self._record_mall_buy(g)
             # 買到的東西在商城倉庫，要領進背包才換得上
             st = mall.storage(sc)
             if st is None:

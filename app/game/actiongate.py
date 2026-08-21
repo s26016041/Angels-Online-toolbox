@@ -63,13 +63,23 @@ def forget(scanner) -> None:
     _last.pop(getattr(scanner, "pid", 0) or 0, None)
 
 
+# `build()` 的三種結果。★ 使用者 2026-08-21 定：「每個步驟都要確認，避免因為
+#   遊戲指令忙線等等不明原因沒吃到指令」—— 所以「**沒送出去**」也要再試，
+#   不能跟「沒救」混為一談。
+SENT = "sent"     # 送出去了 → 接著驗結果
+RETRY = "retry"   # 這次沒送成（指令槽忙碌、暫時讀不到…）→ 等一下重來
+STOP = "stop"     # 沒救（跳板沒接上、位址定位失敗…）→ 立刻回報，重試沒意義
+
+
 def retry(scanner, done, build, say=None, what: str = "",
           wait: float = 8.0, gaps=None, tries: int = TRIES
           ) -> tuple[bool, str]:
     """「排隊 → 送 → 驗結果 → 沒成就再送」。
 
     · `done()`  → True ／ False ／ **None（讀不到，不下結論）**
-    · `build()` → `(ok, why, 成功訊息的 callable)`：真正去送那一包
+    · `build()` → `(狀態, 說明, 成功訊息的 callable)`，狀態見上面三個常數。
+      **`RETRY` 跟 `SENT` 一樣會再繞一輪** —— 指令槽忙碌那種「遊戲根本沒
+      收到」的情況，放棄等於功能無聲失敗。
     · `gaps`    → 每一次送出前要隔多久（不給就每次都用 `ACTION_GAP`）。
       第一次通常可以短一點（前一個動作可能已經隔很久了），重送就一定要
       隔滿 —— 會走到重送就代表**很可能就是被節流擋掉的**。
@@ -77,21 +87,27 @@ def retry(scanner, done, build, say=None, what: str = "",
     ★ 每次送出前先 `done()`：這是重試安全的前提，見檔頭。
     """
     gaps = list(gaps or ())
+    rounds = max(tries, len(gaps))
     last = ""
-    for i in range(max(tries, len(gaps))):
+    for i in range(rounds):
         if done() is True:
             return True, f"{what}已完成"
         gate(scanner, gaps[i] if i < len(gaps) else ACTION_GAP, say)
         if say:
             say(f"{what}（第 {i + 1} 次）")
-        ok, why, good = build()
-        if not ok:
-            return False, why           # 連送都送不出去 → 不是節流，別白等
+        state, why, good = build()
+        if state == STOP:
+            return False, why           # 沒救 → 別白等
+        if state != SENT:               # 沒送出去（指令槽忙…）→ 下一輪重送
+            last = why
+            if say:
+                say(f"{what}沒送出去（{why}）→ 等一下重送")
+            continue
         end = time.monotonic() + wait
         while time.monotonic() < end:
             time.sleep(POLL)
             if done() is True:
                 return True, good()
         last = f"{what}沒有生效"
-    return False, (f"{last}（送了 {max(tries, len(gaps))} 次都沒反應"
+    return False, (f"{last}（試了 {rounds} 次都不成"
                    " —— 被伺服器擋？條件不符？）")

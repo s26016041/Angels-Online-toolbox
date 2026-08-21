@@ -121,6 +121,27 @@ def _ptr_of(scanner, slot: int) -> int | None:
     return p if 0x10000 < p < 0x7FFF0000 else None
 
 
+def _serial_of(scanner, slot: int) -> int | None:
+    """第 slot 格那件東西的**唯一序號**（物品 +0x00）。讀不到／空格回 None。
+
+    ⚠⚠ **換裝的驗證一定要認序號，不能認陣列指標**（2026-08-21 實機量出來的）：
+      換裝時遊戲**不動陣列指標，直接把兩個格子的物品內容互換** ——
+          換之前  格8 ptr=0x3be9ce30 serial=76031311
+          0.25 秒 格8 ptr=0x3be9ce30 serial=76022663   ← 指標一模一樣
+      拿指標當「換好了沒」的判準就永遠驗不到，於是每一次都判失敗、每一次都
+      重送 —— 實測同一格連送三包（淨效果剛好換一次，運氣好；偶數次就會
+      **換回去**）。這是 [[stale-address-identity-check]]「讀得到≠還是它」
+      的同一類坑。
+    """
+    p = _ptr_of(scanner, slot)
+    if not p:
+        return None
+    raw = scanner._read_bytes(p + bag.ITEM_SERIAL, 4)
+    if not raw or len(raw) < 4:
+        return None
+    return struct.unpack("<I", bytes(raw))[0]
+
+
 def _to_ball(scanner, item, ptr: int | None = None) -> Ball | None:
     """`bag.Item` → `Ball`；不是球回 None。"""
     if not item.is_ball:
@@ -230,11 +251,14 @@ def swap(mover, scanner, src_slot: int, dst_slot: int, say=None
     if src_slot == dst_slot:
         return False, "來源與目標是同一格"
 
-    # 「換好了」＝目標格的**物品指標換人**。基準只認一次，重送也拿它比。
-    before = _ptr_of(scanner, dst_slot)
+    # 「換好了」＝目標格那件東西的**序號換人**（見 `_serial_of`：指標不會變）。
+    # 基準只認一次，重送也拿它比。
+    before = _serial_of(scanner, dst_slot)
+    if before is None:
+        return False, f"第 {dst_slot} 格讀不到（還沒進場？）"
 
     def _done():
-        now = _ptr_of(scanner, dst_slot)
+        now = _serial_of(scanner, dst_slot)
         if now is None:
             return None                    # 讀不到 → 不下結論
         return now != before
@@ -242,12 +266,15 @@ def swap(mover, scanner, src_slot: int, dst_slot: int, say=None
     def _build():
         # ★ 格號每一次都重讀重驗：背包在等待的這幾秒可能已經變動。
         if _ptr_of(scanner, src_slot) is None:
-            return False, f"第 {src_slot} 格現在是空的（背包剛剛變動過）", None
+            # 讀不到跟「真的空了」長得一樣 → 當暫時性失敗，下一輪重讀重送。
+            return (actiongate.RETRY,
+                    f"第 {src_slot} 格讀不到／是空的（背包剛剛變動過）", None)
         with mover.lock:
             if mover.call_sync(SWAP_FN, src_slot, dst_slot,
                                timeout=CALL_TIMEOUT) is None:
-                return False, "換裝指令排不進去", None
-        return True, "", lambda: "已換上"
+                # ★ 指令槽忙碌＝遊戲**根本沒收到**，一定要重送（使用者定）。
+                return actiongate.RETRY, "換裝指令排不進去（指令槽忙碌）", None
+        return actiongate.SENT, "", lambda: "已換上"
 
     return actiongate.retry(scanner, _done, _build, say,
                             f"換上第 {dst_slot} 格",

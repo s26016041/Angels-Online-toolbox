@@ -227,31 +227,39 @@ def free_slot(scanner) -> int | None:
 
 
 def _send(mover, scanner, opcode: int, body: int,
-          payload: bytes) -> tuple[bool, str]:
-    """建包 → 填內文（從 +2 開始）→ 送出。跟 supply.deposit_slot 同一套。"""
+          payload: bytes) -> tuple[str, str]:
+    """建包 → 填內文（從 +2 開始）→ 送出。跟 supply.deposit_slot 同一套。
+
+    ⚠⚠ 回的是 `actiongate` 的**三態字串**（`SENT`／`RETRY`／`STOP`），
+      **不是 bool**。這裡曾經回 True/False，`actiongate.retry` 拿它跟 `SENT`
+      比就永遠不相等 → 每一發都被當成「沒送出去」而重送 —— 2026-08-21 實機
+      因此**多買了一顆球**（多花 45 點）。錢的路徑上，型別錯就是花錯錢。
+    ★ 「指令槽忙碌」那種**遊戲根本沒收到**的一律 `RETRY`（使用者定：要重送）；
+      只有「沒救」（位址沒定位）才 `STOP`。
+    """
     if not (jumpmap.BUILD_FN and jumpmap.SEND_FN):
-        return False, "送包位址還沒定位（改版？先跑 patch_doctor）"
+        return actiongate.STOP, "送包位址還沒定位（改版？先跑 patch_doctor）"
     with mover.lock:
         buf = mover.scratch() + SCRATCH_OFF
         mover.write(buf, b"\0" * 16)
         if mover.call_sync(jumpmap.BUILD_FN, opcode, body, ecx=buf,
                            timeout=CALL_TIMEOUT) is None:
-            return False, "建封包排不進去（指令槽忙碌）"
+            return actiongate.RETRY, "建封包排不進去（指令槽忙碌）"
         data = _u32(scanner, buf + 4)
         if not 0x10000 < data < 0x7FFF0000:
-            return False, "封包資料指標不合理"
+            return actiongate.RETRY, "封包資料指標不合理（下一輪重讀）"
         if not mover.write(data + 2, payload):
-            return False, "寫封包內容失敗"
+            return actiongate.RETRY, "寫封包內容失敗"
         conn = _u32(scanner, jumpmap.CONN_PTR)
         pkt = _u32(scanner, buf + 0xC)
         if not conn:
-            return False, "還沒連上線 —— 可能正在重連"
+            return actiongate.RETRY, "還沒連上線 —— 可能正在重連"
         if not 0x10000 < pkt < 0x7FFF0000:
-            return False, "封包指標不合理"
+            return actiongate.RETRY, "封包指標不合理"
         if mover.call_sync(jumpmap.SEND_FN, conn, pkt,
                            timeout=CALL_TIMEOUT) is None:
-            return False, "送出排不進去（指令槽忙碌）"
-    return True, ""
+            return actiongate.RETRY, "送出排不進去（指令槽忙碌）"
+    return actiongate.SENT, ""
 
 
 def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
@@ -283,9 +291,9 @@ def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
         return False
 
     def _build():
-        ok, why = _send(mover, scanner, BUY_OPCODE, BUY_BODY,
+        st, why = _send(mover, scanner, BUY_OPCODE, BUY_BODY,
                         struct.pack("<IB", g.mall_id & 0xFFFFFFFF, 0))
-        return ok, why, lambda: (f"已買到「{g.name}」×"
+        return st, why, lambda: (f"已買到「{g.name}」×"
                                  f"{got[0][2] if got else g.count}"
                                  f"（{g.price} 點）")
 
@@ -312,11 +320,13 @@ def take(mover, scanner, serial: int, type_id: int, say=None
     def _build():
         slot = free_slot(scanner)                # ★ 現找，不用上一發那個
         if slot is None:
-            return False, "背包沒有空格（或整袋讀不到）", None
-        ok, why = _send(mover, scanner, TAKE_OPCODE, TAKE_BODY,
+            # 「沒空格」與「整袋讀不到」長得一樣，兩種都可能下一輪就好了
+            # —— 當暫時性失敗重送，不要直接判死。
+            return actiongate.RETRY, "背包沒有空格（或整袋讀不到）", None
+        st, why = _send(mover, scanner, TAKE_OPCODE, TAKE_BODY,
                         struct.pack("<BII", TAKE_ACTION,
                                     serial & 0xFFFFFFFF, slot & 0xFFFFFFFF))
-        return ok, why, lambda: f"已把「{name}」領進背包"
+        return st, why, lambda: f"已把「{name}」領進背包"
 
     return actiongate.retry(scanner, _done, _build, say,
                             f"領取「{name}」", wait=WAIT_SECS)
