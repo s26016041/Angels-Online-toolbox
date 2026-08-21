@@ -3201,9 +3201,11 @@ class CharFarmPage(QWidget):
     def _test_ball_swap(self) -> None:
         """臨時測試鈕：當場把整條流程跑一遍並攤開來給使用者看。
 
-        ⚠ 這顆是**驗證用**的（memory 的 test-via-button）：換球封包 0x12、
-          商城買 0x12B、領取 0x2F/0x16 都是 2026-08-21 離線反組譯挖出來的，
-          還沒有人在真遊戲上按過。驗過就拆。
+        ⚠ 這顆是**驗證用**的（memory 的 test-via-button）：三種封包都是
+          2026-08-21 離線反組譯挖出來的。
+          ✅ 換球 0x12、領取 0x2F/0x16 已實機驗證（嵐狐）。
+          ⚠ 買 0x12B 還沒 —— 驗它要真的花點數，所以另外問一次才送。
+          三包都驗過之後這顆鈕就可以拆了。
         """
         sc = self.sc
         if sc is None or not sc.attached:
@@ -3255,6 +3257,34 @@ class CharFarmPage(QWidget):
                 tok, tmsg = mall.take(self._mover, sc, st[0][0], st[0][1])
                 lines.append(f"\n【領取測試】"
                              f"{'✔ ' if tok else '⛔ '}{tmsg}")
+
+        # ★ 「買」那包（0x12B）**只有花點數才驗得到**，所以一定要另外問一次，
+        #   而且把價錢寫在問句裡。⚠ 預設是「否」—— 不小心按到不會扣點。
+        #   （換球 0x12 與領取 0x2F/0x16 已於 2026-08-21 實機驗證。）
+        buy = mall.cheapest(sc, cur[0].type_id) if cur else None
+        if buy is not None:
+            ask = QMessageBox.question(
+                self, "測試換球",
+                f"要順便測「商城購買」嗎？\n\n"
+                f"會買：{buy.name}×{buy.count}"
+                f"（商城編號 {buy.mall_id}）\n"
+                f"⚠ 這會真的花掉 {buy.price} 點。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ask == QMessageBox.Yes:
+                if not self._ensure_mover():
+                    lines.append("\n⚠ 跳板沒接上，無法送封包。")
+                    QMessageBox.warning(self, "測試換球", "\n".join(lines))
+                    return
+                bok, bmsg = mall.buy(self._mover, sc, buy)
+                lines.append(f"\n【購買測試】{'✔ ' if bok else '⛔ '}{bmsg}")
+                if bok:
+                    st2 = mall.storage(sc) or []
+                    mine = [r for r in st2 if r[1] == buy.type_id]
+                    if mine:
+                        tok, tmsg = mall.take(self._mover, sc,
+                                              mine[0][0], buy.type_id)
+                        lines.append(f"【接著領取】"
+                                     f"{'✔ ' if tok else '⛔ '}{tmsg}")
 
         # 真正的流程只有「全滿」才會跑；測試鈕讓使用者能在沒滿的時候也驗封包，
         # 所以沒滿時退而求其次：把左右兩顆對調（純驗證 0x12 通不通）。

@@ -165,8 +165,8 @@ class FakeTimer:
 class FakeBox:
     """QMessageBox 替身：記下講了什麼，問句一律回「否」（測試不送封包）。"""
 
-    Yes = "YES"
-    No = "NO"
+    Yes = 2
+    No = 4
     said: list[str] = []
 
     @staticmethod
@@ -177,8 +177,13 @@ class FakeBox:
     def information(_p, _t, text):
         FakeBox.said.append(text)
 
+    # PySide6 的旗標常數：程式碼會傳 `QMessageBox.Yes | QMessageBox.No`，
+    # 假物件要吃得下（真的介面長什麼樣，替身就要長什麼樣 —— 這正是
+    # attached 被寫成方法那次的教訓）。
+    Ok = 1
+
     @staticmethod
-    def question(_p, _t, text):
+    def question(_p, _t, text, _buttons=None, _default=None):
         FakeBox.said.append(text)
         return FakeBox.No
 
@@ -409,6 +414,11 @@ for label, worn, spare in (
         check(f"{label} → 有畫面可看", bool(FakeBox.said), "一句話都沒說")
 check("問了『要不要順便測領取』就不會擅自送包（回否 → 沒領）",
       MALL.takes == [], f"實得 {MALL.takes}")
+check("『要不要測購買』也是回否就不扣點（沒送過購買）",
+      MALL.buys == [], f"實得 {MALL.buys}")
+check("購買問句有把價錢寫進去",
+      any("點" in t and "商城編號" in t for t in FakeBox.said),
+      f"實得 {FakeBox.said}")
 
 print()
 if FAILS:
