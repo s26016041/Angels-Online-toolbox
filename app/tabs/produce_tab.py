@@ -160,6 +160,9 @@ SETTINGS_PREFIX = "produce"
 # 開著時多久檢查一次「有沒有在正確地採、有沒有停下來」（使用者要求 5 秒）。
 # 一次是幾毫秒的純讀，5 秒一次完全不吃資源。
 GATHER_TICK_MS = 5000
+# ★ 自動換球補貨失敗後隔多久再試（跟掛機頁同一個值；2026-08-22 使用者回報
+#   「滿了卻不動、看不出原因」—— 永久放棄是錯的，被拒的購買不扣點）。
+BALL_RETRY_GAP = 600.0
 # 連續幾次「位置沒動、資源也沒少」就判定停住了 → 踢一下（重設中心點）。
 # 3 次 ≈ 15 秒：採一次要幾秒，走去下一個也要幾秒，太短會把正常的採集誤判成卡住。
 STUCK_TICKS = 3
@@ -250,8 +253,9 @@ class CharProducePage(QWidget):
         self._loading = True
         # ── 自動換球（見 _ball_tick）──
         self._ball_busy = False    # 換球背景執行緒進行中（看門狗要讓路）
-        self._ball_said = False    # 這次「都滿了」已經花過點數（擋重複購買）
         self._ball_told = False    # 這次「都滿了」已經講過失敗（擋重複吵）
+        # ⚠ 補貨失敗之後隔多久才再試（**不是永久放棄**）。
+        self._ball_retry_at = 0.0
         self._ball_off = ""        # 大聲停用的原因（有字就不再試）
         # 商城購買紀錄（「商城紀錄」鈕）。⚠ 點數，跟金幣的表分開。
         self._mall_buys: list[tuple[float, int, int, int, int]] = []
@@ -324,7 +328,12 @@ class CharProducePage(QWidget):
         run_bar.addWidget(self.run_cb)
         run_bar.addSpacing(24)
         run_bar.addWidget(self.ball_cb)
-        run_bar.addSpacing(4)
+        # ★★ 現況／為什麼沒動作一定要看得到（2026-08-22 使用者回報）。
+        self._ball_lbl = QLabel("經驗球：—")
+        self._ball_lbl.setStyleSheet("color: #9aa2b8;")
+        run_bar.addSpacing(6)
+        run_bar.addWidget(self._ball_lbl)
+        run_bar.addSpacing(12)
         run_bar.addWidget(self.mall_log_btn)
         run_bar.addStretch(1)
         root.addLayout(run_bar)
@@ -1803,7 +1812,8 @@ class CharProducePage(QWidget):
     def _on_ball_toggle(self, on: bool) -> None:
         """「自動換球」開關。純粹換一組狀態，不動採集。"""
         self._save_settings()
-        self._ball_said = self._ball_told = False
+        self._ball_told = False
+        self._ball_retry_at = 0.0
         self._ball_off = ""
         if on:
             self._note("自動換球已開啟：兩顆經驗球都滿了會暫停精靈換球")
@@ -1828,43 +1838,74 @@ class CharProducePage(QWidget):
             return
         if "定位失敗" in msg:
             self._ball_off = msg          # 改版把函式搬走了 → 大聲停用
-        # 同一個「都滿了」事件的失敗只講一次（狀態列已經寫了，不必再吵）。
+        else:
+            # 失敗**不是永久放棄**：排一次冷卻之後再試。
+            self._ball_retry_at = time.monotonic() + BALL_RETRY_GAP
+        self._ball_lbl.setText(f"經驗球：⚠ {msg}")
         self._ball_told = True
+
+    def _ball_status(self, sc) -> tuple[str, list | None, object]:
+        """看一眼經驗球現況，回 `(給人看的一句話, 要換的球, 背包備球)`。
+
+        ★★ 跟掛機頁同一套：**每一個「這輪不動作」的出口都要說得出理由**
+           （2026-08-22 使用者回報「滿了沒買新的換上，看不出來問題在哪」）。
+        ⚠ 純讀、不做任何動作，所以可以每一拍叫（也給畫面標籤用）。
+        """
+        if not self.ball_cb.isChecked():
+            return "沒有開啟", None, None
+        if self._ball_off:
+            return f"⛔ 已停用：{self._ball_off}", None, None
+        if self._ball_busy:
+            return "換球進行中…", None, None
+        if sc is None or not sc.attached:
+            return "還沒接上遊戲", None, None
+        got = balls.worn(sc)
+        if got is None:
+            return "飾品欄讀不到（換地圖／載入中？）", None, None
+        cur = got[0]
+        if not cur:
+            return "飾品欄沒有裝經驗球", None, None
+        blind = [b for b in cur if not b.known]
+        if blind:
+            return f"⚠ 讀不到上限（{blind[0].name}）→ 不判斷滿沒滿", None, None
+        shown = "、".join(f"{b.value:,}/{b.cap:,}" for b in cur)
+        if not all(b.full for b in cur):
+            return f"{shown}（要兩顆都滿才換）", None, None
+        pool = balls.spares(sc)
+        if pool is None:
+            return "都滿了，但背包讀不到 —— 這輪不動作", None, None
+        pairs, missing = balls.pick_spares(pool, cur)
+        if missing:
+            left = self._ball_retry_at - time.monotonic()
+            if left > 0:
+                return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
+                        f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
+            return f"都滿了、備球差 {len(missing)} 顆 → 去商城買", cur, pool
+        return f"都滿了 → 換上背包的 {len(pairs)} 顆備球", cur, pool
 
     def _ball_tick(self) -> bool:
         """自動換球。回 True＝這一拍交給它，`_gather_tick` 後面都別做了。
 
         ⚠⚠ 「讀不到就不下結論」（[[bag-false-empty-guards]]）：飾品欄沒讀完、
           背包沒讀完、上限讀不到 → 這輪什麼都不做，更不准去花點數買。
+          **但一律把理由寫到畫面上**（見 `_ball_status`）。
         """
-        if not self.ball_cb.isChecked() or self._ball_off:
+        if self._ball_busy:
             return False
         sc = self.sc
-        if sc is None or not sc.attached:
+        why, cur, pool = self._ball_status(sc)
+        self._ball_lbl.setText("經驗球：" + why)
+        if cur is None:
+            if "要兩顆都滿" in why or "沒有裝經驗球" in why:
+                self._ball_told = False
+                self._ball_retry_at = 0.0
             return False
-        got = balls.worn(sc)
-        if got is None:
-            return False                             # 讀不到 → 不下結論
-        cur = got[0]
-        # ★ 跟掛機同一條規則：**裝著的球全部都滿了**才動；只有一顆滿、
-        #   或根本沒裝球 → 什麼都不做也不通知。
-        if not cur or not all(b.full for b in cur):
-            self._ball_said = self._ball_told = False
-            return False
-        pool = balls.spares(sc)
-        if pool is None:
-            return False                             # 讀不到 → 不下結論
-        # 備球不夠就要花點數 —— 決定的當下先閂上，一個「滿了」事件只買一輪。
-        _, missing = balls.pick_spares(pool, cur)
-        if missing and self._ball_said:
-            return False
-        if missing:
-            self._ball_said = True
         if not self._ensure_mover():
+            self._ball_lbl.setText("經驗球：⚠ 跳板沒接上，換不了")
             return False
 
         self._ball_busy = True
-        self._note("經驗球都滿了 → 暫停精靈、按 ESC、換球…")
+        self._note(f"經驗球：{why} —— 暫停精靈、按 ESC…")
         mover, hwnd = self._mover, self.hwnd
 
         def _worker() -> None:
@@ -1879,6 +1920,7 @@ class CharProducePage(QWidget):
         threading.Thread(target=_worker, daemon=True,
                          name=f"ballswap-{self.pid}").start()
         return True
+
 
     def _ensure_mover(self) -> bool:
         """需要叫遊戲函式時才裝跳板 —— 沒用到就不要在遊戲裡放程式碼。

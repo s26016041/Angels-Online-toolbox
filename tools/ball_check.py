@@ -396,12 +396,22 @@ check("只買過一次（門閂擋住重複花點數）", len(MALL.buys) == 1,
 check("只通知一次", len(page.notices) == 1, f"實得 {page.notices}")
 check("掛機沒有被停掉", not page.run_cb.isChecked())
 
+print("④ 補貨失敗**不是永久放棄**：冷卻過了要再試（2026-08-22）")
+MALL.buys.clear()
+page._ball_retry_at = 0.0            # 模擬冷卻時間到了
+tick(page)
+check("冷卻過了會再試一次", len(MALL.buys) == 1, f"實得 {MALL.buys}")
+check("但不會再吵第二次", len(page.notices) == 1, f"實得 {page.notices}")
+check("失敗後有排下一次重試",
+      page._ball_retry_at > 0, f"實得 {page._ball_retry_at}")
+MALL.buys.clear()
+
 print("④ 球換掉之後（不再全滿）門閂重新武裝")
 BALLS.worn_out = ([FakeBall(8, 4937, 10), FakeBall(9, 4937, 10)], True)
 tick(page)                                   # 沒全滿 → 放掉門閂
 BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
 tick(page)
-check("再滿一次會再買／再通知", len(MALL.buys) == 2, f"實得 {MALL.buys}")
+check("再滿一次會再買／再通知", len(MALL.buys) == 1, f"實得 {MALL.buys}")
 MALL.buy_ok = True
 
 print("③ 商城根本沒賣這顆 → 通知一次，一毛點數都不花")
@@ -798,10 +808,14 @@ BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
 check("只有一顆滿 → 不接手、不動精靈",
       page._ball_tick() is False and ROBOT.calls == [],
       f"實得 {ROBOT.calls}")
+check("生產頁也把理由寫在畫面上",
+      "要兩顆都滿" in page._ball_lbl.text(), f"實得「{page._ball_lbl.text()}」")
 
 page = build_prod()
 BALLS.worn_out = None
 check("飾品欄讀不到 → 不接手", page._ball_tick() is False)
+check("讀不到也講得出來", "飾品欄讀不到" in page._ball_lbl.text(),
+      f"實得「{page._ball_lbl.text()}」")
 BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
 BALLS.spare_out = None
 check("背包讀不到 → 不接手、更不會去買",
@@ -817,6 +831,51 @@ check("沒備球 → 去商城買兩顆並記帳", len(page._mall_buys) == 2,
 check("商城紀錄是點數（45×2）", sum(r[4] for r in page._mall_buys) == 90)
 dlg = produce_tab.mall_buys_dialog(page, page._mall_buys, "小狐")
 check("生產頁的商城表跟掛機頁同一份", dlg._tbl.rowCount() == 2)
+MALL.on_take = None
+
+print("⑭ 每一個「這輪不動作」的出口都要說得出理由（不准安靜跳過）")
+page = build_page()
+cases = [
+    ("沒有開啟", lambda: page.ball_cb.setChecked(False)),
+    ("飾品欄讀不到", lambda: setattr(BALLS, "worn_out", None)),
+    ("飾品欄沒有裝經驗球", lambda: setattr(BALLS, "worn_out", ([], True))),
+    ("讀不到上限", lambda: setattr(
+        BALLS, "worn_out", ([FakeBall(8, 4937, 99, 0)], True))),
+    ("要兩顆都滿", lambda: setattr(
+        BALLS, "worn_out",
+        ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, 5)], True))),
+    ("背包讀不到", lambda: (setattr(
+        BALLS, "worn_out",
+        ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)),
+        setattr(BALLS, "spare_out", None))),
+]
+for want, setup in cases:
+    page = build_page()
+    setup()
+    page._ball_t = farm_tab.BALL_GAP
+    page._ball_tick(TICK)
+    txt = page._ball_lbl.text()
+    check(f"「{want}」講得出來", want in txt, f"實得「{txt}」")
+page = build_page()
+BALLS.worn_out = ([FakeBall(8, 4937, 60_000), FakeBall(9, 4937, 60_000)], True)
+BALLS.spare_out = []
+page._ball_t = farm_tab.BALL_GAP
+page._ball_tick(TICK)
+check("沒滿時看得到現在幾分幾", "60,000/120,000" in page._ball_lbl.text(),
+      f"實得「{page._ball_lbl.text()}」")
+
+print("⑮ 商城倉庫已經有現成的 → **直接領，不准再買一次**（省錢的關鍵）")
+page = build_page()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = []
+MALL.store.append((777, 4937, 1))            # 上一輪買成功、領失敗，東西還在倉庫
+MALL.on_take = lambda tid: BALLS.spare_out.append(FakeBall(70, tid, 0))
+tick(page)
+check("一毛錢都沒花", MALL.buys == [], f"實得 {MALL.buys}")
+check("直接把倉庫那顆領回來", MALL.takes == [777], f"實得 {MALL.takes}")
+check("領完就換上了", len(BALLS.swaps) == 1, f"實得 {BALLS.swaps}")
+check("訊息講明沒再花錢",
+      any("沒再花錢" in m for m in page.notices), f"實得 {page.notices}")
 MALL.on_take = None
 
 print()

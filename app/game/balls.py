@@ -301,8 +301,26 @@ def restock(mover, scanner, need: list, say=None, on_buy=None
     """
     from app.game import mall              # 這裡才 import：避免模組載入期繞圈
 
-    spent = bought = 0
+    spent = bought = taken = 0
     for cur in need:
+        # ★★★ **先看商城倉庫有沒有現成的**，有就直接領，不要再買一次。
+        #   ⚠⚠ 這是「重試不能燒錢」的關鍵：上一輪可能**買成功了、領失敗**
+        #   （背包滿、被節流擋…），東西就躺在商城倉庫。沒有這一步的話，
+        #   下一輪會看到「背包還是沒備球」→ 又買一顆 → 每重試一次燒一次點數。
+        st = mall.storage(scanner)
+        if st is None:
+            return False, "商城倉庫讀不到 —— 這時候不買（免得重複扣點）"
+        have = [r for r in st if r[1] == cur.type_id]
+        if have:
+            if say:
+                say(f"商城倉庫已經有「{cur.name}」→ 直接領，不用再買")
+            ok, msg = mall.take(mover, scanner, have[0][0], cur.type_id,
+                                say=say)
+            if not ok:
+                return False, f"從商城倉庫領「{cur.name}」失敗：{msg}"
+            taken += 1
+            continue
+
         g = mall.cheapest(scanner, cur.type_id)
         if g is None:
             return False, f"商城查不到「{cur.name}」，補不到備球"
@@ -323,7 +341,12 @@ def restock(mover, scanner, need: list, say=None, on_buy=None
         ok, msg = mall.take(mover, scanner, mine[0][0], g.type_id, say=say)
         if not ok:
             return False, f"從商城倉庫領「{g.name}」失敗：{msg}"
-    return True, f"已從商城補 {bought} 顆備球（花費 {spent} 點）"
+    parts = []
+    if bought:
+        parts.append(f"從商城買 {bought} 顆（花費 {spent} 點）")
+    if taken:
+        parts.append(f"從商城倉庫領回 {taken} 顆（沒再花錢）")
+    return True, "已" + "、".join(parts or ["補好備球"])
 
 
 def run_swap(mover, scanner, cur: list, pool, say=None, on_buy=None
