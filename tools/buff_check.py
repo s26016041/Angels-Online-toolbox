@@ -105,6 +105,13 @@ buff.quickbar = types.SimpleNamespace(
     VK_F1=0x70, Reader=lambda sc: FakeQuickbar.Reader(sc),
     read_page=QB.read_page, use=QB.use)
 
+# 假的「身上 buff 樹」（app/game/buffs.py 的 I/O）：
+#   TREE["left"] = None → 讀不到（① ~ ⑥ 全部走這條＝退化路徑）
+#                = 0.0  → 身上沒有這招
+#                > 0    → 身上還剩幾秒
+TREE = {"left": None}
+buff.buffs = types.SimpleNamespace(left_of=lambda sc, sid: TREE["left"])
+
 SC = object()
 
 
@@ -192,6 +199,57 @@ u0, k0 = QB.uses, KEYS["n"]
 step(b, mv, hook)
 check("改送真按鍵", KEYS["n"] == k0 + 1 and QB.uses == u0)
 QB.cell_skill = 5424
+
+print("⑦ 看身上真正的剩餘時間（使用者 2026-08-22：剩 < 20 秒或沒有才放）")
+TREE["left"] = 25.0                     # 剩 25 秒 > LEAD(20) → 不該放
+b, mv, hook = new_buff(), FakeMover(), FakeHook()
+u0 = QB.uses
+step(b, mv, hook)
+check("剩 25 秒（> 20）→ 不放", QB.uses == u0, f"實得按了 {QB.uses - u0} 次")
+check("開始時也不無腦放一次了", not b._confirming)
+TREE["left"] = 15.0                     # 剩 15 秒 < LEAD → 要放
+b._forget_live()
+step(b, mv, hook)
+check("剩 15 秒（< 20）→ 放", QB.uses == u0 + 1)
+TREE["left"] = 0.0                      # 身上沒有 → 要放
+b, mv, hook = new_buff(), FakeMover(), FakeHook()
+u0 = QB.uses
+step(b, mv, hook)
+check("身上沒有 → 放", QB.uses == u0 + 1)
+
+print("⑧ 送出後身上真的多了那個 buff → 確認成功（比廣播硬）")
+TREE["left"] = 0.0
+b, mv, hook = new_buff(), FakeMover(), FakeHook()   # hook.hit 一直是 False
+step(b, mv, hook)
+check("先進確認中", b._confirming)
+TREE["left"] = 1200.0                   # 伺服器生效了
+b._forget_live()
+note = step(b, mv, hook)
+check("身上看到就算成功（不必等廣播）", "身上確認" in note, f"實得 {note}")
+u0 = QB.uses
+CLOCK.t += 60
+step(b, mv, hook)
+check("之後時間還夠就不再按", QB.uses == u0)
+
+print("⑨ 送出後身上一直沒有 → 重試；連 3 次 → 退回自記時間，不無限重放")
+TREE["left"] = 0.0                      # 放了也不會出現（鍵對不上的假想改版）
+b, mv, hook = new_buff(), FakeMover(), FakeHook()
+u0 = QB.uses
+for _ in range(3):
+    step(b, mv, hook)                   # 送出
+    CLOCK.t += buff.CAST_WAIT + 0.5     # 等確認超時
+    note = step(b, mv, hook)
+    CLOCK.t += buff.RETRY + 0.5         # 等重試冷卻
+check("三次都送出去了", QB.uses == u0 + 3, f"實得 {QB.uses - u0} 次")
+check("第三次退回自記時間", b._tree_skip is True and "改用自己記時間" in note,
+      f"實得 {note}")
+sent = QB.uses
+for _ in range(60):                     # 走 120 秒（持續 1200 秒還沒到期）
+    CLOCK.t += 2.0
+    step(b, mv, hook)
+check("之後零重放（無限補發迴圈沒回來）", QB.uses == sent,
+      f"實得又送了 {QB.uses - sent} 次")
+TREE["left"] = None                     # 收乾淨，別影響之後的測試
 
 print()
 if FAILS:

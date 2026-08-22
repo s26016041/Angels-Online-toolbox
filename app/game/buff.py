@@ -1,4 +1,4 @@
-"""自動分身：開自動戰鬥時無腦放一次，之後時間到就補放。
+"""自動分身：身上**剩不到 LEAD 秒或根本沒有**就補放（2026-08-22 起）。
 
 怎麼放
 ------
@@ -50,18 +50,35 @@
 
 計時
 ----
-持續時間查 `skills.py`（資源包抽出來的，單位是秒；黑狐的 5424 是 1200 秒）。
-剩不到 LEAD 秒就補。**不偵測身上有沒有**（使用者要求）——
-遊戲的 buff 剩餘時間找不到（試過 11 種方法），與其猜不如每次開就重放一次。
+★★★ **2026-08-22 起看身上真正的剩餘時間**（使用者指定：`剩 < LEAD` 或
+`身上沒有` 才放）。來源＝身上生效中的 buff 樹（`app/game/buffs.py`，實體
+`+0x420`，節點 `+0x18` 是到期 Unix 秒）—— 那是官方精靈「自動輔助」用來判斷
+「這招還在不在」的同一份資料。
+
+⚠ 讀不到（沒進場／改版位移／驗證不過）就**退回舊做法**：自己記時間、
+  持續時間查 `skills.py`（單位秒，黑狐的 5424 是 1200 秒），開始時無腦放一次。
+  絕不把「讀不到」當成「身上沒有」——那會每輪白放一次、白扣魔。
+
+⛔ 舊註記「不偵測身上有沒有（使用者要求）／buff 剩餘時間找不到（試過 11 種
+  方法）」已作廢：那 11 種都在找「每秒遞減的欄位」，而遊戲存的是**固定不動的
+  到期戳記**，本來就不會遞減（見 buffs.py 檔頭）。
 """
 from __future__ import annotations
 
 import time
 
-from app.game import bag, castwatch, player, quickbar, skills
+from app.game import bag, buffs, castwatch, player, quickbar, skills
 
-# 剩幾秒就補（使用者指定 10 秒）
-LEAD = 10.0
+# 剩幾秒就補（使用者 2026-08-22 指定 20 秒：**剩 < 20 秒或身上沒有**就放）
+LEAD = 20.0
+# 多久重讀一次身上的 buff 樹（單招走樹搜尋實測 0.05~0.16ms，但心跳 10ms
+# 一拍，不節流等於每秒白讀 100 次 × 五台）。
+LIVE_GAP = 0.4
+# 送出後「樹上一直看不到這招」連續幾次就放棄用樹確認（退回自己記時間）。
+# ⚠⚠ 這道閘門是**防無限重放**用的：萬一某招放進身上的鍵不是技能 ID
+#   （改版／特殊技能），沒有它就會變成每 RETRY 秒重放一次、永遠停不下來
+#   —— 2026-08-20 castwatch 那次翻車就是這個形狀（見檔頭）。
+TREE_MISS_MAX = 3
 # 按鍵到遊戲把技能編號寫進欄位要一點時間，實測 1 秒內。
 CONFIRM_WAIT = 1.2
 # 學不到／放不出來時，隔多久再試（別每一拍都狂送）
@@ -74,7 +91,7 @@ CAST_WAIT = 4.0
 class AutoBuff:
     """一個角色一份。
 
-    `arm()`  —— 開自動戰鬥或中途勾選時呼叫，下一拍就無腦放一次。
+    `arm()`  —— 開自動戰鬥或中途勾選時呼叫，下一拍起開始顧。
     `step()` —— 每一拍呼叫。
     `skill`  —— 學到的技能編號（呼叫端負責存進設定）。
     """
@@ -101,6 +118,12 @@ class AutoBuff:
         self._srv = 0            # 我的施法者伺服器ID（每次送包重讀，不快取）
         # ★ 這招的廣播「驗不了」（等過一次沒等到）→ 之後跳過確認（見 ①.5）
         self._cw_skip = False
+        # 身上 buff 樹（buffs.py）的快取與失敗計數
+        self._live_at = 0.0       # 上次讀樹的時間（monotonic）
+        self._live: float | None = None   # 上次讀到的剩餘秒；None＝讀不到
+        self._tree_miss = 0       # 送出後樹上看不到這招的連續次數
+        self._live_before = 0.0   # 送出**前**身上還剩幾秒（確認的基準線）
+        self._tree_skip = False   # 連續太多次 → 這招不用樹確認（退回自記時間）
         self.note = ""
         self.armed = False
         self.blocked = ""        # 那個鍵上根本沒有可用的技能 → 停手（見 block）
@@ -124,6 +147,8 @@ class AutoBuff:
         self._learning = False
         self._confirming = False
         self._cw_skip = False                # 換了技能 → 廣播驗不驗得到重新試
+        self._live_at, self._live = 0.0, None
+        self._tree_miss, self._tree_skip = 0, False   # 樹確認也重新試
         self.blocked = ""
         return True
 
@@ -139,7 +164,12 @@ class AutoBuff:
         self.blocked = why
 
     def arm(self) -> None:
-        """開始（或中途勾選）—— 下一拍無腦放一次，不管身上有沒有。"""
+        """開始（或中途勾選）—— 下一拍看身上還剩幾秒再決定放不放。
+
+        ⚠ 舊行為是「無腦放一次，不管身上有沒有」；現在身上還夠（> LEAD）
+          就不放了（使用者 2026-08-22）。只有**讀不到** buff 樹時才會退回
+          舊行為（`_cast_at = 0` → `left()` 是 0 → 這一拍就補）。
+        """
         self._cast_at = 0.0
         self._sent_at = 0.0
         self._learning = False
@@ -147,9 +177,33 @@ class AutoBuff:
         self.armed = True
 
     def left(self) -> float:
+        """自己記時間算出來的剩餘秒 —— **只在讀不到身上 buff 樹時才用**。"""
         if not self._cast_at or not self.secs:
             return 0.0
         return max(0.0, self.secs - (time.monotonic() - self._cast_at))
+
+    def live_left(self, scanner) -> float | None:
+        """身上**真正**還剩幾秒；身上沒有回 0.0；**讀不到回 None**。
+
+        ★ 這是現在的主判據（使用者 2026-08-22：剩 < LEAD 或沒有才放）。
+        ⚠ 節流 LIVE_GAP：心跳每 10ms 一拍，不快取等於每秒白讀 100 次。
+        ⚠ `_tree_skip`（這招驗不了）時一律回 None，讓呼叫端退回自己記時間。
+        """
+        if not self.skill or self._tree_skip or scanner is None:
+            return None
+        now = time.monotonic()
+        if now - self._live_at < LIVE_GAP:
+            return self._live
+        self._live_at = now
+        try:
+            self._live = buffs.left_of(scanner, self.skill)
+        except Exception:                              # noqa: BLE001
+            self._live = None                          # 讀取層炸了＝不知道
+        return self._live
+
+    def _forget_live(self) -> None:
+        """讓下一拍一定重讀（剛送出去、狀態會變的時候呼叫）。"""
+        self._live_at = 0.0
 
     def step(self, scanner, mover, hwnd, pf_this: int, my_id,
              stats_base: int, send_key, cast_hook=None) -> str:
@@ -190,6 +244,37 @@ class AutoBuff:
         #   舊版把等不到當拒收、每 8 秒重放 → 無限補發迴圈（使用者實機症狀）。
         #   → 改判「驗不了」：當作已補、記住這招跳過確認（_cw_skip），不再重放。
         if self._confirming:
+            # ★★★ 最硬的證據：**身上真的多了這個 buff**（buffs.py 讀樹）。
+            #   比施放廣播可靠 —— 廣播會被封包洪流蓋掉（512 槽環形緩衝），
+            #   身上有沒有是狀態不是事件，晚幾拍讀還是讀得到。
+            live = self.live_left(scanner)
+            # ⚠ 確認條件是「**剩餘比送出前變多**」，不是「剩 > LEAD」：
+            #   ① 放成功＝重新計時，剩餘會跳回接近表定值；
+            #   ② 沒放到＝剩餘只會繼續往下掉，永遠過不了這一關；
+            #   ③ 用 `> LEAD` 的話，持續時間本來就比 LEAD 短的 buff
+            #      **永遠確認不了**（放對了也判成沒放）。
+            if live is not None and live > self._live_before + 1.0:
+                self._confirming = False
+                self._tree_miss = 0
+                self._cast_at = self._sent_at
+                self.note = (f"已補分身：技能 {self.skill}"
+                             f"（身上確認，剩 {live / 60:.0f} 分）")
+                return self.note
+            if live is not None and now - self._sent_at >= CAST_WAIT:
+                # 樹讀得到、卻**沒看到這招** → 這一發真的沒放到（硬證據）。
+                #   照 RETRY 節奏再放；連續 TREE_MISS_MAX 次都這樣就別再用樹
+                #   確認（免得鍵對不上時無限重放，見 TREE_MISS_MAX 的說明）。
+                self._confirming = False
+                self._tree_miss += 1
+                if self._tree_miss >= TREE_MISS_MAX:
+                    self._tree_skip = True
+                    self._cast_at = self._sent_at      # 退回自己記時間
+                    self.note = (f"⚠ 技能 {self.skill} 放了 {self._tree_miss} 次"
+                                 f"都沒出現在身上 → 改用自己記時間，不再重放")
+                else:
+                    self.note = (f"⚠ 補分身沒生效（身上沒看到技能 {self.skill}）"
+                                 f"→ {RETRY:.0f} 秒後再試")
+                return self.note
             if (cast_hook is not None and cast_hook.active and self._srv
                     and cast_hook.fired(self._cw_since, self._srv, self.skill)):
                 self._confirming = False
@@ -197,8 +282,11 @@ class AutoBuff:
                 self.note = (f"已補分身：技能 {self.skill}"
                              f"（伺服器已受理，持續 {self.secs / 60:.0f} 分）")
                 return self.note
-            if cast_hook is None or not cast_hook.active:
-                # 監聽中途被卸掉 → 沒訊號可等，退回「送出就當成功」
+            if live is None and (cast_hook is None or not cast_hook.active):
+                # 樹也讀不到、監聽也沒有 → 沒訊號可等，退回「送出就當成功」
+                #   ⚠ 條件裡的 `live is None` 不能拿掉：樹讀得到時要等它出現
+                #   （上面那兩段），這裡搶著判成功會讓下一拍又看到「身上沒有」
+                #   而重放一次。
                 self._confirming = False
                 self._cast_at = self._sent_at
                 return self.note
@@ -212,10 +300,19 @@ class AutoBuff:
             return self.note
 
         # ② 時間還夠 → 什麼都不做
+        #   ★★★ 判據是**身上真正的剩餘時間**（使用者 2026-08-22 指定：
+        #     剩 < LEAD 秒、或身上根本沒有，才放）。`live_left` 回 0.0 就是
+        #     「身上沒有」，回 None 才是「讀不到」。
+        #   ⚠ 讀不到時退回自己記時間（舊行為），不可以當成「沒有」——
+        #     那會每輪白放一次、白扣魔。
         #   ⛔ 這裡不要回「分身還有 X.X 分」的倒數 —— 那個字每 6 秒變一次，
         #     狀態列會被它一直蓋掉（使用者明講不要在下面看到倒數）。
         #     狀態列只留事件：放了／補了／失敗。
-        if self._cast_at and self.left() > LEAD:
+        live = self.live_left(scanner)
+        if live is not None:
+            if live > LEAD:
+                return self.note
+        elif self._cast_at and self.left() > LEAD:
             return self.note
         if now - self._sent_at < RETRY and self._sent_at:
             return self.note                    # 剛失敗過，先等等
@@ -300,14 +397,19 @@ class AutoBuff:
             # use() 回 False＝換圖空窗（自己實體 NULL）／指令槽忙——都是
             # 暫時性的，照 RETRY 節奏再試（transient-failure-auto-retry）。
             self.note = f"⚠ 補分身這一下沒按成（換圖中？）→ {RETRY:.0f} 秒後再試"
-        elif srv:
-            # 有施放廣播監聽 → 先別當成功，等 ①.5 收到「我放出這招」才算
+        elif srv or live is not None:
+            # 有確認手段就先別當成功，等 ①.5：
+            #   ★ 身上 buff 樹讀得到（live 不是 None）＝最硬的證據；
+            #   ★ 施放廣播（srv）＝次強，樹壞掉時的退路。
             self._confirming = True
             self._cw_since = since
             self._srv = srv
-            self.note = "補分身：已按出，等伺服器受理…"
+            self._live_before = live or 0.0   # 確認的基準線（見 ①.5）
+            self._forget_live()          # 狀態剛變 → 下一拍一定重讀
+            self.note = ("補分身：已按出，確認中…" if live is not None
+                         else "補分身：已按出，等伺服器受理…")
         else:
-            # 沒有監聽（裝不起來／讀不到施法者ID）→ 按出就當成功
+            # 兩種確認都沒有（樹讀不到＋監聽裝不起來）→ 按出就當成功
             self._cast_at = now
             self.note = (f"已補分身：技能 {self.skill}（快捷鍵路徑，"
                          f"持續 {self.secs / 60:.0f} 分）")

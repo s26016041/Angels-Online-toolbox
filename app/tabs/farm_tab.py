@@ -1971,7 +1971,7 @@ class CharFarmPage(QWidget):
         self.buff_cb = QCheckBox("自動分身")
         self.buff_cb.setToolTip(
             "把分身技能放在遊戲快捷欄的 F12（只認 F12）。\n"
-            "時間快到自動補放，並確認伺服器真的有受理。\n"
+            "看身上真正的剩餘時間：剩不到 20 秒或身上沒有才補放。\n"
             "不用開掛機，單獨勾也會動。")
         self.buff_cb.toggled.connect(self._save_settings)
         a.addWidget(self.buff_cb)
