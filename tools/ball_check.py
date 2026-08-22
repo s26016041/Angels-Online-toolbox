@@ -150,8 +150,8 @@ class FakeMall:
     def loaded(self, sc):
         return self.is_loaded
 
-    def request_data(self, mover, sc, say=None):
-        self.reqs.append(1)
+    def request_data(self, mover, sc, say=None, force=False):
+        self.reqs.append("force" if force else "load")
         self.is_loaded = True            # 要過就有了（實機：0 → 425 筆）
         return True, "商城資料已載入（425 筆商品）"
 
@@ -308,6 +308,9 @@ def build_page():
     MALL.takes.clear()
     MALL.store.clear()
     MALL.buy_ok = MALL.take_ok = True
+    MALL.blocked_why = None
+    MALL.is_loaded = True
+    MALL.reqs.clear()
     BALLS.result = (True, "已換上")
     real_balls.swap = BALLS.swap     # ⑩ 會換成真的那支，這裡換回來
     page.hwnd = 4242                 # 有視窗才送得出 ESC
@@ -897,6 +900,26 @@ check("兩格都換上了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
 check("⚠ 沒有把「表是空的」講成「商城沒有賣這種球」",
       "沒有賣" not in page._ball_lbl.text(), f"實得「{page._ball_lbl.text()}」")
 MALL.on_take = None
+
+print("⑲ **每次要花錢之前**都先跟伺服器要一次最新商城資料（怕商城改了）")
+page = build_page()
+MALL.is_loaded = True                 # 表早就在了，但可能是舊的
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = []
+MALL.on_take = lambda tid: BALLS.spare_out.append(
+    FakeBall(90 + len(BALLS.spare_out), tid, 0))
+tick(page)
+check("表已經有了也照樣重要一次", MALL.reqs and MALL.reqs[0] == "force",
+      f"實得 {MALL.reqs}")
+check("而且是在買之前", len(MALL.reqs) >= 1 and len(MALL.buys) == 2,
+      f"實得 reqs={MALL.reqs} buys={MALL.buys}")
+MALL.on_take = None
+
+page = build_page()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0)]     # 有備球＝不用花錢
+tick(page)
+check("不用花錢時不去打擾伺服器", MALL.reqs == [], f"實得 {MALL.reqs}")
 
 print("⑰ 動手**之前**就先擋掉會白跑的情況（使用者：商城會不會指令滿）")
 for why in ("商城倉庫滿了（10 格），請先去領取",

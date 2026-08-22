@@ -301,12 +301,15 @@ def restock(mover, scanner, need: list, say=None, on_buy=None
     """
     from app.game import mall              # 這裡才 import：避免模組載入期繞圈
 
-    # ★★ 商品表**要過才有**（2026-08-22 實測：沒開過商城的分身整張是空的）。
-    #   自己跟伺服器要一次就好，不必叫使用者去開商城視窗。
-    if not mall.loaded(scanner):
-        ok, msg = mall.request_data(mover, scanner, say=say)
-        if not ok:
-            return False, msg
+    # ★★★ **每次要花錢之前都跟伺服器要一次最新的商城資料**（使用者 2026-08-22
+    #   問「每次購買需要問一下商城拿數值有做嗎」——本來只有「表是空的」才要）。
+    #   ⚠⚠ 商城會改（限時／搶購位換人、調價）。拿幾小時前的舊表去買，
+    #     **商城編號可能已經指向別的東西** → 花真錢買錯東西，比報錯還糟。
+    #   ⚠ 表本來就空的話（沒開過商城的分身）這一步也順便把它灌進來。
+    #     一次購買才多花幾秒，這個保險很便宜；`REFRESH_GAP` 內不重複要。
+    ok, msg = mall.request_data(mover, scanner, say=say, force=True)
+    if not ok:
+        return False, msg
 
     spent = bought = taken = 0
     for cur in need:

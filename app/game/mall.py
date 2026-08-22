@@ -120,6 +120,13 @@ REQ_SUB_OPCODE = 0x16
 REQ_SUB_BODY = 7
 # ★ 出處：0x595678 依序 `0x5D2ACC(0x14, 0)`、`0x5D2ACC(0x15, 0)`。
 REQ_SUB_ACTIONS = (0x14, 0x15)
+# 已經有表時，重要一次之後等伺服器回填多久（驗不出「換新了沒」）。
+REFRESH_SETTLE = 1.5
+# 這麼短的時間內不重複要（補兩顆球會連叫兩次，沒必要）。
+REFRESH_GAP = 30.0
+
+# 每台上一次跟伺服器要商城資料的時刻。
+_refreshed: dict[int, float] = {}
 
 SCRATCH_OFF = 0x40               # 跟 supply.py 借同一塊暫存區的用法
 CALL_TIMEOUT = 0.5
@@ -263,17 +270,29 @@ def loaded(scanner) -> bool:
     return goods(scanner) is not None
 
 
-def request_data(mover, scanner, say=None) -> tuple[bool, str]:
+def request_data(mover, scanner, say=None, force: bool = False
+                 ) -> tuple[bool, str]:
     """跟伺服器要商城資料，把商品表灌進記憶體。
 
     ★ 照抄遊戲自己的 `automallrequestmalldata`（見上面常數的出處）——
       三包純送包，不碰 Lua、沒有 this，所以我們自己建包送就等價。
-    ⚠ 成功＝**商品表真的有東西了**（不是「送出去了」）。
+
+    · 表是空的（`force=False` 的一般情況）→ 成功＝**商品表真的有東西了**。
+    · `force=True`（**每次要花錢之前**）→ 表已經有東西時驗不出「有沒有換新」，
+      所以送完只等一小段讓伺服器回填就算數。
+      ⚠⚠ 為什麼還是要送：商城會改（限時／搶購位換人、調價）。拿幾小時前的
+        舊表去買，**商城編號可能已經指向別的東西** —— 那就是花真錢買錯東西，
+        比報錯還糟。一次購買才多花幾秒，這個保險很便宜。
+    ⚠ 太密集就不重送（`REFRESH_GAP`）：補兩顆球會連叫兩次，沒必要。
     """
     if not (mover and mover.active):
         return False, "跳板沒接上"
+    pid = getattr(scanner, "pid", 0) or 0
+    had = goods(scanner)
+    if force and had and time.monotonic() - _refreshed.get(pid, -999.0) < REFRESH_GAP:
+        return True, "商城資料剛剛才更新過"
     if say:
-        say("跟伺服器要商城資料…")
+        say("跟伺服器要最新的商城資料…" if had else "跟伺服器要商城資料…")
     actiongate.gate(scanner, say=say)
     st, why = _send(mover, scanner, REQ_OPCODE, REQ_BODY, b"")
     if st != actiongate.SENT:
@@ -283,6 +302,12 @@ def request_data(mover, scanner, say=None) -> tuple[bool, str]:
                         struct.pack("<BI", act, 0))
         if st != actiongate.SENT:
             return False, f"要商城資料失敗：{why}"
+    _refreshed[pid] = time.monotonic()
+    if had:
+        # 已經有表 → 驗不出「換新了沒」，等伺服器回填一下就好。
+        time.sleep(REFRESH_SETTLE)
+        g = goods(scanner)
+        return True, f"商城資料已更新（{len(g) if g else 0} 筆商品）"
     end = time.monotonic() + WAIT_SECS
     while time.monotonic() < end:
         time.sleep(POLL)
