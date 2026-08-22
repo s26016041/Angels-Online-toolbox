@@ -301,6 +301,13 @@ def restock(mover, scanner, need: list, say=None, on_buy=None
     """
     from app.game import mall              # 這裡才 import：避免模組載入期繞圈
 
+    # ★★ 商品表**要過才有**（2026-08-22 實測：沒開過商城的分身整張是空的）。
+    #   自己跟伺服器要一次就好，不必叫使用者去開商城視窗。
+    if not mall.loaded(scanner):
+        ok, msg = mall.request_data(mover, scanner, say=say)
+        if not ok:
+            return False, msg
+
     spent = bought = taken = 0
     for cur in need:
         # ★★★ **先看商城倉庫有沒有現成的**，有就直接領，不要再買一次。

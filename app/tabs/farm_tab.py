@@ -3312,6 +3312,13 @@ class CharFarmPage(QWidget):
             if left > 0:
                 return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
                         f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
+            # ★ 動手**之前**先看一眼會不會白跑（倉庫滿／背包沒空格／商城沒賣）
+            #   —— 節流一次要等 6 秒，白跑一輪就是三十秒（2026-08-22 使用者問
+            #   「會檢查嗎，說不定商城會指令滿或吃掉指令」）。
+            #   「吃掉指令」那半由 actiongate.retry 顧（送出去→驗結果→補送）。
+            stop = mall.blocked(sc, len(missing), missing[0].type_id)
+            if stop:
+                return f"⚠ 都滿了、備球差 {len(missing)} 顆，但{stop}", None, None
             return (f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…",
                     cur, pool)
         return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool

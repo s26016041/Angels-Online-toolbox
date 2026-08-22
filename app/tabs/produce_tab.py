@@ -147,7 +147,7 @@ from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (bag, balls, ballswap, entity, gather, itemname,
+from app.game import (bag, balls, ballswap, entity, gather, itemname, mall,
                       jumpmap, locate, lua, move,
                       navigate, produce, recall, recipes, robot, scene, scenery,
                       supply)
@@ -1886,6 +1886,10 @@ class CharProducePage(QWidget):
             if left > 0:
                 return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
                         f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
+            # ★ 動手前先看會不會白跑（理由同掛機頁）。
+            stop = mall.blocked(sc, len(missing), missing[0].type_id)
+            if stop:
+                return f"⚠ 都滿了、備球差 {len(missing)} 顆，但{stop}", None, None
             return f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…", cur, pool
         return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool
 

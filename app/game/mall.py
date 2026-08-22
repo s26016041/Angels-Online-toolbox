@@ -15,8 +15,12 @@
    實際商城分類 30 就擺著六筆技能經驗球。商城商品是伺服器下發的，只有記憶體
    那張才是真的（這正是 CLAUDE.md「優先讀記憶體」那條規則的教科書案例）。
 
-★ 五台實測：**沒開過商城視窗的分身也讀得到整張表**（424~425 筆），
-  所以掛機中要買東西不必先把商城叫出來。
+⛔⛔ **商品表「要過才有」** —— 2026-08-22 實測五台裡**三台整張表是空的**
+   （425 格指標全 0），因為那幾台這次開機後沒人開過商城。
+   前一天記的「沒開過商城也讀得到」是取樣運氣好（那幾台早就開過了），**已推翻**。
+★ 但不必叫使用者去開商城：`request_data()` 照抄遊戲自己的
+  `automallrequestmalldata` 送三包就會灌進來 —— ✅ 2026-08-22 實測
+  s26016041 由 0 筆 → **425 筆**。
 
 記錄欄位（實機對照畫面／售價比例確認，2026-08-21）：
 
@@ -98,6 +102,24 @@ TAKE_BODY = supply.DEPOSIT_BODY
 #   `push [ebp+0xc] / push [商城倉庫該筆+0x00] / push 0x16 / call 0x5D2A93`
 #   —— 那個 0x16 就是 0x2F 封包的動作碼（0x11 是存入倉庫，見 supply.py）。
 TAKE_ACTION = 0x16
+
+# ★★★ 「跟伺服器要商城資料」＝ UI 指令 `automallrequestmalldata`（0x595678）
+#   照抄它送的三包（反組譯：它完全沒碰 Lua 狀態，就是三個送包）：
+#       封包 0x12D，內文 2（只有代號）
+#       0x5D2ACC(0x14, 0) → 封包 0x16、內文 7 ＝ u8 動作 + u32 0
+#       0x5D2ACC(0x15, 0) → 同上，動作 0x15
+#   ⚠⚠ **商品表是要過才有**：2026-08-22 實測五台裡三台的整張表是空的
+#   （425 格指標全 0），因為那幾台這次開機後沒人開過商城。
+#   （前一天「沒開過商城也讀得到」的結論是取樣運氣好——那幾台早就開過了。）
+REQ_OPCODE = 0x12D
+# ⚠ 同一段反組譯的版面：`push 2 / push 0x12D` —— 內文 2 ＝ 只有代號，沒有內容。
+REQ_BODY = 2
+# ★ 出處：反組譯 0x5D2ACC（`push 7 / push 0x16`）—— 0x16 那一族的送包函式。
+REQ_SUB_OPCODE = 0x16
+# ⚠ 同一段反組譯的版面：內文 7 = 代號(u16) + 動作(u8) + 參數(u32)。
+REQ_SUB_BODY = 7
+# ★ 出處：0x595678 依序 `0x5D2ACC(0x14, 0)`、`0x5D2ACC(0x15, 0)`。
+REQ_SUB_ACTIONS = (0x14, 0x15)
 
 SCRATCH_OFF = 0x40               # 跟 supply.py 借同一塊暫存區的用法
 CALL_TIMEOUT = 0.5
@@ -211,8 +233,8 @@ def storage(scanner) -> list[tuple[int, int, int]] | None:
     return out
 
 
-def free_slot(scanner) -> int | None:
-    """背包第一個空格（陣列索引）。整袋沒讀完就回 None，不猜。"""
+def _free_slots(scanner) -> list[int] | None:
+    """背包所有空格（陣列索引）。整袋沒讀完就回 None，不猜。"""
     got = bag.head(scanner)
     if got is None:
         return None
@@ -220,9 +242,86 @@ def free_slot(scanner) -> int | None:
     if not complete:
         return None
     used = {it.slot for it in items}
-    for s in range(bag.FIRST_SLOT, bag.LAST_SLOT + 1):
-        if s not in used:
-            return s
+    return [s for s in range(bag.FIRST_SLOT, bag.LAST_SLOT + 1)
+            if s not in used]
+
+
+def free_slot(scanner) -> int | None:
+    """背包第一個空格（陣列索引）。整袋沒讀完就回 None，不猜。"""
+    got = _free_slots(scanner)
+    return got[0] if got else None
+
+
+def free_count(scanner) -> int | None:
+    """背包還有幾個空格。整袋沒讀完就回 **None**（不是 0）。"""
+    got = _free_slots(scanner)
+    return None if got is None else len(got)
+
+
+def loaded(scanner) -> bool:
+    """商品表**有沒有資料**（不是「讀不到」，是「這台還沒跟伺服器要過」）。"""
+    return goods(scanner) is not None
+
+
+def request_data(mover, scanner, say=None) -> tuple[bool, str]:
+    """跟伺服器要商城資料，把商品表灌進記憶體。
+
+    ★ 照抄遊戲自己的 `automallrequestmalldata`（見上面常數的出處）——
+      三包純送包，不碰 Lua、沒有 this，所以我們自己建包送就等價。
+    ⚠ 成功＝**商品表真的有東西了**（不是「送出去了」）。
+    """
+    if not (mover and mover.active):
+        return False, "跳板沒接上"
+    if say:
+        say("跟伺服器要商城資料…")
+    actiongate.gate(scanner, say=say)
+    st, why = _send(mover, scanner, REQ_OPCODE, REQ_BODY, b"")
+    if st != actiongate.SENT:
+        return False, f"要商城資料失敗：{why}"
+    for act in REQ_SUB_ACTIONS:
+        st, why = _send(mover, scanner, REQ_SUB_OPCODE, REQ_SUB_BODY,
+                        struct.pack("<BI", act, 0))
+        if st != actiongate.SENT:
+            return False, f"要商城資料失敗：{why}"
+    end = time.monotonic() + WAIT_SECS
+    while time.monotonic() < end:
+        time.sleep(POLL)
+        g = goods(scanner)
+        if g:
+            return True, f"商城資料已載入（{len(g)} 筆商品）"
+    return False, "送出了但商城商品表還是空的"
+
+
+def blocked(scanner, need: int, type_id: int) -> str | None:
+    """**動手之前**先看有沒有一眼就知道會失敗的事；沒問題回 None。
+
+    ★ 2026-08-22 使用者問「會檢查嗎，說不定商城會指令滿或吃掉指令」——
+      「吃掉指令」那半靠 `actiongate.retry`（送出去、驗結果、沒生效補送）；
+      這一支管的是**另一半**：倉庫滿／背包沒空格／商城根本沒賣，這些純讀
+      就看得出來，不必先白跑三十秒（節流一次要等 6 秒）才失敗。
+    ⚠ 讀不到一律回 None（＝不擋）：讀不到不等於有問題，真的動手時每一步
+      還是會各自驗一次。
+    """
+    st = storage(scanner)
+    if st is not None:
+        have = sum(1 for _s, tid, _n in st if tid == type_id)
+        # 倉庫已經有現成的就不必買，滿不滿都無所謂（restock 會直接領）
+        if not have and len(st) >= STORAGE_SLOTS:
+            return f"商城倉庫滿了（{STORAGE_SLOTS} 格），請先去領取"
+    free = free_count(scanner)
+    if free is not None and free < need:
+        return f"背包只剩 {free} 格空位，補 {need} 顆放不下"
+    # ⚠⚠ **「查不到」要先分清楚是「表空的」還是「真的沒賣」** ——
+    #   2026-08-22 實測：沒開過商城的分身整張表是空的（指標全 0），
+    #   舊版會把它講成「商城沒有賣這種球」＝拿讀不到當結論
+    #   （[[bag-false-empty-guards]] 那條鐵則的同一個坑）。
+    if not loaded(scanner):
+        # ★ 表還沒載入**不算擋** —— `restock()` 會先 `request_data()` 把它要下來。
+        #   ⚠ 這時更**不准**去問 `cheapest()`：表是空的，問了一定回 None，
+        #   然後就會被講成「商城沒有賣這種球」＝拿讀不到當結論。
+        return None
+    if cheapest(scanner, type_id) is None:
+        return "商城沒有賣這種球"
     return None
 
 

@@ -139,6 +139,22 @@ class FakeMall:
     def cheapest(self, sc, type_id):
         return self.sells.get(type_id)
 
+    # ★ 動手前的預檢（倉庫滿／背包沒空格／商城沒賣）。預設不擋。
+    blocked_why = None
+    is_loaded = True
+    reqs = []
+
+    def blocked(self, sc, need, type_id):
+        return self.blocked_why
+
+    def loaded(self, sc):
+        return self.is_loaded
+
+    def request_data(self, mover, sc, say=None):
+        self.reqs.append(1)
+        self.is_loaded = True            # 要過就有了（實機：0 → 425 筆）
+        return True, "商城資料已載入（425 筆商品）"
+
     def buy(self, mover, sc, g, say=None):
         self.buys.append(g.mall_id)
         if not self.buy_ok:
@@ -253,6 +269,9 @@ real_mall.cheapest = MALL.cheapest
 real_mall.buy = MALL.buy
 real_mall.storage = MALL.storage
 real_mall.take = MALL.take
+real_mall.blocked = MALL.blocked
+real_mall.loaded = MALL.loaded
+real_mall.request_data = MALL.request_data
 # 精靈：預設沒開（純掛機）；要驗「練技／採集要先停精靈」時再打開。
 ROBOT = types.SimpleNamespace(
     run=False, calls=[],
@@ -863,6 +882,36 @@ page._ball_t = farm_tab.BALL_GAP
 page._ball_tick(TICK)
 check("沒滿時看得到現在幾分幾", "60,000/120,000" in page._ball_lbl.text(),
       f"實得「{page._ball_lbl.text()}」")
+
+print("⑱ 商城表是空的 → 自己去跟伺服器要，**不准說成「沒有賣」**")
+page = build_page()
+MALL.is_loaded = False               # 這台沒開過商城，整張表是空的
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = []
+MALL.on_take = lambda tid: BALLS.spare_out.append(
+    FakeBall(80 + len(BALLS.spare_out), tid, 0))
+tick(page)
+check("有去跟伺服器要商城資料", len(MALL.reqs) == 1, f"實得 {MALL.reqs}")
+check("要到之後照樣買得成", len(MALL.buys) == 2, f"實得 {MALL.buys}")
+check("兩格都換上了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
+check("⚠ 沒有把「表是空的」講成「商城沒有賣這種球」",
+      "沒有賣" not in page._ball_lbl.text(), f"實得「{page._ball_lbl.text()}」")
+MALL.on_take = None
+
+print("⑰ 動手**之前**就先擋掉會白跑的情況（使用者：商城會不會指令滿）")
+for why in ("商城倉庫滿了（10 格），請先去領取",
+            "背包只剩 1 格空位，補 2 顆放不下",
+            "商城沒有賣這種球"):
+    page = build_page()
+    MALL.blocked_why = why
+    BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+    BALLS.spare_out = []
+    tick(page)
+    check(f"「{why[:8]}…」→ 一包都不送", MALL.buys == [] and BALLS.swaps == [],
+          f"實得 {MALL.buys} {BALLS.swaps}")
+    check("而且畫面講得出原因", why[:6] in page._ball_lbl.text(),
+          f"實得「{page._ball_lbl.text()}」")
+MALL.blocked_why = None
 
 print("⑯ 標籤要跟著跑，不能凍在動作前那句（2026-08-22「文字怪怪的」）")
 page = build_page()
