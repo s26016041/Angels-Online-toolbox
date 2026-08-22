@@ -1820,7 +1820,12 @@ class CharProducePage(QWidget):
 
     def _ball_say(self, text: str) -> None:
         """背景流程的進度 → 狀態列。**背景執行緒呼叫**，要繞回 UI 執行緒。"""
-        QTimer.singleShot(0, lambda: self._note(f"經驗球：{text}"))
+        def _show() -> None:
+            self._note(f"經驗球：{text}")
+            # ★ 理由同掛機頁：作業期間標籤不會自己更新，會凍住。
+            self._ball_lbl.setText(f"經驗球：{text}")
+
+        QTimer.singleShot(0, _show)
 
     def _record_mall_buy(self, g) -> None:
         """商城買到一筆 → 記帳（背景執行緒呼叫，只碰純資料）。"""
@@ -1835,6 +1840,7 @@ class CharProducePage(QWidget):
         self._ball_busy = False
         self._note(("經驗球：" if ok else "⚠ 自動換球：") + msg, warn=not ok)
         if ok:
+            self._ball_lbl.setText(f"經驗球：✔ {msg}")
             return
         if "定位失敗" in msg:
             self._ball_off = msg          # 改版把函式搬走了 → 大聲停用
@@ -1880,8 +1886,8 @@ class CharProducePage(QWidget):
             if left > 0:
                 return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
                         f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
-            return f"都滿了、備球差 {len(missing)} 顆 → 去商城買", cur, pool
-        return f"都滿了 → 換上背包的 {len(pairs)} 顆備球", cur, pool
+            return f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…", cur, pool
+        return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool
 
     def _ball_tick(self) -> bool:
         """自動換球。回 True＝這一拍交給它，`_gather_tick` 後面都別做了。

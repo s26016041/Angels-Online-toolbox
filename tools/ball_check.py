@@ -864,6 +864,38 @@ page._ball_tick(TICK)
 check("沒滿時看得到現在幾分幾", "60,000/120,000" in page._ball_lbl.text(),
       f"實得「{page._ball_lbl.text()}」")
 
+print("⑯ 標籤要跟著跑，不能凍在動作前那句（2026-08-22「文字怪怪的」）")
+page = build_page()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+tick(page)
+txt = page._ball_lbl.text()
+check("成功之後標籤換成結果（不是還停在「→ …」）",
+      "✔" in txt and "→ 去商城" not in txt, f"實得「{txt}」")
+check("結果講得出換上什麼", "已換上" in txt, f"實得「{txt}」")
+
+page = build_page()
+seen_lbl = []
+_orig_say = page._ball_say
+page._ball_say = lambda t: (seen_lbl.append(t), _orig_say(t))[0]
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0)]
+tick(page)
+check("作業期間有把進度寫出去（不會靜默）", bool(seen_lbl),
+      f"實得 {seen_lbl}")
+
+print("⑯ 從商城倉庫領回時，不可以說成「買」")
+page = build_page()
+BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
+BALLS.spare_out = []
+MALL.store.append((888, 4937, 1))
+MALL.on_take = lambda tid: BALLS.spare_out.append(FakeBall(71, tid, 0))
+tick(page)
+res = page._ball_lbl.text()
+check("訊息說的是「領回」不是「買」",
+      "領回" in res and "買" not in res.split("領回")[0], f"實得「{res}」")
+MALL.on_take = None
+
 print("⑮ 商城倉庫已經有現成的 → **直接領，不准再買一次**（省錢的關鍵）")
 page = build_page()
 BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)

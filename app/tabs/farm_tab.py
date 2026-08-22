@@ -3215,6 +3215,7 @@ class CharFarmPage(QWidget):
         self._ball_busy = False
         self.status.setText(("經驗球：" if ok else "⚠ 自動換球：") + msg)
         if ok:
+            self._ball_lbl.setText(f"經驗球：✔ {msg}")
             self.notify(msg)
             return
         # ⚠ 定位失敗＝改版把函式搬走了，重試沒有意義 → 大聲停用。
@@ -3237,7 +3238,15 @@ class CharFarmPage(QWidget):
           `actiongate.ACTION_GAP`）跑起來會靜默幾十秒，看起來就像當掉
           —— 使用者 2026-08-21 回報的「卡住了」有一半是這個。
         """
-        QTimer.singleShot(0, lambda: self.status.setText(f"經驗球：{text}"))
+        def _show() -> None:
+            self.status.setText(f"經驗球：{text}")
+            # ★ 標籤也要跟著跑：作業期間 `_ball_tick` 直接 return
+            #   （不更新標籤），不寫這裡的話它會整段凍在動作前那句
+            #   「→ 去商城補貨…」上，看起來像卡住或講錯
+            #   （2026-08-22 使用者回報「文字怪怪的」）。
+            self._ball_lbl.setText(f"經驗球：{text}")
+
+        QTimer.singleShot(0, _show)
 
     def _record_mall_buy(self, g) -> None:
         """商城買到一筆 → 記帳（**背景執行緒**呼叫，只碰純資料）。"""
@@ -3303,9 +3312,9 @@ class CharFarmPage(QWidget):
             if left > 0:
                 return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
                         f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
-            return (f"都滿了、備球差 {len(missing)} 顆 → 去商城買",
+            return (f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…",
                     cur, pool)
-        return f"都滿了 → 換上背包的 {len(pairs)} 顆備球", cur, pool
+        return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool
 
     def _ball_tick(self, dt: float) -> None:
         """自動換球的心跳（BALL_GAP 一拍）。
