@@ -3332,8 +3332,33 @@ class CharFarmPage(QWidget):
                     cur, pool)
         return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool
 
-    def _ball_tick(self, dt: float) -> None:
+    def _ball_hold(self) -> str:
+        """現在**不方便動手**換球的理由（空字串＝可以動手）。
+
+        ★★ 只擋動作、**不擋讀值** —— 標籤照樣每一拍更新（見 `_ball_tick`）。
+          2026-08-24 使用者回報生產頁「數字卡住了但明明已經滿了」：兩個分頁
+          舊版都把整個 `_ball_tick` 埋在一長串提早 `return` 後面，補給／死亡
+          回程／換頻道那幾分鐘**連讀都沒讀**，那一列就凍在幾分鐘前的數字上
+          —— 看起來像「球的值讀不到」，其實是根本沒去讀。
+          ✅ 讀值本身沒問題：2026-08-24 五台實機 60 秒取樣（`tools/ball_live_probe.py`），
+             飾品欄兩顆球的 `+0xA0` 每一拍都在跳、上限 `+0x10C` 也對得上。
+        ⚠ 補給／死亡回程期間是精靈或我們自己的流程在開車，這時插一包換裝會把
+          狀態機弄亂，所以**動作**照舊要讓路 —— 球滿了只是不再累積，等那一趟
+          跑完再換沒有任何損失。
+        """
+        if self._supply:
+            return "正在跑回程補給"
+        if self._death:
+            return "正在跑死亡回程"
+        if self._rot_settle > 0 or self._rot_seq:
+            return "正在巡迴換頻道"
+        return ""
+
+    def _ball_tick(self, dt: float, hold: str = "") -> None:
         """自動換球的心跳（BALL_GAP 一拍）。
+
+        `hold` 有字＝現在不方便動手（見 `_ball_hold`）：**標籤照樣更新**，
+        只是不開始換球那條背景流程。
 
         ⚠⚠ 「讀不到就不下結論」的關卡（[[bag-false-empty-guards]]）：飾品欄
           沒讀完、上限讀不到、背包沒讀完 → 這輪什麼都不做，更不准去花點數。
@@ -3346,7 +3371,13 @@ class CharFarmPage(QWidget):
             return
         self._ball_t = 0.0
         sc = self.sc
-        why, cur, pool = self._ball_status(sc)
+        try:
+            why, cur, pool = self._ball_status(sc)
+        except Exception as exc:                     # noqa: BLE001
+            # ⚠ 這一列現在跑在**所有提早 return 之前**，讀取失敗（換地圖、
+            #   行程剛關掉）不准把整個心跳打斷 —— 那會連帶讓掛機／採集停擺。
+            self._ball_lbl.setText(f"經驗球：⚠ 讀取失敗 {exc!r}")
+            return
         self._ball_lbl.setText("經驗球：" + why)
         if cur is None:
             # 不能動手。球沒滿就把「失敗只講一次」的門閂重新武裝。
@@ -3359,6 +3390,11 @@ class CharFarmPage(QWidget):
             elif mall.short_of_points(why) and not self._ball_told:
                 self._ball_told = True
                 self.notify(f"自動換球停在補貨：{why}。儲值後會自動繼續。")
+            return
+        if hold:
+            # ★ 球滿了、備球也配得到，只是現在不方便動手 —— 把「在等什麼」寫
+            #   出來，不要停在「→ 換上背包的 N 顆備球…」害人以為當掉了。
+            self._ball_lbl.setText(f"經驗球：都滿了，但{hold} → 跑完就換")
             return
         if not self._ensure_mover():
             self._ball_lbl.setText("經驗球：⚠ 跳板沒接上，換不了")
@@ -4921,6 +4957,13 @@ class CharFarmPage(QWidget):
         #   放後面就永遠不會更新。
         self._update_jump_countdown()
 
+        # ★★ 自動換球：**標籤要在所有提早 return 之前更新**（理由跟上面那行
+        #   趴趴GO 倒數一模一樣）。補給／死亡回程／巡迴換頻／`state is None`
+        #   那幾段整個 tick 都會提早 return，舊版把它放在最後面 → 那一列凍住
+        #   （2026-08-24 使用者回報，生產頁是同一個結構）。
+        # ⚠ 動作照舊讓路：`_ball_hold()` 有字就只更新數字、不動手。
+        self._ball_tick(dt, self._ball_hold())
+
         if not self.run_cb.isChecked():
             # ★ 自動分身／自動召喚獨立於掛機（使用者 2026-08-13：手動打王
             #   不開掛機也要能補）。補給／死亡回程／巡迴換頻是掛機才有的
@@ -4929,9 +4972,8 @@ class CharFarmPage(QWidget):
             # ★ 自動練技也獨立於掛機（互斥）：開關看門狗＋藥水見底＋補給趟
             #   全在它自己的心跳裡（見 _train_tick）。
             self._train_tick(dt)
-            # ★ 自動換球同樣獨立於掛機：技能球在**練技**時也一樣會滿，
-            #   手動打王時也會 —— 觸發條件是「球滿了」，不是「在掛機」。
-            self._ball_tick(dt)
+            # ★ 自動換球同樣獨立於掛機（技能球在**練技**時也一樣會滿，手動
+            #   打王時也會）—— 已經在上面所有 return 之前跑過了，這裡不必再叫。
             return
 
         # ★ 死亡回程要在最前面：死亡／復活／傳送期間 state 常常是 None、
@@ -5027,9 +5069,6 @@ class CharFarmPage(QWidget):
         #   交棒給精靈時不要插隊按鍵，但打怪中該補還是要補
         #   —— buff／召喚斷掉的損失比少打一下大。
         self._companion_tick()
-        # ★ 自動換球（見 _ball_tick）。放這裡的理由跟上面同一套：不搶補給的路，
-        #   但打怪中球滿了就要換 —— 換球只是一包，不影響出手節奏。
-        self._ball_tick(dt)
 
         # ★ 該不該回去補給。壞裝照勾選；藥水**全自動**（2026-08-19 使用者要求，
         #   沒有勾選）：見底（≤robot.POTION_LOW）→ 店裡買得到就跑回程補給、

@@ -727,6 +727,15 @@ class CharProducePage(QWidget):
             return
         # 負重是純讀、幾微秒，不管有沒有在採都更新（使用者要看得到）。
         self._refresh_weight()
+        # ★★ 自動換球**獨立於「開始自動生產」**，而且要在所有提早 `return`
+        #   之前（2026-08-24 使用者回報：生產角色技能球滿了沒換，而且那一列
+        #   的數字整個卡住）。舊版把 `_ball_tick()` 埋在下面一長串 `return`
+        #   後面 —— 沒勾自動生產、或正在跑回程／補給／製作那一趟，就**連讀都
+        #   沒讀**，數字自然凍在幾小時前，看起來像讀不到值。
+        #   觸發條件是「球滿了」，不是「在採集」（掛機頁 2026-08-21 就是這樣
+        #   定的，這裡補齊；規則本體兩邊共用 `app/game/balls.py`）。
+        # ⚠ 動作照舊讓路：`_ball_hold()` 有字就只更新數字、不動手。
+        self._ball_tick(self._ball_hold())
         if not self.run_cb.isChecked():
             return
         try:
@@ -758,11 +767,6 @@ class CharProducePage(QWidget):
                                  f"⚠ 負重 {pct:.0f}% → 回程做半成品")
                 return
             if self._check_broken():
-                return
-            # ★ 換球只在**穩定採集中**做（上面所有「有一趟在跑」的關卡都過了）。
-            #   ⚠ 刻意不去打斷回程／製作那一趟：球滿了只是不再累積，等它跑完
-            #   再換沒有任何損失，硬插進去卻可能把狀態機弄亂。
-            if self._ball_tick():
                 return
             me = self._my_pos()
             if me is None:
@@ -1809,6 +1813,11 @@ class CharProducePage(QWidget):
     #   的看門狗①下一拍就會把精靈重新開起來。
     # ⚠ 換球期間 `_gather_tick` 整支讓路（見 `_ball_busy`），不然看門狗會在
     #   中途把精靈又打開，跟我們打架。
+    # ★★ 2026-08-24 起**獨立於「開始自動生產」**：`_ball_tick()` 在
+    #   `_gather_tick` 的最前面跑（所有提早 `return` 之前），所以
+    #     · 沒勾自動生產也會換（觸發條件是「球滿了」，不是「在採集」）
+    #     · 回程／補給／製作那一趟進行中→**只更新數字、不動手**（見 `_ball_hold`）
+    #   舊版埋在一長串 `return` 後面，使用者看到的就是「數字卡住、滿了也不換」。
     def _on_ball_toggle(self, on: bool) -> None:
         """「自動換球」開關。純粹換一組狀態，不動採集。"""
         self._save_settings()
@@ -1900,17 +1909,41 @@ class CharProducePage(QWidget):
             return f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…", cur, pool
         return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool
 
-    def _ball_tick(self) -> bool:
-        """自動換球。回 True＝這一拍交給它，`_gather_tick` 後面都別做了。
+    def _ball_hold(self) -> str:
+        """現在**不方便動手**換球的理由（空字串＝可以動手）。
+
+        ★★ 只擋動作、**不擋讀值** —— 標籤照樣每一拍更新（見 `_ball_tick`）。
+          2026-08-24 使用者回報「數字卡住了但明明已經滿了」就是這個：舊版連
+          讀都沒讀。✅ 讀值本身沒問題（五台實機 60 秒取樣，`tools/ball_live_probe.py`：
+          `+0xA0` 每一拍都在跳、上限 `+0x10C` 也對得上）。
+        ⚠ 刻意不去打斷回程／補給／製作那一趟：球滿了只是不再累積，等它跑完再
+          換沒有任何損失，硬插進去卻會把狀態機弄亂。
+        """
+        if self._trip is not None:
+            return "正在跑回程做半成品那一趟"
+        if self._sup is not None or (self._sup_thread is not None
+                                     and self._sup_thread.is_alive()):
+            return "正在跑回程補給那一趟"
+        return ""
+
+    def _ball_tick(self, hold: str = "") -> None:
+        """自動換球。`hold` 有字＝現在不方便動手（見 `_ball_hold`）：
+        **標籤照樣更新**，只是不開始換球那條背景流程。
 
         ⚠⚠ 「讀不到就不下結論」（[[bag-false-empty-guards]]）：飾品欄沒讀完、
           背包沒讀完、上限讀不到 → 這輪什麼都不做，更不准去花點數買。
           **但一律把理由寫到畫面上**（見 `_ball_status`）。
         """
         if self._ball_busy:
-            return False
+            return
         sc = self.sc
-        why, cur, pool = self._ball_status(sc)
+        try:
+            why, cur, pool = self._ball_status(sc)
+        except Exception as exc:                     # noqa: BLE001
+            # ⚠ 這一列現在跑在**所有提早 return 之前**，讀取失敗（換地圖、
+            #   行程剛關掉）不准把整個心跳打斷 —— 那會連帶讓掛機／採集停擺。
+            self._ball_lbl.setText(f"經驗球：⚠ 讀取失敗 {exc!r}")
+            return
         self._ball_lbl.setText("經驗球：" + why)
         if cur is None:
             if "要兩顆都滿" in why or "沒有裝經驗球" in why:
@@ -1922,10 +1955,15 @@ class CharProducePage(QWidget):
                 self._ball_told = True
                 self._note(f"自動換球停在補貨：{why}。儲值後會自動繼續。",
                            warn=True)
-            return False
+            return
+        if hold:
+            # ★ 球滿了、備球也配得到，只是現在不方便動手 —— 把「在等什麼」寫
+            #   出來，不要停在「→ 換上背包的 N 顆備球…」害人以為當掉了。
+            self._ball_lbl.setText(f"經驗球：都滿了，但{hold} → 跑完就換")
+            return
         if not self._ensure_mover():
             self._ball_lbl.setText("經驗球：⚠ 跳板沒接上，換不了")
-            return False
+            return
 
         self._ball_busy = True
         self._note(f"經驗球：{why} —— 暫停精靈、按 ESC…")
@@ -1942,7 +1980,6 @@ class CharProducePage(QWidget):
 
         threading.Thread(target=_worker, daemon=True,
                          name=f"ballswap-{self.pid}").start()
-        return True
 
 
     def _ensure_mover(self) -> bool:

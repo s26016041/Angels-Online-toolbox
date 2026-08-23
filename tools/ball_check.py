@@ -825,8 +825,9 @@ def build_prod():
 page = build_prod()
 BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
 BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
-took = page._ball_tick()
-check("接手這一拍（回 True，_gather_tick 後面別做了）", took is True)
+page._ball_tick(page._ball_hold())
+check("採集中（沒有任何一趟在跑）→ 真的動手換", BALLS.swaps != [],
+      f"實得 {BALLS.swaps}")
 check("先關精靈主開關", ("set_run", False) in ROBOT.calls, f"實得 {ROBOT.calls}")
 check("有按 ESC", ("esc", ballswap.VK_ESCAPE) in ROBOT.calls,
       f"實得 {ROBOT.calls}")
@@ -838,21 +839,23 @@ check("跑完把 _ball_busy 放掉", page._ball_busy is False)
 page = build_prod()
 BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, 5)], True)
 BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
-check("只有一顆滿 → 不接手、不動精靈",
-      page._ball_tick() is False and ROBOT.calls == [],
-      f"實得 {ROBOT.calls}")
+page._ball_tick(page._ball_hold())
+check("只有一顆滿 → 不換、不動精靈",
+      BALLS.swaps == [] and ROBOT.calls == [], f"實得 {ROBOT.calls}")
 check("生產頁也把理由寫在畫面上",
       "要兩顆都滿" in page._ball_lbl.text(), f"實得「{page._ball_lbl.text()}」")
 
 page = build_prod()
 BALLS.worn_out = None
-check("飾品欄讀不到 → 不接手", page._ball_tick() is False)
+page._ball_tick(page._ball_hold())
+check("飾品欄讀不到 → 不換", BALLS.swaps == [], f"實得 {BALLS.swaps}")
 check("讀不到也講得出來", "飾品欄讀不到" in page._ball_lbl.text(),
       f"實得「{page._ball_lbl.text()}」")
 BALLS.worn_out = ([FakeBall(8, 4937, CAP)], True)
 BALLS.spare_out = None
-check("背包讀不到 → 不接手、更不會去買",
-      page._ball_tick() is False and MALL.buys == [], f"實得 {MALL.buys}")
+page._ball_tick(page._ball_hold())
+check("背包讀不到 → 不換、更不會去買",
+      BALLS.swaps == [] and MALL.buys == [], f"實得 {MALL.buys}")
 
 page = build_prod()
 BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
@@ -865,6 +868,68 @@ check("商城紀錄是點數（45×2）", sum(r[4] for r in page._mall_buys) == 
 dlg = produce_tab.mall_buys_dialog(page, page._mall_buys, "小狐")
 check("生產頁的商城表跟掛機頁同一份", dlg._tbl.rowCount() == 2)
 MALL.on_take = None
+
+print("⑳ 2026-08-24 回報：「技能球滿了沒換、而且那一列的數字卡住」")
+# 根因不是讀不到值（五台實機取樣，`+0xA0` 每一拍都在跳），而是**根本沒去讀**：
+# 舊版兩個分頁都把整個 `_ball_tick` 埋在一長串提早 `return` 後面。
+import inspect                                       # noqa: E402
+
+gsrc = inspect.getsource(produce_tab.CharProducePage._gather_tick)
+check("生產頁：換球在「開始自動生產」那道閘門**之前**（沒勾也要更新數字）",
+      gsrc.index("self._ball_tick(") < gsrc.index("if not self.run_cb.isChecked():"))
+check("生產頁：換球在「有一趟在跑就 return」之前",
+      gsrc.index("self._ball_tick(") < gsrc.index("if self._trip is not None:"))
+check("生產頁：整支 _gather_tick 只叫一次換球（不會重複跑）",
+      gsrc.count("self._ball_tick(") == 1, f"實得 {gsrc.count('self._ball_tick(')}")
+
+tsrc = inspect.getsource(farm_tab.CharFarmPage.tick)
+# ⚠ `if not self.run_cb.isChecked():` 在 tick() 裡出現兩次（前面那次是決定
+#   掃描間隔、不會 return），要比的是**會 return 的那一次**＝最後一次。
+check("掛機頁：換球在「沒掛機就 return」那個分支之前",
+      tsrc.index("self._ball_tick(") < tsrc.rindex("if not self.run_cb.isChecked():"))
+check("掛機頁：換球在死亡回程／補給／`state is None` 那幾個 return 之前",
+      tsrc.index("self._ball_tick(") < tsrc.index("if self._death_tick(dt):")
+      and tsrc.index("self._ball_tick(") < tsrc.index("if self.state is None:"))
+check("掛機頁：整支 tick 只叫一次換球",
+      tsrc.count("self._ball_tick(") == 1, f"實得 {tsrc.count('self._ball_tick(')}")
+
+# 「有一趟在跑」→ 只更新數字、不動手（動作照舊讓路）
+page = build_prod()
+page._trip = {"step": "craft"}
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+hold = page._ball_hold()
+page._ball_tick(hold)
+check("生產頁：回程那一趟進行中 → 一顆都不換、也不動精靈",
+      BALLS.swaps == [] and ROBOT.calls == [], f"實得 {BALLS.swaps} {ROBOT.calls}")
+check("生產頁：但畫面要講得出在等什麼（不准凍住）",
+      "回程做半成品" in page._ball_lbl.text() and "跑完就換" in page._ball_lbl.text(),
+      f"實得「{page._ball_lbl.text()}」")
+page._trip = None
+check("生產頁：那一趟跑完就沒有藉口了", page._ball_hold() == "",
+      f"實得「{page._ball_hold()}」")
+page._ball_tick(page._ball_hold())
+check("生產頁：跑完真的換了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
+
+page = build_page()
+page._supply = True
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+page._ball_t = farm_tab.BALL_GAP
+page._ball_tick(TICK, page._ball_hold())
+check("掛機頁：補給中 → 不換，但數字照樣更新",
+      BALLS.swaps == [] and "補給" in page._ball_lbl.text(),
+      f"實得 {BALLS.swaps}「{page._ball_lbl.text()}」")
+page._supply = False
+check("掛機頁：補給結束就沒有藉口了", page._ball_hold() == "")
+
+# 讀取層炸掉不准把整個心跳打斷（它現在跑在所有 return 之前）
+page = build_prod()
+page._ball_status = lambda sc: (_ for _ in ()).throw(RuntimeError("讀爆了"))
+page._ball_tick("")
+check("讀取失敗不會往外炸（會害掛機／採集整個停擺）", True)
+check("而且畫面看得到讀取失敗", "讀取失敗" in page._ball_lbl.text(),
+      f"實得「{page._ball_lbl.text()}」")
 
 print("⑭ 每一個「這輪不動作」的出口都要說得出理由（不准安靜跳過）")
 page = build_page()
