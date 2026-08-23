@@ -1844,6 +1844,13 @@ class CharProducePage(QWidget):
             return
         if "定位失敗" in msg:
             self._ball_off = msg          # 改版把函式搬走了 → 大聲停用
+        elif mall.rejected(msg):
+            # ★ 送出去了、伺服器就是不受理（最常見＝**商城點數不足**）——
+            #   不會自己好，排冷卻只是每 10 分鐘再白跑一輪（掛機頁同一套）。
+            self._ball_off = msg
+            self._note(f"自動換球已停用：{msg}　"
+                       f"（儲值後把「自動換球」的勾拿掉再勾一次就會重試）",
+                       warn=True)
         else:
             # 失敗**不是永久放棄**：排一次冷卻之後再試。
             self._ball_retry_at = time.monotonic() + BALL_RETRY_GAP

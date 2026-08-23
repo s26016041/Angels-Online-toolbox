@@ -386,6 +386,21 @@ def _send(mover, scanner, opcode: int, body: int,
     return actiongate.SENT, ""
 
 
+# ★★ 「送出去了、伺服器就是不受理」的標記 —— 呼叫端用 `rejected()` 認它。
+#   這種失敗**不會自己好**（點數不足要去儲值、下架／限購要等官方），
+#   跟「跳板沒接上」「倉庫讀不到」那種等一下就好的暫時性失敗必須分開：
+#   前者要停手＋通知，後者才排冷卻重試。
+#   ⚠ 2026-08-23 使用者回報「商城點數不夠會卡在那邊」＝ 舊版全部當暫時性，
+#     每 10 分鐘白跑一輪（每輪三次購買重試、各等滿 6 秒節流），永遠補不到、
+#     而且只通知第一次 → 看起來就是卡住。
+REJECT_TAG = "伺服器一直不受理"
+
+
+def rejected(msg: str) -> bool:
+    """這個失敗訊息是不是「送出去了但伺服器不受理」（見 `REJECT_TAG`）。"""
+    return REJECT_TAG in (msg or "")
+
+
 def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
     """買一份商品。成功 ＝ **商城倉庫真的多出一筆這個道具**。
 
@@ -421,8 +436,21 @@ def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
                                  f"{got[0][2] if got else g.count}"
                                  f"（{g.price} 點）")
 
-    return actiongate.retry(scanner, _done, _build, say,
-                            f"購買「{g.name}」", wait=WAIT_SECS)
+    ok, msg = actiongate.retry(scanner, _done, _build, say,
+                               f"購買「{g.name}」", wait=WAIT_SECS)
+    if not ok and "沒有生效" in msg:
+        # ⚠ 這裡跟 `actiongate.retry` 的訊息形狀耦合（它的 `last` 只有兩種：
+        #   「沒送出去」＝指令槽忙／被節流，「沒有生效」＝送出去了但結果
+        #   沒出現）。**全專案只有這一處認這個字**，改那邊要一起改。
+        if storage(scanner) is None:
+            # 驗不了 ≠ 被拒收（[[bag-false-empty-guards]] 的同一條鐵則）
+            return False, f"買「{g.name}」結果驗不了：商城倉庫讀不到"
+        # 倉庫讀得到、就是沒多出這一筆 → 伺服器把這幾發全擋了。
+        # 最常見的原因就是**商城點數不足**（客戶端不預檢，見檔頭）。
+        return False, (f"買「{g.name}」（{g.price} 點）{REJECT_TAG}"
+                       f"：送了 {actiongate.TRIES} 次都沒進商城倉庫"
+                       f" —— 商城點數不足？（也可能那顆下架／限購）")
+    return ok, msg
 
 
 def take(mover, scanner, serial: int, type_id: int, say=None
