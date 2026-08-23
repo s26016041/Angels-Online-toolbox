@@ -1894,7 +1894,7 @@ class CharProducePage(QWidget):
                 return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
                         f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
             # ★ 動手前先看會不會白跑（理由同掛機頁）。
-            stop = mall.blocked(sc, len(missing), missing[0].type_id)
+            stop = mall.blocked(sc, missing)
             if stop:
                 return f"⚠ 都滿了、備球差 {len(missing)} 顆，但{stop}", None, None
             return f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…", cur, pool
@@ -1916,6 +1916,12 @@ class CharProducePage(QWidget):
             if "要兩顆都滿" in why or "沒有裝經驗球" in why:
                 self._ball_told = False
                 self._ball_retry_at = 0.0
+            # ★ 點數不夠要講出來（掛機頁同一套；純讀不送包，所以不會卡，
+            #   點數補回來下一拍自己過關）。
+            elif mall.short_of_points(why) and not self._ball_told:
+                self._ball_told = True
+                self._note(f"自動換球停在補貨：{why}。儲值後會自動繼續。",
+                           warn=True)
             return False
         if not self._ensure_mover():
             self._ball_lbl.setText("經驗球：⚠ 跳板沒接上，換不了")

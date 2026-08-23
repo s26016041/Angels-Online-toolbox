@@ -34,7 +34,8 @@ APP = QApplication.instance() or QApplication([])
 from app.game import bag                            # noqa: E402
 from app.game import balls as real_balls            # noqa: E402
 from app.game import mall as real_mall              # noqa: E402
-from app.game import actiongate                     # noqa: E402
+from app.game import actiongate
+from app.game import mall as mall_real                     # noqa: E402
 from app.game import ballswap                       # noqa: E402
 from app.tabs import farm_tab                       # noqa: E402
 from app.tabs import produce_tab                    # noqa: E402
@@ -144,8 +145,18 @@ class FakeMall:
     is_loaded = True
     reqs = []
 
-    def blocked(self, sc, need, type_id):
+    def blocked(self, sc, need):
+        """⚠ 簽名要跟真的一模一樣（`need` 是**缺球清單**不是顆數）——
+        替身跟真的長得不一樣就是在測替身（[[test-via-button]] 踩過三次）。
+        點數那條的真邏輯另外由 `tools/mallpoint_check.py` 跑真的模組驗。"""
         return self.blocked_why
+
+    # ★ 這兩個是純字串判斷、不碰記憶體 → **直接用真的那一份**，
+    #   免得替身跟產品對「這個訊息算不算點數不足」的看法不一致。
+    short_of_points = staticmethod(mall_real.short_of_points)
+    rejected = staticmethod(mall_real.rejected)
+    SHORT_TAG = mall_real.SHORT_TAG
+    REJECT_TAG = mall_real.REJECT_TAG
 
     def loaded(self, sc):
         return self.is_loaded
@@ -932,8 +943,31 @@ for why in ("商城倉庫滿了（10 格），請先去領取",
     tick(page)
     check(f"「{why[:8]}…」→ 一包都不送", MALL.buys == [] and BALLS.swaps == [],
           f"實得 {MALL.buys} {BALLS.swaps}")
+
     check("而且畫面講得出原因", why[:6] in page._ball_lbl.text(),
           f"實得「{page._ball_lbl.text()}」")
+MALL.blocked_why = None
+
+print("⑰b 點數不夠 → 一包都不送，而且**要通知**（使用者：要通知不要卡在那邊）")
+page = build_page()
+MALL.blocked_why = (f"{mall_real.SHORT_TAG}：補 2 顆要 90 點，"
+                    f"目前只有 36 點（差 54 點）")
+BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+BALLS.spare_out = []
+tick(page)
+check("一包都不送", MALL.buys == [] and BALLS.swaps == [],
+      f"實得 {MALL.buys} {BALLS.swaps}")
+check("有通知使用者", any("點數不足" in n for n in page.notices),
+      f"實得 {page.notices}")
+check("通知寫得出差多少", any("差 54 點" in n for n in page.notices),
+      f"實得 {page.notices}")
+before = len(page.notices)
+for _ in range(5):                      # 再跑幾拍：同一個事件不可以一直吵
+    tick(page)
+check("不會每一拍都吵", len(page.notices) == before,
+      f"又多吵了 {len(page.notices) - before} 次")
+check("狀態列看得到原因", "點數不足" in page._ball_lbl.text(),
+      f"實得 {page._ball_lbl.text()}")
 MALL.blocked_why = None
 
 print("⑯ 標籤要跟著跑，不能凍在動作前那句（2026-08-22「文字怪怪的」）")

@@ -3325,7 +3325,7 @@ class CharFarmPage(QWidget):
             #   —— 節流一次要等 6 秒，白跑一輪就是三十秒（2026-08-22 使用者問
             #   「會檢查嗎，說不定商城會指令滿或吃掉指令」）。
             #   「吃掉指令」那半由 actiongate.retry 顧（送出去→驗結果→補送）。
-            stop = mall.blocked(sc, len(missing), missing[0].type_id)
+            stop = mall.blocked(sc, missing)
             if stop:
                 return f"⚠ 都滿了、備球差 {len(missing)} 顆，但{stop}", None, None
             return (f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…",
@@ -3353,6 +3353,12 @@ class CharFarmPage(QWidget):
             if "要兩顆都滿" in why or "沒有裝經驗球" in why:
                 self._ball_told = False
                 self._ball_retry_at = 0.0
+            # ★ 點數不夠：**要講出來**（使用者 2026-08-23：「要通知不要卡在
+            #   那邊」）。這條路純讀、不送任何封包，所以不會卡；點數補回來
+            #   下一拍就自己過關，不必手動重勾。同一個「滿了」事件只吵一次。
+            elif mall.short_of_points(why) and not self._ball_told:
+                self._ball_told = True
+                self.notify(f"自動換球停在補貨：{why}。儲值後會自動繼續。")
             return
         if not self._ensure_mover():
             self._ball_lbl.setText("經驗球：⚠ 跳板沒接上，換不了")

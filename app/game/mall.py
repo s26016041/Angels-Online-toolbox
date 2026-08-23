@@ -88,6 +88,21 @@ STORAGE_STRIDE = 0x37
 STORAGE_SLOTS = 10               # 0x5D38B1 `cmp eax,9`／memset 0x226 兩處印證
 ST_SERIAL, ST_ITEM, ST_COUNT = 0x00, 0x04, 0x08
 
+# ★★★ **我的商城點數**（管理器 + 這裡）。2026-08-23 使用者核對畫面確認。
+#   位置：緊接在商城倉庫 10 格陣列的正後方（0xCEC4 + 10×0x37 = 0xD0EA → 對齊 0xD0EC）
+#   —— 伺服器回商城資料時把「倉庫＋點數」寫進同一塊。
+#   怎麼找到的：北極狐是五台裡唯一沒要過商城資料的（商品表空的），
+#   拿它跟其他四台比對「只有拿到商城資料的人才有值」的欄位就篩出來了
+#   （黑狐 152／白狐 202／嵐狐 182／雪狐 36／北極狐 0，畫面核對全中）。
+#   ⛔ 別的路都不通，別再走一遍：客戶端買東西前**不檢查點數**
+#     （`mallbuy` 0x5D49BE 直接送 0x12B，「Mile點數不足」是伺服器回的訊息）；
+#     Lua 的 `MallBuyCheck` 被 `game.isdef('__MILE_MALL')` 關著、`checkmilemall`
+#     沒註冊進 game 表；精靈變數 `AM_INT_CURRENTPOINT`(1602) 只有**開了自動商城**
+#     才會填，五台實測全 0。
+POINTS_OFF = 0xD0EC
+# 合理性上界（驗不過就當讀到垃圾回 None）。
+POINTS_MAX = 100_000_000
+
 # ★ 出處：反組譯 mallbuy 本體 0x5D49BE 的 `push 7 / push 0x12B`
 #   （建包 0x50E1C2 的兩個參數＝內文長度、封包代號）。
 BUY_OPCODE = 0x12B
@@ -265,6 +280,26 @@ def free_count(scanner) -> int | None:
     return None if got is None else len(got)
 
 
+def points(scanner) -> int | None:
+    """我現在有多少商城點數；**不知道回 None**（≠ 0 點）。
+
+    ⚠⚠ **商品表沒載入時一律回 None** —— 那代表這台這次開機還沒跟伺服器要過
+      商城資料，那格根本沒被填過（北極狐實測就是 0）。把「沒要過」講成
+      「沒點數」就是拿讀不到當結論（[[bag-false-empty-guards]] 的同一個坑）。
+      要先 `request_data()` 把資料要下來，這一格才有意義。
+    """
+    if not loaded(scanner):
+        return None
+    mgr = _u32(scanner, gather.WORLD_PTR)
+    if not mgr:
+        return None
+    raw = scanner._read_bytes(mgr + POINTS_OFF, 4)
+    if not raw or len(raw) != 4:
+        return None
+    val = struct.unpack("<I", bytes(raw))[0]
+    return val if 0 <= val <= POINTS_MAX else None
+
+
 def loaded(scanner) -> bool:
     """商品表**有沒有資料**（不是「讀不到」，是「這台還沒跟伺服器要過」）。"""
     return goods(scanner) is not None
@@ -317,36 +352,82 @@ def request_data(mover, scanner, say=None, force: bool = False
     return False, "送出了但商城商品表還是空的"
 
 
-def blocked(scanner, need: int, type_id: int) -> str | None:
+# ★ 「錢不夠」的標記 —— 呼叫端用 `short_of_points()` 認它（要通知使用者）。
+SHORT_TAG = "商城點數不足"
+
+
+def short_of_points(msg: str) -> bool:
+    """這個訊息是不是「點數不夠」（呼叫端據此通知，見 `SHORT_TAG`）。"""
+    return SHORT_TAG in (msg or "")
+
+
+def quote(scanner, need: list) -> tuple[int, int, str]:
+    """這批缺的球要花多少點：回 `(要花的點數, 真的要買幾份, 說明)`。
+
+    ⚠⚠ **一次換兩顆就是兩份**（使用者 2026-08-23 提醒：缺兩顆＝90 點，
+      不是一顆的 45）—— 逐項查各自的 `cheapest`，不要拿第一顆的價錢乘。
+    ★ 商城倉庫裡已經有現成的那幾顆**不算錢**（`restock` 會直接領）。
+    說明非空 ＝ 算不出來（商城沒賣／表沒載入），呼叫端自己決定要不要擋。
+    """
+    st = storage(scanner)
+    have = [tid for _s, tid, _n in st] if st is not None else []
+    total = 0
+    count = 0
+    for cur in need:
+        tid = getattr(cur, "type_id", None)
+        if tid is None:
+            return 0, 0, "缺球清單看不懂"
+        if tid in have:
+            have.remove(tid)                     # 這顆領就好，不必買
+            continue
+        g = cheapest(scanner, tid)
+        if g is None:
+            return total, count, f"商城查不到「{getattr(cur, 'name', tid)}」"
+        total += g.price
+        count += 1
+    return total, count, ""
+
+
+def blocked(scanner, need: list) -> str | None:
     """**動手之前**先看有沒有一眼就知道會失敗的事；沒問題回 None。
 
     ★ 2026-08-22 使用者問「會檢查嗎，說不定商城會指令滿或吃掉指令」——
       「吃掉指令」那半靠 `actiongate.retry`（送出去、驗結果、沒生效補送）；
-      這一支管的是**另一半**：倉庫滿／背包沒空格／商城根本沒賣，這些純讀
-      就看得出來，不必先白跑三十秒（節流一次要等 6 秒）才失敗。
+      這一支管的是**另一半**：倉庫滿／背包沒空格／商城沒賣／**點數不夠**，
+      這些純讀就看得出來，不必先白跑三十秒（節流一次要等 6 秒）才失敗。
     ⚠ 讀不到一律回 None（＝不擋）：讀不到不等於有問題，真的動手時每一步
       還是會各自驗一次。
     """
+    n = len(need)
+    first = getattr(need[0], "type_id", 0) if need else 0
     st = storage(scanner)
     if st is not None:
-        have = sum(1 for _s, tid, _n in st if tid == type_id)
+        have = sum(1 for _s, tid, _n in st if tid == first)
         # 倉庫已經有現成的就不必買，滿不滿都無所謂（restock 會直接領）
         if not have and len(st) >= STORAGE_SLOTS:
             return f"商城倉庫滿了（{STORAGE_SLOTS} 格），請先去領取"
     free = free_count(scanner)
-    if free is not None and free < need:
-        return f"背包只剩 {free} 格空位，補 {need} 顆放不下"
+    if free is not None and free < n:
+        return f"背包只剩 {free} 格空位，補 {n} 顆放不下"
     # ⚠⚠ **「查不到」要先分清楚是「表空的」還是「真的沒賣」** ——
     #   2026-08-22 實測：沒開過商城的分身整張表是空的（指標全 0），
     #   舊版會把它講成「商城沒有賣這種球」＝拿讀不到當結論
     #   （[[bag-false-empty-guards]] 那條鐵則的同一個坑）。
     if not loaded(scanner):
         # ★ 表還沒載入**不算擋** —— `restock()` 會先 `request_data()` 把它要下來。
-        #   ⚠ 這時更**不准**去問 `cheapest()`：表是空的，問了一定回 None，
-        #   然後就會被講成「商城沒有賣這種球」＝拿讀不到當結論。
+        #   ⚠ 這時更**不准**去問 `cheapest()`／`points()`：表是空的，問了一定
+        #   回 None／0，然後就會被講成「商城沒有賣這種球」「沒點數」。
         return None
-    if cheapest(scanner, type_id) is None:
-        return "商城沒有賣這種球"
+    total, count, why = quote(scanner, need)
+    if why:
+        return why
+    # ★★★ 點數不夠 —— 這是**唯一不會自己好**的擋法（要儲值），所以訊息要
+    #   講清楚差多少，呼叫端看到 `short_of_points()` 會通知使用者。
+    #   ⚠ `points()` 回 None ＝ 不知道（不是 0 點）→ 不擋，讓後面照常試。
+    have_pt = points(scanner)
+    if have_pt is not None and count and have_pt < total:
+        return (f"{SHORT_TAG}：補 {count} 顆要 {total} 點，"
+                f"目前只有 {have_pt} 點（差 {total - have_pt} 點）")
     return None
 
 
@@ -411,6 +492,13 @@ def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
         return False, "跳板沒接上"
     if not g.buyable:
         return False, f"商城編號 {g.mall_id} 不在可送範圍（限時／搶購位）"
+    # ★★ 送出**前當場重讀**點數：預檢是幾秒前算的，而且補第二顆時第一顆
+    #   已經扣過錢了 —— 不夠就別送，免得白送三發（每發等滿 6 秒節流）再失敗。
+    #   ⚠ `points()` 回 None ＝ 不知道 → 照送（讀不到不是「沒錢」的證據）。
+    have_pt = points(scanner)
+    if have_pt is not None and have_pt < g.price:
+        return False, (f"{SHORT_TAG}：買「{g.name}」要 {g.price} 點，"
+                       f"目前只有 {have_pt} 點")
     before = storage(scanner)
     if before is None:
         return False, "商城倉庫讀不到 —— 這時候不買"
