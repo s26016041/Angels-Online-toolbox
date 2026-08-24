@@ -51,6 +51,13 @@ NEAR_SUB = 3.0           # 離路線上的轉折點這麼近就算走到了
 STALL_TRIES = 4          # 同一個轉折點連續這麼多拍沒進展就重算
 # 最短路走不動（多半是被怪／別的玩家擋在路上）最多從頭重算幾次。
 # 超過就認輸並讓呼叫端換目標 —— 無限重算會讓巡邏永遠停在同一個地方。
+# ⚠⚠ 數的是**連續毫無進展**的重算：只要往前挪了（走到下一個轉折點、或離目前
+#   這個轉折點又近了 0.5 格）額度就還回去（2026-08-24 修）。
+#   舊版 `_replans` 一路累加、只有換目標才歸零 —— 走一趟兩百格的巡邏，
+#   路上被怪擋三次（每次都自己脫困、也真的一路走近了）就會在第四次被判
+#   「走不到」，然後那張圖只有一個巡邏點的話**直接停掉掛機**。
+#   使用者 2026-08-24 回報「巡邏點設得到就一定走得到，為什麼會走不到就停」
+#   —— 就是這個。
 REPLAN_MAX = 3
 
 
@@ -75,6 +82,12 @@ class Navigator:
         self.goal = goal
         self.note = ""
         self.stuck = False
+        # ★★ `stuck` 有**兩種完全不同的意思**，呼叫端要分開處理（2026-08-24）：
+        #   "grid"    地形圖說根本沒有路 → 真的到不了（設定／地圖的問題）
+        #   "blocked" 路是通的，只是一直被擋著走不動 → **暫時性失敗**，
+        #             照使用者的規矩要一直重試，不准拿它停掉掛機
+        #             （[[transient-failure-auto-retry]]）
+        self.stuck_reason = ""
         self._route: list | None = None      # 目前這條最短路的轉折點
         self._ri = 0                         # 走到第幾個轉折點
         self._best = None                    # 對目前轉折點的最佳距離
@@ -114,6 +127,7 @@ class Navigator:
                 self.note = "地形圖算不出路徑，重讀一次再試"
                 return False
             self.stuck = True
+            self.stuck_reason = "grid"
             self.note = "⛔ 地形圖顯示到不了那裡"
             return False
         self._grid_fail = 0
@@ -165,6 +179,7 @@ class Navigator:
             self._ri += 1
             self._go_now = True     # 到點了 → 下一拍立刻送下一段
             self._best = None
+            self._replans = 0       # ★ 走到一個轉折點＝真的有進展（見 REPLAN_MAX）
         if self._ri >= len(self._route):
             # 路線走完了還沒到（終點被放寬到最近的可走格）→ 重算一次收尾。
             self._route = None
@@ -173,8 +188,14 @@ class Navigator:
 
         pt = self._route[self._ri]
         d = _d(here, pt)
-        if self._best is None or d < self._best - 0.5:
+        if self._best is None:
+            self._best, self._stall = d, 0      # 這一段剛開始，還沒有基準
+        elif d < self._best - 0.5:
+            # ★ 真的又走近了 → 重算額度還回去（見 REPLAN_MAX 的 ⚠⚠）。
+            #   ⚠ 不可以把這條併回 `_best is None`：剛重算完 `_best` 就是 None，
+            #     那樣每重算一次都會立刻把額度洗掉 → REPLAN_MAX 形同虛設。
             self._best, self._stall = d, 0
+            self._replans = 0
         else:
             self._stall += 1
             if self._stall >= STALL_TRIES:
@@ -184,7 +205,8 @@ class Navigator:
                 self._maps.drop()          # 順便重讀圖（可能換圖了）
                 if self._replans > REPLAN_MAX:
                     self.stuck = True
-                    self.note = (f"⛔ 重算 {REPLAN_MAX} 次還是走不動"
+                    self.stuck_reason = "blocked"
+                    self.note = (f"⛔ 連續 {REPLAN_MAX} 次重算都完全沒往前走"
                                  "（路被擋住？）")
                     return self.note
                 self.note = f"路上被擋住 → 重算最短路（第 {self._replans} 次）"

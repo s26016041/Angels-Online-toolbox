@@ -310,6 +310,56 @@ check("掛機沒有被停掉", page.run_cb.isChecked())
 check("有把那趟的結果留下來（煞車的訊息要引它）",
       "HP藥水+359" in page._supply_last, f"實得「{page._supply_last}」")
 
+print("⑨ 走不到巡邏點：「被擋住」不准拿來停掛機（2026-08-24 使用者回報）")
+# 使用者原話：「巡邏點設得到就一定可以走到，為什麼會走不到就停？」——他是對的。
+# `Navigator.stuck` 有兩種意思，舊版混成一件事：
+#   · blocked 路是通的、只是被怪／別人擋著 → 暫時性失敗，要一直重試
+#   · grid    地形圖說根本沒有路 → 設定／地圖的問題，人不處理不會好
+# 而且導航器的重算額度以前整趟累加不歸零（見 tools/nav_check.py ③），
+# 走一趟長路被擋幾次就滿了 → 那張圖只有一個巡邏點時直接停機。
+
+
+def _spot_case(reason, note, spots, spot_i, here):
+    page = build_page()
+    page.run_cb.blockSignals(True)
+    page.run_cb.setChecked(True)
+    page.run_cb.blockSignals(False)
+    page._spots = spots
+    page._spot_i = spot_i
+    page._nav.stuck = True
+    page._nav.stuck_reason = reason
+    page._nav.note = note
+    page._spot_stuck(here, spots[spot_i][0], spots[spot_i][1])
+    return page
+
+
+ONE = [(50.0, 60.0, 122)]
+TWO = [(50.0, 60.0, 122), (70.0, 80.0, 122)]
+
+page = _spot_case("blocked", "⛔ 連續 3 次重算都完全沒往前走（路被擋住？）",
+                  ONE, 0, [0])
+check("只有一個巡邏點＋路被擋住 → **掛機不停**", page.run_cb.isChecked(),
+      f"實得 status「{page.status.text()}」")
+check("而且畫面講清楚是暫時性的", "掛機不停" in page.status.text(),
+      f"實得「{page.status.text()}」")
+check("訊息帶得出導航器說的原因", "沒往前走" in page.status.text(),
+      f"實得「{page.status.text()}」")
+check("沒有發通知去吵人", page.notices == [], f"實得 {page.notices}")
+check("導航器有重置（下一拍會重新規劃）", page._nav.stuck is False)
+
+page = _spot_case("grid", "⛔ 地形圖顯示到不了那裡", ONE, 0, [0])
+check("只有一個巡邏點＋地形圖說沒路 → 照舊停機", not page.run_cb.isChecked())
+check("而且有通知", any("掛機已停止" in m for m in page.notices),
+      f"實得 {page.notices}")
+check("訊息說得出是地形圖的問題", "到不了那裡" in page.status.text(),
+      f"實得「{page.status.text()}」")
+
+page = _spot_case("blocked", "⛔ 連續 3 次重算都完全沒往前走（路被擋住？）",
+                  TWO, 0, [0, 1])
+check("有第二個點 → 換過去，不停機",
+      page.run_cb.isChecked() and page._spot_i == 1,
+      f"實得 spot_i={page._spot_i}")
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))

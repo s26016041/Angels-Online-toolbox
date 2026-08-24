@@ -5243,17 +5243,7 @@ class CharFarmPage(QWidget):
                 return
             note = self._nav.step(self.sc, self._mover, self.player, sx, sy)
             if self._nav.stuck:
-                # ★ 真的到不了就換下一個點（舊版沒有這道，會站到天亮）
-                nxt = here[(here.index(self._spot_i) + 1) % len(here)]
-                stuck_msg = (f"⛔ 走不到巡邏點 {self._spot_i + 1}"
-                             f" ({sx:.0f},{sy:.0f})")
-                self._nav.reset()
-                if nxt == self._spot_i:
-                    self._stop_with(stuck_msg + " → 這張圖只有這一個點，已停止掛機")
-                    self.notify(stuck_msg + "，掛機已停止。")
-                    return
-                self._spot_i = nxt
-                self.status.setText(stuck_msg + f" → 改去巡邏點 {nxt + 1}")
+                self._spot_stuck(here, sx, sy)
                 return
             self.status.setText(
                 f"周圍沒有選中的怪 → 前往巡邏點 {self._spot_i + 1}"
@@ -5953,6 +5943,41 @@ class CharFarmPage(QWidget):
         who = f"{self.account}（{self.char_name}）"
         note = self._notifier.fire(who, msg)
         self.status.setText(self.status.text() + f"　[{note}]")
+
+    def _spot_stuck(self, here: list, sx: float, sy: float) -> None:
+        """導航器說走不到巡邏點 → 換下一個點／就地重試／停機。
+
+        ★★ 「走不到」有**兩種**，處理方式完全不同（2026-08-24 使用者：
+          「巡邏點設得到就一定走得到，為什麼會走不到就停？」—— 他是對的）：
+
+          · `"blocked"` 路是通的，只是一直被擋著（怪／別的玩家站在路上、
+            走到一半被打斷）→ **暫時性失敗**，照使用者定的規矩要一直重試，
+            絕不准拿它停掉掛機（[[transient-failure-auto-retry]]）。
+            ⚠ 舊版把它跟「真的到不了」混成同一件事，那張圖只有一個巡邏點
+              就直接停機 —— 而且導航器的重算額度以前**整趟累加、不歸零**，
+              走一趟長路被擋三次就滿了（已在 `navigate.py` 修掉，見 REPLAN_MAX）。
+          · `"grid"` 地形圖說根本沒有路 → 這是設定／地圖的問題，人不處理不會
+            好，維持原本的「換下一個點；只有一個點就停機」。
+
+        `here` 是**這張圖**的巡邏點索引清單（呼叫端剛算好的）。
+        """
+        why = self._nav.note or "走不到"
+        nxt = here[(here.index(self._spot_i) + 1) % len(here)]
+        stuck_msg = (f"⛔ 走不到巡邏點 {self._spot_i + 1}"
+                     f" ({sx:.0f},{sy:.0f})：{why}")
+        blocked = self._nav.stuck_reason != "grid"
+        self._nav.reset()
+        if nxt == self._spot_i:
+            if blocked:
+                # 只有這一個點 → 沒得換，就地重新規劃再走（**不停機**）
+                self.status.setText(
+                    stuck_msg + " → 路被擋住，重新規劃再走（暫時性失敗，掛機不停）")
+                return
+            self._stop_with(stuck_msg + " → 這張圖只有這一個點，已停止掛機")
+            self.notify(stuck_msg + "，掛機已停止。")
+            return
+        self._spot_i = nxt
+        self.status.setText(stuck_msg + f" → 改去巡邏點 {nxt + 1}")
 
     def _stop_with(self, msg: str) -> None:
         self.run_cb.setChecked(False)
