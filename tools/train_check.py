@@ -214,7 +214,14 @@ ROBOT.dry = []                          # 買到了
 tick(page)                              # 收結果
 check("收工：離開補給狀態", page._train_supply is False)
 check("回來主開關開回去", ROBOT.run is True)
-check("煞車歸零", page._train_dry_trips == 0)
+# ★★ 2026-08-24 改：煞車不再在「補給收尾那一拍」數（落地那一瞬間背包還在
+#   同步，數到 0 是假的 —— 北極狐實錘：補給自己對帳到 HP藥水+359 卻同拍判見底）。
+#   改成在**下一拍那個安定下來的見底檢查**上歸零／累加，所以要多推一拍。
+# ⚠ `_end_supply`／收尾會把 `self.inv` 清掉（換過地圖），`_check_dry` 這時
+#   回 None＝「讀不到」→ 不加也不清；等掃描執行緒重新定位到表頭才會判。
+page.inv = 0x1000
+tick(page)
+check("煞車歸零（下一拍的安定讀數）", page._train_dry_trips == 0)
 page.inv = 0x1000                       # _drop_cached_addrs 清掉了，補回來
 
 print("④b 購買紀錄：補給買到的有記帳、表單畫得出來")
@@ -249,13 +256,18 @@ ROBOT.calls.clear()
 ROBOT.dry = [("MP", "MP藥水（藍藥水）")]
 ROBOT.run = ROBOT.ex = False
 page.train_cb.setChecked(True)
-tick(page)                              # 第 1 趟出發
-tick(page)                              # 收結果：還是見底 → 煞車 1
-check("第一趟後煞車＝1（還不停）", page._train_dry_trips == 1
-      and page.train_cb.isChecked())
+tick(page)                              # 第 1 趟出發（煞車 → 1）
+check("出發就記一趟（不是回來才記）", page._train_dry_trips == 1)
+tick(page)                              # 收結果（這一拍**不准**判見底）
+check("補給收尾那一拍不判見底（落地時背包還沒同步）",
+      page._train_dry_trips == 1 and page.train_cb.isChecked())
 page.inv = 0x1000
-tick(page)                              # 第 2 趟出發
-tick(page)                              # 收結果：還是見底 → 煞車 2 → 停
+tick(page)                              # 安定讀數：還是見底 → 第 2 趟出發（煞車 2）
+check("第一趟後還不停，第二趟照樣出發",
+      page._train_dry_trips == 2 and page.train_cb.isChecked())
+tick(page)                              # 收結果
+page.inv = 0x1000
+tick(page)                              # 安定讀數：跑滿兩趟還是見底 → 停
 check("第二趟後自動關閉", not page.train_cb.isChecked())
 check("有「還是見底」通知",
       any("還是見底" in m for m in page.notices), f"實得 {page.notices}")
@@ -273,6 +285,30 @@ check("有「找不到回程道具」通知",
 check("一趟都沒出發（沒翼不出發）", len(SUPPLY.trips) == n_trips)
 ROBOT.wing = (5, 30)
 ROBOT.dry = []
+
+print("⑧ 掛機補給收尾那一拍**不准**判「藥水還是見底」（2026-08-24 北極狐實錘）")
+# ⛔⛔ run_full_supply 的最後一步是趴趴GO 傳回練功點 —— **落地那一瞬間背包還在
+#   同步**：容器配好了、金幣（第 0 格）也到了（`bag.synced()` 因此說 True），
+#   但幾百顆藥水還沒被伺服器推過來，數起來就是 0。
+#   實機訊息：「⚠ 連續 2 趟補給回來藥水還是見底（…藥水:HP藥水+359、MP藥水+143，
+#   負重 94%；已回到練功點）—— 已停止掛機」——**+359 是買完重讀背包的實收差額**，
+#   藥水確實進了背包，卻同一拍被判見底，兩趟就把掛機停了。
+#   → 煞車改在掛機途中那個**安定下來**的見底檢查上數（跟練技那邊同一套）。
+page = build_page()
+page.run_cb.blockSignals(True)
+page.run_cb.setChecked(True)
+page.run_cb.blockSignals(False)
+page._supply = True
+page._supply_result = (True, "藥水:HP藥水+359、MP藥水+143，負重 94%；已回到練功點")
+ROBOT.dry = [("HP", "HP藥水（極效紅藥水）")]     # 落地瞬間「看起來」還是見底
+page._dry_trips = 1
+took = page._supply_tick(TICK)
+check("收尾這一拍有收工", took is True and page._supply is False)
+check("⛔ 沒有拿落地那一拍的假讀數去加煞車", page._dry_trips == 1,
+      f"實得 {page._dry_trips}")
+check("掛機沒有被停掉", page.run_cb.isChecked())
+check("有把那趟的結果留下來（煞車的訊息要引它）",
+      "HP藥水+359" in page._supply_last, f"實得「{page._supply_last}」")
 
 print()
 if FAILS:

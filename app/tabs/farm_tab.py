@@ -1626,6 +1626,7 @@ class CharFarmPage(QWidget):
         # 連續幾趟補給回來藥水**還是見底**（≥2 就大聲停 —— 買水一直買不進來
         #   多半是金幣不夠／背包滿，重試只會每趟燒一張翼；跟壞裝煞車同一套）。
         self._dry_trips = 0
+        self._supply_last = ""       # 最後一趟補給的結果訊息（煞車的訊息要引）
         # ── 自動練技（_train_tick；跟掛機互斥，見 _on_train_toggle）──
         # 練技的「原地」：(x, y, 場景)。開練技後第一次讀到位置就記下來，
         # 補給那趟回程一律跳回這張圖 —— 不能記「出發當下」：上一趟若失敗把
@@ -1638,6 +1639,7 @@ class CharFarmPage(QWidget):
         self._train_progress = ""    # 背景執行緒的最新進度（say 回報）
         self._train_gen = 0          # 第幾趟（作廢晚回來的結果）
         self._train_dry_trips = 0    # 連續幾趟回來藥水還是見底（≥2 大聲停）
+        self._train_last = ""        # 最後一趟練技補給的結果訊息
         self._train_no_wing = 0      # 連續幾次確認沒回程道具（NO_RECALL_TRIES）
         self._train_lua_t = 0.0      # 上次為了建練習技能記錄退 Lua 的時刻
         # ── 自動換球（_ball_tick；2026-08-21 使用者要求）──
@@ -2858,26 +2860,18 @@ class CharFarmPage(QWidget):
                     return True
             elif worn is not None:
                 self._broken_trips = 0
-            # ★★ 補給回來藥水**還是見底**？連續兩趟就大聲停 —— 買水那步一直
-            #   買不進來（金幣不夠／背包滿）不是暫時性失敗，重試只會每趟燒
-            #   一張翼（跟上面壞裝煞車同一套）。讀不到＝不確定 → 不加也不清。
-            dry_after = None
-            if self.inv and self._mover is not None and self._mover.active:
-                try:
-                    dry_after = robot.potions_out(self._mover, self.sc,
-                                                  self.inv, self.pid)
-                except Exception:                          # noqa: BLE001
-                    dry_after = None
-            if dry_after:
-                self._dry_trips += 1
-                if self._dry_trips >= 2:
-                    self._end_supply(
-                        f"⚠ 連續 {self._dry_trips} 趟補給回來藥水還是見底"
-                        f"（{msg}）—— 已停止掛機：金幣夠嗎？背包滿了嗎？",
-                        stop=True)
-                    return True
-            elif dry_after is not None:
-                self._dry_trips = 0
+            # ⛔⛔ **這裡不准判「藥水還是見底」**（2026-08-24 實機事故，
+            #   [[bag-false-empty-guards]] 第七次復發）：`run_full_supply` 的
+            #   最後一步是趴趴GO 傳回練功點，**落地這一瞬間背包還在同步** ——
+            #   容器已經配好、金幣（第 0 格）也到了（所以 `bag.synced()` 說
+            #   True、`complete` 與 `is_valid` 也都過），但幾百顆藥水還沒被
+            #   伺服器推過來，數起來就是 0。
+            #   北極狐實錘：補給流程自己對帳到「HP藥水+359、MP藥水+143」
+            #   （買完重讀背包的**實收差額**，藥水確實進了背包），同一拍的
+            #   見底判斷卻說見底 → 兩趟就把掛機停了。
+            #   → 煞車改在 `tick()` 裡那個**已經安定下來**的見底檢查上數
+            #     （搜 `self._dry_trips`）。跑的趟數跟舊版一樣，最多兩趟。
+            self._supply_last = msg
             self._end_supply(f"🔧 補給完成：{msg}　共花 {_mmss(self._supply_t)}")
             return True
         # 逾時兜底：run_full_supply 內部各段都有逾時，正常會自己回結果；
@@ -3073,26 +3067,12 @@ class CharFarmPage(QWidget):
                 ok, msg = self._train_result
                 self._train_result = None
                 self._train_supply = False
-                # ★ 回來還是見底？連續兩趟就大聲停 —— 一直買不進來
-                #   （金幣不夠／背包滿）不是暫時性失敗，重試只會每趟燒一張翼
-                #   （跟掛機補給的 _dry_trips 煞車同一套）。
-                # ⚠ 要在 _drop_cached_addrs **之前**算：它會把 self.inv 清成
-                #   None，之後 _check_dry 只會回「讀不到」，煞車永遠數不到
-                #   （potions_out 自帶表頭驗證，拿舊表頭算是安全的 ——
-                #   驗不過就回不觸發，跟掛機補給那邊同一個順序）。
-                dry_after = self._check_dry()
+                # ⛔⛔ **這裡不准判「藥水還是見底」** —— 落地那一瞬間背包還在
+                #   同步，數到 0 是假的（詳見 `_supply_tick` 收尾那段的 ⛔⛔，
+                #   2026-08-24 北極狐實錘）。煞車改在下面那個安定的見底檢查上數。
+                self._train_last = msg
                 self._drop_cached_addrs()  # 補給跑完換過地圖，快取位址作廢
                 self._train_push()         # 回來了 → 主開關＋練習技能開回去
-                if dry_after:
-                    self._train_dry_trips += 1
-                    if self._train_dry_trips >= 2:
-                        self._train_stop(
-                            f"⚠ 連續 {self._train_dry_trips} 趟補給回來藥水"
-                            f"還是見底（{msg}）→ 自動練技已停止："
-                            "金幣夠嗎？背包滿了嗎？")
-                        return
-                elif dry_after is not None:
-                    self._train_dry_trips = 0
                 self.status.setText(
                     f"🥋 練技補給完成：{msg}　共花 {_mmss(self._train_supply_t)}"
                     "（主開關已開回，練技繼續）")
@@ -3119,7 +3099,16 @@ class CharFarmPage(QWidget):
         self._train_push()
         # 藥水見底？（HP/MP 兩組都看，判定跟掛機同一套 —— _check_dry）
         dry = self._check_dry()
+        # ★★ 「連續兩趟還是見底」的煞車在這裡數（安定的讀數），不在補給收尾
+        #   那一拍 —— 理由見 `_supply_tick` 收尾那段的 ⛔⛔。
+        if dry is not None and not dry:
+            self._train_dry_trips = 0
         if not dry:
+            return
+        if self._train_dry_trips >= 2:
+            self._train_stop(
+                f"⚠ 連續 {self._train_dry_trips} 趟補給回來藥水還是見底"
+                f"（{self._train_last}）→ 自動練技已停止：金幣夠嗎？背包滿了嗎？")
             return
         # 見底的那組放的是店裡沒賣的藥水（活動藥水這類）→ 買不到，
         # 跑補給也是白燒一張翼：通知＋自動關閉（使用者指定）。
@@ -3134,6 +3123,8 @@ class CharFarmPage(QWidget):
             return
         self._train_start_supply(
             "、".join(d for _, d in dry) + f"剩 ≤{robot.POTION_LOW} 顆")
+        if self._train_supply:
+            self._train_dry_trips += 1     # 真的出發了才算一趟（見上面）
 
     # ------------------------------------------------------------------
     # -- 購買紀錄（回程補給跟商人買了什麼；2026-08-20 使用者要求）--------
@@ -5138,6 +5129,21 @@ class CharFarmPage(QWidget):
             # ★ 藥水見底清單（不通知——買得到會自動補給，通知只在
             #   _dry_stop 那種「店裡沒賣、要停機」才發；2026-08-19 使用者定）。
             dry = self._check_dry()
+            # ★★ 「連續兩趟補給回來藥水還是見底 → 停機」這道煞車**在這裡數**，
+            #   不在補給收尾那一拍（理由見 `_supply_tick` 收尾那段的 ⛔⛔）：
+            #   這裡的讀數是掛機途中安定下來的，落地那一瞬間的不是。
+            #   · 藥水好好的 → 煞車歸零
+            #   · 真的又要為了藥水跑一趟 → +1；已經跑滿兩趟還是見底 → 停機
+            #   ⚠ `dry is None` ＝讀不到 → 不加也不清（不確定就不動）。
+            if dry is not None and not dry:
+                self._dry_trips = 0
+            if dry and self._dry_trips >= 2:
+                why = (f"⚠ 連續 {self._dry_trips} 趟補給回來藥水還是見底"
+                       f"（{self._supply_last}）—— 已停止掛機："
+                       "金幣夠嗎？背包滿了嗎？")
+                self._stop_with(why)
+                self.notify(why)
+                return
             # ★ 見底那幾組裡有「補給店沒賣」的（精靈頁放活動藥水這類非賣品）
             #   → 買不到，跑補給也是白燒一張翼：通知＋翼回城＋直接停機。
             #   設定暫時讀不到（plan=None）或那組讀成空清單就先照常跑補給
@@ -5158,6 +5164,8 @@ class CharFarmPage(QWidget):
                                           gear, True, True, self.pid,
                                           broken=broken, dry=dry)
                 if why and self._start_supply(why):
+                    if dry:
+                        self._dry_trips += 1   # 這一趟是為了藥水跑的（見上面）
                     return
             if broken:
                 names = "、".join(it.name for it in broken)
