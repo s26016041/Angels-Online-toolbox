@@ -1081,6 +1081,82 @@ check("訊息講明沒再花錢",
       any("沒再花錢" in m for m in page.notices), f"實得 {page.notices}")
 MALL.on_take = None
 
+print("㉑ 收尾一定要真的回得到主執行緒（2026-08-24：球換好了、畫面卻永遠卡住）")
+# ⚠⚠⚠ 這一段**刻意用真的 threading.Thread 與真的 Qt 事件迴圈**。
+#   上面所有測試都把 threading 換成 InlineThread、QTimer 換成 FakeTimer ——
+#   那正是 2026-08-24 這個 bug 躲過整套回歸的原因（[[test-via-button]]
+#   「替身介面跟真的不一樣＝測到替身」，這是第四次）：
+#     · 真的：從普通 threading.Thread 排的 `QTimer.singleShot` **永遠不會跑**
+#             （那條執行緒沒有 Qt 事件迴圈）
+#     · 替身：`FakeTimer.singleShot(0, f)` 是**當場直接呼叫 f**
+#   → 替身永遠是綠的，實機卻是 `_ball_busy` 永遠舉著、那一列凍在
+#     「→ 去商城補貨…」，生產頁連 `_gather_tick` 都每一拍掉頭。
+import ast                                            # noqa: E402
+import textwrap                                       # noqa: E402
+import threading as real_threading                    # noqa: E402
+import time as real_time                              # noqa: E402
+from PySide6.QtCore import QTimer as RealQTimer       # noqa: E402
+
+
+def pump(page, secs=5.0):
+    """轉真的事件迴圈，等背景執行緒的收尾回到主執行緒。"""
+    end = real_time.monotonic() + secs
+    while real_time.monotonic() < end and page._ball_busy:
+        APP.processEvents()
+        real_time.sleep(0.01)
+    APP.processEvents()
+
+
+_slow = BALLS.swap
+BALLS.swap = lambda *a, **k: (real_time.sleep(0.05), _slow(*a, **k))[1]
+real_balls.swap = BALLS.swap
+
+for name, mod, build, run_one in (
+        ("掛機頁", farm_tab, build_page, lambda pg: pg._ball_tick(TICK)),
+        ("生產頁", produce_tab, build_prod, lambda pg: pg._ball_tick("")),
+):
+    mod.threading = real_threading
+    mod.QTimer = RealQTimer
+    page = build()
+    BALLS.worn_out = ([FakeBall(8, 4937, CAP), FakeBall(9, 4937, CAP)], True)
+    BALLS.spare_out = [FakeBall(30, 4937, 0), FakeBall(31, 4937, 0)]
+    page._ball_t = farm_tab.BALL_GAP
+    before = page._ball_lbl.text()
+    run_one(page)
+    check(f"{name}：閂有舉起來（背景執行緒真的開起來了）", page._ball_busy is True)
+    pump(page)
+    check(f"{name}：跑完 _ball_busy 有被放掉（不會永遠卡住）",
+          page._ball_busy is False, "⛔ 這就是實機那個 bug：收尾回不到主執行緒")
+    txt = page._ball_lbl.text()
+    check(f"{name}：畫面拿到結果，不是還停在動作前那句",
+          txt != before and "補貨…" not in txt and "換上背包的" not in txt,
+          f"實得「{txt}」")
+    check(f"{name}：兩格都真的換了", len(BALLS.swaps) == 2, f"實得 {BALLS.swaps}")
+
+    # 看門狗：收尾真的掉了（模擬），也不准無聲卡死
+    page = build()
+    page._ball_busy = True
+    page._ball_thread = None
+    page._ball_busy_t = real_time.monotonic() - mod.BALL_STUCK_SECS - 1
+    page._ball_t = farm_tab.BALL_GAP
+    run_one(page)
+    check(f"{name}：收尾掉了 → 看門狗把閂放掉（不無聲卡死）",
+          page._ball_busy is False)
+    check(f"{name}：而且畫面講得出來", "解除卡住" in page._ball_lbl.text(),
+          f"實得「{page._ball_lbl.text()}」")
+
+# ⛔ 死規則：換球那條背景流程**不准**再出現 QTimer.singleShot
+for nm, obj in (("掛機頁", farm_tab.CharFarmPage),
+                ("生產頁", produce_tab.CharProducePage)):
+    for fn in ("_ball_say", "_ball_tick", "_ball_watch"):
+        # ★ 走語法樹，不是抓字串 —— 註解／docstring 裡寫「不准用
+        #   QTimer.singleShot」是**規定**，不是違規。
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(obj, fn))))
+        bad = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Attribute) and n.attr == "singleShot"]
+        check(f"{nm} {fn} 不再用 QTimer.singleShot 回主執行緒", not bad,
+              "⛔ 從普通 threading.Thread 排的 singleShot 永遠不會跑")
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))

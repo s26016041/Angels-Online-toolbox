@@ -167,6 +167,9 @@ TRAIN_GAP = 3.0
 # 自己建 —— Lua 呼叫是全專案風險最高的動作（會動遊戲的 Lua 堆疊），
 # 看門狗絕不能每 3 秒撞一次，失敗至少隔這麼久才再試。
 TRAIN_LUA_GAP = 30.0
+# ★ 換球背景執行緒死了、卻沒收到收尾多久就當它掉了（見 _ball_watch）。
+#   ⚠ 這是兜底，不是正常路徑 —— 會走到這裡就是有 bug，所以畫面要講出來。
+BALL_STUCK_SECS = 15.0
 # ★「自動換球」的心跳間隔（見 CharFarmPage._ball_tick）。球從空到滿要好幾小時，
 #   「滿了晚 8 秒才換」沒有任何損失（滿了就是不再累積，不會溢出漏算），
 #   所以刻意放慢 —— 它每一拍都要把飾品欄兩格＋整個背包讀一遍。
@@ -1493,6 +1496,20 @@ class InvWorker(QThread):
 class CharFarmPage(QWidget):
     """單一分身的掛機介面。"""
 
+    # ★★★ 背景換球流程回主執行緒的**唯一**管道（2026-08-24 實機事故）。
+    #   ⛔⛔ **不准再用 `QTimer.singleShot` 從背景執行緒回呼** ——
+    #     那是普通的 `threading.Thread`（不是 QThread），**沒有 Qt 事件迴圈**，
+    #     在上面排的 singleShot **永遠不會被執行**（離線實測：完全不跑，
+    #     Qt 只在 stderr 印一行 timers can only be used with threads started
+    #     with QThread，打包版連那行都看不到）。
+    #     實機症狀：球其實換好了，但收尾回呼掉了 → `_ball_busy` 這個閂永遠
+    #     舉著 → 那一列凍在「→ 去商城補貨…」，生產頁連 `_gather_tick` 都
+    #     每一拍 `if self._ball_busy: return` 直接掉頭（採集看門狗一起停擺）。
+    #   ★ signal 跨執行緒是安全的（Qt 會排隊到接收端的執行緒），離線實測
+    #     確認兩個 signal 都在 MainThread 收到。
+    _ball_said = Signal(str)              # 進度（背景 → 畫面）
+    _ball_finished = Signal(bool, str)    # 收尾 (成功?, 訊息)
+
     def __init__(self, pid: int, hwnd: int, title: str, sc: MemoryScanner,
                  on_scan, tgt: TargetWorker, keys: KeyWorker,
                  notifier: Notifier | None = None,
@@ -1626,7 +1643,10 @@ class CharFarmPage(QWidget):
         # ── 自動換球（_ball_tick；2026-08-21 使用者要求）──
         self._ball_t = 0.0           # 心跳計時（BALL_GAP 一拍）
         self._ball_busy = False      # 換球背景執行緒進行中（換一次要等伺服器）
-        self._ball_result = None     # 背景執行緒的結果 (成功?, 訊息, 球名, 左右)
+        self._ball_thread = None     # 那條執行緒本人（看門狗要看它死了沒）
+        self._ball_busy_t = 0.0      # 閂是什麼時候舉起來的（看門狗用）
+        self._ball_said.connect(self._ball_show)
+        self._ball_finished.connect(self._ball_done)
         # 「備球不夠」的門閂。★ 它同時擋兩件事：重複通知、以及**重複花點數**
         #   —— 一個「都滿了」事件最多買一輪。球真的被換下去（不再全滿）
         #   之後自動重新武裝，跟收益監控「情況恢復就重新武裝」同一套。
@@ -3210,9 +3230,31 @@ class CharFarmPage(QWidget):
         if on:
             self.status.setText("自動換球已開啟：兩顆經驗球都滿了會一起換")
 
+    def _ball_watch(self) -> None:
+        """看門狗：換球執行緒都結束了、`_ball_busy` 這個閂卻沒被放掉 → 自己放。
+
+        ⚠⚠ `_ball_busy` 是典型的「舉起來就一定要有人放下」的閂
+          （[[frozen-tick-state-machines]]）。2026-08-24 實機就是踩到這個：
+          收尾走 `QTimer.singleShot`，而那條普通 `threading.Thread` 沒有 Qt
+          事件迴圈 → 回呼**整個沒跑** → 球明明換好了，畫面卻永遠停在
+          「→ 去商城補貨…」，生產頁連 `_gather_tick` 都每一拍掉頭。
+        ★ 收尾已經改走 signal（跨執行緒安全），這一層是**兜底**：
+          執行緒死了、又超過 `BALL_STUCK_SECS` 還沒收到收尾 → 放掉閂並講出來，
+          寧可下一輪重跑一次，也不要無聲卡死。
+        """
+        t = self._ball_thread
+        if t is not None and t.is_alive():
+            return
+        if time.monotonic() - self._ball_busy_t < BALL_STUCK_SECS:
+            return                    # 給收尾 signal 一點時間排隊
+        self._ball_busy = False
+        self._ball_thread = None
+        self._ball_lbl.setText("經驗球：⚠ 換球流程沒回報結果 → 已解除卡住")
+
     def _ball_done(self, ok: bool, msg: str) -> None:
         """換球／補貨背景執行緒的收尾（在 UI 執行緒上跑）。"""
         self._ball_busy = False
+        self._ball_thread = None
         self.status.setText(("經驗球：" if ok else "⚠ 自動換球：") + msg)
         if ok:
             self._ball_lbl.setText(f"經驗球：✔ {msg}")
@@ -3241,21 +3283,25 @@ class CharFarmPage(QWidget):
                 self.notify(msg)
 
     def _ball_say(self, text: str) -> None:
-        """把背景流程的進度丟回狀態列。**背景執行緒呼叫**，所以要繞回 UI 執行緒。
+        """把背景流程的進度丟回畫面。**背景執行緒呼叫** → 一律走 signal。
 
         ⚠ 沒有這個的話，整條流程（官方兩次商城動作要隔 5 秒以上，見
           `actiongate.ACTION_GAP`）跑起來會靜默幾十秒，看起來就像當掉
           —— 使用者 2026-08-21 回報的「卡住了」有一半是這個。
+        ⛔ 不准改回 `QTimer.singleShot`：理由見 `_ball_said` 的宣告
+          （2026-08-22 那次「文字怪怪的」其實根本沒修好，就是敗在這裡）。
         """
-        def _show() -> None:
-            self.status.setText(f"經驗球：{text}")
-            # ★ 標籤也要跟著跑：作業期間 `_ball_tick` 直接 return
-            #   （不更新標籤），不寫這裡的話它會整段凍在動作前那句
-            #   「→ 去商城補貨…」上，看起來像卡住或講錯
-            #   （2026-08-22 使用者回報「文字怪怪的」）。
-            self._ball_lbl.setText(f"經驗球：{text}")
+        try:
+            self._ball_said.emit(text)
+        except RuntimeError:                         # 分頁已經被關掉／重載
+            pass
 
-        QTimer.singleShot(0, _show)
+    def _ball_show(self, text: str) -> None:
+        """`_ball_said` 的接收端（**主執行緒**）。"""
+        self.status.setText(f"經驗球：{text}")
+        # ★ 標籤也要跟著跑：作業期間 `_ball_tick` 直接 return（不更新標籤），
+        #   不寫這裡的話它會整段凍在動作前那句「→ 去商城補貨…」上。
+        self._ball_lbl.setText(f"經驗球：{text}")
 
     def _record_mall_buy(self, g) -> None:
         """商城買到一筆 → 記帳（**背景執行緒**呼叫，只碰純資料）。"""
@@ -3365,6 +3411,7 @@ class CharFarmPage(QWidget):
           **但一律把理由寫到畫面上**（見 `_ball_status`）。
         """
         if self._ball_busy:
+            self._ball_watch()        # 閂舉著就一定要有人看著它（見 _ball_watch）
             return
         self._ball_t += dt
         if self._ball_t < BALL_GAP:
@@ -3401,6 +3448,7 @@ class CharFarmPage(QWidget):
             return
 
         self._ball_busy = True
+        self._ball_busy_t = time.monotonic()
         self.status.setText(f"經驗球：{why}")
 
         def _worker() -> None:
@@ -3408,11 +3456,16 @@ class CharFarmPage(QWidget):
                 ok, msg = self._ball_run(sc, cur, pool)
             except Exception as exc:                 # noqa: BLE001
                 ok, msg = False, f"{exc!r}"
-            # ⚠ 回 UI 執行緒才碰 Qt（背景執行緒直接改元件會炸）。
-            QTimer.singleShot(0, lambda: self._ball_done(ok, msg))
+            # ⚠⚠ 回 UI 執行緒**只能走 signal**（見 `_ball_finished` 的宣告）：
+            #   從普通 threading.Thread 排的 QTimer.singleShot 永遠不會跑。
+            try:
+                self._ball_finished.emit(ok, msg)
+            except RuntimeError:                     # 分頁已經被關掉／重載
+                pass
 
-        threading.Thread(target=_worker, daemon=True,
-                         name=f"ballswap-{self.pid}").start()
+        self._ball_thread = threading.Thread(
+            target=_worker, daemon=True, name=f"ballswap-{self.pid}")
+        self._ball_thread.start()
 
     # ------------------------------------------------------------------
     # -- 血/魔不足時坐下回復 ---------------------------------------------

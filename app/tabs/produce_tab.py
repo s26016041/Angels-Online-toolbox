@@ -128,7 +128,7 @@ import threading
 import time
 from collections import Counter
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -163,6 +163,8 @@ GATHER_TICK_MS = 5000
 # ★ 自動換球補貨失敗後隔多久再試（跟掛機頁同一個值；2026-08-22 使用者回報
 #   「滿了卻不動、看不出原因」—— 永久放棄是錯的，被拒的購買不扣點）。
 BALL_RETRY_GAP = 600.0
+# ★ 換球背景執行緒死了、卻沒收到收尾多久就當它掉了（見 _ball_watch）。
+BALL_STUCK_SECS = 15.0
 # 連續幾次「位置沒動、資源也沒少」就判定停住了 → 踢一下（重設中心點）。
 # 3 次 ≈ 15 秒：採一次要幾秒，走去下一個也要幾秒，太短會把正常的採集誤判成卡住。
 STUCK_TICKS = 3
@@ -239,6 +241,20 @@ BENCH_SAME = 2.0
 class CharProducePage(QWidget):
     """一台分身的生產頁。"""
 
+    # ★★★ 背景換球流程回主執行緒的**唯一**管道（2026-08-24 實機事故）。
+    #   ⛔⛔ **不准再用 `QTimer.singleShot` 從背景執行緒回呼** ——
+    #     那是普通的 `threading.Thread`（不是 QThread），**沒有 Qt 事件迴圈**，
+    #     在上面排的 singleShot **永遠不會被執行**（離線實測：完全不跑，
+    #     Qt 只在 stderr 印一行 timers can only be used with threads started
+    #     with QThread，打包版連那行都看不到）。
+    #     實機症狀：球其實換好了，但收尾回呼掉了 → `_ball_busy` 這個閂永遠
+    #     舉著 → 那一列凍在「→ 去商城補貨…」，生產頁連 `_gather_tick` 都
+    #     每一拍 `if self._ball_busy: return` 直接掉頭（採集看門狗一起停擺）。
+    #   ★ signal 跨執行緒是安全的（Qt 會排隊到接收端的執行緒），離線實測
+    #     確認兩個 signal 都在 MainThread 收到。
+    _ball_said = Signal(str)              # 進度（背景 → 畫面）
+    _ball_finished = Signal(bool, str)    # 收尾 (成功?, 訊息)
+
     def __init__(self, pid: int, hwnd: int, title: str,
                  sc: MemoryScanner, account: str, char_name: str) -> None:
         super().__init__()
@@ -253,6 +269,10 @@ class CharProducePage(QWidget):
         self._loading = True
         # ── 自動換球（見 _ball_tick）──
         self._ball_busy = False    # 換球背景執行緒進行中（看門狗要讓路）
+        self._ball_thread = None   # 那條執行緒本人（看門狗要看它死了沒）
+        self._ball_busy_t = 0.0    # 閂是什麼時候舉起來的（看門狗用）
+        self._ball_said.connect(self._ball_show)
+        self._ball_finished.connect(self._ball_done)
         self._ball_told = False    # 這次「都滿了」已經講過失敗（擋重複吵）
         # ⚠ 補貨失敗之後隔多久才再試（**不是永久放棄**）。
         self._ball_retry_at = 0.0
@@ -1827,14 +1847,20 @@ class CharProducePage(QWidget):
         if on:
             self._note("自動換球已開啟：兩顆經驗球都滿了會暫停精靈換球")
 
-    def _ball_say(self, text: str) -> None:
-        """背景流程的進度 → 狀態列。**背景執行緒呼叫**，要繞回 UI 執行緒。"""
-        def _show() -> None:
-            self._note(f"經驗球：{text}")
-            # ★ 理由同掛機頁：作業期間標籤不會自己更新，會凍住。
-            self._ball_lbl.setText(f"經驗球：{text}")
+    def _ball_show(self, text: str) -> None:
+        """`_ball_said` 的接收端（**主執行緒**）。"""
+        self._note(f"經驗球：{text}")
+        self._ball_lbl.setText(f"經驗球：{text}")
 
-        QTimer.singleShot(0, _show)
+    def _ball_say(self, text: str) -> None:
+        """背景流程的進度 → 畫面。**背景執行緒呼叫** → 一律走 signal。
+
+        ⛔ 不准改回 `QTimer.singleShot`：理由見 `_ball_said` 的宣告。
+        """
+        try:
+            self._ball_said.emit(text)
+        except RuntimeError:                         # 分頁已經被關掉／重載
+            pass
 
     def _record_mall_buy(self, g) -> None:
         """商城買到一筆 → 記帳（背景執行緒呼叫，只碰純資料）。"""
@@ -1844,9 +1870,31 @@ class CharProducePage(QWidget):
         mall_buys_dialog(self, self._mall_buys,
                          self.char_name or self.account or str(self.pid)).exec()
 
+    def _ball_watch(self) -> None:
+        """看門狗：換球執行緒都結束了、`_ball_busy` 這個閂卻沒被放掉 → 自己放。
+
+        ⚠⚠ `_ball_busy` 是典型的「舉起來就一定要有人放下」的閂
+          （[[frozen-tick-state-machines]]）。2026-08-24 實機就是踩到這個：
+          收尾走 `QTimer.singleShot`，而那條普通 `threading.Thread` 沒有 Qt
+          事件迴圈 → 回呼**整個沒跑** → 球明明換好了，畫面卻永遠停在
+          「→ 去商城補貨…」，生產頁連 `_gather_tick` 都每一拍掉頭。
+        ★ 收尾已經改走 signal（跨執行緒安全），這一層是**兜底**：
+          執行緒死了、又超過 `BALL_STUCK_SECS` 還沒收到收尾 → 放掉閂並講出來，
+          寧可下一輪重跑一次，也不要無聲卡死。
+        """
+        t = self._ball_thread
+        if t is not None and t.is_alive():
+            return
+        if time.monotonic() - self._ball_busy_t < BALL_STUCK_SECS:
+            return                    # 給收尾 signal 一點時間排隊
+        self._ball_busy = False
+        self._ball_thread = None
+        self._ball_lbl.setText("經驗球：⚠ 換球流程沒回報結果 → 已解除卡住")
+
     def _ball_done(self, ok: bool, msg: str) -> None:
         """換球背景執行緒的收尾（UI 執行緒）。"""
         self._ball_busy = False
+        self._ball_thread = None
         self._note(("經驗球：" if ok else "⚠ 自動換球：") + msg, warn=not ok)
         if ok:
             self._ball_lbl.setText(f"經驗球：✔ {msg}")
@@ -1935,6 +1983,7 @@ class CharProducePage(QWidget):
           **但一律把理由寫到畫面上**（見 `_ball_status`）。
         """
         if self._ball_busy:
+            self._ball_watch()        # 閂舉著就一定要有人看著它（見 _ball_watch）
             return
         sc = self.sc
         try:
@@ -1966,6 +2015,7 @@ class CharProducePage(QWidget):
             return
 
         self._ball_busy = True
+        self._ball_busy_t = time.monotonic()
         self._note(f"經驗球：{why} —— 暫停精靈、按 ESC…")
         mover, hwnd = self._mover, self.hwnd
 
@@ -1976,10 +2026,16 @@ class CharProducePage(QWidget):
                     on_buy=self._record_mall_buy, hwnd=hwnd)
             except Exception as exc:                 # noqa: BLE001
                 ok, msg = False, f"{exc!r}"
-            QTimer.singleShot(0, lambda: self._ball_done(ok, msg))
+            # ⚠⚠ 回 UI 執行緒**只能走 signal**（見 `_ball_finished` 的宣告）：
+            #   從普通 threading.Thread 排的 QTimer.singleShot 永遠不會跑。
+            try:
+                self._ball_finished.emit(ok, msg)
+            except RuntimeError:                     # 分頁已經被關掉／重載
+                pass
 
-        threading.Thread(target=_worker, daemon=True,
-                         name=f"ballswap-{self.pid}").start()
+        self._ball_thread = threading.Thread(
+            target=_worker, daemon=True, name=f"ballswap-{self.pid}")
+        self._ball_thread.start()
 
 
     def _ensure_mover(self) -> bool:
