@@ -73,7 +73,7 @@ import time
 from app.game import actiongate, bag, gather, itemname, jumpmap, supply
 
 # ★ 商城商品表的全域指標。AOB 定位（locate.py mall.TABLE_PTR）。
-TABLE_PTR = 0x0098BCA8
+TABLE_PTR = 0x00997394
 # 編號上界：0x552566 的 `cmp ecx,0x9C3F`（編號 1..0x9C40）。
 MAX_ID = 0x9C40
 # 記錄欄位（見檔頭）

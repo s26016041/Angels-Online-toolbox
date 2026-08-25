@@ -5,9 +5,13 @@
 天使 Online 的視窗**失焦（不是最小化）時畫面會凍住，但邏輯／網路照跑**。
 反組譯出來的機制（angel.dat 無 ASLR，基底 0x400000）：
 
-* 視窗程序 `WndProc = 0x70CAB0` 收到 `WM_ACTIVATE(0x06)` / `WM_ACTIVATEAPP(0x1C)`
-  時，會算出「現在是不是 active」這個布林，存進視窗物件 `[this+0xC]`；
-  **只有狀態真的變了**才去呼叫 `OnActivate([vtable+0x50] = 0x70C480)`。
+* 視窗訊息 handler 收到 `WM_ACTIVATE(0x06)` / `WM_ACTIVATEAPP(0x1C)` 時，
+  會算出「現在是不是 active」這個布林，存進視窗物件 `[this+0xC]`；
+  **只有狀態真的變了**才去呼叫 `OnActivate([vtable+0x50])`。
+  ⚠ 2026-08-25 改版把這一層重寫了（v3，詳見下方與 locate.SIGS 的註解）：
+    WndProc 變成 thunk、真正的 handler 是虛擬函式、訊息用跳表分派，而且
+    **兩個訊息拆成兩支 handler** —— active 狀態機只留在 WM_ACTIVATEAPP
+    那支。實務上不影響：分身彼此是不同行程，切換時照樣發 WM_ACTIVATEAPP。
 * `OnActivate` 做三件事（2026-08-13 全支反組譯定案）：
   1. `0x70B630(bActive)` → **輸入層**（this=[0xA158F4]）：記下 active 狀態，
      取得焦點時呼叫 `0x70BCF0`（重新取得輸入裝置）、失焦呼叫 `0x70B7F0`（放掉）。
@@ -25,14 +29,16 @@
 被系統放掉之後再也接不回來 → 「右鍵鎖怪→走過去放技能」失靈（走路正常、
 放不出招；見 memory 的 manual-cast-broken-investigation）。
 
-v2 改成兩個位置、共 8 個位元組，都在同一段 WM_ACTIVATE handler 裡：
+v2/v3 都是兩個位置、共 9 個位元組，都在同一段 WM_ACTIVATEAPP handler 裡
+（下面的位址與位元組是 v3＝2026-08-25 改版後的樣子；v2 的是 0x70CC5A／
+32 C0→B0 01 與 +0xE／je +0x0A，語意一模一樣）：
 
-    0x70CC5A（A）  32 C0（xor al,al）      → B0 01（mov al,1）
+    0x70D387（A）  0F 95 C2（setne dl）    → B2 01 90（mov dl,1 / nop）
         失焦也算 active → [this+0xC] 恆為 1 → OnActivate(0) 永不執行
         ＝不暫停、不廣播 deactivate ＝ 失焦不凍（跟 v1 一模一樣，實測過）。
-    0x70CC68（B）  0F 84 rel32（je 沒變就跳走）→ 83 7D 10 00 74 0A
+    0x70D38F（B）  0F 84 rel32（je 沒變就跳走）→ 83 7D 10 00 74 08
         ＝ cmp dword [ebp+0x10], 0（wParam；0 ＝ 失焦）
-          je  +0x0A（跳到等價的 epilogue，什麼都不做）
+          je  +8（跳到等價的 epilogue，什麼都不做）
         wParam ≠ 0（取得焦點）→ **每次都呼叫 OnActivate(1)** ＝ 遊戲原本
         重新聚焦要做的整套（輸入層重新取得＋恢復音效＋廣播 active）——
         手動操作就是靠這一下復活的。
@@ -41,18 +47,19 @@ v2 改成兩個位置、共 8 個位元組，都在同一段 WM_ACTIVATE handler
   原本就會做的那段補回來」——那段程式碼原版每次重新聚焦都在跑，是熟路。
 * 位置 B 的原樣是 `je rel32`，**位移量是那一版程式碼的版面、改版會變**，
   所以：判斷「原始狀態」只認前兩個位元組 `0F 84`（je rel32 的形狀）；
-  還原時寫 `0F 84 0A 00 00 00`＝跳到 call 後面那個 epilogue（0x70CC78）——
-  跟原本跳的 0x70D1E9 **語意完全等價**（反組譯核對過：同樣恢復暫存器、
-  eax=0、cookie 檢查、ret 0x10），而且位移量由特徵鎖住的骨架保證，
-  不隨版本變。⚠ 不能把今天讀到的位移記起來還原 —— 改版後寫回舊位移
+  還原時寫 `0F 84 08 00 00 00`＝跳到 call 後面那個 epilogue（v3 的 0x70D39D）
+  —— 跟原本跳的 0x70D970 **語意完全等價**（反組譯核對過：同樣恢復暫存器、
+  eax=0、cookie 檢查、ret 0x10），而且位移量由特徵鎖住的骨架保證。
+  ⚠ 位移量本身**會隨改版變**（v2 是 0x0A、v3 是 8）—— 改版時要照特徵鎖住的
+  骨架重新數一次，不是「不隨版本變」。⚠ 不能把今天讀到的位移記起來還原 —— 改版後寫回舊位移
   ＝跳到錯的地方＝當機。
 
 ## 位址怎麼來
 
 `PATCH_ADDR`（位置 A）由 `locate.warm()` 依 AOB 特徵自動定位（見 locate.py
-的 `unfreeze.PATCH_ADDR`；特徵把 A 的 2 個與 B 的 6 個位元組**全部遮成 ??**，
-所以 patch 前後都定位得到）。位置 B ＝ `PATCH_ADDR + 0xE`，中間那 12 個
-位元組正是特徵的錨，距離不會變。定位失敗會清成 0，這裡每個寫入前都會問
+的 `unfreeze.PATCH_ADDR`；特徵把 A 的 3 個與 B 的 6 個位元組**全部遮成 ??**，
+所以 patch 前後都定位得到）。位置 B ＝ `PATCH_ADDR + SITE2_OFF`，中間那幾個
+位元組正是特徵的錨，同一版之內距離不會變。定位失敗會清成 0，這裡每個寫入前都會問
 `locate.located()` 並**當場重讀確認內容是預期的樣子**才動手 ——
 寫錯位址是直接破壞遊戲記憶體，這條退路一定要有。
 """
@@ -65,22 +72,25 @@ from app.game import locate
 
 # locate.warm() 會把這個改寫成當下的絕對位址。沒定位成功前是 2026-08-12 的值，
 # 但 apply()/remove() 一律先問 locate.located() 才會用，所以這個預設值只是文件。
-PATCH_ADDR = 0x0070CC5A
-# ★ 位置 B（je 那 6 個位元組）＝ PATCH_ADDR + 0xE。中間隔的 12 bytes
-#   （EB 02 B0 01 88 45 E0 88 43 0C 3A C1）就是 AOB 特徵的錨 —— 相對距離由
-#   特徵骨架保證，改版時 PATCH_ADDR 重新定位、這個距離不變（見檔頭）。
-SITE2_OFF = 0xE
+PATCH_ADDR = 0x0070D387
+# ★ 位置 B（je 那 6 個位元組）＝ PATCH_ADDR + 8。中間隔的 5 bytes
+#   （88 57 0C 3A D1 ＝ mov [edi+0xc],dl / cmp dl,cl）就是 AOB 特徵的錨
+#   —— 相對距離由特徵骨架保證，改版時 PATCH_ADDR 重新定位、這個距離不變。
+#   ⚠⚠ 這個距離是**版面**：v2（2026-08-13）是 0xE，v3（2026-08-25 改版）是 8。
+#     改版後一定要重新數 —— 寫錯＝跳進指令中間＝當場當機。
+SITE2_OFF = 0x8
 
-ORIG = b"\x32\xc0"      # xor al,al   → 算出「失焦＝inactive」
-PATCHED = b"\xb0\x01"   # mov al,1    → 永遠 active
+ORIG = b"\x0f\x95\xc2"      # setne dl        → 算出「失焦＝inactive」
+PATCHED = b"\xb2\x01\x90"   # mov dl,1 / nop  → 永遠 active
 
-# 位置 B：cmp dword [ebp+0x10],0（wParam）/ je +0x0A（失焦→什麼都不做）
-PATCHED2 = b"\x83\x7d\x10\x00\x74\x0a"
+# 位置 B：cmp dword [ebp+0x10],0（wParam）/ je +8（失焦→什麼都不做）
+PATCHED2 = b"\x83\x7d\x10\x00\x74\x08"
 # 原樣＝je rel32 的形狀。位移量（後 4 bytes）是版面、改版會變，不比對。
 JE_SHAPE = b"\x0f\x84"
-# 還原寫這個：je rel32 → +0x10 處的等價 epilogue（語意同原本的目標，
-# 位移量由特徵骨架保證）。⚠ 不是原始位移 —— 理由見檔頭。
-RESTORE2 = b"\x0f\x84\x0a\x00\x00\x00"
+# 還原寫這個：je rel32 → 跳過那 8 bytes 的 OnActivate 呼叫，落在等價的
+# epilogue（語意同原本的遠跳目標，位移量由特徵骨架保證）。
+# ⚠ 不是原始位移 —— 理由見檔頭。
+RESTORE2 = b"\x0f\x84\x08\x00\x00\x00"
 
 PAGE_EXECUTE_READWRITE = 0x40
 
@@ -118,9 +128,9 @@ def state(scanner) -> str:
     """
     if not _located():
         return "unknown"
-    a = scanner._read_bytes(PATCH_ADDR, 2)
-    b = scanner._read_bytes(_site2(), 6)
-    if not a or not b or len(a) < 2 or len(b) < 6:
+    a = scanner._read_bytes(PATCH_ADDR, len(ORIG))
+    b = scanner._read_bytes(_site2(), len(PATCHED2))
+    if not a or not b or len(a) < len(ORIG) or len(b) < len(PATCHED2):
         return "unknown"
     a_on, a_off = a == PATCHED, a == ORIG
     b_on, b_off = b == PATCHED2, bytes(b[:2]) == JE_SHAPE
@@ -191,7 +201,7 @@ def remove(scanner) -> bool:
     ok_a = _write(scanner, PATCH_ADDR, ORIG, lambda b: b == PATCHED)
     # B 已經是 je 形狀（原版原樣或我們還原過的等價 je）＝不必動；
     # 只有還掛著我們的 PATCHED2 才寫回 RESTORE2。
-    now = scanner._read_bytes(_site2(), 6) if _located() else None
+    now = scanner._read_bytes(_site2(), len(PATCHED2)) if _located() else None
     if now and len(now) >= 2 and bytes(now[:2]) == JE_SHAPE:
         ok_b = True
     else:

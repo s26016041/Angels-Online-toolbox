@@ -129,10 +129,20 @@ SIGS: tuple[Sig, ...] = (
         "55 8B EC 56 8B F1 33 C0 57 8B 7D 0C 57 89 06 89 46 04 89 46 08"
         " 89 46 0C E8 ?? ?? ?? ?? 8B 4E 04 66 8B 45 08 66 89 01",
         0x0050DF6E),
+    # ⚠⚠ 2026-08-25 改版壞在這裡，值得記：`8B 0C 85 <表位址>` 那個表格全域
+    #   （當時 0xA16060）本來是**模組內**立即值、由 `_auto_mask` 自動遮掉；
+    #   這次改版模組縮小（SizeOfImage 0x620000 → 0x5E7000），舊立即值一下子
+    #   落到模組範圍**外** → `_auto_mask` 不再認得它 → 整段特徵拿它當固定
+    #   位元組比對 → 一個都不中。**教訓：內嵌位址不能指望 _auto_mask，
+    #   因為它是拿「現在這一版」的模組範圍在判斷，而 pattern 是舊版抄的。**
+    #   所以這裡自己寫 `??`（跟結構偏移同一條規矩）。
+    #   ⛔ 別想「把 _auto_mask 的判定範圍放寬」一勞永逸 —— 實測 80 段特徵裡
+    #     有 37 處「指令邊界湊出來、剛好落在那個帶」的巧合視窗，它們正在
+    #     當有效的錨；放寬會把它們一起遮掉，反而製造一堆模糊命中。
     Sig("jumpmap", "SEND_FN", "fn", None,
-        "55 8B EC 8B 45 08 8B 0C 85 60 60 A1 00 85 C9 74 08 FF 75 0C"
+        "55 8B EC 8B 45 08 8B 0C 85 ?? ?? ?? ?? 85 C9 74 08 FF 75 0C"
         " E8 ?? ?? ?? ?? 5D C3",
-        0x00711130),
+        0x007127A0),
     # 連線物件的全域指標。錨在「送傳送包」那幾行（`mov [eax+2],esi` 起）——
     # 只用 `push [0x9B67D0]` 當特徵不夠獨特。
     Sig("jumpmap", "CONN_PTR", "data", 5,
@@ -182,13 +192,22 @@ SIGS: tuple[Sig, ...] = (
         " 66 8B 45 08 FF 75 FC 66 89 41 02 66 8B 45 0C 66 89 41 04"
         " FF 35 ?? ?? ?? ?? E8 ?? ?? ?? ?? 59 59 C9 C3",
         0x005D23C3),
-    # 商城商品表的全域指標（見 app/game/mall.py）。錨在遊戲自己的查表函式
-    #   0x552566：`商城編號-1 <= 0x9C3F` 才 `[[TABLE_PTR] + 編號*4]`。
-    #   那個上界常數 0x9C3F 與 `8B 04 B0`（eax + esi*4）就是骨架，位址本身放萬用。
+    # 商城商品表的全域指標（見 app/game/mall.py）。跟怪物表／技能表是**同一種**
+    #   查表函式（模組裡 28 支長得一模一樣）。
+    # ⚠ 舊寫法（只到 `8B 04 B0 EB`）一直是靠「只遮目標」那層才唯一的 ——
+    #   也就是拿舊表位址當錨，改版位移必失效（patch_doctor 2026-08-18 起
+    #   就一直在示警，2026-08-25 這次終於輪到它了：全遮 28 撞成一團）。
+    #   ⛔ 往後延伸沒有用：能分辨的兩個常數（上界 0x9C3F、錯誤編號 0x9C41）
+    #     湊出來的 4-byte 視窗剛好落在模組範圍內，`_auto_mask` 會一起遮掉。
+    # ★ 照 monsters/skillcost 的做法改用**字串內容**當錨：`Mall`
+    #   （表名字串在錯誤訊息那條路上被 push；字串位址會移、內容不會變）。
+    #   全遮 28 → 字串錨過濾後 1，模擬改版也定位得回來。
     Sig("mall", "TABLE_PTR", "data", 16,
         "56 8B 75 08 8D 4E FF 81 F9 3F 9C 00 00 77 0A"
-        " A1 A8 BC 98 00 8B 04 B0 EB",
-        0x0098BCA8),
+        " A1 94 73 99 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 41 9C 00 00 56"
+        " 68 BC AF 7D 00",
+        0x00997394, str_at=58, str_val=b"Mall"),
     Sig("lua", "GETFIELD_FN", "fn", None,
         "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
         " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"
@@ -249,9 +268,22 @@ SIGS: tuple[Sig, ...] = (
     Sig("entity", "VT_ENTITY2", "data", 2,
         "C7 00 D8 29 7D 00 8D 8B FC 02 00 00 C7 40 08 24 2A 7D 00 E8 ?? ?? ?? ??",
         0x007D29D8),
+    # ⚠⚠ 2026-08-25 改版把狀態物件的建構函式**重寫**了（不是位移）：
+    #   舊：`mov [ebx],vt / [ebx+0x10] / [ebx+0x14] / [ebx+0x38]`
+    #   新：`mov [edi],vt / [edi+0x10] / [edi+0x14] / [edi+0x18] / [edi+0x2c]`
+    #   —— 暫存器換了、成員位置也換了（+0x38 消失、多一個 +0x2c），
+    #   所以是「一個都沒中」而不是「位移」。
+    #   找回來的路（兩個獨立來源對得起來才採用，見 memory patch-2026-08-25）：
+    #     ① player.VTABLE_RVA 的特徵本來就寫在**同一支**建構函式裡（它沒壞），
+    #        從它的命中處 0x5A641D 往上找 `mov [edi],imm` 就是這裡。
+    #     ② 執行時 `[quickbar.MGR_PTR]` 就是狀態物件本人，讀它的 +0 拿到
+    #        0x7E5E10 —— 五台分身全部一致。
+    #   ⛔ 不准拿 player.VTABLE_RVA 的位移量（+0x1FE8）去推 VT_STATE：
+    #     實際是 0x7E3DD8 → 0x7E5E10（+0x2038），差了 0x50。
     Sig("entity", "VT_STATE", "data", 2,
-        "C7 03 50 3E 7E 00 C7 43 10 68 3E 7E 00 C7 43 14 80 3E 7E 00 C7 43 38 98 3E 7E 00",
-        0x007E3E50),
+        "C7 07 10 5E 7E 00 C7 47 10 28 5E 7E 00 C7 47 14 40 5E 7E 00"
+        " C7 47 18 4C 5E 7E 00 C7 47 2C 58 5E 7E 00 E8 ?? ?? ?? ?? 33 C9",
+        0x007E5E10),
     Sig("entity", "VT_PLAYER", "data", 10,
         "01 C7 07 AC 8B 7D 00 C7 47 08 F8 8B 7D 00 C7 87 10 02 00 00 00 8C 7D 00",
         0x007D8BF8),
@@ -636,20 +668,35 @@ SIGS: tuple[Sig, ...] = (
         " 85 94 81 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? 57 E8 ?? ?? ?? ??",
         0x000058F8),
     # ── 失焦不凍畫面（見 app/game/unfreeze.py）──────────────────────
-    # 要 patch 的位址：視窗程序 WndProc(0x70CAB0) 處理 WM_ACTIVATE 的 handler。
-    # v2（2026-08-13）patch 兩處：命中處那 2 bytes（32 C0→B0 01，失焦也算
-    # active＝不凍）＋命中處 +0xE 那 6 bytes（je「沒變就跳走」→ cmp wParam／
-    # je，取得焦點時每次都呼叫 OnActivate(1)＝重設輸入，手動操作才不會壞）。
-    # ⚠ kind='fn' 回傳的是命中處位址；**兩處要改的 8 個位元組全部遮成 ??**
+    # 要 patch 的位址：視窗訊息 handler 裡算「現在是不是 active」那一段。
+    # v3（2026-08-25）：官方把整個視窗訊息分派**重寫**了，舊特徵一個都沒中。
+    #   · WndProc 變成 thunk：`mov ecx,[0x9DCA30] / mov eax,[ecx] /
+    #     jmp [eax+0x88]`，真正的 handler 是虛擬函式（0x52C10C 又跳 0x70D1E0）。
+    #   · 0x70D1E0 用跳表分派；舊版 WM_ACTIVATE(0x06) 與 WM_ACTIVATEAPP(0x1C)
+    #     **共用**同一支 handler，新版拆成兩支，active 狀態機只留在
+    #     WM_ACTIVATEAPP 這支（0x70D380）—— WM_ACTIVATE 那支只管全螢幕 z-order，
+    #     沒有碰 [this+0xC]，也沒有叫 OnActivate。
+    #   · 算法也從 `cmp 1/cmp 2/xor al,al/jmp/mov al,1` 換成 `setne dl`。
+    #   找回來的路：視窗類別名字串 `_MIDAGEONL_` → 唯一引用處 0x544E93 →
+    #   註冊視窗類別的函式 0x70C6D0 → `mov [ebp-0x24], 0x70CB00`＝lpfnWndProc；
+    #   再執行時讀 [0x9DCA30] 的 vtable +0x88 拿到 handler（五台一致）。
+    # patch 兩處（語意與 v2 完全相同，只是位元組換了）：
+    #   A ＝命中處 3 bytes `0F 95 C2`(setne dl) → `B2 01 90`(mov dl,1 / nop)
+    #       ＝失焦也算 active → [this+0xC] 恆為 1 → OnActivate(0) 永不執行。
+    #   B ＝命中處 +8 的 6 bytes `0F 84 rel32`(je 沒變就跳走)
+    #       → `83 7D 10 00 74 08`＝cmp wParam,0 / je 等價 epilogue。
+    # ⚠ kind='fn' 回傳的是命中處位址；**兩處要改的 9 個位元組全部遮成 ??**
     #   —— patch 前後都要定位得到（不然套用之後重掃就找不到自己了）。
-    #   靠中間那串骨架當錨：`jmp +2 / mov al,1 / mov [ebp-0x20],al /
-    #   mov [ebx+0xc],al / cmp al,cl`（這 12 bytes 也保證 +0xE 這個距離），
-    #   加上後面 `mov eax,[ebx] / mov ecx,ebx / push [ebp-0x20] /
-    #   call [eax+0x50]`（+0x50 是類別版面，大更新才會變）。
+    #   中間那串 `mov [edi+0xc],dl / cmp dl,cl`（88 57 0C 3A D1，5 bytes）
+    #   保證 A→B 的距離＝8；後面 `mov eax,[edi] / mov ecx,edi / push edx /
+    #   call [eax+0x50]`（8 bytes）＋ epilogue `pop edi / pop esi / xor eax,eax /
+    #   pop ebx` 保證 B 的 `je +8` 剛好落在完整的 epilogue 上。
+    #   ⚠⚠ 那個 +8 是**這一版的版面**：v2 時代是 +0x0A（舊的 call 那段多 2 bytes）。
+    #     改版後一定要重新數，寫錯＝跳進指令中間＝當場當機。
     Sig("unfreeze", "PATCH_ADDR", "fn", None,
-        "?? ?? EB 02 B0 01 88 45 E0 88 43 0C 3A C1 ?? ?? ?? ?? ?? ??"
-        " 8B 03 8B CB FF 75 E0 FF 50 50",
-        0x0070CC5A),
+        "?? ?? ?? 88 57 0C 3A D1 ?? ?? ?? ?? ?? ??"
+        " 8B 07 8B CF 52 FF 50 50 5F 5E 33 C0 5B",
+        0x0070D387),
     # ── 施放廣播監聽的 hook 點（見 app/game/castwatch.py）──────────────
     # 「入向訊息入佇列」函式 0x7122b0 的進入點 —— 每一包解密後明文的唯一咽喉。
     # castwatch inline-hook 它讀施放廣播（op=0x1d、子類型 0x0301、技能ID @8）。

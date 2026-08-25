@@ -43,7 +43,7 @@ CLASS_FILE = "assets/jumpmap_class.tsv"
 
 # ⚠ 這三個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 BUILD_FN = 0x0050DF6E        # 建封包(代號, 內文長度)，ecx = 暫存區
-SEND_FN = 0x00711130         # 送出(連線, 封包)
+SEND_FN = 0x007127A0         # 送出(連線, 封包)
 CONN_PTR = 0x009B67D0        # [這裡] = 連線物件
 
 # ★ 出處：反組譯 0x5E751B 尾巴（遊戲自己送傳送包的那段，見檔頭「怎麼送」）。

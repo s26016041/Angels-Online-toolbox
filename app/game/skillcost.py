@@ -73,6 +73,8 @@ TMPL_SPAN = OFF_COST_SP + 4
 #   10516/10516 全中**（第二名 169 筆），同輪自檢 mp@+0x58 10510/10516（2026-08-14，
 #   reports/duration_offset_probe.txt）。recheck_tables 每次改版拿它對帳 skills.tsv。
 OFF_DURATION_SECS = 0x100
+# 合理性上限（秒）：超過就當讀到垃圾。30 天跟 buffs.STALE_AFTER 同一個量級。
+MAX_DURATION_SECS = 30 * 24 * 3600
 
 # --- 玩家實體裡的「數值」子物件（0x549E7D 的 this = 實體 + 0x210）---
 OFF_ATTR = 0x210
@@ -140,6 +142,24 @@ def cost(scanner, skill_id: int) -> tuple[int, int] | None:
     if not (0 <= mp <= MAX_COST_MP and 0 <= sp <= MAX_COST_SP):
         return None
     return mp, sp
+
+
+def duration_secs(scanner, skill_id: int) -> int | None:
+    """這一招的 buff 持續時間（**秒**）；**讀不到／不合理回 None**（＝不知道）。
+
+    ★ 出處是**遊戲自己載進記憶體的 Magic 範本**（+0x100），不是資源包抄來的
+      `assets/skills.tsv.gz` —— 官方調數值會自動跟上，不必重新解包。
+      （2026-08-25 改版就把技能 20752 從 4500 秒改成 960 秒，寫死表當場過期。）
+    ⚠ 回 None 有三種可能：還沒進遊戲、改版把表搬走了、版面變了。呼叫端一律
+      當「不知道」處理 —— `buffs._sane()` 就是讀不到才退回寫死表。
+    """
+    tmpl = template(scanner, skill_id)
+    if tmpl is None:
+        return None
+    v = _u32(scanner, tmpl + OFF_DURATION_SECS)
+    if v is None or not 0 <= v <= MAX_DURATION_SECS:
+        return None
+    return v
 
 
 def sp_now(scanner, entity_addr: int, mp_now: int) -> int | None:

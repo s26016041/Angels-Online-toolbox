@@ -321,8 +321,12 @@ def check_item_names(sc, tabs, lines):
 CHECKS = (
     ("skill_range.tsv.gz（技能射程）", check_skill_range,
      "⛔ 過期後果：走位停太遠 → 零傷害，完全不報錯", True),
+    # ★ 2026-08-25 起**降級為退路**（同 items.py 球表的處理）：buff 時長的正路
+    #   改成現場讀記憶體的 Magic 範本 +0x100（`skillcost.duration_secs`），
+    #   這張表只在讀不到時才頂上。所以對不上不再是「會做錯事」＝不擋解包判定，
+    #   但仍然要報出來（差太多代表退路會失準，值得知道）。
     ("skills.tsv.gz（buff 持續時間）", check_skill_secs,
-     "⛔ 過期後果：補 buff 的時間點算錯（太早浪費 MP／太晚裸奔）", True),
+     "已降級為退路：正路讀記憶體範本，這裡只驗退路有沒有過期", False),
     ("在線獎勵格（OnlineGift）", check_onlinegift,
      "正路現場讀表自動跟上；這裡驗退路 REWARD_IDS 沒過期", True),
     ("自動分解白名單（DECOMP_ITEMS）", check_decomp_whitelist,

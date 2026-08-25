@@ -45,7 +45,7 @@ from __future__ import annotations
 import struct
 import time
 
-from app.game import bag, skills
+from app.game import bag, skillcost, skills
 
 # ⚠ 結構偏移（CLAUDE.md 允許寫死，大更新才會壞；出處＝上面的反組譯）。
 #   ★ 全專案只有這裡認識這棵樹的版面，別在第二個地方再抄一份。
@@ -101,18 +101,36 @@ def _head(scanner, ent: int | None):
     return head if _ok(head) else None
 
 
-def _sane(expire: int, skill_id: int, now: float) -> bool:
+def _cap_secs(scanner, skill_id: int) -> int | None:
+    """這一招的持續時間上限（秒）；不知道回 None。
+
+    ★ 先問**遊戲自己載進記憶體的 Magic 範本**（`skillcost.duration_secs`），
+      讀不到才退回資源包抄來的寫死表。順序很重要：官方調數值時記憶體會跟上、
+      寫死表不會（2026-08-25 的技能 20752 就是 4500→960 秒）。
+    ⚠⚠ 範本的 0 要當「沒有記錄時長」，**不能當上限 0** —— 寫死表本來就
+      「沒有持續時間的不收錄」（skills.py 檔頭），拿 0 當上限會讓身上真的
+      掛著、剩餘 > 60 秒的 buff 被 `_sane()` 判成垃圾 → 呼叫端以為沒有 →
+      白放重放。所以 0 一律往下走退路，最後回 None＝不做這道檢查。
+    """
+    v = skillcost.duration_secs(scanner, skill_id)
+    if v:
+        return v
+    info = skills.of(skill_id)
+    return info.secs if info else None
+
+
+def _sane(scanner, expire: int, skill_id: int, now: float) -> bool:
     """到期戳記合理嗎 —— 兩道交叉驗證，過不了就當讀到垃圾。
 
     ① 絕對範圍：不能早於 60 秒前、也不能晚於 30 天後。
-    ② 跟技能表交叉比對：剩餘不可能超過**表定持續時間**（多給 60 秒餘裕，
-       伺服器延長類的效果不至於差這麼多）。查不到表就只驗 ①。
+    ② 跟技能的持續時間交叉比對：剩餘不可能超過持續時間（多給 60 秒餘裕，
+       伺服器延長類的效果不至於差這麼多）。問不到就只驗 ①。
     """
     left = expire - now
     if not (-STALE_BEFORE <= left <= STALE_AFTER):
         return False
-    info = skills.of(skill_id)
-    return not (info and left > float(info.secs) + 60.0)
+    cap = _cap_secs(scanner, skill_id)
+    return not (cap is not None and left > float(cap) + 60.0)
 
 
 def find(scanner, skill_id: int, ent: int | None = None) -> float | None:
@@ -138,7 +156,7 @@ def find(scanner, skill_id: int, ent: int | None = None) -> float | None:
             return None
         left, _parent, right, key, expire = got
         if key == skill_id:
-            return float(expire) if _sane(expire, key, now) else None
+            return float(expire) if _sane(scanner, expire, key, now) else None
         cur = left if skill_id < key else right
         depth += 1
     # 樹搜尋說沒有 —— 再全走一次確認（順便擋「樹沒排序」這種改版意外）
@@ -171,7 +189,7 @@ def active(scanner, ent: int | None = None) -> dict[int, float] | None:
         if got is None:
             return None
         left, _parent, right, key, expire = got
-        if not _sane(expire, key, now):
+        if not _sane(scanner, expire, key, now):
             return None
         out[key] = float(expire)
         if right != head and _ok(right):             # ++it
