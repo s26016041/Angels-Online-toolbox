@@ -136,11 +136,24 @@ def checks(sc, log):
                           for m, n in alive))
 
     # energy 四欄：read() 自己就會逐欄驗版面，回 None 代表驗不過。
+    # ⚠⚠ **四欄全 0 不算通過。** 晶化資料要「開過晶能視窗（送 0x3F）」才會同步
+    #   下來；沒同步時整片是 0，而 0 通過每一道逐欄驗證（能量 0、抽到 −1、
+    #   每次 0、點數全 0）→ read() 回一個合法物件 → 這一項就印綠燈。
+    #   2026-08-25 實際踩到：OFF_ENERGY 已經搬家（0x54 → 0x34），這項還是 ✔，
+    #   直到使用者自己開了晶能視窗、錯位置讀到垃圾才顯現。
+    #   （memory `lazy-sync-request-first`：全 0 先懷疑沒同步。）
+    #   ⚠ 這支是純讀工具，不會替你送 0x3F —— 判成「驗不了」並請人開一次視窗。
     got = energy.read(sc, state)
-    put("晶化欄位 energy.OFF_*", got is not None,
-        "" if got is None else
-        f"能量 {got.energy}／抽到 {got.result}／每次 {got.per_roll}"
-        f"／點數 {sum(got.points)}")
+    synced = got is not None and (got.energy or got.result is not None
+                                  or got.per_roll or any(got.points))
+    if got is not None and not synced:
+        put("晶化欄位 energy.OFF_*", NA,
+            "四欄全 0 ＝ 這台還沒開過晶能視窗同步 —— 驗不了（開一次晶能視窗再跑）")
+    else:
+        put("晶化欄位 energy.OFF_*", got is not None,
+            "" if got is None else
+            f"能量 {got.energy}／抽到 {got.result}／每次 {got.per_roll}"
+            f"／點數 {sum(got.points)}")
 
     # quickbar.TABLE_OFF：讀得到頁面且每一格型別合法（read_page 內建驗證）
     page = quickbar.read_page(sc, 0)
@@ -347,10 +360,17 @@ def main() -> int:
         got = [res.get(key) for _n, res in per_client]
         got = [g for g in got if g is not None]
         oks = [g[0] for g in got]
-        # 一項要**在每一台上都失敗**才算壞（跟 health.py 同一套邏輯，避免誤報）
-        if oks and all(o is False for o in oks):
+        # ⚠⚠ 2026-08-25 改掉了舊規則「要**每一台**都失敗才算壞」。
+        #   舊規則的本意是避免誤報（有分身停在登入頁），但那種情況本來就會回
+        #   NA（驗不了），不是 False —— 所以「有人 True 就算過」等於**讓通過的
+        #   分身把失敗的蓋掉**。晶化搬家那次 5 台有 2 台因為讀到的垃圾剛好像
+        #   合理值而通過，整項就印了綠燈。
+        #   新規則：**只要有任何一台「驗得了而且驗不過」，就是壞。**
+        #   驗不了（NA）不參與判定，只有全部都 NA 時才報「驗不了」。
+        real = [o for o in oks if o is not None]     # 排除「這台驗不了」
+        if any(o is False for o in real):
             mark, bucket = "✘", bad
-        elif any(o is True for o in oks):
+        elif real:
             mark, bucket = "✔", None
         else:
             mark, bucket = "–", unknown
@@ -367,7 +387,7 @@ def main() -> int:
     print(f"\n通過 {len(names) - len(bad) - len(unknown)}／壞 {len(bad)}"
           f"／驗不了 {len(unknown)}　→ {OUT}")
     if bad:
-        print("\n⛔ 這幾項在每一台上都失敗 —— 偏移八成搬家了：")
+        print("\n⛔ 這幾項有分身驗不過 —— 偏移八成搬家了（哪一台看報告）：")
         for k in bad:
             print(f"   · {k}")
         print("   重新定位的方法見 memory 的 patch-2026-08-11（找遊戲自己用"

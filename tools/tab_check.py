@@ -266,12 +266,22 @@ def c_jumpmap(c):
 
 
 def c_energy(c):
+    """晶能欄位。
+
+    ⚠⚠ **四欄全 0 不算通過。** 晶化資料要「開過晶能視窗（送 0x3F）」才會同步
+      下來；沒同步時整片是 0，而 0 通過 energy.read() 每一道逐欄驗證 → 回一個
+      合法物件 → 這一項就印綠燈。2026-08-25 實際踩到：OFF_ENERGY 已經搬家
+      （0x54 → 0x34），這項還是 ✔，直到使用者自己開了晶能視窗才顯現。
+      （memory `lazy-sync-request-first`：全 0 先懷疑沒同步。）
+    """
     if not c.state:
         return BAD, "沒有狀態物件"
     st = energy.read(c.sc, c.state)
     names = energy.attr_names(c.sc)
     if st is None:
         return BAD, "讀不到晶能欄位（要先開過晶能視窗同步，或版面變了）"
+    if not (st.energy or st.result is not None or st.per_roll or any(st.points)):
+        return NA, "四欄全 0 ＝ 這台還沒開過晶能視窗同步，驗不了（開一次再跑）"
     return ((OK if names else BAD),
             f"能量 {st.energy}、屬性名稱 {len(names)} 個")
 
@@ -336,6 +346,7 @@ def main() -> int:
         return 2
     lines: list[str] = []
     bad_total = 0
+    na_total = 0
     for w in wins:
         sc = MemoryScanner()
         sc.open(w.pid)
@@ -344,6 +355,7 @@ def main() -> int:
             c = Ctx(sc, w.hwnd, w.pid, w.title)
             mine = [f"=== {w.title} (pid {w.pid}) ===", ""]
             nbad = 0
+            nna = 0
             for tab, checks in TABS.items():
                 mine.append(f"  【{tab}】")
                 for name, fn in checks:
@@ -352,20 +364,29 @@ def main() -> int:
                     except Exception as exc:               # noqa: BLE001
                         st, detail = BAD, f"{type(exc).__name__}: {exc}"
                     nbad += st == BAD
+                    nna += st == NA
                     mine.append(f"    {st} {name:<16} {detail}")
                 mine.append("")
             lines += mine
             bad_total += nbad
-            print(f"{'✘' if nbad else '✔'} {w.title}　"
-                  f"{'失敗 %d 項' % nbad if nbad else '全部通過'}")
-            for ln in mine:                    # 只印這一台壞掉的那幾行
-                if ln.strip().startswith(BAD):
-                    print("   " + ln.strip())
+            na_total += nna
+            # ⚠ 2026-08-25 起「驗不了」也要印出來。以前 NA 靜靜消失，畫面上
+            #   跟「全部通過」長得一模一樣 —— 那等於把「沒驗到」講成「沒問題」。
+            note = "全部通過" if not nbad else "失敗 %d 項" % nbad
+            if nna:
+                note += "（另有 %d 項驗不了）" % nna
+            print(f"{'✘' if nbad else '✔'} {w.title}　{note}")
+            for ln in mine:                    # 這一台壞掉／驗不了的那幾行
+                t = ln.strip()
+                if t.startswith(BAD) or t.startswith(NA):
+                    print("   " + t)
         finally:
             sc.close()
     os.makedirs(os.path.dirname(REPORT), exist_ok=True)
     open(REPORT, "w", encoding="utf-8").write("\n".join(lines) + "\n")
-    print(f"\n{len(wins)} 台，共 {bad_total} 項失敗。報告：{REPORT}")
+    print(f"\n{len(wins)} 台，共 {bad_total} 項失敗"
+          f"{'、%d 項驗不了' % na_total if na_total else ''}。"
+          f"報告：{REPORT}")
     return 1 if bad_total else 0
 
 
