@@ -160,9 +160,15 @@ SETTINGS_PREFIX = "produce"
 # 開著時多久檢查一次「有沒有在正確地採、有沒有停下來」（使用者要求 5 秒）。
 # 一次是幾毫秒的純讀，5 秒一次完全不吃資源。
 GATHER_TICK_MS = 5000
-# ★ 自動換球補貨失敗後隔多久再試（跟掛機頁同一個值；2026-08-22 使用者回報
-#   「滿了卻不動、看不出原因」—— 永久放棄是錯的，被拒的購買不扣點）。
-BALL_RETRY_GAP = 600.0
+# ★ 自動換球補貨失敗後隔多久再試（跟掛機頁同一個值）（**使用者 2026-08-26 定：10 秒**）。
+#   被伺服器拒掉的購買**不扣點**，而且 `balls.restock` 會先看商城倉庫有沒有
+#   現成的，所以短間隔重試是安全的 —— 永久放棄才是錯的。
+#   ⚠ 這個值敢設這麼短，前提是下面那道**便宜的純讀預檢排在冷卻前面**：
+#     倉庫滿／背包沒空格／商城沒賣 會先被 `mall.blocked()` 擋掉、直接講原因，
+#     不會每 10 秒就真的跑一輪三十秒的補貨（3 次購買 × 各等滿 6 秒節流）。
+#   ⛔ 6 秒那個節流不要動 —— 那是遊戲伺服器自己的規矩（見 actiongate 檔頭
+#     反組譯 0x6112B7：間隔 <= 5 秒就回「操作太快」），改了只會被擋。
+BALL_RETRY_GAP = 10.0
 # ★ 換球背景執行緒死了、卻沒收到收尾多久就當它掉了（見 _ball_watch）。
 BALL_STUCK_SECS = 15.0
 # 連續幾次「位置沒動、資源也沒少」就判定停住了 → 踢一下（重設中心點）。
@@ -1946,14 +1952,15 @@ class CharProducePage(QWidget):
             return "都滿了，但背包讀不到 —— 這輪不動作", None, None
         pairs, missing = balls.pick_spares(pool, cur)
         if missing:
-            left = self._ball_retry_at - time.monotonic()
-            if left > 0:
-                return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
-                        f"上次補貨失敗 → {left / 60:.0f} 分鐘後再試"), None, None
-            # ★ 動手前先看會不會白跑（理由同掛機頁）。
+            # ★★ 便宜的純讀預檢排在冷卻前面（理由同掛機頁）：原因一解除，
+            #   下一拍就動手，不必把冷卻等完。
             stop = mall.blocked(sc, missing)
             if stop:
                 return f"⚠ 都滿了、備球差 {len(missing)} 顆，但{stop}", None, None
+            left = self._ball_retry_at - time.monotonic()
+            if left > 0:
+                return (f"⚠ 都滿了、備球差 {len(missing)} 顆，"
+                        f"上次補貨失敗 → {left:.0f} 秒後再試"), None, None
             return f"都滿了、備球差 {len(missing)} 顆 → 去商城補貨…", cur, pool
         return f"都滿了 → 換上背包的 {len(pairs)} 顆備球…", cur, pool
 
