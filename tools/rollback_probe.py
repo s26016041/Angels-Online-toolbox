@@ -81,11 +81,33 @@ class Probe:
         self._anchor_t = 0.0
         self.stalling = False
         self._stall_from = 0.0
+        # 目標追蹤（抓「打傷了沒打死就換目標」）
+        self._tgt = 0
+        self._tgt_t = 0.0
+        self._tgt_hp_after = 0.0   # 換目標後短暫時間血量欄可能還是舊值
+        self._tgt_first: int | None = None
+        self._tgt_min: int | None = None
+        self._tgt_last: int | None = None
+        self._tgt_zero_at: float | None = None
+        self._dmg_t = -999.0               # 上次看到目標血量下降的時刻
+        # 驗屍：premature 換目標 2 秒後掃實體清單看舊目標死了沒
+        self.pending_necro: list[dict] = []          # {due(絕對時間), eid, ev}
+        self.necro_results: deque = deque()          # 掃描執行緒 → 主迴圈
+        # 目標怪的位置（掃描執行緒 1Hz 更新；驗「走路終點是不是怪那格」）
+        self.tgt_at: tuple[int, float, float] | None = None   # (eid, x, y)
+        self._tgt_at_last: list[float] | None = None  # 目前目標最後一次已知位置
+        self._hot = None                              # snapshot 熱區快取
         # 統計
         self.events: list[dict] = []
         self.n_rollback = 0
         self.n_stall = 0
         self.n_conn_drop = 0
+        self.n_premature = 0
+        self.n_switch = 0
+        self.n_kill = 0
+        self.n_necro_corpse = 0
+        self.n_necro_gone = 0
+        self.n_necro_alive = 0
 
     # -- 讀一拍 ------------------------------------------------------
     def sample(self, t: float) -> dict:
@@ -149,15 +171,99 @@ class Probe:
                         row["target_hp"] = thp
             except Exception:
                 self.state = None
+        # 目標怪的位置（掃描執行緒 1Hz 更新的快取，eid 對得上才用）
+        ta = self.tgt_at
+        if ta and row.get("target") == ta[0]:
+            row["tgt_at"] = [round(ta[1], 1), round(ta[2], 1)]
         row["conn"] = self.conn
         self.rows += 1
         return row
+
+    # -- 目標追蹤：抓「打傷了沒打死就換目標」 -------------------------
+    def _track_target(self, row: dict, emit) -> None:
+        """目標欄 +4 是遊戲自己維護的血量百分比，死亡訊號＝寫成 ≤0
+        （出處 entity.set_target_id 的反組譯說明）。所以：
+        換目標當下上一隻 last_hp>0 且 min_hp<first_hp ＝ 打傷了沒打死就放生。"""
+        eid = row.get("target")
+        if eid is None:                     # 狀態物件還沒定位到，欄位不存在
+            return
+        t, hp = row["t"], row.get("target_hp")
+        if eid == self._tgt:
+            self._tgt_zero_at = None
+            if row.get("tgt_at"):
+                self._tgt_at_last = row["tgt_at"]
+            # 換目標後 0.4 秒內血量欄可能還是上一隻的殘值（遊戲 0.3 秒內回填）
+            if eid and hp is not None and t >= self._tgt_hp_after and hp <= 100:
+                if self._tgt_first is None and hp > 0:
+                    self._tgt_first = hp
+                if self._tgt_first is not None:
+                    if self._tgt_last is not None and hp < self._tgt_last:
+                        self._dmg_t = t          # 正在輸出（發呆判定要排除）
+                    self._tgt_min = (hp if self._tgt_min is None
+                                     else min(self._tgt_min, hp))
+                    self._tgt_last = hp
+            return
+        if eid == 0:
+            # 單拍讀失敗 read_target_checked 也會回 0——清空要持續 0.5 秒才算
+            if self._tgt_zero_at is None:
+                self._tgt_zero_at = t
+                return
+            if t - self._tgt_zero_at < 0.5:
+                return
+        old, first, mn, last = self._tgt, self._tgt_first, self._tgt_min, self._tgt_last
+        old_at = self._tgt_at_last
+        dur = t - self._tgt_t
+        self._tgt, self._tgt_t = eid, t
+        self._tgt_hp_after = t + 0.4
+        self._tgt_first = self._tgt_min = self._tgt_last = None
+        self._tgt_zero_at = None
+        self._tgt_at_last = None
+        if not old:                          # 首次選定
+            return
+        if first is None:
+            # 鎖定整段從沒看到血量>0：放棄的（15s 逃生／屍體判定），
+            # 這正是「打不中呆等」的樣子——記下來，附怪的位置算距離。
+            ev = {"ev": "target_giveup", "t": t, "who": self.name,
+                  "from": old, "to": eid, "secs": round(dur, 1),
+                  "old_at": old_at, "pos": row.get("pos")}
+            self.events.append(ev)
+            emit(ev)
+            if dur >= 8.0:
+                p0, p1 = row.get("pos"), old_at
+                dist = (p0 and p1 and
+                        round(math.hypot(p0[0] - p1[0], p0[1] - p1[1]), 1))
+                print(f"🕳 [{time.strftime('%H:%M:%S')}] {self.name} "
+                      f"鎖定 {dur:.0f} 秒血量不動放棄 {old:#x}"
+                      f"（我在 {p0}，怪在 {p1}，距離 {dist}）")
+            return
+        if last is not None and last <= 0:
+            verdict = "killed"              # 有看見死亡訊號才換＝正常
+        elif mn is not None and mn < first:
+            verdict = "premature"           # 打傷了、最後一眼還活著就換
+        else:
+            verdict = "no_damage"           # 沒打傷就換（規則允許）
+        ev = {"ev": "target_switch", "t": t, "who": self.name,
+              "from": old, "to": eid, "secs": round(dur, 1),
+              "first_hp": first, "min_hp": mn, "last_hp": last,
+              "verdict": verdict, "pos": row.get("pos"), "old_at": old_at}
+        self.n_switch += 1
+        if verdict == "killed":
+            self.n_kill += 1
+        self.events.append(ev)
+        emit(ev)
+        if verdict == "premature":
+            self.n_premature += 1
+            # 別急著喊：last_hp>0 也可能只是 10Hz 拍不到歸 0 的那一瞬
+            # （掛機在死亡訊號後 20ms 內就換走）。2 秒後回頭驗屍才算數。
+            self.pending_necro.append(
+                {"due": time.monotonic() + 2.0, "eid": old, "ev": ev})
 
     # -- 事件判讀 ----------------------------------------------------
     def judge(self, row: dict, emit) -> None:
         t, pos = row["t"], row.get("pos")
         prev = self.prev
         self.prev = row
+        self._track_target(row, emit)
         if pos is None:
             return
         pos = (pos[0], pos[1])
@@ -216,7 +322,8 @@ class Probe:
                 self.stalling = False
             self._anchor, self._anchor_t = pos, t
         elif (not self.stalling and t - self._anchor_t >= STALL_SECS
-              and row.get("anim") != "Sit"):
+              and row.get("anim") != "Sit"
+              and t - self._dmg_t > 5.0):   # 站定輸出中（遠程砲台）不算發呆
             self.stalling = True
             self.n_stall += 1
             self._stall_from = self._anchor_t
@@ -224,7 +331,9 @@ class Probe:
                   "at": [round(pos[0], 1), round(pos[1], 1)],
                   "anim": row.get("anim"), "conn": row.get("conn"),
                   "automove": row.get("automove"),
-                  "target": row.get("target")}
+                  "target": row.get("target"),
+                  "target_hp": row.get("target_hp"),
+                  "tgt_at": row.get("tgt_at")}
             self.events.append(ev)
             emit(ev)
             print(f"⚠ [{time.strftime('%H:%M:%S')}] {self.name} "
@@ -277,12 +386,57 @@ def main() -> int:
                         p.state = entity.locate_state(p.sc)
                     except Exception:
                         p.state = None
+                # 每秒一遍實體清單（首遍全掃、之後熱區）：
+                # ① 更新目標怪的位置（驗「走路終點是不是怪那格」）
+                # ② 驗屍（premature 換目標滿 2 秒的找舊目標死了沒）
+                ents = None
+                try:
+                    _, _, ents, hot, _ = entity.snapshot(p.sc,
+                                                         regions=p._hot)
+                    p._hot = hot or None
+                except Exception:
+                    p._hot = None
+                if ents is not None:
+                    want = p._tgt
+                    e = next((x for x in ents if x.eid == want), None)
+                    if e is not None:
+                        p.tgt_at = (e.eid, e.x, e.y)
+                    elif want:
+                        # 目前的目標在熱區找不到 → 熱區可能過期，下一輪全掃
+                        p._hot = None
+                # 屍體會躺著（中位 5 秒）所以「打死了」多半找得到 Dead；
+                # 還活著＝真放生實錘。結果丟回主迴圈印／寫檔（避免兩執行緒搶檔案）。
+                due = [q for q in p.pending_necro
+                       if time.monotonic() >= q["due"]]
+                if due:
+                    if ents is not None:
+                        p.pending_necro = [q for q in p.pending_necro
+                                           if q not in due]
+                        for q in due:
+                            e = next((x for x in ents
+                                      if x.eid == q["eid"]), None)
+                            if e is None:
+                                v = "gone"
+                                p.n_necro_gone += 1
+                            elif e.dead:
+                                v = "corpse"
+                                p.n_necro_corpse += 1
+                            else:
+                                v = "alive"
+                                p.n_necro_alive += 1
+                            p.necro_results.append(
+                                {"ev": "necropsy", "t": q["ev"]["t"],
+                                 "who": p.name, "eid": q["eid"], "verdict": v,
+                                 "state": e.state if e else None,
+                                 "at": e and [round(e.x, 1), round(e.y, 1)],
+                                 "switch_ev": q["ev"]})
             time.sleep(1.0)
 
     threading.Thread(target=state_loop, daemon=True).start()
 
     t0 = time.monotonic()
     last_conn = 0.0
+    last_report = 0.0
     with open(path, "w", encoding="utf-8") as fh:
         def emit(row: dict) -> None:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -319,6 +473,26 @@ def main() -> int:
                         continue
                     emit(row)
                     p.judge(row, emit)
+                    while p.necro_results:
+                        res = p.necro_results.popleft()
+                        emit(res)
+                        if res["verdict"] == "alive":
+                            p.events.append(res)
+                            se = res["switch_ev"]
+                            print(f"⚠⚠ [{time.strftime('%H:%M:%S')}] {p.name}"
+                                  f" 真放生實錘！{se['first_hp']}%→"
+                                  f"{se['last_hp']}% 打了 {se['secs']}s 就換，"
+                                  f"2 秒後那隻還活著"
+                                  f"（state={res['state']} 在 {res['at']}）")
+                if t - last_report >= 120.0:
+                    last_report = t
+                    for p in probes:
+                        print(f"[{time.strftime('%H:%M:%S')}] {p.name} 累計："
+                              f"換目標 {p.n_switch}"
+                              f"（見證死亡 {p.n_kill}、驗屍＝屍體 "
+                              f"{p.n_necro_corpse}、消失 {p.n_necro_gone}、"
+                              f"⚠還活著 {p.n_necro_alive}）"
+                              f"　回朔 {p.n_rollback}　發呆 {p.n_stall}")
                 fh.flush()
                 time.sleep(max(0.0, GAP - (time.monotonic() - t0 - t)))
         except KeyboardInterrupt:
@@ -329,7 +503,10 @@ def main() -> int:
     for p in probes:
         print(f"{p.name}　{p.rows} 拍　回朔 {p.n_rollback} 次"
               f"　發呆(≥{STALL_SECS:.0f}s) {p.n_stall} 段"
-              f"　斷線 {p.n_conn_drop} 次")
+              f"　斷線 {p.n_conn_drop} 次"
+              f"　換目標 {p.n_switch}（最後一眼還活著 {p.n_premature}："
+              f"驗屍屍體 {p.n_necro_corpse}／消失 {p.n_necro_gone}"
+              f"／⚠真活著 {p.n_necro_alive}）")
         for ev in p.events:
             if ev["ev"] == "rollback":
                 back = ev.get("back_secs")
@@ -337,6 +514,12 @@ def main() -> int:
                       f"{ev['from']}→{ev['to']}"
                       f"（落點{'＝%.0f 秒前的位置' % back if back else '不明'}，"
                       f"發呆中={ev['stalling']} 連線={ev['conn']}）")
+            elif ev["ev"] == "necropsy" and ev["verdict"] == "alive":
+                se = ev["switch_ev"]
+                print(f"  ⚠⚠ t={ev['t']:.0f}s 真放生："
+                      f"{se['first_hp']}%→{se['last_hp']}%"
+                      f" 打了 {se['secs']}s 就換，驗屍還活著"
+                      f"（state={ev['state']} 在 {ev['at']}）")
     print(f"\n逐拍紀錄：{path}")
     print("→ 把這個檔案路徑（和 farm_debug_*.log，如果有開）拿回來分析。")
     for p in probes:
