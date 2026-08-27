@@ -1,27 +1,29 @@
-"""活動分頁「自動使用活動硬幣」離線測試 —— offscreen Qt ＋ 假遊戲層。
+"""活動分頁離線測試（自動使用活動硬幣 ＋ 自動抽轉盤）—— offscreen Qt ＋ 假遊戲層。
 
     py tools\\event_check.py       （全 PASS 印 OK，有 FAIL 結束碼 1）
 
 驗的規格（2026-08-27 使用者定）：
 
-① 名字含關鍵字（預設「啤酒節」）**而且**有「x<數字>」的才使用；
-   沒有「x<數字>」的是**硬幣本體**，絕對不能動到。
-② 關鍵字空白 → 什麼都不做（安全預設，不然會把整袋帶 x 的東西吃掉）。
-③ ★★★ 送給遊戲的**格號**要是 `inventory.find_by_type()` 給的
-   （物品自己記的 +0x25），**不是** `bag.Item.slot`（陣列索引）——
-   表頭實測偏過 6 格，拿索引打封包會**用到別的東西**。
-④ 送出去 ≠ 成功：那個種類的總數變少了才算用掉；連 CONFIRM_TRIES 輪
-   沒變少就停下來（⛔ 不准無限重送，重送一次就可能多用掉一個）。
-⑤ 背包沒同步完（`bag.scan` 第二值 False）**不准**判「都用完了」。
+① 名字含「啤酒節」**而且**有「x<數字>」的才使用；沒有「x<數字>」的是
+   **硬幣本體**，絕對不能動到。
+② ★★★ 送給遊戲的**格號**要是 `inventory.find_by_type()` 給的（物品自己記的
+   `+0x25`），**不是** `bag.Item.slot`（陣列索引）—— 表頭實測偏過 6 格，
+   拿索引打封包會**用到別的東西**。
+③ 送出去 ≠ 成功：總數變少了才算用掉；連 `CONFIRM_TRIES` 輪沒變少就停
+   （⛔ 不准無限重送，重送一次就可能多用一個）。
+④ 背包沒同步完（`bag.scan` 第二值 False）**不准**判「都用完了」。
+⑤ 轉盤：**叫遊戲自己抽**。沒開視窗／正在轉一律拒絕；抽完靠**背包多了什麼**
+   對帳，沒多也照實記，不編故事。
 
-第①條同時**回頭對真的物品名表**：2026-08-27 官方在活動中途把銅幣編號
-從 79912 換成 87395、舊的改名「(舊)」—— 規則認名字不認編號，所以要能
-同時吃到新舊兩組，而且四種本體一個都不能中。
+第①條同時**回頭對真的物品名表**：2026-08-27 官方在活動中途把銅幣編號從
+79912 換成 87395、舊的改名「(舊)」—— 規則認名字不認編號，要能同時吃到新舊
+兩組，而且四種本體一個都不能中。
 """
 from __future__ import annotations
 
 import gzip
 import os
+import struct
 import sys
 import types
 
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import QApplication              # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
-from app.game import bag                                # noqa: E402
+from app.game import bag, roulette                      # noqa: E402
 from app.tabs import event_tab                          # noqa: E402
 
 FAILS: list[str] = []
@@ -70,52 +72,103 @@ BODY = [79912, 79913, 79914, 87395]                  # 四種本體
 STACKS = [i for i in list(range(79915, 79944)) + list(range(87396, 87403))
           if i in names]
 pool = [item(i) for i in BODY + STACKS if i in names]
-hits = {it.type_id for it in event_tab.pick_targets(pool, "啤酒節")}
+hits = {it.type_id for it in event_tab.pick_targets(pool)}
 check(f"{len(STACKS)} 種「x數字」全部會被使用",
       all(i in hits for i in STACKS),
       f"漏掉 {[i for i in STACKS if i not in hits]}")
-check("四種硬幣本體一個都不會被使用",
-      not any(i in hits for i in BODY),
+check("四種硬幣本體一個都不會被使用", not any(i in hits for i in BODY),
       f"誤中 {[(i, names[i]) for i in BODY if i in hits]}")
-check("新舊兩組銅幣都吃得到（改名不影響）",
-      87399 in hits and 79918 in hits)
-
-print()
-print("③ 關鍵字閘門與裝備保護")
-check("關鍵字空白 → 什麼都不做",
-      event_tab.pick_targets(pool, "  ") == [])
-check("關鍵字不符 → 不動作",
-      event_tab.pick_targets(pool, "幸運草") == [])
-gear = item(87399, gear=True)         # 名字有 x10 但它是裝備
+check("新舊兩組銅幣都吃得到（改名不影響）", 87399 in hits and 79918 in hits)
+check("關鍵字空白 → 什麼都不做", event_tab.pick_targets(pool, "  ") == [])
+check("關鍵字不符 → 不動作", event_tab.pick_targets(pool, "幸運草") == [])
 check("裝備不會被使用（關鍵字打太寬的保險）",
-      event_tab.pick_targets([gear], "啤酒節") == [])
+      event_tab.pick_targets([item(87399, gear=True)]) == [])
 
 print()
-print("④ 接線：挑一個 → 送出 → 對帳（跑真的 EventTab）")
+print("③ 轉盤狀態解析（跑真的 roulette.state）")
+MGR_PTR, OBJ_OFF, SPIN_FN, MGR = 0x9BD6AC, 0xC7D430, 0x6132F5, 0x39000000
+OBJ = MGR + OBJ_OFF
+SPOT = roulette.Spot(cmd_fn=0x58E66D, mgr_ptr=MGR_PTR, obj_off=OBJ_OFF,
+                     spin_fn=SPIN_FN)
 
-USED: list[int] = []
-ARRAY_SLOT = 30            # bag 給的陣列索引（★不可以拿它打封包）
-REAL_SLOT = 77             # 物品自己記的格號（+0x25）
 
+class RouletteSC:
+    """只換記憶體讀取；欄位版面交給真的 roulette.state 去解。"""
 
-class FakeSC:
-    def _read_bytes(self, a, n):
+    def __init__(self, kind=1, due=-1):
+        self.kind, self.due = kind, due
+
+    def module_base(self, m):
+        return 0x400000
+
+    def _read_bytes(self, addr, n):
+        if addr == MGR_PTR:
+            return struct.pack("<I", MGR)
+        if addr == OBJ:
+            b = bytearray(0x2C)
+            struct.pack_into("<I", b, 0x00, 0x37FD2D28)     # 參數1 的來源
+            b[roulette.OFF_KIND] = self.kind
+            struct.pack_into("<i", b, roulette.OFF_DUE_LO, self.due)
+            struct.pack_into("<i", b, roulette.OFF_DUE_HI, self.due)
+            return bytes(b)
         return None
+
+
+roulette.locate = lambda sc: SPOT          # 位址抽取另外驗（見下面第⑥節）
+st = roulette.state(RouletteSC(kind=1, due=-1))
+check("讀得到、視窗開著、沒在轉",
+      st is not None and st.open and not st.spinning and st.kind == 1)
+check("正在轉認得出來", roulette.state(RouletteSC(kind=1, due=1234)).spinning)
+check("0xFF ＝ 沒開", not roulette.state(RouletteSC(kind=0xFF)).open)
 
 
 class FakeMover:
     active = True
 
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.calls = []
 
+    def call_sync(self, fn, *args, ecx=None, timeout=None):
+        self.calls.append((fn, args, ecx))
+        return 1
+
+
+mv = FakeMover()
+ok, why = roulette.spin(mv, RouletteSC(kind=0xFF))
+check("⛔ 轉盤沒開就拒絕", not ok and "沒開" in why, why)
+check("拒絕的時候一次都沒叫下去", mv.calls == [])
+ok, why = roulette.spin(mv, RouletteSC(kind=1, due=999))
+check("⛔ 正在轉就拒絕", not ok and mv.calls == [], why)
+ok, why = roulette.spin(mv, RouletteSC(kind=3, due=-1))
+check("★ 抽的時候 ecx＝轉盤物件、參數＝遊戲自己記的種類",
+      ok and mv.calls == [(SPIN_FN, (3,), OBJ)], f"實得 {mv.calls}")
+
+print()
+print("④ 接線：用硬幣（跑真的 EventTab）")
+USED: list[int] = []
+ARRAY_SLOT, REAL_SLOT = 30, 77       # 陣列索引 vs 物品自己記的格號
 BAG = {"items": [], "complete": True}
 event_tab.bag = types.SimpleNamespace(
     scan=lambda sc: (list(BAG["items"]), BAG["complete"]),
-    head=lambda sc: (0x1000, 200),
-    Item=bag.Item)
+    head=lambda sc: (0x1000, 200), Item=bag.Item)
 event_tab.inventory = types.SimpleNamespace(
     find_by_type=lambda sc, h, tid: (REAL_SLOT, 0x2000, 1))
 event_tab.recall = types.SimpleNamespace(
     use_item=lambda mv, slot: (USED.append(slot), True)[1])
+ROU = {"state": roulette.State(obj=OBJ, kind=1, spinning=False),
+       "spin": (True, "已叫下去"), "draw": (True, "已送出"), "calls": []}
+event_tab.roulette = types.SimpleNamespace(
+    state=lambda sc: ROU["state"],
+    spin=lambda mv, sc: (ROU["calls"].append("spin"), ROU["spin"])[1],
+    draw=lambda mv, sc: (ROU["calls"].append("draw"), ROU["draw"])[1],
+    State=roulette.State, KIND_NONE=roulette.KIND_NONE)
+
+
+class FakeSC:
+    def _read_bytes(self, a, n):
+        return None
 
 
 def new_page():
@@ -124,46 +177,123 @@ def new_page():
     p._movers = {1: FakeMover()}
     p.who.addItem("測試", 1)
     p.who.setCurrentIndex(0)
-    p.key.setText("啤酒節")
-    p._running = True
     return p
 
 
 page = new_page()
+page._use_timer.start(999999)                 # 暫停狀態下 tick 不做事（見護欄）
 BAG["items"] = [item(87395, 7), item(87399, 3, slot=ARRAY_SLOT)]
 page._use_tick()
-check("挑的是有 x 的那個、本體沒被碰",
-      len(USED) == 1, f"實得 {USED}")
-check("★送出的格號是 find_by_type 給的（不是 bag 的陣列索引）",
+check("挑的是有 x 的那個、本體沒被碰", len(USED) == 1, f"實得 {USED}")
+check("★送出的格號是 find_by_type 給的（不是陣列索引）",
       USED == [REAL_SLOT], f"實得 {USED}（陣列索引是 {ARRAY_SLOT}）")
-check("送出後進入等對帳狀態", page._pending is not None)
-
-BAG["items"] = [item(87395, 7), item(87399, 2, slot=ARRAY_SLOT)]   # 3 → 2
+BAG["items"] = [item(87395, 7), item(87399, 2, slot=ARRAY_SLOT)]     # 3 → 2
 page._use_tick()
-check("總數變少了 → 記一筆成功", page._used == 1 and page.log.rowCount() == 1,
-      f"used={page._used} rows={page.log.rowCount()}")
+check("總數變少了 → 記一筆", page._used == 1 and page.log.rowCount() == 1)
+check("紀錄是「時間 ＋ 描述」兩欄，描述寫用了什麼",
+      page.log.columnCount() == 2
+      and "用了" in page.log.item(0, 1).text(),
+      page.log.item(0, 1).text() if page.log.item(0, 1) else "（空）")
 
 print()
 print("⑤ 沒變少不准無限重送；沒同步完不准說「用完了」")
 page = new_page()
 USED.clear()
-BAG["items"] = [item(87399, 3, slot=ARRAY_SLOT)]
+BAG["items"], BAG["complete"] = [item(87399, 3, slot=ARRAY_SLOT)], True
+page._use_timer.start(999999)                 # 假裝正在跑
 for _ in range(event_tab.CONFIRM_TRIES + 2):
-    page._use_tick()                       # 數量永遠不變 → 應該要自己停
-check("連續沒變少就停下來", page._running is False)
-check(f"⛔ 沒有無限重送（只送了 1 次）", len(USED) == 1, f"實得 {len(USED)} 次")
+    page._use_tick()
+check("連續沒變少就停下來", not page._use_timer.isActive())
+check("⛔ 沒有無限重送（只送了 1 次）", len(USED) == 1, f"實得 {len(USED)} 次")
 check("停下來有講原因", "沒變少" in page.status.text(), page.status.text())
+page._use_tick()                              # 暫停之後再叫也不准動
+check("★暫停之後再叫 tick 也不會再送", len(USED) == 1, f"實得 {len(USED)} 次")
 
 page = new_page()
 USED.clear()
-BAG["items"], BAG["complete"] = [], False      # 讀到空的，但沒同步完
+page._use_timer.start(999999)
+BAG["items"], BAG["complete"] = [], False
 page._use_tick()
 check("背包沒同步完 → 不准判「都用完了」",
-      page._running is True and "同步" in page.status.text(),
-      page.status.text())
+      page._use_timer.isActive() and USED == [])
 BAG["complete"] = True
 page._use_tick()
-check("真的空了才收工", page._running is False and "用完" in page.status.text(),
+check("真的空了才收工",
+      not page._use_timer.isActive() and "用完" in page.status.text(),
+      page.status.text())
+
+print()
+print("⑥ 接線：快速抽（勾「不等動畫」＝自己送 0x164）")
+page = new_page()
+BAG["items"], BAG["complete"] = [item(87395, 100)], True
+ROU["calls"].clear()
+page._spin_timer.start(999999)
+page._spin_tick()                                   # 送一發
+check("走的是 draw（不是 spin）", ROU["calls"] == ["draw"], f"實得 {ROU['calls']}")
+check("送完進入等背包變化", page._spin is not None and page._spin[0] == "fast")
+BAG["items"] = [item(87395, 90), item(79913, 4)]    # 扣 10 銅、得 4 銀
+page._spin_tick()
+check("背包有動靜 → 記一筆「抽到什麼」",
+      page._spins == 1 and "轉盤抽到" in page.log.item(0, 1).text()
+      and "銀幣" in page.log.item(0, 1).text(),
+      page.log.item(0, 1).text() if page.log.item(0, 1) else "（空）")
+
+page = new_page()
+BAG["items"] = [item(87395, 100)]
+ROU["calls"].clear()
+page._spin_timer.start(999999)
+page._spin_tick()
+page._spin = ("fast", 0.0, page._spin[2])           # 讓 FAST_WAIT 過去
+page._spin_tick()
+check("⛔ 送了卻沒動靜 → 暫停，不無限重送",
+      not page._spin_timer.isActive() and ROU["calls"] == ["draw"]
+      and "沒有任何變化" in page.status.text(), page.status.text())
+
+print()
+print("⑦ 慢速那條（不勾「不等動畫」）跟「不混用」")
+page = new_page()
+page.fast_cb.setChecked(False)
+BAG["items"], BAG["complete"] = [item(87395, 100)], True
+ROU["calls"].clear()
+page._spin_timer.start(999999)
+page._spin_tick()
+check("走的是 spin（請遊戲自己按）", ROU["calls"] == ["spin"], f"實得 {ROU['calls']}")
+check("進入等動畫的狀態機", page._spin[0] == "start")
+ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=True)
+page._spin_tick()
+check("看到開始轉", page._spin[0] == "run")
+ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=False)
+page._spin_tick()
+check("看到轉完", page._spin[0] == "settle")
+BAG["items"] = [item(87395, 90), item(79913, 4)]
+page._spin = ("settle", 0.0, page._spin[2])
+page._spin_tick()
+check("抽到什麼有記進歷史", page._spins == 1
+      and "轉盤抽到" in page.log.item(0, 1).text())
+
+page = new_page()
+ROU["calls"].clear()
+ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=True)   # 客戶端正在轉
+page._spin_timer.start(999999)
+page._spin_tick()
+check("★客戶端正在轉時一次都不送（不然同一轉兩包＝多扣一次）",
+      ROU["calls"] == [] and page._spin is None)
+
+page = new_page()
+page._spin_timer.start(999999)
+ROU["state"] = roulette.State(obj=OBJ, kind=roulette.KIND_NONE, spinning=False)
+page._spin_tick()
+check("轉盤關掉就收工",
+      not page._spin_timer.isActive() and "收工" in page.status.text(),
+      page.status.text())
+
+page = new_page()
+page._spin_timer.start(999999)
+ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=False)
+ROU["draw"] = (False, "⚠ 轉盤視窗沒開")
+page._spin_tick()
+check("叫不動就暫停＋講原因",
+      not page._spin_timer.isActive() and "沒開" in page.status.text(),
       page.status.text())
 
 print()
