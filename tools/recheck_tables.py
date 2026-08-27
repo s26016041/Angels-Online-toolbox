@@ -32,8 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
-from app.game import (bag, dailygift, energy, entity, itemname,   # noqa: E402
-                      locate, monsters, skillcost, skills)
+from app.game import (bag, dailygift, energy, entity, itemicon,  # noqa: E402
+                      itemname, locate, monsters, skillcost, skills)
 from app.paths import resource                        # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -318,6 +318,26 @@ def check_item_names(sc, tabs, lines):
             + ("　← 新道具，重新解包才會有" if unnamed else ""), True)
 
 
+def check_item_icons(sc, tabs, lines):
+    """道具圖示包（只驗**涵蓋率**：圖在資源包，記憶體裡沒有圖可比）。
+
+    圖示編號本身是從記憶體讀的（範本 +0x00），所以這裡問的是
+    「這一版遊戲用到的編號，assets/item_icons.zip 收得齊嗎」。
+    """
+    if not itemicon.count():
+        lines.append("    圖包沒載到 —— 跑 py tools\build_item_icons.py 產生")
+        return "assets/item_icons.zip 讀不到", False
+    its = bag.items(sc) + bag.items(sc, bag.WORN_FIRST, bag.WORN_LAST)
+    if not its:
+        return "背包讀不到東西", False
+    miss = sorted({i.icon_id for i in its if not itemicon.has(i.icon_id)})
+    if miss:
+        lines.append(f"    這些圖示編號沒有圖（會空白）：{miss[:20]}")
+    return (f"圖包 {itemicon.count()} 個編號；身上＋背包 {len(its)} 件，"
+            f"沒有圖 {len(miss)} 種"
+            + ("　← 新道具，重跑 build_item_icons.py" if miss else ""), True)
+
+
 CHECKS = (
     ("skill_range.tsv.gz（技能射程）", check_skill_range,
      "⛔ 過期後果：走位停太遠 → 零傷害，完全不報錯", True),
@@ -335,6 +355,8 @@ CHECKS = (
      "驗王／等級／滿血血量的來源", True),
     ("item_names（物品名稱）", check_item_names,
      "只影響顯示：查不到就顯示成編號，不會做錯事", False),
+    ("item_icons.zip（道具圖示）", check_item_icons,
+     "只影響顯示：查不到就沒有圖示，不會做錯事", False),
 )
 
 
