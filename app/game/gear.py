@@ -31,7 +31,13 @@
   用的另一組序號（HP/MP/攻/防…），順序不一樣，硬套會安靜地標錯屬性名。
 
 ⚠ 這些是結構偏移（CLAUDE.md 允許寫死的那一類，大更新才會壞）；改版後靠
-  `/_patchCheck` 的流程重驗，`tools/gear_check.py` 會把上面每一條逐項對一次。
+  `/_patchCheck` 的流程重驗 —— 不變量在 `tools/verify_offsets.py` 的
+  「裝備明細 gear.OFF_*/TMPL_*」那條（強化次數 0~15、孔 0~5 且孔外必須是 0、
+  寶石種類 ID 查得到名字、進階屬性編號認得出來、攻擊下限 ≤ 上限）。
+  ⚠⚠ 那條**一定要連身上穿的一起看**：背包裡的裝備幾乎都是 +0／0 孔，
+    全 0 的樣本驗不出版面對不對（偏移搬到隔壁照樣讀到 0、照樣印綠燈）。
+    ⛔ 2026-08-28 之前這裡寫的是「`tools/gear_check.py` 會逐項對一次」——
+      **那支從來沒存在過**，等於掛了一張沒人在驗的保證書。
 """
 from __future__ import annotations
 
@@ -65,15 +71,15 @@ TMPL_FLAGS = 0x14           # 旗標；bit 0xC 決定攻擊速度那行印原值
 TMPL_LEVEL = 0x34           # 物品等級      74/74
 TMPL_SKILL_LEVEL = 0x4C     # 技能等限      47/47
 TMPL_HP = 0x58              # 最大HP        （提示框 0x5EFF79）
-TMPL_MP = 0x60              # 最大MP
+TMPL_MP = 0x60              # 最大MP        （同上，item.xml 全量比對）
 TMPL_ATK_MIN = 0x6C         # 攻擊下限　★「平均攻擊 ± 攻擊變數」實測 1722/1808
-TMPL_ATK_MAX = 0x70         # 攻擊上限
+TMPL_ATK_MAX = 0x70         # 攻擊上限　★ 跟 ATK_MIN 同一輪實測 1722/1808
 TMPL_DEF = 0x74             # 防禦          （item.xml 防禦 100%）
 TMPL_MATK = 0x78            # 魔攻          （item.xml 魔攻 100%）
 TMPL_MDEF = 0x7C            # 魔防          （item.xml 魔防 100%）
 TMPL_HIT = 0x80             # 精準          （item.xml 精準 100%）
-TMPL_AGI = 0x84             # 靈敏
-TMPL_MOVE_SPEED = 0xC4      # 移動速度
+TMPL_AGI = 0x84             # 靈敏          （同上，item.xml 全量比對）
+TMPL_MOVE_SPEED = 0xC4      # 移動速度      （同上，item.xml 全量比對）
 TMPL_ATK_SPEED = 0xC8       # 攻擊速度      （item.xml 攻擊速度 100%）
 TMPL_RANGE = 0xCC           # 攻擊範圍      7/7
 TMPL_WEIGHT = 0xF8          # 重量          117/117

@@ -69,12 +69,14 @@ CMD_NAME = b"roulettestart\0"
 #   而且指令字串在 `0x3E2890`，離 4MB 邊界只剩 120KB，改版稍微長一點就整個掃不到。
 #   → 長度一律問作業系統要（`SizeOfImage`），FALLBACK 只在問不到時墊底。
 FALLBACK_SPAN = 0x800000
-CMD_BODY = 0x40             # 指令函式前 0x40 bytes 就夠抽出三個值
+CMD_BODY = 0x40             # 指令函式前 0x40 bytes 就夠抽出三個值（見檔頭「位址」節）
 
-OFF_PARAM1_PTR = 0x00       # → [這裡] 是封包參數1
-OFF_KIND = 0x0D             # 目前開著的轉盤種類；0xFF = 沒開
-OFF_DUE_LO = 0x20           # 這一轉的到期時刻（-1 = 沒在轉）
-OFF_DUE_HI = 0x24
+# 轉盤物件的欄位 —— **出處全在檔頭「轉盤物件的欄位」那張表**（2026-08-27 實測
+# 五台對照）。這裡各留一句，免得只看這幾行的人以為是猜的。
+OFF_PARAM1_PTR = 0x00       # → [這裡] 是封包參數1（實測剛抽過那台讀到 0x40）
+OFF_KIND = 0x0D             # 轉盤種類；0xFF=沒開（實測只有剛開過的那台是 1）
+OFF_DUE_LO = 0x20           # 到期時刻低位（實測五台全 -1 ＝ 沒在轉）
+OFF_DUE_HI = 0x24           # 到期時刻高位（同上，0x613718 送完就寫回 -1）
 KIND_NONE = 0xFF
 
 
@@ -121,7 +123,9 @@ def _module_span(scanner, base: int) -> int:
     return FALLBACK_SPAN
 
 
-CHUNK = 0x100000            # 分段讀的段大小（1MB）
+# 分段讀的段大小（1MB）。⚠ 不能整塊讀：映像有讀不到的段，一次讀整個會整批失敗；
+# 也不能砍半重試 —— 砍半會跳過字串（見上面 _read_image 的說明）。
+CHUNK = 0x100000
 
 
 def _read_image(scanner, base: int, span: int) -> bytes | None:

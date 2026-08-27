@@ -45,16 +45,24 @@ INBOUND_FN = 0x007122B0
 STOLEN = 7
 _EXPECT_PROLOGUE = bytes((0x55, 0x8B, 0xEC, 0x53, 0x8A, 0x5D, 0x10))
 
+# 施放廣播的封包版面。★ 出處：2026-08-18 首次攔到**入向明文包**，拿五台的
+# 實際施放逐欄比對出來的（memory `inbound-packet-cast-broadcast`）。
+# ⚠ 這是**封包版面**不是結構偏移 —— AOB 救不了（沒有指令可以當錨），
+#   只有官方改協定才會變，而那會讓 castwatch 收不到確認 → 掛機退回
+#   「等不到＝驗不了」那條安全路（不會亂補發，見 farm-attack-rules）。
 CAST_OP = 0x1D           # 施放廣播 opcode（offset 0，u16）
 CAST_SUB = 0x0301        # 主施放子類型（offset 6，u16）——只認這個
 OFF_CASTER = 2           # 施法者伺服器ID（u32）
 OFF_SUB = 6              # 子類型（u16）
 OFF_SKILL = 8            # 技能ID（u32）
 
-SRV_ID_OFF = 0x1D0       # 玩家實體 + 這個 = 我的施法者伺服器ID
+# 玩家實體 + 這個 ＝ 我的施法者伺服器ID（拿來認「這一包是不是我放的」）。
+# ⚠ 結構偏移，改版可能搬家；搬家的症狀是**永遠認不出自己的廣播**＝等不到確認，
+#   同樣退回安全路而不是亂送。實測五台的值都對得上自己的施放廣播。
+SRV_ID_OFF = 0x1D0
 
-_N = 512                 # 環槽數（2 的次方）
-_CAP = 16                # 每包記前幾 bytes（夠讀 op/caster/sub/skill）
+_N = 512                 # 環槽數（2 的次方）——我們自己的緩衝，跟遊戲無關
+_CAP = 16                # 每包記前幾 bytes（夠讀 op/caster/sub/skill 四欄）
 _SLOT = 4 + _CAP         # seq(4) + data
 _k32 = ctypes.windll.kernel32
 

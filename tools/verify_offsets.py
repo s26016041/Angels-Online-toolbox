@@ -33,7 +33,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from app.core import charname, preload                      # noqa: E402
 from app.core.memory import MemoryScanner                   # noqa: E402
-from app.game import bag, energy, entity, inventory         # noqa: E402
+from app.game import bag, energy, enhance, entity, gear      # noqa: E402
+from app.game import inventory, itemname                     # noqa: E402
 from app.game import locate, login, monsters, move, player  # noqa: E402
 from app.game import quickbar, scene, skillcost, skills     # noqa: E402
 from app.game import scenery, team, terrain                 # noqa: E402
@@ -67,6 +68,11 @@ COVERS: tuple[tuple[str, str], ...] = (
     # 伺服器清單那條：servers() 走 SRV_BEGIN/END/STRIDE 撈整張、每筆驗
     # port 範圍＋兩格分流數互驗＋名稱可讀 —— SRV_ 開頭的整組都吃這條。
     ("login", "SRV_"),
+    # 裝備明細那組（強化次數／孔／寶石／進階屬性＋範本基礎數值）。
+    # ⚠ gear.py 的檔頭原本寫「tools/gear_check.py 會逐項對一次」，
+    #   **那支根本不存在** —— 等於掛著一張沒人在驗的保證書（2026-08-28 /_audit）。
+    #   偏移的不變量本來就都住在這一支，所以補在這裡，不另開一支。
+    ("gear", "OFF_"), ("gear", "TMPL_"),
 )
 
 
@@ -332,6 +338,59 @@ def checks(sc, log):
         put("伺服器清單 login.SRV_*", good,
             "、".join(f"{nm}×{n}" for nm, n in srv) if srv
             else "APP 物件在、清單卻讀不到 —— SRV_* 版面八成搬家了")
+
+    # gear.OFF_*／TMPL_*：裝備明細的版面。搬家的樣子是**數值全部變成垃圾**，
+    # 所以驗的是「每一件裝備的每一欄都落在講得出道理的範圍」：
+    #   強化次數 0~15（enhance.MAX_LEVEL，使用者確認過的遊戲上限）
+    #   孔 0~5，且**孔以外的格子必須是 0**（版面對了才會剛好這樣）
+    #   鑲進去的寶石種類 ID 查得到名字（查不到＝那個欄位根本不是寶石 ID）
+    #   進階屬性的編號認得出來（ATTR_NAMES），數值 > 0
+    #   範本：攻擊下限 ≤ 上限、重量 ≥ 0、等級限制 0~200
+    # ⚠ 只有「真的讀到裝備」才下結論；背包沒掃完或身上沒裝備一律 NA。
+    # ⛔⛔ **一定要連身上穿的一起看**（WORN_FIRST~LAST）：背包裡的裝備幾乎都是
+    #   +0、0 孔、沒進階屬性，全 0 的樣本**驗不出任何東西** —— 偏移搬到隔壁
+    #   照樣讀到 0，照樣印綠燈。這正是 2026-08-25 晶能那個假綠燈的同一種錯
+    #   （全 0 也算通過），不能在這裡再犯一次。真有內容的是穿在身上那幾件
+    #   （實測五台：+10、5/5 孔、進階屬性都在身上這幾格）。
+    worn, worn_ok = gear.in_bag(sc, bag.WORN_FIRST, bag.WORN_LAST)
+    packed, pack_ok = gear.in_bag(sc)
+    gears, complete = worn + packed, (worn_ok and pack_ok)
+    # 「有東西可驗」＝ 至少有一件真的帶了強化／孔／進階屬性
+    meaty = any(g.enhance or g.holes or g.advs for g in gears)
+    if not complete:
+        put("裝備明細 gear.OFF_*/TMPL_*", NA, "背包沒掃完整，這一拍不算數")
+    elif not gears:
+        put("裝備明細 gear.OFF_*/TMPL_*", NA, "身上跟背包都沒有裝備")
+    elif not meaty:
+        put("裝備明細 gear.OFF_*/TMPL_*", NA,
+            f"{len(gears)} 件全是 +0／0 孔／沒進階屬性 —— 全 0 驗不出版面對不對")
+    else:
+        bad = []
+        for g in gears:
+            if not 0 <= g.enhance <= enhance.MAX_LEVEL:
+                bad.append(f"{g.name} 強化 {g.enhance}")
+            if not 0 <= g.holes <= gear.GEM_SLOTS:
+                bad.append(f"{g.name} 孔 {g.holes}")
+            if any(g.gems[g.holes:]):
+                bad.append(f"{g.name} 孔外還有寶石 {g.gems}")
+            for gid in g.gems_filled:
+                if not itemname.of(gid):
+                    bad.append(f"{g.name} 寶石 {gid} 查不到名字")
+            for aid, val in g.advs:
+                if aid not in gear.ATTR_NAMES or val <= 0:
+                    bad.append(f"{g.name} 進階屬性 {aid}={val}")
+            b = g.base
+            if b:
+                if b["atk_min"] > b["atk_max"]:
+                    bad.append(f"{g.name} 攻擊 {b['atk_min']}>{b['atk_max']}")
+                if b["weight"] < 0 or not 0 <= b["level_req"] <= 200:
+                    bad.append(f"{g.name} 重量 {b['weight']}／"
+                               f"等限 {b['level_req']}")
+        top = max(gears, key=lambda g: g.enhance)
+        put("裝備明細 gear.OFF_*/TMPL_*", not bad,
+            f"{len(gears)} 件全部合理（最高 +{top.enhance}"
+            f"、{len(top.gems_filled)}/{top.holes} 孔）" if not bad
+            else "；".join(bad[:3]))
     return out
 
 
