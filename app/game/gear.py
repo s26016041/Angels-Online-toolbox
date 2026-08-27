@@ -86,6 +86,22 @@ ATTR_NAMES: dict[int, str] = {
 }
 
 
+# 裝備類的分類代號 → 名字。★ 代號本身是從記憶體讀的（範本 +0x18），這裡只是
+# 把它翻成中文；對照關係是 `bag.py` 那份「+0x18 1:1 對到 item.xml 物品類別」
+# （2026-08-08 五台實測 23 種分類零衝突）驗過的那一份，**只用於顯示**。
+# ⚠ 認不得的代號一律顯示「分類N」，不猜。
+KIND_NAMES = {
+    2: "頭飾", 3: "衣服", 4: "手套", 5: "鞋子", 6: "飾品", 7: "背包",
+    8: "披風", 9: "劍", 10: "刀", 11: "斧", 12: "錘", 13: "槍", 14: "杖",
+    15: "弓箭", 16: "彈弓", 17: "盾",
+}
+
+
+def kind_name(kind: int) -> str:
+    """裝備分類的中文名；認不得就照實顯示代號。"""
+    return KIND_NAMES.get(kind, f"分類{kind}")
+
+
 def attr_name(attr_id: int) -> str:
     """屬性編號的名字；**認不得就照實顯示編號**（不猜、不套別張表）。"""
     return ATTR_NAMES.get(attr_id, f"屬性{attr_id}")
@@ -239,7 +255,8 @@ def tooltip(g: Gear) -> list[tuple[str, str]]:
     """
     it = g.item
     lines: list[tuple[str, str]] = [
-        (it.name, GRADE_COLOUR.get(it.grade, "#FFFFFF"))]
+        (it.name, GRADE_COLOUR.get(it.grade, "#FFFFFF")),
+        (kind_name(it.kind), GREY)]
     bonus = {aid: val for aid, val in g.advs}
     b = g.base
 
