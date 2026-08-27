@@ -236,29 +236,55 @@ def _base_stats(scanner, blob: bytes) -> dict[str, int]:
             for name, off in _BASE_FIELDS}
 
 
-def read(scanner, slot: int) -> Gear | None:
-    """讀某一格的裝備明細；那一格不是裝備／讀不到就回 None。
+# `read_state()` 的第二個回傳值。★ 這個三態是**安全關鍵**，不是裝飾：
+# 「讀不到」跟「那一格真的沒東西」在這條路上長得一模一樣（[[bag-false-empty-guards]]，
+# 復發六次），而 `enhance.py` 拿它判定「裝備是不是被強化錘打掉了」——
+# 把讀取失敗當成消失，會對著使用者宣告他的裝備沒了（2026-08-28 /_audit 抓到）。
+READ_OK = "ok"
+READ_UNREADABLE = "unreadable"   # 讀不到：換地圖／遊戲正在搬背包／頁面沒映射
+READ_ABSENT = "absent"           # **確定讀到了**，那一格是空的或不是裝備
+
+
+def read_state(scanner, slot: int) -> tuple["Gear | None", str]:
+    """(那一格的裝備, 為什麼沒有)。回 `READ_ABSENT` 才代表「真的不在」。
 
     ⚠ **每次要動作之前都要重讀一次**（`enhance.py` 就是這樣驗結果的）：
       強化失敗會讓裝備直接消失，先前那一拍讀到的東西可能已經不存在了。
+    ⛔ 呼叫端不准把 `None` 一律當「不見了」—— 要先看第二個值。
     """
     got = bag.head(scanner)
     if got is None:
-        return None
+        # 背包表頭讀不到：`bag.head` 自己已經重試過 HEAD_TRIES 次，
+        # 還是不行就是換地圖／還沒進場 —— 這時候什麼都不知道。
+        return None, READ_UNREADABLE
     begin, count = got
     if not 0 <= slot < count:
-        return None
-    ptr = struct.unpack_from(
-        "<I", bytes(scanner._read_bytes(begin + slot * 4, 4) or b"\0\0\0\0"), 0)[0]
+        return None, READ_UNREADABLE
+    raw = scanner._read_bytes(begin + slot * 4, 4)
+    if not raw:
+        return None, READ_UNREADABLE
+    ptr = struct.unpack_from("<I", bytes(raw), 0)[0]
     if not ptr:
-        return None
+        return None, READ_ABSENT          # 指標讀到了，是 0 ＝ 這格真的空著
     blob = scanner._read_bytes(ptr, bag.ITEM_SPAN)
     if not blob or len(blob) < bag.ITEM_SPAN:
-        return None
-    items = bag.scan(scanner, slot, slot)[0]
-    if not items or not items[0].is_gear:
-        return None
-    return _read_one(scanner, slot, items[0], bytes(blob))
+        return None, READ_UNREADABLE
+    items, complete = bag.scan(scanner, slot, slot)
+    if not items:
+        # 掃得完整才敢說「這格沒東西」；掃不完整就是讀不到
+        return None, (READ_ABSENT if complete else READ_UNREADABLE)
+    if not items[0].is_gear:
+        return None, READ_ABSENT          # 讀到了，但那不是裝備
+    return _read_one(scanner, slot, items[0], bytes(blob)), READ_OK
+
+
+def read(scanner, slot: int) -> Gear | None:
+    """讀某一格的裝備明細；那一格不是裝備／讀不到都回 None。
+
+    ⚠ 分不出「讀不到」與「不在了」——**要判定東西有沒有消失一律用
+      `read_state()`**，別用這支。
+    """
+    return read_state(scanner, slot)[0]
 
 
 def in_bag(scanner, first: int = bag.FIRST_SLOT,
