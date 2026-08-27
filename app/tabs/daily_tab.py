@@ -514,7 +514,7 @@ class DailyTab(BaseTab):
         else:
             self._log(label, self._ex_act(),
                       "⚠ 進遊戲了卻讀不到背包 —— 這台沒換，"
-                      "請跑 tools\\selfcheck.py 看是不是位址失效")
+                      "可能是官方改版了，跟 Claude 說一聲做改版體檢")
         return 0
 
     def _ex_begin(self, pid: int, label: str, cycle: int = 0,

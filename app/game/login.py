@@ -557,7 +557,7 @@ def _writable(*attrs: str) -> str:
     bad = [a for a in attrs if not locate.located("login", a)]
     if bad:
         return ("遊戲位址還沒驗證過（" + "、".join(bad) +
-                "）—— 可能是改版讓特徵失效了，先跑 py tools\\patch_doctor.py。")
+                "）—— 可能是官方改版了，跟 Claude 說一聲做改版體檢。")
     return ""
 
 
