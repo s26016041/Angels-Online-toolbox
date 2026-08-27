@@ -96,18 +96,33 @@ def checks(sc, log):
     if state is None:
         return out
 
-    # entity.OFF_TARGET：沒目標時是 0；有目標時必須是**現場某個實體的 ID**，
-    # 而且血量欄（+4）落在 0~100。這是「寫錯欄位」最直接的照妖鏡。
+    # entity.OFF_TARGET：沒目標時是 0；有目標時最好是**現場某個實體的 ID**，
+    # 而且血量欄（+4）落在 0~100。
+    # ⚠⚠ **「ID 不在實體清單裡」不算失敗。** 2026-08-27 實際踩到誤報：
+    #   目標怪被回收之後，遊戲**不會**把這個欄位清掉，所以留著一個死掉的
+    #   eid 是完全正常的（[[entity-list-churn]]：消失＝回收）。當時雪狐留著
+    #   0x4b96032d、血量欄 100，被判成「偏移搬家」——同一時間 action_check
+    #   寫 1270350671 讀回 1270350671、怪血真的掉，證明偏移好得很。
+    #   ★ 純讀分不出「舊目標」與「讀錯欄位」→ 只在**有正面證據是垃圾**時
+    #     才判 ✘（血量欄不在 0~100），其餘回 NA 並指路去 ⑤ 層。
+    #   ⛔ 別為了讓報告變綠而放寬 —— 亂喊狼來了跟漏抓一樣糟，會訓練人忽略紅燈。
     ok, tid, thp = entity.read_target_checked(sc, state)
     ids = {e.eid for e in ents}
     if not ok:
         put("目標欄位 entity.OFF_TARGET", NA, "狀態物件驗不過")
     elif tid == 0:
         put("目標欄位 entity.OFF_TARGET", NA, "目前沒有選定目標")
+    elif not 0 <= thp <= 100:
+        # 血量欄是遊戲自己維護的百分比，超出 0~100 ＝ 我們讀的根本不是那一組。
+        put("目標欄位 entity.OFF_TARGET", False,
+            f"ID {tid:#x} 血量欄 {thp} —— **不是 0~100 的百分比**，八成讀錯欄位")
+    elif tid in ids:
+        put("目標欄位 entity.OFF_TARGET", True,
+            f"ID {tid:#x}（在實體清單裡） 血量欄 {thp}")
     else:
-        put("目標欄位 entity.OFF_TARGET", tid in ids and 0 <= thp <= 100,
-            f"ID {tid:#x}{'（在實體清單裡）' if tid in ids else '（不在清單裡）'}"
-            f" 血量欄 {thp}")
+        put("目標欄位 entity.OFF_TARGET", NA,
+            f"ID {tid:#x} 不在清單裡（多半是舊目標被回收了）、血量欄 {thp} 合理"
+            " —— 純讀分不出來，要驗請跑 py tools\\action_check.py --yes")
 
     # team.MEMBERS_OFF：沒隊友時全 0（驗不了）；有隊友時 ID 必須是實體 ID
     # 或至少落在合理範圍，而且名字要是可讀字串。
