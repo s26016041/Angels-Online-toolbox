@@ -73,7 +73,7 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
-                      channel, entity,
+                      channel, entity, eventmap,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
@@ -222,6 +222,10 @@ REVIVE_RETRY = 5.0
 # 復活整趟最多等多久。超過就當流程斷了（標記點沒設？封包沒生效？）：
 # 停機並通知 —— 使用者是掛網離開的，要叫得動他。
 DEATH_WAIT_MAX = 90.0
+# ★ 活動地圖（暴走穗海農場那種）的死亡回程要久得多：趴趴GO 到不了，得飛去
+#   天使學園、走到啤酒節使者旁邊、講三次話、再等載圖（見 app/game/eventmap.py）。
+#   拿 90 秒去卡它等於每次都判失敗停機，所以那條路另外給一個大很多的上限。
+DEATH_EVENT_MAX = 300.0
 # 多久可以重下一次移動指令。★ 單次指令只走得到約 15 格（見 app/game/move.py
 # 的 MAX_HOP），長距離是靠這裡定期重下、一段一段接力走完的，所以不能太久。
 # ★ 下一次移動指令最少隔多久。**而且角色還在走時一律不下**（見 tick）。
@@ -1706,6 +1710,16 @@ class CharFarmPage(QWidget):
         # ⚠ 不是 bool：等超過 JUMP_LAND_SECS 沒到就要當那一包沒生效、再送一次。
         self._death_jumped = None
         self._death_closed = False # 死亡選擇視窗已經關掉了（一次死亡只關一次）
+        # 活動地圖的死亡回程（趴趴GO 到不了 → 走活動 NPC 的對話選單，
+        # 整段阻塞所以丟背景執行緒；見 _death_event_return）
+        self._death_thread = None
+        self._death_ev_result = None    # (成功了嗎, 說明)；None = 還沒回來
+        self._death_ev_progress = ""    # 背景執行緒的最新進度字串
+        self._death_max = DEATH_WAIT_MAX  # 這一次死亡回程的總逾時（活動地圖會放寬）
+        # 巡邏點右鍵「走去活動地圖」的背景工作（見 _evgo_tick / _fly_to_event）
+        self._evgo_thread = None
+        self._evgo_result = None
+        self._evgo_progress = ""
         self._mover: move.Mover | None = None
         self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
         self._castwatch = None       # 施放廣播監聽（首發＋補分身的 100% 確認用）
@@ -2133,6 +2147,21 @@ class CharFarmPage(QWidget):
         #   而且用 _NoteLabel（不列入寬度計算、過長截斷）。
         self.jump_lbl = _NoteLabel()
         sup_v.addLayout(c)
+        # ★ 測試鈕（2026-08-27 使用者要求）：不必等裝備真的壞，直接跑一趟
+        #   **真的**回程補給，用來驗活動地圖（暴走穗海農場）的回程走不走得通。
+        #   ⚠ 走的就是壞裝觸發那條路（_start_supply → supply.run_full_supply），
+        #     不是另做一套 —— 測到的才是真的（memory test-via-button 的教訓）。
+        t = QHBoxLayout()
+        self.test_supply_btn = QPushButton("🧪 測試：假裝裝備壞掉，馬上回去補給")
+        self.test_supply_btn.setToolTip(
+            "馬上跑一趟真的回程補給，用來測活動地圖回得來嗎。\n"
+            "跟裝備真的壞掉走同一條路：天使之翼回城→存倉→修裝→買水→回記錄點"
+            "（活動地圖走活動 NPC 的對話選單回去）。\n"
+            "⚠ 會真的用掉一張天使之翼、真的花錢買東西。")
+        self.test_supply_btn.clicked.connect(self._test_supply)
+        t.addWidget(self.test_supply_btn)
+        t.addStretch(1)
+        sup_v.addLayout(t)
         sup_v.addWidget(self.jump_lbl)
         grid.addWidget(g_sup, 2, 0, 1, 2)
 
@@ -2538,6 +2567,12 @@ class CharFarmPage(QWidget):
         self._death_sent = False
         self._death_jumped = None
         self._death_closed = False
+        # 活動地圖那條路的狀態每次死亡都重來（上一趟的結果不准留著被誤讀）
+        self._death_ev_result = None
+        self._death_ev_progress = ""
+        self._death_max = (DEATH_EVENT_MAX
+                           if eventmap.for_scene(self._death_scene)
+                           else DEATH_WAIT_MAX)
         # 我們自己完全讓開（跟交棒補給時一樣）：不送技能鍵、不寫目標
         self._keys.set_on(False)
         self._atk.hold_off()
@@ -2549,6 +2584,54 @@ class CharFarmPage(QWidget):
             self._supply_gen += 1
         self.status.setText(f"☠ 角色死亡 → {DEATH_REVIVE_SECS:.0f} 秒後"
                             "送「回標記點」復活…")
+
+    def _death_event_return(self, route) -> bool:
+        """死亡回程的**活動地圖版**：走活動 NPC 的對話選單回去。
+
+        趴趴GO 的傳送表裡沒有活動地圖，所以原本那條「送一包等落地」的路
+        整個不適用。這裡要飛去 NPC 那張城鎮圖、走到 NPC 旁邊、講三次話、
+        再等載圖 —— 整段是阻塞式的（`eventmap.go_back`），所以跟回程補給
+        一樣丟**背景執行緒**跑，這一拍只負責顯示進度與收結果，不凍畫面。
+
+        ⚠ 成功不在這裡判：人真的落地之後，下一拍上面的 `back`
+          （`scene.same_map`）就會看到，照原路接回自動戰鬥。
+        ⚠ 逾時由 `self._death_max`（DEATH_EVENT_MAX）兜底。
+        """
+        t = self._death_thread
+        if t is not None and t.is_alive():
+            self.status.setText(
+                f"★ 復活了 → 回{route.name}中…{self._death_ev_progress}")
+            return True
+        if self._death_ev_result is not None:
+            ok, msg = self._death_ev_result
+            self._death_ev_result = None
+            if not ok:
+                self._death_fail(msg)        # 大聲停機＋通知（不無聲卡住）
+            # 成功的話什麼都不用做：下一拍 `back` 會看到人已經在練功圖上。
+            return True
+        # ⚠ 跳板裝不起來是**暫時性失敗**：下一拍再試，別為了它直接停機。
+        if not self._ensure_mover():
+            self.status.setText("★ 復活了 → 跳板裝不起來，再試著回活動地圖…")
+            return True
+        mv, sc, sid = self._mover, self.sc, self._death_scene
+        self._death_ev_progress = ""
+
+        def _worker():
+            try:
+                res = eventmap.go_back(
+                    mv, sc, sid,
+                    say=lambda m: setattr(self, "_death_ev_progress", m))
+            except Exception as exc:                      # noqa: BLE001
+                res = (False, f"回{route.name}出錯：{exc}")
+            self._death_ev_result = res
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._death_thread = t
+        t.start()
+        self._drop_cached_addrs()            # 這一趟會換好幾次地圖
+        self.status.setText(f"★ 復活了 → 走去找{route.npc_name}"
+                            f"回{route.name}…")
+        return True
 
     def _death_fail(self, why: str) -> None:
         """死亡回程走不下去 → 停機＋通知。
@@ -2576,9 +2659,9 @@ class CharFarmPage(QWidget):
             return False
         self._death_t += dt
         self._death_poll += dt
-        if self._death_t >= DEATH_WAIT_MAX:
+        if self._death_t >= self._death_max:
             self._death_fail(
-                f"死亡回程超過 {DEATH_WAIT_MAX:.0f} 秒沒完成"
+                f"死亡回程超過 {self._death_max:.0f} 秒沒完成"
                 "（「回標記點」沒生效？標記點沒設或在別張地圖？）")
             return True
         if self._death_poll < DEATH_POLL:
@@ -2628,6 +2711,12 @@ class CharFarmPage(QWidget):
             if self._death_scene is None:
                 self._death_fail("死亡時不知道人在哪張地圖，沒辦法傳回去")
                 return True
+            # ★ 活動地圖（暴走穗海農場）不在趴趴GO 清單裡 —— 改走活動 NPC 的
+            #   對話選單回去（見 _death_event_return）。活動結束、eventmap
+            #   那邊的 ROUTES 清空之後，這裡自動退回下面原本的趴趴GO 路。
+            route = eventmap.for_scene(self._death_scene)
+            if route is not None:
+                return self._death_event_return(route)
             pos = self._death_pos or (None, None)
             e = jumpmap.nearest(self._death_scene, pos[0], pos[1])
             if e is None:
@@ -2790,6 +2879,34 @@ class CharFarmPage(QWidget):
         t.start()
         self.status.setText(f"🔧 {why} → 開始跑補給（存倉庫→修裝→買水→趴趴GO回來）…")
         return True
+
+    def _test_supply(self) -> None:
+        """🧪 測試鈕：假裝裝備壞掉，馬上跑一趟**真的**回程補給。
+
+        2026-08-27 使用者要求：活動地圖（暴走穗海農場）的回程要能實機驗，
+        但總不能等裝備真的耐久剩 1。所以這裡直接叫 `_start_supply` ——
+        跟壞裝觸發**完全同一條路**（背景執行緒跑 `supply.run_full_supply`），
+        沒有另做一套測試專用流程（那只會測到替身）。
+
+        ⚠ 不必先勾「開始掛機」：`tick()` 沒勾掛機那條路也會輪詢 `_supply_tick`
+          （見那裡的說明），所以進度、完成、逾時都照樣有人管。
+        """
+        if self._supply:
+            self.status.setText("🧪 已經在跑補給了，等這一趟跑完再測")
+            return
+        if self._death:
+            self.status.setText("🧪 死亡回程進行中，等它結束再測")
+            return
+        if not self._ensure_mover():
+            self.status.setText("🧪 跳板裝不起來，測試補給沒辦法開始")
+            return
+        # 記錄點＝要飛回哪裡。跟按「開始掛機」同一套（巡邏點優先，見 _pick_home）
+        # —— 不重挑的話會沿用上一次掛機留下的舊記錄點，測出來的是別張圖。
+        self._pick_home()
+        home = self._home
+        where = scene.scene_name(home[2]) if home else "出發當下的位置"
+        if not self._start_supply(f"🧪 測試：假裝裝備壞掉（回程目標：{where}）"):
+            return          # 失敗原因 _start_supply 已經寫在狀態列上了
 
     def _end_supply(self, why: str, stop: bool = False) -> None:
         """補給收工，恢復打怪。stop=True 代表補給失敗，順便停掉掛機並通知。
@@ -3751,9 +3868,14 @@ class CharFarmPage(QWidget):
         menu = QMenu(self.spot_list)
         act = menu.addAction("✈ 用天使趴趴GO飛到這張圖（記錄點跟著改）")
         # 飛不了的原因直接寫在選單項上（QMenu 的滑鼠提示預設不顯示）
+        route = eventmap.for_scene(sid)
         if sid is None:
             act.setEnabled(False)
             act.setText("✈ 這個點沒記地圖，不能飛（刪掉重加）")
+        elif route is not None:
+            # 活動地圖不在趴趴GO 清單裡：改走活動 NPC 的對話選單（見 eventmap）
+            act.setText(f"🍺 走去找{route.npc_name}，進"
+                        f"{route.label(scene.subspace(sid))}（記錄點跟著改）")
         elif jumpmap.nearest(sid, x, y) is None:
             # 表裡沒這張圖的落點（或 jumpmap.tsv 缺檔）→ 拒絕動作，不猜
             act.setEnabled(False)
@@ -3773,6 +3895,11 @@ class CharFarmPage(QWidget):
         x, y, sid = self._spots[row]
         if sid is None:
             return
+        # ★ 活動地圖：趴趴GO 到不了，改走活動 NPC 的對話選單（背景執行緒）
+        route = eventmap.for_scene(sid)
+        if route is not None:
+            self._fly_to_event(route, sid, x, y)
+            return
         e = jumpmap.nearest(sid, x, y)
         if e is None:
             self.status.setText(f"⚠ 趴趴GO沒有去{scene.scene_name(sid)}的傳送點")
@@ -3790,6 +3917,60 @@ class CharFarmPage(QWidget):
         # 飛過去＝記錄點也跟著過去（2026-08-18 使用者要求）
         self._set_home(x, y, sid)
         self.status.setText(f"✈ {msg}（記錄點已改成這個巡邏點）")
+
+    def _fly_to_event(self, route, sid: int, x: float, y: float) -> None:
+        """右鍵「走去活動地圖」：飛去 NPC 那張圖、走過去、講話進場。
+
+        整段是阻塞式（`eventmap.go_back`，含載圖等待），所以丟背景執行緒跑；
+        進度／結果由 `_evgo_tick` 每一拍顯示，畫面不會凍。
+        ⚠ 補給／死亡回程在跑時不准插隊 —— 那兩條也在開車，兩邊同時走位會打架。
+        """
+        if self._supply or self._death:
+            self.status.setText("⚠ 補給／死亡回程進行中，等它跑完再走去活動地圖")
+            return
+        t = self._evgo_thread
+        if t is not None and t.is_alive():
+            self.status.setText("⚠ 已經在走去活動地圖了，等這一趟跑完")
+            return
+        if not self._ensure_mover():
+            self.status.setText("⚠ 無法啟用移動，走不過去")
+            return
+        mv, sc = self._mover, self.sc
+        want = route.label(scene.subspace(sid))
+        self._evgo_result = None
+        self._evgo_progress = f"走去找{route.npc_name}，進{want}…"
+
+        def _worker():
+            try:
+                res = eventmap.go_back(
+                    mv, sc, sid,
+                    say=lambda m: setattr(self, "_evgo_progress", m))
+            except Exception as exc:                      # noqa: BLE001
+                res = (False, f"走去{route.name}出錯：{exc}")
+            self._evgo_result = res
+
+        self._evgo_thread = threading.Thread(target=_worker, daemon=True)
+        self._evgo_thread.start()
+        # 飛過去＝記錄點也跟著過去（跟趴趴GO 那條同一個規則，2026-08-18 使用者要求）
+        self._set_home(x, y, sid)
+        self.status.setText(f"🍺 {self._evgo_progress}（記錄點已改成這個巡邏點）")
+
+    def _evgo_tick(self) -> bool:
+        """「走去活動地圖」進行中回 True（呼叫端整個讓開）。"""
+        t = self._evgo_thread
+        if t is not None and t.is_alive():
+            self.status.setText(f"🍺 {self._evgo_progress}")
+            return True
+        if self._evgo_result is not None:
+            ok, msg = self._evgo_result
+            self._evgo_result = None
+            self._evgo_thread = None
+            # 換過地圖：快取位址與導航路線全作廢（同趴趴GO 那條）
+            self._drop_cached_addrs()
+            self._forget_routes()
+            self._since_scan = SCAN_NOW
+            self.status.setText(("★ " if ok else "⚠ ") + msg)
+        return False
 
     def _ensure_mover(self) -> bool:
         """需要移動時才安裝 hook —— 沒用到就不要在遊戲裡放程式碼。
@@ -5018,10 +5199,25 @@ class CharFarmPage(QWidget):
         # ⚠ 動作照舊讓路：`_ball_hold()` 有字就只更新數字、不動手。
         self._ball_tick(dt, self._ball_hold())
 
+        # ★ 巡邏點右鍵「走去活動地圖」：那段是我們在開車（飛、走路、跟 NPC
+        #   講話），進行中就整個讓開 —— 不管掛機勾著沒，都不能同時打怪／
+        #   下移動指令。放在掛機勾選的判斷之前，兩種情形都顧得到。
+        if self._evgo_tick():
+            return
+
         if not self.run_cb.isChecked():
+            # ★★ 補給的輪詢**不看掛機勾選**（2026-08-27 加）：
+            #   · 🧪 測試鈕可以在沒掛機的時候開一趟；
+            #   · 使用者也可能在補給跑到一半把掛機關掉。
+            #   沒人輪詢的話背景執行緒跑完沒人收結果、逾時保險也不會響，
+            #   畫面就永遠停在「回程補給中…」（跟 2026-08-09 那個
+            #   「趴趴GO 傳送中…」永遠沒人管是同一型的坑）。
+            #   補給中一樣整個讓開，不做下面那些事。
+            if self._supply_tick(dt):
+                return
             # ★ 自動分身／自動召喚獨立於掛機（使用者 2026-08-13：手動打王
-            #   不開掛機也要能補）。補給／死亡回程／巡迴換頻是掛機才有的
-            #   狀態，這條路不會經過，所以不必讓路。
+            #   不開掛機也要能補）。死亡回程／巡迴換頻是掛機才有的狀態，
+            #   這條路不會經過，所以不必讓路。
             self._companion_tick()
             # ★ 自動練技也獨立於掛機（互斥）：開關看門狗＋藥水見底＋補給趟
             #   全在它自己的心跳裡（見 _train_tick）。

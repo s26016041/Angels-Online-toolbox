@@ -184,6 +184,146 @@ for route in eventmap.ROUTES:
         print(f"  － 跳過資源包比對（{exc}）")
 
 print()
+print("⑤ 掛機分頁的接線（offscreen Qt ＋ 假遊戲層，跑的是真的 farm_tab）")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import types                                            # noqa: E402
+from PySide6.QtWidgets import QApplication              # noqa: E402
+
+APP = QApplication.instance() or QApplication([])
+from app.tabs import farm_tab                           # noqa: E402
+
+
+class FakeSC:
+    def _read_bytes(self, addr, n):
+        return None
+
+    def alive(self):
+        return True
+
+
+class InlineThread:
+    """背景執行緒改成同步跑，測試才是決定性的（跟 train_check 同一招）。"""
+
+    def __init__(self, target=None, args=(), daemon=None):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+    def is_alive(self):
+        return False
+
+
+class FakeSupply:
+    """只換 I/O：記下每趟 run_full_supply 收到什麼，其他照真的跑。"""
+
+    SHOP_TABLE = {4836: (2, 30)}
+
+    def __init__(self):
+        self.trips = []
+
+    def shop_sells(self, tid):
+        return True
+
+    def run_full_supply(self, mv, sc, say=None, back_to=None, potions=None,
+                        potion_only=False, ledger=None):
+        self.trips.append({"back_to": back_to})
+        if say:
+            say("測試補給中…")
+        return True, "測試補給完成"
+
+
+SUPPLY = FakeSupply()
+GOBACK: list[int] = []          # eventmap.go_back 被叫到時記下 scene_id
+JUMPED: list[int] = []          # jumpmap.teleport 被叫到時記下 jump_id
+farm_tab.supply = SUPPLY
+farm_tab.threading = types.SimpleNamespace(Thread=InlineThread)
+# ⚠ 只換「會碰到遊戲」的那兩支，其他（for_scene / ROUTES / nearest / label）
+#   全部跑真的 —— 換掉整個模組就會變成在測替身（memory test-via-button）。
+eventmap.go_back = (lambda mv, sc, sid, say=None:
+                    (GOBACK.append(sid), (True, "已進到暴走穗海農場分流2"))[1])
+jumpmap.teleport = (lambda mv, sc, jid:
+                    (JUMPED.append(jid), (True, "已送出傳送"))[1])
+# 背包／精靈那兩支讀的是真記憶體，這裡給決定性的答案（有翼、不買藥水）
+farm_tab.robot.has_recall_item = lambda sc, inv: (5, 30)
+farm_tab.robot.potion_buy_ids = lambda mv, sc, pid: None
+
+EVENT_SPOT = (45.0, 16.0, (1 << scene.SUBSPACE_SHIFT) | 441)   # 分流2 的巡邏點
+PLAIN_SPOT = (10.0, 137.0, 6)                                   # 穗海農場
+
+
+def build_page():
+    sc = FakeSC()
+    page = farm_tab.CharFarmPage(
+        1234, 0, "t", sc, lambda pid, full=False: True,
+        farm_tab.TargetWorker(sc), farm_tab.KeyWorker(0, sc),
+        account="acct", char_name="小狐")
+    page._ensure_mover = lambda: True
+    page._mover = types.SimpleNamespace(active=True)
+    page.cur_scene = lambda: EVENT_SPOT[2]
+    page.my_pos = lambda: (EVENT_SPOT[0], EVENT_SPOT[1])
+    page.inv = 0x1000
+    page._sync_castwatch = lambda: None
+    page._keys.begin_learning = lambda: None
+    page._buff.armed = True
+    page._summon.armed = True
+    page.notify = lambda msg: None
+    page._drop_cached_addrs = lambda: None
+    return page
+
+
+if not eventmap.ROUTES:
+    print("  － 沒有登記的活動地圖，跳過")
+else:
+    ROUTE = eventmap.ROUTES[0]
+
+    page = build_page()
+    page._spots = [EVENT_SPOT]
+    page._test_supply()
+    check("🧪 測試鈕真的開了一趟補給", len(SUPPLY.trips) == 1,
+          f"實得 {SUPPLY.trips}")
+    check("回程目標＝活動地圖那個巡邏點（含分流序號）",
+          SUPPLY.trips and SUPPLY.trips[0]["back_to"] == EVENT_SPOT,
+          f"實得 {SUPPLY.trips[0]['back_to'] if SUPPLY.trips else None}")
+    check("跑完自己收工（_supply_tick 收得到結果）",
+          page._supply_tick(0.1) is True and page._supply is False)
+
+    page = build_page()
+    page._death_scene = EVENT_SPOT[2]
+    GOBACK.clear()
+    page._death_event_return(ROUTE)
+    check("死亡回程走活動 NPC（不是趴趴GO）", GOBACK == [EVENT_SPOT[2]],
+          f"實得 {GOBACK}")
+    check("結果收得回來、不會卡著",
+          page._death_event_return(ROUTE) is True
+          and page._death_ev_result is None)
+    check("活動地圖的死亡回程逾時放寬",
+          farm_tab.DEATH_EVENT_MAX > farm_tab.DEATH_WAIT_MAX)
+
+    page = build_page()
+    page._spots = [EVENT_SPOT]
+    GOBACK.clear()
+    page._fly_to_spot(0)
+    check("巡邏點右鍵：活動地圖走 NPC 對話", GOBACK == [EVENT_SPOT[2]],
+          f"實得 {GOBACK}")
+    check("飛過去＝記錄點跟著改", page._home == EVENT_SPOT,
+          f"實得 {page._home}")
+    check("走完把結果收掉（_evgo_tick 不會永遠回 True）",
+          page._evgo_tick() is False and page._evgo_result is None)
+
+    page = build_page()
+    page._spots = [PLAIN_SPOT]
+    GOBACK.clear()
+    JUMPED.clear()
+    page._fly_to_spot(0)
+    check("一般地圖的巡邏點**不會**被導去活動 NPC", GOBACK == [],
+          f"實得 {GOBACK}")
+    check("一般地圖照舊送趴趴GO",
+          JUMPED == [jumpmap.nearest(PLAIN_SPOT[2], PLAIN_SPOT[0],
+                                     PLAIN_SPOT[1]).jump_id],
+          f"實得 {JUMPED}")
+
+print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
     sys.exit(1)
