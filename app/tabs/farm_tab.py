@@ -1765,6 +1765,11 @@ class CharFarmPage(QWidget):
         self._rot_home = 0           # 出發時在哪一頻（只給顯示用）
         self._rot_max = 0            # 這台伺服器有幾個分流（開始巡迴時讀）
         self._rot_last = ""          # 上次顯示的巡迴文字（沒變就不重畫）
+        # ★ 打王換頻道（2026-08-28 使用者要求）：跟「自動換頻」**擇一**，
+        #   一輪的走法完全一樣，只是引信不同 —— 不看時間，改成
+        #   「確認打死一隻王」就當場出發。
+        self._rot_boss_hit = False   # 打到王了，下一拍出發（跑起來就清掉）
+        self._rot_sync = False       # 兩個勾選互斥時的遞迴防護
         # ⛔⛔ 「坐下休息」整組狀態（_rest／_rest_why／_sit_want／_hp_pct…）
         #   2026-08-09 依使用者要求**整個移除**。原話：
         #   「我用這程式是想練等快速，但如果需要休息、水跟不上，
@@ -2061,7 +2066,8 @@ class CharFarmPage(QWidget):
         r = QHBoxLayout()
         self.rot_cb = QCheckBox("自動換頻")
         self.rot_cb.setToolTip(
-            "依序換過每一頻再回到原本那一頻，停留期間照常掛機。")
+            "時間到就依序換過每一頻再回到原本那一頻，停留期間照常掛機。\n"
+            "跟「打王換頻道」只能擇一。")
         r.addWidget(self.rot_cb)
         r.addWidget(QLabel("每"))
         self.rot_every = QDoubleSpinBox()
@@ -2070,7 +2076,9 @@ class CharFarmPage(QWidget):
         self.rot_every.setDecimals(0)
         self.rot_every.setValue(30.0)
         fit_spin(self.rot_every)
-        self.rot_every.setToolTip("隔多久開始新的一輪巡迴（從上一輪開始算）。")
+        self.rot_every.setToolTip(
+            "隔多久開始新的一輪巡迴（從上一輪開始算）。\n"
+            "只有「自動換頻」在用 —— 勾「打王換頻道」時整格反灰。")
         r.addWidget(self.rot_every)
         r.addWidget(QLabel("分一輪，每頻"))
         self.rot_stay = QDoubleSpinBox()
@@ -2079,12 +2087,32 @@ class CharFarmPage(QWidget):
         self.rot_stay.setDecimals(0)
         self.rot_stay.setValue(60.0)
         fit_spin(self.rot_stay)
-        self.rot_stay.setToolTip("換到一頻之後待多久才換下一頻（照常打怪）。")
+        self.rot_stay.setToolTip(
+            "換到一頻之後待多久才換下一頻（照常打怪）。\n"
+            "兩種換頻方式共用這一格。")
         r.addWidget(self.rot_stay)
         r.addWidget(QLabel("秒"))
         r.addStretch(1)
+        # ── 打王換頻道（2026-08-28 使用者要求）─────────────────
+        # ★ 跟「自動換頻」**二選一**，共用上面那兩個數字：一輪的走法一模一樣
+        #   （繞完每一頻、每頻停「每頻 N 秒」、回到原本那一頻），差別只在引信
+        #   —— 這邊**完全不看「每 N 分一輪」**，改成打死一隻王就當場出發。
+        r2 = QHBoxLayout()
+        self.rot_boss_cb = QCheckBox("打王換頻道")
+        self.rot_boss_cb.setToolTip(
+            "打死一隻王就馬上跑一輪完整的巡迴（不看「每 N 分一輪」）。\n"
+            "跑完回到原本那一頻等下一隻王；巡迴途中再打到王不另外排。\n"
+            "跟「自動換頻」只能擇一。")
+        r2.addWidget(self.rot_boss_cb)
+        r2.addStretch(1)
+        # ★ 互斥與「每 N 分一輪」反灰都走同一支（_on_rot_mode）。
+        #   ⚠ 接在 _wire_saving 之前 —— 訊號照連接順序跑，互斥要先做完
+        #   才輪到存檔，不然會存到還沒同步的狀態。
+        self.rot_cb.toggled.connect(self._on_rot_mode)
+        self.rot_boss_cb.toggled.connect(self._on_rot_mode)
         self.rot_lbl = _NoteLabel()
         rot_v.addLayout(r)
+        rot_v.addLayout(r2)
         rot_v.addWidget(self.rot_lbl)
         # ⚠ 「坐下休息」拆掉之後 (1,0) 空了出來 —— 這裡改成**跨兩欄**，
         #   而不是留一個空格子（左邊空一大塊很難看，右欄的寬度又是
@@ -3638,6 +3666,52 @@ class CharFarmPage(QWidget):
     # ⚠ `_foe_evidence()` / `_fighting_me()` / `_under_attack()` **沒有刪** ——
     #   「冷卻中的怪正在打我就解禁」還在用它們（見 _pick_next）。
 
+    def _on_rot_mode(self) -> None:
+        """「自動換頻」與「打王換頻道」二選一，順便把用不到的格子反灰。
+
+        ⚠ 遞迴防護（_rot_sync）是必要的：這支自己會 setChecked()，
+          那又會再送一次 toggled 回到這裡。
+        ★ 換模式就把兩邊的計時／旗標歸零 —— 不然切回「自動換頻」時會沿用
+          切走之前累積的分鐘數，看起來像「才剛勾就馬上換頻」。
+        ⚠ 正在跑的那一輪**不打斷**：兩種模式的一輪走法完全一樣，
+          半路收手只會停在別頻。
+        """
+        if self._rot_sync:
+            return
+        src = self.sender()
+        self._rot_sync = True
+        try:
+            if src is self.rot_cb and self.rot_cb.isChecked():
+                self.rot_boss_cb.setChecked(False)
+            elif src is self.rot_boss_cb and self.rot_boss_cb.isChecked():
+                self.rot_cb.setChecked(False)
+        finally:
+            self._rot_sync = False
+        # 「每 N 分一輪」只有自動換頻在用
+        self.rot_every.setEnabled(not self.rot_boss_cb.isChecked())
+        self._rot_t = 0.0
+        self._rot_boss_hit = False
+
+    def _note_boss_kill(self, m) -> None:
+        """確認打死的是不是王 —— 是王就讓「打王換頻道」下一拍出發。
+
+        ⚠ `is_boss` 回 **None ＝ 查不到**（改版位移、範本表還沒載完）：
+          一律**不算王、不觸發**。寧可不換頻，也不要拿猜的值去動作。
+        ⚠ 名字比對分不出王（有 20 種怪同名一王一小怪），所以只認種類 ID
+          的王旗標，跟「只打王」那個勾選無關 —— 沒勾只打王、名單裡剛好
+          打到王，一樣算。
+        ⚠ 正在巡迴中（含換完頻的穩定期）打到的王**不記**
+          （2026-08-28 使用者定案：忽略，把這輪跑完就待命）——
+          不然王多的地方會一輪接一輪永遠停不下來。
+        """
+        if m is None or not self.rot_boss_cb.isChecked():
+            return
+        if self._rot_seq or self._rot_settle > 0:
+            return
+        if monsters.is_boss(self.sc, m.type_id) is not True:
+            return
+        self._rot_boss_hit = True
+
     def _rot_say(self, text: str) -> None:
         """更新巡迴狀態文字。**內容沒變就不要動它** ——
         心跳是 10ms 一拍，每拍都 setText 等於每秒重畫 100 次，白花 CPU 也會閃。
@@ -3651,16 +3725,22 @@ class CharFarmPage(QWidget):
 
         ★ 只有「切換的那幾秒」會暫停，**停留期間照常掛機** ——
           不然巡迴就只是在浪費時間。
+        ★ 兩種引信共用同一段流程（2026-08-28）：
+          · 自動換頻　＝「每 N 分一輪」時間到就出發。
+          · 打王換頻道＝**不看時間**，確認打死一隻王（_note_boss_kill）
+            就當場出發，跑完回到原本那一頻等下一隻王。
         ⚠ 補給那一趟完全不換頻：換頻會斷線重連、把人丟到別的分流，
           正在跑回程的精靈跟排著的趴趴GO都會被打斷（回不去的成因之一）。
           這裡不累積時間，補給結束後接著算就好。
         """
         if self._supply:
             return False
-        if not self.rot_cb.isChecked():
+        by_boss = self.rot_boss_cb.isChecked()
+        if not (self.rot_cb.isChecked() or by_boss):
             if self._rot_seq or self._rot_settle:
                 self._rot_seq, self._rot_settle = [], 0.0
                 self._rot_say("")
+            self._rot_boss_hit = False
             return False
 
         # 剛換完 → 等重連與重新定位，這段不打怪
@@ -3689,16 +3769,33 @@ class CharFarmPage(QWidget):
             self._rot_settle = ROT_SETTLE
             if not self._rot_seq:
                 self._rot_t = 0.0        # 繞完一圈了，重新計時
-                self._rot_say(f"　巡迴完成，回到 {self._rot_home} 頻")
+                # ⚠ 這一輪途中打到的王一律不算（使用者定案：忽略）。
+                #   _note_boss_kill 已經擋掉大部分，這裡再清一次是為了
+                #   「換完頻的穩定期才送到的遲到死亡回報」。
+                self._rot_boss_hit = False
+                self._rot_say(
+                    f"　巡迴完成，回到 {self._rot_home} 頻"
+                    + ("，等下一隻王" if by_boss else ""))
             return True
 
-        # 沒在巡迴 → 累積時間，到了就排一輪
-        self._rot_t += dt
-        every = float(self.rot_every.value()) * 60.0
-        if self._rot_t < every:
-            left = every - self._rot_t
-            self._rot_say(f"　下一輪巡迴還有 {_mmss(left)}")
-            return False
+        # 沒在巡迴 → 該不該出發？
+        if by_boss:
+            # 打王換頻道：**完全不看時間**，等 _note_boss_kill 舉旗。
+            if not self._rot_boss_hit:
+                self._rot_say("　打王換頻道：打到一隻王就出發")
+                return False
+            # ⚠ 旗標在這裡就清掉（不是等排班成功）：底下讀不到頻道／分流數時
+            #   會「這一輪跳過」，旗標留著會讓每一拍（10ms）都去跑
+            #   channel.count() 那個全記憶體掃描。跳過就等下一隻王。
+            self._rot_boss_hit = False
+            self._rot_t = 0.0
+        else:
+            self._rot_t += dt
+            every = float(self.rot_every.value()) * 60.0
+            if self._rot_t < every:
+                left = every - self._rot_t
+                self._rot_say(f"　下一輪巡迴還有 {_mmss(left)}")
+                return False
         here = channel.current(self.hwnd)
         # ★ 分流數讀遊戲載進記憶體的伺服器清單，改版增減分流會自動跟上。
         #   ⚠ channel.count() 是**全記憶體掃描**（一次 0.3~1 秒）而這裡跑在
@@ -3719,7 +3816,8 @@ class CharFarmPage(QWidget):
         self._rot_seq = [(here - 1 + i) % n + 1 for i in range(1, n + 1)]
         self._rot_wait = 0.0             # 下一拍就出發
         self._rot_say(
-            "　開始巡迴：" + " → ".join(str(c) for c in [here] + self._rot_seq))
+            ("　打到王了 → 開始巡迴：" if by_boss else "　開始巡迴：")
+            + " → ".join(str(c) for c in [here] + self._rot_seq))
         return True
 
     # ------------------------------------------------------------------
@@ -4918,6 +5016,9 @@ class CharFarmPage(QWidget):
             return
         if confirmed:
             self._bump_kills()
+            # ★ 打王換頻道的引信：**只認自己確認打死的那一隻**。
+            #   遲到的回報（eid 對不上）在上面就 return 了，不會走到這裡。
+            self._note_boss_kill(m)
         # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
         self._killed[eid] = time.monotonic() + (
             KILL_MEMORY if confirmed else NOHP_MEMORY)
@@ -5961,6 +6062,10 @@ class CharFarmPage(QWidget):
         self.summon_cb.setChecked(bool(g(self._key("auto_summon"), False)))
         self.ball_cb.setChecked(bool(g(self._key("auto_ball"), False)))
         self.rot_cb.setChecked(bool(g(self._key("rotate"), False)))
+        # ⚠ 兩個互斥的勾選要**照這個順序**讀：setChecked 會走 _on_rot_mode，
+        #   後讀的那個為準。舊設定檔沒有 rot_boss 鍵 → 預設 False，
+        #   原本勾了自動換頻的人行為完全不變。
+        self.rot_boss_cb.setChecked(bool(g(self._key("rot_boss"), False)))
         self.sup_gear_cb.setChecked(bool(g(self._key("supply_gear"), False)))
         # ⛔ 舊的 supply_potion / supply_hp / supply_mp 不再讀：藥水補給
         #    全自動（2026-08-19 使用者要求，勾選框已刪）。
@@ -6112,6 +6217,7 @@ class CharFarmPage(QWidget):
         s(self._key("auto_summon"), self.summon_cb.isChecked())
         s(self._key("auto_ball"), self.ball_cb.isChecked())
         s(self._key("rotate"), self.rot_cb.isChecked())
+        s(self._key("rot_boss"), self.rot_boss_cb.isChecked())
         s(self._key("supply_gear"), self.sup_gear_cb.isChecked())
         # ⛔ supply_hp / supply_mp 不再存：藥水補給全自動（勾選框已刪）。
         s(self._key("supply_jump"), self.sup_jump_cb.isChecked())
@@ -6132,6 +6238,7 @@ class CharFarmPage(QWidget):
         self.picked.model().rowsRemoved.connect(self._save_settings)
         self.boss_cb.toggled.connect(self._save_settings)
         self.rot_cb.toggled.connect(self._save_settings)
+        self.rot_boss_cb.toggled.connect(self._save_settings)
         self.rot_every.valueChanged.connect(self._save_settings)
         self.rot_stay.valueChanged.connect(self._save_settings)
         self.rb_tg.toggled.connect(self._save_settings)
