@@ -40,6 +40,16 @@ INTERACT_FN = 0x0054A520   # ★ AOB 定位（locate.py supply.INTERACT_FN）：
 INTERACT_MODE = 1
 # ★ 出處同上段實測序列②：TALK_OPTION1＝對話第一個選項（商人＝我要買東西）。
 TALK_BUY = 10
+# ★ 對話選單的「第 N 項」碼：TALK_OPTION1=10 … TALK_OPTION10=19（擷取實測，
+#   跟 TALK_BUY / TALK_BANK_USE 同一組機制）。**要送第幾項一律叫這支**，
+#   不要再在別的模組寫一次 10（多寫一份就會有一份跟不上）。
+TALK_OPTION1 = 10
+
+
+def talk_option(n: int) -> int:
+    """對話選單第 `n` 項（1 起算）的 talkaction 碼。"""
+    return TALK_OPTION1 + (n - 1)
+
 # ★ 出處：擷取的呼叫鏈跟「買東西」完全一樣＝對話第一個選項
 #   （商人是買、維修商是修），所以也是 10。
 TALK_REPAIR = 10
@@ -412,14 +422,37 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT) -> bool:
     return False
 
 
-def _wait_wnd(mover, scanner, name: str, timeout: float) -> bool:
-    """輪詢等某視窗開；開了馬上回 True（取代「睡滿固定秒數再看一眼」）。"""
+def leave_npc(mover) -> None:
+    """送「離開 NPC 互動」包 ＝ 泛用送包(0x22, 0)。
+
+    ⚠⚠ **對話開著／交易開著時角色被伺服器鎖住不能走**（實測 walk 位移=0，
+      見 `_bank_close`、`REPAIR_CLOSE_FN` 的說明）。所以任何「開了 NPC 對話但
+      沒走完流程」的路徑收尾都要叫這支，不然人就卡在原地。
+    ★ 送包走 `attack.SELECT_FN`（泛用送包，AOB 已定位）——**不准在別處寫死第二份**。
+    ⚠ 失敗不吵：這是收尾動作，叫不動最多是視窗還在，不該把整趟判成失敗。
+    """
+    try:
+        if attack.SELECT_FN and mover and mover.active:
+            with mover.lock:
+                mover.call_sync(attack.SELECT_FN, LEAVE_NPC_CODE, 0,
+                                timeout=CALL_TIMEOUT)
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def _wait_for(ok, timeout: float) -> bool:
+    """輪詢等 `ok()` 成立；成立馬上回 True（取代「睡滿固定秒數再看一眼」）。"""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if _wnd_open(mover, scanner, name):
+        if ok():
             return True
         time.sleep(0.1)
     return False
+
+
+def _wait_wnd(mover, scanner, name: str, timeout: float) -> bool:
+    """輪詢等某視窗開。"""
+    return _wait_for(lambda: _wnd_open(mover, scanner, name), timeout)
 
 
 def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> None:
@@ -445,9 +478,16 @@ def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> 
 
 
 def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str,
-                tries: int = 4) -> bool:
+                tries: int = 4, confirm=None,
+                confirm_timeout: float | None = None) -> bool:
     """點 NPC 開對話、送對話選項、**確認對應視窗開了**；沒開才調位置重試。
     **銀行／修裝／買東西共用這一支**，只差 `talk_codes` 與 `wnd_name`。
+
+    confirm / confirm_timeout（2026-08-27 加，給活動地圖入口 NPC 用）：
+      有些 NPC 的「成功」不是開一個視窗，而是**人被傳走了**（啤酒節使者送你進
+      暴走穗海農場）。這時傳一個 `confirm()` 進來當成功判定、`confirm_timeout`
+      當等待上限，`wnd_name` 就不看了。**不傳就跟以前一模一樣**（買/修/銀行
+      三條路完全不受影響）。
 
     ★★★ 流程（2026-08-19 使用者定調：點一次→確認沒開對話→往 NPC 身上靠再點，不准退）：
       ① **先走到位才發互動包**（使用者 8/19 晚實機定調）：離 NPC > CLICK_RANGE 就先
@@ -467,7 +507,11 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     """
     if not (mover and mover.active):
         return False
-    if _wnd_open(mover, scanner, wnd_name):          # 已經開著就別重點
+    # 成功判定：預設「那個視窗開了」；confirm 有給就用它（人被傳走那種）。
+    done = confirm if confirm is not None else (
+        lambda: _wnd_open(mover, scanner, wnd_name))
+    wait_done = (lambda: _wait_for(done, confirm_timeout or WND_TIMEOUT))
+    if done():                                       # 已經成功了就別重點
         return True
     # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早也無害——
     #   對話框晚一拍才到，下一輪 _wait_dialog 看到「值已經變了」立刻接上，不重等。
@@ -520,12 +564,39 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _talkaction(mover, scanner, code)
             time.sleep(TALK_GAP)                     # ★ 選項之間等夠（太快送會沒作用）
         _talkaction(mover, scanner, talk_codes[-1])
-        if _wait_wnd(mover, scanner, wnd_name, WND_TIMEOUT):
+        if wait_done():
             return True
         # 對話框有開但最終視窗沒開（假邊沿/選項沒吃到）→ 刷新基準，下一輪要求新變化，
         # 免得同一個舊值一直當「已開」空轉送選項。
         base = _dialog_token(scanner)
-    return _wnd_open(mover, scanner, wnd_name)
+    return done()
+
+
+def walk_to_npc(mover, scanner, npc_id: int, fallback,
+                timeout: float | None = None) -> bool:
+    """公開入口：走到某個 NPC 旁（給 `eventmap` 之類的別的模組用）。
+
+    ⚠ 預設值寫成 None 再取 `WALK_TIMEOUT` —— 那個常數宣告在檔案更下面
+      （回程補給那一段），寫在參數預設值裡模組載入期就會 NameError。
+    """
+    return _walk_to_npc(mover, scanner, npc_id, fallback,
+                        WALK_TIMEOUT if timeout is None else timeout)
+
+
+def talk_to_npc(mover, scanner, npc_id: int, fallback, talk_codes,
+                confirm, confirm_timeout: float, tries: int = 1) -> bool:
+    """公開入口：點 NPC 開對話、依序送選項、用 `confirm()` 判成功。
+
+    給「成功不是開一個視窗、而是人被傳走」的 NPC 用（活動地圖入口，見
+    `app/game/eventmap.py`）。買/修/銀行三條路走的是同一支 `_engage_npc`，
+    這裡只是把它的視窗判定換成呼叫端給的條件。
+    ⚠ 預設 `tries=1`：`_engage_npc` 自己的重試迴圈**中間不會再問一次成功了沒**，
+      人已經被傳走的話它會在新地圖繼續找那隻不存在的 NPC 亂走。重試請放在
+      呼叫端的外層迴圈（每一輪重新進來就會先問 `confirm()`）。
+    """
+    return _engage_npc(mover, scanner, npc_id, fallback, talk_codes, "",
+                       tries=tries, confirm=confirm,
+                       confirm_timeout=confirm_timeout)
 
 
 def _nudge_toward(mover, scanner, npc_id: int, step: float) -> bool:
@@ -740,13 +811,7 @@ def _bank_close(mover, scanner) -> None:
     ★ 送包走 `attack.SELECT_FN`（泛用送包，AOB 已定位）——擷取時的 0x5D29C1 就是它
       8/11 改版後的位址，**不准在這裡寫死第二份**（改版位移後呼叫舊位址＝跳進亂碼）。
     """
-    try:
-        if attack.SELECT_FN:
-            with mover.lock:
-                mover.call_sync(attack.SELECT_FN, LEAVE_NPC_CODE, 0,
-                                timeout=CALL_TIMEOUT)
-    except Exception:                                      # noqa: BLE001
-        pass
+    leave_npc(mover)
     try:
         lua.call(mover, scanner, "game.closebank")
         lua.call(mover, scanner, "DestroyBankWnd")
@@ -1383,11 +1448,18 @@ def run_full_supply(mover, scanner, say=None,
     if back_to is not None:
         start_map = int(back_to[2])
         start_pos = (float(back_to[0]), float(back_to[1]))
-    back = jumpmap.nearest(start_map,
-                           start_pos[0] if start_pos else None,
-                           start_pos[1] if start_pos else None)
+    # ★ 活動地圖（暴走穗海農場那種）不在趴趴GO 傳送表裡 —— 回程要走活動 NPC
+    #   的對話選單（app/game/eventmap.py）。活動結束把那邊的 ROUTES 清掉，
+    #   這裡就自動退回原本的趴趴GO 行為。
+    from app.game import eventmap            # 避免模組載入期循環相依
+    ev = eventmap.for_scene(start_map)
+    back = None if ev else jumpmap.nearest(
+        start_map,
+        start_pos[0] if start_pos else None,
+        start_pos[1] if start_pos else None)
     note(f"記錄練功點：{scene.scene_name(start_map)}"
-         + (f"（回程點：{back.name}）" if back else "（⚠ 沒有回程傳送點）"))
+         + (f"（回程：找{ev.npc_name}）" if ev else
+            f"（回程點：{back.name}）" if back else "（⚠ 沒有回程傳送點）"))
 
     # 2. 天使之翼回城
     slot = _wing_slot(scanner)
@@ -1410,6 +1482,10 @@ def run_full_supply(mover, scanner, say=None,
     # ⚠ 這裡是背景執行緒，重送設有限次（不回報比重試更糟）；還是沒到就大聲說，
     #   呼叫端看得到「人不在採集圖」自己接手。
     def _jump_back() -> tuple[bool, str]:
+        # ★ 活動地圖：改走活動 NPC 的對話選單，而且回**原來那條分流**
+        #   （start_map 帶著支流序號，eventmap.go_back 自己拆）。
+        if ev is not None:
+            return eventmap.go_back(mover, scanner, start_map, say=note)
         if back is None:
             return False, "⚠ 沒有回練功點的傳送點，留在城裡"
         for _ in range(JUMP_TRIES):
