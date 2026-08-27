@@ -68,7 +68,12 @@ from app.game import jumpmap
 
 GAME_MODULE = "angel.dat"
 CMD_NAME = b"roulettestart\0"
-SCAN_SPAN = 0x400000        # 掃整個映像找字串／指令表項
+# ⚠⚠ **「掃多少」不等於「模組多大」**（2026-08-27 第一版就栽在這裡）：
+#   一開始寫死掃 4MB，又拿 `base + 4MB` 當「這個值在不在模組裡」的上界 ——
+#   結果全域 `0x9BD6AC` 離基底 **5.7MB**、直接被自己的檢查擋掉，五台全部回 None。
+#   而且指令字串在 `0x3E2890`，離 4MB 邊界只剩 120KB，改版稍微長一點就整個掃不到。
+#   → 長度一律問作業系統要（`SizeOfImage`），FALLBACK 只在問不到時墊底。
+FALLBACK_SPAN = 0x800000
 CMD_BODY = 0x40             # 指令函式前 0x40 bytes 就夠抽出三個值
 
 OFF_PARAM1_PTR = 0x00       # → [這裡] 是封包參數1
@@ -119,6 +124,42 @@ def _u32(scanner, addr: int) -> int | None:
     return struct.unpack("<I", bytes(raw))[0] if raw else None
 
 
+def _module_span(scanner, base: int) -> int:
+    """`angel.dat` 的 `SizeOfImage`；問不到就用 FALLBACK_SPAN 墊底。"""
+    try:
+        for m in scanner.list_modules():
+            if m.name.lower() == GAME_MODULE and m.base == base and m.size:
+                return int(m.size)
+    except Exception:                                      # noqa: BLE001
+        pass
+    return FALLBACK_SPAN
+
+
+CHUNK = 0x100000            # 分段讀的段大小（1MB）
+
+
+def _read_image(scanner, base: int, span: int) -> bytes | None:
+    """把整個映像讀進來找字串。**分段讀，讀不到的段補零。**
+
+    ⚠⚠ 不可以「一次讀整份、失敗就砍半」：映像裡有沒配置的頁時整份會失敗，
+      而砍半一下就從 6MB 掉到 3MB —— 指令字串在 3.9MB 處，直接被跳過
+      （2026-08-27 寫這支時真的踩到）。分段讀才不會因為尾巴壞掉就丟掉前面，
+      補零也讓**位移保持正確**（位移一歪，抽出來的位址全是垃圾）。
+    ⚠ 範圍檢查仍然用 `span`：讀不到那一段，不代表那個位址不在模組裡。
+    """
+    out = bytearray()
+    got = False
+    for off in range(0, span, CHUNK):
+        n = min(CHUNK, span - off)
+        raw = scanner._read_bytes(base + off, n)
+        if raw and len(raw) == n:
+            out += bytes(raw)
+            got = True
+        else:
+            out += b"\0" * n          # 這一段讀不到 → 補零，後面的位移照樣對
+    return bytes(out) if got else None
+
+
 def locate(scanner) -> Spot | None:
     """從 UI 指令表推出三個位址；推不出來回 None（＝大聲停用，不亂叫）。
 
@@ -133,14 +174,14 @@ def locate(scanner) -> Spot | None:
     if key in _addr_cache:
         return _addr_cache[key]
     spot = None
-    raw = scanner._read_bytes(base, SCAN_SPAN)
-    if raw:
-        buf = bytes(raw)
+    span = _module_span(scanner, base)
+    buf = _read_image(scanner, base, span)
+    if buf:
         i = buf.find(CMD_NAME)
         j = buf.find(struct.pack("<I", base + i)) if i >= 0 else -1
         if j >= 0:
             fn = struct.unpack_from("<I", buf, j + 4)[0]
-            if base <= fn < base + SCAN_SPAN:
+            if base <= fn < base + span:
                 body = buf[fn - base: fn - base + CMD_BODY]
                 mgr = off = call = None
                 for k in range(len(body) - 6):
@@ -151,9 +192,11 @@ def locate(scanner) -> Spot | None:
                     elif body[k] == 0xE8:
                         call = fn + k + 5 + struct.unpack_from("<i", body, k + 1)[0]
                 # 三個都要抽到、而且落在合理範圍才算數
+                # ⚠ 上界用**模組真正的長度**，不是我們掃了多少（見 FALLBACK_SPAN
+                #   上面那段：全域在 .data，離基底比掃描長度遠得多）。
                 if (mgr and off and call
-                        and base <= mgr < base + SCAN_SPAN
-                        and base <= call < base + SCAN_SPAN
+                        and base <= mgr < base + span
+                        and base <= call < base + span
                         and 0 < off < 0x2000000):
                     spot = Spot(cmd_fn=fn, mgr_ptr=mgr, obj_off=off,
                                 spin_fn=call)

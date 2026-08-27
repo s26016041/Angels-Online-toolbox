@@ -114,7 +114,67 @@ class RouletteSC:
         return None
 
 
-roulette.locate = lambda sc: SPOT          # 位址抽取另外驗（見下面第⑥節）
+# ── 位址抽取本人：用**合成的映像**跑真的 locate() ──────────────────
+# ⚠⚠ 這一段是 2026-08-27 實機翻車補回來的回歸：第一版寫死掃 4MB，又拿
+#   `base + 4MB` 當「這個值在不在模組裡」的上界 → 全域 0x9BD6AC 離基底 5.7MB
+#   直接被自己的檢查擋掉，**五台全部回 None**（使用者回報「轉不到轉盤」）。
+#   所以合成映像刻意重現那個版面：字串放在接近 4MB 的地方、全域放在 5.7MB。
+IMG_BASE, IMG_SIZE = 0x400000, 0x5E7000
+STR_AT, TBL_AT, FN_AT = 0x3E2890, 0x3E0138, 0x18E66D
+REAL_BODY = bytes.fromhex(
+    "558bec51518b45088d4df86a0189 45fcc645f800e89f42faff8b0dacd69b005081c130"
+    "d4c700e85d4c080033c040c9c3".replace(" ", ""))
+
+
+class ImageSC:
+    """一整份假的 angel.dat 映像（只有我們在乎的那幾段是真的）。"""
+
+    def __init__(self, size=IMG_SIZE, readable=None):
+        self.size, self.readable = size, readable or size
+        img = bytearray(size)
+        img[STR_AT:STR_AT + len(roulette.CMD_NAME)] = roulette.CMD_NAME
+        struct.pack_into("<II", img, TBL_AT, IMG_BASE + STR_AT, IMG_BASE + FN_AT)
+        img[FN_AT:FN_AT + len(REAL_BODY)] = REAL_BODY
+        self.img = bytes(img)
+
+    def module_base(self, name):
+        return IMG_BASE
+
+    def list_modules(self):
+        return [types.SimpleNamespace(name="angel.dat", base=IMG_BASE,
+                                      size=self.size)]
+
+    def _read_bytes(self, addr, n):
+        off = addr - IMG_BASE
+        if off < 0 or off + n > self.readable:   # 這一段落在讀不到的尾巴
+            return None
+        return self.img[off:off + n]
+
+
+roulette._addr_cache.clear()
+got = roulette.locate(ImageSC())
+check("★locate() 從合成映像推得出三個值（全域在 5.7MB 也要過）",
+      got is not None and (got.mgr_ptr, got.obj_off, got.spin_fn)
+      == (0x9BD6AC, 0xC7D430, 0x6132F5),
+      f"實得 {got}")
+roulette._addr_cache.clear()
+got2 = roulette.locate(ImageSC(readable=0x500000))
+check("★尾巴有讀不到的段也要推得出來（分段讀＋補零，位移不准歪）",
+      got2 is not None and got2.spin_fn == 0x6132F5, f"實得 {got2}")
+roulette._addr_cache.clear()
+
+
+class NoStringSC(ImageSC):
+    def __init__(self):
+        super().__init__()
+        self.img = bytes(self.size)           # 字串被官方改掉了
+
+
+check("⛔ 推不出來就回 None（大聲停用，不亂猜）",
+      roulette.locate(NoStringSC()) is None)
+roulette._addr_cache.clear()
+
+roulette.locate = lambda sc: SPOT          # 底下改用固定值驗欄位解析
 st = roulette.state(RouletteSC(kind=1, due=-1))
 check("讀得到、視窗開著、沒在轉",
       st is not None and st.open and not st.spinning and st.kind == 1)
