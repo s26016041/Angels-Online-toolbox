@@ -45,26 +45,21 @@
 
 ⚠ 結構偏移屬於「大更新才會壞」那一類（CLAUDE.md 允許寫死），但每個都留了
   出處；讀取端一律做合理性驗證，驗不過就回 None 讓呼叫端停手。
-## 快速抽（使用者 2026-08-27 要求「不想等動畫」）
+## ⛔ 刪掉的路：自己送 0x164「快速抽」（2026-08-27 當天做、當天刪）
 
-上面那條是「請遊戲按下去」，動畫轉完才送包。**也可以自己送那一包**，兩個參數
-都在記憶體裡現讀得到（實測 `[[物件]]`=0x40、`[物件+0x29]`=0，跟擷取一字不差）：
+一度做過「不等動畫、自己送那一包」（參數兩個都讀得到）。**已整段移除**，兩個原因：
 
-    代號 0x164、內文 7 ＝ u16代號 + u32(參數1) + u8(參數2)
+1. **使用者實測：轉盤本來就有冷卻**，抽一次要等 CD —— 省下動畫那幾秒沒有意義。
+2. **實機按下去回「建封包排不進去（指令槽忙碌）」**，送不出去。
 
-⚠⚠ **只有「完全不叫 `roulettestart`」才安全**：客戶端的計時器
-  （`0x613718`）是靠 `[物件+0x20/+0x24]` 的到期時刻決定要不要送 0x164 的，
-  沒開始轉的話那兩格是 -1、閘門第一關就 `jl` 出去 → 它不會再送第二包。
-  所以**兩條路不能混用**（先叫 roulettestart 再自己送＝同一轉送兩包＝多扣一次）。
-⚠ 這條**還沒實機驗過**（送包版面有兩份獨立證據，但「伺服器收不收自己送的」
-  沒試過）。呼叫端一定要靠背包對帳確認，沒動靜就停手。
+留這條在這裡當紀錄，免得下次有人又想「送包比較快」再走一遍。
+★ 真正該走的是下面的 `spin()`：**已實機驗證**（2026-08-27 黑狐，銅幣 75→65、
+  抽到「2026-啤酒節銅幣 x30 (2)」×1，spinning True→False 約 3 秒）。
 """
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-
-from app.game import jumpmap
 
 GAME_MODULE = "angel.dat"
 CMD_NAME = b"roulettestart\0"
@@ -80,17 +75,8 @@ OFF_PARAM1_PTR = 0x00       # → [這裡] 是封包參數1
 OFF_KIND = 0x0D             # 目前開著的轉盤種類；0xFF = 沒開
 OFF_DUE_LO = 0x20           # 這一轉的到期時刻（-1 = 沒在轉）
 OFF_DUE_HI = 0x24
-OFF_PARAM2 = 0x29           # 封包參數2（實測 0）
 KIND_NONE = 0xFF
 
-# ★ 出處：0x613718 反組譯 —— `6a 07 / 68 64 01 00 00` ＝內文 7、代號 0x164；
-#   `89 41 02`（u32 @+2）、`88 41 06`（u8 @+6）。擷取的長度 22 也對得上
-#   （線路長度 = 6 + 向上取整16(7) = 22，見 memory packet-opcode-table）。
-DRAW_OPCODE = 0x164
-DRAW_BODY = 7
-# 相對 mover.scratch()；避開 jumpmap 0x100 / sell 0x140 / supply·exchange 0x180 /
-# team 0x1C0 / produce 0x200。
-SCRATCH_OFF = 0x240
 
 CALL_TIMEOUT = 1.0
 _addr_cache: dict[tuple[int, int], "Spot | None"] = {}
@@ -247,71 +233,3 @@ def spin(mover, scanner) -> tuple[bool, str]:
         ok = mover.call_sync(spot.spin_fn, st.kind, ecx=st.obj,
                              timeout=CALL_TIMEOUT) is not None
     return (ok, "已叫下去" if ok else "指令槽忙，等下一輪")
-
-
-def draw_args(scanner) -> tuple[int, int] | None:
-    """封包 0x164 的兩個參數 `(參數1, 參數2)`，**現讀**；讀不到／不合理回 None。
-
-    出處（0x613718 反組譯，實測值與擷取一字不差）：
-        參數1 = `[[轉盤物件]]`      ← `mov eax,[esi]` / `push [eax]`
-        參數2 = `[轉盤物件+0x29]`   ← `movzx eax, byte [esi+0x29]`
-    """
-    st = state(scanner)
-    if st is None or not st.open:
-        return None
-    inner = _u32(scanner, st.obj + OFF_PARAM1_PTR)
-    if inner is None or not 0x10000 < inner < 0x7FFF0000:
-        return None                       # 視窗剛開還沒填好 → 不要拿垃圾去送
-    p1 = _u32(scanner, inner)
-    raw = scanner._read_bytes(st.obj + OFF_PARAM2, 1)
-    if p1 is None or not raw:
-        return None
-    return p1, bytes(raw)[0]
-
-
-def draw(mover, scanner) -> tuple[bool, str]:
-    """**快速抽**：自己送 0x164，不等客戶端的動畫。回 (送出去了嗎, 說明)。
-
-    ⚠⚠ **絕對不要跟 `spin()` 混用**：`spin()` 會讓客戶端起一個計時器，時間到
-      它自己也送一包 —— 同一轉送兩包＝多扣一次。要嘛全走這支，要嘛全走 spin()。
-    ⚠ 只保證「送出去了」；有沒有抽到要靠**背包對帳**（呼叫端做）。
-    """
-    if not (mover and mover.active):
-        return False, "跳板沒裝好"
-    if not (jumpmap.BUILD_FN and jumpmap.SEND_FN):
-        return False, "送包位址還沒定位（改版？先跑 patch_doctor）"
-    st = state(scanner)
-    if st is None:
-        return False, "⚠ 讀不到轉盤狀態"
-    if not st.open:
-        return False, "⚠ 轉盤視窗沒開 —— 先在遊戲裡跟啤酒節使者選好要抽哪個轉盤"
-    if st.spinning:
-        # 客戶端正在轉（有人按了遊戲自己的按鈕）→ 它待會會自己送一包，
-        # 這時再送就是兩包。讓開。
-        return False, "客戶端正在轉，這一輪讓開"
-    args = draw_args(scanner)
-    if args is None:
-        return False, "⚠ 讀不到封包參數（轉盤資料還沒填好？）"
-    p1, p2 = args
-    with mover.lock:
-        buf = mover.scratch() + SCRATCH_OFF
-        mover.write(buf, b"\0" * 16)
-        if mover.call_sync(jumpmap.BUILD_FN, DRAW_OPCODE, DRAW_BODY, ecx=buf,
-                           timeout=CALL_TIMEOUT) is None:
-            return False, "建封包排不進去（指令槽忙碌）"
-        data = _u32(scanner, buf + 4)
-        if data is None or not 0x10000 < data < 0x7FFF0000:
-            return False, "封包資料指標不合理"
-        # data+0 代號由建構函式寫；我們填 +2 參數1(u32)、+6 參數2(u8)。
-        if not mover.write(data + 2, struct.pack("<IB", p1, p2)):
-            return False, "寫封包內容失敗"
-        conn = _u32(scanner, jumpmap.CONN_PTR)
-        pkt = _u32(scanner, buf + 0xC)
-        if not conn:
-            return False, "還沒連上線 —— 可能正在重連"
-        if pkt is None or not 0x10000 < pkt < 0x7FFF0000:
-            return False, "封包指標不合理"
-        if mover.call_sync(jumpmap.SEND_FN, conn, pkt,
-                           timeout=CALL_TIMEOUT) is None:
-            return False, "送出排不進去（指令槽忙碌）"
-    return True, f"已送出（參數 {p1:#x}, {p2}）"

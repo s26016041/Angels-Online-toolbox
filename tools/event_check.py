@@ -218,11 +218,10 @@ event_tab.inventory = types.SimpleNamespace(
 event_tab.recall = types.SimpleNamespace(
     use_item=lambda mv, slot: (USED.append(slot), True)[1])
 ROU = {"state": roulette.State(obj=OBJ, kind=1, spinning=False),
-       "spin": (True, "已叫下去"), "draw": (True, "已送出"), "calls": []}
+       "spin": (True, "已叫下去"), "calls": []}
 event_tab.roulette = types.SimpleNamespace(
     state=lambda sc: ROU["state"],
     spin=lambda mv, sc: (ROU["calls"].append("spin"), ROU["spin"])[1],
-    draw=lambda mv, sc: (ROU["calls"].append("draw"), ROU["draw"])[1],
     State=roulette.State, KIND_NONE=roulette.KIND_NONE)
 
 
@@ -256,68 +255,56 @@ check("紀錄是「時間 ＋ 描述」兩欄，描述寫用了什麼",
       page.log.item(0, 1).text() if page.log.item(0, 1) else "（空）")
 
 print()
-print("⑤ 沒變少不准無限重送；沒同步完不准說「用完了」")
+print("⑤ 硬幣：送了沒少要跳過（不是停機），沒東西也不准收工")
 page = new_page()
 USED.clear()
 BAG["items"], BAG["complete"] = [item(87399, 3, slot=ARRAY_SLOT)], True
-page._use_timer.start(999999)                 # 假裝正在跑
+page._use_timer.start(999999)
 for _ in range(event_tab.CONFIRM_TRIES + 2):
     page._use_tick()
-check("連續沒變少就停下來", not page._use_timer.isActive())
-check("⛔ 沒有無限重送（只送了 1 次）", len(USED) == 1, f"實得 {len(USED)} 次")
-check("停下來有講原因", "沒變少" in page.status.text(), page.status.text())
-page._use_tick()                              # 暫停之後再叫也不准動
-check("★暫停之後再叫 tick 也不會再送", len(USED) == 1, f"實得 {len(USED)} 次")
+check("★沒少 → 跳過那個種類，**不停機**",
+      page._use_timer.isActive() and 87399 in page._skip, f"skip={page._skip}")
+check("⛔ 對同一個東西只送過 1 次", len(USED) == 1, f"實得 {len(USED)} 次")
+check("跳過有記進歷史", "跳過" in page.log.item(0, 1).text(),
+      page.log.item(0, 1).text() if page.log.item(0, 1) else "（空）")
+n = len(USED)
+for _ in range(3):
+    page._use_tick()
+check("跳過之後就不再碰它", len(USED) == n, f"又送了 {len(USED)-n} 次")
+
+page = new_page()
+USED.clear()
+page._use_timer.start(999999)
+BAG["items"], BAG["complete"] = [], True          # 背包空的
+page._use_tick()
+check("★背包沒東西**也不收工**（一直掃到按暫停）",
+      page._use_timer.isActive() and USED == [], page.status.text())
+check("狀態列講清楚在等什麼", "繼續盯著" in page.status.text(),
+      page.status.text())
+BAG["items"] = [item(87399, 3, slot=ARRAY_SLOT)]  # 抽到新的禮盒 → 自動接上
+page._use_tick()
+check("新東西進背包會自己接上", len(USED) == 1, f"實得 {USED}")
 
 page = new_page()
 USED.clear()
 page._use_timer.start(999999)
 BAG["items"], BAG["complete"] = [], False
 page._use_tick()
-check("背包沒同步完 → 不准判「都用完了」",
-      page._use_timer.isActive() and USED == [])
-BAG["complete"] = True
+check("背包沒同步完不會亂送", USED == [] and page._use_timer.isActive())
+page._stop_use("已暫停")
 page._use_tick()
-check("真的空了才收工",
-      not page._use_timer.isActive() and "用完" in page.status.text(),
-      page.status.text())
+check("★暫停之後再叫 tick 也不會再送", USED == [], f"實得 {len(USED)} 次")
 
 print()
-print("⑥ 接線：快速抽（勾「不等動畫」＝自己送 0x164）")
+print("⑥ 轉盤：一整轉（叫下去 → 轉 → 轉完 → 對背包的帳）")
 page = new_page()
 BAG["items"], BAG["complete"] = [item(87395, 100)], True
 ROU["calls"].clear()
-page._spin_timer.start(999999)
-page._spin_tick()                                   # 送一發
-check("走的是 draw（不是 spin）", ROU["calls"] == ["draw"], f"實得 {ROU['calls']}")
-check("送完進入等背包變化", page._spin is not None and page._spin[0] == "fast")
-BAG["items"] = [item(87395, 90), item(79913, 4)]    # 扣 10 銅、得 4 銀
-page._spin_tick()
-check("背包有動靜 → 記一筆「抽到什麼」",
-      page._spins == 1 and "轉盤抽到" in page.log.item(0, 1).text()
-      and "銀幣" in page.log.item(0, 1).text(),
-      page.log.item(0, 1).text() if page.log.item(0, 1) else "（空）")
-
-page = new_page()
-BAG["items"] = [item(87395, 100)]
-ROU["calls"].clear()
+ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=False)
+ROU["spin"] = (True, "已叫下去")
 page._spin_timer.start(999999)
 page._spin_tick()
-page._spin = ("fast", 0.0, page._spin[2])           # 讓 FAST_WAIT 過去
-page._spin_tick()
-check("⛔ 送了卻沒動靜 → 暫停，不無限重送",
-      not page._spin_timer.isActive() and ROU["calls"] == ["draw"]
-      and "沒有任何變化" in page.status.text(), page.status.text())
-
-print()
-print("⑦ 慢速那條（不勾「不等動畫」）跟「不混用」")
-page = new_page()
-page.fast_cb.setChecked(False)
-BAG["items"], BAG["complete"] = [item(87395, 100)], True
-ROU["calls"].clear()
-page._spin_timer.start(999999)
-page._spin_tick()
-check("走的是 spin（請遊戲自己按）", ROU["calls"] == ["spin"], f"實得 {ROU['calls']}")
+check("走的是 spin（叫遊戲自己抽）", ROU["calls"] == ["spin"], f"實得 {ROU['calls']}")
 check("進入等動畫的狀態機", page._spin[0] == "start")
 ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=True)
 page._spin_tick()
@@ -329,31 +316,52 @@ BAG["items"] = [item(87395, 90), item(79913, 4)]
 page._spin = ("settle", 0.0, page._spin[2])
 page._spin_tick()
 check("抽到什麼有記進歷史", page._spins == 1
-      and "轉盤抽到" in page.log.item(0, 1).text())
+      and "轉盤抽到" in page.log.item(0, 1).text()
+      and "銀幣" in page.log.item(0, 1).text(),
+      page.log.item(0, 1).text() if page.log.item(0, 1) else "（空）")
 
+print()
+print("⑦ 轉盤：⛔ 任何狀況都不准自己暫停")
 page = new_page()
+page._spin_timer.start(999999)
 ROU["calls"].clear()
-ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=True)   # 客戶端正在轉
-page._spin_timer.start(999999)
-page._spin_tick()
-check("★客戶端正在轉時一次都不送（不然同一轉兩包＝多扣一次）",
-      ROU["calls"] == [] and page._spin is None)
-
-page = new_page()
-page._spin_timer.start(999999)
 ROU["state"] = roulette.State(obj=OBJ, kind=roulette.KIND_NONE, spinning=False)
 page._spin_tick()
-check("轉盤關掉就收工",
-      not page._spin_timer.isActive() and "收工" in page.status.text(),
-      page.status.text())
+check("★轉盤視窗沒開 → 等他打開，**不停**",
+      page._spin_timer.isActive() and ROU["calls"] == []
+      and "等你打開" in page.status.text(), page.status.text())
+ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=False)
+page._spin_tick()
+check("開回來就自己接上", ROU["calls"] == ["spin"], f"實得 {ROU['calls']}")
 
 page = new_page()
 page._spin_timer.start(999999)
-ROU["state"] = roulette.State(obj=OBJ, kind=1, spinning=False)
-ROU["draw"] = (False, "⚠ 轉盤視窗沒開")
+ROU["calls"].clear()
+ROU["spin"] = (False, "指令槽忙，等下一輪")
 page._spin_tick()
-check("叫不動就暫停＋講原因",
-      not page._spin_timer.isActive() and "沒開" in page.status.text(),
+check("★叫不動（冷卻／指令槽忙）→ 下一輪再叫，**不停**",
+      page._spin_timer.isActive() and page._spin is None,
+      page.status.text())
+ROU["spin"] = (True, "已叫下去")
+page._spin_tick()
+check("好了就自己接上", page._spin is not None and page._spin[0] == "start")
+
+page = new_page()
+page._spin_timer.start(999999)
+ROU["calls"].clear()
+page._spin_tick()                                   # 叫下去
+page._spin = ("start", 0.0, page._spin[2])          # 讓 START_WAIT 過去
+page._spin_tick()
+check("★叫了沒轉（冷卻中）→ 歸零重來，**不停**",
+      page._spin_timer.isActive() and page._spin is None
+      and "冷卻" in page.status.text(), page.status.text())
+
+page = new_page()
+page._spin_timer.start(999999)
+page._scanners.clear()                              # 分身不見了
+page._spin_tick()
+check("只有分身消失才會真的停",
+      not page._spin_timer.isActive() and "分身不見" in page.status.text(),
       page.status.text())
 
 print()

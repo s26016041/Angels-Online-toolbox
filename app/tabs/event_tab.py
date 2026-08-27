@@ -3,7 +3,7 @@
 ★★★ 活動結束 ⇒ **刪掉這個檔 ＋ `app/game/roulette.py` 就好**（主視窗是掃
   `app/tabs/` 自動掛分頁的），其他分頁一行都不用動。
 
-## 功能①：自動使用活動硬幣
+## 功能①：自動使用啤酒節硬幣
 
 掃背包，名字**同時**含 `KEY`（「啤酒節」）**而且**有「x<數字>」的才使用；
 沒有「x<數字>」的是**硬幣本體**（例：`2026-啤酒節銅幣`）—— **絕對不使用**。
@@ -14,14 +14,22 @@
 
 ## 功能②：自動抽轉盤（要先在遊戲裡把轉盤視窗開起來）
 
-兩條路二選一（`app/game/roulette.py`），**不能混用**：
+**叫遊戲自己抽**（`roulette.spin()` → `roulettestart` 真正做事的那支），
+✅ 2026-08-27 實機驗證：黑狐銅幣 75→65、抽到「2026-啤酒節銅幣 x30 (2)」×1。
 
-* **勾「不等動畫」（預設）**＝ `roulette.draw()` 自己送 `0x164`。
-  參數兩個都從轉盤物件**現讀**（`[[物件]]` 與 `[物件+0x29]`，實測跟擷取一字不差）。
-* 不勾 ＝ `roulette.spin()` 請遊戲自己按下去，跟手點一模一樣，但要等動畫轉完。
+⛔ 一度做過「不等動畫、自己送 0x164」，**已刪**：使用者實測轉盤本來就有冷卻，
+  而且那條實機會回「建封包排不進去（指令槽忙碌）」。理由記在 roulette.py 檔頭。
 
-⚠⚠ 混用會**同一轉送兩包＝多扣一次**：`spin()` 會讓客戶端起一個到期計時器，
-  時間到它自己也送一包。`draw()` 因此在「客戶端正在轉」時一律讓開。
+## ⚠⚠ 兩個功能都**不准自己暫停**（使用者 2026-08-27 明令）
+
+「就算滿了也要幫我抽不能停，不可以自己幫我暫停」、硬幣也是「一直掃到我按暫停」。
+所以出口**只有暫停鈕**（跟分身消失）。做得到而且安全的原因：
+
+* 轉盤：遊戲自己那支 `0x6132F5` 內建閘門（種類對不對、是不是正在轉、冷卻），
+  條件不到它就什麼都不做 —— 我們一直叫也不會多抽、不會多扣。
+* 硬幣：**沒有東西符合條件就一包都不送**，只是繼續掃。真的送了卻沒少
+  （那個東西不能直接使用）→ 把那個種類**跳過**、換下一個，而不是停機
+  ——⛔ 這樣才不會對同一個東西無限重送。
 
 ## ⛔ 不准寫死物品編號 —— 這次改版就是活教材
 
@@ -44,7 +52,6 @@ import time
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -72,8 +79,8 @@ USE_MS = 3000               # 幾毫秒用一個（使用者指定 3 秒）
 SPIN_MS = 500              # 抽轉盤的心跳（要盯「轉完了沒 / 背包變了沒」）
 SPIN_SETTLE = 2.0          # 轉完之後等獎品進背包的時間（秒）
 SPIN_MAX_WAIT = 30.0       # 一轉最多等這麼久（卡住就停，不無限等）
-# 快速抽：送出去之後最多等這麼久等背包有動靜；等不到就當這一發沒生效。
-FAST_WAIT = 5.0
+# 叫下去之後等這麼久還沒開始轉 ＝ 多半是冷卻沒好 → 歸零重來（不停、不傻等）
+START_WAIT = 3.0
 CONFIRM_TRIES = 3          # 連續這麼多輪沒動靜 → 停下來說話（不無限重送）
 LOG_COLS = ("時間", "描述")
 LOG_MAX = 500
@@ -131,6 +138,8 @@ class EventTab(BaseTab):
         # 用硬幣：送出去等對帳的那一發 (種類id, 名字, 送出前總數, 試了幾輪)
         self._pending = None
         self._used = 0
+        # 送了幾輪數量都沒變少的種類 → 跳過它（不停機、也不無限重送）
+        self._skip: set[int] = set()
         # 抽轉盤：(階段, 起始時刻, 抽之前的背包盤點)
         self._spin = None
         self._spins = 0
@@ -152,7 +161,7 @@ class EventTab(BaseTab):
         root.addLayout(bar)
 
         # ── 硬幣 ──────────────────────────────────────────
-        box = QGroupBox("活動硬幣")
+        box = QGroupBox("啤酒節硬幣")
         h = QHBoxLayout(box)
         self.use_btn = QPushButton("▶ 自動使用")
         self.use_btn.setToolTip(
@@ -182,16 +191,6 @@ class EventTab(BaseTab):
         self.spin_stop.setEnabled(False)
         self.spin_stop.clicked.connect(lambda: self._stop_spin("已暫停"))
         h2.addWidget(self.spin_stop)
-        h2.addSpacing(10)
-        # ★ 使用者 2026-08-27：「不想等動畫」。勾著＝自己送 0x164（參數兩個都
-        #   從轉盤物件現讀）；不勾＝請遊戲自己按下去、動畫轉完它才送。
-        # ⚠ 兩條路**不能混用**（見 roulette.draw 的說明），所以是二選一。
-        self.fast_cb = QCheckBox("不等動畫")
-        self.fast_cb.setChecked(True)
-        self.fast_cb.setToolTip(
-            "直接送抽獎封包，不等轉盤動畫轉完（快很多）。\n"
-            "取消勾選＝請遊戲自己按下去，跟手點一模一樣但要等動畫。")
-        h2.addWidget(self.fast_cb)
         h2.addStretch(1)
         self.spin_lbl = QLabel("－")
         h2.addWidget(self.spin_lbl)
@@ -341,11 +340,12 @@ class EventTab(BaseTab):
         if self._mover(pid) is None:
             return                       # 原因 _mover 已經寫在狀態列上
         self._pending = None
+        self._skip.clear()               # 重新開始就重新給每個種類一次機會
         self.use_btn.setEnabled(False)
         self.use_stop.setEnabled(True)
         self.who.setEnabled(False)
         self._use_timer.start(USE_MS)
-        self.status.setText(f"▶ 開始使用活動硬幣（每 {USE_MS // 1000} 秒一個）…")
+        self.status.setText(f"▶ 開始使用啤酒節硬幣（每 {USE_MS // 1000} 秒一個）…")
         self._use_tick()                 # 不要空等第一拍
 
     def _stop_use(self, msg: str = "", quiet: bool = False) -> None:
@@ -361,15 +361,18 @@ class EventTab(BaseTab):
     def _use_tick(self) -> None:
         """一輪：先對上一發的帳，再挑一個用掉。
 
-        ⚠ 第一件事就是問「還在跑嗎」：**暫停就是暫停**，不管是誰叫到這裡都
-          不准再送出任何東西（計時器停掉之後仍在佇列裡的事件、或之後有人
-          手動呼叫）。少了這道護欄，停下來之後還會再多用掉一個。
+        ⚠⚠ **不准自己暫停**（使用者 2026-08-27 明令「持續一直掃到我按暫停」）：
+          背包裡沒有符合條件的東西**不是收工**，只是這一輪沒事做 —— 繼續掃，
+          等他抽到新的禮盒自然就接上。出口只有暫停鈕與分身消失。
+        ⚠ 那「送了卻沒少」怎麼辦？**跳過那個種類，換下一個**（`self._skip`），
+          ⛔ 不是對同一個東西無限重送 —— 每重送一次都可能多用掉一個。
+        ⚠ 暫停之後一律不再送。
         """
         if not self._use_timer.isActive():
             return
         pid, sc = self._cur()
         if sc is None:
-            self._stop_use("⚠ 分身不見了，自動使用已停止")
+            self._stop_use("⚠ 分身不見了，自動使用已停止")     # 只有這個會停
             return
         hits, complete, all_items = self._scan()
         if hits is None:
@@ -388,20 +391,23 @@ class EventTab(BaseTab):
             else:
                 tries += 1
                 if tries >= CONFIRM_TRIES:
-                    # ⛔ 不准無限重送：真的用掉卻誤判的話，每重送一次就多用一個。
-                    self._stop_use(
-                        f"⚠ 送了「{name}」{tries} 輪，背包數量都沒變少 → 已暫停"
-                        "（這個東西不能直接使用？還是有視窗擋著？）")
-                    return
-                self._pending = (tid, name, before, tries)
+                    # 這個種類送了幾輪都沒少 → **跳過它**繼續做別的，不要停機，
+                    # 也不要對它無限重送。
+                    self._skip.add(tid)
+                    self._pending = None
+                    self._log(f"⚠ 跳過「{name}」（送了 {tries} 輪數量都沒變少）")
+                else:
+                    self._pending = (tid, name, before, tries)
                 return
 
-        if not hits:                             # ② 挑下一個
-            if not complete:
-                return                           # 沒同步完，別急著說用完了
-            self._stop_use(f"✔ 都用完了（這次總共 {self._used} 個）")
+        todo = [it for it in hits if it.type_id not in self._skip]
+        if not todo:                             # ② 沒事做 —— 但不收工，繼續掃
+            self.status.setText(
+                f"⏳ 目前沒有可以用的{KEY}硬幣，繼續盯著…"
+                f"（已用掉 {self._used} 個"
+                + (f"、跳過 {len(self._skip)} 種" if self._skip else "") + "）")
             return
-        want = hits[0]
+        want = todo[0]
         # ★★ 格號**當場重讀**：bag 給的 slot 是陣列索引，不是物品自己記的
         #    格號（+0x25）。拿索引打封包會用到別的東西（見檔頭）。
         h = bag.head(sc)
@@ -428,12 +434,10 @@ class EventTab(BaseTab):
         if st is None:
             self.status.setText("⚠ 讀不到轉盤（官方改寫了？）—— 不動作")
             return
-        if not st.open:
-            self.status.setText(
-                "⚠ 轉盤視窗沒開 —— 先在遊戲裡跟啤酒節使者選好要抽哪個轉盤")
-            return
         if self._mover(pid) is None:
             return
+        # ⚠ 轉盤視窗還沒開**照樣讓它開始**（使用者要的是「不准自己停」）——
+        #   心跳會顯示「等你打開…」，你在遊戲裡開好它就自己接上。
         self._spin = None
         self.spin_btn.setEnabled(False)
         self.spin_stop.setEnabled(True)
@@ -455,23 +459,32 @@ class EventTab(BaseTab):
     def _spin_tick(self) -> None:
         """一轉的狀態機：叫下去 → 等它開始轉 → 等轉完 → 對背包的帳。
 
-        ⚠ 同 `_use_tick`：暫停之後一律不再送（抽一次就是花一次錢）。
+        ⚠⚠ **不准自己暫停**（使用者 2026-08-27 明令「就算滿了也要幫我抽不能停」）。
+          任何一步不順（轉盤沒開、冷卻中、叫不動、等太久）都只是**這一輪算了**，
+          把狀態歸零、下一輪重來。出口只有暫停鈕與分身消失。
+        ★ 這樣做安全的原因：真正動手的是遊戲自己那支（`0x6132F5`），它內建
+          「種類對不對／是不是正在轉／冷卻到了沒」三道閘門 —— 條件不到它什麼
+          都不做，所以我們一直叫**不會多抽、不會多扣**。
+        ⚠ 暫停之後一律不再叫（抽一次就是花一次錢）。
         """
         if not self._spin_timer.isActive():
             return
         pid, sc = self._cur()
         if sc is None:
-            self._stop_spin("⚠ 分身不見了，自動抽已停止")
+            self._stop_spin("⚠ 分身不見了，自動抽已停止")     # 只有這個會停
             return
         st = roulette.state(sc)
         if st is None:
-            self._stop_spin("⚠ 讀不到轉盤狀態 → 已暫停")
+            self.status.setText("⚠ 這一拍讀不到轉盤狀態，下一輪再看")
+            self._spin = None
             return
         if not st.open:
-            self._stop_spin(f"✔ 轉盤關掉了，收工（這次抽了 {self._spins} 次）")
+            # 視窗被關掉／還沒開 —— 不停，等他開回來（使用者要求）
+            self.status.setText(
+                f"⏳ 轉盤視窗沒開，等你打開…（已抽 {self._spins} 次）")
+            self._spin = None
             return
 
-        fast = self.fast_cb.isChecked()
         if self._spin is None:                   # ① 叫下去
             if st.spinning:
                 return                           # 遊戲自己還在轉，等它
@@ -481,41 +494,32 @@ class EventTab(BaseTab):
             mv = self._mover(pid)
             if mv is None:
                 return
-            ok, why = (roulette.draw if fast else roulette.spin)(mv, sc)
+            ok, why = roulette.spin(mv, sc)
             if not ok:
-                self._stop_spin(f"⚠ {why} → 已暫停")
+                # 冷卻中／指令槽忙／剛好在轉 —— 都是暫時的，下一輪再叫。
+                self.status.setText(f"⏳ {why}（已抽 {self._spins} 次）")
                 return
-            self._spin = ("fast" if fast else "start",
-                          time.monotonic(), totals(items))
+            self._spin = ("start", time.monotonic(), totals(items))
             return
 
         stage, t0, before = self._spin
         waited = time.monotonic() - t0
-        if stage == "fast":                      # 快速抽：直接等背包有動靜
-            items, complete = bag.scan(sc)
-            if complete:
-                after = totals(items)
-                if spent(before, after) or gained(before, after):
-                    self._finish_spin(before, after)
-                    return
-            if waited > FAST_WAIT:
-                # ⛔ 不無限重送：等不到就停手，不然可能一直丟包給伺服器。
-                self._stop_spin(
-                    "⚠ 送出去之後背包沒有任何變化 → 已暫停"
-                    "（伺服器沒收這一包？硬幣不夠？還是轉盤視窗被關了？）")
-            return
         if stage == "start":                     # ② 等它真的開始轉
             if st.spinning:
                 self._spin = ("run", time.monotonic(), before)
-            elif waited > SPIN_MAX_WAIT:
-                self._stop_spin("⚠ 叫下去了但轉盤沒動 → 已暫停"
-                                "（硬幣不夠？還是視窗被關掉了？）")
+            elif waited > START_WAIT:
+                # 叫下去了但沒轉 —— 幾乎都是**冷卻還沒好**（使用者：轉盤有休息
+                # 時間）。歸零、下一輪再叫，不要停、也不要傻等滿 SPIN_MAX_WAIT。
+                self._spin = None
+                self.status.setText(
+                    f"⏳ 還在冷卻，等一下再抽（已抽 {self._spins} 次）")
             return
         if stage == "run":                       # ③ 等轉完
             if not st.spinning:
                 self._spin = ("settle", time.monotonic(), before)
             elif waited > SPIN_MAX_WAIT:
-                self._stop_spin("⚠ 轉太久沒停 → 已暫停")
+                self._spin = None                # 轉太久 → 這輪不算，重來
+                self.status.setText("⏳ 這一轉等太久，重新來過")
             return
         # ④ 轉完了，等獎品進背包再對帳
         if waited < SPIN_SETTLE:
@@ -523,7 +527,8 @@ class EventTab(BaseTab):
         items, complete = bag.scan(sc)
         if not complete:
             if waited > SPIN_MAX_WAIT:
-                self._stop_spin("⚠ 轉完了但背包一直讀不完整 → 已暫停")
+                self._spin = None                # 背包一直讀不完整 → 這輪不記帳
+                self.status.setText("⏳ 背包同步中，這一轉沒記到帳")
             return
         self._finish_spin(before, totals(items))
 
