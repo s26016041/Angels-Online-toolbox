@@ -65,8 +65,10 @@ JUMP_TRIES = 3
 JUMP_WAIT = 12.0
 # 選完分流之後等地圖真的變（載圖要幾秒）；等不到＝這一輪沒成功
 ENTER_WAIT = 20.0
-# 整條「找 NPC → 講話 → 進圖」最多重來幾次
-ENTER_TRIES = 3
+# 「靠近 → 點 → 沒開就換站位再點」最多幾輪（交給 supply._engage_npc 自己數）。
+# ★ 至少要 4：第 1 輪是走近＋點，之後每輪才輪到 NUDGE_STEPS 那三階
+#   （踩上他本格 → 穿過去 1.5 格 → 3 格），人牆就是靠那幾階擠進去的。
+ENTER_TRIES = 5
 
 
 @dataclass(frozen=True)
@@ -167,10 +169,12 @@ def enter(mover, scanner, route: EventMap, sub: int = 0,
     `sub` ＝ 想進第幾條分流的**支流序號（0 起算）**；選單上顯示成「分流 sub+1」。
     超出選單範圍就夾回去（伺服器只開這麼多條）。
 
-    ⚠ 每一輪都先確認「是不是已經進去了」再動作 —— `supply._engage_npc` 進場
-      第一件事就是問 `confirm()`，所以人一旦被傳走就立刻收工，不會在活動地圖
-      裡繼續找那隻不存在的 NPC 亂走（這也是這裡把 `tries=1`、重試放在外層的原因：
-      `_engage_npc` 自己的重試迴圈中間**不會**再問一次成功了沒）。
+    ⛔⛔ **不准自己先用地形圖走到 NPC 那一格**（2026-08-27 使用者實機回報：
+      「人太多會走不到」）。第一版就是這樣寫的，而 `run_full_supply` 早就寫著
+      同一個坑：「各步驟**不在這裡先用地形圖 _walk_to_npc**（它在 NPC 櫃檯區
+      會誤判走不到）」。天使學園廣場整天圍滿人，那條路只會磨到逾時。
+      → 走近／點擊／點不開換站位**全部交給 `supply.talk_to_npc`**，
+        跟藥水雜貨商人同一套（0x54A520 自己走最後一段、不開就往他身上靠）。
     """
     def note(m):
         if say:
@@ -193,34 +197,28 @@ def enter(mover, scanner, route: EventMap, sub: int = 0,
     if not ok:
         return False, msg
 
-    # 先走過去：落點離 NPC 還有十幾格，NPC 不一定串流進來了。
-    #（`_engage_npc` 自己也會在找不到 NPC 時走，但那會吃掉一輪重試。）
-    note(f"走去找{route.npc_name}（{route.npc_pos[0]},{route.npc_pos[1]}）…")
-    supply.walk_to_npc(mover, scanner, route.npc_id, route.npc_pos)
-    # ★ 走到了還看不到這隻 → 兩件事分得開來講：活動下架 / 他不在表上寫的位置。
-    #   （這兩種都不是「對話沒吃到」，講錯方向會害人往錯的地方查。）
-    if supply.find_npc(scanner, route.npc_id) is None:
-        return False, (f"⚠ 已經走到 {route.npc_pos} 附近，還是看不到"
-                       f"{route.npc_name}（NPC {route.npc_id}）——"
-                       "活動結束了？還是他被移到別的地方？"
-                       "（位置出處：GAMEDATA/setting/base/SP*_NPC.XML）")
-
     # 對話碼：先走到「選分流」那一頁，最後一項才是分流本身。
     codes = [supply.talk_option(n) for n in route.menu_path]
     codes.append(supply.talk_option(sub + 1))
-    arrived = (lambda: scene.same_map(_here(scanner), route.scene))
-    for i in range(ENTER_TRIES):
-        note(f"跟{route.npc_name}講話，選「{route.label(sub)}」…"
-             + (f"（第 {i + 1} 次）" if i else ""))
-        if supply.talk_to_npc(mover, scanner, route.npc_id, route.npc_pos,
-                              codes, arrived, ENTER_WAIT):
-            time.sleep(1.0)                    # 落地穩一下再交回去
-            return True, f"已進到{scene.scene_name(_here(scanner))}"
+    note(f"走去找{route.npc_name}，選「{route.label(sub)}」…")
+    if supply.talk_to_npc(mover, scanner, route.npc_id, route.npc_pos, codes,
+                          lambda: scene.same_map(_here(scanner), route.scene),
+                          ENTER_WAIT, tries=ENTER_TRIES):
+        time.sleep(1.0)                        # 落地穩一下再交回去
+        return True, f"已進到{scene.scene_name(_here(scanner))}"
+
     # ⚠ 失敗收尾一定要送「離開 NPC」：對話開著角色被伺服器鎖住不能走
     #   （見 supply.leave_npc），不送的話人會定在 NPC 旁邊動不了。
     supply.leave_npc(mover)
-    return False, (f"⚠ 跟{route.npc_name}講了 {ENTER_TRIES} 次都沒進到"
-                   f"{route.name}（人可能還在{scene.scene_name(_here(scanner))}）")
+    # ★ 失敗原因分兩種講清楚（講錯方向會害人往錯的地方查）：
+    #   看得到他＝對話沒吃到／等級不夠；看不到他＝活動下架或被移走。
+    if supply.find_npc(scanner, route.npc_id) is None:
+        return False, (f"⚠ 附近看不到{route.npc_name}（NPC {route.npc_id}）——"
+                       f"活動結束了？還是他不在 {route.npc_pos} 了？"
+                       "（位置出處：GAMEDATA/setting/base/SP*_NPC.XML）")
+    return False, (f"⚠ 找到{route.npc_name}了，但點了 {ENTER_TRIES} 次都沒進到"
+                   f"{route.name}（人還在{scene.scene_name(_here(scanner))}"
+                   f"，離他 {supply._dist_to_npc(scanner, route.npc_id)} 格）")
 
 
 def go_back(mover, scanner, scene_id: int, say=None) -> tuple[bool, str]:

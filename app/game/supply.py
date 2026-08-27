@@ -75,8 +75,18 @@ LEAVE_NPC_CODE = 0x22
 #   讀不到時走安全退化（等停下＋固定等待照送）。
 DIALOG_WND = "WND_MESSAGE"
 DIALOG_TIMEOUT = 12.0      # 點 NPC 後等對話框的上限（0x54A520 會自己走過去，邊走邊等）
+# ★★ **貼著 NPC 點下去的那種，等 3 秒就夠**（2026-08-27 使用者回報：
+#   「點不到的時候會等很久才橋位置」）。人已經在 CLICK_RANGE 內時，對話框就是
+#   一趟伺服器來回的事；DIALOG_TIMEOUT 那 12 秒是留給「從遠處點、客戶端自己
+#   走過去」的。⚠ 差別在**人擠人的時候**：被別的玩家推著滑動 → `is_walking`
+#   一直是 True → 底下那個「停住 0.8 秒就放棄」的快路徑永遠不觸發，舊寫法就
+#   卡滿 12 秒才肯換站位（天使學園廣場實測）。所以要有這個硬上限。
+DIALOG_NEAR_TIMEOUT = 3.0
 DIALOG_STILL_GRACE = 0.8   # 角色停住這麼久還沒開對話框＝這次點沒成功，馬上去調位置
                            # （判太早無害：基準只記一次，晚到的對話下一輪立刻接上）
+# ★ 走近 NPC 時「連續這麼久沒更靠近」＝被卡住了（人牆／伺服器退回移動）
+#   → 不要磨到逾時，直接回去讓呼叫端發互動包（客戶端自己會再走一段）。
+APPROACH_STALL = 3.0
 TALK_GAP = 1.2             # 對話選項之間的間隔——太快送對話會沒作用（8/14 實測）
 WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
 # ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**，調位置＝沿「自己→NPC」方向
@@ -404,6 +414,11 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT) -> bool:
     0x54A520 會自己把角色走到 NPC 旁才開對話 → 還在走就耐心等；
     停下來 DIALOG_STILL_GRACE 秒還沒開＝這次點沒成功（站著點的 flaky 案例），
     早點回 False 讓呼叫端調位置重點，不用傻等滿 timeout。
+
+    ⚠⚠ 「還在走就耐心等」在**人擠人**的地方會失效：角色被別的玩家推著滑動，
+      `is_walking` 一直是 True，快路徑永遠不觸發 → 傻等滿 timeout 才換站位
+      （使用者 2026-08-27 回報）。所以貼身點的時候呼叫端要傳
+      `DIALOG_NEAR_TIMEOUT`（3 秒）當硬上限，別靠這裡的走路判斷。
     """
     if baseline is None:                 # 讀不到基準（改版把全域名換了？）→ 交給呼叫端安全退化
         return False
@@ -519,6 +534,12 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     fails = 0        # 「點了確認沒開」的次數（決定 nudge 步伐階梯）
     walked = False   # 這一趟 engage 動過腳沒（點擊要跟在移動後面才穩，8/14 flaky 實測）
     for _ in range(tries):
+        # ★★ 每一輪先問「是不是已經成功了」。⚠ 沒有這一句的話，**成功會害死人**：
+        #   活動地圖入口 NPC 講完話人就被傳走了，下面 find_npc 在新地圖當然找不到
+        #   → 跑去用地形圖走向那個「天使學園的座標」，角色在新地圖亂走
+        #   （視窗類的呼叫端本來就不會走到這裡，行為不變）。
+        if done():
+            return True
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
             _walk_to_npc(mover, scanner, npc_id, fallback, 30.0)
@@ -546,13 +567,20 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                 found = find_npc(scanner, npc_id) or found
         walked = True
         npc_ent, _ = found
+        # ★ 點下去的當下離多遠 → 決定要等對話框多久（見 DIALOG_NEAR_TIMEOUT）：
+        #   貼著點＝3 秒沒開就換站位重點，不要傻等 12 秒（使用者 8/27 回報）。
+        #   從遠處點＝客戶端要自己走過去，那才需要 12 秒。
+        gap_now = _npc_gap(scanner, npc_id)
+        wait_dlg = (DIALOG_NEAR_TIMEOUT
+                    if gap_now is not None and gap_now <= CLICK_RANGE + 1.0
+                    else DIALOG_TIMEOUT)
         if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話（一次一發）
             time.sleep(0.5)
             continue
         if base is None:                             # 安全退化：全域讀不到才走盲等照送
             _wait_still(scanner, timeout=12.0)
             time.sleep(TALK_GAP)
-        elif _wait_dialog(scanner, base):
+        elif _wait_dialog(scanner, base, wait_dlg):
             if not _wait_arrival(scanner, npc_id):
                 fails += 1                           # 對話開了但人沒到位（被擋/太遠）
                 continue                             # → 絕不送購買選項，調位置重來
@@ -572,27 +600,18 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     return done()
 
 
-def walk_to_npc(mover, scanner, npc_id: int, fallback,
-                timeout: float | None = None) -> bool:
-    """公開入口：走到某個 NPC 旁（給 `eventmap` 之類的別的模組用）。
-
-    ⚠ 預設值寫成 None 再取 `WALK_TIMEOUT` —— 那個常數宣告在檔案更下面
-      （回程補給那一段），寫在參數預設值裡模組載入期就會 NameError。
-    """
-    return _walk_to_npc(mover, scanner, npc_id, fallback,
-                        WALK_TIMEOUT if timeout is None else timeout)
-
-
 def talk_to_npc(mover, scanner, npc_id: int, fallback, talk_codes,
-                confirm, confirm_timeout: float, tries: int = 1) -> bool:
+                confirm, confirm_timeout: float, tries: int = 4) -> bool:
     """公開入口：點 NPC 開對話、依序送選項、用 `confirm()` 判成功。
 
     給「成功不是開一個視窗、而是人被傳走」的 NPC 用（活動地圖入口，見
     `app/game/eventmap.py`）。買/修/銀行三條路走的是同一支 `_engage_npc`，
-    這裡只是把它的視窗判定換成呼叫端給的條件。
-    ⚠ 預設 `tries=1`：`_engage_npc` 自己的重試迴圈**中間不會再問一次成功了沒**，
-      人已經被傳走的話它會在新地圖繼續找那隻不存在的 NPC 亂走。重試請放在
-      呼叫端的外層迴圈（每一輪重新進來就會先問 `confirm()`）。
+    這裡只是把它的視窗判定換成呼叫端給的條件 —— 靠近、點、點不開就往 NPC
+    身上靠再點，**全部跟藥水雜貨商人同一套**（使用者 2026-08-27 要求）。
+
+    ⛔ **呼叫端不要自己先用地形圖走過去**：`run_full_supply` 就寫著那個坑
+      （NPC 櫃檯區會誤判走不到），天使學園廣場人擠人時更明顯。走近這件事
+      交給這裡面的 `_approach_npc`（遊戲尋路）與 0x54A520 自己收尾。
     """
     return _engage_npc(mover, scanner, npc_id, fallback, talk_codes, "",
                        tries=tries, confirm=confirm,
@@ -649,11 +668,23 @@ def _approach_npc(mover, scanner, npc_id: int, timeout: float = 20.0) -> None:
     走**遊戲尋路** walk_route（stop_short 留 1.5 免撞 NPC 本格）；長距離一包
     走不完就重送；回 0（貼身坑或算不出）→ walk_near 直走貼近。
     順便天然滿足「點擊要跟在移動後面」（8/14 剛走近才穩）。
+
+    ⚠⚠ **走不動就別磨滿 timeout**（使用者 2026-08-27 回報「點不到的時候會等
+      很久才橋位置」）：NPC 旁邊圍滿人的時候（天使學園廣場）距離根本縮不了，
+      舊寫法會在這裡空轉 20 秒才回去點。改成連續 `APPROACH_STALL` 秒沒更靠近
+      就返回 —— 交給呼叫端照樣發互動包（0x54A520 自己會再走最後一段），
+      點不開再由 `_nudge_toward` 往 NPC 身上靠，那條路本來就是為人牆設計的。
     """
     t0 = time.time()
+    best = None                      # 目前為止最近的距離
+    best_t = t0                      # 上次「真的更靠近」是什麼時候
     while time.time() - t0 < timeout:
         gap = _npc_gap(scanner, npc_id)
         if gap is None or gap <= CLICK_RANGE:
+            return
+        if best is None or gap < best - 0.5:         # 有進展 → 續命
+            best, best_t = gap, time.time()
+        elif time.time() - best_t > APPROACH_STALL:  # 卡住了 → 別磨，回去點
             return
         found = find_npc(scanner, npc_id)
         nt = _ent_tile_f(scanner, found[0]) if found else None

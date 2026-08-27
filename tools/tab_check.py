@@ -101,7 +101,11 @@ def c_scene(c):
     s = c.scene
     if not s:
         return BAD, "讀不到場景"
-    ok = 0 < s.id < 10000
+    # ⚠ 合理性要看**剝掉支流序號之後**的場景編號：活動地圖（暴走穗海農場分流4）
+    #   的 raw 編號是 197049 = (3 << 16) | 441（見 scene.split）。直接對 raw
+    #   設上限會把「站在活動地圖上」誤判成壞掉（2026-08-27 實際誤報過一次）。
+    base, sub = scene.split(s.id)
+    ok = 0 < base < 10000 and 0 <= sub < 100
     return (OK if ok else BAD), f"{s}　同圖代號={s.key}"
 
 
