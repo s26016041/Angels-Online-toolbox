@@ -152,11 +152,56 @@ def locate(scanner) -> Scene | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# 支流空間（＝遊戲介面寫的「分流1～5」，stage.xml 的「平行空間」）
+# ---------------------------------------------------------------------------
+# ★★★ 場景編號的**高 16 位是支流序號**，低 16 位才是 stage.xml 的場景編號：
+#         raw = (支流序號 << 16) | 場景編號        支流序號 0 ＝「分流1」
+#
+# 兩份互相獨立的證據（2026-08-27）：
+#   ① 遊戲自己的對話腳本 `GAMEDATA/setting/base/spmsg.xml` 對話 2023126~2023130
+#      （啤酒節使者的「暴走穗海農場分流1~5」五個選項）送的是
+#      `動作 37, 參數 = (441, 0..4, 1)` —— 場景 441 加一個 0 起算的支流序號；
+#      `stage.xml` 場景 441 也寫著 `平行空間="20"`。
+#   ② 實機讀值：使用者在「暴走穗海農場」上，`OFF_SCENE_ID` 讀到
+#      **65977 = (1 << 16) | 441**（＝分流2）；同一拍另外四台在一般地圖
+#      （123 人馬崗哨、126 千夜魔宮）高 16 位都是 0。
+#      使用者最早回報的 197049 = (3 << 16) | 441 ＝分流4，也對得上。
+#
+# ⚠ 一般地圖的編號全都 < 1000（stage.xml 最大是 999），所以「> 0xFFFF ＝ 有支流」
+#   不會誤判；高 16 位是 0 時整條路徑跟以前完全一樣。
+SUBSPACE_SHIFT = 16
+_SCENE_MASK = (1 << SUBSPACE_SHIFT) - 1
+
+
+def split(scene_id: int | None) -> tuple[int | None, int]:
+    """場景編號 → (真正的場景編號, 支流序號)。支流序號 0 ＝本流／分流1。"""
+    if scene_id is None:
+        return None, 0
+    return scene_id & _SCENE_MASK, scene_id >> SUBSPACE_SHIFT
+
+
+def base_id(scene_id: int | None) -> int | None:
+    """把支流序號剝掉，只留 stage.xml 那個場景編號。"""
+    return split(scene_id)[0]
+
+
+def subspace(scene_id: int | None) -> int:
+    """支流序號（0 起算）；一般地圖是 0。介面上的「分流N」＝ 這個值 + 1。"""
+    return split(scene_id)[1]
+
+
 def scene_name(scene_id: int | None) -> str:
-    """編號 → 中文地圖名；表裡沒有（改版新增）就照樣顯示編號。"""
+    """編號 → 中文地圖名；表裡沒有（改版新增）就照樣顯示編號。
+
+    有支流序號時照遊戲的講法接在後面（「暴走穗海農場分流2」，
+    字串出處 `str_msg` 508269~508273）。
+    """
     if scene_id is None:
         return "未知"
-    return SCENE_NAMES.get(scene_id, f"場景 {scene_id}")
+    base, sub = split(scene_id)
+    name = SCENE_NAMES.get(base, f"場景 {base}")
+    return name if sub == 0 else f"{name}分流{sub + 1}"
 
 
 def map_key(scene_id: int | None) -> int | None:
@@ -164,10 +209,16 @@ def map_key(scene_id: int | None) -> int | None:
 
     同一張圖的不同分流是不同的場景編號（天使學園 = 41 / 141 / 241），但地形完全
     一樣（都是 `map\\map041.mpc`），所以巡邏點的座標可以互通、換分流不該擋。
+
+    ★ 支流空間（暴走穗海農場分流1~5）也一樣：**同一個 .mpc、座標完全互通**，
+      每次進去支流序號都不一定一樣（伺服器分配／使用者自己選），拿 raw 編號硬比
+      會把「已經站在同一張圖」看成別張圖 —— 巡邏點、回程判定就全部失效
+      （使用者回報的「記錄點變成場景 197049」就是這個）。
     """
     if scene_id is None:
         return None
-    return SAME_MAP_AS.get(scene_id, scene_id)
+    base = base_id(scene_id)
+    return SAME_MAP_AS.get(base, base)
 
 
 def same_map(a: int | None, b: int | None) -> bool:
@@ -201,8 +252,11 @@ SAME_MAP_AS: dict[int, int] = {
 # 對照關係是「表格字串編號 = 1290000000 + 場景編號」（已驗證）。
 #
 # ⚠ 跟 items.py 一樣是**寫死的遊戲資料**：改版新增地圖時這裡不會自動跟上，
-#   只會顯示成「場景 123」（不會顯示錯的名字）。要更新就重跑上面兩個 XML。
-#   那兩個檔在專案的 GAMEDATA/setting/ 底下，遊戲目錄那邊是打包在 .pak 裡的。
+#   只會顯示成「場景 123」（不會顯示錯的名字）。
+# ★ 更新方式（**不要手打**，CLAUDE.md 的鐵則）：
+#       py tools\\build_scene_names.py            # 從 GAMEDATA 重抽、寫回這裡
+#       py tools\\build_scene_names.py --check    # 只比對，過期回傳碼 1
+#   那兩個 XML 在專案的 GAMEDATA/setting/ 底下，遊戲目錄那邊是打包在 .pak 裡的。
 # ---------------------------------------------------------------------------
 SCENE_NAMES: dict[int, str] = {
     2: "亂石海岸",
@@ -351,6 +405,8 @@ SCENE_NAMES: dict[int, str] = {
     270: "GVG 地圖6",
     271: "GVG 地圖7",
     272: "GVG 地圖8",
+    283: "暴走夏日沙灘",
+    441: "暴走穗海農場",
     501: "社團農場",
     502: "天使小學堂",
     999: "測試地圖",
