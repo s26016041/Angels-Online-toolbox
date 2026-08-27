@@ -170,7 +170,12 @@ class DailyTab(BaseTab):
         self.log.setAlternatingRowColors(True)
         hh = self.log.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.Stretch)
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        # ⚠ 時間欄不開 ResizeToContents：每 setItem 一次就重量**整欄**，紀錄堆多了
+        #   每記一筆都卡一下（[[qt-ui-pitfalls]]，energy_tab 已修過同一個）。
+        #   內容固定是 HH:MM:SS，寬度算一次釘死就好。
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        hh.resizeSection(
+            0, self.log.fontMetrics().horizontalAdvance("00:00:00") + 24)
         root.addWidget(self.log)
 
         self.status = QLabel("")

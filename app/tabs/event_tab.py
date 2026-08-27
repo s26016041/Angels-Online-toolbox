@@ -203,7 +203,12 @@ class EventTab(BaseTab):
         self.log.setSelectionMode(QAbstractItemView.NoSelection)
         self.log.verticalHeader().setVisible(False)
         hh = self.log.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        # ⚠ 時間欄不開 ResizeToContents：每 setItem 一次就重量**整欄**，紀錄堆到
+        #   幾百列後每記一筆都卡一下（[[qt-ui-pitfalls]] 的老坑，energy_tab 已修過
+        #   同一個；這裡 LOG_MAX 也是 500）。內容固定是 HH:MM:SS，寬度算一次釘死。
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        hh.resizeSection(
+            0, self.log.fontMetrics().horizontalAdvance("00:00:00") + 24)
         hh.setSectionResizeMode(1, QHeaderView.Stretch)
         root.addWidget(self.log, 1)
 
