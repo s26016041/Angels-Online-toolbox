@@ -47,7 +47,12 @@ REPORT = os.path.join(ROOT, "reports", "coverage_audit.txt")
 BASELINE = os.path.join(ROOT, "reports", "callconv_baseline.json")
 
 ADDR_LO, ADDR_HI = 0x400000, 0xA00000
+# ⚠ 這是靠「值落在 0x400000~0xA00000」判斷的，**長度與上限值會誤報**：
+#   `energy.MAX_ENERGY = 0x989680`（一千萬）、`roulette.FALLBACK_SPAN = 0x800000`
+#   （問不到 SizeOfImage 時墊底用的掃描長度）都中槍過。這些字尾／字首一律當
+#   數值不當位址 —— 位址不會取名叫 `_SPAN`／`_SIZE`。
 NOT_ADDR = ("MAX_", "MIN_", "LIMIT_", "CAP_", "THRESHOLD_")
+NOT_ADDR_SUFFIX = ("_SPAN", "_SIZE", "_LEN", "_BYTES")
 ADDR_ALLOW = {("injector", "CODE_LO"), ("injector", "CODE_HI")}
 
 # ⚠⚠ 偏移**不一定叫 OFF_***：`SRV_BEGIN`、`M_ID`、`OBJ_UI_MGR`、`PENDING_OFF`
@@ -61,6 +66,26 @@ NOT_GAME_OFF = (
     "TIMEOUT", "_MS", "MS_", "_SEC", "TRIES", "RETRY", "INTERVAL", "SETTLE",
     "SPAN", "MAX", "MIN", "LIMIT", "CAP_", "NAME_MAX", "COUNT", "PAGES",
     "SLOTS", "SIZE", "VK_", "KIND_", "BIT_", "RUN_", "TILE", "FULL",
+)
+# ⚠⚠ **子字串排除會誤殺真偏移**（2026-08-28 /_audit 抓到）：`MAX`/`MIN`/`COUNT`/
+#   `LIMIT`/`SPAN`/`SIZE`/`_SEC` 這幾條把一票貨真價實的結構偏移掃進了「不算偏移」，
+#   於是它們從債務數字裡**安靜消失** —— 正是這支工具自己在警告的假覆蓋率：
+#     player.OFF_MAX_HP/OFF_MAX_MP、monsters.OFF_MAX_HP、entity.OFF_WEIGHT_MAX
+#     （註解自己寫著「這兩個是結構偏移」，而隔壁的 OFF_WEIGHT 有被算到）、
+#     skillcost.OFF_DURATION_SECS（+0x100 buff 時長）、bag.ITEM_TIMELIMIT／ITEM_COUNT、
+#     bag.TMPL_DURA_MAX、gear.TMPL_ATK_MIN/MAX。
+#   → 名字**開頭**是這些的，一律當結構偏移，排除規則管不到它。
+#   開頭比字尾可靠：`OFF_`／`TMPL_` 前綴代表「這是某個結構裡的位置」，
+#   後面接什麼形容詞（MAX/MIN/COUNT）都不改變這件事。
+#   ⛔ 前綴只放「一看就是結構裡的位置」的，不要貪心：`ITEM_`／`MEMBER_` 試過，
+#     會把 `recipes.ITEM_MAX`（物品ID 上限）、`team.MEMBER_MAX`（隊員數上限）
+#     這種**數量**也算成偏移 —— 多報跟少報一樣是雜訊。這種個別加到下面那張表。
+GAME_OFF_PREFIX = ("OFF_", "TMPL_", "REC_", "NODE_")
+# 前綴撈不到、但確實是版面的一員（跨距／間距＝版面的一部分，改版一樣會壞）
+GAME_OFF_EXACT = (
+    "bag.ITEM_COUNT", "bag.ITEM_TIMELIMIT", "bag.ITEM_SPAN",
+    "team.MEMBER_STRIDE", "mall.G_SPAN", "mall.STORAGE_STRIDE",
+    "recipes.R_SIZE", "recipes.G_SIZE", "quickbar.ENTRY_SIZE",
 )
 # 全名（模組.名字）精準排除 —— 名字太短、子字串比對會誤傷別人的才放這裡
 # （例如 "_CODE" 會吃掉 SWITCH_CODE/SELECT_CODE 那些真封包代碼＝假覆蓋率）。
@@ -136,14 +161,27 @@ def _justified(path: str, lineno: int) -> bool:
 
     使用者的規矩是「一律用特徵搜尋，**除非真的無法或有更好的方式**」——
     那個「除非」必須寫下來。沒寫理由的例外就是債，不是設計。
-    往上找連續的註解行（跳過空行），看有沒有交代限制的字眼。
+    往上找連續的註解行（跳過空行），**外加常數自己那一行的行尾註解** ——
+    ⚠ 2026-08-28 /_audit 抓到：原本只往上看，於是 `gear.py` 那 18 個範本偏移
+      （出處都寫在行尾，像 `TMPL_DEF = 0x74  # 防禦（item.xml 防禦 100%）`）
+      全被算成「連理由都沒寫」。行尾註解是**最看得到**的位置，沒有道理不算。
     """
     try:
         lines = open(path, encoding="utf-8").read().splitlines()
     except OSError:
         return False
     words = ("⚠", "⛔", "★", "不能", "無法", "沒辦法", "只能", "沒有更好",
-             "改版", "會壞", "出處", "反組譯", "實測", "驗證")
+             "改版", "會壞", "出處", "反組譯", "實測", "驗證",
+             # 本專案實際在用的「證據」寫法：拿樣本全量對過資源包／提示框
+             "全中", "全對", "對帳", ".xml", "提示框", "樣本")
+    # 「N/N」＝ N 個樣本 N 個全中，本專案標準的證據記法（`117/117`）。
+    # ⛔ 只認兩邊同數字：這樣才不會把 `8/14`、`2026-08-11` 這種日期當成證據。
+    all_hit = re.compile(r"\b(\d+)/\1\b")
+    own = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+    if "#" in own:
+        tail = own.split("#", 1)[1]
+        if any(w in tail for w in words) or all_hit.search(tail):
+            return True
     i = lineno - 2                       # lineno 是 1 起算，-2 = 上面那行
     seen = []
     while i >= 0 and len(seen) < 8:
@@ -184,12 +222,17 @@ def scan_consts():
                     rel = os.path.relpath(path, ROOT)
                     where = f"{rel}:{node.lineno}"
                     why = _justified(path, node.lineno)
-                    if ADDR_LO <= v < ADDR_HI and not t.id.startswith(NOT_ADDR):
+                    if (ADDR_LO <= v < ADDR_HI
+                            and not t.id.startswith(NOT_ADDR)
+                            and not t.id.endswith(NOT_ADDR_SUFFIX)):
                         addrs.append((mod, t.id, v, where, why))
                     elif not (0 < abs(v) < 0x400000):
                         continue
                     elif "game" not in dirpath or mod in SKIP_MODULES:
                         continue          # 只看 app/game 這層跟遊戲要資料的
+                    elif (t.id.startswith(GAME_OFF_PREFIX)
+                          or f"{mod}.{t.id}" in GAME_OFF_EXACT):
+                        offs.append((mod, t.id, v, where, why))
                     elif (any(k in t.id for k in NOT_GAME_OFF)
                           or f"{mod}.{t.id}" in NOT_GAME_OFF_EXACT):
                         skipped.append(f"{mod}.{t.id} = {v:#x}   {where}")
