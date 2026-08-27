@@ -197,6 +197,13 @@ def enter(mover, scanner, route: EventMap, sub: int = 0,
     #（`_engage_npc` 自己也會在找不到 NPC 時走，但那會吃掉一輪重試。）
     note(f"走去找{route.npc_name}（{route.npc_pos[0]},{route.npc_pos[1]}）…")
     supply.walk_to_npc(mover, scanner, route.npc_id, route.npc_pos)
+    # ★ 走到了還看不到這隻 → 兩件事分得開來講：活動下架 / 他不在表上寫的位置。
+    #   （這兩種都不是「對話沒吃到」，講錯方向會害人往錯的地方查。）
+    if supply.find_npc(scanner, route.npc_id) is None:
+        return False, (f"⚠ 已經走到 {route.npc_pos} 附近，還是看不到"
+                       f"{route.npc_name}（NPC {route.npc_id}）——"
+                       "活動結束了？還是他被移到別的地方？"
+                       "（位置出處：GAMEDATA/setting/base/SP*_NPC.XML）")
 
     # 對話碼：先走到「選分流」那一頁，最後一項才是分流本身。
     codes = [supply.talk_option(n) for n in route.menu_path]
