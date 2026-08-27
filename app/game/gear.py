@@ -60,8 +60,8 @@ assert OFF_ENHANCE < bag.ITEM_SPAN
 
 # --- 範本（基礎數值）-----------------------------------------------------
 # 拿背包實物對 `setting/base/item*.xml` 找出來的（每一欄都是 N/N 全中）：
-TMPL_FLAGS = 0x14           # 旗標；bit 0xC 有立 → 遊戲的提示框**不印攻擊速度**
-                            #   （出處：0x5EFE26 `test [範本+0x14],0xC / jne 跳過`）
+TMPL_FLAGS = 0x14           # 旗標；bit 0xC 決定攻擊速度那行印原值還是換算值
+                            #   （出處：0x5F04FC 與 0x5EFE26 兩支互補的判斷）
 TMPL_LEVEL = 0x34           # 物品等級      74/74
 TMPL_SKILL_LEVEL = 0x4C     # 技能等限      47/47
 TMPL_HP = 0x58              # 最大HP        （提示框 0x5EFF79）
@@ -411,6 +411,52 @@ GRADE_COLOUR = {bag.GRADE_NORMAL: "#FFFFFF",
                 bag.GRADE_FINE: "#00F7FF"}    # 青藍
 
 
+def speed_display(raw: int) -> int:
+    """範本的攻擊速度欄 → **提示框上顯示的那個小數字**。
+
+        顯示值 = (範本+0xC8 − 100) ÷ 10 + 5      （整數除法，向零截斷）
+
+    出處：`0x5F051C`（提示框攻擊速度那行）
+        `mov eax,[範本+0xC8] / add eax,-0x64 / idiv 10 / lea ecx,[eax+5]`
+    ✅ 使用者 2026-08-28 實機核對：奧羅娜的預言 範本值 70 → 遊戲顯示 **2**，
+       (70−100)÷10+5 = 2 吻合。
+    ⚠ 以前直接把 70 印出來是錯的 —— 那是內部值，不是玩家看到的數字。
+    """
+    d = int(raw) - 100
+    # C 的整數除法是**向零截斷**，Python 的 // 是向下取整，負數會差 1
+    q = -(abs(d) // 10) if d < 0 else d // 10
+    return q + 5
+
+
+# 攻擊速度那行的閘門（照抄 `0x5F04FC` 與 `0x5EFE26` 兩支互補的判斷）：
+#   範本+0x14 的 bit 0xC 有立 → 印**換算後**的值（分類 46 紙娃娃除外）
+#   沒立                     → 分類 24 印換算後的值，其餘印範本原值
+SPEED_FLAG = 0x0C
+SPEED_KIND_RAW = 0x18           # 24
+SPEED_KIND_NEVER = 0x2E         # 46 紙娃娃
+
+
+def _speed_line(lines: list, it, b: dict, add: int) -> None:
+    raw = b.get("atk_speed", 0)
+    if not raw:
+        return
+    if b.get("flags", 0) & SPEED_FLAG:
+        if it.kind == SPEED_KIND_NEVER:
+            return
+        shown = speed_display(raw)
+        if add:
+            lines.append((f"攻擊速度 {speed_display(raw + add)}（{shown}）", GREEN))
+        else:
+            lines.append((f"攻擊速度 {shown}", GREY))
+        return
+    if it.kind == SPEED_KIND_RAW:
+        lines.append((f"攻擊速度 {speed_display(raw)}", GREY))
+        return
+    lines.append((f"攻擊速度 {raw + add}"
+                  + (f"（{raw} +{add}）" if add else ""),
+                  GREEN if add else GREY))
+
+
 def tooltip(g: Gear, scanner=None) -> list[tuple[str, str]]:
     """提示框要顯示的 [(文字, 顏色)]，順序照遊戲的提示框排。
 
@@ -447,19 +493,17 @@ def tooltip(g: Gear, scanner=None) -> list[tuple[str, str]]:
                           GREEN))
         else:
             lines.append((f"{lo}-{hi} 點攻擊力", GREY))
+    # ★ 行的順序照遊戲的提示框排（使用者的 裝備顯示.png）：
+    #   攻擊力 → 攻擊速度 → 防禦 → 魔攻 → 魔防 → HP → MP → 精準 → 靈敏
+    _speed_line(lines, it, b, bonus.get(16, 0))
     stat(10, "點防禦力", b.get("def", 0))
     stat(11, "魔攻", b.get("matk", 0))
     stat(12, "魔防", b.get("mdef", 0))
-    stat(13, "精準", b.get("hit", 0))
-    stat(14, "靈敏", b.get("agi", 0))
     stat(1, "最大HP", b.get("hp", 0))
     stat(3, "最大MP", b.get("mp", 0))
-    # ★ 攻擊速度：遊戲自己有一道閘門（範本+0x14 的 bit 0xC 有立就不印），
-    #   照抄，不然會出現遊戲根本沒顯示的一行。
-    if not (b.get("flags", 0) & 0x0C) and it.kind != 0x18:
-        stat(16, "攻擊速度", b.get("atk_speed", 0))
-    if b.get("range"):
-        lines.append((f"攻擊範圍 {b['range']}", GREY))
+    stat(13, "精準", b.get("hit", 0))
+    stat(14, "靈敏", b.get("agi", 0))
+    # ⚠ 攻擊範圍（範本 +0xCC）讀得到，但使用者 2026-08-28 指定**不要印**。
     lines.append((f"耐久度 {it.dura} / {it.dura_max}",
                   RED if it.broken else GREY))
     if b.get("weight"):
