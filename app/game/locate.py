@@ -349,6 +349,22 @@ SIGS: tuple[Sig, ...] = (
         " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 A9 61 00 00 56"
         " 68 74 29 7D 00",
         0x0098BC90, str_at=58, str_val=b"Magic"),
+    # 道具範本表（[這裡]+種類ID*4 → 範本）。★ 跟 Magic／Npc 是同一種查表函式
+    #   （模組裡 28 支長得一模一樣），所以一樣拿**字串內容**當錨：`Item`。
+    #   用途：寶石只留種類 ID 在裝備身上，要查它的範本才算得出加成（gear.py）。
+    Sig("gear", "ITEM_TABLE_PTR", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 8F 5F 01 00 77 0A"
+        " A1 5C 73 99 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 91 5F 01 00 56"
+        " 68 B8 48 7D 00",
+        0x0099735C, str_at=58, str_val=b"Item"),
+    # 寶石效果表（[這裡]+效果編號*4 → 一列）。同上，字串錨是 `Jeweleffect`。
+    Sig("gear", "JEWEL_TABLE_PTR", "data", 16,
+        "56 8B 75 08 8D 4E FF 81 F9 E7 03 00 00 77 0A"
+        " A1 CC 73 99 00 8B 04 B0 EB 3B 68 FF 01 00 00 8D 85 FD FD FF FF"
+        " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 E9 03 00 00 56"
+        " 68 18 8B 7D 00",
+        0x009973CC, str_at=58, str_val=b"Jeweleffect"),
     Sig("move", "WAYPOINTS", "data", 1,
         "68 84 66 9B 00 FF 75 0C 8B C8 FF 75 08 E8 ?? ?? ?? ?? 33 C9 85 C0 0F 9F C1",
         0x009B6684),

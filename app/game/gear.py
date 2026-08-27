@@ -35,10 +35,15 @@
 """
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass, field
 
 from app.game import bag, itemname
+
+# 由 locate.warm() 依 AOB 寫回，⚠ 不要在別處複製這兩個值。
+ITEM_TABLE_PTR = 0x0099735C     # [這裡] + 種類ID*4 → 道具範本
+JEWEL_TABLE_PTR = 0x009973CC    # [這裡] + 效果編號*4 → 寶石效果表的一列
 
 # --- 物品結構（裝備專屬的那半）-------------------------------------------
 OFF_ADV = 0x0C              # 5 個 dword：高 6 位屬性編號、低 26 位數值
@@ -55,6 +60,8 @@ assert OFF_ENHANCE < bag.ITEM_SPAN
 
 # --- 範本（基礎數值）-----------------------------------------------------
 # 拿背包實物對 `setting/base/item*.xml` 找出來的（每一欄都是 N/N 全中）：
+TMPL_FLAGS = 0x14           # 旗標；bit 0xC 有立 → 遊戲的提示框**不印攻擊速度**
+                            #   （出處：0x5EFE26 `test [範本+0x14],0xC / jne 跳過`）
 TMPL_LEVEL = 0x34           # 物品等級      74/74
 TMPL_SKILL_LEVEL = 0x4C     # 技能等限      47/47
 TMPL_HP = 0x58              # 最大HP        （提示框 0x5EFF79）
@@ -95,6 +102,58 @@ KIND_NAMES = {
     8: "披風", 9: "劍", 10: "刀", 11: "斧", 12: "錘", 13: "槍", 14: "杖",
     15: "弓箭", 16: "彈弓", 17: "盾",
 }
+
+
+# 屬性編號 → 範本裡的欄位偏移。**跟 ATTR_NAMES 是同一組編號**：
+# 把寶石效果套用函式 `0x53384C` 的 switch 用每個代號各跑一遍，得到
+# 「代號 → 它把範本哪個欄位加進去」，結果跟提示框那邊抽出來的編號完全一致。
+# ⚠ 攻擊力是一對（下限、上限）。
+ATTR_OFFSET: dict[int, tuple[int, ...]] = {
+    1: (0x58,), 3: (0x60,), 5: (0x68,), 7: (0xFC,),
+    8: (0x6C, 0x70), 10: (0x74,), 11: (0x78,), 12: (0x7C,),
+    13: (0x80,), 14: (0x84,), 15: (0xC4,), 16: (0xC8,),
+    18: (0x88,), 19: (0x94,), 20: (0xA0,), 21: (0xAC,),
+    22: (0x8C,), 23: (0x98,), 24: (0xA4,), 25: (0xB0,),
+    26: (0xB8,), 27: (0xBC,), 40: (0xC0,),
+    44: (0xE0,), 57: (0xE8,), 58: (0x13C,),
+}
+
+# --- 強化加成（`0x5331B6`）-----------------------------------------------
+# 三條分支，差別只在係數與加到哪幾欄；分類走哪一條是遊戲自己的跳表決定的
+# （位元組表 `0x532FA7` 之外，強化這支用的是 `0x53344E`）：
+#   武器（分類 9~16、63、75）：每級 = ceil(平均攻擊 × 0.06)，攻擊上下限各加
+#                              「每級 × 次數」，且**至少等於次數**；
+#                              魔攻 = ceil(魔攻 × 0.06) × 次數（沒有保底）
+#   防具（分類 2~8、17、76）：0.03，加防禦（有保底）與魔防（沒有）
+#   座騎（分類 25）：0.08 的武器版，另外移動速度 += 次數 × 2
+# ✅ 對帳：奧羅娜的預言（杖，1722~1808，強化 10）→ ceil(1765×0.06)=106、
+#    106×10 = **1060**，跟遊戲提示框的「+1060 點攻擊力」一模一樣。
+ENHANCE_WEAPON_KINDS = frozenset({9, 10, 11, 12, 13, 14, 15, 16, 63, 75})
+ENHANCE_ARMOR_KINDS = frozenset({2, 3, 4, 5, 6, 7, 8, 17, 76})
+ENHANCE_MOUNT_KIND = 25
+RATE_ARMOR = 0.03           # [0x7D8B48]
+RATE_WEAPON = 0.06          # [0x7D8B4C]
+RATE_MOUNT = 0.08           # [0x7D8B50]
+
+# 寶石效果表一列的版面：三組效果（+0x00 / +0x24 / +0x48），
+# 每組裡面照**裝備分類**挑一欄（＝ jeweleffect.xml 的 影響武器／影響裝備2~8／影響盾）。
+# 出處：`0x532CD3` 的跳表（位元組表 0x532FA7、case 表 0x532F83）逐支反組譯。
+GEM_GROUPS = (0x00, 0x24, 0x48)
+GEM_FIELD_OF_KIND: dict[int, int] = {
+    9: 0x00, 10: 0x00, 11: 0x00, 12: 0x00, 13: 0x00, 14: 0x00, 15: 0x00,
+    16: 0x00,                                   # 武器
+    2: 0x04, 3: 0x08, 4: 0x0C, 5: 0x10,         # 頭飾／衣服／手套／鞋子
+    8: 0x14, 6: 0x18, 7: 0x1C, 17: 0x20,        # 披風／飾品／背包／盾
+}
+
+
+def _f32(x: float) -> float:
+    """照 x86 的 `mulss` 那樣把中間結果收成單精度 —— 不然 ceil 會差 1。"""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def _per_level(value: int, rate: float) -> int:
+    return math.ceil(_f32(_f32(float(value)) * _f32(rate)))
 
 
 def kind_name(kind: int) -> str:
@@ -155,6 +214,7 @@ def _read_one(scanner, slot: int, item: bag.Item, blob: bytes) -> Gear:
 
 
 _BASE_FIELDS = (
+    ("flags", TMPL_FLAGS),
     ("atk_min", TMPL_ATK_MIN), ("atk_max", TMPL_ATK_MAX),
     ("def", TMPL_DEF), ("matk", TMPL_MATK), ("mdef", TMPL_MDEF),
     ("hit", TMPL_HIT), ("agi", TMPL_AGI), ("hp", TMPL_HP), ("mp", TMPL_MP),
@@ -235,6 +295,111 @@ def in_bag(scanner, first: int = bag.FIRST_SLOT,
     return out, complete
 
 
+# --- 加成（強化 ＋ 進階屬性 ＋ 寶石）-------------------------------------
+def _u32(scanner, addr: int) -> int:
+    raw = scanner._read_bytes(addr, 4)
+    return struct.unpack("<I", bytes(raw))[0] if raw else 0
+
+
+def _sane(ptr: int) -> bool:
+    return 0x10000 < ptr < 0x7FFF0000
+
+
+def item_template(scanner, type_id: int) -> int:
+    """種類 ID → 道具範本；查不到回 0（照抄遊戲 `0x50348A` 的邊界檢查）。"""
+    if not 1 <= int(type_id) <= 0x15F8F:
+        return 0
+    table = _u32(scanner, ITEM_TABLE_PTR)
+    if not _sane(table):
+        return 0
+    tmpl = _u32(scanner, table + int(type_id) * 4)
+    return tmpl if _sane(tmpl) else 0
+
+
+def _jewel_row(scanner, effect_id: int) -> int:
+    if not 1 <= int(effect_id) <= 0x3E7:
+        return 0
+    table = _u32(scanner, JEWEL_TABLE_PTR)
+    if not _sane(table):
+        return 0
+    row = _u32(scanner, table + int(effect_id) * 4)
+    return row if _sane(row) else 0
+
+
+def _no_gem_bonus(g: "Gear") -> dict[int, int]:
+    """沒有 scanner 時的退路：只算強化＋進階屬性（寶石那份算不了就不假裝）。"""
+    out = dict(enhance_bonus(g))
+    for attr_id, val in g.advs:
+        out[attr_id] = out.get(attr_id, 0) + val
+    return out
+
+
+def enhance_bonus(g: "Gear") -> dict[int, int]:
+    """強化次數帶來的加成 {屬性編號: 數值}（照抄 `0x5331B6`）。"""
+    n = g.enhance
+    out: dict[int, int] = {}
+    if n <= 0 or not g.base:
+        return out
+    kind = g.item.kind
+    b = g.base
+    if kind in ENHANCE_WEAPON_KINDS or kind == ENHANCE_MOUNT_KIND:
+        rate = RATE_MOUNT if kind == ENHANCE_MOUNT_KIND else RATE_WEAPON
+        avg = _f32(float(b.get("atk_min", 0) + b.get("atk_max", 0)) * 0.5)
+        out[8] = max(_per_level(avg, rate) * n, n)        # ★ 至少等於次數
+        matk = _per_level(b.get("matk", 0), rate) * n
+        if matk:
+            out[11] = matk
+        if kind == ENHANCE_MOUNT_KIND:
+            out[15] = n * 2                               # 座騎：移動速度
+    elif kind in ENHANCE_ARMOR_KINDS:
+        out[10] = max(_per_level(b.get("def", 0), RATE_ARMOR) * n, n)
+        mdef = _per_level(b.get("mdef", 0), RATE_ARMOR) * n
+        if mdef:
+            out[12] = mdef
+    return out
+
+
+def gem_bonus(scanner, g: "Gear") -> dict[int, int]:
+    """鑲的寶石帶來的加成 {屬性編號: 數值}（照抄 `0x532CD3` ＋ `0x53384C`）。
+
+    ⚠ 值是**寶石自己的範本欄位**（效果編號只決定「加哪一欄」），所以查不到
+      寶石範本就整顆跳過 —— 不猜。
+    """
+    out: dict[int, int] = {}
+    field_off = GEM_FIELD_OF_KIND.get(g.item.kind)
+    if field_off is None:
+        return out
+    for type_id in g.gems[:g.holes]:
+        if not type_id:
+            break                       # 遊戲自己也是遇到空孔就停
+        tmpl = item_template(scanner, type_id)
+        if not tmpl:
+            continue
+        effect_id = _u32(scanner, tmpl + bag.TMPL_PARAM1)
+        row = _jewel_row(scanner, effect_id) if effect_id else 0
+        if not row:
+            continue
+        for grp in GEM_GROUPS:
+            code = _u32(scanner, row + grp + field_off)
+            for off in ATTR_OFFSET.get(code, ()):        # 認不得的代號就跳過
+                val = struct.unpack(
+                    "<i", bytes(scanner._read_bytes(tmpl + off, 4) or bytes(4)))[0]
+                if val:
+                    out[code] = out.get(code, 0) + val
+                break                  # 攻擊力那對取下限那欄就好（上下限同值）
+    return out
+
+
+def total_bonus(scanner, g: "Gear") -> dict[int, int]:
+    """提示框綠字要顯示的加成總和：強化 ＋ 進階屬性 ＋ 寶石。"""
+    out = dict(enhance_bonus(g))
+    for attr_id, val in g.advs:
+        out[attr_id] = out.get(attr_id, 0) + val
+    for attr_id, val in gem_bonus(scanner, g).items():
+        out[attr_id] = out.get(attr_id, 0) + val
+    return out
+
+
 # --- 提示框文字 ----------------------------------------------------------
 GREEN = "#7CFC7C"           # 加成（照遊戲提示框：綠字）
 GREY = "#C8C8C8"
@@ -246,25 +411,29 @@ GRADE_COLOUR = {bag.GRADE_NORMAL: "#FFFFFF",
                 bag.GRADE_FINE: "#00F7FF"}    # 青藍
 
 
-def tooltip(g: Gear) -> list[tuple[str, str]]:
+def tooltip(g: Gear, scanner=None) -> list[tuple[str, str]]:
     """提示框要顯示的 [(文字, 顏色)]，順序照遊戲的提示框排。
 
-    ⚠ 綠字加成只加**這件裝備自己的進階屬性**；遊戲的提示框還會把寶石效果
-      算進去（`裝備顯示.png` 的 +1060 攻擊就有寶石的份）—— 寶石那份的算法
-      還沒解，所以這裡**不假裝算得出來**：寶石單獨列出名字，不混進總和。
+    綠字加成 ＝ **強化 ＋ 進階屬性 ＋ 寶石**，三份都照遊戲自己的算法算
+    （見 `enhance_bonus` / `gem_bonus`）。
+    ⚠ 寶石那份要讀寶石的範本，所以得給 `scanner`；沒給就只算強化＋進階屬性。
     """
     it = g.item
     lines: list[tuple[str, str]] = [
         (it.name, GRADE_COLOUR.get(it.grade, "#FFFFFF")),
         (kind_name(it.kind), GREY)]
-    bonus = {aid: val for aid, val in g.advs}
+    bonus = (total_bonus(scanner, g) if scanner is not None
+             else _no_gem_bonus(g))
     b = g.base
 
     def stat(attr_id: int, label: str, base_val: int, suffix: str = "") -> None:
         add = bonus.get(attr_id, 0)
         if not base_val and not add:
             return
-        if add:
+        if add and not base_val:
+            # 裝備本身沒有這一欄、純粹是加成 → 照遊戲寫成「+34 最大MP」
+            lines.append((f"+{add} {label}{suffix}", GREEN))
+        elif add:
             lines.append((f"{base_val + add}（{base_val} +{add}）{label}{suffix}",
                           GREEN))
         else:
@@ -285,8 +454,12 @@ def tooltip(g: Gear) -> list[tuple[str, str]]:
     stat(14, "靈敏", b.get("agi", 0))
     stat(1, "最大HP", b.get("hp", 0))
     stat(3, "最大MP", b.get("mp", 0))
-    if b.get("atk_speed"):
-        lines.append((f"攻擊速度 {b['atk_speed']}", GREY))
+    # ★ 攻擊速度：遊戲自己有一道閘門（範本+0x14 的 bit 0xC 有立就不印），
+    #   照抄，不然會出現遊戲根本沒顯示的一行。
+    if not (b.get("flags", 0) & 0x0C) and it.kind != 0x18:
+        stat(16, "攻擊速度", b.get("atk_speed", 0))
+    if b.get("range"):
+        lines.append((f"攻擊範圍 {b['range']}", GREY))
     lines.append((f"耐久度 {it.dura} / {it.dura_max}",
                   RED if it.broken else GREY))
     if b.get("weight"):
@@ -294,12 +467,12 @@ def tooltip(g: Gear) -> list[tuple[str, str]]:
     if b.get("level_req"):
         lines.append((f"需要等級{b['level_req']}以上", GREY))
 
-    # 剩下的進階屬性（上面沒配到基礎欄位的），照實列出來
-    shown = {8, 10, 11, 12, 13, 14, 1, 3}
-    for aid, val in g.advs:
-        if aid in shown:
+    # 剩下的加成（上面沒配到基礎欄位的），照實列出來
+    shown = {8, 10, 11, 12, 13, 14, 1, 3, 16}
+    for aid in sorted(bonus):
+        if aid in shown or not bonus[aid]:
             continue
-        lines.append((f"+{val} {attr_name(aid)}", GREEN))
+        lines.append((f"+{bonus[aid]} {attr_name(aid)}", GREEN))
 
     lines.append(("", GREY))
     lines.append((f"已強化次數 ( {g.enhance} )", PURPLE))

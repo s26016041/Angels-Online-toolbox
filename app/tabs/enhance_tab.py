@@ -78,6 +78,7 @@ class BagGrid(QWidget):
         self._gears: list[gear.Gear] = []
         self._serial = 0
         self._hover = 0
+        self.scanner = None            # 算寶石加成要讀寶石的範本
         self.setMouseTracking(True)
         self.setMinimumHeight(CELL * 3)
 
@@ -167,17 +168,17 @@ class BagGrid(QWidget):
         if g.serial != self._hover:
             self._hover = g.serial
             QToolTip.showText(ev.globalPosition().toPoint(),
-                              _tooltip_html(g), self)
+                              _tooltip_html(g, self.scanner), self)
 
     def sizeHint(self) -> QSize:                         # noqa: N802
         rows = max(1, (len(self._gears) + COLS - 1) // COLS)
         return QSize(COLS * CELL + PAD * 2, rows * CELL + PAD * 2)
 
 
-def _tooltip_html(g: gear.Gear) -> str:
+def _tooltip_html(g: gear.Gear, scanner=None) -> str:
     """把 `gear.tooltip()` 那幾行變成提示框 HTML（顏色照遊戲）。"""
     parts = []
-    for text, colour in gear.tooltip(g):
+    for text, colour in gear.tooltip(g, scanner):
         if not text:
             parts.append("<div style='height:6px'></div>")
             continue
@@ -340,6 +341,7 @@ class EnhanceTab(BaseTab):
         pid, sc = self._cur()
         if sc is None:
             return
+        self.grid.scanner = sc
         gears, complete = gear.in_bag(sc)
         got = enhance.find_hammer(sc)
         if got:
