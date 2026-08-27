@@ -4,7 +4,7 @@
 ------
 1. 在遊戲裡自己走到商人身邊、跟他說話，把「賣東西」的畫面開著。
 2. 手動：勾要賣的，按「賣出勾選的」。
-   自動：按「自動賣白裝」或「自動賣白＋藍裝」，每 3 秒清一次背包，按「暫停」停。
+   自動：按「自動賣白裝」或「自動賣白＋藍裝」，每 1 秒清一次背包，按「暫停」停。
 
 **為什麼要你自己先跟商人說話**：伺服器是靠「點 NPC」那一包記住你在跟誰交易的，
 沒有那一包，賣出封包送過去也是被丟掉。替使用者自動去點商人要先認得出哪隻是
@@ -103,7 +103,9 @@ def _refill(table, stretch_col: int, fill) -> None:
 
 
 REFRESH_MS = 1000           # 背包即時更新的間隔（純讀，一次幾毫秒）
-AUTO_MS = 3000              # 自動賣出的間隔 —— 使用者指定 3 秒
+AUTO_MS = 1000              # 自動賣出的間隔 —— 使用者 2026-08-27 從 3 秒改成 1 秒
+# ⚠ 只比 SETTLE_MS（0.9 秒）多一點點是安全的：`_auto_tick` 看到上一批還在結算
+#   （`_pending` 非 None）就整拍跳過，所以不會疊送、不會重複賣同一件。
 # 送出到「背包少一件、金幣變多」反映出來要多久。用回程道具實測是 1.5 秒才換地圖，
 # 但那包含伺服器換場景；單純扣物品加錢快得多。0.9 秒是保守值，
 # 沒結算完也不會漏 —— 下一輪會再看到那件東西，頂多晚一輪記帳。
@@ -198,13 +200,13 @@ class SellTab(BaseTab):
         # --- 自動 --------------------------------------------------------
         auto = QHBoxLayout()
         self.auto_white = QPushButton("自動賣白裝")
-        self.auto_white.setToolTip("每 3 秒把背包裡「普通(白)」的裝備／武器賣掉。")
+        self.auto_white.setToolTip("每 1 秒把背包裡「普通(白)」的裝備／武器賣掉。")
         self.auto_white.clicked.connect(
             lambda: self._start_auto(frozenset({bag.GRADE_NORMAL}), "白裝"))
         auto.addWidget(self.auto_white)
         self.auto_blue = QPushButton("自動賣白＋藍裝")
         self.auto_blue.setToolTip(
-            "每 3 秒把背包裡「普通(白)」與「優質(藍)」的裝備／武器賣掉。"
+            "每 1 秒把背包裡「普通(白)」與「優質(藍)」的裝備／武器賣掉。"
             "頂級(橘) 不會被賣。")
         self.auto_blue.clicked.connect(
             lambda: self._start_auto(
