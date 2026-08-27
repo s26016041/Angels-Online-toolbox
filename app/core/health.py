@@ -146,8 +146,22 @@ def check_client(sc, hwnd: int, account: str,
         put("分流資訊", cur_ch is not None and n_ch is not None,
             f"{cur_ch} / {n_ch}")
 
+        # ⚠⚠ **四欄全 0 不算通過，但也不算失敗 —— 是「驗不了」。**
+        #   晶化資料要「開過晶能視窗（送 0x3F）」才會同步下來；沒同步時整片是 0，
+        #   而 0 通過 energy.read() 每一道逐欄驗證 → 回一個合法物件 → 這裡就亮綠燈。
+        #   2026-08-25 真的踩到：OFF_ENERGY 已經搬家（0x54 → 0x34），自我監察
+        #   從頭到尾都是綠的，最後是**使用者自己發現數字不對**
+        #   （memory `lazy-sync-request-first`：全 0 先懷疑沒同步）。
+        #   tools/tab_check.py 的 c_energy 當天就改成判「驗不了」了，
+        #   這支產品內建的自我監察卻漏掉 —— 2026-08-28 /_audit 補上。
+        #   ⛔ 不能改成 put(..., False)：那會讓「沒開過晶能視窗」的正常情況
+        #     在五台都沒開時被 Report.broken 判成壞掉（[[health-selfcheck-login-false-alarm]]
+        #     那種誤報會關掉整個程式）。**不記這個鍵**＝這台不投票，才是對的。
         es = energy.read(sc, st) if st else None
-        put("能量晶化欄位", es is not None, f"能量 {es.energy}" if es else "")
+        synced = es is not None and (es.energy or es.result is not None
+                                     or es.per_roll or any(es.points))
+        if es is None or synced:
+            put("能量晶化欄位", es is not None, f"能量 {es.energy}" if es else "")
     # 屬性名稱讀的是開機就載好的靜態表，登入畫面照樣該有 —— 不必進遊戲。
     put("屬性名稱", len(energy.attr_names(sc)) == energy.ATTR_COUNT)
 
