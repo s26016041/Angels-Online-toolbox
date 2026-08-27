@@ -43,7 +43,7 @@ STAMP_FILE = "assets/table_stamp.json"
 #   是 skills.tsv.gz 的 1 筆。點名沒驗過的東西＝把使用者導向錯的地方。
 #   → 改成只講「可能過期」＋指路去那支真的查得出來的工具。
 _WARN = ("偵測到遊戲換版：寫死資料表還沒對這一版核對過（可能過期，也可能沒事）"
-         " —— 跟 Claude 說一聲跑改版體檢，它會查出是哪一張、要不要緊")
+         " —— 跑 py tools\\recheck_tables.py 看哪一張真的對不上")
 
 
 def check() -> str | None:

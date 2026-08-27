@@ -116,8 +116,8 @@ class MainWindow(QMainWindow):
                 self,
                 "沒有可用的分頁",
                 "找不到任何分頁，視窗會是空的。\n\n"
-                "這是打包出來的問題，不是你操作錯 —— 這一版不能用，\n"
-                "跟 Claude 說一聲重新編一版。",
+                "若這是打包後的 .exe，通常是漏收了 app 底下的分頁模組；\n"
+                "請確認 spec 有 collect_submodules('app')，或改用 build_local.py 重新編譯。",
             )
         else:
             self.statusBar().showMessage(

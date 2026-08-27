@@ -465,8 +465,7 @@ class CharCard(QFrame):
                 where = f"飾品欄{side}" if side else "這個位置"
                 tip = (f"{where}裝的東西不在對照表裡（種類 ID {b['type_id']}，"
                        f"目前值 {b['value']:,}）。\n"
-                       "這顆球還沒收進顯示用的對照表，所以只顯示編號；"
-                       "數值本身是照遊戲的資料讀的，沒有算錯。")
+                       "把這個 ID 補進 app/game/items.py 就能正常顯示名稱與上限。")
                 name.setToolTip(tip)
                 info.setToolTip(tip)
                 continue
