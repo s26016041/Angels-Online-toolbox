@@ -14,7 +14,14 @@
 `usequickkey` 第三個參數從「0 可以」變成「0 一律失敗」。參數個數沒變、函式頭
 沒變、特徵完美命中，**只有真的打一隻怪才驗得出來**。
 
-## ⚠⚠ 寫這種探針最容易踩的三個坑（2026-08-25 全踩過一次）
+## ⚠⚠ 假紅燈跟假綠燈一樣糟
+
+這支的結論會被拿來判「改版是不是把動作層弄壞了」，所以**「驗不了」一定要跟
+「壞了」分開**。2026-08-28 /_audit 就踩到：工具箱自己的掛機正在跑那幾台，
+每 150ms 把目標換成它要打的怪，於是「寫進去又讀回別的」三台全中，收尾印
+「⛔ 呼叫慣例語意改掉了」—— 其實 `OFF_TARGET` 完全正常（見下面坑 5）。
+
+## ⚠⚠ 寫這種探針最容易踩的坑（2026-08-25 踩過 1~4、08-28 踩到 5）
 
 1. **一定要用 `entity.set_target()`（目標 ID ＋ 血量欄兩個一起寫）**，
    不是 `set_target_id()`。只寫 ID 的話血量欄停在 0，遊戲會認定目標已死
@@ -28,11 +35,18 @@
    遊戲自己的「接近怪」狀態機會把我們的 `walk_exact` 整個蓋掉 —— 症狀是
    座標**一格都沒動**，看起來就像走位壞了。5 台裡有 3 台這樣假失敗過。
 
+5. **目標欄被搶著寫 ≠ 目標欄搬家**。掛機在跑的分身每 150ms 就重選一次目標，
+   我們寫進去 0.3 秒後當然讀回別的。分辨法：寫完**立刻**再讀一次 ——
+   0ms 讀回我們寫的值就代表寫入有落地；之後被換成**另一隻活著的實體**，
+   那是別人在正常選怪，判「驗不了」不判「壞了」。
+   （真的搬家長什麼樣：0ms 當下就不是我們寫的值。）
+
 ## 判定
 
 ✔ 打得到 —— 目標血量% 真的下降，或 MP 真的照技能的消耗扣了
 ✘ 打不到 —— 叫得出去（進得了指令槽）但兩個證據都沒有 ★ 這就是改版壞掉的樣子
-– 沒驗到 —— 附近沒活怪／沒有負擔得起又射程夠的招／狀態物件中途失效
+– 沒驗到 —— 附近沒活怪／沒有負擔得起又射程夠的招／狀態物件中途失效／
+           **這台正被掛機等功能佔著**（目標欄被搶、動畫狀態是 'Cast'）
 """
 from __future__ import annotations
 
@@ -55,9 +69,22 @@ OWNER = object()
 TRIES = 12          # 最多叫幾下快捷鍵
 GAP = 0.8           # 每下之間等多久（遊戲自己有冷卻，叫太密只是白叫）
 WALK_TILES = 3      # 走幾格
-# 這些動畫狀態代表「角色正忙著，走位指令會被無視」——判驗不了，不是判失敗。
-# 'Cast' 就是自動練技／掛機放招時的樣子（見 check_walk）。
-BUSY_STATES = ("Cast",)
+# 這些動畫狀態代表「角色現在不可能動」——判驗不了，不是判失敗。
+# 'Cast' ＝ 自動練技／掛機正在放招（2026-08-25 實錄）。
+# 'Dead' ＝ **角色是死的**：走位不會動、招也放不出去，兩項都會假失敗
+#   （2026-08-28 /_audit：黑狐死在那裡，走位跟打怪同時被判 ✘，
+#    收尾還印「呼叫慣例語意改掉了」）。屍體驗不了動作層，不是動作層壞了。
+BUSY_STATES = ("Cast", "Dead")
+
+
+def cannot_act(sc, me) -> str:
+    """角色現在有沒有「根本不可能動」的理由？有就回那個動畫狀態，沒有回 ""。
+
+    ⛔ 打怪／走位**兩邊都要先問這一句**：只有走位問過，害死掉的角色在打怪那邊
+      照樣被判成「叫得出去卻沒反應」＝改版壞掉的樣子（假紅燈）。
+    """
+    st = entity.read_state(sc, me)
+    return st if st in BUSY_STATES else ""
 
 
 def usable_skills(sc, ent_addr, mp_now):
@@ -112,6 +139,11 @@ def check_attack(sc, mv, log, state, me, base):
     if not pos or not stats:
         log.append("    – 讀不到座標或角色屬性")
         return None
+    busy = cannot_act(sc, me)
+    if busy:
+        log.append(f"    – 角色動畫狀態是 {busy!r}"
+                   f"（死了／正被別的功能佔著）→ 這台驗不了")
+        return None
     mobs = [e for e in ents if e.is_monster and not e.dead]
     if not mobs:
         log.append("    – 附近沒有活著的怪")
@@ -133,12 +165,32 @@ def check_attack(sc, mv, log, state, me, base):
     # ★★ 兩欄一起寫（見檔頭坑 1）。順便補驗 verify_offsets 常常驗不到的
     #    entity.OFF_TARGET —— 它要有選定目標才驗得到。
     entity.set_target(sc, state, t.eid)
+    # ⚠⚠ 坑 5（2026-08-28 /_audit）：讀回別的值**不一定是欄位搬家** ——
+    #   工具箱自己的掛機正在跑這一台時，它每 150ms 就會把目標換成它要打的怪，
+    #   於是「寫進去又讀回別的」每次都成立 → 三台被判 ✘、收尾還印
+    #   「⛔ 呼叫慣例語意改掉了」，那是**假的紅燈**（跟假綠燈一樣糟）。
+    #   實測：寫完 0ms 讀回來一定是我們寫的值（寫入有落地），50ms 後才被換成
+    #   **另一隻活著的同種怪** —— 那是別人在正常選怪，不是我們寫壞了。
+    #   ⇒ 讀回來的值如果對得上一隻活著的實體，就是有人在搶，判「驗不了」。
+    ok0, tid0, _hp = entity.read_target_checked(sc, state)
+    landed = tid0 == t.eid
     time.sleep(0.3)
     ok, tid, hp0 = entity.read_target_checked(sc, state)
     mark = "✔" if tid == t.eid else "✘"
     log.append(f"    目標欄位 +{entity.OFF_TARGET:#x}：寫 {t.eid} → 讀回 {tid} "
                f"{mark}｜血量% 欄 = {hp0}")
     if tid != t.eid:
+        other = next((e for e in ents if e.eid == tid and not e.dead), None)
+        if landed and other is not None:
+            log.append(f"    – 寫入有落地（當下讀回 {tid0} ＝我們寫的），"
+                       f"0.3 秒後被換成活怪「{other.name}」"
+                       f"＝這台正被別的功能佔著（掛機在跑）→ 驗不了")
+            return None
+        if landed:
+            log.append(f"    – 寫入有落地（當下讀回 {tid0}），"
+                       f"0.3 秒後變成 {tid}（不是已知的活怪）→ 驗不了")
+            return None
+        log.append("    ✘ 寫進去當下就不是我們寫的值 —— 欄位可能真的搬家了")
         return False
 
     mp_before = stats.mp
@@ -225,12 +277,13 @@ def check_walk(sc, mv, log, me, state):
         #   自動練技就是典型：角色一直在原地施法（動畫狀態 'Cast'），
         #   我們送的目的地當然沒人理。判成 ✘ 就是誤報。
         #   （2026-08-25 使用者當場指出：白狐在練技，所以不能動。）
-        busy = entity.read_state(sc, me)
-        if busy in BUSY_STATES:
+        busy = cannot_act(sc, me)
+        if busy:
             log.append(f"    – 沒動，但動畫狀態是 {busy!r}"
-                       f" ＝ 這台正被別的功能佔著（自動練技／掛機在跑）→ 驗不了")
+                       f" ＝ 角色死了／正被別的功能佔著（自動練技／掛機）→ 驗不了")
             return None
-        log.append(f"    ✘ 座標一格都沒動（動畫狀態 {busy!r}）")
+        log.append(f"    ✘ 座標一格都沒動"
+                   f"（動畫狀態 {entity.read_state(sc, me)!r}）")
         return False
     b = go(p0[0], p0[1], "回程")               # 收拾乾淨：走回原本站的地方
     back = abs(b[0] - p0[0]) < 0.9 and abs(b[1] - p0[1]) < 0.9
@@ -244,6 +297,10 @@ def main() -> int:
                     help="確認要動使用者的角色（有副作用，必填）")
     ap.add_argument("--attack", action="store_true", help="只驗打怪")
     ap.add_argument("--walk", action="store_true", help="只驗走位")
+    # 掛機在跑的分身會搶目標欄（見檔頭坑 5），驗不了。要驗打怪就得先空一台出來，
+    # 所以要能只挑那一台跑 —— 不然每次都得把五台全打擾一遍。
+    ap.add_argument("--acct", default="",
+                    help="只驗這個帳號（比對視窗標題，可給片段）")
     a = ap.parse_args()
     if not a.yes:
         print("⚠ 這支會動到角色（出手、走位）。確定要跑就加 --yes。")
@@ -252,8 +309,11 @@ def main() -> int:
     do_walk = a.walk or not (a.attack or a.walk)
 
     wins = preload.windows()
+    if a.acct:
+        wins = [w for w in wins if a.acct in w.title]
     if not wins:
-        print("找不到遊戲視窗 —— 先把遊戲開起來、進到遊戲裡再跑。")
+        print("找不到遊戲視窗 —— 先把遊戲開起來、進到遊戲裡再跑。"
+              if not a.acct else f"沒有標題含「{a.acct}」的遊戲視窗。")
         return 1
 
     log = ["=== ⑤ 動作層體檢（真的打一隻怪／走一步）==="]
