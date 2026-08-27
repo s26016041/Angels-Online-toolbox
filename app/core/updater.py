@@ -248,12 +248,53 @@ def clean_leftovers() -> None:
     _clean_stale_mei()
 
 
+def _looks_abandoned(d: Path) -> bool:
+    """這個解壓目錄真的沒人在用嗎 —— **先刪 python3XX.dll，刪得掉才算**。
+
+    為什麼要有這道關卡，而不是直接 rmtree 看它成不成功（2026-08-28 實際闖的禍）：
+    rmtree 是**一路刪下去**的，遇到刪不掉的檔案只會在最後拋例外 —— 在那之前
+    它已經把所有刪得掉的東西刪光了。對一個**還在執行**的 onefile 解壓目錄來說：
+
+      - 被映射的 .dll / .pyd 留著 → **被害的程式不會當**（所以沒人發現）
+      - assets/*.gz 這種沒被開著的純資料檔 → **全部被刪光**
+
+    也就是最糟的那種失效：安靜地少一塊功能。我們就是這樣把姊妹專案
+    RO-Online-toolbox 正在跑的目錄挖空的（它的怪物表憑空消失、怪物過濾退化、
+    全程沒有任何錯誤）。舊註解那句「還被別的行程開著 → 那個行程結束後自己會清」
+    從頭到尾就是錯的。
+
+    探測要挑**行程活著就一定映射著**的檔案，才問得出「有沒有人在跑」：
+    python3XX.dll 就是。python3.dll（穩定 ABI 的轉送層）不保證被載入，不能用。
+
+    ⛔ 兩個直覺的探測法實測都不成立，別再試（見 RO 專案 GAMEDATA [ENV-007]）：
+      - 目錄 rename 得動嗎 → **改得動**（LoadLibrary 開檔時帶 FILE_SHARE_DELETE）
+      - 獨佔開啟（CreateFileW, share=0）得開嗎 → **開得起來**
+      只有 unlink 對映射中的映像檔會失敗。
+
+    探測本身是破壞性的，但破壞的是「通過＝馬上要整個刪掉」的目錄，
+    而且它是整個清理流程動的**第一個**檔案：不通過就等於什麼都沒發生。
+    """
+    probes = sorted(d.glob("python3[0-9][0-9].dll"))
+    if not probes:
+        # 不像 onefile 的解壓目錄（或已經被誰清到一半）→ 不歸我們處理，別碰。
+        return False
+    for dll in probes:
+        try:
+            dll.unlink()
+        except OSError:
+            return False          # 還映射著 → 有人在跑 → 收手
+    return True
+
+
 def _clean_stale_mei() -> None:
-    """清掉 %TEMP% 裡別人留下的 _MEIxxxxxx 解壓目錄。
+    """清掉 %TEMP% 裡**已經沒人在用**的 _MEIxxxxxx 解壓目錄。
 
     onefile 的 exe 若沒能正常收尾（更新換檔、當掉、被工作管理員砍掉）就會留下
     這種目錄，一個約 80MB，累積起來很可觀 —— 使用者電腦上實際存過 9 個 / 86MB。
-    正在使用中的那些會刪失敗，直接跳過；自己這次的解壓目錄也不能刪。
+    自己這次的解壓目錄不能刪。
+
+    ⚠ 「刪不掉的自然會失敗」**不是**安全網 —— 那樣會把還在跑的程式挖空，
+    理由見 `_looks_abandoned()`。動手前一定要先過那道關卡。
     """
     mine = os.environ.get("_PYI_APPLICATION_HOME_DIR") or getattr(
         sys, "_MEIPASS", "")
@@ -268,7 +309,9 @@ def _clean_stale_mei() -> None:
         if not d.is_dir() or (mine and os.path.normcase(str(d))
                               == os.path.normcase(str(mine))):
             continue
+        if not _looks_abandoned(d):
+            continue              # 檔案還鎖著 → 有人在跑 → 一根寒毛都不准動
         try:
             shutil.rmtree(d)
         except OSError:
-            pass          # 還被別的行程開著 → 那個行程結束後自己會清
+            pass                  # 剩下的下次再清，清理失敗不值得打擾使用者
