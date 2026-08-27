@@ -36,10 +36,14 @@ from app.paths import resource
 
 STAMP_FILE = "assets/table_stamp.json"
 
-# 提醒訊息點名的是「會做錯事」的那幾份表（顯示用的 itemname/scene 名稱表
-# 過期無害，不值得嚇人）。
-_WARN = ("偵測到遊戲換版：寫死資料表（技能射程／趴趴GO地圖等）還沒對新版核對"
-         " —— 重跑 tools/build_*.py 確認後執行 py tools\\stamp_tables.py 蓋章")
+# ⚠⚠ 訊息**不准點名具體是哪張表**。這支只是比映像 CRC 的**代理訊號**，
+#   它根本不知道哪一張對不上（要知道得跑完整的 recheck_tables）。
+#   舊版寫「技能射程／趴趴GO地圖等」，2026-08-27 使用者問「為何會說技能射程
+#   趴趴GO」—— 當下那兩張其實**全對**（19312/19312、120/120），真正對不上的
+#   是 skills.tsv.gz 的 1 筆。點名沒驗過的東西＝把使用者導向錯的地方。
+#   → 改成只講「可能過期」＋指路去那支真的查得出來的工具。
+_WARN = ("偵測到遊戲換版：寫死資料表還沒對這一版核對過（可能過期，也可能沒事）"
+         " —— 跑 py tools\\recheck_tables.py 看哪一張真的對不上")
 
 
 def check() -> str | None:
