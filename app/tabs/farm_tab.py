@@ -35,6 +35,7 @@ import struct
 import os
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
@@ -1533,6 +1534,11 @@ class InvWorker(QThread):
         self._want.clear()
 
 
+# 活著的掛機分頁（通知設定共用，改一台要把其他台的畫面同步過去）。
+# ⚠ 弱引用：分身關掉時這裡不能是最後一個抓著頁面不放的人。
+_NOTIFY_PAGES: weakref.WeakSet = weakref.WeakSet()
+
+
 class CharFarmPage(QWidget):
     """單一分身的掛機介面。"""
 
@@ -1567,7 +1573,9 @@ class CharFarmPage(QWidget):
         self._prefix = prefix
         keys.mode = mode
         self._loading = True          # 載入設定期間不要反過來又存一次
-        # 通知器每個分身一個，設定讀自己頁面上的那一列（使用者要求各自獨立）
+        # 通知器每個分身一個，設定讀自己頁面上的那一列。
+        # ★ 2026-08-28 起那一列本身是**所有分身共用的**（見 `_nkey`），
+        #   所以五台讀到的會是同一份設定。
         self._notifier = notifier or Notifier(
             self, "⚠ 自動掛機警報",
             lambda: ("telegram" if self.rb_tg.isChecked() else "sound",
@@ -1847,8 +1855,10 @@ class CharFarmPage(QWidget):
         root = QVBoxLayout(body)
         root.setSpacing(6)
 
-        # 通知列（最上面）。★ 每個分身各自一份設定，不共用
-        # —— 使用者要求：不同分身可能要通知到不同的地方。
+        # 通知列（最上面）。★★ 2026-08-28 使用者改成**所有分身共用一份**
+        # （原話：「自動掛機的通知 改成共用 不區分角色」），推翻 2026-08-07
+        # 那條「不同分身可能要通知到不同的地方」。設定鍵見 `_nkey`，
+        # 改一台會把其他分身的畫面一起同步（`_save_notify`）。
         nbar = QHBoxLayout()
         # ★ 通知總開關（使用者要求）。關掉之後所有掛機通知都不送 ——
         #   下面那些「藥水沒了」「裝備壞了」都受它管。
@@ -1860,8 +1870,9 @@ class CharFarmPage(QWidget):
         #   設計理由寫在程式註解／memory，不放進提示。
         self.notify_cb.setToolTip(
             "通知總開關：裝備壞掉、藥水用完、掛機出狀況才通知。\n"
+            "這一列設定所有分身共用，改一台全部跟著改。\n"
             "關掉只是不通知，掛機該停還是會停。")
-        self.notify_cb.toggled.connect(self._save_settings)
+        self.notify_cb.toggled.connect(self._save_notify)
         nbar.addWidget(self.notify_cb)
         nbar.addSpacing(10)
         nbar.addWidget(QLabel("通知方式"))
@@ -2364,6 +2375,9 @@ class CharFarmPage(QWidget):
         self._load_settings()
         self._loading = False
         self._wire_saving()
+        # ★ 通知設定是所有分身共用的 —— 登記進來，別台改了才同步得到這一頁。
+        #   放在最後：登記完就可能被別台叫去 `_load_notify()`，控制項必須都在了。
+        _NOTIFY_PAGES.add(self)
 
     # ------------------------------------------------------------------
     # -- 選中怪物清單 --------------------------------------------------
@@ -6205,6 +6219,67 @@ class CharFarmPage(QWidget):
         # ★ 前綴要跟分頁綁在一起，兩個掛機分頁的設定才不會互相覆蓋。
         return f"{self._prefix}.{self.account}.{field}"
 
+    def _nkey(self, field: str) -> str:
+        """通知那一列的設定鍵 —— **不含帳號，所有分身共用一份**。
+
+        ★ 2026-08-28 使用者要求：「自動掛機的通知改成共用，不區分角色」
+          （推翻 2026-08-07 那條「不同分身可能要通知到不同的地方」）。
+        """
+        return f"{self._prefix}.{field}"
+
+    def _load_notify(self) -> None:
+        """把共用的通知設定套到這一頁的控制項上。
+
+        ⚠ 共用鍵還不存在時（從舊版升上來），**拿這個帳號原本那份當共用值**
+          並立刻寫回去 —— 不然使用者打好的 Telegram 群組 ID 會憑空消失，
+          而且每次載入都從「當時那個帳號」撿一次，值會跟著分頁順序跳動。
+        ⚠ 套用期間要把 `_loading` 舉起來：這支也會被別台的變更叫到，
+          那時不能反過來又存一次（存了就是拿舊畫面覆蓋新設定）。
+        """
+        g = config.get
+        on = g(self._nkey("notify_on"), None)
+        method = g(self._nkey("notify"), None)
+        room = g(self._nkey("tg_id"), None)
+        if on is None or method is None or room is None:
+            on = g(self._key("notify_on"), True) if on is None else on
+            method = (g(self._key("notify"), "sound")
+                      if method is None else method)
+            room = g(self._key("tg_id"), "") if room is None else room
+            config.set(self._nkey("notify_on"), bool(on))
+            config.set(self._nkey("notify"), str(method))
+            config.set(self._nkey("tg_id"), str(room or ""))
+            config.save()
+        keep, self._loading = self._loading, True
+        try:
+            self.notify_cb.setChecked(bool(on))
+            if str(method) == "telegram":
+                self.rb_tg.setChecked(True)
+            else:
+                self.rb_sound.setChecked(True)
+            self.tg_id.setText(str(room or ""))
+        finally:
+            self._loading = keep
+
+    def _save_notify(self) -> None:
+        """通知那一列改了 → 存進共用鍵，**其他分身的頁面同步跟著變**。
+
+        ⚠ 不同步的話畫面會說謊：另一台頁面上還顯示舊的群組 ID，而它送通知
+          時讀的是自己那一列（`Notifier` 的 get_settings）→ 送到舊的地方去。
+        """
+        if self._loading:
+            return
+        config.set(self._nkey("notify_on"), self.notify_cb.isChecked())
+        config.set(self._nkey("notify"),
+                   "telegram" if self.rb_tg.isChecked() else "sound")
+        config.set(self._nkey("tg_id"), self.tg_id.text().strip())
+        config.save()
+        for page in list(_NOTIFY_PAGES):
+            try:
+                if page is not self and page._prefix == self._prefix:
+                    page._load_notify()
+            except RuntimeError:                 # 那一頁的 C++ 物件已被刪掉
+                _NOTIFY_PAGES.discard(page)
+
     def _seed_from_default_tab(self) -> None:
         """這個帳號第一次用這個分頁 → 把「自動掛機」那邊的設定整份帶過來。
 
@@ -6250,7 +6325,6 @@ class CharFarmPage(QWidget):
         # ⛔ 舊的 "move"（自動走過去）/"patrol"/"back" 不再讀：走位永遠開、
         #    巡邏＝有設巡邏點就巡（見「移動與巡邏」群組移除處）。
         self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
-        self.notify_cb.setChecked(bool(g(self._key("notify_on"), True)))
         self.buff_cb.setChecked(bool(g(self._key("auto_buff"), False)))
         # 學過的分身技能編號 —— 有存就不用再按 F12 學一次
         self._buff = buff.AutoBuff(
@@ -6290,9 +6364,8 @@ class CharFarmPage(QWidget):
             sid = int(p[2]) if len(p) > 2 and p[2] is not None else None
             self._spots.append((float(p[0]), float(p[1]), sid))
         self._refresh_spots()
-        if g(self._key("notify"), "sound") == "telegram":
-            self.rb_tg.setChecked(True)
-        self.tg_id.setText(str(g(self._key("tg_id"), "") or ""))
+        # 通知那一列走共用鍵（不分角色），見 `_load_notify`。
+        self._load_notify()
 
     def _on_robot_pref(self, _on: bool) -> None:
         """會連動精靈設定的勾選變動（趴趴GO回地圖／死亡回練功區／壞裝觸發）。
@@ -6408,7 +6481,6 @@ class CharFarmPage(QWidget):
         s(self._key("vks"), self._sel_vks())
         s(self._key("opener_vk"), int(self.open_box.currentData() or 0))
         s(self._key("boss_only"), self.boss_cb.isChecked())
-        s(self._key("notify_on"), self.notify_cb.isChecked())
         s(self._key("auto_buff"), self.buff_cb.isChecked())
         s(self._key("buff_skill"), int(self._buff.skill or 0))
         s(self._key("auto_summon"), self.summon_cb.isChecked())
@@ -6422,8 +6494,6 @@ class CharFarmPage(QWidget):
         s(self._key("rot_every"), float(self.rot_every.value()))
         s(self._key("rot_stay"), float(self.rot_stay.value()))
         s(self._key("spots"), [[x, y, sid] for x, y, sid in self._spots])
-        s(self._key("notify"), "telegram" if self.rb_tg.isChecked() else "sound")
-        s(self._key("tg_id"), self.tg_id.text().strip())
         config.save()
 
     def _wire_saving(self) -> None:
@@ -6438,12 +6508,14 @@ class CharFarmPage(QWidget):
         self.rot_boss_cb.toggled.connect(self._save_settings)
         self.rot_every.valueChanged.connect(self._save_settings)
         self.rot_stay.valueChanged.connect(self._save_settings)
-        self.rb_tg.toggled.connect(self._save_settings)
-        self.tg_id.editingFinished.connect(self._save_settings)
+        # 通知那一列存的是**共用**設定（不分角色）—— 走 `_save_notify`，
+        # 它順便把其他分身的畫面同步過去。
+        self.rb_tg.toggled.connect(self._save_notify)
+        self.tg_id.editingFinished.connect(self._save_notify)
 
     # ------------------------------------------------------------------
     def notify(self, msg: str) -> None:
-        """送警報通知。設定是這個分身自己的（通知列在頁面最上面）。
+        """送警報通知。設定在頁面最上面那一列，**所有分身共用一份**。
 
         ⚠ 受「啟用通知」總開關管（使用者要求）。關掉只是不送通知，
           該停的還是會停 —— 停機原因照樣寫在狀態列。
