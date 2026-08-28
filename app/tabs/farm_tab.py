@@ -1939,29 +1939,35 @@ class CharFarmPage(QWidget):
         fit_btn(self.log_btn)
         self.log_btn.clicked.connect(self._show_logs)
         run_bar.addWidget(self.log_btn)
+        run_bar.addStretch(1)
+        root.addLayout(run_bar)
+
         # ★ 自動換球（2026-08-21 使用者要求）：飾品欄的經驗球滿了就自動換上
         #   背包裡的備球，沒備球就通知一次。判斷全走遊戲自己的資料
         #   （範本分類＋上限），三族 32 種球都認得 —— 見 app/game/balls.py。
-        run_bar.addSpacing(24)
+        # ★★ 2026-08-28 使用者要求**自己一列**（放在「開始掛機」那列下面）：
+        #   原本擠在主開關那一列的最右邊，而它的現況字會變長（「→ 去商城
+        #   補貨…」「⚠ 點數不足」），排在右邊會把整列推寬。
+        ball_bar = QHBoxLayout()
         self.ball_cb = QCheckBox("自動換球")
         self.ball_cb.setToolTip(
             "飾品欄兩顆經驗球都滿了才一起換（只有一顆滿不動作）。\n"
             "背包備球不夠會去天使商城買，花點數，每次都通知。\n"
             "買不到只通知一次，掛機照常繼續。")
         self.ball_cb.toggled.connect(self._on_ball_toggle)
-        run_bar.addWidget(self.ball_cb)
+        ball_bar.addWidget(self.ball_cb)
         # ★★ 現況／為什麼沒動作，**一定要看得到**（2026-08-22 使用者回報
         #   「滿了沒買新的換上，看不出來問題在哪」）—— 十個安靜的 return
         #   讓「功能沒動」跟「功能沒開」長得一模一樣。
         self._ball_lbl = QLabel("經驗球：—")
         self._ball_lbl.setStyleSheet("color: #9aa2b8;")
-        run_bar.addSpacing(6)
-        run_bar.addWidget(self._ball_lbl)
+        ball_bar.addSpacing(6)
+        ball_bar.addWidget(self._ball_lbl)
         # ⛔ 臨時的「測試換球」鈕已拆掉（2026-08-21 三包實機驗證完成：
         #   換球 0x12、商城買 0x12B、領取 0x2F/0x16 —— 五個帳號跑過，
         #   買 2 包／領 2 包／換 2 包，一包都沒多送，兩格都換上）。
-        run_bar.addStretch(1)
-        root.addLayout(run_bar)
+        ball_bar.addStretch(1)
+        root.addLayout(ball_bar)
 
         # ★ 依分類分組（使用者要求）：原本 5 條平鋪的橫列很難一眼看懂哪個是
         #   哪個，改成有標題的方框、排成兩欄，垂直空間也省下來給下面的清單。
@@ -2340,14 +2346,19 @@ class CharFarmPage(QWidget):
         panes.addWidget(spot)
         root.addLayout(panes)
 
-        # ⚠ 這一行本來是 setWordWrap(True)：「掛機中：只打「A、B、C」　精靈：…
-        #   　⚠ 勾的鍵上沒有技能」這種長訊息會折成兩三行，整頁就跟著變高
-        #   （固定 700 的視窗立刻多一條捲軸，捲軸又把寬度吃掉 → 跑版）。
-        #   改成單行截斷，完整內容在滑鼠提示裡。**不隱藏**（它一直有字，
-        #   收起來會讓下面的東西上下跳）。
+        # ⛔ 2026-08-28 使用者要求：整頁最下面那行灰字狀態列**不要顯示**。
+        # ★ 物件保留、只是不進版面：全頁五十幾處 `self.status.setText(...)`
+        #   是各條流程（補給、死亡回程、換球、換頻道…）的收尾，拔掉會變成
+        #   一場大改；離線測試也靠它讀「這一拍講了什麼」（train_check）。
+        # ⚠ 代價講在前面：畫面上看不到進度與「為什麼沒動作」了，只剩通知、
+        #   「經驗球：…」那一列與各功能自己的標籤。想看回來就把它
+        #   `root.addWidget(self.status)` 加回去。
+        # ⚠ hide_when_empty=False → `setText()` 不會自己 setVisible，
+        #   所以 hide() 之後不會被下一則訊息叫回畫面上。
         self.status = _NoteLabel(hide_when_empty=False)
+        self.status.setParent(self)          # 屬於這一頁（不然會變成獨立視窗）
+        self.status.hide()
         self.status.setText("尚未掃描")
-        root.addWidget(self.status)
         root.addStretch(1)
 
         self._load_settings()

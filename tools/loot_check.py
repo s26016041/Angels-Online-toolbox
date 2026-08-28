@@ -319,6 +319,37 @@ check("說「還沒對到新東西」", "還沒對到" in empty._head.text())
 check("零列", empty._tbl.rowCount() == 0)
 empty.deleteLater()
 
+print("⑰ 版面（2026-08-28 使用者調的）")
+
+
+def _row_of(page, w) -> int:
+    """這個小工具回「w 在版面的第幾條橫列」（找不到回 -1）。
+
+    ⚠ 分頁的內容掛在捲動區裡那個 `body`，不是 `page.layout()` —— 直接問
+      page 會一列都找不到（全 -1，反而看起來「通過」）。
+    """
+    root = page.run_cb.parentWidget().layout()
+    for i in range(root.count()):
+        lay = root.itemAt(i).layout()
+        if lay is None:
+            continue
+        for j in range(lay.count()):
+            if lay.itemAt(j).widget() is w:
+                return i
+    return -1
+
+
+run_row = _row_of(page, page.run_cb)
+check("「自動換球」自成一列，就在「開始掛機」下面",
+      _row_of(page, page.ball_cb) == run_row + 1,
+      f"開始掛機在第 {run_row} 列、自動換球在第 {_row_of(page, page.ball_cb)} 列")
+check("「經驗球：…」跟它同一列（不在主開關那列右邊）",
+      _row_of(page, page._ball_lbl) == _row_of(page, page.ball_cb) != run_row)
+check("最下面那行灰字狀態列不顯示",
+      not page.status.isVisibleTo(page))
+check("狀態列的內容照樣收得到（流程收尾與離線測試在用）",
+      page.status.text() != "")
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
