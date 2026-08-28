@@ -80,7 +80,8 @@ from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
 from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list, fit_spin,
-                               mall_buys_dialog, no_elide, record_mall_buy)
+                               mall_buys_dialog, mall_buys_widget, no_elide,
+                               record_mall_buy)
 
 # 設 AO_FARM_LOG=1 就會把每一秒的決策寫進 farm_debug_<帳號>.log。
 # 平常是關的 —— 從外面看不到「為什麼不走」，只能靠這個。
@@ -1924,42 +1925,20 @@ class CharFarmPage(QWidget):
             "精靈頁放的是商店沒賣的藥水：通知並自動關閉。")
         self.train_cb.toggled.connect(self._on_train_toggle)
         run_bar.addWidget(self.train_cb)
-        # ★ 購買紀錄（2026-08-20 使用者要求）：回程補給跟商人買了什麼的流水帳，
-        #   按了開一張表（時間／商人／物品／數量／花費＋總額）。
-        # ★★ 2026-08-21 使用者要求**商店與商城分兩張表**：花的錢根本不同種
-        #   （商店＝金幣、商城＝點數），混在同一張表總額就是錯的。
+        # ★ 「紀錄」一顆鈕開三個分頁（2026-08-28 使用者要求：獲得物品／
+        #   商店紀錄／商城紀錄本來各一顆，按鈕列太擠 → 併成一顆、視窗裡分頁）。
+        # ⚠ 分頁是分開的，**表沒有合併**：商店花金幣、商城花點數、獲得算件數，
+        #   混成一張總額就是錯的（2026-08-21 使用者定的規矩還在）。
         run_bar.addSpacing(24)
-        self.buy_log_btn = QPushButton("商店紀錄")
-        self.buy_log_btn.setToolTip(
-            "回程補給跟商人買了什麼：時間、物品、數量、花費（金幣）與總額。\n"
-            "只記這次開著工具箱期間的（重開清空）。")
-        # 跟「歸零」同一套量法：照字型量寬高，別讓原生按鈕邊框把字切掉。
-        fm2 = self.buy_log_btn.fontMetrics()
-        self.buy_log_btn.setFixedSize(
-            fm2.horizontalAdvance("商店紀錄") + 32, fm2.height() + 8)
-        self.buy_log_btn.clicked.connect(self._show_purchases)
-        run_bar.addWidget(self.buy_log_btn)
-        self.mall_log_btn = QPushButton("商城紀錄")
-        self.mall_log_btn.setToolTip(
-            "自動換球去天使商城買了什麼：時間、商品、數量、花費（點數）與總額。\n"
-            "只記這次開著工具箱期間的（重開清空）。")
-        fmm = self.mall_log_btn.fontMetrics()
-        self.mall_log_btn.setFixedSize(
-            fmm.horizontalAdvance("商城紀錄") + 32, fmm.height() + 8)
-        self.mall_log_btn.clicked.connect(self._show_mall_buys)
-        run_bar.addSpacing(4)
-        run_bar.addWidget(self.mall_log_btn)
-        # ★ 獲得物品（2026-08-28 使用者要求）：這段期間背包多了什麼、金幣多了
-        #   多少。同一種東西累加成一列，附遊戲自己的圖示；視窗裡有「重新計算」。
-        self.loot_btn = QPushButton("獲得物品")
-        self.loot_btn.setToolTip(
-            "掛機期間撿到什麼：物品圖示、名稱、累計數量與金幣收入。\n"
-            "同一種東西累加成一列；補給買來的不算。\n"
-            "視窗裡按「重新計算」重新起算（只記這次開著工具箱期間的）。")
-        fit_btn(self.loot_btn)
-        self.loot_btn.clicked.connect(self._show_loot)
-        run_bar.addSpacing(4)
-        run_bar.addWidget(self.loot_btn)
+        self.log_btn = QPushButton("紀錄")
+        self.log_btn.setToolTip(
+            "一個視窗三個分頁，只記這次開著工具箱期間的（重開清空）：\n"
+            "· 獲得物品：掛機撿到什麼（圖示、累計數量），補給買的不算\n"
+            "· 商店紀錄：回程補給跟商人買了什麼（花金幣）\n"
+            "· 商城紀錄：自動換球去天使商城買了什麼（花點數）")
+        fit_btn(self.log_btn)
+        self.log_btn.clicked.connect(self._show_logs)
+        run_bar.addWidget(self.log_btn)
         # ★ 自動換球（2026-08-21 使用者要求）：飾品欄的經驗球滿了就自動換上
         #   背包裡的備球，沒備球就通知一次。判斷全走遊戲自己的資料
         #   （範本分類＋上限），三族 32 種球都認得 —— 見 app/game/balls.py。
@@ -3343,10 +3322,11 @@ class CharFarmPage(QWidget):
         #   `bought()` 兩種時序都對得起來（見 loot.py），這裡不必管誰先誰後。
         self._loot.bought(tid, qty)
 
-    def _purchases_dialog(self) -> QDialog:
+    def _purchases_panel(self) -> QWidget:
         """把購買紀錄畫成一張表（新的在上面），總額掛在表的上方。
 
-        跟 exec 拆開是為了離線測試能只建表不進事件迴圈（train_check.py）。
+        ★ 回的是**內容**不是視窗：產品介面把它塞進「紀錄」那個三分頁視窗
+          （`_logs_dialog`），單獨開窗（離線測試）走 `_purchases_dialog`。
         ⚠ 一次性快照：開的當下有什麼畫什麼，要看新的關掉重開（不做即時
           刷新 —— 高頻改表是 qt-ui-pitfalls 的坑，這裡不需要）。
         """
@@ -3354,9 +3334,9 @@ class CharFarmPage(QWidget):
         total = sum(c for *_x, c in rows if c is not None)
         unknown = sum(1 for *_x, c in rows if c is None)
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"購買紀錄 — {self.char_name or self.account or self.pid}")
-        v = QVBoxLayout(dlg)
+        panel = QWidget(self)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
         if rows:
             head = f"總花費 {total:,} 金幣（共 {len(rows)} 筆）"
             if unknown:
@@ -3386,13 +3366,13 @@ class CharFarmPage(QWidget):
             tbl.setColumnWidth(col, w)
         tbl.horizontalHeader().setStretchLastSection(True)
         v.addWidget(tbl, 1)
-        dlg.resize(640, 420)
         # 給離線測試摸得到（不重跑排版邏輯就能驗內容）
-        dlg._head, dlg._tbl = lab, tbl
-        return dlg
+        panel._head, panel._tbl = lab, tbl
+        return panel
 
-    def _show_purchases(self) -> None:
-        self._purchases_dialog().exec()
+    def _purchases_dialog(self) -> QDialog:
+        """單獨開一張商店紀錄（離線測試 train_check.py 走這支）。"""
+        return self._wrap_panel(self._purchases_panel(), "購買紀錄")
 
     # -- 獲得物品（2026-08-28 使用者要求）--------------------------------
     #
@@ -3409,18 +3389,19 @@ class CharFarmPage(QWidget):
         self._loot_t = 0.0
         self._loot.update(self.sc, self.char_name or self.account)
 
-    def _loot_dialog(self) -> QDialog:
-        """把累計的收穫畫成一張表（新的在上面），金幣掛在表的上方。
+    def _loot_panel(self) -> QWidget:
+        """把累計的收穫畫成一張表（新的在上面），摘要掛在表的上方。
 
+        ⛔ **不算金幣**（使用者 2026-08-28：「錢不算好了」）—— 只數東西。
         ⚠ 一次性快照：開的當下有什麼畫什麼，**不即時刷新**（使用者指定
           「不用刷頻」；高頻改表也是 qt-ui-pitfalls 那個坑）。按「重新計算」
           會就地重畫一次（那時表本來就是空的）。
-        跟 exec 拆開是為了離線測試能只建表不進事件迴圈（tab_check.py）。
+        ★ 回的是**內容**不是視窗：產品介面把它塞進「紀錄」那個三分頁視窗
+          （`_logs_dialog`），單獨開窗（離線測試）走 `_loot_dialog`。
         """
-        dlg = QDialog(self)
-        dlg.setWindowTitle(
-            f"獲得物品 — {self.char_name or self.account or self.pid}")
-        v = QVBoxLayout(dlg)
+        panel = QWidget(self)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
         lab = QLabel()
         lab.setStyleSheet("font-weight: bold;")
         lab.setWordWrap(True)
@@ -3437,21 +3418,17 @@ class CharFarmPage(QWidget):
         bar.addStretch(1)
         reset_btn = QPushButton("重新計算")
         reset_btn.setToolTip("把累計歸零，從現在這一刻重新開始算。")
-        close_btn = QPushButton("關閉")
         bar.addWidget(reset_btn)
-        bar.addWidget(close_btn)
         v.addLayout(bar)
 
         def fill() -> None:
             rows = self._loot.rows()
-            gold = self._loot.gold
             total = sum(n for _t, n, _i, _s in rows)
             since = _elapsed_text(time.time() - self._loot.since)
-            head = (f"金幣 +{gold:,}　"
-                    f"物品 {len(rows)} 種 / {total:,} 件　"
+            head = (f"{len(rows)} 種 / {total:,} 件　"
                     f"起算 {time.strftime('%m/%d %H:%M', time.localtime(self._loot.since))}"
                     f"（{since}）")
-            if not rows and not gold:
+            if not rows:
                 head += f"　—— 還沒對到新東西（每 {LOOT_GAP:.0f} 秒對帳一次背包）"
             lab.setText(head)
             # ⚠ 追加式的表不 clear()（qt-ui-pitfalls）；這裡是整批重畫，
@@ -3483,15 +3460,61 @@ class CharFarmPage(QWidget):
 
         fill()
         reset_btn.clicked.connect(lambda: (self._reset_loot(), fill()))
-        close_btn.clicked.connect(dlg.accept)
-        dlg.resize(620, 460)
         # 給離線測試摸得到（不重跑排版邏輯就能驗內容）
-        dlg._head, dlg._tbl, dlg._fill = lab, tbl, fill
-        dlg._reset_btn, dlg._close_btn = reset_btn, close_btn
+        panel._head, panel._tbl, panel._fill = lab, tbl, fill
+        panel._reset_btn = reset_btn
+        return panel
+
+    def _loot_dialog(self) -> QDialog:
+        """單獨開一張「獲得物品」（離線測試／有需要時單開）。"""
+        return self._wrap_panel(self._loot_panel(), "獲得物品")
+
+    # -- 三張紀錄合成一個視窗（2026-08-28 使用者要求）--------------------
+    #
+    # 使用者原話：「商店紀錄 商城紀錄 獲得物品 我想變成一個按鈕然後把他們
+    # 變成跳出來的頁面的三個分頁」。所以按鈕列上只剩一顆「紀錄」。
+    # ⚠ 三張表**還是各自獨立**（商店花金幣、商城花點數、獲得是件數）——
+    #   2026-08-21 那條「不可以合併成一張表」的要求沒有被推翻，合的是視窗。
+    def _wrap_panel(self, panel: QWidget, title: str) -> QDialog:
+        """把一張表包成單獨的視窗（產品介面走分頁，這條給單開／離線測試）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            f"{title} — {self.char_name or self.account or self.pid}")
+        v = QVBoxLayout(dlg)
+        v.addWidget(panel)
+        dlg.resize(640, 460)
+        for attr in ("_head", "_tbl", "_fill", "_reset_btn"):
+            if hasattr(panel, attr):             # 表沒有的就不掛
+                setattr(dlg, attr, getattr(panel, attr))
         return dlg
 
-    def _show_loot(self) -> None:
-        self._loot_dialog().exec()
+    def _logs_dialog(self) -> QDialog:
+        """「紀錄」視窗：獲得物品／商店紀錄／商城紀錄三個分頁。
+
+        ⚠ 一次性快照（跟三張表原本各自的規矩一樣）：開的當下有什麼畫什麼，
+          要看新的關掉重開。三張都在開窗時就畫好 —— 資料本來就在記憶體裡，
+          切分頁不必再讀一次。
+        """
+        who = self.char_name or self.account or self.pid
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"紀錄 — {who}")
+        v = QVBoxLayout(dlg)
+        tabs = QTabWidget()
+        loot_panel = self._loot_panel()
+        buy_panel = self._purchases_panel()
+        mall_panel = mall_buys_widget(dlg, self._mall_buys, str(who))
+        tabs.addTab(loot_panel, "獲得物品")
+        tabs.addTab(buy_panel, "商店紀錄")
+        tabs.addTab(mall_panel, "商城紀錄")
+        v.addWidget(tabs, 1)
+        dlg.resize(660, 520)
+        # 給離線測試摸得到
+        dlg._tabs = tabs
+        dlg._loot, dlg._buys, dlg._mall = loot_panel, buy_panel, mall_panel
+        return dlg
+
+    def _show_logs(self) -> None:
+        self._logs_dialog().exec()
 
     # ------------------------------------------------------------------
     # -- 自動換球（2026-08-21 使用者要求）--------------------------------

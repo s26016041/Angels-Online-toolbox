@@ -266,6 +266,22 @@ class ClientWatchMixin:
 
 
 def mall_buys_dialog(parent, rows: list, who: str) -> QDialog:
+    """「商城紀錄」單獨一個視窗（自動生產頁的按鈕、離線測試走這支）。
+
+    ★ 內容本體在 `mall_buys_widget()` —— 掛機頁把同一份塞進「紀錄」視窗的
+      一個分頁（2026-08-28 使用者要求三張表併成一顆按鈕）。
+    """
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(f"商城購買紀錄 — {who}")
+    v = QVBoxLayout(dlg)
+    panel = mall_buys_widget(dlg, rows, who)
+    v.addWidget(panel)
+    dlg.resize(640, 420)
+    dlg._head, dlg._tbl = panel._head, panel._tbl   # 給離線測試摸得到
+    return dlg
+
+
+def mall_buys_widget(parent, rows: list, who: str) -> QWidget:
     """「商城紀錄」表：時間／商城編號／商品／數量／花費(點數)＋總額。
 
     ★ 自動掛機與自動生產**共用這一份** —— 兩邊各畫一次的話，改欄位就會有
@@ -277,9 +293,9 @@ def mall_buys_dialog(parent, rows: list, who: str) -> QDialog:
     rows = list(rows)[::-1]                     # 新的在上面
     total = sum(r[4] for r in rows)
 
-    dlg = QDialog(parent)
-    dlg.setWindowTitle(f"商城購買紀錄 — {who}")
-    v = QVBoxLayout(dlg)
+    panel = QWidget(parent)
+    v = QVBoxLayout(panel)
+    v.setContentsMargins(0, 0, 0, 0)
     head = (f"總花費 {total:,} 點（共 {len(rows)} 筆）" if rows else
             "還沒有商城購買紀錄 —— 自動換球買不到備球時會記在這裡。")
     lab = QLabel(head)
@@ -304,9 +320,8 @@ def mall_buys_dialog(parent, rows: list, who: str) -> QDialog:
         tbl.setColumnWidth(col, w)
     tbl.horizontalHeader().setStretchLastSection(True)
     v.addWidget(tbl, 1)
-    dlg.resize(640, 420)
-    dlg._head, dlg._tbl = lab, tbl              # 給離線測試摸得到
-    return dlg
+    panel._head, panel._tbl = lab, tbl          # 給離線測試摸得到
+    return panel
 
 
 def record_mall_buy(rows: list, g) -> None:

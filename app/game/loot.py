@@ -1,10 +1,11 @@
-"""掛機收穫：這段期間背包多了什麼東西、金幣多了多少。
+"""掛機收穫：這段期間背包多了什麼東西。
 
     lt = loot.Loot()
     lt.update(scanner, who="小天使")     # 每隔幾秒叫一次（掛機頁的心跳）
     lt.rows()                            # [(種類id, 累計數量, 圖示編號, 最後時間)]
-    lt.gold                              # 累計金幣收入
     lt.reset()                           # 「重新計算」
+
+⛔ **金幣不算**（使用者 2026-08-28 決定：「錢不算好了」）—— 這裡只數東西。
 
 怎麼算出來的
 ------------
@@ -23,8 +24,8 @@
 ⚠⚠ 讀不到一定要整拍作廢（[[bag-false-empty-guards]]，那個坑已經復發七次）
   —— 背包讀不到時 `bag.items()` 回的是空清單，跟「東西全被賣光」長得一模一樣。
   拿它當基準的話，下一拍整袋東西會被算成「剛剛獲得」，數字會離譜地灌水。
-  所以這裡只吃 `bag.scan()` 的第二個回傳值（整段真的都讀到了），
-  以及 `bag.gold()` 的非 None；有一個不成立就**基準不動、什麼都不算**。
+  所以這裡只吃 `bag.scan()` 的第二個回傳值（整段真的都讀到了、而且伺服器
+  真的把內容推過來了）；它不成立就**基準不動、什麼都不算**。
 
 ⚠ 買來的東西不算收穫（`bought()`）：回程補給買的兩百瓶藥水本來就會讓背包
   變多，記進「掛機獲得」只會讓人以為打怪掉了兩百瓶。補給那條路本來就在
@@ -32,8 +33,9 @@
   ★ 記帳跟快照誰先誰後都要對：`bought()` **先從已經累計的數量倒扣**，
     扣不完的才掛在待扣帳上等下一拍（快照先發生／記帳先發生兩種順序都成立）。
 
-金幣走 `bag.gold()`（背包第 0 格的物品，遊戲自己的取法），不是 `player.read()`
-—— 換地圖空窗那支會回一億五千萬的差額，見 `bag.gold()` 檔頭那段實測。
+⚠ 這裡**不必**另外問一次 `bag.gold()`：「東西真的推過來了嗎」那道同步判定
+  已經在 `bag.scan()` 的第二個回傳值裡（它自己會查第 0 格的金幣物件，
+  見 `bag._gold_slot_ok`）—— 再讀一次金幣只是同一道閘問第二遍。
 
 全程只讀記憶體，不寫入、不注入。
 """
@@ -65,15 +67,13 @@ class Loot:
         """
         with self._lock:
             self.since = time.time()
-            self.gold = 0
-            # 種類id → [累計數量, 圖示編號, 最後一次增加的時間, 第幾次增加]
+            # 種類id →[累計數量, 圖示編號, 最後一次增加的時間, 第幾次增加]
             # ⚠ 排序要用最後那個流水號當第二鍵：同一拍進來的好幾種東西時間戳
             #   會一模一樣（`time.time()` 的解析度不夠），只看時間的話順序
             #   等於「誰先被 dict 走到」，看起來就像沒照新舊排。
             self._items: dict[int, list] = {}
             self._seq = 0
             self._prev: dict[int, int] | None = None   # 上一拍的整袋數量
-            self._prev_gold: int | None = None
             self._pending: dict[int, int] = {}         # 買來的待扣帳
             self._who: str | None = None               # 上一拍是哪隻角色
 
@@ -126,9 +126,6 @@ class Loot:
         items, complete = bag.scan(scanner)
         if not complete:
             return False                     # ⚠⚠ 讀不到 ≠ 沒有，整拍作廢
-        gold = bag.gold(scanner)
-        if gold is None:
-            return False
         cur: dict[int, int] = {}
         icons: dict[int, int] = {}
         for it in items:
@@ -139,9 +136,9 @@ class Loot:
         with self._lock:
             same_who = who is None or self._who is None or who == self._who
             self._who = who if who is not None else self._who
-            if self._prev is None or self._prev_gold is None or not same_who:
+            if self._prev is None or not same_who:
                 # 第一拍（或剛歸零／剛換人）：只建基準，不算收穫。
-                self._prev, self._prev_gold = cur, gold
+                self._prev = cur
                 return True
             for tid, n in cur.items():
                 gain = n - self._prev.get(tid, 0)
@@ -167,7 +164,5 @@ class Loot:
                     slot[2], slot[3] = now, self._seq
                     if not slot[1] and icons.get(tid):
                         slot[1] = icons[tid]
-            if gold > self._prev_gold:
-                self.gold += gold - self._prev_gold
-            self._prev, self._prev_gold = cur, gold
+            self._prev = cur
         return True
