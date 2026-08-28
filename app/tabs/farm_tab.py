@@ -37,7 +37,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -73,7 +74,7 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
-                      channel, entity, eventmap,
+                      channel, entity, eventmap, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
@@ -186,6 +187,35 @@ BALL_RETRY_GAP = 10.0
 # 「購買紀錄」在記憶體裡最多留幾筆（跟自動回連的事件歷史同一套：session 狀態，
 # 工具箱重開清空）。一趟補給通常 2~5 筆，500 筆夠看好幾天。
 PURCHASE_CAP = 500
+# ★ 「獲得物品」（2026-08-28 使用者要求）多久對帳一次背包。整袋掃一遍實測
+#   幾毫秒（`bag.scan` 一次批量讀指標＋每件一次讀取，範本有快取），放在 UI
+#   心跳上很便宜；間隔太長的話「撿到又賣掉」會整批漏掉，3 秒是折衷。
+#   ⚠ 這是**對帳**的頻率，不是視窗刷新的頻率 —— 視窗是一次性快照
+#     （使用者指定「不用刷頻」，高頻改表也是 qt-ui-pitfalls 的坑）。
+LOOT_GAP = 3.0
+# 「獲得物品」表裡圖示格的邊長（px）。遊戲的道具圖示實測多半是 36x36
+#   （assets/item_icons.zip，見 tools/build_item_icons.py），照原尺寸擺最清楚。
+LOOT_ICON = 36
+# 小按鈕照字型量寬度時要留的左右內距（px）。⚠ Windows 原生按鈕左右各吃
+#   ~10px 邊框＋焦點框，只加字寬會被切掉（「歸零」那顆踩過）。
+BTN_PAD = 32
+
+
+def fit_btn(btn) -> None:
+    """照字型把按鈕縮到剛好裝得下字（跟「歸零」「商店紀錄」同一套量法）。"""
+    fm = btn.fontMetrics()
+    btn.setFixedSize(fm.horizontalAdvance(btn.text()) + BTN_PAD,
+                     fm.height() + 8)
+
+
+def _elapsed_text(secs: float) -> str:
+    """把「已經過了幾秒」講成人看的（1 小時 5 分 / 12 分 / 40 秒）。"""
+    s = max(0, int(secs))
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{s // 60} 分"
+    return f"{s // 3600} 小時 {s % 3600 // 60} 分"
 # ★★ 「背包裡找不到回程道具」要**連續確認幾次**才准停機（每次間隔就是
 #   GEAR_CHECK_GAP）。⚠ 不可以改回「第一次就停機」：換頻道／傳送後重連時，
 #   容器與內容是**分批到齊**的 —— 使用者 2026-08-09 回報「裝備壞掉卻說我
@@ -1677,6 +1707,11 @@ class CharFarmPage(QWidget):
         # 補給背景執行緒 append（純資料、不碰 Qt），按「購買紀錄」鈕時才畫表。
         # session 狀態不進 config（跟擊殺數、事件歷史同一類）。
         self._purchases: list[tuple[float, str, int, int, int | None]] = []
+        # ── 獲得物品（2026-08-28 使用者要求）──
+        # 背包快照對帳的累計器（見 app/game/loot.py）。session 狀態不進 config，
+        # 跟擊殺數／購買紀錄同一類；「重新計算」鈕會把它歸零。
+        self._loot = loot.Loot()
+        self._loot_t = 0.0         # 對帳心跳（LOOT_GAP 一拍）
         # ⛔ 舊的 self._dry 通知門閂已刪：買得到的藥水見底**不通知**
         #   （2026-08-19 使用者：會自動補給還通知是吵人），只剩 _dry_stop
         #   那種「店裡沒賣、要停機」才通知，而停機本身就不會重複。
@@ -1914,6 +1949,17 @@ class CharFarmPage(QWidget):
         self.mall_log_btn.clicked.connect(self._show_mall_buys)
         run_bar.addSpacing(4)
         run_bar.addWidget(self.mall_log_btn)
+        # ★ 獲得物品（2026-08-28 使用者要求）：這段期間背包多了什麼、金幣多了
+        #   多少。同一種東西累加成一列，附遊戲自己的圖示；視窗裡有「重新計算」。
+        self.loot_btn = QPushButton("獲得物品")
+        self.loot_btn.setToolTip(
+            "掛機期間撿到什麼：物品圖示、名稱、累計數量與金幣收入。\n"
+            "同一種東西累加成一列；補給買來的不算。\n"
+            "視窗裡按「重新計算」重新起算（只記這次開著工具箱期間的）。")
+        fit_btn(self.loot_btn)
+        self.loot_btn.clicked.connect(self._show_loot)
+        run_bar.addSpacing(4)
+        run_bar.addWidget(self.loot_btn)
         # ★ 自動換球（2026-08-21 使用者要求）：飾品欄的經驗球滿了就自動換上
         #   背包裡的備球，沒備球就通知一次。判斷全走遊戲自己的資料
         #   （範本分類＋上限），三族 32 種球都認得 —— 見 app/game/balls.py。
@@ -3292,6 +3338,10 @@ class CharFarmPage(QWidget):
             (time.time(), merchant, int(tid), int(qty), cost))
         if len(self._purchases) > PURCHASE_CAP:
             del self._purchases[:-PURCHASE_CAP]
+        # ★ 買來的不算「獲得物品」（2026-08-28）：補給買的兩百瓶藥水本來就會
+        #   讓背包變多，記進收穫只會讓人以為打怪掉了兩百瓶。
+        #   `bought()` 兩種時序都對得起來（見 loot.py），這裡不必管誰先誰後。
+        self._loot.bought(tid, qty)
 
     def _purchases_dialog(self) -> QDialog:
         """把購買紀錄畫成一張表（新的在上面），總額掛在表的上方。
@@ -3343,6 +3393,105 @@ class CharFarmPage(QWidget):
 
     def _show_purchases(self) -> None:
         self._purchases_dialog().exec()
+
+    # -- 獲得物品（2026-08-28 使用者要求）--------------------------------
+    #
+    # 對帳在 `tick()` 裡（LOOT_GAP 一拍），算法與各種誤報的防線見
+    # `app/game/loot.py` 檔頭。這裡只負責畫。
+    def _reset_loot(self) -> None:
+        """「重新計算」：歸零並**當場重建基準**。
+
+        ⚠ 不當場重建的話，歸零到下一拍（最多 LOOT_GAP 秒）之間背包的變動
+          會算進新的一輪 —— 看起來就像「才剛按重置就跳出東西」。
+          讀不到（還沒進場／換地圖中）就讓它留空，下一拍自然會建。
+        """
+        self._loot.reset()
+        self._loot_t = 0.0
+        self._loot.update(self.sc, self.char_name or self.account)
+
+    def _loot_dialog(self) -> QDialog:
+        """把累計的收穫畫成一張表（新的在上面），金幣掛在表的上方。
+
+        ⚠ 一次性快照：開的當下有什麼畫什麼，**不即時刷新**（使用者指定
+          「不用刷頻」；高頻改表也是 qt-ui-pitfalls 那個坑）。按「重新計算」
+          會就地重畫一次（那時表本來就是空的）。
+        跟 exec 拆開是為了離線測試能只建表不進事件迴圈（tab_check.py）。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            f"獲得物品 — {self.char_name or self.account or self.pid}")
+        v = QVBoxLayout(dlg)
+        lab = QLabel()
+        lab.setStyleSheet("font-weight: bold;")
+        lab.setWordWrap(True)
+        v.addWidget(lab)
+
+        tbl = QTableWidget(0, 4)
+        tbl.setHorizontalHeaderLabels(["圖示", "物品", "數量", "最後獲得"])
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setIconSize(QSize(LOOT_ICON, LOOT_ICON))
+        v.addWidget(tbl, 1)
+
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        reset_btn = QPushButton("重新計算")
+        reset_btn.setToolTip("把累計歸零，從現在這一刻重新開始算。")
+        close_btn = QPushButton("關閉")
+        bar.addWidget(reset_btn)
+        bar.addWidget(close_btn)
+        v.addLayout(bar)
+
+        def fill() -> None:
+            rows = self._loot.rows()
+            gold = self._loot.gold
+            total = sum(n for _t, n, _i, _s in rows)
+            since = _elapsed_text(time.time() - self._loot.since)
+            head = (f"金幣 +{gold:,}　"
+                    f"物品 {len(rows)} 種 / {total:,} 件　"
+                    f"起算 {time.strftime('%m/%d %H:%M', time.localtime(self._loot.since))}"
+                    f"（{since}）")
+            if not rows and not gold:
+                head += f"　—— 還沒對到新東西（每 {LOOT_GAP:.0f} 秒對帳一次背包）"
+            lab.setText(head)
+            # ⚠ 追加式的表不 clear()（qt-ui-pitfalls）；這裡是整批重畫，
+            #   而且只有兩個時機（開視窗、按重新計算），設列數就夠。
+            tbl.setRowCount(len(rows))
+            for i, (tid, qty, icon_id, ts) in enumerate(rows):
+                icon_it = QTableWidgetItem()
+                pm = itemicon.pixmap(icon_id) if icon_id else None
+                if pm is not None and not pm.isNull():
+                    icon_it.setIcon(QIcon(pm))
+                else:
+                    # 沒有這張圖（改版新道具、圖包沒重建）→ 留白，
+                    # **不拿別張圖頂替**（itemicon 檔頭的規矩）。
+                    icon_it.setText("—")
+                    icon_it.setTextAlignment(Qt.AlignCenter)
+                tbl.setItem(i, 0, icon_it)
+                cells = (itemname.label(tid), f"{qty:,}",
+                         time.strftime("%m/%d %H:%M:%S", time.localtime(ts)))
+                for col, text in enumerate(cells, start=1):
+                    it = QTableWidgetItem(text)
+                    if col == 2:                  # 數量靠右
+                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    tbl.setItem(i, col, it)
+                tbl.setRowHeight(i, LOOT_ICON + 8)
+            # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
+            for col, w in enumerate((LOOT_ICON + 12, 240, 80)):
+                tbl.setColumnWidth(col, w)
+            tbl.horizontalHeader().setStretchLastSection(True)
+
+        fill()
+        reset_btn.clicked.connect(lambda: (self._reset_loot(), fill()))
+        close_btn.clicked.connect(dlg.accept)
+        dlg.resize(620, 460)
+        # 給離線測試摸得到（不重跑排版邏輯就能驗內容）
+        dlg._head, dlg._tbl, dlg._fill = lab, tbl, fill
+        dlg._reset_btn, dlg._close_btn = reset_btn, close_btn
+        return dlg
+
+    def _show_loot(self) -> None:
+        self._loot_dialog().exec()
 
     # ------------------------------------------------------------------
     # -- 自動換球（2026-08-21 使用者要求）--------------------------------
@@ -3447,6 +3596,9 @@ class CharFarmPage(QWidget):
     def _record_mall_buy(self, g) -> None:
         """商城買到一筆 → 記帳（**背景執行緒**呼叫，只碰純資料）。"""
         record_mall_buy(self._mall_buys, g)
+        # 商城買的備球最後會領進背包（balls.restock），跟商店買的一樣
+        # 不算「獲得物品」—— 那是花點數換來的，不是打怪掉的。
+        self._loot.bought(g.type_id, g.count)
 
     def _mall_buys_dialog(self) -> QDialog:
         return mall_buys_dialog(
@@ -5224,6 +5376,17 @@ class CharFarmPage(QWidget):
         #   一定要放在最前面：底下每一段都在讀寫一個已經不存在的行程。
         if self._check_game_gone(dt):
             return
+        # ★ 獲得物品的對帳（2026-08-28 使用者要求）：整袋快照比對，只認增加的
+        #   （怎麼算、為什麼讀不到要整拍作廢，見 app/game/loot.py 檔頭）。
+        # ⚠ 一定要放在所有提早 return **之前**：補給／死亡回程／活動地圖那幾段
+        #   都會直接 return，放後面的話正好在「回城賣東西」那段停止記帳
+        #   （跟趴趴GO 倒數、換球標籤踩過的是同一個坑）。
+        # ★ 不看「開始掛機」有沒有勾：手動打王、練技一樣會撿到東西，
+        #   而按鈕隨時都在，勾選才記帳會讓它看起來壞掉。
+        self._loot_t += dt
+        if self._loot_t >= LOOT_GAP:
+            self._loot_t = 0.0
+            self._loot.update(self.sc, self.char_name or self.account)
         # ★ 掃描**一直都在跑**，不管有沒有在掛機 ——
         #   這樣「周圍怪物」永遠是即時的，使用者隨時可以把名字加進來，
         #   也不必先按什麼按鈕才能開始（掃描只掃熱區，很便宜）。
