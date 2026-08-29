@@ -35,6 +35,30 @@
   ＋這招之後跳過確認（`_cw_skip`），**絕不重放**。真的收到廣播時照樣
   回報「伺服器已受理」。沒有監聽（裝不起來）一樣退回「按出就當成功」。
 
+## ★★★ 使用者實機回報「分身不出來」的真根因（2026-08-30 北極狐實測修）
+
+`reports/leadwatch.txt`（純唯讀，盯跳板呼叫＋MP＋身上 buff 樹，420 秒）：
+
+    116.98s 工具箱叫了 F12 → MP −51 → 5471 剩 20 秒跳回 299　✅ 放到了
+    396.98s 工具箱叫了 F12 → **MP 一點都沒扣** → 剩 20 → 15 → 10 → 5 → 0 到期
+            → 之後 22 秒（記錄結束）**沒有第二次呼叫**
+
+也就是說：**遊戲會偶爾拒收這一發**（自我 buff，MP 不扣＝根本沒施放；多半是
+撞上打怪的動作硬直／後置時間 —— 掛機的攻擊迴圈每秒叫 5 次 usequickkey），
+而工具箱**一發打空就當作放好了**，下一次補放要等一整輪（300 秒）——
+使用者看到的就是「分身大部分時間都不在」。
+
+⚠⚠ 為什麼會變成「打空也不重送」：`_tree_skip`。它本來只該處理「這招放進
+  身上的鍵不是技能 ID＝驗不了」，但舊版把**連續 3 次沒生效**一律當成驗不了，
+  於是早期連踩三次拒收之後就永久瞎放（而且 `live_left` 從此不讀樹，
+  再也沒機會發現「其實驗得到」，**重開工具箱才會好**）。
+
+✅ 修法（兩處，配合 memory confirm-and-resend／transient-failure-auto-retry）：
+  ① 樹上**曾經**看得到這一招 → `_tree_seen`，之後永遠不准 `_tree_skip`；
+     沒生效就照 RETRY 重送到成功為止（`_cast_at` 不准前進）。
+  ② `_tree_skip` 只擋回報、不擋讀取 —— 照樣每 LIVE_GAP 讀一次樹，
+     看到就自我修復（不必重開工具箱）。
+
 技能編號怎麼來
 --------------
 ★★★ **直接讀快捷欄**（`quickbar.read_page`，2026-08-06 找到的表）——
@@ -78,6 +102,10 @@ LIVE_GAP = 0.4
 # ⚠⚠ 這道閘門是**防無限重放**用的：萬一某招放進身上的鍵不是技能 ID
 #   （改版／特殊技能），沒有它就會變成每 RETRY 秒重放一次、永遠停不下來
 #   —— 2026-08-20 castwatch 那次翻車就是這個形狀（見檔頭）。
+# ⚠⚠⚠ 但它**只能管「這招驗不了」，不准拿來管「這一發沒放到」**
+#   （2026-08-30 北極狐實機根因，見檔頭「一發打空就少五分鐘」那一節）：
+#   樹上曾經看得到這招（`_tree_seen`）就代表驗得了，之後放不出來一律是
+#   暫時性失敗 → 照 RETRY 重送到成功為止，永遠不准關掉確認。
 TREE_MISS_MAX = 3
 # 按鍵到遊戲把技能編號寫進欄位要一點時間，實測 1 秒內。
 CONFIRM_WAIT = 1.2
@@ -124,6 +152,9 @@ class AutoBuff:
         self._tree_miss = 0       # 送出後樹上看不到這招的連續次數
         self._live_before = 0.0   # 送出**前**身上還剩幾秒（確認的基準線）
         self._tree_skip = False   # 連續太多次 → 這招不用樹確認（退回自記時間）
+        # ★★★ 樹上**曾經**看得到這一招 ＝「這招驗得了」的硬證據。
+        #   有它就永遠不准再退回自記時間（見 TREE_MISS_MAX 的說明）。
+        self._tree_seen = False
         self.note = ""
         self.armed = False
         self.blocked = ""        # 那個鍵上根本沒有可用的技能 → 停手（見 block）
@@ -149,6 +180,7 @@ class AutoBuff:
         self._cw_skip = False                # 換了技能 → 廣播驗不驗得到重新試
         self._live_at, self._live = 0.0, None
         self._tree_miss, self._tree_skip = 0, False   # 樹確認也重新試
+        self._tree_seen = False              # 換了技能 → 驗不驗得到重新認定
         self.blocked = ""
         return True
 
@@ -188,18 +220,30 @@ class AutoBuff:
         ★ 這是現在的主判據（使用者 2026-08-22：剩 < LEAD 或沒有才放）。
         ⚠ 節流 LIVE_GAP：心跳每 10ms 一拍，不快取等於每秒白讀 100 次。
         ⚠ `_tree_skip`（這招驗不了）時一律回 None，讓呼叫端退回自己記時間。
+
+        ⚠⚠ **`_tree_skip` 不擋讀取，只擋回報**（2026-08-30 改）：舊版一旦
+          `_tree_skip` 就直接 return None，樹再也不讀 —— 於是「這招其實驗得到」
+          這件事永遠沒機會被發現，一台分身只要早期連踩三次拒收就**一輩子**
+          瞎放（重開工具箱才會好）。現在照讀，看到就把 `_tree_seen` 立起來並
+          當場解除 `_tree_skip`（自我修復）。一次走樹 0.05~0.16ms，0.4 秒
+          一次的成本可以忽略。
         """
-        if not self.skill or self._tree_skip or scanner is None:
+        if not self.skill or scanner is None:
             return None
         now = time.monotonic()
-        if now - self._live_at < LIVE_GAP:
-            return self._live
-        self._live_at = now
-        try:
-            self._live = buffs.left_of(scanner, self.skill)
-        except Exception:                              # noqa: BLE001
-            self._live = None                          # 讀取層炸了＝不知道
-        return self._live
+        if now - self._live_at >= LIVE_GAP:
+            self._live_at = now
+            try:
+                self._live = buffs.left_of(scanner, self.skill)
+            except Exception:                          # noqa: BLE001
+                self._live = None                      # 讀取層炸了＝不知道
+            if self._live:
+                # 樹上真的看得到這一招（不管是我們放的還是使用者自己放的）
+                # → 「驗得了」定案，之後放不出來一律當暫時性失敗重送。
+                self._tree_seen = True
+                self._tree_skip = False
+                self._tree_miss = 0
+        return None if self._tree_skip else self._live
 
     def _forget_live(self) -> None:
         """讓下一拍一定重讀（剛送出去、狀態會變的時候呼叫）。"""
@@ -266,12 +310,18 @@ class AutoBuff:
                 #   確認（免得鍵對不上時無限重放，見 TREE_MISS_MAX 的說明）。
                 self._confirming = False
                 self._tree_miss += 1
-                if self._tree_miss >= TREE_MISS_MAX:
+                if self._tree_miss >= TREE_MISS_MAX and not self._tree_seen:
                     self._tree_skip = True
                     self._cast_at = self._sent_at      # 退回自己記時間
                     self.note = (f"⚠ 技能 {self.skill} 放了 {self._tree_miss} 次"
                                  f"都沒出現在身上 → 改用自己記時間，不再重放")
                 else:
+                    # ★★★ 樹上曾經看得到這招（`_tree_seen`）＝這一發只是被
+                    #   遊戲擋掉（動作硬直／後置時間），是**暫時性失敗** ——
+                    #   照 RETRY 重送到成功為止，⛔ 不准放棄確認也不准假裝放到了
+                    #   （memory transient-failure-auto-retry / confirm-and-resend）。
+                    #   ⚠ `_cast_at` 故意不動：動了就等於把「沒放到」記成
+                    #     「剛放好」，下一次補放要等一整輪（北極狐的 5 分鐘空窗）。
                     self.note = (f"⚠ 補分身沒生效（身上沒看到技能 {self.skill}）"
                                  f"→ {RETRY:.0f} 秒後再試")
                 return self.note

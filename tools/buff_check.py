@@ -251,6 +251,54 @@ check("之後零重放（無限補發迴圈沒回來）", QB.uses == sent,
       f"實得又送了 {QB.uses - sent} 次")
 TREE["left"] = None                     # 收乾淨，別影響之後的測試
 
+print("⑩ 樹上曾經看得到 → 一發打空要一直重送（2026-08-30 北極狐根因）")
+# 實機：剩 20 秒補一發 → 遊戲拒收（MP 一點沒扣）→ 舊版當作放好了，
+#      下一次補放要等一整輪 300 秒 → 使用者看到「分身不出來」。
+TREE["left"] = 600.0                    # 身上還有 → 這一招驗得到（_tree_seen）
+b, mv, hook = new_buff(), FakeMover(), FakeHook()
+step(b, mv, hook)
+check("身上夠就不放", QB.uses == (u0 := QB.uses))
+check("樹上看得到 → 記住驗得了", b._tree_seen is True)
+TREE["left"] = 15.0                     # 掉到 LEAD 以下 → 該補了
+b._forget_live()
+step(b, mv, hook)
+check("剩 15 秒 → 補一發", QB.uses == u0 + 1 and b._confirming)
+cast_at0 = b._cast_at
+for i in range(3):                      # 連續三發都被遊戲拒收
+    CLOCK.t += buff.CAST_WAIT + 0.5
+    TREE["left"] = max(0.0, 15.0 - (CLOCK.t - 1000) % 300)  # 只會往下掉
+    b._forget_live()
+    note = step(b, mv, hook)
+    CLOCK.t += buff.RETRY + 0.5
+    b._forget_live()
+    step(b, mv, hook)
+check("三次沒生效還是繼續重送", QB.uses >= u0 + 4,
+      f"實得只送了 {QB.uses - u0} 次")
+check("沒有退回自記時間", b._tree_skip is False and b._tree_seen is True)
+check("_cast_at 不准被沒放到的那一發推前",
+      b._cast_at == cast_at0, f"實得 {b._cast_at} vs {cast_at0}")
+TREE["left"] = 1200.0                   # 終於放進去了
+b._forget_live()
+note = step(b, mv, hook)
+check("放到就確認成功", "身上確認" in note, f"實得 {note}")
+
+print("⑪ 已經退回自記時間的分身，樹上再看到那招要自我修復")
+TREE["left"] = 0.0
+b, mv, hook = new_buff(), FakeMover(), FakeHook()
+for _ in range(3):                      # 逼出 _tree_skip（樹上永遠看不到）
+    step(b, mv, hook)
+    CLOCK.t += buff.CAST_WAIT + 0.5
+    step(b, mv, hook)
+    CLOCK.t += buff.RETRY + 0.5
+check("先進入自記時間模式", b._tree_skip is True)
+TREE["left"] = 900.0                    # 其實驗得到（改版位移修好／使用者自己放）
+b._forget_live()
+# ★ 讀到的**當下**就修好（`_tree_skip` 只擋回報不擋讀取）——
+#   不必重開工具箱，也不必等下一拍。
+check("讀到就自我修復＋回真實剩餘", b.live_left(SC) == 900.0)
+check("旗標清乾淨", b._tree_skip is False and b._tree_seen is True)
+TREE["left"] = None                     # 收乾淨
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
