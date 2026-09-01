@@ -60,6 +60,8 @@ KINDS = (WALK, INTERACT, CLEAR, WAIT)
 
 # 對話選單最多幾項（talkaction 碼只到第 10 項，見 supply.talk_option）
 MENU_MAX = 10
+# 可走格數容許差幾成（見 check_map）。副本的門會開關，格數本來就會變。
+WALKABLE_TOLERANCE = 0.02
 
 
 def folder() -> Path:
@@ -220,6 +222,10 @@ def validate(step: dict) -> tuple[bool, str]:
         for n in menu:
             if not isinstance(n, int) or not 1 <= n <= MENU_MAX:
                 return False, f"選項序號要在 1~{MENU_MAX}（收到 {n}）"
+        gap = step.get("gap")
+        if gap is not None and (not isinstance(gap, (int, float))
+                                or not 0 < gap <= 30):
+            return False, f"選項間隔要在 0~30 秒（收到 {gap}）"
     elif kind == WAIT:
         s = step.get("secs")
         if not isinstance(s, (int, float)) or not 0 < s <= 600:
@@ -242,7 +248,9 @@ def describe(step: dict) -> str:
         # ★ 有名字就印名字（「惡魔系雕像01（60049）」）—— 光看編號認不出是什麼
         #   東西（2026-09-02 使用者回報）。查不到就退回只顯示編號。
         who = mapobj.label(m) if isinstance(m, int) else f"外觀 {m}"
-        return f"對話 ({x}, {y})　{who}{tail}"
+        gap = step.get("gap")
+        return (f"對話 ({x}, {y})　{who}{tail}"
+                + (f"　間隔 {gap} 秒" if gap and menu else ""))
     if kind == CLEAR:
         return "清光周圍的怪"
     if kind == WAIT:
@@ -270,7 +278,12 @@ def check_map(script: Script, grid, scene_id: int | None,
         if (fp.get("w"), fp.get("h")) != (now["w"], now["h"]):
             return False, (f"地圖大小變了（腳本 {fp.get('w')}x{fp.get('h')}、"
                            f"現在 {now['w']}x{now['h']}）—— 官方改過地圖？")
-        if fp.get("walkable") and fp["walkable"] != now["walkable"]:
-            return False, (f"可走格數變了（腳本 {fp['walkable']}、"
-                           f"現在 {now['walkable']}）—— 官方改過地圖？")
+        # ⚠⚠ 可走格數**不是固定的**（2026-09-02 實測踩到）：同一個副本的
+        #   分流 5 是 22675 格、分流 6 是 22659 格，差 16 格 —— 因為副本裡有
+        #   會開關的門（`靜態-資料片門01關`），門關著那幾格就不能走。
+        #   所以只能比「有沒有差很多」，比精確值會在每一趟都誤報成「官方改圖」。
+        want, got = fp.get("walkable") or 0, now["walkable"]
+        if want and abs(got - want) > want * WALKABLE_TOLERANCE:
+            return False, (f"可走格數差太多（腳本 {want}、現在 {got}）"
+                           f"—— 官方改過地圖？")
     return True, ""

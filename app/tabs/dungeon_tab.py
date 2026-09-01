@@ -559,7 +559,9 @@ class DungeonTab(BaseTab):
                 return
             self._clicked = True
             self._menu_i = 0
-            self._menu_t = MENU_GAP
+            # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
+            #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
+            self._menu_t = float(step.get("gap") or MENU_GAP)
             self._say(f"第 {self._i + 1} 步　已點外觀 {hit[0].model}")
             return
 
@@ -573,7 +575,7 @@ class DungeonTab(BaseTab):
                 self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
                 return
             self._menu_i += 1
-            self._menu_t = MENU_GAP
+            self._menu_t = float(step.get("gap") or MENU_GAP)
             self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
                       f"（{self._menu_i}/{len(menu)}）")
             return

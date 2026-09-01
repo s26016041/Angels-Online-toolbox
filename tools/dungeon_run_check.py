@@ -149,6 +149,18 @@ def main() -> int:
     ck("送完 → 前進下一步", tab._i == 1)
     ck("★ 送完會送「離開互動」（不送伺服器會以為還在講話）", tab.left == [1])
 
+    # ★ 每一步自己的選項間隔（使用者：太快說話會出現無異議對話）
+    slow = {"do": "interact", "at": [20, 20], "model": 60307,
+            "menu": [1, 2], "gap": 5.0}
+    tab = make_tab([slow], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    run(tab, 0.3)
+    ck("點下去了", tab._clicked)
+    run(tab, 2.0)
+    ck("★ 間隔 5 秒時，2 秒還不送選項", tab.sent == [], str(tab.sent))
+    run(tab, 4.0)
+    ck("★ 過了 5 秒才送第一個", len(tab.sent) == 1, str(tab.sent))
+
     tab = make_tab([step], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60999)])   # 外觀對不上
     run(tab, 0.3)

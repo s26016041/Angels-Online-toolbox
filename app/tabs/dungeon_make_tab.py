@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -140,55 +141,96 @@ class MapWindow(QDialog):
       開成獨立視窗就能拉大／最大化，還多一顆「符合視窗」自動算縮放。
     """
 
-    def __init__(self, parent, render, on_pick) -> None:
-        super().__init__(parent)
+    def __init__(self, tab) -> None:
+        super().__init__(tab)
         self.setWindowTitle("副本地圖")
         self.setModal(False)                     # ⚠ 非強制回應：開著也能操作主視窗
-        self.resize(1100, 760)
-        self._render = render                    # (縮放) → QPixmap
-        self._on_pick = on_pick
+        self.resize(1100, 780)
+        self._tab = tab
         v = QVBoxLayout(self)
+
         bar = QHBoxLayout()
         bar.addWidget(QLabel("縮放"))
         self.zoom = QSpinBox()
         self.zoom.setRange(1, 12)
-        self.zoom.setValue(4)
-        self.zoom.valueChanged.connect(self.redraw)
+        self.zoom.setValue(3)
+        self.zoom.valueChanged.connect(lambda _v: self.redraw())
         bar.addWidget(self.zoom)
         b = QPushButton("符合視窗")
         b.setToolTip("自動算一個剛好把整張圖塞進視窗的縮放。")
         b.clicked.connect(self._fit)
         bar.addWidget(b)
+        self.live_cb = QCheckBox("即時更新")
+        self.live_cb.setChecked(True)
+        self.live_cb.setToolTip("每半秒重畫一次，角色走到哪裡地圖上就跟著動。")
+        bar.addWidget(self.live_cb)
         bar.addStretch(1)
         self.info = QLabel("　")
         bar.addWidget(self.info)
         v.addLayout(bar)
+
         self.canvas = MapCanvas()
-        self.canvas.picked.connect(self._picked)
+        self.canvas.picked.connect(tab._on_pick)
         self.area = QScrollArea()
         self.area.setWidget(self.canvas)
         self.area.setWidgetResizable(False)
         v.addWidget(self.area, 1)
 
-    def _picked(self, x: float, y: float) -> None:
-        self._on_pick(x, y)
+        # 加點位的按鈕擺在這裡（使用者 2026-09-02：地圖跟加點位都放這個視窗）
+        ph = QHBoxLayout()
+        self.pick_lbl = QLabel("點一下地圖選位置")
+        ph.addWidget(self.pick_lbl)
+        ph.addStretch(1)
+        self.add_pick = QPushButton("加入點到的位置")
+        self.add_pick.setToolTip("把地圖上點到的那一格，加成一個「走到」步驟。")
+        self.add_pick.setEnabled(False)
+        self.add_pick.clicked.connect(tab._add_picked)
+        ph.addWidget(self.add_pick)
+        b = QPushButton("加入我現在站的位置")
+        b.setToolTip("把角色**現在**站的那一格，加成一個「走到」步驟。")
+        b.clicked.connect(tab._add_here)
+        ph.addWidget(b)
+        v.addLayout(ph)
+
+        self.status = QLabel("　")
+        self.status.setWordWrap(True)
+        v.addWidget(self.status)
+
+        # ⚠ 即時更新只重畫**疊圖**（角色、點位、物件），底圖是快取的 ——
+        #   底圖 420x230 ＝ 96600 次 setPixel，每半秒重算一次會吃掉一顆核心。
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._live)
+        self._timer.start(500)
+
+    def _live(self) -> None:
+        if self.isVisible() and self.live_cb.isChecked():
+            self.redraw()
 
     def _fit(self) -> None:
-        pix = self._render(1)
+        pix = self._tab._render(1)
         if pix.isNull():
             return
         vp = self.area.viewport().size()
         s = min(vp.width() / max(pix.width(), 1),
                 vp.height() / max(pix.height(), 1))
+        self.zoom.blockSignals(True)
         self.zoom.setValue(max(1, int(s)))
+        self.zoom.blockSignals(False)
         self.redraw(fit_to=s if s < 1 else None)
 
-    def redraw(self, _v=None, fit_to: float | None = None) -> None:
+    def redraw(self, fit_to: float | None = None) -> None:
         s = fit_to if fit_to else self.zoom.value()
-        pix = self._render(s)
-        if not pix.isNull():
-            self.canvas.show_map(pix, s)
-            self.info.setText(f"{pix.width()} x {pix.height()} 像素")
+        pix = self._tab._render(s)
+        if pix.isNull():
+            return
+        # ⚠ 重畫會換掉 pixmap，捲軸位置預設會被拉回原點 —— 使用者正在看某個
+        #   角落時每半秒被彈回左上角是不能用的。所以自己把位置存回去。
+        hx = self.area.horizontalScrollBar().value()
+        hy = self.area.verticalScrollBar().value()
+        self.canvas.show_map(pix, s)
+        self.area.horizontalScrollBar().setValue(hx)
+        self.area.verticalScrollBar().setValue(hy)
+        self.info.setText(f"{pix.width()} x {pix.height()} 像素")
 
 
 class DungeonMakeTab(BaseTab):
@@ -209,7 +251,8 @@ class DungeonMakeTab(BaseTab):
         self._pick = None                 # 在地圖上點到的格子
         self._menu: list[int] = []        # 正在試的對話選項路徑
         self._poked = None                # 正在試的那個物件（scenery.Prop）
-        self._big = None                  # 放大檢視的獨立視窗
+        self._big = None                  # 地圖的獨立視窗
+        self._base = None                 # 底圖快取（QImage，只跟地形／房間有關）
         self._poke_base = None            # 點下去之前的對話框代號
         self._poke_until = 0.0
 
@@ -251,56 +294,19 @@ class DungeonMakeTab(BaseTab):
         fbar.addStretch(1)
         root.addLayout(fbar)
 
-        # ── 地圖 ＋ 步驟 ────────────────────────────────────
+        # ── 地圖（一顆按鈕 → 獨立視窗，使用者 2026-09-02 指定）───────
         mid = QHBoxLayout()
-
-        mapbox = QGroupBox("地圖")
-        mv = QVBoxLayout(mapbox)
-        mh = QHBoxLayout()
         draw = QPushButton("繪製地圖")
-        draw.setToolTip("把這台分身**目前所在**的地圖畫出來。\n"
-                        "互不相通的房間會用不同顏色，可互動的物件標成紅點。")
+        draw.setToolTip(
+            "把這台分身**目前所在**的地圖畫成一個獨立視窗（可以拉大／最大化）。\n"
+            "互不相通的房間用不同顏色，可互動的物件標成紅點，角色是黃色十字。\n"
+            "加點位的按鈕也在那個視窗裡；地圖會即時更新。")
         draw.clicked.connect(self._draw)
-        mh.addWidget(draw)
-        mh.addWidget(QLabel("縮放"))
-        self.zoom = QSpinBox()
-        self.zoom.setRange(1, 8)
-        self.zoom.setValue(2)
-        self.zoom.setToolTip("一格畫幾個像素。")
-        self.zoom.valueChanged.connect(lambda _v: self._redraw_overlay())
-        mh.addWidget(self.zoom)
-        big = QPushButton("放大檢視")
-        big.setToolTip("把地圖開在一個可以拉大／最大化的獨立視窗，\n"
-                       "裡面一樣可以點位置。")
-        big.clicked.connect(self._open_big)
-        mh.addWidget(big)
-        mh.addStretch(1)
-        mv.addLayout(mh)
+        mid.addWidget(draw)
+        mid.addStretch(1)
+        root.addLayout(mid)
 
-        self.canvas = MapCanvas()
-        self.canvas.picked.connect(self._on_pick)
-        area = QScrollArea()
-        area.setWidget(self.canvas)
-        area.setWidgetResizable(False)
-        area.setMinimumHeight(320)
-        mv.addWidget(area, 1)
-
-        ph = QHBoxLayout()
-        self.pick_lbl = QLabel("點一下地圖選位置")
-        ph.addWidget(self.pick_lbl)
-        ph.addStretch(1)
-        self.add_pick = QPushButton("加入點到的位置")
-        self.add_pick.setToolTip("把地圖上點到的那一格，加成一個「走到」步驟。")
-        self.add_pick.setEnabled(False)
-        self.add_pick.clicked.connect(self._add_picked)
-        ph.addWidget(self.add_pick)
-        b = QPushButton("加入我現在站的位置")
-        b.setToolTip("把角色**現在**站的那一格，加成一個「走到」步驟。")
-        b.clicked.connect(self._add_here)
-        ph.addWidget(b)
-        mv.addLayout(ph)
-        mid.addWidget(mapbox, 3)
-
+        mid = QHBoxLayout()
         stepbox = QGroupBox("步驟（由上往下執行）")
         sv = QVBoxLayout(stepbox)
         self.steps = QListWidget()
@@ -326,10 +332,22 @@ class DungeonMakeTab(BaseTab):
             "  排在對話前面就不會遇到「還有怪物」那種點不動的對話。）")
         b.clicked.connect(lambda: self._add({"do": dungeon.CLEAR}))
         sh2.addWidget(b)
-        b = QPushButton("加入「等待」")
-        b.setToolTip("單純等幾秒（例如等門開的動畫）。")
-        b.clicked.connect(self._add_wait)
+        # ★ 使用者 2026-09-02：「需要按一個休息幾秒，不然太快說話可能會出現
+        #   無異議對話」——秒數就放旁邊，按一下就加，不必再跳輸入框。
+        self.wait_secs = QDoubleSpinBox()
+        self.wait_secs.setRange(0.5, 600.0)
+        self.wait_secs.setSingleStep(0.5)
+        self.wait_secs.setDecimals(1)
+        self.wait_secs.setValue(3.0)
+        self.wait_secs.setSuffix(" 秒")
+        b = QPushButton("加入「休息」")
+        b.setToolTip("在這裡停幾秒再做下一步。\n"
+                     "例如上一個機關剛講完話，馬上跟下一個講會被拒絕。")
+        b.clicked.connect(
+            lambda: self._add({"do": dungeon.WAIT,
+                               "secs": round(self.wait_secs.value(), 1)}))
         sh2.addWidget(b)
+        sh2.addWidget(self.wait_secs)
         sv.addLayout(sh2)
         mid.addWidget(stepbox, 2)
         root.addLayout(mid, 1)
@@ -390,6 +408,19 @@ class DungeonMakeTab(BaseTab):
         self.menu_lbl = QLabel("已選路徑：（還沒選）")
         ph2.addWidget(self.menu_lbl)
         ph2.addStretch(1)
+        # ★ 使用者 2026-09-02：「太快說話可能會出現無異議對話」——所以每一步
+        #   自己記「點下去之後隔多久送選項、選項之間隔多久」。
+        ph2.addWidget(QLabel("選項間隔"))
+        self.gap_secs = QDoubleSpinBox()
+        self.gap_secs.setRange(0.2, 30.0)
+        self.gap_secs.setSingleStep(0.5)
+        self.gap_secs.setDecimals(1)
+        self.gap_secs.setValue(1.5)
+        self.gap_secs.setSuffix(" 秒")
+        self.gap_secs.setToolTip(
+            "點下去之後隔多久才送第一個選項，以及選項之間隔多久。\n"
+            "太快送出去，伺服器那邊對話還沒準備好就會被拒絕。")
+        ph2.addWidget(self.gap_secs)
         b = QPushButton("清掉路徑")
         b.setToolTip("選錯了重來（不會影響已存的步驟）。")
         b.clicked.connect(self._clear_menu)
@@ -412,15 +443,11 @@ class DungeonMakeTab(BaseTab):
             fit_spin(sp)
         self._reload_files()
 
-    def _open_big(self) -> None:
-        if self._grid is None:
-            self.status.setText("先按「繪製地圖」")
-            return
-        if self._big is None:
-            self._big = MapWindow(self, self._render, self._on_pick)
-        self._big.show()
-        self._big.raise_()
-        self._big._fit()
+    def _say_map(self, text: str) -> None:
+        """狀態訊息：地圖視窗開著就寫在它上面，不然寫回分頁。"""
+        if self._big is not None and self._big.isVisible():
+            self._big.status.setText(text)
+        self.status.setText(text)
 
     # ------------------------------------------------------------------
     # 分身
@@ -623,23 +650,17 @@ class DungeonMakeTab(BaseTab):
         self._script.add(step)
         self._refresh_steps()
         self.steps.setCurrentRow(self.steps.count() - 1)
-        self.status.setText(f"已加入：{dungeon.describe(step)}")
-
-    def _add_wait(self) -> None:
-        secs, ok = QInputDialog.getDouble(self, "等待", "等幾秒？", 3.0,
-                                          0.5, 600.0, 1)
-        if ok:
-            self._add({"do": dungeon.WAIT, "secs": round(secs, 1)})
+        self._say_map(f"已加入：{dungeon.describe(step)}")
 
     def _add_here(self) -> None:
         _pid, sc = self._cur()
         if sc is None:
-            self.status.setText("先選一台分身")
+            self._say_map("先選一台分身")
             return
         me = self._me(sc)
         if me is None:
             # 讀不到就什麼都不做 —— 存一個 (0,0) 進去比不存危險得多。
-            self.status.setText("⚠ 讀不到角色位置，這一步沒有存")
+            self._say_map("⚠ 讀不到角色位置，這一步沒有存")
             return
         self._add({"do": dungeon.WALK, "to": [round(me[0]), round(me[1])]})
 
@@ -683,19 +704,30 @@ class DungeonMakeTab(BaseTab):
         QWidget.repaint(self)
         t0 = time.time()
         self._rooms, self._sizes = dungeon.rooms(grid)
+        self._base = None                  # 換圖了 → 底圖快取作廢
         props = scenery.nearby(sc)
         self._props_all = props or []
-        self._redraw_overlay()
         sid = scene.current_id(sc)
-        self.status.setText(
-            f"{scene.scene_name(sid)}　{grid.w}x{grid.h}　"
-            f"可走 {sum(sum(r) for r in grid.open)} 格　"
-            f"房間 {len(self._sizes)} 間 {self._sizes}　"
-            f"可互動物件 {len(self._props_all)} 個"
-            f"（{(time.time() - t0) * 1000:.0f} ms）")
+        note = (f"{scene.scene_name(sid)}　{grid.w}x{grid.h}　"
+                f"可走 {sum(sum(r) for r in grid.open)} 格　"
+                f"房間 {len(self._sizes)} 間 {self._sizes}　"
+                f"可互動物件 {len(self._props_all)} 個"
+                f"（{(time.time() - t0) * 1000:.0f} ms）")
+        if self._big is None:
+            self._big = MapWindow(self)
+        self._big.show()
+        self._big.raise_()
+        self._big._fit()
+        self._say_map(note)
 
     def _base_image(self) -> QImage:
-        """1 像素 1 格的底圖（可走格依房間上色）。放大交給 scaled()。"""
+        """1 像素 1 格的底圖（可走格依房間上色）。放大交給 scaled()。
+
+        ⚠ **要快取**：420x230 ＝ 96600 次 setPixel，即時更新每半秒重算一次會
+          把一顆核心吃滿。底圖只跟地形與房間有關，重畫疊圖時不必重算。
+        """
+        if self._base is not None:
+            return self._base
         g = self._grid
         img = QImage(g.w, g.h, QImage.Format_RGB32)
         img.fill(QColor(*WALL_COLOR))
@@ -708,13 +740,10 @@ class DungeonMakeTab(BaseTab):
                 c = ROOM_COLORS[r % len(ROOM_COLORS)] if r is not None \
                     else (70, 70, 70)
                 img.setPixel(x, y, QColor(*c).rgb())
+        self._base = img
         return img
 
     def _redraw_overlay(self) -> None:
-        if self._grid is None:
-            return
-        s = self.zoom.value()
-        self.canvas.show_map(self._render(s), s)
         if self._big is not None and self._big.isVisible():
             self._big.redraw()
 
@@ -768,12 +797,13 @@ class DungeonMakeTab(BaseTab):
         walk = self._grid.walkable(gx, gy)
         room = self._rooms.get((gx, gy))
         self._pick = (gx, gy)
-        # ⚠ 不可走的格子不給加：走不到的終點會讓執行端一直重試到逾時。
-        self.add_pick.setEnabled(walk)
-        self.pick_lbl.setText(
-            f"點到 ({gx}, {gy})　"
-            + (f"房間 {room}" if room is not None else
-               ("可走（碎片區）" if walk else "⚠ 這格不能走")))
+        if self._big is not None:
+            # ⚠ 不可走的格子不給加：走不到的終點會讓執行端一直重試到逾時。
+            self._big.add_pick.setEnabled(walk)
+            self._big.pick_lbl.setText(
+                f"點到 ({gx}, {gy})　"
+                + (f"房間 {room}" if room is not None else
+                   ("可走（碎片區）" if walk else "⚠ 這格不能走")))
         self._redraw_overlay()
 
     # ------------------------------------------------------------------
@@ -931,7 +961,8 @@ class DungeonMakeTab(BaseTab):
         self._add({"do": dungeon.INTERACT,
                    "at": [round(pr.x, 1), round(pr.y, 1)],
                    "model": pr.model,
-                   "menu": list(self._menu)})
+                   "menu": list(self._menu),
+                   "gap": round(self.gap_secs.value(), 1)})
         self._poked = None
         self._menu = []
         self._refresh_menu()

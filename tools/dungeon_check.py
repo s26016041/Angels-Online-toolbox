@@ -71,6 +71,13 @@ def main() -> int:
     ok, why = dungeon.validate({"do": "interact", "at": [1, 2],
                                 "select_id": 0x13920001})
     ck("★ 存了 select_id → 擋下來（世代碼會變）", not ok, why)
+    ok, _ = dungeon.validate({"do": "interact", "at": [1, 2], "menu": [1],
+                              "gap": 1.5})
+    ck("interact 帶選項間隔 正常", ok)
+    ok, why = dungeon.validate({"do": "interact", "at": [1, 2], "gap": 0})
+    ck("選項間隔 0 → 擋下來", not ok, why)
+    ok, why = dungeon.validate({"do": "interact", "at": [1, 2], "gap": 999})
+    ck("選項間隔 999 秒 → 擋下來", not ok, why)
     ok, _ = dungeon.validate({"do": "clear"})
     ck("clear 正常", ok)
     ok, why = dungeon.validate({"do": "wait", "secs": 0})
@@ -155,9 +162,12 @@ def main() -> int:
     ok, why = dungeon.check_map(s, G2(22675), 196685,
                                 lambda v: None if v is None else (v & 0xFFFF))
     ck("★ 換了場景 → 大聲擋下", not ok, why)
-    ok, why = dungeon.check_map(s, G2(22600), 196684,
+    ok, why = dungeon.check_map(s, G2(22659), 196684,
                                 lambda v: None if v is None else (v & 0xFFFF))
-    ck("★ 可走格數變了（官方改地圖）→ 大聲擋下", not ok, why)
+    ck("★ 差 16 格（副本的門開關）→ 照樣過，不誤報", ok, why)
+    ok, why = dungeon.check_map(s, G2(20000), 196684,
+                                lambda v: None if v is None else (v & 0xFFFF))
+    ck("★ 差一成（官方真的改了地圖）→ 大聲擋下", not ok, why)
     ok, why = dungeon.check_map(s, None, None, None)
     ck("不比場景也不給圖 → 過（呼叫端自己決定）", ok, why)
 
