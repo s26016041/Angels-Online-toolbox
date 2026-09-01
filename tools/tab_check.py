@@ -300,15 +300,30 @@ def c_decomp(c):
 
 
 def c_sell(c):
-    """販賣裝備：要看得出「哪些是裝備」與品質／耐久。"""
+    """販賣裝備：要看得出「哪些是裝備」與品質／耐久。
+
+    ⚠⚠ 2026-09-01 抓到：這裡本來寫 `getattr(i, "is_equip", False)`，但
+      `bag.Item` 根本沒有 `is_equip`（叫 `is_gear`）—— `getattr` 的預設值
+      把它吞成 False，於是**這一項永遠回 NA「沒有裝備可賣」**，不管背包裡
+      有什麼。整整一輪體檢它都在假裝自己驗過了。
+      ★ 通則：檢查工具裡不准用 `getattr(x, "名字", 預設)` 讀**自家**物件的
+        屬性 —— 名字打錯會安靜地變成「驗不了」，而「假的驗不了」跟假綠燈同級
+        （[[audit-command-and-backlog]]：稽核工具自己在假報）。直接取屬性，
+        打錯就 AttributeError，當場就知道。
+    """
     its = c.bag_items or []
-    eq = [i for i in its if getattr(i, "is_equip", False)]
     if not its:
         return BAD, "讀不到背包"
+    eq = [i for i in its if i.is_gear]
     if not eq:
         return NA, f"背包 {len(its)} 件，沒有裝備可賣"
-    g = [f"{itemname.of(i.type_id)}(品質{getattr(i, 'grade', '?')}"
-         f"/耐久{getattr(i, 'dura', '?')})" for i in eq[:3]]
+    bad = [i for i in eq
+           if i.grade not in bag.GRADE_NAMES or not 0 <= i.dura <= i.dura_max]
+    if bad:
+        i = bad[0]
+        return BAD, (f"裝備 {len(eq)} 件，其中 {len(bad)} 件欄位不合理："
+                     f"{i.name} 品質={i.grade} 耐久={i.dura}/{i.dura_max}")
+    g = [f"{i.name}({i.grade_name}/耐久{i.dura}/{i.dura_max})" for i in eq[:3]]
     return OK, f"裝備 {len(eq)} 件：" + "、".join(g)
 
 

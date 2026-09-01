@@ -231,10 +231,14 @@ def checks(sc, log):
     mons = [e for e in ents if e.is_monster]
     if mons and idx:
         info = monsters.info(sc, mons[0].type_id, idx)
+        # ⚠ 直接取屬性，不要 getattr(..., 預設)：名字打錯會安靜地變成預設值
+        #   （2026-09-01 這裡的 `name` 就一直印成 '?' —— MonsterInfo 沒有那個
+        #   欄位，怪名要查 monsters.name_of()）。同一輪在 tab_check.c_sell
+        #   抓到更嚴重的一例：整項永遠回「驗不了」。
         put("怪物範本 monsters.OFF_*",
-            bool(info) and 0 < getattr(info, "level", 0) <= 500,
-            f"{getattr(info, 'name', '?')} Lv{getattr(info, 'level', '?')}"
-            f" HP{getattr(info, 'max_hp', '?')}")
+            bool(info) and 0 < info.level <= 500,
+            (f"{mons[0].name or mons[0].type_id} "
+             f"Lv{info.level} HP{info.max_hp}") if info else "查不到範本")
     else:
         put("怪物範本 monsters.OFF_*", NA, "附近沒有怪")
 
