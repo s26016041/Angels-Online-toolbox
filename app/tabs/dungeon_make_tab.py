@@ -376,9 +376,12 @@ class DungeonMakeTab(BaseTab):
         self.hide_tag = QCheckBox("藏起看不見的標記點")
         self.hide_tag.setChecked(True)
         self.hide_tag.setToolTip(
-            "資源包標了「看不見」的物件（TAG01 這種伺服器用的位置標記）不列出來。\n"
-            "找不到你要的機關時可以取消勾選，把全部都列出來。")
-        self.hide_tag.toggled.connect(lambda _v: self._scan_props())
+            "資源包標了「看不見」的物件（TAG01 這種伺服器用的位置標記）不列出來，\n"
+            "地圖上也不畫它們的紅點。\n"
+            "找不到你要的機關時可以取消勾選，把全部都列出來（標記點會畫成暗灰小點）。")
+        # 清單跟地圖上的點用同一個勾選框，兩邊一起跟著變。
+        self.hide_tag.toggled.connect(lambda _v: (self._scan_props(),
+                                                  self._redraw_overlay()))
         th.addWidget(self.hide_tag)
         th.addStretch(1)
         tv.addLayout(th)
@@ -757,10 +760,21 @@ class DungeonMakeTab(BaseTab):
             self._base_image().scaled(w, h, Qt.IgnoreAspectRatio,
                                       Qt.FastTransformation))
         p = QPainter(pix)
-        # 可互動的物件（紅點）
+        # 可互動的物件。⚠ 場景標記點（TAG01/TAG02…，SP_ATTRIB_HIDE）畫面上
+        #   根本看不見，一張圖上有好幾百個 —— 全畫成紅點會把真正的機關淹掉
+        #   （使用者 2026-09-02：「為何繪製地圖那麼多紅點」）。跟下面的清單
+        #   用**同一個**勾選框，預設不畫；要看就取消勾選。
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(220, 80, 80))
+        hide_tag = self.hide_tag.isChecked()
         for pr in getattr(self, "_props_all", []):
+            tag = mapobj.hidden(pr.model)
+            if tag:
+                if hide_tag:
+                    continue
+                p.setBrush(QColor(90, 95, 105))      # 標記點：暗灰小點
+                p.drawEllipse(int(pr.x * s) - 1, int(pr.y * s) - 1, 3, 3)
+                continue
+            p.setBrush(QColor(220, 80, 80))
             p.drawEllipse(int(pr.x * s) - 2, int(pr.y * s) - 2, 5, 5)
         # 已存的步驟
         for i, (x, y) in ((i, xy) for i, xy, _k in self._script.points()):
