@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.config import APP_DIR_NAME
+from app.game import mapobj
 
 FOLDER_NAME = "副本"
 
@@ -237,7 +238,11 @@ def describe(step: dict) -> str:
         menu = step.get("menu") or []
         tail = ("　選項 " + " → ".join(f"第{n}項" for n in menu)) if menu \
             else "　（只說話，不選項）"
-        return f"對話 ({x}, {y})　外觀 {step.get('model', '?')}{tail}"
+        m = step.get("model")
+        # ★ 有名字就印名字（「惡魔系雕像01（60049）」）—— 光看編號認不出是什麼
+        #   東西（2026-09-02 使用者回報）。查不到就退回只顯示編號。
+        who = mapobj.label(m) if isinstance(m, int) else f"外觀 {m}"
+        return f"對話 ({x}, {y})　{who}{tail}"
     if kind == CLEAR:
         return "清光周圍的怪"
     if kind == WAIT:

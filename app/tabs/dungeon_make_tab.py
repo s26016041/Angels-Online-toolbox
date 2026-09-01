@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -55,8 +57,8 @@ from PySide6.QtWidgets import (
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (bag, dungeon, entity, locate, lua, move, produce, scene,
-                      scenery, sell, supply)
+from app.game import (bag, dungeon, entity, locate, lua, mapobj, move, produce,
+                      scene, scenery, sell, supply)
 from app.tabs.base_tab import BaseTab, fit_spin
 
 # 房間配色（互不相通的連通區各給一色）。第 7 間之後循環用。
@@ -87,8 +89,8 @@ class MapCanvas(QLabel):
         self.setText("按「繪製地圖」把目前這張圖畫出來")
         self._scale = 3
 
-    def show_map(self, pix: QPixmap, scale: int) -> None:
-        self._scale = max(1, scale)
+    def show_map(self, pix: QPixmap, scale: float) -> None:
+        self._scale = max(0.2, float(scale))
         self.setPixmap(pix)
         self.resize(pix.size())
 
@@ -97,6 +99,96 @@ class MapCanvas(QLabel):
             return
         self.picked.emit(ev.position().x() / self._scale,
                          ev.position().y() / self._scale)
+
+
+class _IconPeek(QLabel):
+    """滑鼠移到物件清單某一條時，跳出來顯示那個東西的圖。
+
+    ⚠ 用 `Qt.ToolTip` 視窗旗標而不是 `setToolTip()`：Qt 的提示字串放不進
+      本機記憶體裡的圖（要嘛存暫存檔、要嘛自己畫），自己開一個小視窗最單純。
+    """
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            "background:#20242c; color:#d8dde6; border:1px solid #55606f;"
+            " padding:6px;")
+
+    def show_for(self, model: int, at) -> None:
+        pm = mapobj.pixmap(model)
+        name = mapobj.name_of(model)
+        if pm is None:
+            # 沒有圖就別跳空框 —— 名字清單上已經有了。
+            self.hide()
+            return
+        big = pm.scaled(pm.width() * 2, pm.height() * 2,
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.setPixmap(big)
+        self.setToolTip(name)
+        self.adjustSize()
+        self.move(at.x() + 18, at.y() + 18)
+        self.show()
+
+
+class MapWindow(QDialog):
+    """把地圖開在一個**可以放到最大**的獨立視窗裡。
+
+    ★ 為什麼要有它（2026-09-02 使用者回報「我看不到全部，縮放 1 也看不清全貌」）：
+      主視窗固定 940 寬，塞得下的地圖區只有約 550px，而副本地圖是 420x230 格
+      —— 縮放 1 全圖擠在 420px 裡看不清細節，縮放 3 又超出畫面。
+      開成獨立視窗就能拉大／最大化，還多一顆「符合視窗」自動算縮放。
+    """
+
+    def __init__(self, parent, render, on_pick) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("副本地圖")
+        self.setModal(False)                     # ⚠ 非強制回應：開著也能操作主視窗
+        self.resize(1100, 760)
+        self._render = render                    # (縮放) → QPixmap
+        self._on_pick = on_pick
+        v = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("縮放"))
+        self.zoom = QSpinBox()
+        self.zoom.setRange(1, 12)
+        self.zoom.setValue(4)
+        self.zoom.valueChanged.connect(self.redraw)
+        bar.addWidget(self.zoom)
+        b = QPushButton("符合視窗")
+        b.setToolTip("自動算一個剛好把整張圖塞進視窗的縮放。")
+        b.clicked.connect(self._fit)
+        bar.addWidget(b)
+        bar.addStretch(1)
+        self.info = QLabel("　")
+        bar.addWidget(self.info)
+        v.addLayout(bar)
+        self.canvas = MapCanvas()
+        self.canvas.picked.connect(self._picked)
+        self.area = QScrollArea()
+        self.area.setWidget(self.canvas)
+        self.area.setWidgetResizable(False)
+        v.addWidget(self.area, 1)
+
+    def _picked(self, x: float, y: float) -> None:
+        self._on_pick(x, y)
+
+    def _fit(self) -> None:
+        pix = self._render(1)
+        if pix.isNull():
+            return
+        vp = self.area.viewport().size()
+        s = min(vp.width() / max(pix.width(), 1),
+                vp.height() / max(pix.height(), 1))
+        self.zoom.setValue(max(1, int(s)))
+        self.redraw(fit_to=s if s < 1 else None)
+
+    def redraw(self, _v=None, fit_to: float | None = None) -> None:
+        s = fit_to if fit_to else self.zoom.value()
+        pix = self._render(s)
+        if not pix.isNull():
+            self.canvas.show_map(pix, s)
+            self.info.setText(f"{pix.width()} x {pix.height()} 像素")
 
 
 class DungeonMakeTab(BaseTab):
@@ -117,6 +209,9 @@ class DungeonMakeTab(BaseTab):
         self._pick = None                 # 在地圖上點到的格子
         self._menu: list[int] = []        # 正在試的對話選項路徑
         self._poked = None                # 正在試的那個物件（scenery.Prop）
+        self._big = None                  # 放大檢視的獨立視窗
+        self._poke_base = None            # 點下去之前的對話框代號
+        self._poke_until = 0.0
 
         root = QVBoxLayout(self)
 
@@ -170,9 +265,15 @@ class DungeonMakeTab(BaseTab):
         mh.addWidget(QLabel("縮放"))
         self.zoom = QSpinBox()
         self.zoom.setRange(1, 8)
-        self.zoom.setValue(3)
+        self.zoom.setValue(2)
         self.zoom.setToolTip("一格畫幾個像素。")
+        self.zoom.valueChanged.connect(lambda _v: self._redraw_overlay())
         mh.addWidget(self.zoom)
+        big = QPushButton("放大檢視")
+        big.setToolTip("把地圖開在一個可以拉大／最大化的獨立視窗，\n"
+                       "裡面一樣可以點位置。")
+        big.clicked.connect(self._open_big)
+        mh.addWidget(big)
         mh.addStretch(1)
         mv.addLayout(mh)
 
@@ -219,7 +320,10 @@ class DungeonMakeTab(BaseTab):
         sv.addLayout(sh)
         sh2 = QHBoxLayout()
         b = QPushButton("加入「清光周圍的怪」")
-        b.setToolTip("排在對話前面，就不會遇到「還有怪物」那種點不動的對話。")
+        b.setToolTip(
+            "在這裡**停下來等到完全沒怪**才繼續。\n"
+            "（平常本來就會邊走邊清，這一步是要它站住不要往前走 —— \n"
+            "  排在對話前面就不會遇到「還有怪物」那種點不動的對話。）")
         b.clicked.connect(lambda: self._add({"do": dungeon.CLEAR}))
         sh2.addWidget(b)
         b = QPushButton("加入「等待」")
@@ -249,11 +353,26 @@ class DungeonMakeTab(BaseTab):
         b.setToolTip("送出離開互動（不送的話伺服器會覺得你還在跟它講話）。")
         b.clicked.connect(self._leave)
         th.addWidget(b)
+        # ★ 場景標記點（TAG01/TAG02…）畫面上根本看不見，但照樣有互動 id，
+        #   一站就掃到 45 個把真正的機關淹掉 —— 預設收起來。
+        self.hide_tag = QCheckBox("藏起看不見的標記點")
+        self.hide_tag.setChecked(True)
+        self.hide_tag.setToolTip(
+            "資源包標了「看不見」的物件（TAG01 這種伺服器用的位置標記）不列出來。\n"
+            "找不到你要的機關時可以取消勾選，把全部都列出來。")
+        self.hide_tag.toggled.connect(lambda _v: self._scan_props())
+        th.addWidget(self.hide_tag)
         th.addStretch(1)
         tv.addLayout(th)
 
         self.props = QListWidget()
         self.props.setMaximumHeight(110)
+        # ★ 滑鼠移到某一條就跳一個小框顯示那個東西長什麼樣（使用者 2026-09-02
+        #   要求）。⚠ 要開 setMouseTracking 才會有 itemEntered。
+        self.props.setMouseTracking(True)
+        self.props.itemEntered.connect(self._preview)
+        self.props.viewport().installEventFilter(self)
+        self._peek = _IconPeek(self)
         tv.addWidget(self.props)
 
         oh = QHBoxLayout()
@@ -287,9 +406,21 @@ class DungeonMakeTab(BaseTab):
         self.status.setWordWrap(True)
         root.addWidget(self.status)
 
+        self._poke_timer = QTimer(self)
+        self._poke_timer.timeout.connect(self._poke_check)
         for sp in self.findChildren(QSpinBox):
             fit_spin(sp)
         self._reload_files()
+
+    def _open_big(self) -> None:
+        if self._grid is None:
+            self.status.setText("先按「繪製地圖」")
+            return
+        if self._big is None:
+            self._big = MapWindow(self, self._render, self._on_pick)
+        self._big.show()
+        self._big.raise_()
+        self._big._fit()
 
     # ------------------------------------------------------------------
     # 分身
@@ -583,10 +714,18 @@ class DungeonMakeTab(BaseTab):
         if self._grid is None:
             return
         s = self.zoom.value()
+        self.canvas.show_map(self._render(s), s)
+        if self._big is not None and self._big.isVisible():
+            self._big.redraw()
+
+    def _render(self, s: float) -> QPixmap:
+        """把地圖畫成一張圖。`s` ＝ 一格幾個像素（可以小於 1 ＝ 縮小）。"""
+        if self._grid is None:
+            return QPixmap()
         g = self._grid
+        w, h = max(1, int(g.w * s)), max(1, int(g.h * s))
         pix = QPixmap.fromImage(
-            self._base_image().scaled(g.w * s, g.h * s,
-                                      Qt.IgnoreAspectRatio,
+            self._base_image().scaled(w, h, Qt.IgnoreAspectRatio,
                                       Qt.FastTransformation))
         p = QPainter(pix)
         # 可互動的物件（紅點）
@@ -618,7 +757,7 @@ class DungeonMakeTab(BaseTab):
             p.drawLine(mx - 6, my, mx + 6, my)
             p.drawLine(mx, my - 6, mx, my + 6)
         p.end()
-        self.canvas.show_map(pix, s)
+        return pix
 
     def _on_pick(self, x: float, y: float) -> None:
         if self._grid is None:
@@ -654,18 +793,40 @@ class DungeonMakeTab(BaseTab):
             # ⚠ 讀不到 ≠ 附近沒有東西（[[bag-false-empty-guards]] 的同一個坑）。
             self.status.setText("⚠ 物件清單讀不到（不是「附近沒有」）")
             return
+        shown = [p for p in props
+                 if not (self.hide_tag.isChecked() and mapobj.hidden(p.model))]
+        hidden_n = len(props) - len(shown)
+        props = shown
         self._props = props
         self.props.clear()
         for pr in props:
+            # ★ 印名字不只印編號（2026-09-02）：光看「外觀 60049」認不出那是
+            #   「惡魔系雕像01」。查不到名字就退回顯示編號（安全退化）。
             self.props.addItem(
-                f"外觀 {pr.model}　({_fmt(pr.x)}, {_fmt(pr.y)})　"
+                f"{mapobj.label(pr.model)}　({_fmt(pr.x)}, {_fmt(pr.y)})　"
                 f"{pr.dist(me):.1f} 格")
         if props:
             self.props.setCurrentRow(0)
+        tail = f"（另有 {hidden_n} 個看不見的標記點沒列）" if hidden_n else ""
         self.status.setText(
-            f"附近 {PROP_RADIUS:.0f} 格內有 {len(props)} 個點得到的物件"
+            f"附近 {PROP_RADIUS:.0f} 格內有 {len(props)} 個點得到的物件{tail}"
             if props else
-            f"附近 {PROP_RADIUS:.0f} 格內沒有點得到的物件（走近一點再掃）")
+            f"附近 {PROP_RADIUS:.0f} 格內沒有可列的物件{tail}"
+            "　—— 走近一點再掃，或取消勾選把標記點也列出來")
+
+    def _preview(self, item) -> None:
+        """滑鼠移到清單某一條 → 顯示那個外觀的圖。"""
+        i = self.props.row(item)
+        if not 0 <= i < len(self._props):
+            return
+        from PySide6.QtGui import QCursor
+        self._peek.show_for(self._props[i].model, QCursor.pos())
+
+    def eventFilter(self, obj, ev):                      # noqa: N802（Qt 命名）
+        # 滑鼠離開清單就把預覽收掉（itemEntered 不會告訴我們「移出去了」）。
+        if obj is self.props.viewport() and ev.type() == ev.Type.Leave:
+            self._peek.hide()
+        return super().eventFilter(obj, ev)
 
     def _dialog_token(self, sc):
         """對話框的執行期代號。⚠ 非 0 **不代表開著**，只能拿來比「有沒有變」。"""
@@ -697,22 +858,35 @@ class DungeonMakeTab(BaseTab):
         self._menu = []
         self._refresh_menu()
         self.save_talk.setEnabled(True)
-        # 等對話框「換了一個新代號」＝真的開了新的框（不能看非 0）。
-        t0 = time.time()
-        opened = False
-        while time.time() - t0 < DIALOG_WAIT:
-            now = self._dialog_token(sc)
-            if now is not None and now != before and now != 0:
-                opened = True
-                break
-            QWidget.repaint(self)
-            time.sleep(0.1)
-        self.status.setText(
-            f"已點外觀 {prop.model} ({_fmt(prop.x)},{_fmt(prop.y)})　"
-            + ("對話框開了 —— 看遊戲畫面，按下面對應的「第 N 項」"
-               if opened else
-               "⚠ 沒看到對話框變化（可能是純動作、也可能沒點到；"
-               "看一下遊戲畫面）"))
+        # ⚠⚠ 等對話框**不可以**在 GUI 執行緒裡 sleep 迴圈（2026-09-02 使用者
+        #   回報「點點看無效，只會讓我程式當機好幾秒」）—— 那是最多 12 秒的
+        #   卡死，畫面不重畫、按鈕按不動，看起來就像當掉。改用計時器輪詢。
+        self._poke_base = before
+        self._poke_until = time.time() + DIALOG_WAIT
+        self.status.setText(f"已點 {mapobj.label(prop.model)}"
+                            f" ({_fmt(prop.x)},{_fmt(prop.y)})　等對話框…")
+        self._poke_timer.start(100)
+
+    def _poke_check(self) -> None:
+        """輪詢對話框開了沒（接在「點點看」後面，不卡畫面）。"""
+        _pid, sc = self._cur()
+        if sc is None:
+            self._poke_timer.stop()
+            return
+        now = self._dialog_token(sc)
+        if now is not None and now != self._poke_base and now != 0:
+            self._poke_timer.stop()
+            self.status.setText(
+                "對話框開了 —— 看遊戲畫面，按下面對應的「第 N 項」")
+            return
+        if time.time() >= self._poke_until:
+            self._poke_timer.stop()
+            # ⚠ 「沒看到變化」≠「沒點到」：有些機關是純動作（開門、放火），
+            #   根本不會開對話框。所以這裡只陳述事實，不下結論。
+            self.status.setText(
+                "⚠ 沒看到對話框變化 —— 可能是純動作的機關（開門那種），"
+                "也可能沒點到。看一下遊戲畫面：真的開了就直接按「第 N 項」；"
+                "什麼都沒發生就把這一步存成沒有選項的對話。")
 
     def _send_option(self, n: int) -> None:
         pid, sc = self._cur()
