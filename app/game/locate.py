@@ -684,35 +684,43 @@ SIGS: tuple[Sig, ...] = (
         " 85 94 81 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? 57 E8 ?? ?? ?? ??",
         0x000058F8),
     # ── 失焦不凍畫面（見 app/game/unfreeze.py）──────────────────────
-    # 要 patch 的位址：視窗訊息 handler 裡算「現在是不是 active」那一段。
-    # v3（2026-08-25）：官方把整個視窗訊息分派**重寫**了，舊特徵一個都沒中。
-    #   · WndProc 變成 thunk：`mov ecx,[0x9DCA30] / mov eax,[ecx] /
-    #     jmp [eax+0x88]`，真正的 handler 是虛擬函式（0x52C10C 又跳 0x70D1E0）。
-    #   · 0x70D1E0 用跳表分派；舊版 WM_ACTIVATE(0x06) 與 WM_ACTIVATEAPP(0x1C)
-    #     **共用**同一支 handler，新版拆成兩支，active 狀態機只留在
-    #     WM_ACTIVATEAPP 這支（0x70D380）—— WM_ACTIVATE 那支只管全螢幕 z-order，
-    #     沒有碰 [this+0xC]，也沒有叫 OnActivate。
-    #   · 算法也從 `cmp 1/cmp 2/xor al,al/jmp/mov al,1` 換成 `setne dl`。
-    #   找回來的路：視窗類別名字串 `_MIDAGEONL_` → 唯一引用處 0x544E93 →
-    #   註冊視窗類別的函式 0x70C6D0 → `mov [ebp-0x24], 0x70CB00`＝lpfnWndProc；
-    #   再執行時讀 [0x9DCA30] 的 vtable +0x88 拿到 handler（五台一致）。
-    # patch 兩處（語意與 v2 完全相同，只是位元組換了）：
-    #   A ＝命中處 3 bytes `0F 95 C2`(setne dl) → `B2 01 90`(mov dl,1 / nop)
-    #       ＝失焦也算 active → [this+0xC] 恆為 1 → OnActivate(0) 永不執行。
-    #   B ＝命中處 +8 的 6 bytes `0F 84 rel32`(je 沒變就跳走)
-    #       → `83 7D 10 00 74 08`＝cmp wParam,0 / je 等價 epilogue。
-    # ⚠ kind='fn' 回傳的是命中處位址；**兩處要改的 9 個位元組全部遮成 ??**
-    #   —— patch 前後都要定位得到（不然套用之後重掃就找不到自己了）。
-    #   中間那串 `mov [edi+0xc],dl / cmp dl,cl`（88 57 0C 3A D1，5 bytes）
-    #   保證 A→B 的距離＝8；後面 `mov eax,[edi] / mov ecx,edi / push edx /
-    #   call [eax+0x50]`（8 bytes）＋ epilogue `pop edi / pop esi / xor eax,eax /
-    #   pop ebx` 保證 B 的 `je +8` 剛好落在完整的 epilogue 上。
-    #   ⚠⚠ 那個 +8 是**這一版的版面**：v2 時代是 +0x0A（舊的 call 那段多 2 bytes）。
-    #     改版後一定要重新數，寫錯＝跳進指令中間＝當場當機。
+    # 要 patch 的位址：「切換 active 狀態」那個共用小函式裡的狀態比較那一行。
+    # v4（2026-09-01）：官方把 v3 內聯在 WM_ACTIVATEAPP handler 裡的狀態機
+    #   **抽成一支獨立的小函式**，舊特徵整段沒中。新版長這樣：
+    #     WM_ACTIVATEAPP case（0x73015C）：
+    #        cmp [ebp+0x10],0 / mov ecx,edi / setne al / movzx eax,al /
+    #        push eax / call SetActive
+    #     SetActive（0x72FD40，就是這一段特徵）：
+    #        push ebp / mov ebp,esp / mov edx,[ebp+8]
+    #        cmp byte [ecx+0xC],dl   ← ★ 要改的 3 bytes（命中處）
+    #        je  +0xC                （狀態沒變 → 什麼都不做）
+    #        mov eax,[ecx] / mov [ecx+0xC],dl / mov [ebp+8],edx /
+    #        pop ebp / jmp [eax+0x50]（＝tail-call OnActivate(bActive)）
+    #        pop ebp / ret 4
+    #   找回來的路（跟 v3 同一條，位址全部重走一遍）：視窗類別名字串
+    #   `_MIDAGEONL_`(0x803578) → 唯一引用處 0x544FF9 → 開視窗的方法
+    #   0x72F370 → `mov [ebp-0x24], 0x72F7C0`＝lpfnWndProc → 那支是 thunk
+    #   `mov ecx,[0xA127A8] / mov eax,[ecx] / jmp [eax+0x88]` → 執行時讀
+    #   vtable+0x88 得到 0x52C2F9 → 再跳 0x72FFA0（訊息跳表分派）→
+    #   索引表 0x730790 + 目標表 0x730758 解出 WM_ACTIVATEAPP(0x1C) 的 case。
+    # patch 只有一處、3 個位元組（語意與 v2/v3 完全相同）：
+    #   `38 51 0C`(cmp byte [ecx+0xC],dl) → `84 D2 90`(test dl,dl / nop)
+    #   → 後面**原封不動**的 `je +0xC` 就變成「bActive==0（失焦）就什麼都不做」，
+    #     而 bActive!=0（取得焦點）一律往下走 ＝ 每次都跑 OnActivate(1)
+    #     （輸入層重新取得＋恢復音效＋廣播 active），手動操作靠這一下復活。
+    # ★ v3 那個「+8／+0x0A 要重新數」的坑這一版消失了：我們沒動那個 je，
+    #   位移量是遊戲自己的，不必也不准由我們寫死。
+    # ⚠ kind='fn' 回傳的是命中處位址 ＝ 正好就是要改的那 3 bytes；它們**全部
+    #   遮成 ??** —— patch 前後都要定位得到（不然套用之後重掃就找不到自己了）。
+    #   錨＝後面那串完整的函式骨架（je/mov/mov/mov/pop/jmp [eax+0x50]/pop/ret 4），
+    #   `88 51 0C` 把 ecx/edx 的配置一起釘住 ＝ 還原時寫回 `38 51 0C` 一定對。
+    # ⚠ 這支 SetActive 有 4 個呼叫點（WM_ACTIVATEAPP、WM_NCLBUTTONDOWN、
+    #   輸入法那兩個），另外三個都是 `push 1` 且前面有「自己是前景視窗」的閘門
+    #   → patch 後它們變成「每次都跑 OnActivate(1)」，跟取得焦點走的是同一條
+    #   熟路，且都是使用者手動觸發的低頻訊息。
     Sig("unfreeze", "PATCH_ADDR", "fn", None,
-        "?? ?? ?? 88 57 0C 3A D1 ?? ?? ?? ?? ?? ??"
-        " 8B 07 8B CF 52 FF 50 50 5F 5E 33 C0 5B",
-        0x0070D387),
+        "?? ?? ?? 74 0C 8B 01 88 51 0C 89 55 08 5D FF 60 50 5D C2 04 00",
+        0x0072FD46),
     # ── 施放廣播監聽的 hook 點（見 app/game/castwatch.py）──────────────
     # 「入向訊息入佇列」函式 0x7122b0 的進入點 —— 每一包解密後明文的唯一咽喉。
     # castwatch inline-hook 它讀施放廣播（op=0x1d、子類型 0x0301、技能ID @8）。
