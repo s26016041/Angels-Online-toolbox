@@ -194,6 +194,7 @@ def check_attack(sc, mv, log, state, me, base):
         return False
 
     mp_before = stats.mp
+    sp_before = skillcost.sp_now(sc, me, mp_before)
     sent = 0
     hp = hp0
     for k in range(TRIES):
@@ -203,6 +204,8 @@ def check_attack(sc, mv, log, state, me, base):
         ok, tid, hp = entity.read_target_checked(sc, state)
         now = player.read(sc, base)
         mp_now = now.mp if now else None
+        # ⚠ sp_now 要拿**同一拍**的 MP 當基準（見 skillcost.sp_now 的說明）
+        sp_now_ = skillcost.sp_now(sc, me, mp_now) if mp_now is not None else None
         if not ok:
             log.append("    – 狀態物件中途失效（換圖／重生）—— 這一輪不算數")
             return None
@@ -215,9 +218,21 @@ def check_attack(sc, mv, log, state, me, base):
             log.append(f"    ✔ 第 {k + 1} 下：MP {mp_before} → {mp_now}"
                        f"（扣了 {mp_before - mp_now}，招確實放出去了）")
             return True
+        # ⚠⚠ **SP 招也要認**（2026-09-01 實錄的假紅燈）：嵐狐挑到的 F1 是
+        #   946 冰凍狙擊Ⅳ，MP=0／SP=1000 —— 怪血明明 100% → 48%，但因為
+        #   `tid` 被遊戲換成別隻、MP 又一毛都沒扣，整項判成 ✘「叫得出去卻
+        #   沒反應」，還印出「呼叫慣例語意改掉了」的收尾。只看 MP 等於對
+        #   **半數的招視而不見**。SP 照消耗扣掉跟 MP 扣掉是一樣硬的證據。
+        if (cost[1] > 0 and sp_before is not None and sp_now_ is not None
+                and sp_now_ <= sp_before - cost[1]):
+            log.append(f"    ✔ 第 {k + 1} 下：SP {sp_before} → {sp_now_}"
+                       f"（扣了 {sp_before - sp_now_}，招確實放出去了）")
+            return True
     now = player.read(sc, base)
+    sp_end = skillcost.sp_now(sc, me, now.mp) if now else None
     log.append(f"    ✘ 叫了 {TRIES} 下（進指令槽 {sent} 次）：血量% {hp0} → {hp}、"
-               f"MP {mp_before} → {now.mp if now else None}")
+               f"MP {mp_before} → {now.mp if now else None}、"
+               f"SP {sp_before} → {sp_end}")
     return False
 
 
@@ -257,11 +272,21 @@ def check_walk(sc, mv, log, me, state):
         log.append("    – 附近找不到「直線走得過去」的格子（牆邊／死角）")
         return None
 
+    # ⚠⚠ 「被別的功能佔著」要**整趟一路採樣**，不能只在最後看一眼。
+    #   2026-09-01 實錄：白狐開著自動練技，是**斷斷續續**在施法 —— 走到一半
+    #   被robot打斷（只挪了 0.3 格就停），等我們回頭讀狀態時它已經回到 'Wait'
+    #   → 判成 ✘「叫得出去卻沒反應」＝假紅燈。
+    #   跟 tab_check 的 sp_now 同一個老坑：**量測工具自己把數據弄假**。
+    seen: set[str] = set()
+
     def go(tx, ty, label):
         mv.walk_exact(sc, me, tx, ty)
         end = p0
         for _ in range(25):
             time.sleep(0.25)
+            st = entity.read_state(sc, me)
+            if st in BUSY_STATES:
+                seen.add(st)
             end = entity.player_pos(sc, me) or end
             if abs(end[0] - tx) < 0.6 and abs(end[1] - ty) < 0.6:
                 break
@@ -277,13 +302,15 @@ def check_walk(sc, mv, log, me, state):
         #   自動練技就是典型：角色一直在原地施法（動畫狀態 'Cast'），
         #   我們送的目的地當然沒人理。判成 ✘ 就是誤報。
         #   （2026-08-25 使用者當場指出：白狐在練技，所以不能動。）
-        busy = cannot_act(sc, me)
+        # 現在是不是忙 ＋ **這一趟有沒有忙過**（斷斷續續施法的抓不到當下）
+        busy = cannot_act(sc, me) or (sorted(seen)[0] if seen else "")
         if busy:
-            log.append(f"    – 沒動，但動畫狀態是 {busy!r}"
+            log.append(f"    – 沒動，但這一趟出現過動畫狀態 {busy!r}"
                        f" ＝ 角色死了／正被別的功能佔著（自動練技／掛機）→ 驗不了")
             return None
         log.append(f"    ✘ 座標一格都沒動"
-                   f"（動畫狀態 {entity.read_state(sc, me)!r}）")
+                   f"（動畫狀態 {entity.read_state(sc, me)!r}，"
+                   f"整趟沒出現過 {BUSY_STATES}）")
         return False
     b = go(p0[0], p0[1], "回程")               # 收拾乾淨：走回原本站的地方
     back = abs(b[0] - p0[0]) < 0.9 and abs(b[1] - p0[1]) < 0.9
