@@ -470,7 +470,7 @@ class DungeonMakeTab(BaseTab):
         tv.addLayout(oh)
 
         ph2 = QHBoxLayout()
-        self.menu_lbl = QLabel("已選路徑：（還沒選）")
+        self.menu_lbl = QLabel("已選路徑：（先按「點點看」試一個物件）")
         ph2.addWidget(self.menu_lbl)
         ph2.addStretch(1)
         # ★ 使用者 2026-09-02：「太快說話可能會出現無異議對話」——所以每一步
@@ -491,7 +491,10 @@ class DungeonMakeTab(BaseTab):
         b.clicked.connect(self._clear_menu)
         ph2.addWidget(b)
         self.save_talk = QPushButton("把這一步存進腳本")
-        self.save_talk.setToolTip("存成「對話」步驟：位置＋外觀＋選項路徑。")
+        self.save_talk.setToolTip(
+            "存成「對話」步驟：位置＋外觀＋選項路徑。\n"
+            "★ 一個選項都沒按就存 ＝ **純對話**（點一下、等一下、離開），\n"
+            "　 整段沒有選項的機關／NPC 就是這樣記。")
         self.save_talk.setEnabled(False)
         self.save_talk.clicked.connect(self._save_talk)
         ph2.addWidget(self.save_talk)
@@ -1269,9 +1272,26 @@ class DungeonMakeTab(BaseTab):
         self.status.setText(f"已送第 {n} 項 —— 看遊戲畫面有沒有進到下一層")
 
     def _refresh_menu(self) -> None:
-        self.menu_lbl.setText(
-            "已選路徑：" + (" → ".join(f"第{n}項" for n in self._menu)
-                            if self._menu else "（還沒選）"))
+        """把「這一步會存成什麼」寫在畫面上。
+
+        ★ 使用者 2026-09-02 問「所以單純過對話按鈕呢」——**不另外加一顆**：
+          純對話就是「點點看之後一個選項都不按，直接存」。原本畫面只寫
+          「（還沒選）」，看起來像沒做完，所以改成講清楚它會存成純對話，
+          存檔鈕的字也跟著變。（⛔ 再開一顆按鈕做同一件事，就是剛拿掉的
+          「清光周圍的怪」那種多餘指令。）
+        """
+        if self._menu:
+            path = " → ".join(f"第{n}項" for n in self._menu)
+            btn = f"存這一步（選項 {path}）"
+        elif self._poked is not None:
+            path = "**沒有選項＝純對話**（不用按第 N 項，直接存）"
+            btn = "存這一步（純對話）"
+        else:
+            path = "（先按「點點看」試一個物件）"
+            btn = "把這一步存進腳本"
+        self.menu_lbl.setText("已選路徑：" + path)
+        if hasattr(self, "save_talk"):
+            self.save_talk.setText(btn)
 
     def _clear_menu(self) -> None:
         self._menu = []
