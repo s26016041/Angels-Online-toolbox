@@ -933,9 +933,24 @@ def main() -> int:
     run(tab, 0.5)
     ck("★★ 還在走路 → **先站穩再點**（走著點人沒到，對話開不起來）",
        clicks2 == [], str(clicks2))
+    # ⚠⚠ 但不能無限等：人擠人／被推時 `is_walking` 會恆為 True
+    #   （[[self-supply-buy]] 的老坑），那樣就永遠不點了 → 等過 STILL_WAIT
+    #   就照點。
+    run(tab, dt.STILL_WAIT + 0.3)
+    ck(f"★★ 一直在動超過 {dt.STILL_WAIT:.1f} 秒 → **不等了，照樣點**",
+       len(clicks2) >= 1, str(clicks2))
     walking["v"] = False
+    clicks2.clear()
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(20.5, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    never3 = FakeTalk([(1,)])
+    never3.opened = lambda: None
+    wire(tab, never3)
+    dt.produce.click = lambda *_a, **_k: (clicks2.append(1),
+                                          (True, "點了"))[1]
     run(tab, 0.3)
-    ck("　站穩了才點下去", len(clicks2) == 1, str(clicks2))
+    ck("　站著不動的話馬上就點", len(clicks2) == 1, str(clicks2))
     # 點完遊戲自己在走過去 → 只要還在靠近就不要插手重點
     #   ⚠ 要像真的走路那樣**每一拍都更近一點**（使用者要求重試收到 1 秒，
     #     用「1.5 秒才動一格」的假走法會被判成停住不動）。

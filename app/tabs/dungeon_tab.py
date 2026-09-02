@@ -144,6 +144,10 @@ TALK_SETTLE = 2
 #   ⚠ 安全性不變：底下那條「**沒有更靠近才累加**」還在，所以遊戲正在自己
 #     走過去的期間**一次都不會插手**，收快的只有「真的停住不動」那種。
 CLICK_RETRY = 1.0
+# ⚠⚠ 「站穩了才點」最多等這麼久，超過就照點（**不是逾時停機，是照樣做**）。
+#   出處 [[self-supply-buy]] 的老坑：人擠人／被推的時候 `is_walking` 會**恆為
+#   True**，「等停穩」那道閘就永遠不會過 —— 看起來就是「站在它旁邊卻不點」。
+STILL_WAIT = 1.5
 # ⚠⚠ 但「點了沒反應」的計時**只在人站著沒動**時才累加：點下去（0x05）之後
 #   **遊戲會自己走過去**才開對話（製作頁的「點點看」能成功就是靠這個）。
 #   人正在往它靠近的期間如果我們去重點／重下走路指令，就會把遊戲那趟
@@ -570,6 +574,7 @@ class DungeonTab(BaseTab):
         self._talk_did = ""          # 這一頁做過什麼（"opt"／"close"）
         self._talk_base = None       # 點下去那一刻的簽章（判「有沒有點到」）
         self._click_t = 0.0          # 點了多久還沒反應（只在沒更靠近時累加）
+        self._still_t = 0.0          # 等「站穩」等了多久
         self._click_best = None      # 點下去之後離那個物件最近到過幾格
         self._nudge = 0              # 往物件靠上去第幾次了
         self._clicked = False        # 這一步的物件點過了嗎
@@ -1459,9 +1464,16 @@ class DungeonTab(BaseTab):
         if not self._clicked:
             # ★ 站穩了才點：走路中送互動包，人還沒到、對話開不起來
             #   （補給那邊同一條規矩「先走到位才發互動包」）。
+            #   ⚠ 但**最多等 STILL_WAIT 秒**：`is_walking` 有可能恆為 True
+            #     （被推、人擠人），那樣就會永遠不點。等過頭就照點。
             if self._busy_walking():
-                self._say(f"{tag}　還在走，站穩再點…")
-                return
+                self._still_t += dt
+                if self._still_t < STILL_WAIT:
+                    self._say(f"{tag}　還在走，站穩再點…"
+                              f"（{self._still_t:.1f}/{STILL_WAIT:.1f} 秒）")
+                    return
+                self._say(f"{tag}　一直在動（被推？）—— 不等了，直接點")
+            self._still_t = 0.0
             props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
             if props is None:
                 # ⚠ 讀不到 ≠ 沒有。等下一拍再試，不要當成「這裡沒東西」。
@@ -1627,6 +1639,7 @@ class DungeonTab(BaseTab):
         self._empty_since = 0.0
         self._poke_t = 0.0            # 下一步的傳點要馬上補送第一次
         self._nudge = 0               # 靠近重試的次數歸零
+        self._still_t = 0.0
         self._nav.reset()
         self._refresh_steps()
 
