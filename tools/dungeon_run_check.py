@@ -827,6 +827,27 @@ def main() -> int:
     ck("★★ 對話收尾會把視窗關掉（⛔ 不要帶著對話框到處跑）",
        bool(closed), str(closed))
 
+    # ★★ 使用者 2026-09-02：「他沒走到我標的對話點才說話，而是在上個點位
+    #   一直打對話」——對話點的容忍半徑本來 3.0（＝navigate.ARRIVE），
+    #   站在 2.4 格外就開點了。收緊到 TALK_NEAR，最後一段自己走。
+    walked = []
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(17.8, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    tab._mover = type("M", (), {
+        "walk_near": lambda _s, _sc, _p, x, y, k: walked.append((x, y, k)),
+        "walk_exact": lambda _s, _sc, _p, x, y: walked.append((x, y, 0)),
+    })()
+    dt.entity.is_walking = lambda _sc, _p: False
+    run(tab, 0.5)
+    ck("★★ 離對話點 2.2 格 → **還要再走過去**，不是就地開點",
+       not tab._clicked and walked, f"點了={tab._clicked} 走={walked}")
+    ck("　最後一段用 walk_near 留幾格（機關常站在不可走格上）",
+       bool(walked) and walked[0][2] == dt.TALK_KEEP, str(walked))
+    tab._pos = [19.0, 20.0]
+    run(tab, 0.4)
+    ck("　真的靠近了才點下去", tab._clicked)
+
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
     tab._keys, tab._atk = FakeKeys(), FakeAtk()

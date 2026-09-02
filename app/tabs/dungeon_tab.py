@@ -106,7 +106,9 @@ from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
 
 TICK_MS = 100
 # 掃描節奏：交戰中要快（換目標／死亡），純趕路可以慢一點。
-SCAN_FAST, SCAN_SLOW = 0.25, 0.8
+# ⚠ 趕路那個本來是 0.8 秒 —— 太慢：怪冒出來要一秒後才看得到，看起來就像
+#   「走過去才打怪」（使用者 2026-09-02）。收到 0.35 秒。
+SCAN_FAST, SCAN_SLOW = 0.25, 0.35
 # 走到腳本點位算「到了」的容忍半徑（格）。
 ARRIVE = 1.8
 # ⚠⚠ `navigate.ARRIVE` 是 3.0 —— **尋路器在 3 格以內就什麼都不做**。
@@ -115,8 +117,15 @@ ARRIVE = 1.8
 #   那一段改成直接送走路（`walk_exact`，不尋路）——就是 move.walk_near 檔頭
 #   寫的「站在 2.2 格卡 8.2 秒」同一個老坑。
 NAV_DEAD = navigate.ARRIVE
-# 對話那一步要先靠多近才點（格）。⚠ 太遠點下去人還沒到、對話就開了。
-TALK_NEAR = 3.0
+# 對話那一步要先靠多近才點（格）。
+# ⚠⚠ 2026-09-02 使用者實遇：本來是 3.0，剛好等於 `navigate.ARRIVE` ——
+#   結果站在**上一個點位**（離對話點 2.4 格）就開始點，人根本沒走過去，
+#   然後「在上個點位一直打對話」。⛔ 太遠發互動包＝人沒到、對話開不起來
+#   （補給點 NPC 那邊踩過同一個坑，見 supply 的「先走到位才發互動包」）。
+#   → 收緊到 1.8，最後那一段用 `walk_near` 自己走（尋路器 3 格內不動）。
+TALK_NEAR = 1.8
+# 走到對話點時要留幾格（物件常常站在不可走的格上，不能走到它身上）。
+TALK_KEEP = 1.2
 # 腳本裡的座標跟現場物件對得起來的最大誤差（格）。
 PROP_TOL = 3.0
 # 送完一個對話動作之後等多久再看下一頁。
@@ -1146,7 +1155,8 @@ class DungeonTab(BaseTab):
                     self._blocked(dt, f"走不到 ({gx}, {gy})", (gx, gy))
                     return
             self._say(f"第 {self._i + 1} 步　走到 ({gx}, {gy})"
-                      f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
+                      f"　剩 {_d((gx, gy), me):.1f} 格　{note}"
+                      f"　{self._mon_note()}")
             return
 
         if kind == dungeon.PORTAL:
@@ -1246,10 +1256,14 @@ class DungeonTab(BaseTab):
         # ⚠ 先走到旁邊再點：太遠就發互動包＝人還沒到、對話先開，選項送出去
         #   會落空（買東西那條路踩過同一個坑）。
         if _d((ax, ay), me) > TALK_NEAR:
-            note = self._nav.step(self._sc, self._mover, self._player, ax, ay)
-            if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._blocked(dt, f"走不到對話點 ({ax}, {ay})", (ax, ay))
-                return
+            if _d((ax, ay), me) <= NAV_DEAD:
+                note = self._close_in(ax, ay, TALK_KEEP)
+            else:
+                note = self._nav.step(self._sc, self._mover, self._player,
+                                      ax, ay)
+                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                    self._blocked(dt, f"走不到對話點 ({ax}, {ay})", (ax, ay))
+                    return
             self._say(f"第 {self._i + 1} 步　走去對話點 ({ax}, {ay})"
                       f"　剩 {_d((ax, ay), me):.1f} 格　{note}")
             return
@@ -1453,15 +1467,31 @@ class DungeonTab(BaseTab):
         self._notice, self._notice_t = text, time.monotonic() + NOTICE_SECS
         self.status.setText(text)
 
-    def _close_in(self, gx: float, gy: float) -> str:
+    def _mon_note(self) -> str:
+        """狀態列上的怪物盤點：看得到幾隻、其中幾隻走得到。
+
+        ★ 使用者 2026-09-02 說「走過去才打怪」時，第一件要分清楚的事就是
+          「當下到底看不看得到怪」——沒有這一行只能用猜的。
+        """
+        live = len(self._live_monsters())
+        if not live:
+            return "（周圍 0 隻怪）"
+        return f"（周圍 {live} 隻怪，走得到 {len(self._targets())} 隻）"
+
+    def _close_in(self, gx: float, gy: float, keep: float = 0.0) -> str:
         """最後那 3 格：尋路器已經當「到了」不動作 → 自己直接走過去。
 
+        `keep` > 0 就停在離目標那麼多格（對話點用 —— 機關／NPC 常常站在
+        不可走的格上，走到它身上是走不到的）。
         ⚠ 正在走就別再送（重下指令會把上一段打斷）。
         """
         try:
             if entity.is_walking(self._sc, self._player):
                 return "走最後一段…"
-            self._mover.walk_exact(self._sc, self._player, gx, gy)
+            if keep > 0:
+                self._mover.walk_near(self._sc, self._player, gx, gy, keep)
+            else:
+                self._mover.walk_exact(self._sc, self._player, gx, gy)
         except Exception:                                # noqa: BLE001
             return "走最後一段（送不出去）"
         return "直接走最後一段（尋路器 3 格內不動作）"
