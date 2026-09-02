@@ -414,6 +414,16 @@ class DungeonMakeTab(BaseTab):
         b.setToolTip("送出離開互動（不送的話伺服器會覺得你還在跟它講話）。")
         b.clicked.connect(self._leave)
         th.addWidget(b)
+        # ★ 使用者 2026-09-02：「我們可以讀到傳送點物件，那能不能多一個按鈕
+        #   是走去傳送點…走入傳送點一樣記錄在 json 是流程一部分」
+        b = QPushButton("這個是傳送點")
+        b.setToolTip(
+            "把清單裡選到的那個物件記成「走進傳點」的一步（存進腳本）。\n"
+            "跑的時候：走過去 → 等人被順移／換圖才算完成；\n"
+            "站上去沒反應就每 5 秒對它送一次互動，撐 3 分鐘沒過就停下來通知。\n"
+            "按完之後你自己走進去，出口在哪會自動記進這一步。")
+        b.clicked.connect(self._add_portal_prop)
+        th.addWidget(b)
         # ★ 場景標記點（TAG01/TAG02…）畫面上根本看不見，但照樣有互動 id，
         #   一站就掃到 45 個把真正的機關淹掉 —— 預設收起來。
         self.hide_tag = QCheckBox("藏起看不見的標記點")
@@ -876,6 +886,28 @@ class DungeonMakeTab(BaseTab):
         self._pw_timer.start(PORTAL_WATCH_MS)
         self._say_map("走進那個傳點吧 —— 我盯著看它把你送到哪，"
                       "看到就自動記進這一步。")
+
+    def _add_portal_prop(self) -> None:
+        """把清單裡選到的物件記成「走進傳點」（使用者 2026-09-02 要的按鈕）。
+
+        跟 `_add_portal`（用地圖上點到的格）差別只在**位置從哪來**：
+        這裡連**外觀編號**一起記，跑的時候站上去沒被搬走才有東西可以補送。
+        """
+        i = self.props.currentRow()
+        if not 0 <= i < len(self._props):
+            self.status.setText("先在清單裡選一個物件（那個傳送點）")
+            return
+        pr = self._props[i]
+        n = len(self._script.steps)
+        self._add({"do": dungeon.PORTAL,
+                   "to": [round(pr.x, 1), round(pr.y, 1)],
+                   "model": pr.model})
+        if len(self._script.steps) <= n:
+            return                       # 被 _add 擋下來了（換圖了之類）
+        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
+        self._pw_timer.start(PORTAL_WATCH_MS)
+        self._say_map(f"記成傳送點：{mapobj.label(pr.model)} —— "
+                      "走進去吧，我盯著看它把你送到哪。")
 
     def _portal_watch(self) -> None:
         """盯著「剛加的那個傳點」把人送到哪。看到順移才記，看不到就說看不到。"""

@@ -267,7 +267,7 @@ def main() -> int:
     tab._pos = [21.0, 20.0]
     run(tab, 0.2)
     ck("走近了 → 點下去", tab._clicked)
-    run(tab, dt.MENU_GAP * 2 + 0.5)
+    run(tab, dt.MENU_GAP * 3 + 0.6)
     from app.game import supply as _sup
     want = [_sup.talk_option(1), _sup.talk_option(2)]
     ck("選項照順序送出（第1項→第2項）", tab.sent == want,
@@ -328,13 +328,60 @@ def main() -> int:
     tab = make_tab([{"do": "portal", "to": [50, 50]}, {"do": "clear"}])
     run(tab, 0.5)
     ck("★ 站到傳點上**不算**完成（會被搬走，那一格不會到達）", tab._i == 0)
+    ck("　還沒到就一直往傳點走", tab._nav.goal == (50, 50), str(tab._nav.goal))
     tab._pos = [50.2, 50.2]
     run(tab, 0.3)
     ck("★ 就算站上去了也還是不算完成", tab._i == 0, str(tab._i))
-    ck("　一直往傳點走", tab._nav.goal == (50, 50), str(tab._nav.goal))
     tab._jumped = True
     run(tab, 0.1)
     ck("★ 順移了 → 這一步完成", tab._i == 1)
+
+    # ★★ 純對話（使用者 2026-09-02：「純對話：整段都沒有選項」）
+    #   ⛔ 舊碼點完的**下一拍**就送離開互動 → 對話框都還沒開就被取消掉。
+    talk = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [],
+            "gap": 2.0}
+    tab = make_tab([talk], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    run(tab, 0.3)
+    ck("純對話：點下去了", tab._clicked)
+    run(tab, 1.0)
+    ck("★★ 沒有選項也**不會馬上離開**（等對話真的出現）",
+       tab.left == [] and tab._i == 0, str(tab.left))
+    ck("　狀態列講得出在等什麼", "純對話" in tab.status.text(),
+       tab.status.text())
+    run(tab, 1.5)
+    ck("　等完才送離開互動並前進", tab.left == [1] and tab._i == 1,
+       f"{tab.left} 步{tab._i}")
+
+    # ★★ 傳點站上去沒被搬走 → 每 PORTAL_POKE 秒補送一次，撐 PORTAL_TIMEOUT
+    #   （使用者 2026-09-02：「在傳送點每 5 秒送一次，3 分鐘就結束跳通知」）
+    poked = []
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0), props=[FakeProp(50.0, 50.0, 60123)])
+    dt.produce.click = lambda _mv, _sc, p: (poked.append(p.model), (True, "點了"))[1]
+    run(tab, 0.3)
+    ck("★ 站在傳點上 → 立刻補送第一次互動", poked == [60123], str(poked))
+    run(tab, dt.PORTAL_POKE - 1.0)
+    ck(f"　{dt.PORTAL_POKE:.0f} 秒還沒到不重送（⛔ 不是每拍狂送）",
+       len(poked) == 1, str(poked))
+    run(tab, 1.5)
+    ck(f"★ 過了 {dt.PORTAL_POKE:.0f} 秒才送第二次", len(poked) == 2, str(poked))
+    fired = []
+    tab._warn = lambda msg: fired.append(msg)
+    tab._step_t = dt.PORTAL_TIMEOUT + 1
+    run(tab, 0.2)
+    ck(f"★★ 撐滿 {dt.PORTAL_TIMEOUT:.0f} 秒還沒過 → 停下來",
+       not tab.run_cb.isChecked(), tab.status.text())
+    ck("　而且**跳通知警告使用者**", len(fired) == 1, str(fired))
+    ck("　通知講得出是傳點過不去", "傳點" in (fired[0] if fired else ""),
+       str(fired))
+    # 沒記外觀編號的舊腳本 → 只站著等，⛔ 不可以就近亂點
+    poked.clear()
+    tab = make_tab([{"do": "portal", "to": [50, 50]}], pos=(50.0, 50.0),
+                   props=[FakeProp(50.0, 50.0, 60123)])
+    run(tab, 2.0)
+    ck("★ 沒記外觀編號 → 只站著等，⛔ 不就近亂點一個", poked == [], str(poked))
+    dt.produce.click = lambda *a, **k: (True, "點了")
 
     # 出口對不對得上（腳本記了 land 就要驗）
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])

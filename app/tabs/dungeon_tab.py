@@ -91,6 +91,7 @@ from PySide6.QtWidgets import (
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
+from app.core.notifier import Notifier
 from app.game import (dungeon, entity, itemname, locate, move, navigate,
                       produce, quickbar, scene, scenery, sell, skills, supply,
                       terrain)
@@ -151,6 +152,12 @@ NOTICE_SECS = 6.0
 # ⚠ 跟 dungeon.rooms() 的 min_cells 同一個道理：實測這張圖有 9/4/2 格的
 #   零星角落，錨在那上面會把整張圖的怪都判成走不到。
 MIN_REGION = 20
+# ★★ 傳點站上去卻沒被搬走時的補救（使用者 2026-09-02 定案）：
+#   「偵測走過去然後要有突然位移或換圖，如果失敗就在傳送點每 5 秒送一次，
+#     如果 3 分鐘都這樣就結束跳通知警告使用者」
+PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
+PORTAL_POKE = 5.0          # 每幾秒對傳點物件送一次互動
+PORTAL_TIMEOUT = 180.0     # 這麼久還沒被搬走 → 結束並通知
 
 
 def _d(a, b) -> float:
@@ -171,6 +178,7 @@ class DungeonTab(BaseTab):
         self._script = None
         self._keys = None            # KeyWorker
         self._atk = None             # TargetWorker
+        self._notifier = None        # 跳通知用（第一次要通知時才建）
         self._qb_sc = None           # 技能鍵標名字用的 Reader（跟著分身換）
         self._qb_ui = None
         self._scan = ScanWorker()
@@ -406,6 +414,7 @@ class DungeonTab(BaseTab):
         self._unreach_t = 0.0        # 「沒有路」連續多久了（等門開）
         self._blocked_last = False   # 上一拍是不是卡在「沒有路」
         self._notice = ""            # 要停留幾秒的提示
+        self._poke_t = 0.0           # 還有多久對傳點補送一次互動
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -838,9 +847,16 @@ class DungeonTab(BaseTab):
             self._unreach_t = 0.0
         self._blocked_last = False
         self._step_t += dt
-        if self._step_t > STEP_TIMEOUT:
+        # ⚠ 傳點那一步有自己的（比較長的）上限：使用者要求站上去沒反應時
+        #   每 5 秒補送一次、撐滿 3 分鐘才放棄，90 秒會提早砍掉。
+        cap = PORTAL_TIMEOUT if kind == dungeon.PORTAL else STEP_TIMEOUT
+        if self._step_t > cap:
             self._stop(f"⛔ 第 {self._i + 1} 步「{dungeon.describe(step)}」"
-                       f"卡了 {STEP_TIMEOUT:.0f} 秒還沒完成 —— 停下來")
+                       f"卡了 {cap:.0f} 秒還沒完成 —— 停下來")
+            if kind == dungeon.PORTAL:
+                self._warn(f"傳點過不去：第 {self._i + 1} 步"
+                           f"「{dungeon.describe(step)}」站上去 "
+                           f"{PORTAL_TIMEOUT:.0f} 秒都沒有被傳走，這一趟停了。")
             return
 
         if kind == dungeon.CLEAR:
@@ -913,6 +929,13 @@ class DungeonTab(BaseTab):
                 self._next()
                 return
             gx, gy = step["to"]
+            if _d((gx, gy), me) <= PORTAL_NEAR:
+                # ★ 已經站在傳點上卻沒被搬走 → 每 PORTAL_POKE 秒對它送一次
+                #   互動（有些傳點要點一下才走）。⛔ 不是每一拍狂送：那是
+                #   洪水，伺服器會擋（跟補給點 NPC 同一個道理）。
+                self._nav.reset()
+                self._poke_portal(step, dt)
+                return
             note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
                 self._blocked(dt, f"走不到傳點 ({gx}, {gy})", (gx, gy))
@@ -926,6 +949,52 @@ class DungeonTab(BaseTab):
             return
 
         self._stop(f"⛔ 第 {self._i + 1} 步是不認得的動作「{kind}」")
+
+    def _poke_portal(self, step: dict, dt: float) -> None:
+        """人已經站在傳點上但沒被搬走 —— 每 PORTAL_POKE 秒補送一次互動。
+
+        使用者 2026-09-02：「如果失敗就在傳送點每 5 秒送一次，如果 3 分鐘
+        都這樣就結束跳通知警告使用者」。3 分鐘那道閘在 `_run_step` 開頭
+        （`PORTAL_TIMEOUT`），這裡只負責補送。
+        ⚠ 沒記外觀編號（舊腳本）就只站著等：⛔ 不可以就近亂點一個東西。
+        """
+        self._poke_t -= dt
+        left = PORTAL_TIMEOUT - self._step_t
+        want = step.get("model")
+        if want is None:
+            self._say(f"第 {self._i + 1} 步　站在傳點上等被傳走…"
+                      f"（還有 {max(left, 0):.0f} 秒）")
+            return
+        if self._poke_t > 0:
+            self._say(f"第 {self._i + 1} 步　站在傳點上等被傳走…"
+                      f"下次補送 {self._poke_t:.1f} 秒（還有 {max(left, 0):.0f} 秒）")
+            return
+        self._poke_t = PORTAL_POKE
+        ax, ay = step["to"]
+        props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
+        if props is None:
+            self._say("物件清單讀不到，等下一次補送…")
+            return
+        hit = [p for p in props if p.model == want]
+        if not hit:
+            # ⛔ 找不到就等，**絕不就近點一個**（點錯東西比不點危險）。
+            self._say(f"第 {self._i + 1} 步　傳點附近找不到外觀 {want} 的物件，"
+                      f"繼續等（還有 {max(left, 0):.0f} 秒）")
+            return
+        ok, msg = produce.click(self._mover, self._sc, hit[0])
+        self._say(f"第 {self._i + 1} 步　站在傳點上，補送互動"
+                  f"（{'送出' if ok else msg}）…還有 {max(left, 0):.0f} 秒")
+
+    def _warn(self, msg: str) -> None:
+        """跳通知警告使用者（跟掛機頁同一套 Notifier）。"""
+        try:
+            if self._notifier is None:
+                self._notifier = Notifier(self, title="⚠ 自動刷副本")
+            who = self.who.currentText() or "副本"
+            note = self._notifier.fire(who, msg)
+            self.status.setText(self.status.text() + f"　[{note}]")
+        except Exception:                                # noqa: BLE001
+            pass                       # 通知送不出去不該再把事情弄糟
 
     def _do_interact(self, step: dict, me, dt: float) -> None:
         ax, ay = step["at"]
@@ -983,7 +1052,19 @@ class DungeonTab(BaseTab):
             self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
                       f"（{self._menu_i}/{len(menu)}）")
             return
-        # 選項送完 → 送離開互動（不送的話伺服器會覺得我們還在講話）
+        # ★★ 收尾前**一定要等**（使用者 2026-09-02 回報「對話有點問題…純對話：
+        #   整段都沒有選項」）：`menu` 是空的時候，舊碼點完的**下一拍**就送
+        #   離開互動 —— 遊戲那邊人還在走過去、對話框都還沒開，等於把互動
+        #   直接取消掉，畫面上什麼都沒發生。有選項的那種也一樣：最後一項
+        #   送出去之後馬上離開，對方的回話同樣被切掉。
+        #   → 不管有沒有選項，都先把這一步自己的間隔等完再離開。
+        self._menu_t -= dt
+        if self._menu_t > 0:
+            what = "純對話（沒有選項）" if not menu else "選項送完"
+            self._say(f"第 {self._i + 1} 步　{what}，"
+                      f"等 {self._menu_t:.1f} 秒再離開對話")
+            return
+        # 送離開互動（不送的話伺服器會覺得我們還在講話，角色會被鎖住不能走）
         supply.leave_npc(self._mover)
         self._next()
 
@@ -996,6 +1077,7 @@ class DungeonTab(BaseTab):
         self._clicked = False
         self._wait_left = 0.0
         self._empty_since = 0.0
+        self._poke_t = 0.0            # 下一步的傳點要馬上補送第一次
         self._nav.reset()
         self._refresh_steps()
 

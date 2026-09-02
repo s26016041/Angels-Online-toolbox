@@ -26,7 +26,7 @@ r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
                        "menu": [1, 2]}                送對話選項（1 起算）
     {"do": "clear"}                                  把周圍的怪清光
     {"do": "wait",     "secs": 3}                    單純等幾秒
-    {"do": "portal",   "to": [x, y],                 走進傳點（人被移走才算完成）
+    {"do": "portal",   "to": [x, y], "model": 60xxx, 走進傳點（人被移走才算完成）
                        "land": [x, y], "scene": 76}
 
 ## 傳點為什麼要獨立一種步驟（使用者 2026-09-02 問對了）
@@ -313,6 +313,9 @@ def validate(step: dict) -> tuple[bool, str]:
         land = step.get("land")
         if land is not None and not (isinstance(land, list) and len(land) == 2):
             return False, "portal 的 land 要是 [x,y]"
+        mdl = step.get("model")
+        if mdl is not None and not isinstance(mdl, int):
+            return False, "portal 的 model 要是外觀編號"
     return True, ""
 
 
@@ -343,13 +346,18 @@ def describe(step: dict) -> str:
         land = step.get("land")
         if not land:
             # ⚠ 還沒看到出口就要講出來 —— 沒看到 ≠ 沒有出口，但也不能裝作記到了。
-            return f"走進傳點 ({x}, {y})　⚠ 還沒看到出口（走進去一次就會記起來）"
+            m = step.get("model")
+            who = f"　{mapobj.label(m)}" if isinstance(m, int) else ""
+            return (f"走進傳點 ({x}, {y}){who}"
+                    "　⚠ 還沒看到出口（走進去一次就會記起來）")
         tail = ""
         dst = step.get("scene")
         if dst is not None:
             from app.game import scene as _scene   # 迴圈匯入：用時才拉
             tail = f"　{_scene.scene_name(dst)}"
-        return (f"走進傳點 ({x}, {y}) → 出口 "
+        m = step.get("model")
+        who = f"　{mapobj.label(m)}" if isinstance(m, int) else ""
+        return (f"走進傳點 ({x}, {y}){who} → 出口 "
                 f"({land[0]:g}, {land[1]:g}){tail}")
     return f"？{kind}"
 
