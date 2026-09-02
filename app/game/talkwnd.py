@@ -73,17 +73,26 @@ class Spot:
 
 def locate(scanner) -> Spot | None:
     """推位址；推不出來回 None（＝**大聲停用**，不亂叫別的函式）。"""
+    return _locate_cmd(scanner, CMD_NAME, "")
+
+
+def _locate_cmd(scanner, cmd_name: bytes, tag: str) -> Spot | None:
+    """從 UI 指令表用**指令名字串**當錨，推出 (指令本體, 全域, 本體函式)。
+
+    骨架：`mov ecx,[某個全域]` → **緊接著那個 call** 就是本體。
+    `messageclose` 與 `ismessageend` 兩支長得一模一樣，所以共用這一支。
+    """
     base = scanner.module_base(GAME_MODULE)
     if not base:
         return None
-    key = (getattr(scanner, "pid", 0), base)
+    key = (getattr(scanner, "pid", 0), base, tag)
     if key in _cache:
         return _cache[key]
     spot = None
     span = roulette._module_span(scanner, base)
     buf = roulette._read_image(scanner, base, span)
     if buf:
-        i = buf.find(CMD_NAME)
+        i = buf.find(cmd_name)
         j = buf.find(struct.pack("<I", base + i)) if i >= 0 else -1
         if j >= 0:
             fn = struct.unpack_from("<I", buf, j + 4)[0]
@@ -109,6 +118,46 @@ def locate(scanner) -> Spot | None:
                     spot = Spot(cmd_fn=fn, world_ptr=world, close_fn=call)
     _cache[key] = spot
     return spot
+
+
+# ★★★ 「對話視窗現在到底開著沒」的**硬訊號**（使用者 2026-09-02：
+#   「對話後關視窗太慢了，不知道在等啥，請要明確知道有沒有視窗」）。
+#   UI 指令 `ismessageend` 的骨架就是答案：
+#       ecx = [視窗管理器全域]
+#       eax = 依視窗代號查視窗物件      ← 查不到（0）＝**沒有這個視窗**
+#   所以叫那支查一下就好，不必再用「值有沒有變」猜。
+FIND_CMD = b"ismessageend" + bytes(1)
+
+
+def find_spot(scanner) -> Spot | None:
+    """推「查視窗」那一支的位址（跟 messageclose 同一個骨架，見 locate）。"""
+    return _locate_cmd(scanner, FIND_CMD, "_find")
+
+
+def window_open(mover, scanner) -> bool | None:
+    """對話視窗**現在**開著嗎。**讀不到／叫不動回 None**（＝不知道）。
+
+    ⚠ 回 None 千萬不要當成 False —— 「不知道」跟「沒有視窗」對呼叫端是
+      完全不同的兩句話（[[bag-false-empty-guards]] 那條規矩）。
+    """
+    if not (mover and mover.active):
+        return None
+    spot = find_spot(scanner)
+    if spot is None:
+        return None
+    mgr = _u32(scanner, spot.world_ptr)
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000:
+        return None
+    g = lua.globals_of(scanner, [WND_NAME]) or {}
+    wnd = g.get(WND_NAME)
+    if not wnd:
+        return None
+    with mover.lock:
+        got = mover.call_sync(spot.close_fn, int(wnd), ecx=mgr,
+                              timeout=CALL_TIMEOUT)
+    if got is None:
+        return None                      # 指令槽忙 → 不知道，不要亂判
+    return bool(got)
 
 
 def _u32(scanner, addr: int) -> int | None:

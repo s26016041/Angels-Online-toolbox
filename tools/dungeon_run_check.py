@@ -189,10 +189,21 @@ class FakeTalk:
         self.i = -1
         self.closes = 0
         self.i_lock = False           # True ＝ 送了動作也不換頁（伺服器沒回）
+        self.unknown = False          # True ＝ 問不到有沒有視窗（叫不動）
 
     def opened(self):
         if self.i < 0:
             self.i = 0
+
+    def window_open(self, _mv, _sc):
+        """有沒有對話視窗 —— 真實世界那支硬訊號（不知道回 None）。
+
+        ⚠ 沒點之前／翻完之後都是**沒有視窗**，但 `page()` 照樣讀得到殘留值，
+          這就是要模擬的重點。
+        """
+        if self.unknown:
+            return None
+        return 0 <= self.i < len(self.pages)
 
     def page(self, _sc):
         if self.i < 0:
@@ -204,6 +215,16 @@ class FakeTalk:
         return dt.talkwnd.Page(is_talk=not opts, options=opts,
                                sig=(min(self.i, len(self.pages)), opts))
 
+    def close_gone(self, _mv, _sc):
+        """按確定 → 整段對話直接結束（**視窗消失**）。
+
+        ⚠ 那些 Lua 全域凍在最後一頁不會被清掉 —— 真實世界就是這樣，
+          所以只有「有沒有視窗」問得出真相。
+        """
+        self.closes += 1
+        self.i = len(self.pages)
+        return True, "送出"
+
     def close(self, _mv, _sc):
         self.closes += 1
         if not self.i_lock:
@@ -213,6 +234,7 @@ class FakeTalk:
 
 def wire(tab, fake):
     dt.talkwnd.page = fake.page
+    dt.talkwnd.window_open = fake.window_open
     dt.talkwnd.close_page = fake.close
     dt.talkwnd.close_window = lambda *_a: True
     real = dt.sell.talk
@@ -507,11 +529,54 @@ def main() -> int:
     tab = make_tab([talk_step], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, fake)
-    fake.close = lambda _mv, _sc: (True, "送出")     # 按了也不翻頁＝對話沒了
-    dt.talkwnd.close_page = fake.close
+    dt.talkwnd.close_page = fake.close_gone   # 按了確定 → 視窗直接不見
     run(tab, 8.0)
     ck("★ 對話走完了選項卻還沒送到 → 停下來",
        not tab.run_cb.isChecked(), tab.status.text())
+
+    # ★★★ 「到底有沒有對話視窗」＝硬訊號（使用者 2026-09-02：
+    #   「對話後關視窗太慢了，不知道在等啥，請要明確知道有沒有視窗」）
+    print("\n有沒有對話視窗（硬訊號）")
+    fake = FakeTalk([()])                       # 一頁沒有選項的對話
+    one = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [],
+           "gap": 0.2}
+    tab = make_tab([one, {"do": "wait", "secs": 9}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, 0.2)
+    ck("　點下去了", tab._clicked and fake.i == 0)
+    run(tab, 0.3)
+    ck("★★ 視窗確定開著 → **馬上**按確定（不必等它「穩定」）",
+       fake.closes >= 1, f"按了{fake.closes}次")
+    run(tab, 0.3)
+    ck("★★★ 視窗不見了 → **立刻**收工，不用等 TALK_SETTLE",
+       tab._i == 1, f"還在第{tab._i + 1}步：{tab.status.text()}")
+    ck("　收工前會送「離開互動」", len(tab.left) >= 1, str(tab.left))
+
+    # ⛔ 視窗還在 ＝ 對話**還沒**結束（就算那些全域一直沒變）
+    fake = FakeTalk([(), ()])
+    fake.i_lock = True                          # 按了確定伺服器也不翻頁
+    tab = make_tab([one, {"do": "wait", "secs": 9}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, dt.TALK_SETTLE * 0.2 + dt.CLOSE_RETRY + 1.0)
+    ck("⛔ 視窗還在 → 不可以當成「對話結束」", tab._i == 0,
+       f"跑到第{tab._i + 1}步")
+    ck("★ 沒反應會補送確定（不是乾等）", fake.closes >= 2,
+       f"按了{fake.closes}次")
+
+    # ⚠ 問不到有沒有視窗（叫不動／讀不到）→ 退回舊的「簽章有沒有變」判斷
+    fake = FakeTalk([(1,), ()])
+    fake.unknown = True
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2},
+                    {"do": "wait", "secs": 9}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, 8.0)
+    ck("⚠ 問不到視窗狀態 → 照舊走得完（不是壞掉）",
+       tab.sent == [_sup2.talk_option(1)] and tab._i == 1,
+       f"送出{tab.sent} 第{tab._i + 1}步 {tab.status.text()}")
 
     # ★★ 傳點站上去沒被搬走 → 每 PORTAL_POKE 秒補送一次，撐 PORTAL_TIMEOUT
     #   （使用者 2026-09-02：「在傳送點每 5 秒送一次，3 分鐘就結束跳通知」）
@@ -991,6 +1056,7 @@ def main() -> int:
     dt.talkwnd.page = lambda _sc: dt.talkwnd.Page(
         is_talk=pages["i"] == 0, options=((1, 2) if pages["i"] else ()),
         sig=(pages["i"],))
+    dt.talkwnd.window_open = lambda _mv, _sc: pages["i"] > 0
     real_enter = dt.portal.enter
     dt.portal.enter = lambda mv, sc, t, pf: (pages.__setitem__("i", 1),
                                              real_enter(mv, sc, t, pf))[1]
@@ -1016,6 +1082,7 @@ def main() -> int:
     tab._phase = "enter"
     dt.talkwnd.page = lambda _sc: dt.talkwnd.Page(   # 一開始就開著、而且不變
         is_talk=True, options=(1, 2), sig=("一直是這一頁",))
+    dt.talkwnd.window_open = lambda _mv, _sc: True
     for _ in range(int(1.0 / TICK)):
         tab._go_entrance(tab._my_pos(), TICK)
     ck("★★ 一到門口對話就已經開著（簽章從頭到尾沒變）→ **照樣送第 1 項**",
