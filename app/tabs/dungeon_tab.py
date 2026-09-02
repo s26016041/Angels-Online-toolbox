@@ -415,6 +415,8 @@ class DungeonTab(BaseTab):
         self._blocked_last = False   # 上一拍是不是卡在「沒有路」
         self._notice = ""            # 要停留幾秒的提示
         self._poke_t = 0.0           # 還有多久對傳點補送一次互動
+        self._phase = "run"          # "enter"＝還在外面撞入口，"run"＝跑腳本
+        self._enter_t = 0.0          # 撞入口撞多久了
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -443,13 +445,32 @@ class DungeonTab(BaseTab):
         if sc is None:
             self._stop("這台分身不見了")
             return
-        # ★ 開跑前比對地圖：對不上就大聲停用，不拿舊腳本盲走。
-        grid = self._maps.get(sc)
-        ok, why = dungeon.check_map(script, grid, scene.current_id(sc),
-                                    scene.map_key)
-        if not ok:
-            self._stop(f"⛔ {why}")
-            return
+        # ★★ 現在人在哪？（使用者 2026-09-02：「自動刷副本那邊就會看，
+        #   如果在副本裡面會直接執行 json 開始跑；如果不在就會去撞副本傳點」）
+        here = scene.map_key(scene.current_id(sc))
+        ent = script.entrance or {}
+        if here is not None and script.scene is not None and here != script.scene:
+            if not ent:
+                self._stop(f"⛔ 你不在「{scene.scene_name(script.scene)}」，"
+                           f"這份腳本也沒記入口傳送點 —— 先進副本再開，"
+                           f"或在製作頁按「這是進副本的入口」記一次。")
+                return
+            if here != ent.get("scene"):
+                self._stop(
+                    f"⛔ 你在「{scene.scene_name(here)}」（{here}）：既不是副本"
+                    f"「{scene.scene_name(script.scene)}」，也不是入口那張圖"
+                    f"「{scene.scene_name(ent.get('scene'))}」—— 先過去再開。")
+                return
+            phase = "enter"                # 在入口那張圖 → 先去撞傳點
+        else:
+            # ★ 已經在副本裡 → 照舊比對地圖指紋，對不上就大聲停用。
+            grid = self._maps.get(sc)
+            ok, why = dungeon.check_map(script, grid, scene.current_id(sc),
+                                        scene.map_key)
+            if not ok:
+                self._stop(f"⛔ {why}")
+                return
+            phase = "run"
         try:
             self._mover = move.acquire(int(pid), injector.process_path(int(pid)),
                                        self)
@@ -458,7 +479,8 @@ class DungeonTab(BaseTab):
             return
         self._pid, self._sc, self._script = int(pid), sc, script
         self._reset_run()
-        self._map_key = scene.map_key(scene.current_id(sc))
+        self._phase = phase
+        self._map_key = here
         self._refresh_steps()
         self._atk = TargetWorker(sc)
         self._atk.died.connect(self._on_died)
@@ -470,7 +492,13 @@ class DungeonTab(BaseTab):
         self._keys.mover = self._mover
         self._keys.vks = self._picked_keys()
         self._keys.start()
-        self.status.setText(f"開始跑「{script.name}」共 {len(script.steps)} 步")
+        if phase == "enter":
+            self.status.setText(
+                f"「{script.name}」：先去撞入口傳送點 —— "
+                f"{dungeon.describe_entrance(ent)}")
+        else:
+            self.status.setText(
+                f"開始跑「{script.name}」共 {len(script.steps)} 步")
 
     def _stop(self, why: str = "", quiet: bool = False) -> None:
         if self._keys is not None:
@@ -666,11 +694,65 @@ class DungeonTab(BaseTab):
         if self._fight(me, dt):
             return
 
-        # ② 沒怪了 → 跑腳本
+        # ② 沒怪了 → 還在外面就先去撞入口，進去了才跑腳本
+        if self._phase == "enter":
+            self._go_entrance(me, dt)
+            return
         if self._i >= len(self._script.steps):
             self._finish(dt)
             return
         self._run_step(me, dt)
+
+    # -- 進副本 -------------------------------------------------------
+    def _go_entrance(self, me, dt: float) -> None:
+        """還在外面：走去入口傳送點，撞進去。
+
+        使用者 2026-09-02 定案：
+        > 「如果在副本裡面會直接執行 json 開始跑；如果不在就會去撞副本傳點，
+        >   如果撞了沒效就會每 5 秒送一次傳送直到成功，然後執行 json」
+
+        ⚠ 進去了是靠 `_check_map_change()` 認的（場景會變）——這裡只負責
+          「走過去 ＋ 撞不進去就補送」。
+        """
+        ent = self._script.entrance or {}
+        gx, gy = ent.get("to", [0, 0])
+        self._enter_t += dt
+        if self._enter_t > PORTAL_TIMEOUT:
+            self._stop(f"⛔ 撞了 {PORTAL_TIMEOUT:.0f} 秒還是沒進得去副本 —— 停下來")
+            self._warn(f"進不去副本：{dungeon.describe_entrance(ent)} "
+                       f"撞了 {PORTAL_TIMEOUT:.0f} 秒都沒反應。")
+            return
+        left = PORTAL_TIMEOUT - self._enter_t
+        if _d((gx, gy), me) > PORTAL_NEAR:
+            note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
+            if self._nav.stuck and self._nav.stuck_reason == "grid":
+                self._blocked(dt, f"走不到入口 ({gx}, {gy})", (gx, gy))
+                return
+            self._say(f"去入口傳送點 ({gx}, {gy})"
+                      f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
+            return
+        # 已經站在入口上還沒進去 → 每 PORTAL_POKE 秒補送一次互動
+        self._nav.reset()
+        self._poke_t -= dt
+        want = ent.get("model")
+        if want is None or self._poke_t > 0:
+            self._say(f"站在入口上等被傳進去…"
+                      f"（還有 {max(left, 0):.0f} 秒）")
+            return
+        self._poke_t = PORTAL_POKE
+        props = scenery.nearby(self._sc, (gx, gy), PROP_TOL)
+        if props is None:
+            self._say("物件清單讀不到，等下一次補送…")
+            return
+        hit = [p for p in props if p.model == want]
+        if not hit:
+            # ⛔ 找不到就等，**絕不就近點一個**。
+            self._say(f"入口附近找不到外觀 {want} 的物件，繼續等"
+                      f"（還有 {max(left, 0):.0f} 秒）")
+            return
+        ok, msg = produce.click(self._mover, self._sc, hit[0])
+        self._say(f"撞入口傳送點（{'送出' if ok else msg}）…"
+                  f"還有 {max(left, 0):.0f} 秒")
 
     def _check_jump(self, me) -> bool:
         """這一拍人有沒有被「搬」過去（順移）。
@@ -697,6 +779,27 @@ class DungeonTab(BaseTab):
         here = scene.map_key(scene.current_id(self._sc, allow_scan=False))
         if here is None or self._map_key is None or here == self._map_key:
             return False
+        if self._phase == "enter":
+            # ★ 還在外面撞入口：換到腳本那張圖就是進來了。
+            if here != self._script.scene:
+                self._stop(f"⛔ 從入口進到的是「{scene.scene_name(here)}」"
+                           f"（{here}），不是腳本的"
+                           f"「{scene.scene_name(self._script.scene)}」—— 停下來")
+                return True
+            grid = self._maps.get(self._sc)
+            ok, why = dungeon.check_map(self._script, grid,
+                                        scene.current_id(self._sc),
+                                        scene.map_key)
+            if not ok:
+                self._stop(f"⛔ 進來了，但{why}")
+                return True
+            self._map_key = here
+            self._phase = "run"
+            self._drop_target()
+            self._nav.reset()
+            self._grid_t = 0.0            # 換圖了 → 地形與可達區重算
+            self._notify(f"進副本了（{scene.scene_name(here)}）→ 開始跑腳本")
+            return True
         step = (self._script.steps[self._i]
                 if self._i < len(self._script.steps) else {})
         if step.get("do") != dungeon.PORTAL:

@@ -424,6 +424,16 @@ class DungeonMakeTab(BaseTab):
             "按完之後你自己走進去，出口在哪會自動記進這一步。")
         b.clicked.connect(self._add_portal_prop)
         th.addWidget(b)
+        # ★ 使用者 2026-09-02：「新增一個『加入進入副本傳送點』，一樣寫在
+        #   同一個 json，他會紀錄那個入口傳送點目前在哪個地圖哪個地方」
+        b = QPushButton("這是進副本的入口")
+        b.setToolTip(
+            "把選到的物件記成**進副本的入口傳送點**（整份腳本一個，不是步驟）。\n"
+            "會連「入口在哪一張圖」一起記起來。\n"
+            "自動刷副本開跑時：人在副本裡就直接跑腳本；\n"
+            "人在入口那張圖就先走去撞它，撞不進去每 5 秒補送一次。")
+        b.clicked.connect(self._set_entrance)
+        th.addWidget(b)
         # ★ 場景標記點（TAG01/TAG02…）畫面上根本看不見，但照樣有互動 id，
         #   一站就掃到 45 個把真正的機關淹掉 —— 預設收起來。
         self.hide_tag = QCheckBox("藏起看不見的標記點")
@@ -719,7 +729,8 @@ class DungeonMakeTab(BaseTab):
         self.stamp_lbl.setText(
             ("⚠ " if bad else "")
             + f"這份腳本：{scene.scene_name(s.scene)}（{s.scene}）{size}{tail}"
-            + (f"　—— 但這台分身現在在「{scene.scene_name(here)}」" if bad else ""))
+            + (f"　—— 但這台分身現在在「{scene.scene_name(here)}」" if bad else "")
+            + f"\n{dungeon.describe_entrance(s.entrance)}")
 
     def _save(self) -> None:
         if self._path is None:
@@ -908,6 +919,35 @@ class DungeonMakeTab(BaseTab):
         self._pw_timer.start(PORTAL_WATCH_MS)
         self._say_map(f"記成傳送點：{mapobj.label(pr.model)} —— "
                       "走進去吧，我盯著看它把你送到哪。")
+
+    def _set_entrance(self) -> None:
+        """把選到的物件記成「進副本的入口傳送點」（整份腳本共用一個）。
+
+        ⚠ 這不是步驟，所以**不受**「同一份腳本只能記同一張圖」那道閘限制：
+          入口本來就在副本**外面**那張圖上。記的是當下這台分身站的那張圖。
+        """
+        i = self.props.currentRow()
+        if not 0 <= i < len(self._props):
+            self.status.setText("先在清單裡選一個物件（那個入口傳送點）")
+            return
+        key, _grid = self._here_key()
+        if key is None:
+            self.status.setText("⚠ 讀不到目前場景，入口沒有記")
+            return
+        if self._script.scene is not None and key == self._script.scene:
+            QMessageBox.warning(
+                self, "入口傳送點",
+                f"你現在就站在腳本那張圖「{scene.scene_name(key)}」裡面。\n"
+                "入口是**外面**那張圖上的傳送點 —— 先出去再記一次。")
+            return
+        pr = self._props[i]
+        self._script.entrance = {"scene": key,
+                                 "to": [round(pr.x, 1), round(pr.y, 1)],
+                                 "model": pr.model}
+        self._refresh_stamp()
+        self.status.setText(
+            f"已記入口：{dungeon.describe_entrance(self._script.entrance)}"
+            "　—— 記得按儲存")
 
     def _portal_watch(self) -> None:
         """盯著「剛加的那個傳點」把人送到哪。看到順移才記，看不到就說看不到。"""

@@ -565,6 +565,46 @@ def main() -> int:
        tab._reach_n == 60, str(tab._reach_n))
     ck("　而且會講出來", "地形變了" in tab.status.text(), tab.status.text())
 
+    # ★★ 入口傳送點（使用者 2026-09-02：「在副本裡面會直接執行 json；
+    #   如果不在就會去撞副本傳點，撞了沒效就每 5 秒送一次直到成功」）
+    print("\n進副本（入口傳送點）")
+    ent = {"scene": 71, "to": [10, 20], "model": 60777}
+    ok, why = dungeon.validate_entrance(ent)
+    ck("入口格式合法", ok, why)
+    ck("沒設入口也合法（只在副本裡跑）",
+       dungeon.validate_entrance({})[0])
+    ck("★ 少了 scene → 擋下",
+       not dungeon.validate_entrance({"to": [1, 2]})[0])
+    ck("★ 少了 to → 擋下", not dungeon.validate_entrance({"scene": 71})[0])
+    ck("清單上看得出是入口", "入口" in dungeon.describe_entrance(ent))
+
+    poked = []
+    tab = make_tab([{"do": "clear"}], pos=(50.0, 50.0),
+                   props=[FakeProp(10.0, 20.0, 60777)])
+    dt.produce.click = lambda _mv, _sc, p: (poked.append(p.model), (True, "點了"))[1]
+    tab._script.scene = 76
+    tab._script.entrance = ent
+    tab._phase = "enter"
+    tab._go_entrance((50.0, 50.0), TICK)
+    ck("★ 還在外面 → 先走去入口", tab._nav.goal == (10, 20), str(tab._nav.goal))
+    ck("　還沒到就不亂送", poked == [], str(poked))
+    tab._go_entrance((10.0, 20.0), TICK)
+    ck("★ 站到入口上 → 立刻撞一次", poked == [60777], str(poked))
+    for _ in range(int((dt.PORTAL_POKE - 1.0) / TICK)):
+        tab._go_entrance((10.0, 20.0), TICK)
+    ck(f"　{dt.PORTAL_POKE:.0f} 秒沒到不重送", len(poked) == 1, str(poked))
+    for _ in range(int(1.5 / TICK)):
+        tab._go_entrance((10.0, 20.0), TICK)
+    ck(f"★ 過了 {dt.PORTAL_POKE:.0f} 秒才送第二次", len(poked) == 2, str(poked))
+    fired = []
+    tab._warn = lambda msg: fired.append(msg)
+    tab._enter_t = dt.PORTAL_TIMEOUT + 1
+    tab._go_entrance((10.0, 20.0), TICK)
+    ck(f"★★ 撞滿 {dt.PORTAL_TIMEOUT:.0f} 秒還進不去 → 停下來",
+       not tab.run_cb.isChecked(), tab.status.text())
+    ck("　而且跳通知", len(fired) == 1 and "進不去副本" in fired[0], str(fired))
+    dt.produce.click = lambda *a, **k: (True, "點了")
+
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])
     tab._script.steps[0] = {"do": "fly"}                  # 繞過 validate 硬塞

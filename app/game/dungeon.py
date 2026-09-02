@@ -201,10 +201,15 @@ class Script:
     map: dict = field(default_factory=dict)     # 地圖指紋
     steps: list[dict] = field(default_factory=list)
     saved_at: str = ""
+    # ★ 進副本的入口傳送點（使用者 2026-09-02）。整份腳本共用一個，不是步驟：
+    #   {"scene": 71, "to": [x, y], "model": 60xxx, "land": [x, y]}
+    #   scene ＝ **外面那張圖**的 map_key（站在那裡才撞得到入口）。
+    entrance: dict = field(default_factory=dict)
 
     # -- 讀寫 ---------------------------------------------------------
     def to_json(self) -> dict:
         return {"name": self.name, "scene": self.scene, "map": self.map,
+                "entrance": self.entrance,
                 "saved_at": self.saved_at, "steps": self.steps}
 
     def save(self, path: Path) -> None:
@@ -263,9 +268,14 @@ def load(path: Path) -> tuple[Script | None, str]:
         ok, why = validate(s)
         if not ok:
             return None, f"第 {i + 1} 步有問題：{why}"
+    ent = d.get("entrance") or {}
+    ok, why = validate_entrance(ent)
+    if not ok:
+        return None, f"入口傳送點有問題：{why}"
     sc = Script(name=str(d.get("name") or Path(path).stem),
                 scene=d.get("scene"),
                 map=d.get("map") or {},
+                entrance=ent,
                 steps=steps,
                 saved_at=str(d.get("saved_at") or ""))
     return sc, ""
@@ -317,6 +327,39 @@ def validate(step: dict) -> tuple[bool, str]:
         if mdl is not None and not isinstance(mdl, int):
             return False, "portal 的 model 要是外觀編號"
     return True, ""
+
+
+def validate_entrance(ent) -> tuple[bool, str]:
+    """入口傳送點的格式檢查。空的（沒設）也算合法 —— 就是「只在副本裡跑」。"""
+    if not ent:
+        return True, ""
+    if not isinstance(ent, dict):
+        return False, "不是物件"
+    if not isinstance(ent.get("scene"), int):
+        return False, "少了 scene（入口在**外面**那張圖的編號）"
+    xy = ent.get("to")
+    if not (isinstance(xy, list) and len(xy) == 2):
+        return False, "少了 to:[x,y]（入口傳送點的位置）"
+    for key in ("model",):
+        v = ent.get(key)
+        if v is not None and not isinstance(v, int):
+            return False, f"{key} 要是編號"
+    land = ent.get("land")
+    if land is not None and not (isinstance(land, list) and len(land) == 2):
+        return False, "land 要是 [x,y]"
+    return True, ""
+
+
+def describe_entrance(ent: dict) -> str:
+    """入口傳送點給人看的一行。"""
+    if not ent:
+        return "沒有記入口（只能在副本裡面開跑）"
+    from app.game import scene as _scene         # 迴圈匯入：用時才拉
+    x, y = ent.get("to", ["?", "?"])
+    m = ent.get("model")
+    who = f"　{mapobj.label(m)}" if isinstance(m, int) else ""
+    return (f"入口：{_scene.scene_name(ent.get('scene'))}"
+            f"（{ent.get('scene')}）({x}, {y}){who}")
 
 
 def describe(step: dict) -> str:
