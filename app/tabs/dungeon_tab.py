@@ -109,15 +109,25 @@ TICK_MS = 100
 SCAN_FAST, SCAN_SLOW = 0.25, 0.8
 # 走到腳本點位算「到了」的容忍半徑（格）。
 ARRIVE = 1.8
+# ⚠⚠ `navigate.ARRIVE` 是 3.0 —— **尋路器在 3 格以內就什麼都不做**。
+#   我們的門檻比它嚴（點位 1.8、傳點 2.5），中間那一段沒人負責，就會變成
+#   「說還有 2.2 格卻不動」（使用者 2026-09-02 實遇，手動走一步才過）。
+#   那一段改成直接送走路（`walk_exact`，不尋路）——就是 move.walk_near 檔頭
+#   寫的「站在 2.2 格卡 8.2 秒」同一個老坑。
+NAV_DEAD = navigate.ARRIVE
 # 對話那一步要先靠多近才點（格）。⚠ 太遠點下去人還沒到、對話就開了。
 TALK_NEAR = 3.0
 # 腳本裡的座標跟現場物件對得起來的最大誤差（格）。
 PROP_TOL = 3.0
 # 送完一個對話動作之後等多久再看下一頁。
 MENU_GAP = 0.8
-# 對話的全域連續這麼多輪都沒變 ＝ 這段對話走完了（那些值關掉還會留著，
-# 只能靠「不再變化」判結束，見 talkwnd.page 的說明）。
+# 按了確定之後連續這麼多輪都沒換頁 ＝ 這段對話走完了（那些全域關掉還會
+# 留著，只能靠「不再變化」判結束，見 talkwnd.page 的說明）。
 TALK_SETTLE = 2
+# 送了選項之後最多等這麼久還沒有下一頁 → 大聲停下。
+# ⛔ 這一段**不可以**用 TALK_SETTLE 那種「沒變就當結束」——伺服器回話本來
+#   就要時間，那樣會誤判成「對話結束但腳本還有選項沒送到」（使用者實遇）。
+TALK_WAIT = 10.0
 # 這麼久還沒走到就當這一步卡住（大聲停下來，不要無聲無息耗著）。
 STEP_TIMEOUT = 90.0
 # 收工前要「連續這麼久都掃不到怪」才算真的沒怪了。
@@ -414,6 +424,7 @@ class DungeonTab(BaseTab):
         self._full_req_t = 0.0       # 補救全掃的節流
         self._talk_sig = None        # 上一輪看到的對話簽章（換頁偵測）
         self._talk_same = 0          # 簽章連續幾輪沒變
+        self._talk_did = ""          # 這一頁做過什麼（"opt"／"close"）
         self._clicked = False        # 這一步的物件點過了嗎
         self._wait_left = 0.0
         self._last = None            # 最近一次掃描結果
@@ -793,14 +804,18 @@ class DungeonTab(BaseTab):
         mins = self._enter_t / 60.0
         tail = f"（已試 {mins:.1f} 分鐘）"
         if _d((gx, gy), me) > PORTAL_NEAR:
-            note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
-            if self._nav.stuck and self._nav.stuck_reason == "grid":
-                # ⛔ 這裡不用 `_blocked()`：那支等過寬限就會停，跟「無限嘗試」
-                #   衝突。改成重讀地形繼續試（人牆散開、門開了就走得到）。
-                self._grid_t = 0.0
-                self._say(f"去入口 ({gx}, {gy})：現在算不出路，重讀地形再試"
-                          f"{tail}")
-                return
+            if _d((gx, gy), me) <= NAV_DEAD:
+                note = self._close_in(gx, gy)
+            else:
+                note = self._nav.step(self._sc, self._mover, self._player,
+                                      gx, gy)
+                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                    # ⛔ 這裡不用 `_blocked()`：那支等過寬限就會停，跟「無限
+                    #   嘗試」衝突。改成重讀地形繼續試（人牆散開就走得到）。
+                    self._grid_t = 0.0
+                    self._say(f"去入口 ({gx}, {gy})：現在算不出路，重讀地形再試"
+                              f"{tail}")
+                    return
             self._say(f"去入口傳送點 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}{tail}")
             return
@@ -1107,10 +1122,14 @@ class DungeonTab(BaseTab):
                 self._nav.reset()
                 self._next()
                 return
-            note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
-            if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._blocked(dt, f"走不到 ({gx}, {gy})", (gx, gy))
-                return
+            if _d((gx, gy), me) <= NAV_DEAD:
+                note = self._close_in(gx, gy)
+            else:
+                note = self._nav.step(self._sc, self._mover, self._player,
+                                      gx, gy)
+                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                    self._blocked(dt, f"走不到 ({gx}, {gy})", (gx, gy))
+                    return
             self._say(f"第 {self._i + 1} 步　走到 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
             return
@@ -1142,10 +1161,14 @@ class DungeonTab(BaseTab):
                 self._nav.reset()
                 self._poke_portal(step, dt)
                 return
-            note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
-            if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._blocked(dt, f"走不到傳點 ({gx}, {gy})", (gx, gy))
-                return
+            if _d((gx, gy), me) <= NAV_DEAD:
+                note = self._close_in(gx, gy)
+            else:
+                note = self._nav.step(self._sc, self._mover, self._player,
+                                      gx, gy)
+                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                    self._blocked(dt, f"走不到傳點 ({gx}, {gy})", (gx, gy))
+                    return
             self._say(f"第 {self._i + 1} 步　走進傳點 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
             return
@@ -1239,6 +1262,7 @@ class DungeonTab(BaseTab):
             self._clicked = True
             self._menu_i = 0
             self._talk_sig, self._talk_same = None, 0
+            self._talk_did = ""
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
             self._menu_t = float(step.get("gap") or MENU_GAP)
@@ -1267,37 +1291,61 @@ class DungeonTab(BaseTab):
             supply.leave_npc(self._mover)
             self._next()
             return
-        # ⚠⚠ 這些全域**關掉對話還會留著**，所以只有「簽章變了＝新的一頁來了」
-        #   才採信；沒變就是還沒換頁（或對話已經結束）。
-        if pg.sig == self._talk_sig:
-            self._talk_same += 1
+        # ⚠⚠ 這些全域**關掉對話還會留著**，所以一切以「簽章變了＝換頁了」為準：
+        #   · 換頁了 → 上一個動作生效了（送出去的選項才算真的送到）
+        #   · 沒換頁 → 還在等伺服器回，**不可以**當成「對話結束」
+        #     （使用者 2026-09-02 回報的 bug 就是這樣誤判：明明有選項卻說
+        #      「對話結束但腳本還有一個選項沒送到」）
+        if pg.sig != self._talk_sig:
+            if self._talk_did == "opt":
+                self._menu_i += 1           # 有換頁 ＝ 剛剛那一項真的送到了
+            self._talk_sig, self._talk_same, self._talk_did = pg.sig, 0, ""
         else:
-            self._talk_sig, self._talk_same = pg.sig, 0
-        stale = self._talk_same >= TALK_SETTLE
-        if pg.has_options and not stale:
-            if self._menu_i >= len(menu):
-                # ⛔ 跳出選項但腳本沒說要選哪一項 —— **絕不亂選**。
-                self._stop(f"⛔ 第 {self._i + 1} 步：對話跳出 {len(pg.options)} 個"
-                           f"選項，但腳本沒有記要選第幾項 —— 停下來")
+            self._talk_same += 1
+        if not self._talk_did:
+            # 這一頁還沒動過 → 決定要做什麼
+            if pg.has_options:
+                if self._menu_i >= len(menu):
+                    # ⛔ 跳出選項但腳本沒說要選哪一項 —— **絕不亂選**。
+                    self._stop(f"⛔ 第 {self._i + 1} 步：對話跳出 "
+                               f"{len(pg.options)} 個選項，"
+                               f"但腳本沒有記要選第幾項 —— 停下來")
+                    return
+                n = menu[self._menu_i]
+                if n not in pg.options:
+                    self._stop(f"⛔ 第 {self._i + 1} 步：腳本要選第 {n} 項，"
+                               f"但這一頁只有 {list(pg.options)} —— 停下來")
+                    return
+                if not sell.talk(self._mover, supply.talk_option(n)):
+                    self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
+                    return
+                self._talk_did = "opt"
+                self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
+                          f"（{self._menu_i + 1}/{len(menu)}）")
                 return
-            n = menu[self._menu_i]
-            if n not in pg.options:
-                self._stop(f"⛔ 第 {self._i + 1} 步：腳本要選第 {n} 項，"
-                           f"但這一頁只有 {list(pg.options)} —— 停下來")
+            if self._talk_same < TALK_SETTLE:
+                # ★ 先確認這一頁是「穩定的沒有選項」才按確定 —— 剛點下去的
+                #   那幾拍讀到的可能還是上一次的殘留（那些全域不會被清掉）。
+                self._say(f"第 {self._i + 1} 步　等對話出現…")
                 return
-            if not sell.talk(self._mover, supply.talk_option(n)):
-                self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
-                return
-            self._menu_i += 1
-            self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
-                      f"（{self._menu_i}/{len(menu)}）")
-            return
-        if pg.is_talk and not stale:
             ok, why = talkwnd.close_page(self._mover, self._sc)
+            self._talk_did = "close"
             self._say(f"第 {self._i + 1} 步　沒有選項的那一頁 → 按確定"
                       f"（{'送出' if ok else why}）")
             return
-        # 簽章不再變化（或本來就沒東西）＝ 這段對話走完了
+        # 動過了但畫面沒換頁 —— 分兩種情況，⛔ 不可以都當成「對話結束」
+        if self._talk_did == "opt":
+            if self._talk_same * gap >= TALK_WAIT:
+                self._stop(f"⛔ 第 {self._i + 1} 步：送了第 "
+                           f"{menu[self._menu_i]} 項之後 {TALK_WAIT:.0f} 秒"
+                           f"都沒有下一頁 —— 停下來")
+                return
+            self._say(f"第 {self._i + 1} 步　等對話回應…")
+            return
+        if self._talk_same < TALK_SETTLE:
+            self._say(f"第 {self._i + 1} 步　等對話翻頁…")
+            return
+        # 按了確定又沒有下一頁 ＝ 這段對話走完了
         if self._menu_i < len(menu):
             self._stop(f"⛔ 第 {self._i + 1} 步：對話結束了，"
                        f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
@@ -1361,6 +1409,19 @@ class DungeonTab(BaseTab):
         """停留幾秒的提示（地形變了、可達區怪怪的…）。"""
         self._notice, self._notice_t = text, time.monotonic() + NOTICE_SECS
         self.status.setText(text)
+
+    def _close_in(self, gx: float, gy: float) -> str:
+        """最後那 3 格：尋路器已經當「到了」不動作 → 自己直接走過去。
+
+        ⚠ 正在走就別再送（重下指令會把上一段打斷）。
+        """
+        try:
+            if entity.is_walking(self._sc, self._player):
+                return "走最後一段…"
+            self._mover.walk_exact(self._sc, self._player, gx, gy)
+        except Exception:                                # noqa: BLE001
+            return "走最後一段（送不出去）"
+        return "直接走最後一段（尋路器 3 格內不動作）"
 
     def _blocked(self, dt: float, what: str, goal=None) -> None:
         """尋路說「現在沒有路」——**不要馬上停**，重讀地形等門開。

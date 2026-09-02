@@ -173,6 +173,7 @@ class FakeTalk:
         self.pages = list(pages)      # 每頁 = None(結束) 或 選項 tuple
         self.i = 0
         self.closes = 0
+        self.i_lock = False           # True ＝ 送了動作也不換頁（伺服器沒回）
 
     def page(self, _sc):
         # ⚠ 翻到底之後 i 就不再變 → 簽章固定 ＝ 真實世界「對話結束後那些
@@ -184,7 +185,8 @@ class FakeTalk:
 
     def close(self, _mv, _sc):
         self.closes += 1
-        self.i = min(self.i + 1, len(self.pages))
+        if not self.i_lock:
+            self.i = min(self.i + 1, len(self.pages))
         return True, "送出"
 
 
@@ -326,7 +328,7 @@ def main() -> int:
     tab._pos = [21.0, 20.0]
     run(tab, 0.2)
     ck("走近了 → 點下去", tab._clicked)
-    run(tab, dt.MENU_GAP * 8 + 0.6)
+    run(tab, dt.MENU_GAP * 20 + 1.0)
     from app.game import supply as _sup
     want = [_sup.talk_option(1), _sup.talk_option(2)]
     ck("選項照順序送出（第1項→第2項）", tab.sent == want,
@@ -405,7 +407,7 @@ def main() -> int:
     tab = make_tab([talk_step], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, fake)
-    run(tab, 4.0)
+    run(tab, 8.0)
     ck("★★ 沒有選項的頁自己按確定過掉", fake.closes >= 2, str(fake.closes))
     ck("★★ 有選項才照腳本送（腳本只記了第 1 項）",
        tab.sent == [_sup2.talk_option(1)], str(tab.sent))
@@ -419,7 +421,7 @@ def main() -> int:
     tab = make_tab([pure], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, fake)
-    run(tab, 4.0)
+    run(tab, 8.0)
     ck("★ 純對話：一路按確定到結束", fake.closes >= 2 and tab.sent == [],
        f"按{fake.closes} 送{tab.sent}")
     ck("　然後才離開互動", tab.left == [1] and tab._i == 1)
@@ -431,7 +433,7 @@ def main() -> int:
     tab = make_tab([oldstyle], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, fake)
-    run(tab, 3.0)
+    run(tab, 8.0)
     ck("★ 舊腳本的 0（過場）忽略掉，選項照送不重複",
        tab.sent == [_sup2.talk_option(1)], str(tab.sent))
 
@@ -462,7 +464,7 @@ def main() -> int:
     wire(tab, fake)
     fake.close = lambda _mv, _sc: (True, "送出")     # 按了也不翻頁＝對話沒了
     dt.talkwnd.close_page = fake.close
-    run(tab, 3.0)
+    run(tab, 8.0)
     ck("★ 對話走完了選項卻還沒送到 → 停下來",
        not tab.run_cb.isChecked(), tab.status.text())
 
@@ -754,6 +756,35 @@ def main() -> int:
 
     # ★★ 使用者 2026-09-02：「進入副本前不要自動打怪」＋「進入副本完全不
     #   打怪一直往點位走，請優先打怪再往點位走」
+    # ⚠⚠ 使用者 2026-09-02 當場回報的兩個 bug，各留一項照妖鏡：
+    #   ① 有選項的那一頁 `MESSAGE_IS_TALK` 也可能是 1（實機讀到 is_talk=True
+    #      而且 options=(1,2)）→ 判「有沒有選項」只准看 OPTIONn。
+    #   ② 送了選項之後畫面還沒換頁，⛔ 不可以當成「對話結束」。
+    print("\n對話的兩個誤判")
+    pg = dt.talkwnd.Page(is_talk=True, options=(1, 2), sig=(1,))
+    ck("★★ is_talk=1 但有選項 → 照樣算「有選項」（⛔ 不可以按確定過掉）",
+       pg.has_options and not pg.is_plain)
+    ck("　真的沒有選項才算純對話",
+       dt.talkwnd.Page(is_talk=False, options=(), sig=(2,)).is_plain)
+
+    slow_reply = FakeTalk([(1, 2), (1, 2), ()])   # 送了選項也不馬上換頁
+    slow_reply.i_lock = True
+    step2 = {"do": "interact", "at": [20, 20], "model": 60307,
+             "menu": [1, 2], "gap": 0.2}
+    tab = make_tab([step2], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    dt.talkwnd.page = slow_reply.page
+    dt.talkwnd.close_page = slow_reply.close
+    tab.sent = []
+    dt.sell.talk = lambda _mv, code: (tab.sent.append(code), True)[1]
+    run(tab, 2.0)                     # 兩秒都沒換頁
+    ck("★★ 送了選項但對話還沒回 → **不可以**當成「對話結束」而停掉",
+       tab.run_cb.isChecked(), tab.status.text())
+    ck("　而且不會重複送同一項", len(tab.sent) == 1, str(tab.sent))
+    run(tab, dt.TALK_WAIT + 1.0)
+    ck(f"★ 真的等超過 {dt.TALK_WAIT:.0f} 秒才大聲停下",
+       not tab.run_cb.isChecked(), tab.status.text())
+
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
     tab._keys, tab._atk = FakeKeys(), FakeAtk()

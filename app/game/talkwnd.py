@@ -140,21 +140,34 @@ def options(scanner) -> set[int] | None:
 class Page:
     """對話**最近一頁**的樣子。⚠ 是「最近一頁」不是「現在開著的那一頁」。"""
 
-    is_talk: bool                # 純對話（沒有選項）
+    is_talk: bool                # `MESSAGE_IS_TALK`（⚠ 不是「沒有選項」的意思）
     options: tuple               # 有哪些選項（1 起算）
     sig: tuple                   # 換頁偵測用的整包簽章
 
     @property
     def has_options(self) -> bool:
-        return bool(self.options) and not self.is_talk
+        """這一頁有選項嗎 ＝ **只看 `MESSAGE_OPTIONn`**。
+
+        ⚠⚠⚠ 2026-09-02 翻案：一開始以為 `MESSAGE_IS_TALK=1` 就代表「這一頁
+          沒有選項」（那時嵐狐剛好 IS_TALK=1、OPTION 全 0）。**錯的** ——
+          後來實機讀到嵐狐 `is_talk=True` 而且 `options=(1,2)` **同時成立**。
+          IS_TALK 是「這是 NPC 對話訊息」之類的類別旗標，不是選項旗標。
+          拿它當「純對話」判會把有選項的頁面按確定過掉，然後說「對話結束了
+          但腳本還有選項沒送到」（使用者當場回報的 bug）。
+        """
+        return bool(self.options)
+
+    @property
+    def is_plain(self) -> bool:
+        """「無異議對話」＝這一頁沒有任何選項。"""
+        return not self.options
 
 
 def page(scanner) -> Page | None:
     """讀對話最近一頁的樣子；讀不到整張 Lua 表回 None。
 
-    ★★ 2026-09-02 五台實測，兩種形狀分得很開：
-        純對話 → `MESSAGE_IS_TALK = 1`、`MESSAGE_OPTIONn` 全 0
-        有選項 → `MESSAGE_IS_TALK = 0`、`MESSAGE_OPTIONn` 非 0
+    ★★ 判「有沒有選項」**只看 `MESSAGE_OPTIONn`**（見 `has_options`）——
+      ⛔ 不要用 `MESSAGE_IS_TALK`，實機讀到過 IS_TALK=1 跟 OPTION 同時成立。
     ⚠⚠ 但這些值**對話關掉之後照樣留著**（嵐狐畫面上根本沒有對話框，
       `IS_TALK` 還是 1）——所以它描述的是「最近一頁」。要當「現在這一頁」
       用，呼叫端**必須先看到 `sig` 變了**（＝新的一頁來了）才採信，
