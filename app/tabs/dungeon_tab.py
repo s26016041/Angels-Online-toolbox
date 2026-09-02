@@ -124,6 +124,12 @@ MENU_GAP = 0.8
 # 按了確定之後連續這麼多輪都沒換頁 ＝ 這段對話走完了（那些全域關掉還會
 # 留著，只能靠「不再變化」判結束，見 talkwnd.page 的說明）。
 TALK_SETTLE = 2
+# ★★ 點下去之後這麼久都沒有任何對話反應 → **再點一次**（使用者 2026-09-02
+#   回報「最後一個石頭雕像點不到」）。點一次就不管是不對的：遊戲是「自己走
+#   過去才開對話」，路上被怪打斷、被人擋住、剛好在走都會讓那一下落空 ——
+#   跟補給點 NPC 那套「沒開就再點」同一個道理（見 supply 的 DIALOG_* 說明）。
+#   ⚠ 上限交給 STEP_TIMEOUT（90 秒）大聲停，不在這裡另外設。
+CLICK_RETRY = 6.0
 # 送了選項之後最多等這麼久還沒有下一頁 → 大聲停下。
 # ⛔ 這一段**不可以**用 TALK_SETTLE 那種「沒變就當結束」——伺服器回話本來
 #   就要時間，那樣會誤判成「對話結束但腳本還有選項沒送到」（使用者實遇）。
@@ -425,6 +431,8 @@ class DungeonTab(BaseTab):
         self._talk_sig = None        # 上一輪看到的對話簽章（換頁偵測）
         self._talk_same = 0          # 簽章連續幾輪沒變
         self._talk_did = ""          # 這一頁做過什麼（"opt"／"close"）
+        self._talk_base = None       # 點下去那一刻的簽章（判「有沒有點到」）
+        self._click_t = 0.0          # 點了多久還沒反應
         self._clicked = False        # 這一步的物件點過了嗎
         self._wait_left = 0.0
         self._last = None            # 最近一次掃描結果
@@ -556,6 +564,13 @@ class DungeonTab(BaseTab):
             self._atk.stop()
             self._atk.wait(500)
             self._atk = None
+        if self._mover is not None:
+            # ★ 停機也要把對話框收掉，不然人會帶著框走來走去。
+            try:
+                talkwnd.close_window(self._mover, self._sc)
+                supply.leave_npc(self._mover)
+            except Exception:                            # noqa: BLE001
+                pass
         if self._mover is not None and self._pid is not None:
             # ★ release() 不是 stop()：跳板是同一個 PID 共用的。
             try:
@@ -1255,13 +1270,18 @@ class DungeonTab(BaseTab):
                     f"格內找不到外觀 {want_model} 的物件"
                     f"（找到 {len(props)} 個別的）—— 停下來")
                 return
+            # ★ 基準要在**點下去之前**讀：點完對話可能立刻就開了，
+            #   那時再讀就跟第一頁一樣，永遠判不出「有沒有點到」。
+            pg0 = talkwnd.page(self._sc)
             ok, msg = produce.click(self._mover, self._sc, hit[0])
             if not ok:
                 self._say(f"點不下去（{msg}），重試中…")
                 return
             self._clicked = True
             self._menu_i = 0
-            self._talk_sig, self._talk_same = None, 0
+            # ⚠ 那些全域關著也會留舊值（見 talkwnd）→ 簽章一直沒變＝沒點到。
+            self._talk_sig = self._talk_base = (pg0.sig if pg0 else None)
+            self._talk_same, self._click_t = 0, 0.0
             self._talk_did = ""
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
@@ -1280,6 +1300,25 @@ class DungeonTab(BaseTab):
             return
         self._menu_t = gap
         pg = talkwnd.page(self._sc)
+        # ★ 點下去之後對話完全沒動靜 → 再點一次（不是點一次就不管）。
+        if pg is not None and pg.sig == self._talk_base:
+            self._click_t += gap
+            if self._click_t >= CLICK_RETRY:
+                self._click_t = 0.0
+                props = scenery.nearby(self._sc, (ax, ay), PROP_TOL) or []
+                hit = [p for p in props
+                       if want_model is None or p.model == want_model]
+                if hit:
+                    ok, msg = produce.click(self._mover, self._sc, hit[0])
+                    self._say(f"第 {self._i + 1} 步　點了沒反應 → 再點一次"
+                              f"（{'送出' if ok else msg}）")
+                else:
+                    self._say(f"第 {self._i + 1} 步　點了沒反應，"
+                              f"而且現在找不到外觀 {want_model} —— 等下一輪")
+                return
+            self._say(f"第 {self._i + 1} 步　等對話出現…"
+                      f"（{self._click_t:.0f}/{CLICK_RETRY:.0f} 秒）")
+            return
         if pg is None:
             # 讀不到 Lua 表 → 退化成「照腳本把選項送完就離開」（不自動翻頁）。
             if self._menu_i < len(menu):
@@ -1351,7 +1390,11 @@ class DungeonTab(BaseTab):
                        f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
                        f" —— 停下來（NPC 的對話跟腳本記的不一樣？）")
             return
-        # 送離開互動（不送的話伺服器會覺得我們還在講話，角色會被鎖住不能走）
+        # ★ 收尾：**先把對話框從畫面上收掉**再送離開互動。
+        #   使用者 2026-09-02：「現在都會帶著最後無異議對話離開到處跑，
+        #   要把對話框點掉避免 BUG」——`messageclose` 只通知伺服器，
+        #   畫面上那個框要叫 Lua 的 DestroyMessageWnd 才會收。
+        talkwnd.close_window(self._mover, self._sc)
         supply.leave_npc(self._mover)
         self._next()
 

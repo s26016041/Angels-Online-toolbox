@@ -185,6 +185,28 @@ def page(scanner) -> Page | None:
                      g.get(FACE_NAME), g.get(WND_NAME)))
 
 
+# ★ 關掉對話視窗本身的 Lua 函式（`reports/lua_allglobals_*.txt` 裡有這個全域）。
+#   ⚠ `messageclose` 那個封包只是**告訴伺服器**「我按了確定」，畫面上的框
+#     是客戶端 UI 自己收掉的 —— 只送封包會變成「帶著對話框到處跑」
+#     （使用者 2026-09-02 回報）。Lua 開關視窗是安全操作（[[lua-engine]]）。
+CLOSE_WND_FN = "DestroyMessageWnd"
+
+
+def close_window(mover, scanner) -> bool:
+    """把對話視窗**從畫面上收掉**。已經關著的話這支是空操作。
+
+    ⚠ Lua 呼叫**不可以叫太密**（[[lua-engine]]：太密會把訊息迴圈弄卡死），
+      所以只在「一段對話收尾」與「停機」時各叫一次。
+    """
+    if not (mover and mover.active):
+        return False
+    try:
+        ok, _val = lua.call(mover, scanner, CLOSE_WND_FN)
+        return bool(ok)
+    except Exception:                                      # noqa: BLE001
+        return False
+
+
 def close_page(mover, scanner) -> tuple[bool, str]:
     """把現在這一頁「無異議對話」按掉（送 `messageclose`）。
 

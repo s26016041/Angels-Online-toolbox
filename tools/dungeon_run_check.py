@@ -171,11 +171,20 @@ class FakeTalk:
 
     def __init__(self, pages):
         self.pages = list(pages)      # 每頁 = None(結束) 或 選項 tuple
-        self.i = 0
+        # ⚠ -1 ＝「還沒點，讀到的是上一次的殘留」——真實世界就是這樣
+        #   （那些 Lua 全域關掉對話還留著），執行端靠「簽章有沒有變」
+        #   判斷點到了沒。
+        self.i = -1
         self.closes = 0
         self.i_lock = False           # True ＝ 送了動作也不換頁（伺服器沒回）
 
+    def opened(self):
+        if self.i < 0:
+            self.i = 0
+
     def page(self, _sc):
+        if self.i < 0:
+            return dt.talkwnd.Page(is_talk=True, options=(), sig=("殘留",))
         # ⚠ 翻到底之後 i 就不再變 → 簽章固定 ＝ 真實世界「對話結束後那些
         #   全域凍在最後一頁」的行為，執行端就是靠這個判對話走完了。
         j = min(self.i, len(self.pages) - 1) if self.pages else 0
@@ -186,19 +195,26 @@ class FakeTalk:
     def close(self, _mv, _sc):
         self.closes += 1
         if not self.i_lock:
-            self.i = min(self.i + 1, len(self.pages))
+            self.i = min(max(self.i, 0) + 1, len(self.pages))
         return True, "送出"
 
 
 def wire(tab, fake):
     dt.talkwnd.page = fake.page
     dt.talkwnd.close_page = fake.close
+    dt.talkwnd.close_window = lambda *_a: True
     real = dt.sell.talk
 
     def talk(mv, code):
-        fake.i += 1
+        if not fake.i_lock:
+            fake.i = min(fake.i + 1, len(fake.pages))
         return real(mv, code)
     dt.sell.talk = talk
+
+    def click(*_a, **_k):            # 點下去 → 對話才開起來
+        fake.opened()
+        return True, "點了"
+    dt.produce.click = click
 
 
 def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
@@ -334,7 +350,8 @@ def main() -> int:
     ck("選項照順序送出（第1項→第2項）", tab.sent == want,
        f"送出 {tab.sent}，應該是 {want}")
     ck("送完 → 前進下一步", tab._i == 1)
-    ck("★ 送完會送「離開互動」（不送伺服器會以為還在講話）", tab.left == [1])
+    ck("★ 送完會送「離開互動」（不送伺服器會以為還在講話）",
+       len(tab.left) >= 1, str(tab.left))
 
     # ★ 每一步自己的選項間隔（使用者：太快說話會出現無異議對話）
     slow = {"do": "interact", "at": [20, 20], "model": 60307,
@@ -411,7 +428,7 @@ def main() -> int:
     ck("★★ 沒有選項的頁自己按確定過掉", fake.closes >= 2, str(fake.closes))
     ck("★★ 有選項才照腳本送（腳本只記了第 1 項）",
        tab.sent == [_sup2.talk_option(1)], str(tab.sent))
-    ck("　對話走完 → 送離開互動、前進", tab.left == [1] and tab._i == 1,
+    ck("　對話走完 → 送離開互動、前進", tab.left and tab._i == 1,
        f"{tab.left} 步{tab._i}")
 
     # 整段都沒有選項 → 一路按到底
@@ -424,7 +441,7 @@ def main() -> int:
     run(tab, 8.0)
     ck("★ 純對話：一路按確定到結束", fake.closes >= 2 and tab.sent == [],
        f"按{fake.closes} 送{tab.sent}")
-    ck("　然後才離開互動", tab.left == [1] and tab._i == 1)
+    ck("　然後才離開互動", tab.left and tab._i == 1, f"{tab.left} 步{tab._i}")
 
     # 舊腳本記了 0（過場）→ 忽略，不會多按
     fake = FakeTalk([(), (1, 2), ()])
@@ -768,15 +785,12 @@ def main() -> int:
        dt.talkwnd.Page(is_talk=False, options=(), sig=(2,)).is_plain)
 
     slow_reply = FakeTalk([(1, 2), (1, 2), ()])   # 送了選項也不馬上換頁
-    slow_reply.i_lock = True
     step2 = {"do": "interact", "at": [20, 20], "model": 60307,
              "menu": [1, 2], "gap": 0.2}
     tab = make_tab([step2], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
-    dt.talkwnd.page = slow_reply.page
-    dt.talkwnd.close_page = slow_reply.close
-    tab.sent = []
-    dt.sell.talk = lambda _mv, code: (tab.sent.append(code), True)[1]
+    wire(tab, slow_reply)
+    slow_reply.i_lock = True                     # 點得開，但之後都不換頁
     run(tab, 2.0)                     # 兩秒都沒換頁
     ck("★★ 送了選項但對話還沒回 → **不可以**當成「對話結束」而停掉",
        tab.run_cb.isChecked(), tab.status.text())
@@ -784,6 +798,34 @@ def main() -> int:
     run(tab, dt.TALK_WAIT + 1.0)
     ck(f"★ 真的等超過 {dt.TALK_WAIT:.0f} 秒才大聲停下",
        not tab.run_cb.isChecked(), tab.status.text())
+
+    # ★★ 使用者 2026-09-02：「最後一個石頭雕像他點不到」→ 點一次就不管是
+    #   不對的（遊戲是自己走過去才開對話，路上被打斷那一下就落空）。
+    never = FakeTalk([(1,)])
+    never.opened = lambda: None            # 怎麼點都開不起來
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, never)
+    clicks = []
+    dt.produce.click = lambda *_a, **_k: (clicks.append(1), (True, "點了"))[1]
+    run(tab, dt.CLICK_RETRY * 2 + 1.0)
+    ck(f"★★ 點了 {dt.CLICK_RETRY:.0f} 秒沒反應 → **再點一次**（不是點一次就不管）",
+       len(clicks) >= 2, str(len(clicks)))
+    ck("　而且還在跑（上限交給 STEP_TIMEOUT 大聲停）", tab.run_cb.isChecked())
+
+    # 收尾要把對話框從畫面上收掉（不然人會帶著框到處跑）
+    closed = []
+    dt.talkwnd.close_window = lambda *_a: (closed.append(1), True)[1]
+    fake = FakeTalk([(1,), ()])
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    dt.talkwnd.close_window = lambda *_a: (closed.append(1), True)[1]
+    run(tab, 8.0)
+    ck("★★ 對話收尾會把視窗關掉（⛔ 不要帶著對話框到處跑）",
+       bool(closed), str(closed))
 
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
