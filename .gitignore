@@ -44,3 +44,6 @@ Thumbs.db
 #   沒擋住的話一個 git add -A 就把它整包塞進 repo。說明見 GAMEDATA.md（那份要進版控）。
 SETTING/
 GAMEDATA/
+
+# 使用者自己複製到根目錄的副本腳本（正式那份在 assets/副本/）
+/副本/
