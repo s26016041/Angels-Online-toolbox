@@ -100,8 +100,8 @@ from app.game import (dungeon, entity, itemname, jumpmap, locate, move,
                       navigate, produce, quickbar, scene, scenery, sell,
                       skills, supply, talkwnd, terrain)
 from app.tabs.base_tab import BaseTab
-from app.tabs.farm_tab import (DEFAULT_KEY, HANDOFF_RANGE, KeyWorker,
-                               MODE_PACKET, ScanWorker, SKILL_KEYS,
+from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
+                               KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
                                TargetWorker)
 
 TICK_MS = 100
@@ -411,6 +411,7 @@ class DungeonTab(BaseTab):
         self._step_t = 0.0           # 這一步跑多久了
         self._menu_i = 0             # 對話選項送到第幾個
         self._menu_t = 0.0
+        self._full_req_t = 0.0       # 補救全掃的節流
         self._talk_sig = None        # 上一輪看到的對話簽章（換頁偵測）
         self._talk_same = 0          # 簽章連續幾輪沒變
         self._clicked = False        # 這一步的物件點過了嗎
@@ -724,8 +725,13 @@ class DungeonTab(BaseTab):
         # ① 先處理怪 —— 使用者定的規矩：路上有怪先殺光再去點位
         #    ⚠ 這裡回 True 就整拍不跑腳本 ＝「在殺怪就不跑點位」；
         #      回 False 代表**打得到的怪一隻都不剩**，才輪到腳本。
-        if self._fight(me, dt):
+        #    ⛔ **只在副本裡面打**（使用者 2026-09-02：「進入副本前不要
+        #      自動打怪」）——去副本路上遇到什麼都不理，直接趕路。
+        if self._phase == "run" and self._fight(me, dt):
             return
+        if self._phase != "run" and self._keys is not None:
+            self._keys.set_on(False)      # 趕路途中確保不會出手
+            self._keys.eid = None
 
         # ② 沒怪了 → 還在別張圖就先飛過去，在入口那張圖就去撞入口
         if self._phase == "fly":
@@ -852,6 +858,7 @@ class DungeonTab(BaseTab):
             self._grid_t = 0.0
             if here == self._script.scene:
                 self._phase = "run"
+                self._scan.force_full(self._pid)
                 self._notify(f"飛到副本裡了（{scene.scene_name(here)}）→ 跑腳本")
             elif here == ent.get("scene"):
                 self._phase = "enter"
@@ -879,6 +886,10 @@ class DungeonTab(BaseTab):
                 return True
             self._map_key = here
             self._phase = "run"
+            # ⚠⚠ 換圖之後怪是**重新配置**的，掃描的「熱區」還是舊圖那一塊 →
+            #   不強制全掃的話最久要等 FULL_EVERY(30 秒) 才看得到怪，
+            #   症狀就是「進副本完全不打怪一直往點位走」（使用者 2026-09-02）。
+            self._scan.force_full(self._pid)
             self._drop_target()
             self._nav.reset()
             self._grid_t = 0.0            # 換圖了 → 地形與可達區重算
@@ -901,6 +912,7 @@ class DungeonTab(BaseTab):
             return True
         # 到了新的圖：座標系換了，正在走的路線與正在打的怪全部作廢。
         self._map_key = here
+        self._scan.force_full(self._pid)      # 新圖的怪是新配置的，熱區要重建
         self._drop_target()
         self._nav.reset()
         self._empty_since = 0.0
@@ -930,6 +942,12 @@ class DungeonTab(BaseTab):
                 # ⚠ 但要**講出來**是「真的沒怪」還是「有怪但都走不到」——
                 #   不講的話就會出現使用者說的「不理怪物直接走點位」而
                 #   完全查不出原因（CLAUDE.md：不准安靜地做決定）。
+                # ★ 一隻都挑不到 → 定期要求全掃當保險（熱區可能整塊漏掉，
+                #   跟掛機頁 FULL_HUNT_GAP 同一套）。
+                now = time.monotonic()
+                if now - self._full_req_t >= FULL_HUNT_GAP:
+                    self._full_req_t = now
+                    self._scan.force_full(self._pid)
                 skipped = len(self._live_monsters())
                 if skipped:
                     self._say(f"周圍 {skipped} 隻怪**全部走不到**"
@@ -1111,6 +1129,7 @@ class DungeonTab(BaseTab):
                         f"差 {_d(land, me):.0f} 格，停下來")
                     return
                 self._drop_target()
+                self._scan.force_full(self._pid)   # 順移到新的一區＝新的怪
                 self._say(f"第 {self._i + 1} 步　傳點過了，落在 "
                           f"({me[0]:.0f}, {me[1]:.0f})")
                 self._next()

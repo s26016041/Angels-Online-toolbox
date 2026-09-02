@@ -125,6 +125,25 @@ class FakeAtk:
         pass
 
 
+class FakeScan:
+    """假掃描執行緒：只記 force_full 被叫幾次（真的那條是 QThread）。"""
+
+    def __init__(self):
+        self.fulls = 0
+
+    def request(self, *_a):
+        pass
+
+    def force_full(self, _pid):
+        self.fulls += 1
+
+    def stop(self):
+        pass
+
+    def wait(self, _ms=0):
+        pass
+
+
 class FakeMaps:
     """假地形快取：記 drop() 被叫幾次（Cache 有 __slots__ 不能改方法）。"""
 
@@ -195,6 +214,10 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     tab._my_pos = lambda: tuple(tab._pos)
     tab._live_monsters = lambda: list(mons)
     tab._refresh_steps = lambda: None
+    # ⚠ 掃描是真的 QThread：測試裡換成假的（也順便收掉，不然一堆殘留執行緒）
+    tab._scan.stop()
+    tab._scan.wait(500)
+    tab._scan = FakeScan()
     tab.run_cb.blockSignals(True)
     tab.run_cb.setChecked(True)
     tab.run_cb.blockSignals(False)
@@ -728,6 +751,50 @@ def main() -> int:
        tab.run_cb.isChecked() and tab._grid_t == 0.0, tab.status.text())
     tab._nav.stuck = False
     dt.produce.click = lambda *a, **k: (True, "點了")
+
+    # ★★ 使用者 2026-09-02：「進入副本前不要自動打怪」＋「進入副本完全不
+    #   打怪一直往點位走，請優先打怪再往點位走」
+    print("\n打怪的時機")
+    tab = make_tab([{"do": "clear"}])
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._maps = FakeMaps()                      # 沒有地形圖 → 不篩選怪
+    tab._script.scene = 76
+    tab._script.entrance = {"scene": 71, "to": [10, 20], "model": 60777}
+    tab._phase = "enter"
+    # ⚠ _reset_run() 會把 _state/_player 清成 None，所以要在 make_tab 之後補
+    tab._state, tab._player = 0x1000, 0x2000
+    tab._live_monsters = lambda: [FakeMon(x=11.0, y=10.0, eid=1)]
+    dt.entity.read_pos = lambda _sc, _addr: (11.0, 10.0)
+    dt.scene.current_id = lambda _sc, allow_scan=True: 71
+    dt.scene.map_key = lambda v: v
+    dt.scene.scene_name = lambda v: f"圖{v}"
+    tab._map_key = 71
+    tab._tick()
+    ck("★★ 還在去副本的路上 → **不打怪**，直接趕路",
+       tab._atk.picked is None and tab._keys.on is False,
+       f"挑了{tab._atk.picked} on={tab._keys.on}")
+    tab._phase = "run"
+    tab._map_key = 71
+    tab._script.scene = 71
+    tab._tick()
+    ck("★ 進到副本裡（run）→ 才開始打怪", tab._atk.picked is not None,
+       tab.status.text())
+
+    # 換圖／傳點之後要強制全掃（不然熱區還是舊圖那塊，會整塊漏掉怪）
+    tab = make_tab([{"do": "clear"}])
+    tab._script.scene = 76
+    tab._script.entrance = {"scene": 71, "to": [10, 20]}
+    tab._phase = "enter"
+    tab._map_key = 71
+    tab._maps = FakeMaps()
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    dt.scene.current_id = lambda _sc, allow_scan=True: 76
+    dt.scene.map_key = lambda v: v
+    dt.dungeon.check_map = lambda *a, **k: (True, "")
+    tab._check_map_change()
+    ck("★★ 進副本的那一刻要求全掃（不然 30 秒內看不到新圖的怪）",
+       tab._scan.fulls == 1 and tab._phase == "run",
+       f"全掃{tab._scan.fulls} phase={tab._phase}")
 
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])
