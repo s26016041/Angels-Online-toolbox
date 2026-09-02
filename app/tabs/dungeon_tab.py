@@ -96,9 +96,9 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (dungeon, entity, itemname, jumpmap, locate, move,
-                      navigate, portal, produce, quickbar, scene, scenery,
-                      sell, skills, supply, talkwnd, terrain)
+from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
+                      move, navigate, portal, produce, quickbar, scene,
+                      scenery, sell, skills, supply, talkwnd, terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
                                KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
@@ -226,6 +226,21 @@ PORTAL_TIMEOUT = 180.0     # 這麼久還沒被搬走 → 結束並通知
 
 def _d(a, b) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _pick(items):
+    """從掃到的東西裡挑「腳本說的那一個」＝**離記的位置最近的那一個**。
+
+    ★★ 使用者 2026-09-02 定案：**不比外觀**。
+      機關被啟動過之後外觀編號會換（實測遺落之地 60335「靜態-廢棄機器人2」
+      → 60301「門開關火不給點」，同一格、同一個東西），比外觀就會變成
+      「找不到」而整趟停掉。場景物件不會移動，**位置**才是它的身分。
+      腳本裡的 `model` 只留著給人看（清單上顯示名字用）。
+    ⚠ 但**看不見的場景標記點（TAG，SP_ATTRIB_HIDE）要排掉** —— 那些是
+      伺服器用的位置標記，一站就掃到一堆，點它們沒有意義。
+    `scenery.nearby` / `portal.nearby` 給的已經是**由近到遠**，取第一個就好。
+    """
+    return [x for x in items if not mapobj.hidden(x.model)][:1]
 
 
 class DungeonTab(BaseTab):
@@ -458,6 +473,7 @@ class DungeonTab(BaseTab):
     def _reset_run(self) -> None:
         self._i = 0                  # 目前跑到第幾步
         self._step_t = 0.0           # 這一步跑多久了
+        self._slow_said = False      # 「這一步比較久」講過了沒
         self._menu_i = 0             # 對話選項送到第幾個
         self._menu_t = 0.0
         self._full_req_t = 0.0       # 補救全掃的節流
@@ -1161,17 +1177,18 @@ class DungeonTab(BaseTab):
             self._unreach_t = 0.0
         self._blocked_last = False
         self._step_t += dt
-        # ⚠ 傳點那一步有自己的（比較長的）上限：使用者要求站上去沒反應時
-        #   每 5 秒補送一次、撐滿 3 分鐘才放棄，90 秒會提早砍掉。
+        # ★★ 使用者 2026-09-02：「STEP_TIMEOUT 改成不通知了，就這樣吧，
+        #   讓他靜默」——逾時**不再停機、也不再跳通知**，只在狀態列講一次
+        #   「這一步比較久」然後繼續試。
+        #   ⚠ 換來的代價講明白：真的卡死不會自己停，出口是使用者取消勾選
+        #     （跟撞入口那條同一套：[[transient-failure-auto-retry]]）。
+        #   ⚠ 也順手解掉「走 500 格的長路被 90 秒判成卡住」那個誤殺
+        #     （遺落之地實測第 5 步要走 533 格）。
         cap = PORTAL_TIMEOUT if kind == dungeon.PORTAL else STEP_TIMEOUT
-        if self._step_t > cap:
-            self._stop(f"⛔ 第 {self._i + 1} 步「{dungeon.describe(step)}」"
-                       f"卡了 {cap:.0f} 秒還沒完成 —— 停下來")
-            if kind == dungeon.PORTAL:
-                self._warn(f"傳點過不去：第 {self._i + 1} 步"
-                           f"「{dungeon.describe(step)}」站上去 "
-                           f"{PORTAL_TIMEOUT:.0f} 秒都沒有被傳走，這一趟停了。")
-            return
+        if self._step_t > cap and not self._slow_said:
+            self._slow_said = True
+            self._notify(f"第 {self._i + 1} 步「{dungeon.describe(step)}」"
+                         f"已經超過 {cap:.0f} 秒 —— 繼續試（不會自己停）")
 
         if kind == dungeon.CLEAR:
             # 怪已經在 _fight 清掉了，走到這裡就代表沒怪。
@@ -1285,9 +1302,9 @@ class DungeonTab(BaseTab):
         trigs = portal.nearby(self._sc, at, PROP_TOL)
         if trigs is None:
             return "物件清單讀不到，等下一次"
-        hit = [t for t in trigs if want is None or t.model == want]
+        hit = _pick(trigs)
         if not hit:
-            return f"附近找不到{'外觀 %d 的' % want if want else ''}傳點物件"
+            return "附近找不到傳點物件"
         pf = move.pathfinder_this(self._sc)
         if not pf:
             return "讀不到自己的實體（載圖中？）"
@@ -1385,14 +1402,11 @@ class DungeonTab(BaseTab):
                 # ⚠ 讀不到 ≠ 沒有。等下一拍再試，不要當成「這裡沒東西」。
                 self._say("物件清單讀不到，重試中…")
                 return
-            hit = [p for p in props
-                   if want_model is None or p.model == want_model]
+            hit = _pick(props)
             if not hit:
-                # ⛔ 絕不「就近點一個」—— 點錯東西比不點危險。
                 self._stop(
                     f"⛔ {tag}：({ax}, {ay}) 附近 {PROP_TOL:.0f} "
-                    f"格內找不到外觀 {want_model} 的物件"
-                    f"（找到 {len(props)} 個別的）—— 停下來")
+                    f"格內找不到可互動的物件 —— 停下來")
                 return
             # ★ 基準要在**點下去之前**讀：點完對話可能立刻就開了，
             #   那時再讀就跟第一頁一樣，永遠判不出「有沒有點到」。
@@ -1440,11 +1454,10 @@ class DungeonTab(BaseTab):
             if self._click_t >= CLICK_RETRY:
                 self._click_t = 0.0
                 props = scenery.nearby(self._sc, (ax, ay), PROP_TOL) or []
-                hit = [p for p in props
-                       if want_model is None or p.model == want_model]
+                hit = _pick(props)
                 if not hit:
                     self._say(f"{tag}　點了沒反應，"
-                              f"而且現在找不到外觀 {want_model} —— 等下一輪")
+                              f"而且那一格現在掃不到東西 —— 等下一輪")
                     return
                 # ★ 先**調整站位往它靠上去**再點（站著硬點是沒用的）。
                 #   物件位置用**現場重讀的**那一個，不是腳本裡的舊座標。
@@ -1544,6 +1557,7 @@ class DungeonTab(BaseTab):
     def _next(self) -> None:
         self._i += 1
         self._step_t = 0.0
+        self._slow_said = False
         self._unreach_t = 0.0
         self._blocked_last = False
         self._menu_i = 0

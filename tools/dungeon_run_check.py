@@ -385,12 +385,19 @@ def main() -> int:
     run(tab, 4.0)
     ck("★ 過了 5 秒才送第一個", len(tab.sent) == 1, str(tab.sent))
 
+    # ★★ 使用者 2026-09-02 定案：**不比外觀** —— 機關被啟動過外觀會換
+    #   （實測 60335 廢棄機器人2 → 60301 門開關火，同一格同一個東西）。
     tab = make_tab([step], pos=(20.0, 20.0),
-                   props=[FakeProp(20.1, 20.2, 60999)])   # 外觀對不上
+                   props=[FakeProp(20.1, 20.2, 60999)])   # 外觀跟腳本不同
     run(tab, 0.3)
-    ck("★ 找不到對應外觀 → 大聲停下（⛔ 絕不就近點一個）",
-       not tab.run_cb.isChecked(), tab.status.text())
-    ck("　訊息有講外觀編號", "60307" in tab.status.text(), tab.status.text())
+    ck("★★ 外觀跟腳本記的不一樣 → 照樣點得到（只認位置）", tab._clicked,
+       tab.status.text())
+    # ⚠ 但看不見的場景標記點（TAG）要排掉 —— 點它們沒有意義
+    tab = make_tab([step], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60005)])   # TAG01（HIDE）
+    run(tab, 0.3)
+    ck("★ 只掃到看不見的標記點（TAG）→ 大聲停下，⛔ 不點它",
+       not tab.run_cb.isChecked() and not tab._clicked, tab.status.text())
 
     tab = make_tab([step], pos=(20.0, 20.0), props=[])
     dt.scenery.nearby = lambda *a, **k: None              # 讀不到
@@ -398,11 +405,17 @@ def main() -> int:
     ck("★ 物件清單讀不到 ≠ 沒有 → 繼續重試，不停機也不亂點",
        tab.run_cb.isChecked() and not tab._clicked, tab.status.text())
 
-    print("\n卡住保護")
+    # ★★ 使用者 2026-09-02：「STEP_TIMEOUT 改成不通知了，讓他靜默」
+    print("\n卡住：靜默繼續，不停機也不通知")
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
-    run(tab, dt.STEP_TIMEOUT + 1)
-    ck(f"★ 一步卡超過 {dt.STEP_TIMEOUT:.0f} 秒 → 停下來",
-       not tab.run_cb.isChecked(), tab.status.text())
+    fired0 = []
+    tab._warn = lambda msg: fired0.append(msg)
+    run(tab, dt.STEP_TIMEOUT + 2)
+    ck(f"★★ 一步超過 {dt.STEP_TIMEOUT:.0f} 秒 → **不停機**，繼續試",
+       tab.run_cb.isChecked(), tab.status.text())
+    ck("　也不跳通知", fired0 == [], str(fired0))
+    ck("　但狀態列講過一次「比較久」", "已經超過" in tab.status.text(),
+       tab.status.text())
 
     print("\n收工判定（使用者定：腳本跑完 ＋ 周圍沒怪）")
     # ⚠ 先在沒怪的情況下把腳本跑完（有怪的話「休息」根本不會開始數，
@@ -522,18 +535,22 @@ def main() -> int:
     tab._warn = lambda msg: fired.append(msg)
     tab._step_t = dt.PORTAL_TIMEOUT + 1
     run(tab, 0.2)
-    ck(f"★★ 撐滿 {dt.PORTAL_TIMEOUT:.0f} 秒還沒過 → 停下來",
-       not tab.run_cb.isChecked(), tab.status.text())
-    ck("　而且**跳通知警告使用者**", len(fired) == 1, str(fired))
-    ck("　通知講得出是傳點過不去", "傳點" in (fired[0] if fired else ""),
-       str(fired))
-    # 附近沒有對應的傳點物件 → 只回報，⛔ 不就近送一個
+    ck(f"★★ 傳點撐滿 {dt.PORTAL_TIMEOUT:.0f} 秒 → 一樣**不停機、不通知**",
+       tab.run_cb.isChecked() and fired == [],
+       f"勾著={tab.run_cb.isChecked()} 通知={fired}")
+    # 那一格附近掃不到傳點 → 只回報，⛔ 不亂送
     tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
                    pos=(50.0, 50.0))
-    tab.trigs = [FakeTrig(50.0, 50.0, 69999)]      # 外觀對不上
+    tab.trigs = [FakeTrig(56.0, 50.0, 69999)]      # 離記的位置 6 格（超出容忍）
     run(tab, 2.0)
-    ck("★ 外觀對不上 → ⛔ 不就近送一個", tab.portal_sent == [],
+    ck("★ 那一格附近掃不到傳點 → ⛔ 不亂送", tab.portal_sent == [],
        str(tab.portal_sent))
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(50.2, 50.1, 69999)]      # 同一格、外觀變了
+    run(tab, 0.3)
+    ck("★★ 傳點外觀變了但位置對得上 → 照樣打得到（只認位置）",
+       tab.portal_sent == [69999], str(tab.portal_sent))
 
     # 出口對不對得上（腳本記了 land 就要驗）
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
@@ -720,7 +737,7 @@ def main() -> int:
     # ★★ 入口傳送點（使用者 2026-09-02：「在副本裡面會直接執行 json；
     #   如果不在就會去撞副本傳點，撞了沒效就每 5 秒送一次直到成功」）
     print("\n進副本（入口傳送點）")
-    ent = {"scene": 71, "to": [10, 20], "model": 60777}
+    ent = {"scene": 71, "to": [10, 20], "model": 60001}
     ok, why = dungeon.validate_entrance(ent)
     ck("入口格式合法", ok, why)
     ck("沒設入口也合法（只在副本裡跑）",
@@ -752,7 +769,7 @@ def main() -> int:
     ck("　還勾著（⛔ 不因為飛不過去就停）", tab.run_cb.isChecked())
 
     tab = make_tab([{"do": "clear"}], pos=(50.0, 50.0))
-    tab.trigs = [FakeTrig(10.0, 20.0, 60777)]
+    tab.trigs = [FakeTrig(10.0, 20.0, 60001)]
     poked = tab.portal_sent
     tab._script.scene = 76
     tab._script.entrance = ent
@@ -761,7 +778,7 @@ def main() -> int:
     ck("★ 還在外面 → 先走去入口", tab._nav.goal == (10, 20), str(tab._nav.goal))
     ck("　還沒到就不亂送", poked == [], str(poked))
     tab._go_entrance((10.0, 20.0), TICK)
-    ck("★ 站到入口上 → 立刻打第一發 0x0D", poked == [60777], str(poked))
+    ck("★ 站到入口上 → 立刻打第一發 0x0D", poked == [60001], str(poked))
     for _ in range(int((dt.PORTAL_POKE - 1.0) / TICK)):
         tab._go_entrance((10.0, 20.0), TICK)
     ck(f"　{dt.PORTAL_POKE:.0f} 秒沒到不重送", len(poked) == 1, str(poked))
@@ -776,7 +793,7 @@ def main() -> int:
     for _ in range(int((dt.PORTAL_POKE + 0.5) / TICK)):
         tab._go_entrance((10.0, 20.0), TICK)
     ck("★★ 撞不進去**無限重試**：15 分鐘後照樣在勾著、照樣打封包",
-       tab.run_cb.isChecked() and poked == [60777],
+       tab.run_cb.isChecked() and poked == [60001],
        f"勾著={tab.run_cb.isChecked()} 送={poked}")
     ck("★★ 而且**不通知**（這是暫時性失敗，出口是使用者自己取消勾選）",
        fired == [], str(fired))
@@ -948,7 +965,7 @@ def main() -> int:
     dt.entity.is_walking = lambda _sc, _p: False
 
     # ★★ 使用者 2026-09-02：「有一個副本門口進去還要選第一個選項才能進去」
-    ent2 = {"scene": 71, "to": [10, 20], "model": 60777, "menu": [1],
+    ent2 = {"scene": 71, "to": [10, 20], "model": 60001, "menu": [1],
             "stand": [11, 20], "gap": 0.2}
     ok, why = dungeon.validate_entrance(ent2)
     ck("★ 對話式入口格式合法", ok, why)
@@ -964,7 +981,7 @@ def main() -> int:
     # ★★ 使用者 2026-09-02 更正：「要去撞他自己會產生對話，所以點點看沒用」
     #   → 入口是**撞（0x0D）出對話**，再選第 N 項；⛔ 不是用點的。
     tab = make_tab([{"do": "clear"}], pos=(10.0, 20.0))
-    tab.trigs = [FakeTrig(10.0, 20.0, 60777)]
+    tab.trigs = [FakeTrig(10.0, 20.0, 60001)]
     tab._script.scene = 76
     tab._script.entrance = ent2
     tab._phase = "enter"
@@ -981,7 +998,7 @@ def main() -> int:
             break
         tab._go_entrance(tab._my_pos(), TICK)
     from app.game import supply as _sup3
-    ck("★★ 撞入口（打 0x0D）", tab.portal_sent == [60777], str(tab.portal_sent))
+    ck("★★ 撞入口（打 0x0D）", tab.portal_sent == [60001], str(tab.portal_sent))
     ck("★★ 撞出對話之後才送第 1 項（⛔ 不是用點的）",
        tab.sent == [_sup3.talk_option(1)], str(tab.sent))
     ck("　還沒進去 → 不前進步驟、階段還是 enter",
@@ -992,7 +1009,7 @@ def main() -> int:
     #   —— 走到那裡時對話**已經開著**（撞過一次／上一輪留的），舊碼把那一頁
     #   當基準，之後永遠「沒變」就只剩打封包。⛔ 不可以只看「簽章變了」。
     tab = make_tab([{"do": "clear"}], pos=(10.0, 20.0))
-    tab.trigs = [FakeTrig(10.0, 20.0, 60777)]
+    tab.trigs = [FakeTrig(10.0, 20.0, 60001)]
     tab._script.scene = 76
     tab._script.entrance = ent2
     tab._phase = "enter"
@@ -1010,7 +1027,7 @@ def main() -> int:
     tab._keys, tab._atk = FakeKeys(), FakeAtk()
     tab._maps = FakeMaps()                      # 沒有地形圖 → 不篩選怪
     tab._script.scene = 76
-    tab._script.entrance = {"scene": 71, "to": [10, 20], "model": 60777}
+    tab._script.entrance = {"scene": 71, "to": [10, 20], "model": 60001}
     tab._phase = "enter"
     # ⚠ _reset_run() 會把 _state/_player 清成 None，所以要在 make_tab 之後補
     tab._state, tab._player = 0x1000, 0x2000
@@ -1060,7 +1077,7 @@ def main() -> int:
     from app.tabs.dungeon_make_tab import DungeonMakeTab
     mk = DungeonMakeTab()
     mk._script = dungeon.Script(name="t")
-    mk._script.entrance = {"scene": 71, "to": [10.0, 20.0], "model": 60777}
+    mk._script.entrance = {"scene": 71, "to": [10.0, 20.0], "model": 60001}
     mk._here_key = lambda: (71, None)
     mk._cur = lambda: (1, object())
     mk._me = lambda _sc: (10.5, 20.0)
