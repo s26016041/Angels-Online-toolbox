@@ -46,6 +46,13 @@ CMD_BODY = 0x60
 CALL_TIMEOUT = 1.0
 # 對話視窗的 Lua 全域名（參數就是它的值）。
 WND_NAME = "WND_MESSAGE"
+# ★★ 這一頁有哪些選項 ＝ Lua 全域 `MESSAGE_OPTIONn` 非 0（2026-09-02 實測：
+#   雪狐點瑪莫魯斯，對話一開 MESSAGE_OPTION1=5190、OPTION2=5191，3~6 是 0）。
+#   有了它就不必把「過場」一格一格記進腳本 —— 沒有選項就自己按確定翻頁，
+#   有選項才照腳本送（使用者 2026-09-02：「只要沒選項就幫我對話到結束
+#   或出現選項」）。
+OPT_NAME = "MESSAGE_OPTION%d"
+OPT_MAX = 10
 
 _cache: dict = {}
 
@@ -102,6 +109,26 @@ def locate(scanner) -> Spot | None:
 def _u32(scanner, addr: int) -> int | None:
     raw = scanner._read_bytes(addr, 4)
     return struct.unpack("<I", bytes(raw))[0] if raw else None
+
+
+def options(scanner) -> set[int] | None:
+    """這一頁有哪些選項（1 起算）。**讀不到整張 Lua 表回 None**，不是空集合。
+
+    ⚠ 「讀不到」跟「這一頁沒有選項」是兩件事：前者不可以拿去當「純對話」
+      而去按確定（那會把有選項的頁面亂按過去）。呼叫端要分開處理。
+
+    ⚠⚠⚠ **這個值會留著上一次的殘留，不可以單獨當「現在這一頁有選項」用**
+      （2026-09-02 實測：雪狐對話開著時 OPTION1/2 非 0 是對的，但同一刻
+      **沒有在對話**的北極狐是 {1,2}、黑狐是 {1,2,3,4,5}）——跟
+      [[lua-readonly-inspect]] 記的 `WND_xxx 非 0 ≠ 視窗開著` 完全同一個坑。
+      要當「這一頁的選項」用，必須先有「新的一頁來了」的邊沿訊號
+      （`MESSAGE_MSG_ID` 變了）再讀，否則就是拿舊資料做決定。
+    """
+    names = [OPT_NAME % i for i in range(1, OPT_MAX + 1)]
+    g = lua.globals_of(scanner, names)
+    if g is None:
+        return None
+    return {i for i in range(1, OPT_MAX + 1) if g.get(OPT_NAME % i)}
 
 
 def close_page(mover, scanner) -> tuple[bool, str]:
