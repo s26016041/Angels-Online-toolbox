@@ -92,9 +92,9 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (dungeon, entity, itemname, locate, move, navigate,
-                      produce, quickbar, scene, scenery, sell, skills, supply,
-                      terrain)
+from app.game import (dungeon, entity, itemname, jumpmap, locate, move,
+                      navigate, produce, quickbar, scene, scenery, sell,
+                      skills, supply, terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, HANDOFF_RANGE, KeyWorker,
                                MODE_PACKET, ScanWorker, SKILL_KEYS,
@@ -155,6 +155,11 @@ MIN_REGION = 20
 # ★★ 傳點站上去卻沒被搬走時的補救（使用者 2026-09-02 定案）：
 #   「偵測走過去然後要有突然位移或換圖，如果失敗就在傳送點每 5 秒送一次，
 #     如果 3 分鐘都這樣就結束跳通知警告使用者」
+# ★ 人在別的圖（天使學園之類）→ 先用**天使趴趴GO**飛到入口那張圖
+#   （使用者 2026-09-02 問：「我在天使學園開自動刷副本會用趴趴GO飛過去嗎」）。
+#   實測表裡 `地底廣場(LV70~80)副本進入點` 就是一個合法目的地。
+#   ⚠ 送出到人真的過去約 1 秒；這麼久還沒到就再送一次（跟撞入口一樣無限重試）。
+FLY_RESEND = 8.0
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
 PORTAL_POKE = 5.0          # 每幾秒對傳點物件送一次互動
 PORTAL_TIMEOUT = 180.0     # 這麼久還沒被搬走 → 結束並通知
@@ -418,8 +423,12 @@ class DungeonTab(BaseTab):
         self._blocked_last = False   # 上一拍是不是卡在「沒有路」
         self._notice = ""            # 要停留幾秒的提示
         self._poke_t = 0.0           # 還有多久對傳點補送一次互動
-        self._phase = "run"          # "enter"＝還在外面撞入口，"run"＝跑腳本
+        # "fly"＝趴趴GO去入口那張圖、"enter"＝撞入口、"run"＝跑腳本
+        self._phase = "run"
         self._enter_t = 0.0          # 撞入口撞多久了
+        self._fly = None             # 要飛去哪個傳送點（jumpmap.Entry）
+        self._fly_t = 0.0            # 還有多久重送一次趴趴GO
+        self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -452,6 +461,7 @@ class DungeonTab(BaseTab):
         #   如果在副本裡面會直接執行 json 開始跑；如果不在就會去撞副本傳點」）
         here = scene.map_key(scene.current_id(sc))
         ent = script.entrance or {}
+        fly = None
         if here is not None and script.scene is not None and here != script.scene:
             if not ent:
                 self._stop(f"⛔ 你不在「{scene.scene_name(script.scene)}」，"
@@ -459,12 +469,18 @@ class DungeonTab(BaseTab):
                            f"或在製作頁按「這是進副本的入口」記一次。")
                 return
             if here != ent.get("scene"):
-                self._stop(
-                    f"⛔ 你在「{scene.scene_name(here)}」（{here}）：既不是副本"
-                    f"「{scene.scene_name(script.scene)}」，也不是入口那張圖"
-                    f"「{scene.scene_name(ent.get('scene'))}」—— 先過去再開。")
-                return
-            phase = "enter"                # 在入口那張圖 → 先去撞傳點
+                # ★ 在別的圖（天使學園之類）→ 先用天使趴趴GO飛到入口那張圖。
+                ex, ey = (ent.get("to") or [None, None])[:2]
+                fly = jumpmap.nearest(ent["scene"], ex, ey)
+                if fly is None:
+                    self._stop(
+                        f"⛔ 你在「{scene.scene_name(here)}」（{here}），"
+                        f"而趴趴GO沒有到「{scene.scene_name(ent.get('scene'))}」"
+                        f"的傳送點 —— 自己走過去再開。")
+                    return
+                phase = "fly"
+            else:
+                phase = "enter"            # 在入口那張圖 → 先去撞傳點
         else:
             # ★ 已經在副本裡 → 照舊比對地圖指紋，對不上就大聲停用。
             grid = self._maps.get(sc)
@@ -483,6 +499,7 @@ class DungeonTab(BaseTab):
         self._pid, self._sc, self._script = int(pid), sc, script
         self._reset_run()
         self._phase = phase
+        self._fly = fly
         self._map_key = here
         self._refresh_steps()
         self._atk = TargetWorker(sc)
@@ -495,7 +512,11 @@ class DungeonTab(BaseTab):
         self._keys.mover = self._mover
         self._keys.vks = self._picked_keys()
         self._keys.start()
-        if phase == "enter":
+        if phase == "fly":
+            self.status.setText(
+                f"「{script.name}」：先用趴趴GO飛去「{fly.name}」，"
+                f"再去撞入口 —— {dungeon.describe_entrance(ent)}")
+        elif phase == "enter":
             self.status.setText(
                 f"「{script.name}」：先去撞入口傳送點 —— "
                 f"{dungeon.describe_entrance(ent)}")
@@ -697,7 +718,10 @@ class DungeonTab(BaseTab):
         if self._fight(me, dt):
             return
 
-        # ② 沒怪了 → 還在外面就先去撞入口，進去了才跑腳本
+        # ② 沒怪了 → 還在別張圖就先飛過去，在入口那張圖就去撞入口
+        if self._phase == "fly":
+            self._go_fly(dt)
+            return
         if self._phase == "enter":
             self._go_entrance(me, dt)
             return
@@ -707,6 +731,30 @@ class DungeonTab(BaseTab):
         self._run_step(me, dt)
 
     # -- 進副本 -------------------------------------------------------
+    def _go_fly(self, dt: float) -> None:
+        """人在別張圖：用天使趴趴GO飛到入口那張圖。
+
+        使用者 2026-09-02 問：「我在天使學園開自動刷副本，會用天使趴趴GO
+        飛過去最近地方嗎」—— 會（本來不會，這一支就是為此加的）。
+        ⚠ 挑的是**離腳本記的入口最近**的那個傳送點（`jumpmap.nearest`），
+          不是隨便第一個 —— 一張圖常有「入口」與「副本進入點」兩個落點。
+        ⚠ 跟撞入口同一條規矩：**無限重試、不通知**（送不出去多半是暫時性的，
+          剛戰鬥完／指令槽忙）。到了沒有是靠換圖偵測認的。
+        """
+        self._fly_total += dt
+        self._fly_t -= dt
+        if self._fly is None:                 # 理論上不會（開跑時就挑好了）
+            self._stop("⛔ 沒有可以飛的傳送點")
+            return
+        if self._fly_t > 0:
+            self._say(f"趴趴GO去「{self._fly.name}」…等落地"
+                      f"（已試 {self._fly_total / 60.0:.1f} 分鐘）")
+            return
+        self._fly_t = FLY_RESEND
+        ok, why = jumpmap.teleport(self._mover, self._sc, self._fly.jump_id)
+        self._say(f"趴趴GO去「{self._fly.name}」（{why}）"
+                  f"　已試 {self._fly_total / 60.0:.1f} 分鐘")
+
     def _go_entrance(self, me, dt: float) -> None:
         """還在外面：走去入口傳送點，撞進去。
 
@@ -786,6 +834,26 @@ class DungeonTab(BaseTab):
         here = scene.map_key(scene.current_id(self._sc, allow_scan=False))
         if here is None or self._map_key is None or here == self._map_key:
             return False
+        if self._phase == "fly":
+            # 飛到了：落在入口那張圖 → 去撞入口；直接落在副本裡 → 開跑。
+            ent = self._script.entrance or {}
+            self._map_key = here
+            self._drop_target()
+            self._nav.reset()
+            self._grid_t = 0.0
+            if here == self._script.scene:
+                self._phase = "run"
+                self._notify(f"飛到副本裡了（{scene.scene_name(here)}）→ 跑腳本")
+            elif here == ent.get("scene"):
+                self._phase = "enter"
+                self._enter_t = 0.0
+                self._poke_t = 0.0
+                self._notify(f"飛到「{scene.scene_name(here)}」→ 去撞入口")
+            else:
+                self._say(f"飛到了「{scene.scene_name(here)}」，"
+                          f"不是要去的那張圖 —— 再飛一次")
+                self._fly_t = 0.0            # 立刻重送
+            return True
         if self._phase == "enter":
             # ★ 還在外面撞入口：換到腳本那張圖就是進來了。
             if here != self._script.scene:

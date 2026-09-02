@@ -578,6 +578,27 @@ def main() -> int:
     ck("★ 少了 to → 擋下", not dungeon.validate_entrance({"scene": 71})[0])
     ck("清單上看得出是入口", "入口" in dungeon.describe_entrance(ent))
 
+    # ★ 人在別張圖（天使學園之類）→ 先用趴趴GO飛到入口那張圖
+    #   （使用者 2026-09-02：「我在天使學園開自動刷副本會用趴趴GO飛過去嗎」）
+    flown = []
+    tab = make_tab([{"do": "clear"}])
+    tab._script.scene = 76
+    tab._script.entrance = ent
+    tab._phase = "fly"
+    tab._fly = dt.jumpmap.Entry(jump_id=73, scene_id=71, x=244, y=20,
+                                name="地底廣場副本進入點")
+    dt.jumpmap.teleport = lambda _mv, _sc, jid: (flown.append(jid),
+                                                 (True, "送出"))[1]
+    tab._go_fly(TICK)
+    ck("★ 在別張圖 → 送趴趴GO", flown == [73], str(flown))
+    for _ in range(int((dt.FLY_RESEND - 1.0) / TICK)):
+        tab._go_fly(TICK)
+    ck(f"　{dt.FLY_RESEND:.0f} 秒內不重送", len(flown) == 1, str(flown))
+    for _ in range(int(1.5 / TICK)):
+        tab._go_fly(TICK)
+    ck("★ 沒到就再送一次（無限重試、不通知）", len(flown) == 2, str(flown))
+    ck("　還勾著（⛔ 不因為飛不過去就停）", tab.run_cb.isChecked())
+
     poked = []
     tab = make_tab([{"do": "clear"}], pos=(50.0, 50.0),
                    props=[FakeProp(10.0, 20.0, 60777)])
