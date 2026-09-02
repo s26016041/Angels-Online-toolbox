@@ -140,6 +140,13 @@ GRID_REFRESH = 2.0
 #   打不到就換一隻（有別隻的話），並**立刻重問一次地形**，不記時間。
 # 一直在打卻完全沒有進展這麼久 → 大聲停下（不無聲無息耗一整晚）。
 NO_PROGRESS = 180.0
+# ★★ 尋路說「沒有路」之後還要再等多久才放棄（秒）。⛔ 不可以馬上停：
+#   副本的門是**解謎才開**的（使用者 2026-09-02），這一秒沒有路不代表等一下
+#   沒有 —— 2026-09-02 實跑就是這樣停在第 4 步（按完火炬、門還沒開）。
+#   等的期間每一拍都重讀地形，門一開就走。
+UNREACH_GRACE = 25.0
+# 重要提示在狀態列上要停留幾秒（不然同一拍的走路訊息會馬上蓋掉）。
+NOTICE_SECS = 6.0
 # 算出來的「我這一區」小於這麼多格就當錨點抓錯了（碎片區）→ 這一輪不篩選。
 # ⚠ 跟 dungeon.rooms() 的 min_cells 同一個道理：實測這張圖有 9/4/2 格的
 #   零星角落，錨在那上面會把整張圖的怪都判成走不到。
@@ -396,6 +403,10 @@ class DungeonTab(BaseTab):
         self._pos_t = 0.0
         self._jumped = False         # 這一拍有沒有順移
         self._grid_t = 0.0           # 還有多久重讀地形圖
+        self._unreach_t = 0.0        # 「沒有路」連續多久了（等門開）
+        self._blocked_last = False   # 上一拍是不是卡在「沒有路」
+        self._notice = ""            # 要停留幾秒的提示
+        self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
         self._grid = None            # 上次讀到的地形圖（判斷怪站的是不是可走格）
@@ -550,14 +561,14 @@ class DungeonTab(BaseTab):
         if len(got) < MIN_REGION:
             # 算出來只有幾格 ＝ 錨點多半錯了（碎片區）。⚠ 這種時候**不過濾**，
             #   不要拿一個顯然不對的可達區把全部的怪都判掉（安全退化）。
-            self._say(f"⚠ 算出來的可走區只有 {len(got)} 格，看起來不對 "
-                      f"→ 這一輪不篩選怪物")
+            self._notify(f"⚠ 算出來的可走區只有 {len(got)} 格，看起來不對 "
+                         f"→ 這一輪不篩選怪物")
             self._reach, self._reach_n = None, 0
             return
         # 這一區的格數變了 ＝ 門開了／關了，講出來（使用者要看得到）
         if self._reach is not None and len(got) != self._reach_n:
-            self._say(f"地形變了：這一區從 {self._reach_n} 格變成 {len(got)} 格"
-                      f"（機關開門？）")
+            self._notify(f"地形變了：這一區從 {self._reach_n} 格變成 "
+                         f"{len(got)} 格（機關開門／關門？）")
         self._reach, self._reach_n = got, len(got)
 
     def _can_reach(self, pos) -> bool:
@@ -819,6 +830,10 @@ class DungeonTab(BaseTab):
     def _run_step(self, me, dt: float) -> None:
         step = self._script.steps[self._i]
         kind = step.get("do")
+        # 上一拍沒卡在「沒有路」→ 等門開的計時歸零（門開了就重新算）
+        if not self._blocked_last:
+            self._unreach_t = 0.0
+        self._blocked_last = False
         self._step_t += dt
         if self._step_t > STEP_TIMEOUT:
             self._stop(f"⛔ 第 {self._i + 1} 步「{dungeon.describe(step)}」"
@@ -860,8 +875,7 @@ class DungeonTab(BaseTab):
                 return
             note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._stop(f"⛔ 第 {self._i + 1} 步：地形圖說走不到 "
-                           f"({gx}, {gy}) —— 腳本的點位是不是在別的房間？")
+                self._blocked(dt, f"走不到 ({gx}, {gy})", (gx, gy))
                 return
             self._say(f"第 {self._i + 1} 步　走到 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
@@ -888,8 +902,7 @@ class DungeonTab(BaseTab):
             gx, gy = step["to"]
             note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._stop(f"⛔ 第 {self._i + 1} 步：地形圖說走不到傳點 "
-                           f"({gx}, {gy})")
+                self._blocked(dt, f"走不到傳點 ({gx}, {gy})", (gx, gy))
                 return
             self._say(f"第 {self._i + 1} 步　走進傳點 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
@@ -909,7 +922,7 @@ class DungeonTab(BaseTab):
         if _d((ax, ay), me) > TALK_NEAR:
             note = self._nav.step(self._sc, self._mover, self._player, ax, ay)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._stop(f"⛔ 第 {self._i + 1} 步：走不到對話點 ({ax}, {ay})")
+                self._blocked(dt, f"走不到對話點 ({ax}, {ay})", (ax, ay))
                 return
             self._say(f"第 {self._i + 1} 步　走去對話點 ({ax}, {ay})"
                       f"　剩 {_d((ax, ay), me):.1f} 格　{note}")
@@ -964,6 +977,8 @@ class DungeonTab(BaseTab):
     def _next(self) -> None:
         self._i += 1
         self._step_t = 0.0
+        self._unreach_t = 0.0
+        self._blocked_last = False
         self._menu_i = 0
         self._clicked = False
         self._wait_left = 0.0
@@ -999,7 +1014,56 @@ class DungeonTab(BaseTab):
                           f" / {len(self._script.steps)} 步")
 
     def _say(self, text: str) -> None:
+        # ★ 重要提示要**看得到**：同一拍裡 `_refresh_grid` 講的「地形變了」
+        #   會被緊接著的走路訊息蓋掉（2026-09-02 實跑時整趟一次都沒顯示到）。
+        #   所以 `_notify()` 的內容在 NOTICE_SECS 秒內一直掛在前面。
+        if self._notice and time.monotonic() < self._notice_t:
+            text = f"{self._notice}　｜　{text}"
+        else:
+            self._notice = ""
         self.status.setText(text)
+
+    def _notify(self, text: str) -> None:
+        """停留幾秒的提示（地形變了、可達區怪怪的…）。"""
+        self._notice, self._notice_t = text, time.monotonic() + NOTICE_SECS
+        self.status.setText(text)
+
+    def _blocked(self, dt: float, what: str, goal=None) -> None:
+        """尋路說「現在沒有路」——**不要馬上停**，重讀地形等門開。
+
+        ⛔ 副本的牆是解謎才打開的（使用者 2026-09-02：「地圖之間有可能會用
+          牆壁隔開，解謎之後會打開又會變成聯通」）。馬上停＝按完機關的那一拍
+          剛好還沒開門就整趟結束（2026-09-02 實跑真的踩到，停在第 4 步）。
+        """
+        self._unreach_t += dt
+        self._blocked_last = True
+        self._grid_t = 0.0                    # 下一拍就重讀地形（門可能剛開）
+        if self._unreach_t > UNREACH_GRACE:
+            self._stop(f"⛔ 第 {self._i + 1} 步：{what} —— 等了 "
+                       f"{UNREACH_GRACE:.0f} 秒地形圖還是說沒有路。"
+                       f"{self._why_unreachable(goal)}")
+            return
+        self._say(f"第 {self._i + 1} 步：{what} —— 現在沒有路，"
+                  f"重讀地形等門開…{self._unreach_t:.0f}/"
+                  f"{UNREACH_GRACE:.0f} 秒")
+
+    def _why_unreachable(self, goal) -> str:
+        """停下來時**把證據講出來**：那一格到底是牆，還是在別的區。
+
+        ⚠ 只在要停的那一拍算（多一次泛洪 6ms）—— 使用者看到「走不到」時
+          最想知道的就是「是門沒開，還是我腳本點錯地方」。
+        """
+        if goal is None or self._grid is None:
+            return "門沒開？點位在別的區？"
+        gx, gy = int(goal[0]), int(goal[1])
+        if not self._grid.walkable(gx, gy):
+            return (f"（({gx}, {gy}) 那一格在地形圖上**是牆** —— "
+                    f"腳本的點位放在不能站的地方？）")
+        comp = self._grid.reachable(gx, gy)
+        mine = self._reach_n if self._reach is not None else "?"
+        return (f"（那一格可以站，但屬於另一區：它那區 "
+                f"{len(comp) if comp else '?'} 格、我這區 {mine} 格 —— "
+                f"中間的門沒開，或是要先走傳點）")
 
     # ------------------------------------------------------------------
     def on_close(self) -> None:

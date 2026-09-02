@@ -196,13 +196,29 @@ def main() -> int:
     run(tab, 0.2)
     ck("走到了 → 前進下一步", tab._i == 1)
 
+    # ★★ 「現在沒有路」⛔ **不可以馬上停**（2026-09-02 實跑踩到）：副本的門
+    #   是解謎才開的，按完機關的那一拍門還沒開就整趟結束。要重讀地形等門開，
+    #   等超過 UNREACH_GRACE 才大聲停。
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     tab._nav.stuck, tab._nav.stuck_reason = True, "grid"
-    run(tab, 0.3)
-    ck("★ 地形圖說走不到 → 大聲停下（不無聲耗著）",
+    run(tab, 1.0)
+    ck("★★ 說走不到 → 先等門開，不馬上停",
+       tab.run_cb.isChecked() and "等門開" in tab.status.text(),
+       tab.status.text())
+    ck("　會一直重讀地形（門一開就走）", tab._grid_t == 0.0)
+    run(tab, dt.UNREACH_GRACE + 1)
+    ck(f"★ 等超過 {dt.UNREACH_GRACE:.0f} 秒還是沒有路 → 大聲停下",
        not tab.run_cb.isChecked(), tab.status.text())
     ck("　訊息講得出是哪一步", "第 1 步" in tab.status.text(),
        tab.status.text())
+    # 門開了（不再 stuck）→ 等待計時要歸零，不會被前面累積的秒數牽連
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._nav.stuck, tab._nav.stuck_reason = True, "grid"
+    run(tab, 5.0)
+    tab._nav.stuck = False
+    run(tab, 0.2)
+    ck("★ 門開了（尋路不再說沒路）→ 等待計時歸零", tab._unreach_t == 0.0,
+       str(tab._unreach_t))
 
     print("\n等待步驟")
     tab = make_tab([{"do": "wait", "secs": 1.0}, {"do": "clear"}])
