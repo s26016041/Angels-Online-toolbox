@@ -913,6 +913,36 @@ def main() -> int:
     ck("★ _walk_beside 才留距離", moved[1] == ("near", 7, 8, 1.2),
        str(moved))
 
+    # ★★ 使用者 2026-09-02：「設定的時候點得到、跑腳本卻不行、滑鼠點也可以」
+    #   —— 差別在製作頁點完沒有人再叫它走路。點 0x05 之後**遊戲會自己
+    #   走過去**才開對話，這期間插手（重點／重下走路）就會把那趟打斷。
+    walking = {"v": True}
+    dt.entity.is_walking = lambda _sc, _p: walking["v"]
+    clicks2 = []
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(20.5, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    never2 = FakeTalk([(1,)])
+    never2.opened = lambda: None
+    wire(tab, never2)
+    dt.produce.click = lambda *_a, **_k: (clicks2.append(1),
+                                          (True, "點了"))[1]
+    run(tab, 0.5)
+    ck("★★ 還在走路 → **先站穩再點**（走著點人沒到，對話開不起來）",
+       clicks2 == [], str(clicks2))
+    walking["v"] = False
+    run(tab, 0.3)
+    ck("　站穩了才點下去", len(clicks2) == 1, str(clicks2))
+    # 點完遊戲自己在走過去 → 只要還在靠近就不要插手重點
+    for k in range(6):
+        tab._pos = [20.5 + 3.0 - k * 0.6, 20.0]   # 一直更靠近
+        run(tab, 1.5)
+    ck("★★ 遊戲正在走過去（一直更靠近）→ **不插手重點**",
+       len(clicks2) == 1, str(clicks2))
+    run(tab, dt.CLICK_RETRY + 1.0)               # 停在原地不動了
+    ck("　真的停住不動才重點", len(clicks2) >= 2, str(clicks2))
+    dt.entity.is_walking = lambda _sc, _p: False
+
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
     tab._keys, tab._atk = FakeKeys(), FakeAtk()

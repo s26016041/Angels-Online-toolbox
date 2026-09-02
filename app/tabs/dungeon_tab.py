@@ -140,6 +140,13 @@ TALK_SETTLE = 2
 #   跟補給點 NPC 那套「沒開就再點」同一個道理（見 supply 的 DIALOG_* 說明）。
 #   ⚠ 上限交給 STEP_TIMEOUT（90 秒）大聲停，不在這裡另外設。
 CLICK_RETRY = 6.0
+# ⚠⚠ 但「點了沒反應」的計時**只在人站著沒動**時才累加：點下去（0x05）之後
+#   **遊戲會自己走過去**才開對話（製作頁的「點點看」能成功就是靠這個）。
+#   人正在往它靠近的期間如果我們去重點／重下走路指令，就會把遊戲那趟
+#   自動接近打斷 —— 使用者 2026-09-02 回報「設定時點得到、跑腳本點不到、
+#   滑鼠點也可以」的差別就在這裡：製作頁點完沒有別人再叫它走路。
+#   只要「離那個物件又更近了」就把計時歸零（＝正在進行中，別插手）。
+CLICK_PROGRESS = 0.5       # 離目標又近了這麼多格就算有進展
 # ★★ 重點之前先**往那個物件靠上去**，一次比一次近，最後直接穿過去
 #   （使用者 2026-09-02：「如果點了沒反應要調整位置往對話物件靠上去」）。
 #   ⚠ 這是補給點 NPC 驗過的招（見 memory self-supply-buy：「確認沒開就往
@@ -454,7 +461,8 @@ class DungeonTab(BaseTab):
         self._talk_same = 0          # 簽章連續幾輪沒變
         self._talk_did = ""          # 這一頁做過什麼（"opt"／"close"）
         self._talk_base = None       # 點下去那一刻的簽章（判「有沒有點到」）
-        self._click_t = 0.0          # 點了多久還沒反應
+        self._click_t = 0.0          # 點了多久還沒反應（只在沒更靠近時累加）
+        self._click_best = None      # 點下去之後離那個物件最近到過幾格
         self._nudge = 0              # 往物件靠上去第幾次了
         self._clicked = False        # 這一步的物件點過了嗎
         self._wait_left = 0.0
@@ -1299,6 +1307,11 @@ class DungeonTab(BaseTab):
         self._nav.reset()
 
         if not self._clicked:
+            # ★ 站穩了才點：走路中送互動包，人還沒到、對話開不起來
+            #   （補給那邊同一條規矩「先走到位才發互動包」）。
+            if self._busy_walking():
+                self._say(f"第 {self._i + 1} 步　還在走，站穩再點…")
+                return
             props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
             if props is None:
                 # ⚠ 讀不到 ≠ 沒有。等下一拍再試，不要當成「這裡沒東西」。
@@ -1325,6 +1338,7 @@ class DungeonTab(BaseTab):
             # ⚠ 那些全域關著也會留舊值（見 talkwnd）→ 簽章一直沒變＝沒點到。
             self._talk_sig = self._talk_base = (pg0.sig if pg0 else None)
             self._talk_same, self._click_t, self._nudge = 0, 0.0, 0
+            self._click_best = None
             self._talk_did = ""
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
@@ -1345,6 +1359,15 @@ class DungeonTab(BaseTab):
         pg = talkwnd.page(self._sc)
         # ★ 點下去之後對話完全沒動靜 → 再點一次（不是點一次就不管）。
         if pg is not None and pg.sig == self._talk_base:
+            # ⚠ 遊戲收到 0x05 會**自己走過去**才開對話 —— 還在靠近的期間
+            #   不可以插手（重點一次會把那趟打斷）。所以只有「沒有更靠近」
+            #   的時候才累加計時。
+            d_now = _d((ax, ay), me)
+            if self._click_best is None or d_now < self._click_best - CLICK_PROGRESS:
+                self._click_best, self._click_t = d_now, 0.0
+                self._say(f"第 {self._i + 1} 步　遊戲正在走過去…"
+                          f"剩 {d_now:.1f} 格")
+                return
             self._click_t += gap
             if self._click_t >= CLICK_RETRY:
                 self._click_t = 0.0
@@ -1358,6 +1381,7 @@ class DungeonTab(BaseTab):
                 # ★ 先**調整站位往它靠上去**再點（站著硬點是沒用的）。
                 #   物件位置用**現場重讀的**那一個，不是腳本裡的舊座標。
                 tx, ty = hit[0].x, hit[0].y
+                self._click_best = None      # 重新給遊戲一次自己走過去的機會
                 keep = NUDGE_KEEP[min(self._nudge, len(NUDGE_KEEP) - 1)]
                 self._nudge += 1
                 how = (self._walk_onto(tx, ty) if keep <= 0
