@@ -113,8 +113,11 @@ ARRIVE = 1.8
 TALK_NEAR = 3.0
 # 腳本裡的座標跟現場物件對得起來的最大誤差（格）。
 PROP_TOL = 3.0
-# 送完一個對話選項之後等多久再送下一個。
+# 送完一個對話動作之後等多久再看下一頁。
 MENU_GAP = 0.8
+# 對話的全域連續這麼多輪都沒變 ＝ 這段對話走完了（那些值關掉還會留著，
+# 只能靠「不再變化」判結束，見 talkwnd.page 的說明）。
+TALK_SETTLE = 2
 # 這麼久還沒走到就當這一步卡住（大聲停下來，不要無聲無息耗著）。
 STEP_TIMEOUT = 90.0
 # 收工前要「連續這麼久都掃不到怪」才算真的沒怪了。
@@ -408,6 +411,8 @@ class DungeonTab(BaseTab):
         self._step_t = 0.0           # 這一步跑多久了
         self._menu_i = 0             # 對話選項送到第幾個
         self._menu_t = 0.0
+        self._talk_sig = None        # 上一輪看到的對話簽章（換頁偵測）
+        self._talk_same = 0          # 簽章連續幾輪沒變
         self._clicked = False        # 這一步的物件點過了嗎
         self._wait_left = 0.0
         self._last = None            # 最近一次掃描結果
@@ -1214,48 +1219,70 @@ class DungeonTab(BaseTab):
                 return
             self._clicked = True
             self._menu_i = 0
+            self._talk_sig, self._talk_same = None, 0
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
             self._menu_t = float(step.get("gap") or MENU_GAP)
             self._say(f"第 {self._i + 1} 步　已點外觀 {hit[0].model}")
             return
 
-        menu = step.get("menu") or []
-        if self._menu_i < len(menu):
-            self._menu_t -= dt
-            if self._menu_t > 0:
-                return
-            n = menu[self._menu_i]
-            # ★ 0 ＝「無異議對話」那一頁按確定 —— **不是** talkaction。
-            #   反組譯實證（talkwnd.py）：那一頁送的是 0x128，跟送選項的
-            #   0x0B 完全是兩回事（使用者 2026-09-02：無異議→選項1→無異議）。
-            if n == 0:
-                ok, why = talkwnd.close_page(self._mover, self._sc)
-                if not ok:
-                    self._say(f"過場（沒有選項那一頁）送不出去（{why}），重試中…")
-                    return
-                what = "過場"
-            else:
-                if not sell.talk(self._mover, supply.talk_option(n)):
-                    self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
-                    return
-                what = f"第 {n} 項"
-            self._menu_i += 1
-            self._menu_t = float(step.get("gap") or MENU_GAP)
-            self._say(f"第 {self._i + 1} 步　已送{what}"
-                      f"（{self._menu_i}/{len(menu)}）")
-            return
-        # ★★ 收尾前**一定要等**（使用者 2026-09-02 回報「對話有點問題…純對話：
-        #   整段都沒有選項」）：`menu` 是空的時候，舊碼點完的**下一拍**就送
-        #   離開互動 —— 遊戲那邊人還在走過去、對話框都還沒開，等於把互動
-        #   直接取消掉，畫面上什麼都沒發生。有選項的那種也一樣：最後一項
-        #   送出去之後馬上離開，對方的回話同樣被切掉。
-        #   → 不管有沒有選項，都先把這一步自己的間隔等完再離開。
+        # ★★★ 走對話（使用者 2026-09-02 定案）：
+        #   「只要沒選項就幫我對話到結束或出現選項」
+        #   → 腳本裡**只記要選第幾項**，沒有選項的那些頁自己按確定過掉。
+        #   ⚠ 舊腳本裡記的 0（過場）直接忽略：現在是自動的，再送一次會多按。
+        menu = [n for n in (step.get("menu") or []) if n]
+        gap = float(step.get("gap") or MENU_GAP)
         self._menu_t -= dt
         if self._menu_t > 0:
-            what = "純對話（沒有選項）" if not menu else "選項送完"
-            self._say(f"第 {self._i + 1} 步　{what}，"
-                      f"等 {self._menu_t:.1f} 秒再離開對話")
+            return
+        self._menu_t = gap
+        pg = talkwnd.page(self._sc)
+        if pg is None:
+            # 讀不到 Lua 表 → 退化成「照腳本把選項送完就離開」（不自動翻頁）。
+            if self._menu_i < len(menu):
+                n = menu[self._menu_i]
+                if sell.talk(self._mover, supply.talk_option(n)):
+                    self._menu_i += 1
+                self._say(f"第 {self._i + 1} 步　讀不到對話狀態 → 照腳本送第 {n} 項")
+                return
+            supply.leave_npc(self._mover)
+            self._next()
+            return
+        # ⚠⚠ 這些全域**關掉對話還會留著**，所以只有「簽章變了＝新的一頁來了」
+        #   才採信；沒變就是還沒換頁（或對話已經結束）。
+        if pg.sig == self._talk_sig:
+            self._talk_same += 1
+        else:
+            self._talk_sig, self._talk_same = pg.sig, 0
+        stale = self._talk_same >= TALK_SETTLE
+        if pg.has_options and not stale:
+            if self._menu_i >= len(menu):
+                # ⛔ 跳出選項但腳本沒說要選哪一項 —— **絕不亂選**。
+                self._stop(f"⛔ 第 {self._i + 1} 步：對話跳出 {len(pg.options)} 個"
+                           f"選項，但腳本沒有記要選第幾項 —— 停下來")
+                return
+            n = menu[self._menu_i]
+            if n not in pg.options:
+                self._stop(f"⛔ 第 {self._i + 1} 步：腳本要選第 {n} 項，"
+                           f"但這一頁只有 {list(pg.options)} —— 停下來")
+                return
+            if not sell.talk(self._mover, supply.talk_option(n)):
+                self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
+                return
+            self._menu_i += 1
+            self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
+                      f"（{self._menu_i}/{len(menu)}）")
+            return
+        if pg.is_talk and not stale:
+            ok, why = talkwnd.close_page(self._mover, self._sc)
+            self._say(f"第 {self._i + 1} 步　沒有選項的那一頁 → 按確定"
+                      f"（{'送出' if ok else why}）")
+            return
+        # 簽章不再變化（或本來就沒東西）＝ 這段對話走完了
+        if self._menu_i < len(menu):
+            self._stop(f"⛔ 第 {self._i + 1} 步：對話結束了，"
+                       f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
+                       f" —— 停下來（NPC 的對話跟腳本記的不一樣？）")
             return
         # 送離開互動（不送的話伺服器會覺得我們還在講話，角色會被鎖住不能走）
         supply.leave_npc(self._mover)

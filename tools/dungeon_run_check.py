@@ -147,6 +147,39 @@ class FakeProp:
         return ((self.x - p[0]) ** 2 + (self.y - p[1]) ** 2) ** 0.5
 
 
+class FakeTalk:
+    """假對話：照一串頁面依序回，送了動作才翻到下一頁。"""
+
+    def __init__(self, pages):
+        self.pages = list(pages)      # 每頁 = None(結束) 或 選項 tuple
+        self.i = 0
+        self.closes = 0
+
+    def page(self, _sc):
+        # ⚠ 翻到底之後 i 就不再變 → 簽章固定 ＝ 真實世界「對話結束後那些
+        #   全域凍在最後一頁」的行為，執行端就是靠這個判對話走完了。
+        j = min(self.i, len(self.pages) - 1) if self.pages else 0
+        opts = tuple(self.pages[j] or ()) if self.pages else ()
+        return dt.talkwnd.Page(is_talk=not opts, options=opts,
+                               sig=(min(self.i, len(self.pages)), opts))
+
+    def close(self, _mv, _sc):
+        self.closes += 1
+        self.i = min(self.i + 1, len(self.pages))
+        return True, "送出"
+
+
+def wire(tab, fake):
+    dt.talkwnd.page = fake.page
+    dt.talkwnd.close_page = fake.close
+    real = dt.sell.talk
+
+    def talk(mv, code):
+        fake.i += 1
+        return real(mv, code)
+    dt.sell.talk = talk
+
+
 def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     """建一個分頁，內部狀態直接擺好，跳過「選分身／裝跳板」那一段。"""
     tab = dt.DungeonTab()
@@ -173,6 +206,9 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     dt.sell.talk = lambda _mv, code: (tab.sent.append(code), True)[1]
     tab.left = []
     dt.supply.leave_npc = lambda *a, **k: tab.left.append(1)
+    # ⚠ 對話那條路現在會問 talkwnd（讀 Lua）——測試一律換成假的，
+    #   預設「每一頁都有選項 1~3」，要別的行為的測試自己再 wire 一次。
+    wire(tab, FakeTalk([(1, 2, 3), (1, 2, 3), (), ()]))
     return tab
 
 
@@ -267,7 +303,7 @@ def main() -> int:
     tab._pos = [21.0, 20.0]
     run(tab, 0.2)
     ck("走近了 → 點下去", tab._clicked)
-    run(tab, dt.MENU_GAP * 3 + 0.6)
+    run(tab, dt.MENU_GAP * 8 + 0.6)
     from app.game import supply as _sup
     want = [_sup.talk_option(1), _sup.talk_option(2)]
     ck("選項照順序送出（第1項→第2項）", tab.sent == want,
@@ -336,64 +372,76 @@ def main() -> int:
     run(tab, 0.1)
     ck("★ 順移了 → 這一步完成", tab._i == 1)
 
-    # ★★ 無異議對話 → 選項1 → 無異議對話 → 結束（使用者 2026-09-02）
-    #   ⛔ 過場那一頁**不能**用 talkaction 代替：反組譯實證它送的是
-    #   messageclose(0x128)，跟送選項的 0x0B 是兩件事。
-    closes = []
-    mixed = {"do": "interact", "at": [20, 20], "model": 60307,
-             "menu": [0, 1, 0], "gap": 1.0}
-    tab = make_tab([mixed], pos=(20.0, 20.0),
-                   props=[FakeProp(20.1, 20.2, 60307)])
-    dt.talkwnd.close_page = lambda _mv, _sc: (closes.append(1), (True, "送出"))[1]
-    run(tab, 0.3)
-    ck("點下去了", tab._clicked)
-    run(tab, 1.0)
-    ck("★★ 第一格是過場 → 送 messageclose，**不是** talkaction",
-       closes == [1] and tab.sent == [], f"過場{closes} 選項{tab.sent}")
-    run(tab, 1.1)
+    # ★★★ 走對話（使用者 2026-09-02：「只要沒選項就幫我對話到結束或出現
+    #   選項」）：腳本只記選項，沒有選項的頁自己按確定過掉。
     from app.game import supply as _sup2
-    ck("★ 第二格才送第 1 項", tab.sent == [_sup2.talk_option(1)],
-       str(tab.sent))
-    run(tab, 1.1)
-    ck("★ 第三格又是過場", closes == [1, 1], str(closes))
-    run(tab, 1.2)
-    ck("　三格走完 → 送離開互動、前進下一步",
-       tab.left == [1] and tab._i == 1, f"{tab.left} 步{tab._i}")
-    ck("　清單上讀得出來", "過場" in dungeon.describe(mixed),
-       dungeon.describe(mixed))
-
-    # ★ 使用者 2026-09-02 追加：「可能會出現 選項→對話→對話→選項→對話→選項
-    #   這種連續的 NPC」——路徑就是一串，長度與順序都不限。
-    long = {"do": "interact", "at": [20, 20], "model": 60307,
-            "menu": [1, 0, 0, 2, 0, 1], "gap": 0.5}
-    ok, why = dungeon.validate(long)
-    ck("★★ 選項→對話→對話→選項→對話→選項 這種長路徑合法", ok, why)
-    closes.clear()
-    tab = make_tab([long], pos=(20.0, 20.0),
+    # 無異議 → 選項(1,2) → 無異議 → 結束；腳本只記 [1]
+    fake = FakeTalk([(), (1, 2), (), ()])
+    talk_step = {"do": "interact", "at": [20, 20], "model": 60307,
+                 "menu": [1], "gap": 0.2}
+    tab = make_tab([talk_step], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
-    run(tab, 0.3 + 0.6 * 6 + 1.0)
-    want = [_sup2.talk_option(1), _sup2.talk_option(2), _sup2.talk_option(1)]
-    ck("　三個選項照順序送對", tab.sent == want, str(tab.sent))
-    ck("　三次過場也照順序送", closes == [1, 1, 1], str(closes))
-    ck("　走完才離開互動", tab.left == [1] and tab._i == 1,
+    wire(tab, fake)
+    run(tab, 4.0)
+    ck("★★ 沒有選項的頁自己按確定過掉", fake.closes >= 2, str(fake.closes))
+    ck("★★ 有選項才照腳本送（腳本只記了第 1 項）",
+       tab.sent == [_sup2.talk_option(1)], str(tab.sent))
+    ck("　對話走完 → 送離開互動、前進", tab.left == [1] and tab._i == 1,
        f"{tab.left} 步{tab._i}")
 
-    # ★★ 純對話（使用者 2026-09-02：「純對話：整段都沒有選項」）
-    #   ⛔ 舊碼點完的**下一拍**就送離開互動 → 對話框都還沒開就被取消掉。
-    talk = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [],
-            "gap": 2.0}
-    tab = make_tab([talk], pos=(20.0, 20.0),
+    # 整段都沒有選項 → 一路按到底
+    fake = FakeTalk([(), (), ()])
+    pure = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [],
+            "gap": 0.2}
+    tab = make_tab([pure], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
-    run(tab, 0.3)
-    ck("純對話：點下去了", tab._clicked)
-    run(tab, 1.0)
-    ck("★★ 沒有選項也**不會馬上離開**（等對話真的出現）",
-       tab.left == [] and tab._i == 0, str(tab.left))
-    ck("　狀態列講得出在等什麼", "純對話" in tab.status.text(),
-       tab.status.text())
-    run(tab, 1.5)
-    ck("　等完才送離開互動並前進", tab.left == [1] and tab._i == 1,
-       f"{tab.left} 步{tab._i}")
+    wire(tab, fake)
+    run(tab, 4.0)
+    ck("★ 純對話：一路按確定到結束", fake.closes >= 2 and tab.sent == [],
+       f"按{fake.closes} 送{tab.sent}")
+    ck("　然後才離開互動", tab.left == [1] and tab._i == 1)
+
+    # 舊腳本記了 0（過場）→ 忽略，不會多按
+    fake = FakeTalk([(), (1, 2), ()])
+    oldstyle = {"do": "interact", "at": [20, 20], "model": 60307,
+                "menu": [0, 1, 0], "gap": 0.2}
+    tab = make_tab([oldstyle], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, 3.0)
+    ck("★ 舊腳本的 0（過場）忽略掉，選項照送不重複",
+       tab.sent == [_sup2.talk_option(1)], str(tab.sent))
+
+    # ⛔ 跳出選項但腳本沒記 → 絕不亂選
+    fake = FakeTalk([(1, 2, 3)])
+    tab = make_tab([pure], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, 2.0)
+    ck("★★ 跳出選項但腳本沒說要選哪一項 → 大聲停下（⛔ 絕不亂選）",
+       not tab.run_cb.isChecked() and tab.sent == [], tab.status.text())
+
+    # ⛔ 腳本要選的項目這一頁沒有 → 停下
+    fake = FakeTalk([(1, 2)])
+    want3 = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [3],
+             "gap": 0.2}
+    tab = make_tab([want3], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, 2.0)
+    ck("★ 腳本要第 3 項但這一頁只有 1、2 → 停下來",
+       not tab.run_cb.isChecked(), tab.status.text())
+
+    # 對話提早結束、選項還沒送完 → 停下
+    fake = FakeTalk([()])
+    tab = make_tab([talk_step], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    fake.close = lambda _mv, _sc: (True, "送出")     # 按了也不翻頁＝對話沒了
+    dt.talkwnd.close_page = fake.close
+    run(tab, 3.0)
+    ck("★ 對話走完了選項卻還沒送到 → 停下來",
+       not tab.run_cb.isChecked(), tab.status.text())
 
     # ★★ 傳點站上去沒被搬走 → 每 PORTAL_POKE 秒補送一次，撐 PORTAL_TIMEOUT
     #   （使用者 2026-09-02：「在傳送點每 5 秒送一次，3 分鐘就結束跳通知」）

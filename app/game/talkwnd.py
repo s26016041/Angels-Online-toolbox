@@ -53,6 +53,11 @@ WND_NAME = "WND_MESSAGE"
 #   或出現選項」）。
 OPT_NAME = "MESSAGE_OPTION%d"
 OPT_MAX = 10
+# 這一頁是不是「無異議對話」（沒有選項）。
+TALK_NAME = "MESSAGE_IS_TALK"
+# 這一則訊息的編號／頭像 —— 只拿來當「換頁了沒」的邊沿訊號。
+MSG_NAME = "MESSAGE_MSG_ID"
+FACE_NAME = "MESSAGE_FACE"
 
 _cache: dict = {}
 
@@ -129,6 +134,42 @@ def options(scanner) -> set[int] | None:
     if g is None:
         return None
     return {i for i in range(1, OPT_MAX + 1) if g.get(OPT_NAME % i)}
+
+
+@dataclass(frozen=True)
+class Page:
+    """對話**最近一頁**的樣子。⚠ 是「最近一頁」不是「現在開著的那一頁」。"""
+
+    is_talk: bool                # 純對話（沒有選項）
+    options: tuple               # 有哪些選項（1 起算）
+    sig: tuple                   # 換頁偵測用的整包簽章
+
+    @property
+    def has_options(self) -> bool:
+        return bool(self.options) and not self.is_talk
+
+
+def page(scanner) -> Page | None:
+    """讀對話最近一頁的樣子；讀不到整張 Lua 表回 None。
+
+    ★★ 2026-09-02 五台實測，兩種形狀分得很開：
+        純對話 → `MESSAGE_IS_TALK = 1`、`MESSAGE_OPTIONn` 全 0
+        有選項 → `MESSAGE_IS_TALK = 0`、`MESSAGE_OPTIONn` 非 0
+    ⚠⚠ 但這些值**對話關掉之後照樣留著**（嵐狐畫面上根本沒有對話框，
+      `IS_TALK` 還是 1）——所以它描述的是「最近一頁」。要當「現在這一頁」
+      用，呼叫端**必須先看到 `sig` 變了**（＝新的一頁來了）才採信，
+      跟 [[lua-readonly-inspect]]「WND_xxx 非 0 ≠ 開著」是同一條紀律。
+    """
+    names = ([OPT_NAME % i for i in range(1, OPT_MAX + 1)]
+             + [TALK_NAME, MSG_NAME, FACE_NAME, WND_NAME])
+    g = lua.globals_of(scanner, names)
+    if g is None:
+        return None
+    opts = tuple(i for i in range(1, OPT_MAX + 1) if g.get(OPT_NAME % i))
+    return Page(is_talk=bool(g.get(TALK_NAME)),
+                options=opts,
+                sig=(bool(g.get(TALK_NAME)), opts, g.get(MSG_NAME),
+                     g.get(FACE_NAME), g.get(WND_NAME)))
 
 
 def close_page(mover, scanner) -> tuple[bool, str]:
