@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -48,8 +49,9 @@ from PySide6.QtWidgets import (
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (dungeon, entity, locate, move, navigate, produce, scene,
-                      scenery, sell, supply, terrain)
+from app.game import (dungeon, entity, itemname, locate, move, navigate,
+                      produce, quickbar, scene, scenery, sell, skills, supply,
+                      terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, HANDOFF_RANGE, KeyWorker,
                                MODE_PACKET, ScanWorker, SKILL_KEYS,
@@ -73,6 +75,15 @@ STEP_TIMEOUT = 90.0
 CLEAR_SETTLE = 3.0
 # 打不到（走不過去）這麼久就放棄這一隻，換下一隻。
 GIVE_UP = 15.0
+# ★★ 順移判定（傳點那一步的完成訊號，使用者 2026-09-02 定案）：
+#   「人被傳走不會換地圖，有順移就算吧，有時候傳點之間也很短」
+#   —— 所以不能用「離傳點多遠」判，要用**一拍之間跳了多少**：
+#   跑步一拍（0.1 秒）最多動 0.6 格，跳這麼多格只可能是被搬過去的。
+JUMP_TILES = 3.0
+# 兩次取樣隔太久就分不出是走的還是傳的（畫面卡一下就會誤判）→ 這一拍不判。
+JUMP_MAX_GAP = 0.35
+# 傳到的位置跟腳本記的出口差這麼多格就當「傳到別的地方」，大聲停下。
+LAND_TOL = 8.0
 
 
 def _d(a, b) -> float:
@@ -93,6 +104,8 @@ class DungeonTab(BaseTab):
         self._script = None
         self._keys = None            # KeyWorker
         self._atk = None             # TargetWorker
+        self._qb_sc = None           # 技能鍵標名字用的 Reader（跟著分身換）
+        self._qb_ui = None
         self._scan = ScanWorker()
         self._scan.done.connect(self._on_scan)
         self._scan.start()
@@ -141,7 +154,7 @@ class DungeonTab(BaseTab):
             "勾要輪流放的技能鍵（可多選），照 F1→F12 順序施放。\n"
             "放什麼直接讀遊戲快捷欄：空格、物品自動略過。")
         km = QMenu(self.key_btn)
-        self._key_cbs: list[tuple[QCheckBox, int]] = []
+        self._key_cbs: list[tuple[QCheckBox, int, str]] = []
         for label, vk in SKILL_KEYS:
             cb = QCheckBox(label)
             cb.setChecked(vk == DEFAULT_KEY)
@@ -149,10 +162,15 @@ class DungeonTab(BaseTab):
             act = QWidgetAction(km)
             act.setDefaultWidget(cb)
             km.addAction(act)
-            self._key_cbs.append((cb, vk))
-        for cb, _vk in self._key_cbs:
+            self._key_cbs.append((cb, vk, label))
+        for cb, _vk, _lab in self._key_cbs:
             cb.toggled.connect(self._keys_changed)
+        # ★ 點開選單的當下把每個鍵標上「現在放什麼」：F1（電擊術Ⅳ）
+        #   —— 跟自動掛機那頁同一套（使用者 2026-09-02：「怎麼沒寫技能名稱，
+        #   不能只有 F1 F2 這樣」）。純讀快捷欄，開著跑也沒差。
+        km.aboutToShow.connect(self._label_keys)
         self.key_btn.setMenu(km)
+        self._sync_key_btn()
         a.addWidget(self.key_btn)
         a.addStretch(1)
         root.addWidget(g)
@@ -237,12 +255,61 @@ class DungeonTab(BaseTab):
                 "腳本資料夾是空的 —— 先去「副本腳本製作」做一份")
 
     def _keys_changed(self) -> None:
+        self._sync_key_btn()
         if self._keys is not None:
             self._keys.vks = self._picked_keys()
 
     def _picked_keys(self) -> list[int]:
-        vks = [vk for cb, vk in self._key_cbs if cb.isChecked()]
+        vks = [vk for cb, vk, _lab in self._key_cbs if cb.isChecked()]
         return vks or [DEFAULT_KEY]
+
+    def _sync_key_btn(self) -> None:
+        """按鈕字樣＝勾了哪些鍵；勾太多就縮寫，別把整條列撐爆。"""
+        labels = [lab for cb, _vk, lab in self._key_cbs if cb.isChecked()]
+        if not labels:
+            self.key_btn.setText("選技能鍵")
+        elif len(labels) <= 4:
+            self.key_btn.setText("、".join(labels))
+        else:
+            self.key_btn.setText(f"{labels[0]} 等 {len(labels)} 鍵")
+
+    def _label_keys(self) -> None:
+        """把選單上的 F1~F12 標成「F1（電擊術Ⅳ）」—— 跟掛機頁同一套。
+
+        技能格 → F1（電擊術Ⅳ）、物品格 → F5（物品：高效紅藥水）、
+        空格 → F7（空）。讀不到快捷欄（還沒進遊戲／改版位移）就維持素的
+        F1~F12，**不亂標**。純讀取。
+
+        ⚠ 只改字（setText），不重建清單 —— 重建會讓順序跳動（[[qt-ui-pitfalls]]）。
+        ⚠ 這一頁的分身是可以換的，所以 Reader 每次照「現在選的那台」開，
+          不像掛機頁綁死一顆（換了分身還用舊的＝標到別隻角色的技能）。
+        """
+        sc = self._scanners.get(self.who.currentData())
+        cells = None
+        if sc is not None:
+            if getattr(self, "_qb_sc", None) is not sc:
+                self._qb_sc, self._qb_ui = sc, quickbar.Reader(sc)
+            try:
+                cells = quickbar.read_page(sc, self._qb_ui.page())
+            except Exception:                            # noqa: BLE001
+                cells = None
+        for i, (cb, _vk, label) in enumerate(self._key_cbs):
+            text = label
+            if cells is not None and i < len(cells):
+                c = cells[i]
+                if c is None:
+                    text = f"{label}（空）"
+                elif c.is_skill:
+                    nm = skills.name_of(c.value) or f"技能{c.value}"
+                    # 位移／補血／buff 放進攻擊循環只會幫倒忙，標出來
+                    # （循環本來就會跳過它們）
+                    if not skills.is_attack(c.value):
+                        nm += "・非攻擊"
+                    text = f"{label}（{nm}）"
+                elif c.is_item:
+                    nm = itemname.of(c.value)
+                    text = f"{label}（物品：{nm}）" if nm else f"{label}（物品）"
+            cb.setText(text)
 
     # ------------------------------------------------------------------
     # 開始／停止
@@ -262,6 +329,10 @@ class DungeonTab(BaseTab):
         self._player = None
         self._empty_since = 0.0      # 連續多久掃不到怪
         self._done = False
+        self._map_key = None         # 現在**應該**在哪一張圖（走過傳點可能換）
+        self._pos_prev = None        # 上一拍的位置（順移偵測用）
+        self._pos_t = 0.0
+        self._jumped = False         # 這一拍有沒有順移
 
     def _on_run_toggled(self, on: bool) -> None:
         if not on:
@@ -299,6 +370,7 @@ class DungeonTab(BaseTab):
             return
         self._pid, self._sc, self._script = int(pid), sc, script
         self._reset_run()
+        self._map_key = scene.map_key(scene.current_id(sc))
         self._refresh_steps()
         self._atk = TargetWorker(sc)
         self._atk.died.connect(self._on_died)
@@ -382,6 +454,14 @@ class DungeonTab(BaseTab):
             self._say("讀不到自己的位置，這一拍不動")
             return
 
+        # ⓪ 人被搬走了嗎？順移要**每一拍**都採樣，不然錯過那一下就看不到了。
+        self._jumped = self._check_jump(me)
+        # 換圖了嗎？—— 座標是**跟著地圖**的，圖一換舊座標全部沒有意義。
+        #   只有 `portal` 那一步准許換圖（有些傳點確實會換圖）；其他時候換圖
+        #   ＝被傳走／死亡回城，繼續跑就是拿別張圖的座標亂走。
+        if self._check_map_change():
+            return
+
         # ① 先處理怪 —— 使用者定的規矩：路上有怪先殺光再去點位
         if self._fight(me, dt):
             return
@@ -391,6 +471,56 @@ class DungeonTab(BaseTab):
             self._finish(dt)
             return
         self._run_step(me, dt)
+
+    def _check_jump(self, me) -> bool:
+        """這一拍人有沒有被「搬」過去（順移）。
+
+        ★ 傳點的完成訊號就是它（使用者 2026-09-02：「人被傳走不會換地圖，
+          有順移就算吧，有時候傳點之間也很短」）—— 用距離門檻會漏掉短傳點，
+          用速度就分得出來：跑步一拍最多 0.6 格，順移一拍好幾十格。
+        ⚠ 兩次取樣隔太久（畫面卡住、剛開始跑）一律**不判**，只重設基準 ——
+          寧可漏一次（下一拍還會再看），不要誤判成傳送了就跳下一步。
+        """
+        now = time.monotonic()
+        prev, prev_t = self._pos_prev, self._pos_t
+        self._pos_prev, self._pos_t = me, now
+        if prev is None or now - prev_t > JUMP_MAX_GAP:
+            return False
+        return _d(prev, me) >= JUMP_TILES
+
+    def _check_map_change(self) -> bool:
+        """換圖了就處理掉。回 True＝這一拍不要再往下跑。
+
+        ⚠ `allow_scan=False`：這是 10 Hz 的心跳，全掃備援 0.3 秒會卡住畫面。
+          讀不到就當「不知道」跳過 —— 讀不到 ≠ 換圖了。
+        """
+        here = scene.map_key(scene.current_id(self._sc, allow_scan=False))
+        if here is None or self._map_key is None or here == self._map_key:
+            return False
+        step = (self._script.steps[self._i]
+                if self._i < len(self._script.steps) else {})
+        if step.get("do") != dungeon.PORTAL:
+            self._stop(
+                f"⛔ 地圖變了（{scene.scene_name(self._map_key)} → "
+                f"{scene.scene_name(here)}），但第 {self._i + 1} 步不是傳點 "
+                f"—— 被傳走還是死亡回城了？停下來，不拿舊座標亂走")
+            return True
+        want = step.get("scene")
+        if want is not None and want != here:
+            self._stop(
+                f"⛔ 第 {self._i + 1} 步的傳點應該到"
+                f"「{scene.scene_name(want)}」（{want}），"
+                f"實際到了「{scene.scene_name(here)}」（{here}）—— 停下來")
+            return True
+        # 到了新的圖：座標系換了，正在走的路線與正在打的怪全部作廢。
+        self._map_key = here
+        self._drop_target()
+        self._nav.reset()
+        self._empty_since = 0.0
+        self._say(f"第 {self._i + 1} 步　已經傳到"
+                  f"「{scene.scene_name(here)}」")
+        self._next()
+        return True
 
     # -- 打怪 ---------------------------------------------------------
     def _fight(self, me, dt: float) -> bool:
@@ -514,6 +644,34 @@ class DungeonTab(BaseTab):
                            f"({gx}, {gy}) —— 腳本的點位是不是在別的房間？")
                 return
             self._say(f"第 {self._i + 1} 步　走到 ({gx}, {gy})"
+                      f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
+            return
+
+        if kind == dungeon.PORTAL:
+            # ★ 完成條件**不是**「走到那一格」而是「人被搬走了」——踩上傳點
+            #   的下一瞬間人就被移走，那一格永遠不會「到達」。
+            #   換圖那種由 `_check_map_change` 接手；同一張圖裡的順移看這裡。
+            if self._jumped:
+                land = step.get("land")
+                if land and _d(land, me) > LAND_TOL:
+                    self._stop(
+                        f"⛔ 第 {self._i + 1} 步：傳點把人送到 "
+                        f"({me[0]:.0f}, {me[1]:.0f})，"
+                        f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— "
+                        f"差 {_d(land, me):.0f} 格，停下來")
+                    return
+                self._drop_target()
+                self._say(f"第 {self._i + 1} 步　傳點過了，落在 "
+                          f"({me[0]:.0f}, {me[1]:.0f})")
+                self._next()
+                return
+            gx, gy = step["to"]
+            note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
+            if self._nav.stuck and self._nav.stuck_reason == "grid":
+                self._stop(f"⛔ 第 {self._i + 1} 步：地形圖說走不到傳點 "
+                           f"({gx}, {gy})")
+                return
+            self._say(f"第 {self._i + 1} 步　走進傳點 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
             return
 

@@ -171,6 +171,71 @@ def main() -> int:
     ok, why = dungeon.check_map(s, None, None, None)
     ck("不比場景也不給圖 → 過（呼叫端自己決定）", ok, why)
 
+    # ── 傳點（使用者 2026-09-02：點位放在傳點上會不會永遠到不了）──
+    print("\n傳點步驟")
+    ok, why = dungeon.validate({"do": "portal", "to": [10, 20]})
+    ck("傳點沒記目的地也是合法的（進去一次才知道）", ok, why)
+    ok, why = dungeon.validate({"do": "portal", "to": [10, 20], "scene": 77})
+    ck("記了目的地也合法", ok, why)
+    ok, why = dungeon.validate({"do": "portal", "scene": 77})
+    ck("★ 少了 to → 擋下", not ok, why)
+    ok, why = dungeon.validate({"do": "portal", "to": [1, 2], "scene": "77"})
+    ck("★ 目的地不是編號 → 擋下", not ok, why)
+    ck("清單上看得出是傳點",
+       "傳點" in dungeon.describe({"do": "portal", "to": [1, 2],
+                                   "scene": 76}))
+    ck("★ 還沒記目的地時清單上要講出來",
+       "⚠" in dungeon.describe({"do": "portal", "to": [1, 2]}))
+
+    s2 = dungeon.Script(scene=76, steps=[
+        {"do": "walk", "to": [1, 1]},
+        {"do": "portal", "to": [2, 2], "scene": 77},
+        {"do": "walk", "to": [3, 3]},
+        {"do": "portal", "to": [4, 4], "scene": 78},
+    ])
+    ck("★ 起點是腳本的章", dungeon.map_at(s2, 0) == 76)
+    ck("★ 傳點之前還是舊圖", dungeon.map_at(s2, 1) == 76)
+    ck("★ 傳點之後換新圖", dungeon.map_at(s2, 2) == 77)
+    ck("★ 整份跑完在最後一張", dungeon.map_at(s2) == 78)
+    s3 = dungeon.Script(scene=76, steps=[{"do": "portal", "to": [2, 2]}])
+    ck("★ 傳點還沒記目的地 → 回「不知道」，不是硬猜一個",
+       dungeon.map_at(s3) is None)
+
+    # ── 腳本放在專案裡（使用者 2026-09-02 定案）────────────────
+    print("\n腳本資料夾")
+    root = Path(dungeon.__file__).resolve().parents[2]
+    ck("★ 資料夾在專案裡（assets/副本），不是使用者端",
+       dungeon.folder() == root / "assets" / dungeon.FOLDER_NAME,
+       str(dungeon.folder()))
+    ck("跑原始碼時存檔位置＝專案那份",
+       dungeon.save_folder() == dungeon.folder(), str(dungeon.save_folder()))
+    ck("舊的使用者資料夾還讀得到（不主動建）",
+       dungeon.user_folder() != dungeon.folder())
+    shipped = sorted(p.stem for p in dungeon.folder().glob("*.json"))
+    listed = [p.stem for p in dungeon.list_scripts()]
+    ck("★ 內建腳本列得出來", bool(shipped) and shipped[0] in listed,
+       f"內建 {shipped}　列到 {listed}")
+    ck("同名不會列兩次", len(listed) == len(set(listed)), str(listed))
+
+    # 內建的每一份都要讀得進來、每一步都合格 —— 發出去的東西不能是壞的。
+    for p in dungeon.folder().glob("*.json"):
+        sc, why = dungeon.load(p)
+        ck(f"★ 內建「{p.stem}」讀得進來", sc is not None, why)
+        if sc is None:
+            continue
+        ck(f"　「{p.stem}」有蓋地圖章", sc.scene is not None and bool(sc.map))
+        bad = [dungeon.validate(st)[1] for st in sc.steps
+               if not dungeon.validate(st)[0]]
+        ck(f"　「{p.stem}」每一步都合格", not bad, "；".join(bad))
+        fp = sc.map or {}
+        out = [st for st in sc.steps
+               for xy in [st.get("to") or st.get("at")] if xy
+               and not (0 <= xy[0] < fp.get("w", 0)
+                        and 0 <= xy[1] < fp.get("h", 0))]
+        # ★ 這一項就是「明明是同一張圖卻說不是」的照妖鏡：座標掉在地圖外面
+        #   ＝章跟步驟不是同一張圖（2026-09-02 真的發生過，章是門口那張）。
+        ck(f"　★「{p.stem}」座標都在章裡那張圖的範圍內", not out, str(out))
+
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
 

@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import math
 import time
 
 from PySide6.QtCore import QTimer, Qt, Signal
@@ -41,7 +42,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
-    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -73,6 +73,15 @@ WALL_COLOR = (26, 28, 32)
 PROP_RADIUS = 25.0
 # 點下去之後等對話框開的上限。⚠ 遊戲會自己走過去才開，所以要放寬一點。
 DIALOG_WAIT = 12.0
+# ★ 傳點的出口是「盯著看到的」不是算的（使用者 2026-09-02：「人被傳走不會
+#   換地圖，有順移就算吧」）：加完傳點那一步就開始每 0.12 秒看一次位置，
+#   一跳超過 JUMP_TILES 格就把落點記進那一步。
+PORTAL_WATCH_MS = 120
+PORTAL_WATCH_SECS = 90.0
+# 一次取樣之間跳這麼多格＝順移（走路一拍最多 0.6 格）。
+JUMP_TILES = 3.0
+# 兩次取樣隔太久就分不出是走的還是傳的 → 不判，只重設基準。
+JUMP_MAX_GAP = 0.4
 
 
 def _fmt(v: float) -> str:
@@ -190,6 +199,19 @@ class MapWindow(QDialog):
         b.setToolTip("把角色**現在**站的那一格，加成一個「走到」步驟。")
         b.clicked.connect(tab._add_here)
         ph.addWidget(b)
+        # ★ 傳點要單獨一種步驟（使用者 2026-09-02 問：「點位放在傳點上會不會
+        #   永遠到不了？」——會）。「走到」的完成條件是站到那一格，但踩上去
+        #   人就被搬走了，那一格永遠不會到達。
+        #   ⚠ 完成訊號是**順移**不是換地圖（使用者當場更正：吞噬之間的傳點
+        #     是同一張圖裡搬位置，場景編號完全不變）。
+        self.add_portal = QPushButton("加入「走進傳點」")
+        self.add_portal.setToolTip(
+            "把點到的那一格當成**傳點**：走過去，看到人被**順移**走才算完成。\n"
+            "⚠ 用一般的「走到」放在傳點上會永遠到不了（人被搬走，那一格不會到達）。\n"
+            "按下去之後你自己走進傳點，工具盯著看，出口在哪會自動記進這一步。")
+        self.add_portal.setEnabled(False)
+        self.add_portal.clicked.connect(tab._add_portal)
+        ph.addWidget(self.add_portal)
         v.addLayout(ph)
 
         self.status = QLabel("　")
@@ -246,6 +268,7 @@ class DungeonMakeTab(BaseTab):
         self._grid = None                 # terrain.Grid（繪製時抓的那張）
         self._rooms: dict = {}
         self._sizes: list[int] = []
+        self._grid_key = None             # 畫出來那張圖的 map_key
         self._props: list = []            # 上次掃到的可互動物件（附近，挑著點）
         self._props_all: list = []        # 繪製地圖時掃到的全部物件（畫紅點）
         self._pick = None                 # 在地圖上點到的格子
@@ -284,8 +307,14 @@ class DungeonMakeTab(BaseTab):
         for text, tip, fn in (
             ("新增", "開一份空白腳本。", self._new_script),
             ("儲存", "存回目前這個檔案。", self._save),
-            ("另存新檔", "存成新的檔名。", self._save_as),
-            ("開啟資料夾", f"腳本都放在 {dungeon.folder()}", self._open_folder),
+            ("另存新檔", "換一個名字存一份。", self._save_as),
+            ("重新蓋章",
+             "把這份腳本記的地圖，改成這台分身**現在**所在的那一張。\n"
+             "腳本是在別張圖上按「新增」開的（例如先在門口開好才走進副本）\n"
+             "就會蓋錯章，自動刷副本會說「不是腳本寫的那張圖」。",
+             self._restamp),
+            ("開啟資料夾", f"腳本都放在 {dungeon.save_folder()}",
+             self._open_folder),
         ):
             b = QPushButton(text)
             b.setToolTip(tip)
@@ -293,6 +322,12 @@ class DungeonMakeTab(BaseTab):
             fbar.addWidget(b)
         fbar.addStretch(1)
         root.addLayout(fbar)
+
+        # ★ 這份腳本是「哪張圖」的 —— 一定要看得見（2026-09-02）：看不見就
+        #   會發生「明明站在對的圖上，開跑卻說不是同一張圖」而查不出原因。
+        self.stamp_lbl = QLabel("　")
+        self.stamp_lbl.setWordWrap(True)
+        root.addWidget(self.stamp_lbl)
 
         # ── 地圖（一顆按鈕 → 獨立視窗，使用者 2026-09-02 指定）───────
         mid = QHBoxLayout()
@@ -442,6 +477,10 @@ class DungeonMakeTab(BaseTab):
 
         self._poke_timer = QTimer(self)
         self._poke_timer.timeout.connect(self._poke_check)
+        # 傳點監看（加完「走進傳點」才跑，看到順移就停）
+        self._pw = None
+        self._pw_timer = QTimer(self)
+        self._pw_timer.timeout.connect(self._portal_watch)
         for sp in self.findChildren(QSpinBox):
             fit_spin(sp)
         self._reload_files()
@@ -491,6 +530,11 @@ class DungeonMakeTab(BaseTab):
 
     def _on_who_changed(self) -> None:
         # 換分身＝換一台的記憶體，之前掃到的物件與地圖全部作廢。
+        # ⚠ 傳點監看也要停：換了一台，「誰在走」就不是同一個人了。
+        if self._pw is not None:
+            self._pw = None
+            self._pw_timer.stop()
+            self._say_map("換了分身 → 傳點監看停掉了（要記出口請重加一次）")
         self._props, self._poked, self._menu = [], None, []
         self.props.clear()
         self._clear_menu()
@@ -538,6 +582,7 @@ class DungeonMakeTab(BaseTab):
             return
         pos = f"　站在 ({_fmt(me[0])}, {_fmt(me[1])})" if me else "　站位讀不到"
         self.here_lbl.setText(f"{scene.scene_name(sid)}（{sid}）{pos}")
+        self._refresh_stamp()
 
     # ------------------------------------------------------------------
     # 腳本檔
@@ -578,27 +623,85 @@ class DungeonMakeTab(BaseTab):
             return
         self._script = dungeon.Script(name=name.strip())
         self._path = None
-        self._stamp_map()
+        # ⛔ **這裡不蓋地圖章**（2026-09-02 真的踩到）：使用者在「地底廣場」
+        #   （場景 71、300x180）按新增，然後才走進「吞噬之間」（76、420x230）
+        #   記步驟 —— 章停在 71，自動刷副本開跑前一比就說「不是同一張圖」，
+        #   而使用者明明站在對的圖上。改成**第一步存進來的時候**才蓋章
+        #   （見 `_add`），章一定跟步驟是同一張圖。
         self._refresh_steps()
         self.files.blockSignals(True)
         self.files.setCurrentIndex(0)
         self.files.blockSignals(False)
         self.status.setText(f"新腳本「{name.strip()}」—— 記得按儲存")
 
-    def _stamp_map(self) -> None:
-        """把目前這張圖的場景編號與指紋蓋進腳本（開跑前用來比對）。"""
+    def _here_key(self) -> tuple[int | None, object]:
+        """(現在這張圖的 map_key, terrain.Grid)；讀不到回 (None, None)。"""
         _pid, sc = self._cur()
         if sc is None:
-            return
+            return None, None
         try:
-            sid = scene.current_id(sc)
-            self._script.scene = scene.map_key(sid)
             from app.game import terrain
+            key = scene.map_key(scene.current_id(sc))
             grid, _why = terrain.load(sc)
-            if grid is not None:
-                self._script.map = dungeon.fingerprint(grid)
+            return key, grid
         except Exception:                                # noqa: BLE001
-            pass
+            return None, None
+
+    def _stamp_map(self, quiet: bool = False) -> bool:
+        """把目前這張圖的場景編號與指紋蓋進腳本（開跑前用來比對）。"""
+        key, grid = self._here_key()
+        if key is None:
+            if not quiet:
+                self.status.setText("⚠ 讀不到目前場景，沒有蓋章")
+            return False
+        self._script.scene = key
+        if grid is not None:
+            self._script.map = dungeon.fingerprint(grid)
+        self._refresh_stamp()
+        return True
+
+    def _restamp(self) -> None:
+        """「重新蓋章」：把腳本的地圖改成現在這一張（舊腳本蓋錯圖時用）。"""
+        key, _grid = self._here_key()
+        if key is None:
+            QMessageBox.warning(self, "重新蓋章", "讀不到目前場景 —— 先選一台分身。")
+            return
+        old = self._script.scene
+        if old is not None and old != key and self._script.steps:
+            if QMessageBox.question(
+                    self, "重新蓋章",
+                    f"這份腳本原本記的是「{scene.scene_name(old)}」（{old}），"
+                    f"現在站的是「{scene.scene_name(key)}」（{key}）。\n"
+                    f"裡面已經有 {len(self._script.steps)} 步 —— "
+                    f"那些座標是在舊那張圖上點的，換成新圖等於全部作廢。\n"
+                    "還是要改嗎？") != QMessageBox.Yes:
+                return
+        if self._stamp_map():
+            self.status.setText(
+                f"已重新蓋章：{scene.scene_name(key)}（{key}）—— 記得按儲存")
+
+    def _refresh_stamp(self) -> None:
+        """把「這份腳本是哪張圖」寫在介面上 —— 看得到才不會又蓋錯圖。"""
+        s = self._script
+        if s.scene is None:
+            self.stamp_lbl.setText("這份腳本：還沒蓋地圖章（存第一步時自動蓋）")
+            return
+        fp = s.map or {}
+        size = (f"　{fp.get('w')}x{fp.get('h')}　可走 {fp.get('walkable')} 格"
+                if fp else "")
+        # 走過傳點的腳本會跨好幾張圖 —— 要比的是「記到現在應該在哪一張」。
+        want = dungeon.map_at(s)
+        if want is None:
+            want = dungeon.map_at(s, len(s.steps) - 1)
+        here, _g = self._here_key()
+        bad = here is not None and want is not None and here != want
+        tail = ""
+        if want is not None and want != s.scene:
+            tail = f"　→ 目前記到「{scene.scene_name(want)}」（{want}）"
+        self.stamp_lbl.setText(
+            ("⚠ " if bad else "")
+            + f"這份腳本：{scene.scene_name(s.scene)}（{s.scene}）{size}{tail}"
+            + (f"　—— 但這台分身現在在「{scene.scene_name(here)}」" if bad else ""))
 
     def _save(self) -> None:
         if self._path is None:
@@ -612,17 +715,20 @@ class DungeonMakeTab(BaseTab):
         self.status.setText(f"已存 {self._path}")
 
     def _save_as(self) -> None:
-        name = self._script.name or "副本"
-        path, _f = QFileDialog.getSaveFileName(
-            self, "另存腳本", str(dungeon.folder() / f"{name}.json"),
-            "腳本 (*.json)")
-        if not path:
+        # ⛔ 不開「另存新檔」的檔案對話框（使用者 2026-09-02 定案）：路徑是
+        #   我們決定的（專案 assets/副本），使用者只要給個名字。
+        name, ok = QInputDialog.getText(
+            self, "另存新檔", "腳本名稱：", text=self._script.name or "副本")
+        name = name.strip()
+        if not ok or not name:
             return
-        from pathlib import Path
-        self._path = Path(path)
-        self._script.name = self._path.stem
-        if self._script.scene is None:
-            self._stamp_map()
+        path = dungeon.save_folder() / f"{name}.json"
+        if path.exists() and QMessageBox.question(
+                self, "另存新檔",
+                f"「{name}」已經有了，要蓋掉嗎？") != QMessageBox.Yes:
+            return
+        self._path = path
+        self._script.name = name
         self._save()
         self._reload_files(keep=str(self._path))
 
@@ -643,6 +749,7 @@ class DungeonMakeTab(BaseTab):
             self.steps.addItem(f"{i + 1:>2}. {dungeon.describe(s)}")
         if 0 <= keep < self.steps.count():
             self.steps.setCurrentRow(keep)
+        self._refresh_stamp()
         self._redraw_overlay()
 
     def _add(self, step: dict) -> None:
@@ -650,6 +757,43 @@ class DungeonMakeTab(BaseTab):
         if not ok:
             self.status.setText(f"⚠ 這一步有問題：{why}")
             return
+        # ★★ 地圖章跟著**步驟**走（2026-09-02 使用者回報「明明是同一張地圖
+        #   卻說不是」的根因就在這）：第一步存進來時蓋章，之後每一步都確認
+        #   還在同一張圖 —— 走出去了還繼續加，等於把兩張圖的座標混在一份
+        #   腳本裡，跑起來一定亂走。
+        here, _grid = self._here_key()
+        if self._script.scene is None:
+            if not self._stamp_map(quiet=True):
+                self._say_map("⚠ 讀不到目前場景，這一步沒有存")
+                return
+        else:
+            steps = self._script.steps
+            prev = dungeon.map_at(self._script, len(steps) - 1)
+            last = steps[-1] if steps else None
+            # ★ 剛走過傳點：把「傳到哪張圖」記進那一步 —— 是我們**看到**的
+            #   （人現在就站在那），不是猜的。這也是腳本唯一准許換圖的時機。
+            if (last is not None and last.get("do") == dungeon.PORTAL
+                    and last.get("scene") is None
+                    and here is not None and here != prev):
+                # ⚠ 這是**換圖型**傳點的補網（換圖時座標不見得會跳，順移監看
+                #   可能看不到）。位置一樣是當場讀的，不是算的。
+                last["scene"] = here
+                me = self._me(self._cur()[1])
+                if me is not None and not last.get("land"):
+                    last["land"] = [round(me[0], 1), round(me[1], 1)]
+                self._say_map(f"第 {len(steps)} 步的傳點會到"
+                              f"「{scene.scene_name(here)}」（{here}）—— 已記住")
+            want = dungeon.map_at(self._script)
+            if want is None:
+                want = prev              # 傳點還沒走過 → 應該還在傳點前那張
+            if here is not None and want is not None and here != want:
+                self._say_map(
+                    f"⛔ 這一步沒有存：腳本這時候應該在"
+                    f"「{scene.scene_name(want)}」（{want}），你現在在"
+                    f"「{scene.scene_name(here)}」（{here}）。\n"
+                    "　換圖只能靠「加入『走進傳點』」那一步 ——"
+                    "整份重來請按「重新蓋章」。")
+                return
         self._script.add(step)
         self._refresh_steps()
         self.steps.setCurrentRow(self.steps.count() - 1)
@@ -672,6 +816,61 @@ class DungeonMakeTab(BaseTab):
             return
         self._add({"do": dungeon.WALK,
                    "to": [int(self._pick[0]), int(self._pick[1])]})
+
+    def _add_portal(self) -> None:
+        """把點到的那一格加成「走進傳點」，然後**盯著看**它會把人送到哪。
+
+        出口（`land`）不在這裡填 —— 加完之後使用者自己走進傳點，工具每
+        0.12 秒看一次位置，看到順移就把**當場看到的**落點記進這一步。
+        ⛔ 不准用算的、也不准猜（傳點對面在哪只有走一次才知道）。
+        """
+        if self._pick is None:
+            return
+        n = len(self._script.steps)
+        self._add({"do": dungeon.PORTAL,
+                   "to": [int(self._pick[0]), int(self._pick[1])]})
+        if len(self._script.steps) <= n:
+            return                       # 被 _add 擋下來了（換圖了之類）
+        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
+        self._pw_timer.start(PORTAL_WATCH_MS)
+        self._say_map("走進那個傳點吧 —— 我盯著看它把你送到哪，"
+                      "看到就自動記進這一步。")
+
+    def _portal_watch(self) -> None:
+        """盯著「剛加的那個傳點」把人送到哪。看到順移才記，看不到就說看不到。"""
+        if self._pw is None:
+            self._pw_timer.stop()
+            return
+        i, deadline, prev, prev_t = self._pw
+        steps = self._script.steps
+        if i >= len(steps) or steps[i].get("do") != dungeon.PORTAL:
+            self._pw = None                      # 那一步被刪／搬走了
+            self._pw_timer.stop()
+            return
+        now = time.monotonic()
+        if now > deadline:
+            self._pw = None
+            self._pw_timer.stop()
+            self._say_map(
+                f"⚠ 等了 {PORTAL_WATCH_SECS:.0f} 秒沒看到你走進傳點 —— "
+                f"第 {i + 1} 步的出口沒記到（清單上會標；再按一次就重新盯）")
+            return
+        _pid, sc = self._cur()
+        me = self._me(sc) if sc is not None else None
+        if me is None:
+            return                               # 讀不到就跳過這一次取樣
+        self._pw = (i, deadline, me, now)
+        if prev is None or now - prev_t > JUMP_MAX_GAP:
+            return                               # 隔太久 → 只重設基準，不判
+        if math.hypot(me[0] - prev[0], me[1] - prev[1]) < JUMP_TILES:
+            return
+        steps[i]["land"] = [round(me[0], 1), round(me[1], 1)]
+        steps[i]["scene"] = scene.map_key(scene.current_id(sc))
+        self._pw = None
+        self._pw_timer.stop()
+        self._refresh_steps()
+        self._say_map(f"第 {i + 1} 步的傳點出口記起來了："
+                      f"({me[0]:.0f}, {me[1]:.0f}) —— 記得按儲存")
 
     def _move(self, delta: int) -> None:
         i = self.steps.currentRow()
@@ -703,6 +902,7 @@ class DungeonMakeTab(BaseTab):
             self.status.setText(f"⚠ 讀不到地形圖：{why}")
             return
         self._grid = grid
+        self._grid_key = scene.map_key(scene.current_id(sc))
         self.status.setText("正在切連通區…")
         QWidget.repaint(self)
         t0 = time.time()
@@ -776,11 +976,19 @@ class DungeonMakeTab(BaseTab):
                 continue
             p.setBrush(QColor(220, 80, 80))
             p.drawEllipse(int(pr.x * s) - 2, int(pr.y * s) - 2, 5, 5)
-        # 已存的步驟
-        for i, (x, y) in ((i, xy) for i, xy, _k in self._script.points()):
+        # 已存的步驟。⚠ 只畫**這張圖**的：走過傳點的腳本會跨好幾張圖，
+        #   把別張圖的座標疊上來只會誤導（同一組座標在兩張圖是不同地方）。
+        for i, (x, y) in ((i, xy) for i, xy, _k in self._script.points()
+                          if self._grid_key is None
+                          or dungeon.map_at(self._script, i) in
+                          (None, self._grid_key)):
             kind = self._script.steps[i].get("do")
-            col = QColor(90, 170, 255) if kind == dungeon.WALK \
-                else QColor(210, 140, 255)
+            if kind == dungeon.WALK:
+                col = QColor(90, 170, 255)          # 走到：藍
+            elif kind == dungeon.PORTAL:
+                col = QColor(120, 235, 140)         # 傳點：綠（會換圖，特別標）
+            else:
+                col = QColor(210, 140, 255)         # 對話：紫
             p.setPen(QPen(col, 2))
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(int(x * s) - 5, int(y * s) - 5, 11, 11)
@@ -814,6 +1022,7 @@ class DungeonMakeTab(BaseTab):
         if self._big is not None:
             # ⚠ 不可走的格子不給加：走不到的終點會讓執行端一直重試到逾時。
             self._big.add_pick.setEnabled(walk)
+            self._big.add_portal.setEnabled(walk)
             self._big.pick_lbl.setText(
                 f"點到 ({gx}, {gy})　"
                 + (f"房間 {room}" if room is not None else
@@ -984,6 +1193,8 @@ class DungeonMakeTab(BaseTab):
 
     # ------------------------------------------------------------------
     def closeEvent(self, ev) -> None:                    # noqa: N802
+        self._pw_timer.stop()
+        self._pw = None
         # ★ 用 release() 不要 stop()：跳板是同一個 PID 共用的。
         for pid in list(self._movers):
             try:

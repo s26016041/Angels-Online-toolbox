@@ -1,6 +1,6 @@
 r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
 
-    dungeon.folder()            # 腳本資料夾（%APPDATA%\AngelsOnlineToolbox\副本）
+    dungeon.folder()            # 腳本資料夾（**專案裡的** assets/副本）
     dungeon.list_scripts()      # 資料夾裡所有 .json
     dungeon.load(path)          # → Script
     script.save(path)
@@ -26,6 +26,31 @@ r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
                        "menu": [1, 2]}                送對話選項（1 起算）
     {"do": "clear"}                                  把周圍的怪清光
     {"do": "wait",     "secs": 3}                    單純等幾秒
+    {"do": "portal",   "to": [x, y],                 走進傳點（人被移走才算完成）
+                       "land": [x, y], "scene": 76}
+
+## 傳點為什麼要獨立一種步驟（使用者 2026-09-02 問對了）
+
+> 「如果我把點位放在傳點上，因為我要進入傳點，那會卡住嗎永遠到不了那個點？」
+
+會卡。`walk` 的完成條件是「站到那一格附近」，但踩上傳點的**下一瞬間人就被
+移走了** —— 那一格永遠不會「到達」，只會耗到 `STEP_TIMEOUT` 才停。
+
+⚠⚠ **完成條件是「順移」不是「換地圖」**（使用者 2026-09-02 當場更正：
+
+> 「但是人被傳走不會換地圖，有順移就算吧，有時候傳點之間也很短」
+
+吞噬之間那 6 間互不相通的房間**都在同一個場景編號裡**，傳點是把人搬到同一
+張圖的另一個地方，場景編號完全不變。所以：
+
+    完成 ＝ 一拍之間位置跳了一大段（順移）　或　場景真的變了
+
+⛔ 不可以用「離傳點多遠」當訊號 —— 使用者說「有時候傳點之間也很短」，
+  出口可能就在幾格外，用距離門檻會漏判。跳一拍的**位移速度**才分得出來
+  （跑步一拍 0.1 秒最多動 0.6 格，順移一定遠大於這個）。
+
+`land` ＝ 腳本製作時**實際看到**的出口位置（不是算出來的）；跑的時候拿來
+確認「傳到的地方跟當初一樣」，差太遠就大聲停下。
 
 ⚠⚠ **`interact` 只存位置與外觀編號，絕對不存「選定 id」。**
   出處 `scenery.py` 檔頭（2026-08-12 實機攔包）：選定 id 的高 16 位是
@@ -45,18 +70,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.config import APP_DIR_NAME
 from app.game import mapobj
+from app.paths import resource
 
 FOLDER_NAME = "副本"
 
 # 步驟種類
 WALK, INTERACT, CLEAR, WAIT = "walk", "interact", "clear", "wait"
-KINDS = (WALK, INTERACT, CLEAR, WAIT)
+PORTAL = "portal"
+KINDS = (WALK, INTERACT, CLEAR, WAIT, PORTAL)
 
 # 對話選單最多幾項（talkaction 碼只到第 10 項，見 supply.talk_option）
 MENU_MAX = 10
@@ -65,21 +93,66 @@ WALKABLE_TOLERANCE = 0.02
 
 
 def folder() -> Path:
-    """腳本資料夾。跟 config.json 放一起（打包成 exe 之後專案目錄是唯讀的）。"""
-    base = os.environ.get("APPDATA")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-    p = Path(base) / APP_DIR_NAME / FOLDER_NAME
-    p.mkdir(parents=True, exist_ok=True)
+    """腳本資料夾＝**專案裡的** `assets/副本`，隨工具箱一起發出去。
+
+    ★ 使用者 2026-09-02 定案：「副本 json 是存在我們專案不是使用者端，
+      這功能是我們自己寫路徑，使用者只負責使用。」
+      —— 副本怎麼跑是我們研究出來的東西（哪個雕像先繞、對話選第幾項），
+      應該像 `supply_shop.json`、`mapobj_names.tsv.gz` 那樣當成**資源**發，
+      不是叫每個使用者自己在自己電腦上重做一份。
+    """
+    p = resource(f"assets/{FOLDER_NAME}")
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass                       # 打包後解壓目錄建不了也沒關係，只是列不到
     return p
 
 
+def user_folder() -> Path:
+    r"""舊版存過腳本的地方（`%APPDATA%\AngelsOnlineToolbox\副本`）。
+
+    ⚠ 只為了**還讀得到**舊檔而留（不主動建）：2026-09-02 之前存的腳本都在
+      這裡，直接改路徑會讓使用者的腳本憑空消失。
+    """
+    base = os.environ.get("APPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return Path(base) / APP_DIR_NAME / FOLDER_NAME
+
+
+def save_folder() -> Path:
+    """製作分頁存檔的位置。
+
+    跑原始碼（我們自己做腳本）＝專案那份，存完 commit 就發給所有人。
+    打包成 exe 之後專案目錄在 PyInstaller 的暫存區（關掉程式就沒了），
+    退回使用者資料夾 —— 安全退化，不要安靜地存進一個等下會被刪掉的地方。
+    """
+    if hasattr(sys, "_MEIPASS") or getattr(sys, "frozen", False):
+        p = user_folder()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return folder()
+
+
 def list_scripts() -> list[Path]:
-    """資料夾裡所有腳本，依檔名排序。"""
-    try:
-        return sorted(folder().glob("*.json"))
-    except OSError:
-        return []
+    """所有看得到的腳本：專案內建的優先，再補上使用者資料夾裡的舊檔。
+
+    同名（檔名一樣）時以專案那份為準 —— 我們發出去的才是維護中的版本。
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+    for d in (folder(), user_folder()):
+        try:
+            files = sorted(d.glob("*.json"))
+        except OSError:
+            continue
+        for p in files:
+            if p.stem in seen:
+                continue
+            seen.add(p.stem)
+            out.append(p)
+    return out
 
 
 def fingerprint(grid) -> dict:
@@ -230,6 +303,16 @@ def validate(step: dict) -> tuple[bool, str]:
         s = step.get("secs")
         if not isinstance(s, (int, float)) or not 0 < s <= 600:
             return False, "wait 的 secs 要在 0~600 秒"
+    elif kind == PORTAL:
+        xy = step.get("to")
+        if not (isinstance(xy, list) and len(xy) == 2):
+            return False, "portal 少了 to:[x,y]"
+        dst = step.get("scene")
+        if dst is not None and not isinstance(dst, int):
+            return False, "portal 的 scene 要是場景編號"
+        land = step.get("land")
+        if land is not None and not (isinstance(land, list) and len(land) == 2):
+            return False, "portal 的 land 要是 [x,y]"
     return True, ""
 
 
@@ -255,7 +338,38 @@ def describe(step: dict) -> str:
         return "清光周圍的怪"
     if kind == WAIT:
         return f"等 {step.get('secs')} 秒"
+    if kind == PORTAL:
+        x, y = step.get("to", ["?", "?"])
+        land = step.get("land")
+        if not land:
+            # ⚠ 還沒看到出口就要講出來 —— 沒看到 ≠ 沒有出口，但也不能裝作記到了。
+            return f"走進傳點 ({x}, {y})　⚠ 還沒看到出口（走進去一次就會記起來）"
+        tail = ""
+        dst = step.get("scene")
+        if dst is not None:
+            from app.game import scene as _scene   # 迴圈匯入：用時才拉
+            tail = f"　{_scene.scene_name(dst)}"
+        return (f"走進傳點 ({x}, {y}) → 出口 "
+                f"({land[0]:g}, {land[1]:g}){tail}")
     return f"？{kind}"
+
+
+def map_at(script: Script, upto: int | None = None) -> int | None:
+    """跑到第 `upto` 步（不含）時**應該**站在哪一張圖（map_key）。
+
+    起點是腳本的地圖章，每經過一個記了目的地的 `portal` 就換一次。
+    `upto=None` ＝整份腳本跑完之後那一張。
+    傳點還沒記到目的地（`scene` 是 None）就回 None ＝「不知道」，
+    呼叫端不要拿 None 去比對（不知道 ≠ 對不上）。
+    """
+    key = script.scene
+    for st in script.steps[:upto]:
+        if st.get("do") != PORTAL:
+            continue
+        key = st.get("scene")
+        if key is None:
+            return None
+    return key
 
 
 def check_map(script: Script, grid, scene_id: int | None,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -192,6 +193,47 @@ def main() -> int:
     ck("★ 怪清光又沉澱夠久 → 這一趟結束", tab._done,
        tab.status.text())
     ck("　收工會停手", not tab.run_cb.isChecked())
+
+    # ★★ 使用者 2026-09-02：「點位放在傳點上會不會永遠到不了？」→ 會，
+    #   所以傳點是獨立一種步驟；而且完成訊號是**順移**不是換地圖
+    #   （「人被傳走不會換地圖，有順移就算吧，有時候傳點之間也很短」）。
+    print("\n傳點步驟")
+    tab = make_tab([{"do": "portal", "to": [50, 50]}, {"do": "clear"}])
+    run(tab, 0.5)
+    ck("★ 站到傳點上**不算**完成（會被搬走，那一格不會到達）", tab._i == 0)
+    tab._pos = [50.2, 50.2]
+    run(tab, 0.3)
+    ck("★ 就算站上去了也還是不算完成", tab._i == 0, str(tab._i))
+    ck("　一直往傳點走", tab._nav.goal == (50, 50), str(tab._nav.goal))
+    tab._jumped = True
+    run(tab, 0.1)
+    ck("★ 順移了 → 這一步完成", tab._i == 1)
+
+    # 出口對不對得上（腳本記了 land 就要驗）
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
+    tab._pos = [201.0, 41.0]
+    tab._jumped = True
+    run(tab, 0.1)
+    ck("★ 傳到腳本記的出口 → 過", tab._i == 1, tab.status.text())
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
+    tab._pos = [12.0, 300.0]
+    tab._jumped = True
+    run(tab, 0.1)
+    ck("★ 傳到別的地方 → 大聲停下（不拿別處的座標繼續跑）",
+       not tab.run_cb.isChecked(), tab.status.text())
+
+    # 順移偵測本身：速度分得出「走的」跟「傳的」
+    tab = make_tab([{"do": "clear"}])
+    tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic()
+    ck("★ 走路一拍動 0.5 格 → 不是順移",
+       not tab._check_jump((10.5, 10.0)))
+    tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic()
+    ck("★ 一拍跳 40 格 → 是順移", tab._check_jump((50.0, 10.0)))
+    tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic() - 5.0
+    ck("★ 兩次取樣隔 5 秒 → 不判（可能是走過去的），只重設基準",
+       not tab._check_jump((50.0, 10.0)))
+    tab._pos_prev = None
+    ck("★ 第一拍沒有基準 → 不判", not tab._check_jump((50.0, 10.0)))
 
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])
