@@ -1033,6 +1033,40 @@ def main() -> int:
     ck("★ 不認得的動作 → 停下來，不當作沒事跳過",
        not tab.run_cb.isChecked(), tab.status.text())
 
+    # ★★ 製作頁：使用者 2026-09-02「按 1 就進副本，無法設定」——
+    #   按了選項人就被傳走，所以選項要在**按下的當下**就記進入口。
+    print("\n製作頁：入口的選項自動記進去")
+    from app.tabs.dungeon_make_tab import DungeonMakeTab
+    mk = DungeonMakeTab()
+    mk._script = dungeon.Script(name="t")
+    mk._script.entrance = {"scene": 71, "to": [10.0, 20.0], "model": 60777}
+    mk._here_key = lambda: (71, None)
+    mk._cur = lambda: (1, object())
+    mk._me = lambda _sc: (10.5, 20.0)
+    mk._mover = lambda _pid: object()
+    mk._refresh_stamp = lambda: None
+    dt.sell.talk = lambda *_a, **_k: True
+    mk._poked = None
+    mk._send_option(1)
+    ck("★★ 站在入口旁按第 1 項 → **自動記進入口**",
+       mk._script.entrance.get("menu") == [1], str(mk._script.entrance))
+    mk._send_option(2)
+    ck("　再按一項就接在後面", mk._script.entrance["menu"] == [1, 2],
+       str(mk._script.entrance["menu"]))
+    mk._me = lambda _sc: (80.0, 90.0)
+    mk._send_option(3)
+    ck("★ 離入口很遠時按的選項 ⛔ 不會亂記進入口",
+       mk._script.entrance["menu"] == [1, 2],
+       str(mk._script.entrance["menu"]))
+    mk._here_key = lambda: (76, None)
+    mk._me = lambda _sc: (10.5, 20.0)
+    mk._send_option(4)
+    ck("★ 不在入口那張圖 ⛔ 也不會記",
+       mk._script.entrance["menu"] == [1, 2],
+       str(mk._script.entrance["menu"]))
+    mk.on_close()
+
+
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
 

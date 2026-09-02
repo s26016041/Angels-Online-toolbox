@@ -937,6 +937,33 @@ class DungeonMakeTab(BaseTab):
         self._say_map(f"記成傳送點：{mapobj.label(pr.model)} —— "
                       "走進去吧，我盯著看它把你送到哪。")
 
+    def _entrance_here(self) -> bool:
+        """現在正在跟**已經記好的那個入口**互動嗎？
+
+        條件：入口記過了、這台分身就在入口那張圖、而且剛剛點／撞的那個
+        物件就是它（外觀一樣、位置對得上）。
+        """
+        ent = self._script.entrance or {}
+        if not ent:
+            return False
+        key, _grid = self._here_key()
+        if key is None or key != ent.get("scene"):
+            return False
+        pr = self._poked
+        ex, ey = (ent.get("to") or [None, None])[:2]
+        if pr is None:
+            # 沒點東西（撞上去的那種）→ 看**人是不是就站在入口旁邊**
+            _pid, sc = self._cur()
+            me = self._me(sc) if sc is not None else None
+            if me is None or ex is None:
+                return False
+            return math.hypot(me[0] - ex, me[1] - ey) <= 5.0
+        if ent.get("model") not in (None, pr.model):
+            return False
+        if ex is None:
+            return True
+        return math.hypot(pr.x - ex, pr.y - ey) <= 4.0
+
     def _set_entrance(self) -> None:
         """把選到的物件記成「進副本的入口傳送點」（整份腳本共用一個）。
 
@@ -969,14 +996,17 @@ class DungeonMakeTab(BaseTab):
             # 門口要選第幾項（0＝沒有選項那種頁跑的時候會自動過，不必記）
             ent["menu"] = [n for n in self._menu if n]
             ent["gap"] = round(self.gap_secs.value(), 1)
+        # ⚠ 重記一次＝從頭來過，舊的選項路徑不留（不然會疊起來）
         at = getattr(self, "_poked_at", None)
         if at:
             ent["stand"] = [round(at[0], 1), round(at[1], 1)]
         self._script.entrance = ent
+        self._menu = []                  # 之後按的選項才是入口的（從頭記）
+        self._refresh_menu()
         self._refresh_stamp()
         self.status.setText(
             f"已記入口：{dungeon.describe_entrance(self._script.entrance)}"
-            "　—— 記得按儲存")
+            "　—— 現在去撞它、按「第 N 項」，那些選項會自動記進入口")
 
     def _portal_watch(self) -> None:
         """盯著「剛加的那個傳點」把人送到哪。看到順移才記，看不到就說看不到。"""
@@ -1320,6 +1350,19 @@ class DungeonMakeTab(BaseTab):
         self._menu.append(n)
         self._refresh_menu()
         self.save_talk.setEnabled(True)
+        # ★★ 使用者 2026-09-02：「不行，我按 1 就進副本，無法設定」——
+        #   按下選項人就被傳走了，來不及再按「這是進副本的入口」。
+        #   所以只要**現在正對著已經記好的入口**，這一項就自動記進入口。
+        if self._entrance_here():
+            ent = self._script.entrance
+            ent.setdefault("menu", []).append(n)
+            ent["gap"] = round(self.gap_secs.value(), 1)
+            self._refresh_stamp()
+            self.status.setText(
+                f"已送第 {n} 項，並記進**入口**的選項路徑"
+                f"（{' → '.join('第%d項' % k for k in ent['menu'])}）"
+                "　—— 記得按儲存")
+            return
         self.status.setText(f"已送第 {n} 項 —— 看遊戲畫面有沒有進到下一頁")
 
     def _refresh_menu(self) -> None:
