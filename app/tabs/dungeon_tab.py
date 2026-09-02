@@ -129,14 +129,6 @@ TALK_NEAR = 1.8
 TALK_KEEP = 1.2
 # 腳本裡的座標跟現場物件對得起來的最大誤差（格）。
 PROP_TOL = 3.0
-# ★★ 「同一個位置上的同一個東西」的容忍半徑（格）。
-#   ⚠⚠ 2026-09-02 實機抓到：**機關被啟動過之後外觀編號會變** ——
-#   遺落之地那台記的是 60335「靜態-廢棄機器人2」，現在同一格 (62.1, 39.0)
-#   上是 60301「門開關火不給點」，於是「找不到外觀 60335」整趟停掉。
-#   場景物件不會移動，所以**位置**比外觀可靠。外觀對不上時，只要那個位置
-#   上「剛好只有一個」可互動物件就採用它，並且**大聲講出來**外觀變了。
-#   ⛔ 仍然不是「就近點一個」：位置要幾乎重合、而且只能有一個候選。
-SAME_SPOT = 1.5
 # 送完一個對話動作之後等多久再看下一頁。
 MENU_GAP = 0.8
 # 按了確定之後連續這麼多輪都沒換頁 ＝ 這段對話走完了（那些全域關掉還會
@@ -334,17 +326,11 @@ class DungeonTab(BaseTab):
 
         self.steps = QListWidget()
         self.steps.setSelectionMode(QListWidget.NoSelection)
-        # ⚠ 步驟多的時候清單會把下面的狀態列擠沒（2026-09-02 使用者截圖：
-        #   12 步的腳本就看不到狀態列了）—— 狀態列是唯一的診斷來源，
-        #   一定要留得住位置。
-        self.steps.setMinimumHeight(80)
         root.addWidget(self.steps, 1)
 
         self.status = QLabel("　")
         self.status.setWordWrap(True)
-        self.status.setMinimumHeight(52)
-        self.status.setStyleSheet("padding:4px;")
-        root.addWidget(self.status, 0)
+        root.addWidget(self.status)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -1284,7 +1270,7 @@ class DungeonTab(BaseTab):
         trigs = portal.nearby(self._sc, at, PROP_TOL)
         if trigs is None:
             return "物件清單讀不到，等下一次"
-        hit = self._match_prop(trigs, at, want)
+        hit = [t for t in trigs if want is None or t.model == want]
         if not hit:
             return f"附近找不到{'外觀 %d 的' % want if want else ''}傳點物件"
         pf = move.pathfinder_this(self._sc)
@@ -1384,7 +1370,8 @@ class DungeonTab(BaseTab):
                 # ⚠ 讀不到 ≠ 沒有。等下一拍再試，不要當成「這裡沒東西」。
                 self._say("物件清單讀不到，重試中…")
                 return
-            hit = self._match_prop(props, (ax, ay), want_model)
+            hit = [p for p in props
+                   if want_model is None or p.model == want_model]
             if not hit:
                 # ⛔ 絕不「就近點一個」—— 點錯東西比不點危險。
                 self._stop(
@@ -1438,7 +1425,8 @@ class DungeonTab(BaseTab):
             if self._click_t >= CLICK_RETRY:
                 self._click_t = 0.0
                 props = scenery.nearby(self._sc, (ax, ay), PROP_TOL) or []
-                hit = self._match_prop(props, (ax, ay), want_model)
+                hit = [p for p in props
+                       if want_model is None or p.model == want_model]
                 if not hit:
                     self._say(f"{tag}　點了沒反應，"
                               f"而且現在找不到外觀 {want_model} —— 等下一輪")
@@ -1593,28 +1581,6 @@ class DungeonTab(BaseTab):
         """停留幾秒的提示（地形變了、可達區怪怪的…）。"""
         self._notice, self._notice_t = text, time.monotonic() + NOTICE_SECS
         self.status.setText(text)
-
-    def _match_prop(self, props, at, want_model):
-        """從掃到的物件裡挑出「腳本說的那一個」。回 [物件] 或 []。
-
-        ① 外觀對得上 → 就是它。
-        ② 外觀對不上，但**那個位置上剛好只有一個**可互動物件（≤SAME_SPOT 格）
-           → 也是它，只是**外觀被啟動之後換掉了**（2026-09-02 實機：
-           60335 廢棄機器人2 → 60301 門開關火）。會大聲講出來。
-        ⛔ 其他情況一律回空 —— **不就近點一個**（點錯比不點危險）。
-        """
-        if want_model is None:
-            return list(props[:1])
-        same = [p for p in props if p.model == want_model]
-        if same:
-            return same
-        near = [p for p in props
-                if math.hypot(p.x - at[0], p.y - at[1]) <= SAME_SPOT]
-        if len(near) == 1:
-            self._notify(f"⚠ ({at[0]}, {at[1]}) 的外觀從 {want_model} 變成 "
-                         f"{near[0].model} —— 機關被啟動過？用位置對上的那一個")
-            return near
-        return []
 
     def _mon_note(self) -> str:
         """狀態列上的怪物盤點：看得到幾隻、其中幾隻走得到。
