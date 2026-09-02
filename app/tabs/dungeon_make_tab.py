@@ -59,7 +59,7 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import (bag, dungeon, entity, locate, lua, mapobj, move, produce,
-                      scene, scenery, sell, supply)
+                      scene, scenery, sell, supply, talkwnd)
 from app.tabs.base_tab import BaseTab, fit_spin
 
 # 房間配色（互不相通的連通區各給一色）。第 7 間之後循環用。
@@ -459,7 +459,17 @@ class DungeonMakeTab(BaseTab):
         tv.addWidget(self.props)
 
         oh = QHBoxLayout()
-        oh.addWidget(QLabel("選項"))
+        oh.addWidget(QLabel("對話"))
+        # ★ 「無異議對話」那一頁（使用者 2026-09-02：「無異議對話 → 選項1 →
+        #   無異議對話 → 結束」）——它送的是 messageclose(0x128)，跟送選項的
+        #   talkaction(0x0B) 完全不同，所以要有自己的按鈕、也自己記一格。
+        b = QPushButton("過場")
+        b.setFixedWidth(46)
+        b.setToolTip(
+            "這一頁**沒有選項**（只有文字＋確定）→ 按這顆過掉它，並記進路徑。\n"
+            "⚠ 跟「第 N 項」是不同的封包，不能拿第 1 項代替。")
+        b.clicked.connect(lambda: self._send_option(0))
+        oh.addWidget(b)
         for n in range(1, dungeon.MENU_MAX + 1):
             b = QPushButton(str(n))
             b.setFixedWidth(34)
@@ -1263,13 +1273,22 @@ class DungeonMakeTab(BaseTab):
         mv = self._mover(pid)
         if mv is None:
             return
-        if not sell.talk(mv, supply.talk_option(n)):
+        # ★ 0 ＝「無異議對話」那一頁按確定，走 messageclose(0x128)；
+        #   1~N 才是 talkaction(0x0B)。⛔ 兩者不能互相代替（反組譯實證，
+        #   見 app/game/talkwnd.py 檔頭）。
+        if n == 0:
+            ok, why = talkwnd.close_page(mv, sc)
+            if not ok:
+                self.status.setText(f"⚠ 過場送不出去（{why}）—— 再按一次")
+                return
+        elif not sell.talk(mv, supply.talk_option(n)):
             self.status.setText(f"⚠ 第 {n} 項送不出去（指令槽忙碌）—— 再按一次")
             return
         self._menu.append(n)
         self._refresh_menu()
         self.save_talk.setEnabled(True)
-        self.status.setText(f"已送第 {n} 項 —— 看遊戲畫面有沒有進到下一層")
+        what = "過場（確定）" if n == 0 else f"第 {n} 項"
+        self.status.setText(f"已送{what} —— 看遊戲畫面有沒有進到下一頁")
 
     def _refresh_menu(self) -> None:
         """把「這一步會存成什麼」寫在畫面上。
@@ -1281,8 +1300,9 @@ class DungeonMakeTab(BaseTab):
           「清光周圍的怪」那種多餘指令。）
         """
         if self._menu:
-            path = " → ".join(f"第{n}項" for n in self._menu)
-            btn = f"存這一步（選項 {path}）"
+            path = " → ".join("過場" if n == 0 else f"第{n}項"
+                               for n in self._menu)
+            btn = f"存這一步（對話 {path}）"
         elif self._poked is not None:
             path = "**沒有選項＝純對話**（不用按第 N 項，直接存）"
             btn = "存這一步（純對話）"

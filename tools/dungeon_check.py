@@ -64,8 +64,17 @@ def main() -> int:
     ck("walk 少了 to → 擋下來", not ok, why)
     ok, _ = dungeon.validate({"do": "interact", "at": [1, 2], "menu": [1, 3]})
     ck("interact 正常", ok)
-    ok, why = dungeon.validate({"do": "interact", "at": [1, 2], "menu": [0]})
-    ck("選項序號 0 → 擋下來（1 起算）", not ok, why)
+    # ★ 0 ＝「無異議對話」那一頁按確定（使用者 2026-09-02：
+    #   「無異議對話 → 選項1 → 無異議對話 → 結束」）。跟送第 N 項是**不同的
+    #   封包**（messageclose 0x128 vs talkaction 0x0B），所以是合法的一格。
+    ok, why = dungeon.validate({"do": "interact", "at": [1, 2],
+                                "menu": [0, 1, 0]})
+    ck("★ 無異議→第1項→無異議 這種路徑記得起來", ok, why)
+    ck("　清單上看得出哪一格是過場",
+       "過場" in dungeon.describe({"do": "interact", "at": [1, 2],
+                                   "menu": [0, 1, 0]}))
+    ok, why = dungeon.validate({"do": "interact", "at": [1, 2], "menu": [-1]})
+    ck("選項序號 -1 → 擋下來", not ok, why)
     ok, why = dungeon.validate({"do": "interact", "at": [1, 2], "menu": [11]})
     ck(f"選項序號 > {dungeon.MENU_MAX} → 擋下來", not ok, why)
     ok, why = dungeon.validate({"do": "interact", "at": [1, 2],

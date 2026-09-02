@@ -98,7 +98,7 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (dungeon, entity, itemname, jumpmap, locate, move,
                       navigate, produce, quickbar, scene, scenery, sell,
-                      skills, supply, terrain)
+                      skills, supply, talkwnd, terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, HANDOFF_RANGE, KeyWorker,
                                MODE_PACKET, ScanWorker, SKILL_KEYS,
@@ -1226,12 +1226,23 @@ class DungeonTab(BaseTab):
             if self._menu_t > 0:
                 return
             n = menu[self._menu_i]
-            if not sell.talk(self._mover, supply.talk_option(n)):
-                self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
-                return
+            # ★ 0 ＝「無異議對話」那一頁按確定 —— **不是** talkaction。
+            #   反組譯實證（talkwnd.py）：那一頁送的是 0x128，跟送選項的
+            #   0x0B 完全是兩回事（使用者 2026-09-02：無異議→選項1→無異議）。
+            if n == 0:
+                ok, why = talkwnd.close_page(self._mover, self._sc)
+                if not ok:
+                    self._say(f"過場（沒有選項那一頁）送不出去（{why}），重試中…")
+                    return
+                what = "過場"
+            else:
+                if not sell.talk(self._mover, supply.talk_option(n)):
+                    self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
+                    return
+                what = f"第 {n} 項"
             self._menu_i += 1
             self._menu_t = float(step.get("gap") or MENU_GAP)
-            self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
+            self._say(f"第 {self._i + 1} 步　已送{what}"
                       f"（{self._menu_i}/{len(menu)}）")
             return
         # ★★ 收尾前**一定要等**（使用者 2026-09-02 回報「對話有點問題…純對話：

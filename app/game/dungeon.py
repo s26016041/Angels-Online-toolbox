@@ -27,7 +27,8 @@ r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
 
     {"do": "walk",     "to": [x, y]}                 走到這一格
     {"do": "interact", "at": [x, y], "model": 60307,  點那個物件，然後照順序
-                       "menu": [1, 2]}                送對話選項（1 起算）
+                       "menu": [0, 1, 0]}             走完對話：0＝過掉沒有選項
+                                                      的那一頁、N＝送第 N 項
     {"do": "clear"}                                  ⚠ 舊步驟，介面已不再產生
                                                      （清怪本來就是每一步的前提）
     {"do": "wait",     "secs": 3}                    單純等幾秒
@@ -308,8 +309,11 @@ def validate(step: dict) -> tuple[bool, str]:
         if not isinstance(menu, list):
             return False, "menu 要是陣列"
         for n in menu:
-            if not isinstance(n, int) or not 1 <= n <= MENU_MAX:
-                return False, f"選項序號要在 1~{MENU_MAX}（收到 {n}）"
+            # ★ 0 ＝「無異議對話」那一頁按確定（走 `talkwnd.close_page`），
+            #   跟「送第 N 項」是**兩種不同的封包**（0x128 vs 0x0B），所以
+            #   要分開記（使用者 2026-09-02：無異議→選項1→無異議→結束）。
+            if not isinstance(n, int) or not 0 <= n <= MENU_MAX:
+                return False, f"對話動作要 0（過場）或 1~{MENU_MAX}（收到 {n}）"
         gap = step.get("gap")
         if gap is not None and (not isinstance(gap, (int, float))
                                 or not 0 < gap <= 30):
@@ -376,7 +380,8 @@ def describe(step: dict) -> str:
     if kind == INTERACT:
         x, y = step.get("at", ["?", "?"])
         menu = step.get("menu") or []
-        tail = ("　選項 " + " → ".join(f"第{n}項" for n in menu)) if menu \
+        tail = ("　對話 " + " → ".join("過場" if n == 0 else f"第{n}項"
+                                       for n in menu)) if menu \
             else "　（只說話，不選項）"
         m = step.get("model")
         # ★ 有名字就印名字（「惡魔系雕像01（60049）」）—— 光看編號認不出是什麼

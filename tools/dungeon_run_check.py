@@ -336,6 +336,48 @@ def main() -> int:
     run(tab, 0.1)
     ck("★ 順移了 → 這一步完成", tab._i == 1)
 
+    # ★★ 無異議對話 → 選項1 → 無異議對話 → 結束（使用者 2026-09-02）
+    #   ⛔ 過場那一頁**不能**用 talkaction 代替：反組譯實證它送的是
+    #   messageclose(0x128)，跟送選項的 0x0B 是兩件事。
+    closes = []
+    mixed = {"do": "interact", "at": [20, 20], "model": 60307,
+             "menu": [0, 1, 0], "gap": 1.0}
+    tab = make_tab([mixed], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    dt.talkwnd.close_page = lambda _mv, _sc: (closes.append(1), (True, "送出"))[1]
+    run(tab, 0.3)
+    ck("點下去了", tab._clicked)
+    run(tab, 1.0)
+    ck("★★ 第一格是過場 → 送 messageclose，**不是** talkaction",
+       closes == [1] and tab.sent == [], f"過場{closes} 選項{tab.sent}")
+    run(tab, 1.1)
+    from app.game import supply as _sup2
+    ck("★ 第二格才送第 1 項", tab.sent == [_sup2.talk_option(1)],
+       str(tab.sent))
+    run(tab, 1.1)
+    ck("★ 第三格又是過場", closes == [1, 1], str(closes))
+    run(tab, 1.2)
+    ck("　三格走完 → 送離開互動、前進下一步",
+       tab.left == [1] and tab._i == 1, f"{tab.left} 步{tab._i}")
+    ck("　清單上讀得出來", "過場" in dungeon.describe(mixed),
+       dungeon.describe(mixed))
+
+    # ★ 使用者 2026-09-02 追加：「可能會出現 選項→對話→對話→選項→對話→選項
+    #   這種連續的 NPC」——路徑就是一串，長度與順序都不限。
+    long = {"do": "interact", "at": [20, 20], "model": 60307,
+            "menu": [1, 0, 0, 2, 0, 1], "gap": 0.5}
+    ok, why = dungeon.validate(long)
+    ck("★★ 選項→對話→對話→選項→對話→選項 這種長路徑合法", ok, why)
+    closes.clear()
+    tab = make_tab([long], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    run(tab, 0.3 + 0.6 * 6 + 1.0)
+    want = [_sup2.talk_option(1), _sup2.talk_option(2), _sup2.talk_option(1)]
+    ck("　三個選項照順序送對", tab.sent == want, str(tab.sent))
+    ck("　三次過場也照順序送", closes == [1, 1, 1], str(closes))
+    ck("　走完才離開互動", tab.left == [1] and tab._i == 1,
+       f"{tab.left} 步{tab._i}")
+
     # ★★ 純對話（使用者 2026-09-02：「純對話：整段都沒有選項」）
     #   ⛔ 舊碼點完的**下一拍**就送離開互動 → 對話框都還沒開就被取消掉。
     talk = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [],
