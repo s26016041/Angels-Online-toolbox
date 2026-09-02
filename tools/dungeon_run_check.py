@@ -385,12 +385,30 @@ def main() -> int:
     run(tab, 4.0)
     ck("★ 過了 5 秒才送第一個", len(tab.sent) == 1, str(tab.sent))
 
+    # ★★ 2026-09-02 實機：**機關被啟動過之後外觀編號會變**
+    #   （遺落之地 60335 廢棄機器人2 → 60301 門開關火）。位置幾乎重合、
+    #   而且只有那一個候選時要認得出來，並講出來。
     tab = make_tab([step], pos=(20.0, 20.0),
-                   props=[FakeProp(20.1, 20.2, 60999)])   # 外觀對不上
+                   props=[FakeProp(20.1, 20.2, 60999)])   # 同一格、外觀變了
     run(tab, 0.3)
-    ck("★ 找不到對應外觀 → 大聲停下（⛔ 絕不就近點一個）",
+    ck("★★ 外觀變了但位置對得上（只有一個候選）→ 照樣點得到",
+       tab._clicked and tab.run_cb.isChecked(), tab.status.text())
+    ck("　而且大聲講出外觀變了", "外觀從 60307 變成 60999" in tab.status.text(),
+       tab.status.text())
+    # ⛔ 但那個位置上有兩個候選就不准猜
+    tab = make_tab([step], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60999),
+                          FakeProp(20.2, 20.1, 60888)])
+    run(tab, 0.3)
+    ck("★ 同一格有兩個候選 → 大聲停下（⛔ 絕不猜）",
        not tab.run_cb.isChecked(), tab.status.text())
     ck("　訊息有講外觀編號", "60307" in tab.status.text(), tab.status.text())
+    # ⛔ 位置差很遠也不算同一個
+    tab = make_tab([step], pos=(20.0, 20.0),
+                   props=[FakeProp(22.5, 20.0, 60999)])
+    run(tab, 0.3)
+    ck("★ 只是「附近」但位置差 2.5 格 → 不當成同一個，停下來",
+       not tab.run_cb.isChecked(), tab.status.text())
 
     tab = make_tab([step], pos=(20.0, 20.0), props=[])
     dt.scenery.nearby = lambda *a, **k: None              # 讀不到
@@ -530,10 +548,16 @@ def main() -> int:
     # 附近沒有對應的傳點物件 → 只回報，⛔ 不就近送一個
     tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
                    pos=(50.0, 50.0))
-    tab.trigs = [FakeTrig(50.0, 50.0, 69999)]      # 外觀對不上
+    tab.trigs = [FakeTrig(53.0, 50.0, 69999)]      # 外觀不同、位置也差 3 格
     run(tab, 2.0)
-    ck("★ 外觀對不上 → ⛔ 不就近送一個", tab.portal_sent == [],
+    ck("★ 外觀不同、位置也對不上 → ⛔ 不就近送一個", tab.portal_sent == [],
        str(tab.portal_sent))
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(50.2, 50.1, 69999)]      # 同一格、外觀變了
+    run(tab, 0.3)
+    ck("★★ 傳點外觀變了但位置對得上 → 照樣打得到",
+       tab.portal_sent == [69999], str(tab.portal_sent))
 
     # 出口對不對得上（腳本記了 land 就要驗）
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
