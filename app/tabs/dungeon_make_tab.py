@@ -410,7 +410,8 @@ class DungeonMakeTab(BaseTab):
         self.poke_btn.clicked.connect(self._poke)
         th.addWidget(self.poke_btn)
         b = QPushButton("離開對話")
-        b.setToolTip("送出離開互動（不送的話伺服器會覺得你還在跟它講話）。")
+        b.setToolTip("把對話框關掉**並**送出離開互動。\n"
+                     "（不送離開的話伺服器會覺得你還在跟它講話，人會走不動。）")
         b.clicked.connect(self._leave)
         th.addWidget(b)
         # ★ 使用者 2026-09-02：「我們可以讀到傳送點物件，那能不能多一個按鈕
@@ -1328,13 +1329,23 @@ class DungeonMakeTab(BaseTab):
         self._refresh_menu()
 
     def _leave(self) -> None:
-        pid, _sc = self._cur()
+        """離開對話：**先把框從畫面上收掉**，再送離開互動。
+
+        ⚠ 使用者 2026-09-02 問「那我按鈕的離開對話會關視窗嗎」——本來不會。
+          `leave_npc` 是 0x22（告訴伺服器我不跟你講話了），畫面上那個框是
+          客戶端 UI 自己收的，要叫 Lua 的 `DestroyMessageWnd`（見 talkwnd）。
+          兩件事都做才是真的「離開對話」。
+        """
+        pid, sc = self._cur()
         if pid is None:
             return
         mv = self._mover(pid)
-        if mv is not None:
-            supply.leave_npc(mv)
-            self.status.setText("已送出離開互動")
+        if mv is None:
+            return
+        closed = talkwnd.close_window(mv, sc)
+        supply.leave_npc(mv)
+        self.status.setText("已關掉對話框並送出離開互動" if closed
+                            else "已送出離開互動（⚠ 對話框沒關成，再按一次）")
 
     def _save_talk(self) -> None:
         if self._poked is None:
