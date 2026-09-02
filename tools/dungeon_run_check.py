@@ -809,10 +809,22 @@ def main() -> int:
     wire(tab, never)
     clicks = []
     dt.produce.click = lambda *_a, **_k: (clicks.append(1), (True, "點了"))[1]
-    run(tab, dt.CLICK_RETRY * 2 + 1.0)
+    moved3 = []
+    tab._mover = type("M", (), {
+        "walk_near": lambda _s, _sc, _p, x, y, k: moved3.append(("near", k)),
+        "walk_exact": lambda _s, _sc, _p, x, y: moved3.append(("exact", 0.0)),
+    })()
+    dt.entity.is_walking = lambda _sc, _p: False
+    run(tab, dt.CLICK_RETRY * 4 + 1.0)
     ck(f"★★ 點了 {dt.CLICK_RETRY:.0f} 秒沒反應 → **再點一次**（不是點一次就不管）",
        len(clicks) >= 2, str(len(clicks)))
     ck("　而且還在跑（上限交給 STEP_TIMEOUT 大聲停）", tab.run_cb.isChecked())
+    # ★★ 使用者 2026-09-02：「如果點了沒反應要調整位置往對話物件靠上去」
+    ck("★★ 重點之前會**往物件靠上去**（站著硬點沒用）", bool(moved3),
+       str(moved3))
+    keeps = [k for _w, k in moved3]
+    ck("　一次比一次近", keeps == sorted(keeps, reverse=True), str(keeps))
+    ck("　最後直接穿過去（留 0 格）", 0.0 in keeps, str(keeps))
 
     # 收尾要把對話框從畫面上收掉（不然人會帶著框到處跑）
     closed = []

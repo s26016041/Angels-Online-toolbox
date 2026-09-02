@@ -140,6 +140,12 @@ TALK_SETTLE = 2
 #   跟補給點 NPC 那套「沒開就再點」同一個道理（見 supply 的 DIALOG_* 說明）。
 #   ⚠ 上限交給 STEP_TIMEOUT（90 秒）大聲停，不在這裡另外設。
 CLICK_RETRY = 6.0
+# ★★ 重點之前先**往那個物件靠上去**，一次比一次近，最後直接穿過去
+#   （使用者 2026-09-02：「如果點了沒反應要調整位置往對話物件靠上去」）。
+#   ⚠ 這是補給點 NPC 驗過的招（見 memory self-supply-buy：「確認沒開就往
+#     NPC 身上靠甚至穿過；站著點有一半機率白站，先動腳再點」）——
+#   站著不動一直重點是沒有用的。
+NUDGE_KEEP = (1.2, 0.6, 0.0)
 # 送了選項之後最多等這麼久還沒有下一頁 → 大聲停下。
 # ⛔ 這一段**不可以**用 TALK_SETTLE 那種「沒變就當結束」——伺服器回話本來
 #   就要時間，那樣會誤判成「對話結束但腳本還有選項沒送到」（使用者實遇）。
@@ -443,6 +449,7 @@ class DungeonTab(BaseTab):
         self._talk_did = ""          # 這一頁做過什麼（"opt"／"close"）
         self._talk_base = None       # 點下去那一刻的簽章（判「有沒有點到」）
         self._click_t = 0.0          # 點了多久還沒反應
+        self._nudge = 0              # 往物件靠上去第幾次了
         self._clicked = False        # 這一步的物件點過了嗎
         self._wait_left = 0.0
         self._last = None            # 最近一次掃描結果
@@ -1318,7 +1325,7 @@ class DungeonTab(BaseTab):
             self._menu_i = 0
             # ⚠ 那些全域關著也會留舊值（見 talkwnd）→ 簽章一直沒變＝沒點到。
             self._talk_sig = self._talk_base = (pg0.sig if pg0 else None)
-            self._talk_same, self._click_t = 0, 0.0
+            self._talk_same, self._click_t, self._nudge = 0, 0.0, 0
             self._talk_did = ""
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
@@ -1345,13 +1352,21 @@ class DungeonTab(BaseTab):
                 props = scenery.nearby(self._sc, (ax, ay), PROP_TOL) or []
                 hit = [p for p in props
                        if want_model is None or p.model == want_model]
-                if hit:
-                    ok, msg = produce.click(self._mover, self._sc, hit[0])
-                    self._say(f"第 {self._i + 1} 步　點了沒反應 → 再點一次"
-                              f"（{'送出' if ok else msg}）")
-                else:
+                if not hit:
                     self._say(f"第 {self._i + 1} 步　點了沒反應，"
                               f"而且現在找不到外觀 {want_model} —— 等下一輪")
+                    return
+                # ★ 先**調整站位往它靠上去**再點（站著硬點是沒用的）。
+                #   物件位置用**現場重讀的**那一個，不是腳本裡的舊座標。
+                tx, ty = hit[0].x, hit[0].y
+                keep = NUDGE_KEEP[min(self._nudge, len(NUDGE_KEEP) - 1)]
+                self._nudge += 1
+                how = (self._walk_onto(tx, ty) if keep <= 0
+                       else self._walk_beside(tx, ty, keep))
+                ok, msg = produce.click(self._mover, self._sc, hit[0])
+                self._say(f"第 {self._i + 1} 步　點了沒反應 → 靠近一點"
+                          f"（留 {keep:g} 格，{how}）再點"
+                          f"（{'送出' if ok else msg}）")
                 return
             self._say(f"第 {self._i + 1} 步　等對話出現…"
                       f"（{self._click_t:.0f}/{CLICK_RETRY:.0f} 秒）")
@@ -1445,6 +1460,7 @@ class DungeonTab(BaseTab):
         self._wait_left = 0.0
         self._empty_since = 0.0
         self._poke_t = 0.0            # 下一步的傳點要馬上補送第一次
+        self._nudge = 0               # 靠近重試的次數歸零
         self._nav.reset()
         self._refresh_steps()
 
