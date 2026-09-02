@@ -68,6 +68,17 @@ class FakeKeys:
     def __init__(self):
         self.on = None
         self.eid = None
+        self.player = None
+        self.pos = None
+        self.handoff = False
+        self.reach = 0.0
+        self.client_walk = False
+        self.mode = dt.MODE_PACKET
+        self.packets = False
+        self.skill = 0
+        self.mover = None
+        self.selected = False
+        self.min_range = 3.0
 
     def set_on(self, v):
         self.on = v
@@ -364,6 +375,18 @@ def main() -> int:
     ck("★ 有別隻的時候先挑別隻（不是黑名單，只是先換一隻）",
        tab._atk.picked is other,
        tab._atk.picked.name if tab._atk.picked else "沒挑")
+
+    # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
+    #   第二個病灶）：KeyWorker 拿它讀「我離目標多遠」，讀成 (0,0) 就每一招
+    #   都判超出射程 → 完全不出手。
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._player = 0x2000
+    tab._live_monsters = lambda: [FakeMon(x=12.0, y=10.0, eid=1)]
+    dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★★ 給 KeyWorker 的玩家位址＝實體本體，⛔ 不可以再 +8",
+       tab._keys.player == 0x2000, hex(tab._keys.player or 0))
 
     # 看門狗：一直在打卻半隻都沒殺掉 → 大聲停下（沒有黑名單就靠它兜底）
     tab = make_tab([{"do": "walk", "to": [50, 50]}])

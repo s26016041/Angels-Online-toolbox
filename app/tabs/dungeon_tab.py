@@ -729,7 +729,12 @@ class DungeonTab(BaseTab):
             return True
         d = _d(mp, me)
         self._keys.pos = (round(mp[0]), round(mp[1]))
-        self._keys.player = self._player + 8
+        # ⚠⚠ 跟 `_my_pos()` 同一個坑（2026-09-02 第二處）：`s.player` 已經是
+        #   實體本體，**不可以再 +8**。KeyWorker 拿它讀「我現在離目標多遠」
+        #   （`entity.read_pos(self.player)`）—— 讀成 (0,0) 的話每一招都會
+        #   判成「超出射程」而完全不出手，症狀就是「完全不打怪物」。
+        #   掛機頁是 `self._keys.player = self.player`（farm_tab），照它。
+        self._keys.player = self._player
         # 能交棒（整輪都是快捷鍵招式）就走到 12 格讓遊戲自己走過去打；
         # 不能交棒就自己走近一點，各招的射程由 KeyWorker 自己比。
         handoff = self._keys.handoff
