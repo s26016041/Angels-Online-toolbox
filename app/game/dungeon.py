@@ -210,8 +210,11 @@ class Script:
     steps: list[dict] = field(default_factory=list)
     saved_at: str = ""
     # ★ 進副本的入口傳送點（使用者 2026-09-02）。整份腳本共用一個，不是步驟：
-    #   {"scene": 71, "to": [x, y], "model": 60xxx, "land": [x, y]}
+    #   {"scene": 71, "to": [x, y], "model": 60xxx,
+    #    "menu": [1], "stand": [x, y], "gap": 1.5}
     #   scene ＝ **外面那張圖**的 map_key（站在那裡才撞得到入口）。
+    #   ★ 有 menu ＝ 門口要「點下去→選第 N 項」才進得去（使用者 2026-09-02）；
+    #     沒有 menu ＝ 踩上去就傳（打 0x0D）。
     entrance: dict = field(default_factory=dict)
 
     # -- 讀寫 ---------------------------------------------------------
@@ -357,6 +360,22 @@ def validate_entrance(ent) -> tuple[bool, str]:
     xy = ent.get("to")
     if not (isinstance(xy, list) and len(xy) == 2):
         return False, "少了 to:[x,y]（入口傳送點的位置）"
+    # ★ 有些副本門口是「點下去 → 選第 1 項」才進得去（使用者 2026-09-02），
+    #   不是踩上去就傳。有記 menu 就照對話走，沒記就當踩的傳點打 0x0D。
+    menu = ent.get("menu")
+    if menu is not None:
+        if not isinstance(menu, list):
+            return False, "menu 要是陣列"
+        for n in menu:
+            if not isinstance(n, int) or not 0 <= n <= MENU_MAX:
+                return False, f"入口的對話動作要 0~{MENU_MAX}（收到 {n}）"
+    st = ent.get("stand")
+    if st is not None and not (isinstance(st, list) and len(st) == 2):
+        return False, "stand 要是 [x,y]"
+    gap = ent.get("gap")
+    if gap is not None and (not isinstance(gap, (int, float))
+                            or not 0 < gap <= 30):
+        return False, f"選項間隔要在 0~30 秒（收到 {gap}）"
     for key in ("model",):
         v = ent.get(key)
         if v is not None and not isinstance(v, int):
@@ -375,8 +394,10 @@ def describe_entrance(ent: dict) -> str:
     x, y = ent.get("to", ["?", "?"])
     m = ent.get("model")
     who = f"　{mapobj.label(m)}" if isinstance(m, int) else ""
+    menu = ent.get("menu") or []
+    how = ("　對話 " + " → ".join(f"第{n}項" for n in menu if n)) if menu         else "　（踩上去就傳）"
     return (f"入口：{_scene.scene_name(ent.get('scene'))}"
-            f"（{ent.get('scene')}）({x}, {y}){who}")
+            f"（{ent.get('scene')}）({x}, {y}){who}{how}")
 
 
 def describe(step: dict) -> str:

@@ -432,7 +432,9 @@ class DungeonMakeTab(BaseTab):
             "把選到的物件記成**進副本的入口傳送點**（整份腳本一個，不是步驟）。\n"
             "會連「入口在哪一張圖」一起記起來。\n"
             "自動刷副本開跑時：人在副本裡就直接跑腳本；\n"
-            "人在入口那張圖就先走去撞它，撞不進去每 5 秒補送一次。")
+            "人在入口那張圖就先走去撞它，撞不進去每 5 秒補送一次。\n"
+            "★ 門口要「點下去→選第 1 項」才進得去的那種：先按「點點看」、\n"
+            "　 再按第 N 項，然後按這顆 —— 站位與選項路徑會一起記進去。")
         b.clicked.connect(self._set_entrance)
         th.addWidget(b)
         # ★ 場景標記點（TAG01/TAG02…）畫面上根本看不見，但照樣有互動 id，
@@ -941,10 +943,15 @@ class DungeonMakeTab(BaseTab):
         ⚠ 這不是步驟，所以**不受**「同一份腳本只能記同一張圖」那道閘限制：
           入口本來就在副本**外面**那張圖上。記的是當下這台分身站的那張圖。
         """
-        i = self.props.currentRow()
-        if not 0 <= i < len(self._props):
-            self.status.setText("先在清單裡選一個物件（那個入口傳送點）")
-            return
+        # ★ 剛「點點看」過就用那一個（連站位、選了第幾項一起記）——
+        #   有些副本門口是「點下去→選第 1 項」才進得去（使用者 2026-09-02）。
+        pr = self._poked
+        if pr is None:
+            i = self.props.currentRow()
+            if not 0 <= i < len(self._props):
+                self.status.setText("先在清單裡選一個物件（那個入口傳送點）")
+                return
+            pr = self._props[i]
         key, _grid = self._here_key()
         if key is None:
             self.status.setText("⚠ 讀不到目前場景，入口沒有記")
@@ -955,10 +962,17 @@ class DungeonMakeTab(BaseTab):
                 f"你現在就站在腳本那張圖「{scene.scene_name(key)}」裡面。\n"
                 "入口是**外面**那張圖上的傳送點 —— 先出去再記一次。")
             return
-        pr = self._props[i]
-        self._script.entrance = {"scene": key,
-                                 "to": [round(pr.x, 1), round(pr.y, 1)],
-                                 "model": pr.model}
+        ent = {"scene": key,
+               "to": [round(pr.x, 1), round(pr.y, 1)],
+               "model": pr.model}
+        if self._menu:
+            # 門口要選第幾項（0＝沒有選項那種頁跑的時候會自動過，不必記）
+            ent["menu"] = [n for n in self._menu if n]
+            ent["gap"] = round(self.gap_secs.value(), 1)
+        at = getattr(self, "_poked_at", None)
+        if at:
+            ent["stand"] = [round(at[0], 1), round(at[1], 1)]
+        self._script.entrance = ent
         self._refresh_stamp()
         self.status.setText(
             f"已記入口：{dungeon.describe_entrance(self._script.entrance)}"

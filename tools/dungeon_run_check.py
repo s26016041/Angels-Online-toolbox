@@ -943,6 +943,39 @@ def main() -> int:
     ck("　真的停住不動才重點", len(clicks2) >= 2, str(clicks2))
     dt.entity.is_walking = lambda _sc, _p: False
 
+    # ★★ 使用者 2026-09-02：「有一個副本門口進去還要選第一個選項才能進去」
+    ent2 = {"scene": 71, "to": [10, 20], "model": 60777, "menu": [1],
+            "stand": [11, 20], "gap": 0.2}
+    ok, why = dungeon.validate_entrance(ent2)
+    ck("★ 對話式入口格式合法", ok, why)
+    ck("　清單上看得出要選第幾項",
+       "第1項" in dungeon.describe_entrance(ent2),
+       dungeon.describe_entrance(ent2))
+    ck("　沒 menu 的照舊寫「踩上去就傳」",
+       "踩上去" in dungeon.describe_entrance(ent))
+    ck("★ menu 值不合法 → 擋下",
+       not dungeon.validate_entrance(
+           {"scene": 71, "to": [1, 2], "menu": [99]})[0])
+
+    fake = FakeTalk([(1, 2), ()])
+    tab = make_tab([{"do": "clear"}], pos=(11.0, 20.0),
+                   props=[FakeProp(10.0, 20.0, 60777)])
+    wire(tab, fake)
+    tab._script.scene = 76
+    tab._script.entrance = ent2
+    tab._phase = "enter"
+    dt.entity.is_walking = lambda _sc, _p: False
+    for _ in range(int(6.0 / TICK)):          # ⚠ 入口那條要直接叫 _go_entrance
+        if not tab.run_cb.isChecked():
+            break
+        tab._go_entrance(tab._my_pos(), TICK)
+    from app.game import supply as _sup3
+    ck("★★ 對話式入口 → 走對話（送第 1 項），不是打 0x0D",
+       tab.sent == [_sup3.talk_option(1)] and tab.portal_sent == [],
+       f"選項{tab.sent} 0x0D{tab.portal_sent}")
+    ck("　對話走完**不前進步驟**（要等場景真的變）",
+       tab._i == 0 and tab._phase == "enter", f"步{tab._i} {tab._phase}")
+
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
     tab._keys, tab._atk = FakeKeys(), FakeAtk()

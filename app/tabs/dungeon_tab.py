@@ -206,6 +206,8 @@ MIN_REGION = 20
 #   實測表裡 `地底廣場(LV70~80)副本進入點` 就是一個合法目的地。
 #   ⚠ 送出到人真的過去約 1 秒；這麼久還沒到就再送一次（跟撞入口一樣無限重試）。
 FLY_RESEND = 8.0
+# 入口對話走完之後等多久再點一次（沒進去的話）。
+ENTER_TALK_GAP = 3.0
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
 # ★★ 使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進傳送點
 #   封包」——所以站上去之後**主動送 0x0D**（`portal.enter`，就是遊戲自己
@@ -827,6 +829,20 @@ class DungeonTab(BaseTab):
         self._say(f"趴趴GO去「{self._fly.name}」（{why}）"
                   f"　已試 {self._fly_total / 60.0:.1f} 分鐘")
 
+    def _entrance_talked(self) -> None:
+        """入口那段對話走完了 —— **不前進步驟**，重來一輪等場景變。
+
+        真的進去了是靠 `_check_map_change()` 認的；對話走完卻還在外面
+        （選錯／伺服器拒收／副本有冷卻）就再點一次，跟撞入口一樣無限重試。
+        """
+        self._clicked = False
+        self._menu_i = 0
+        self._talk_sig = self._talk_base = None
+        self._talk_same, self._talk_did, self._nudge = 0, "", 0
+        self._click_t, self._click_best = 0.0, None
+        self._menu_t = ENTER_TALK_GAP
+        self._say("入口對話走完了，等看看有沒有進去…")
+
     def _go_entrance(self, me, dt: float) -> None:
         """還在外面：走去入口傳送點，撞進去。
 
@@ -849,6 +865,19 @@ class DungeonTab(BaseTab):
         #   的訊號，不是等一下就好）。
         mins = self._enter_t / 60.0
         tail = f"（已試 {mins:.1f} 分鐘）"
+        # ★★ 有些副本門口是「點下去 → 選第 1 項」才進得去（使用者 2026-09-02）
+        #   —— 記了 menu 就照對話那一套走（走站位、站穩才點、自動翻頁、
+        #   選項照記的送），不是打 0x0D。
+        #   ⚠ 走完對話**不前進步驟**：真的進去了是靠換圖偵測認的
+        #   （`_check_map_change` 會把 phase 轉成 "run"）。
+        if ent.get("menu"):
+            step = {"at": list(ent["to"]), "model": ent.get("model"),
+                    "menu": list(ent["menu"]), "gap": ent.get("gap")}
+            if ent.get("stand"):
+                step["stand"] = list(ent["stand"])
+            self._do_interact(step, me, dt, tag=f"進副本入口{tail}",
+                              finish=self._entrance_talked)
+            return
         if _d((gx, gy), me) > PORTAL_NEAR:
             if _d((gx, gy), me) <= NAV_DEAD:
                 note = self._walk_onto(gx, gy)
@@ -1265,7 +1294,17 @@ class DungeonTab(BaseTab):
         except Exception:                                # noqa: BLE001
             pass                       # 通知送不出去不該再把事情弄糟
 
-    def _do_interact(self, step: dict, me, dt: float) -> None:
+    def _do_interact(self, step: dict, me, dt: float,
+                     tag: str = "", finish=None) -> None:
+        """點一個物件並把對話走完。
+
+        `tag` ＝訊息前綴（不給就是「第 N 步」）；`finish` ＝走完之後做什麼
+        （不給就是進到下一步）—— 入口那種「點下去選第 1 項才進得去」的門口
+        也是走這一支（使用者 2026-09-02），只是走完不能前進步驟，
+        要等場景真的變了才算進去。
+        """
+        tag = tag or f"第 {self._i + 1} 步"
+        finish = finish or self._next
         ax, ay = step["at"]
         want_model = step.get("model")
         # ⚠ 先走到旁邊再點：太遠就發互動包＝人還沒到、對話先開，選項送出去
@@ -1287,7 +1326,7 @@ class DungeonTab(BaseTab):
                         self._blocked(dt, f"走不到對話站位 ({sx}, {sy})",
                                       (sx, sy))
                         return
-                self._say(f"第 {self._i + 1} 步　走去對話站位 ({sx:g}, {sy:g})"
+                self._say(f"{tag}　走去對話站位 ({sx:g}, {sy:g})"
                           f"　剩 {_d((sx, sy), me):.1f} 格　{note}"
                           f"　{self._mon_note()}")
                 return
@@ -1300,7 +1339,7 @@ class DungeonTab(BaseTab):
                 if self._nav.stuck and self._nav.stuck_reason == "grid":
                     self._blocked(dt, f"走不到對話點 ({ax}, {ay})", (ax, ay))
                     return
-            self._say(f"第 {self._i + 1} 步　走去對話點 ({ax}, {ay})"
+            self._say(f"{tag}　走去對話點 ({ax}, {ay})"
                       f"　剩 {_d((ax, ay), me):.1f} 格　{note}"
                       f"　{self._mon_note()}")
             return
@@ -1310,7 +1349,7 @@ class DungeonTab(BaseTab):
             # ★ 站穩了才點：走路中送互動包，人還沒到、對話開不起來
             #   （補給那邊同一條規矩「先走到位才發互動包」）。
             if self._busy_walking():
-                self._say(f"第 {self._i + 1} 步　還在走，站穩再點…")
+                self._say(f"{tag}　還在走，站穩再點…")
                 return
             props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
             if props is None:
@@ -1322,7 +1361,7 @@ class DungeonTab(BaseTab):
             if not hit:
                 # ⛔ 絕不「就近點一個」—— 點錯東西比不點危險。
                 self._stop(
-                    f"⛔ 第 {self._i + 1} 步：({ax}, {ay}) 附近 {PROP_TOL:.0f} "
+                    f"⛔ {tag}：({ax}, {ay}) 附近 {PROP_TOL:.0f} "
                     f"格內找不到外觀 {want_model} 的物件"
                     f"（找到 {len(props)} 個別的）—— 停下來")
                 return
@@ -1343,7 +1382,7 @@ class DungeonTab(BaseTab):
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
             self._menu_t = float(step.get("gap") or MENU_GAP)
-            self._say(f"第 {self._i + 1} 步　已點外觀 {hit[0].model}")
+            self._say(f"{tag}　已點外觀 {hit[0].model}")
             return
 
         # ★★★ 走對話（使用者 2026-09-02 定案）：
@@ -1365,7 +1404,7 @@ class DungeonTab(BaseTab):
             d_now = _d((ax, ay), me)
             if self._click_best is None or d_now < self._click_best - CLICK_PROGRESS:
                 self._click_best, self._click_t = d_now, 0.0
-                self._say(f"第 {self._i + 1} 步　遊戲正在走過去…"
+                self._say(f"{tag}　遊戲正在走過去…"
                           f"剩 {d_now:.1f} 格")
                 return
             self._click_t += gap
@@ -1375,7 +1414,7 @@ class DungeonTab(BaseTab):
                 hit = [p for p in props
                        if want_model is None or p.model == want_model]
                 if not hit:
-                    self._say(f"第 {self._i + 1} 步　點了沒反應，"
+                    self._say(f"{tag}　點了沒反應，"
                               f"而且現在找不到外觀 {want_model} —— 等下一輪")
                     return
                 # ★ 先**調整站位往它靠上去**再點（站著硬點是沒用的）。
@@ -1387,11 +1426,11 @@ class DungeonTab(BaseTab):
                 how = (self._walk_onto(tx, ty) if keep <= 0
                        else self._walk_beside(tx, ty, keep))
                 ok, msg = produce.click(self._mover, self._sc, hit[0])
-                self._say(f"第 {self._i + 1} 步　點了沒反應 → 靠近一點"
+                self._say(f"{tag}　點了沒反應 → 靠近一點"
                           f"（留 {keep:g} 格，{how}）再點"
                           f"（{'送出' if ok else msg}）")
                 return
-            self._say(f"第 {self._i + 1} 步　等對話出現…"
+            self._say(f"{tag}　等對話出現…"
                       f"（{self._click_t:.0f}/{CLICK_RETRY:.0f} 秒）")
             return
         if pg is None:
@@ -1400,10 +1439,10 @@ class DungeonTab(BaseTab):
                 n = menu[self._menu_i]
                 if sell.talk(self._mover, supply.talk_option(n)):
                     self._menu_i += 1
-                self._say(f"第 {self._i + 1} 步　讀不到對話狀態 → 照腳本送第 {n} 項")
+                self._say(f"{tag}　讀不到對話狀態 → 照腳本送第 {n} 項")
                 return
             supply.leave_npc(self._mover)
-            self._next()
+            finish()
             return
         # ⚠⚠ 這些全域**關掉對話還會留著**，所以一切以「簽章變了＝換頁了」為準：
         #   · 換頁了 → 上一個動作生效了（送出去的選項才算真的送到）
@@ -1421,47 +1460,47 @@ class DungeonTab(BaseTab):
             if pg.has_options:
                 if self._menu_i >= len(menu):
                     # ⛔ 跳出選項但腳本沒說要選哪一項 —— **絕不亂選**。
-                    self._stop(f"⛔ 第 {self._i + 1} 步：對話跳出 "
+                    self._stop(f"⛔ {tag}：對話跳出 "
                                f"{len(pg.options)} 個選項，"
                                f"但腳本沒有記要選第幾項 —— 停下來")
                     return
                 n = menu[self._menu_i]
                 if n not in pg.options:
-                    self._stop(f"⛔ 第 {self._i + 1} 步：腳本要選第 {n} 項，"
+                    self._stop(f"⛔ {tag}：腳本要選第 {n} 項，"
                                f"但這一頁只有 {list(pg.options)} —— 停下來")
                     return
                 if not sell.talk(self._mover, supply.talk_option(n)):
                     self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
                     return
                 self._talk_did = "opt"
-                self._say(f"第 {self._i + 1} 步　已送第 {n} 項"
+                self._say(f"{tag}　已送第 {n} 項"
                           f"（{self._menu_i + 1}/{len(menu)}）")
                 return
             if self._talk_same < TALK_SETTLE:
                 # ★ 先確認這一頁是「穩定的沒有選項」才按確定 —— 剛點下去的
                 #   那幾拍讀到的可能還是上一次的殘留（那些全域不會被清掉）。
-                self._say(f"第 {self._i + 1} 步　等對話出現…")
+                self._say(f"{tag}　等對話出現…")
                 return
             ok, why = talkwnd.close_page(self._mover, self._sc)
             self._talk_did = "close"
-            self._say(f"第 {self._i + 1} 步　沒有選項的那一頁 → 按確定"
+            self._say(f"{tag}　沒有選項的那一頁 → 按確定"
                       f"（{'送出' if ok else why}）")
             return
         # 動過了但畫面沒換頁 —— 分兩種情況，⛔ 不可以都當成「對話結束」
         if self._talk_did == "opt":
             if self._talk_same * gap >= TALK_WAIT:
-                self._stop(f"⛔ 第 {self._i + 1} 步：送了第 "
+                self._stop(f"⛔ {tag}：送了第 "
                            f"{menu[self._menu_i]} 項之後 {TALK_WAIT:.0f} 秒"
                            f"都沒有下一頁 —— 停下來")
                 return
-            self._say(f"第 {self._i + 1} 步　等對話回應…")
+            self._say(f"{tag}　等對話回應…")
             return
         if self._talk_same < TALK_SETTLE:
-            self._say(f"第 {self._i + 1} 步　等對話翻頁…")
+            self._say(f"{tag}　等對話翻頁…")
             return
         # 按了確定又沒有下一頁 ＝ 這段對話走完了
         if self._menu_i < len(menu):
-            self._stop(f"⛔ 第 {self._i + 1} 步：對話結束了，"
+            self._stop(f"⛔ {tag}：對話結束了，"
                        f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
                        f" —— 停下來（NPC 的對話跟腳本記的不一樣？）")
             return
@@ -1471,7 +1510,7 @@ class DungeonTab(BaseTab):
         #   畫面上那個框要叫 Lua 的 DestroyMessageWnd 才會收。
         talkwnd.close_window(self._mover, self._sc)
         supply.leave_npc(self._mover)
-        self._next()
+        finish()
 
     def _next(self) -> None:
         self._i += 1
