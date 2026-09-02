@@ -227,6 +227,30 @@ def main() -> int:
     run(tab, 0.8)
     ck("時間到 → 前進", tab._i == 1)
 
+    # ★ 使用者 2026-09-02：「休息要確認周圍沒有可以打到的怪物才能進入休息」
+    tab = make_tab([{"do": "wait", "secs": 1.0}, {"do": "clear"}])
+    tab._live_monsters = lambda: [FakeMon(x=11.0, y=10.0, eid=1)]
+    run(tab, 2.0)
+    ck("★★ 周圍還有走得到的怪 → 不進入休息，也不倒數",
+       tab._i == 0 and tab._wait_left == 0.0, tab.status.text())
+    ck("　訊息講得出原因", "先別休息" in tab.status.text(), tab.status.text())
+    tab._live_monsters = lambda: []
+    run(tab, 0.5)
+    ck("　清光了才開始數", tab._i == 0 and tab._wait_left > 0)
+    run(tab, 0.8)
+    ck("　數完才前進", tab._i == 1)
+
+    # 休息數到一半冒出怪 → 從頭數（不是接著數）
+    tab = make_tab([{"do": "wait", "secs": 2.0}, {"do": "clear"}])
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    run(tab, 1.0)
+    ck("休息數到一半", 0 < tab._wait_left < 2.0, str(tab._wait_left))
+    tab._live_monsters = lambda: [FakeMon(x=11.0, y=10.0, eid=2)]
+    dt.entity.read_pos = lambda _sc, _addr: (11.0, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 打起來 → 正在數的休息作廢（等清乾淨從頭數）",
+       tab._wait_left == 0.0, str(tab._wait_left))
+
     print("\n清怪步驟")
     tab = make_tab([{"do": "clear"}])
     run(tab, dt.CLEAR_SETTLE - 0.5)
@@ -283,10 +307,12 @@ def main() -> int:
        not tab.run_cb.isChecked(), tab.status.text())
 
     print("\n收工判定（使用者定：腳本跑完 ＋ 周圍沒怪）")
-    mons = [FakeMon()]
-    tab = make_tab([{"do": "wait", "secs": 0.2}], mons=mons)
+    # ⚠ 先在沒怪的情況下把腳本跑完（有怪的話「休息」根本不會開始數，
+    #   見上面「休息要確認周圍沒有可以打到的怪物」那一條）。
+    tab = make_tab([{"do": "wait", "secs": 0.2}])
     run(tab, 1.0)
     ck("腳本跑完了", tab._i >= 1)
+    tab._live_monsters = lambda: [FakeMon()]
     run(tab, dt.CLEAR_SETTLE + 1)
     ck("★ 還有怪 → 不算結束", tab.run_cb.isChecked() and not tab._done)
     tab._live_monsters = lambda: []

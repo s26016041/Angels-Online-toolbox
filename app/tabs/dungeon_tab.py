@@ -752,6 +752,9 @@ class DungeonTab(BaseTab):
             self._atk.attack(self._state, self._cur)
             self._keys.eid = self._cur.eid
             self._empty_since = 0.0
+            # ★ 打起來了 → 正在數的「休息」作廢，等清乾淨再從頭數
+            #   （使用者 2026-09-02：沒有可以打到的怪才算進入休息）。
+            self._wait_left = 0.0
         # 一直在打卻半隻都沒殺掉 → 大聲停下，不要無聲無息耗一整晚。
         self._nokill_t += dt
         if self._nokill_t > NO_PROGRESS:
@@ -850,6 +853,16 @@ class DungeonTab(BaseTab):
             return
 
         if kind == dungeon.WAIT:
+            # ★ 使用者 2026-09-02：「休息要確認周圍沒有可以打到的怪物
+            #   才能進入休息」——「休息」是拿來等機關／等對話準備好的，
+            #   一邊被打一邊倒數等於白等（而且倒數完就去點機關，人還在挨打）。
+            #   ⚠ 正常情況 `_fight` 已經擋在前面；這裡再明寫一次，
+            #   而且中途被打斷就**從頭數**（見 `_fight` 挑到目標時歸零）。
+            if self._targets():
+                self._wait_left = 0.0
+                self._say(f"第 {self._i + 1} 步　先別休息：周圍還有 "
+                          f"{len(self._targets())} 隻走得到的怪")
+                return
             if self._wait_left <= 0:
                 self._wait_left = float(step.get("secs", 1))
             self._wait_left -= dt

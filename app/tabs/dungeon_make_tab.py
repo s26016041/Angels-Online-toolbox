@@ -384,7 +384,8 @@ class DungeonMakeTab(BaseTab):
         self.wait_secs.setSuffix(" 秒")
         b = QPushButton("加入「休息」")
         b.setToolTip("在這裡停幾秒再做下一步。\n"
-                     "例如上一個機關剛講完話，馬上跟下一個講會被拒絕。")
+                     "例如上一個機關剛講完話，馬上跟下一個講會被拒絕。\n"
+                     "⚠ 周圍還有打得到的怪就不會開始數，清光才從頭數。")
         b.clicked.connect(
             lambda: self._add({"do": dungeon.WAIT,
                                "secs": round(self.wait_secs.value(), 1)}))
