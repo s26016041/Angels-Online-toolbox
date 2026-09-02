@@ -276,6 +276,7 @@ class DungeonMakeTab(BaseTab):
         self._rooms: dict = {}
         self._sizes: list[int] = []
         self._grid_key = None             # 畫出來那張圖的 map_key
+        self._poked_at = None             # 點下去那一刻我站在哪（存成 stand）
         self._props: list = []            # 上次掃到的可互動物件（附近，挑著點）
         self._props_all: list = []        # 繪製地圖時掃到的全部物件（畫紅點）
         self._pick = None                 # 在地圖上點到的格子
@@ -1235,6 +1236,11 @@ class DungeonMakeTab(BaseTab):
             self.status.setText(f"⚠ 點不下去：{msg}")
             return
         self._poked = prop
+        # ★ 記下**點下去的當下我站在哪**（使用者 2026-09-02：「跟 NPC 對話會
+        #   記錄我在哪個位置對話的，會走到那個位置才對話」）—— 比「靠近那個
+        #   物件」可靠得多：物件常常站在不可走的格上，而站位一定站得住
+        #   （你當時就站在那裡講到話）。
+        self._poked_at = self._me(sc)
         self._menu = []
         self._refresh_menu()
         self.save_talk.setEnabled(True)
@@ -1354,12 +1360,18 @@ class DungeonMakeTab(BaseTab):
         pr = self._poked
         # ⚠⚠ 只存位置與外觀。選定 id 的高 16 位是伺服器每次載入地圖重配的
         #   世代碼，存了下次進場一定失效（scenery.py 檔頭，2026-08-12 實機）。
-        self._add({"do": dungeon.INTERACT,
-                   "at": [round(pr.x, 1), round(pr.y, 1)],
-                   "model": pr.model,
-                   "menu": list(self._menu),
-                   "gap": round(self.gap_secs.value(), 1)})
+        step = {"do": dungeon.INTERACT,
+                "at": [round(pr.x, 1), round(pr.y, 1)],
+                "model": pr.model,
+                "menu": list(self._menu),
+                "gap": round(self.gap_secs.value(), 1)}
+        # ★ 站位：點下去那一刻的位置（讀不到就不寫，跑的時候退回「靠近物件」）
+        at = getattr(self, "_poked_at", None)
+        if at:
+            step["stand"] = [round(at[0], 1), round(at[1], 1)]
+        self._add(step)
         self._poked = None
+        self._poked_at = None
         self._menu = []
         self._refresh_menu()
         self.save_talk.setEnabled(False)

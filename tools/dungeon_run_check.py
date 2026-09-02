@@ -848,6 +848,40 @@ def main() -> int:
     run(tab, 0.4)
     ck("　真的靠近了才點下去", tab._clicked)
 
+    # ★★ 使用者 2026-09-02：「跟 NPC 對話會記錄我在哪個位置對話的，
+    #   會走到那個位置才對話」——有 stand 就以站位為準。
+    walked2 = []
+    st = {"do": "interact", "at": [20, 20], "model": 60307,
+          "stand": [24, 20], "menu": [1], "gap": 0.2}
+    ok, why = dungeon.validate(st)
+    ck("★ 帶站位的對話步驟合法", ok, why)
+    ck("　清單上看得到站位", "站位" in dungeon.describe(st),
+       dungeon.describe(st))
+    tab = make_tab([st], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    run(tab, 0.4)
+    ck("★★ 就算已經站在物件旁邊，也要先走到**記下來的站位**",
+       not tab._clicked and tab._nav.goal == (24, 20),
+       f"點了={tab._clicked} 走去={tab._nav.goal}")
+    tab._pos = [24.0, 20.0]
+    run(tab, 0.4)
+    ck("　到站位了才點下去", tab._clicked)
+
+    # 兩支走路分開：走到那一格 vs 走到旁邊留幾格
+    tab = make_tab([{"do": "clear"}])
+    moved = []
+    tab._mover = type("M", (), {
+        "walk_near": lambda _s, _sc, _p, x, y, k: moved.append(("near", x, y, k)),
+        "walk_exact": lambda _s, _sc, _p, x, y: moved.append(("exact", x, y)),
+    })()
+    dt.entity.is_walking = lambda _sc, _p: False
+    tab._walk_onto(5, 6)
+    tab._walk_beside(7, 8, 1.2)
+    ck("★ _walk_onto 走到那一格本身（不留距離）",
+       moved[0] == ("exact", 5, 6), str(moved))
+    ck("★ _walk_beside 才留距離", moved[1] == ("near", 7, 8, 1.2),
+       str(moved))
+
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
     tab._keys, tab._atk = FakeKeys(), FakeAtk()

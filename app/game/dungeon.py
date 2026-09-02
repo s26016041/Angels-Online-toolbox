@@ -27,8 +27,10 @@ r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
 
     {"do": "walk",     "to": [x, y]}                 走到這一格
     {"do": "interact", "at": [x, y], "model": 60307,  點那個物件，然後照順序
-                       "menu": [0, 1, 0]}             走完對話：0＝過掉沒有選項
-                                                      的那一頁、N＝送第 N 項
+                       "stand": [x, y],               送對話選項（N＝第 N 項）
+                       "menu": [1]}                   stand ＝**製作時我站在
+                                                      哪裡跟它講話**，跑的時候
+                                                      先走到那裡才點
     {"do": "clear"}                                  ⚠ 舊步驟，介面已不再產生
                                                      （清怪本來就是每一步的前提）
     {"do": "wait",     "secs": 3}                    單純等幾秒
@@ -318,6 +320,12 @@ def validate(step: dict) -> tuple[bool, str]:
         if gap is not None and (not isinstance(gap, (int, float))
                                 or not 0 < gap <= 30):
             return False, f"選項間隔要在 0~30 秒（收到 {gap}）"
+        # ★ 站位（使用者 2026-09-02：「跟 NPC 對話會記錄我在哪個位置對話的，
+        #   會走到那個位置才對話」）—— 比「靠近那個物件」可靠得多：物件常常
+        #   站在不可走的格上，而站位一定是可以站的（你當時就站在那）。
+        st = step.get("stand")
+        if st is not None and not (isinstance(st, list) and len(st) == 2):
+            return False, "stand 要是 [x,y]"
     elif kind == WAIT:
         s = step.get("secs")
         if not isinstance(s, (int, float)) or not 0 < s <= 600:
@@ -388,7 +396,9 @@ def describe(step: dict) -> str:
         #   東西（2026-09-02 使用者回報）。查不到就退回只顯示編號。
         who = mapobj.label(m) if isinstance(m, int) else f"外觀 {m}"
         gap = step.get("gap")
-        return (f"對話 ({x}, {y})　{who}{tail}"
+        st = step.get("stand")
+        where = f"　站位 ({st[0]:g}, {st[1]:g})" if st else ""
+        return (f"對話 ({x}, {y})　{who}{where}{tail}"
                 + (f"　間隔 {gap} 秒" if gap and menu else ""))
     if kind == CLEAR:
         return "清光周圍的怪"
