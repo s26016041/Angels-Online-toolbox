@@ -140,6 +140,10 @@ GRID_REFRESH = 2.0
 #   打不到就換一隻（有別隻的話），並**立刻重問一次地形**，不記時間。
 # 一直在打卻完全沒有進展這麼久 → 大聲停下（不無聲無息耗一整晚）。
 NO_PROGRESS = 180.0
+# 算出來的「我這一區」小於這麼多格就當錨點抓錯了（碎片區）→ 這一輪不篩選。
+# ⚠ 跟 dungeon.rooms() 的 min_cells 同一個道理：實測這張圖有 9/4/2 格的
+#   零星角落，錨在那上面會把整張圖的怪都判成走不到。
+MIN_REGION = 20
 
 
 def _d(a, b) -> float:
@@ -524,16 +528,30 @@ class DungeonTab(BaseTab):
         if grid is None:
             self._reach, self._reach_n = None, 0
             return
+        # ⚠⚠ 錨點要挑**最大的那一區**，不是「第一個問得到的」（2026-09-02
+        #   修「不打怪」的第三個病灶）：角色常常站在地形圖標成不可走的格上
+        #   （貼牆、石頭邊、剛落地），這時要問旁邊那圈；照順序取第一個問得到
+        #   的，很可能拿到一個幾格大的**碎片區**（實測這張圖有 9/4/2 格的
+        #   零星角落）—— 一旦 `_reach` 變成碎片，**每一隻怪都會被判成走不到**，
+        #   症狀就是「完全不理怪物，直接走點位」。
         got = grid.reachable(*cell)
         if got is None:
-            # 站在不可走格上（貼牆、剛落地）——問旁邊那圈，還是沒有就不過濾。
+            best = None
             for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
                            (1, 1), (1, -1), (-1, 1), (-1, -1)):
-                got = grid.reachable(cell[0] + dx, cell[1] + dy)
-                if got:
-                    break
+                cand = grid.reachable(cell[0] + dx, cell[1] + dy)
+                if cand and (best is None or len(cand) > len(best)):
+                    best = cand
+            got = best
         self._grid = grid
         if not got:
+            self._reach, self._reach_n = None, 0
+            return
+        if len(got) < MIN_REGION:
+            # 算出來只有幾格 ＝ 錨點多半錯了（碎片區）。⚠ 這種時候**不過濾**，
+            #   不要拿一個顯然不對的可達區把全部的怪都判掉（安全退化）。
+            self._say(f"⚠ 算出來的可走區只有 {len(got)} 格，看起來不對 "
+                      f"→ 這一輪不篩選怪物")
             self._reach, self._reach_n = None, 0
             return
         # 這一區的格數變了 ＝ 門開了／關了，講出來（使用者要看得到）
@@ -702,6 +720,13 @@ class DungeonTab(BaseTab):
             if not alive:
                 # ★ 問了一輪，**沒有任何一隻走得到** ＝ 這裡算殺光了
                 #   （使用者 2026-09-02 定的收斂條件）。
+                # ⚠ 但要**講出來**是「真的沒怪」還是「有怪但都走不到」——
+                #   不講的話就會出現使用者說的「不理怪物直接走點位」而
+                #   完全查不出原因（CLAUDE.md：不准安靜地做決定）。
+                skipped = len(self._live_monsters())
+                if skipped:
+                    self._say(f"周圍 {skipped} 隻怪**全部走不到**"
+                              f"（隔壁區／沒有路）→ 當作這裡清光了")
                 self._keys.set_on(False)
                 self._keys.eid = None
                 self._nokill_t = 0.0
@@ -767,7 +792,9 @@ class DungeonTab(BaseTab):
         if self._cur_t > GIVE_UP:
             self._give_up(f"打不到超過 {GIVE_UP:.0f} 秒")
             return True
-        self._say(f"打怪：{self._cur.name}　{d:.1f} 格　{note}")
+        left = len(alive)
+        self._say(f"打怪：{self._cur.name}　{d:.1f} 格　{note}"
+                  f"　（走得到的還有 {left} 隻）")
         return True
 
     def _drop_target(self) -> None:
@@ -819,6 +846,15 @@ class DungeonTab(BaseTab):
         if kind == dungeon.WALK:
             gx, gy = step["to"]
             if _d((gx, gy), me) <= ARRIVE:
+                # ★ 使用者 2026-09-02 定的規矩，這裡再明寫一次當保險：
+                #   「並且周圍（不含走不到的）沒有怪物才算是有走到點位」。
+                #   —— 正常情況 `_fight` 已經擋在前面了，但這一條是規格，
+                #   寫在完成判定裡才不會被別的改動不小心繞過去。
+                if self._targets():
+                    self._say(f"第 {self._i + 1} 步　已經站上點位，"
+                              f"但周圍還有 {len(self._targets())} 隻走得到的怪"
+                              f" —— 先清光才算到")
+                    return
                 self._nav.reset()
                 self._next()
                 return

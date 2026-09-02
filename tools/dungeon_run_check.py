@@ -407,17 +407,73 @@ def main() -> int:
     ck("　沒到時間不重讀（不要每拍讀一整張圖）", tab._maps.drops == 1)
     ck("　讀不到圖 → 可達集合是 None ＝不過濾", tab._reach is None)
 
+    # ★★ 錨點落在碎片區 → 不可以拿它去把全部的怪判掉（「完全不理怪物」的
+    #   第三個病灶）：站在不可走格上時要挑**最大**的鄰居區，而且太小就不篩。
+    big = {(x, 10) for x in range(20, 60)}       # 40 格的正經區域
+    tiny = {(5, 5), (5, 6), (6, 5)}              # 3 格碎片
+    tab = make_tab([{"do": "clear"}])
+    grid = FakeGrid(big | tiny)
+
+    def _reach(x, y):                            # 兩塊各自獨立的連通區
+        if (x, y) in big:
+            return set(big)
+        if (x, y) in tiny:
+            return set(tiny)
+        return None
+    grid.reachable = _reach
+    tab._maps = FakeMaps(grid)
+    tab._grid_t = 0.0
+    tab._refresh_grid((6.0, 6.0), TICK)          # 站在 (6,6)：不可走，鄰居有碎片
+    ck("★ 錨在碎片區上 → 不篩選（⛔ 不可以把整張圖的怪都判成走不到）",
+       tab._reach is None, str(tab._reach_n))
+    ck("　而且會講出來", "看起來不對" in tab.status.text(), tab.status.text())
+    tab._grid_t = 0.0
+    tab._refresh_grid((20.5, 10.5), TICK)        # 站在大區裡
+    ck("　站在正經區域裡就照常篩", tab._reach_n == len(big), str(tab._reach_n))
+
+    # 站在不可走格、旁邊同時有碎片和大區 → 要挑大的那一塊
+    tab = make_tab([{"do": "clear"}])
+    cells = {(10, 10), (10, 11)} | {(12, y) for y in range(5, 40)}
+    grid = FakeGrid(cells)
+    small, large = {(10, 10), (10, 11)}, {(12, y) for y in range(5, 40)}
+
+    def _reach2(x, y):
+        if (x, y) in small:
+            return set(small)
+        if (x, y) in large:
+            return set(large)
+        return None
+    grid.reachable = _reach2
+    tab._maps = FakeMaps(grid)
+    tab._grid_t = 0.0
+    tab._refresh_grid((11.0, 10.0), TICK)        # (11,10) 不可走，兩邊都是鄰居
+    ck("★ 站在牆上時挑**最大**的鄰居區，不是第一個問到的",
+       tab._reach_n == len(large), str(tab._reach_n))
+
+    # 走到點位但周圍還有走得到的怪 → 不算到（使用者明訂的規矩）
+    tab = make_tab([{"do": "walk", "to": [50, 50]}, {"do": "clear"}],
+                   pos=(50.0, 50.0))
+    tab._live_monsters = lambda: [FakeMon(x=51.0, y=50.0, eid=1)]
+    run(tab, 0.3)
+    ck("★★ 站上點位了但周圍還有走得到的怪 → 還不算到",
+       tab._i == 0, tab.status.text())
+    tab._live_monsters = lambda: []
+    run(tab, 0.2)
+    ck("　怪清光了才算到", tab._i == 1)
+
     # 門開了：同一區的格數變多 → 可達集合要跟著變（不然解完謎還說走不到）
     tab = make_tab([{"do": "clear"}])
-    tab._maps = FakeMaps(FakeGrid({(10, 10), (11, 10)}))
+    shut = {(x, 10) for x in range(10, 40)}          # 門關著：30 格
+    open_ = shut | {(x, 11) for x in range(10, 40)}  # 門開了：60 格
+    tab._maps = FakeMaps(FakeGrid(shut))
     tab._grid_t = 0.0
     tab._refresh_grid((10.0, 10.0), TICK)
-    ck("關著的時候只有 2 格", tab._reach_n == 2, str(tab._reach_n))
-    tab._maps.grid = FakeGrid({(10, 10), (11, 10), (12, 10), (13, 10)})
+    ck("關著的時候 30 格", tab._reach_n == 30, str(tab._reach_n))
+    tab._maps.grid = FakeGrid(open_)
     tab._grid_t = 0.0
     tab._refresh_grid((10.0, 10.0), TICK)
     ck("★ 門開了 → 重讀之後可達區真的變大（不必重開分頁）",
-       tab._reach_n == 4, str(tab._reach_n))
+       tab._reach_n == 60, str(tab._reach_n))
     ck("　而且會講出來", "地形變了" in tab.status.text(), tab.status.text())
 
     print("\n不認得的動作")
