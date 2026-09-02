@@ -48,7 +48,8 @@
 
 門會解開，這一秒走不到的怪下一秒可能就打得到。所以每一拍重新問一輪，
 打不到就換一隻（只有還有別隻時才跳過剛放棄的那隻），並立刻重讀地形。
-保險是看門狗：一直在打卻 `NO_PROGRESS` 秒都沒殺掉半隻 → 大聲停下。
+⛔ 而且**沒有任何「幾秒沒到就壞掉」的計時**（使用者 2026-09-02 定案）——
+慢就慢、卡住就一直試，出口是使用者自己取消勾選。
 
 ## 到點位跟自動戰鬥的先後（使用者 2026-09-02 定案）
 
@@ -96,7 +97,6 @@ from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.core.notifier import Notifier
 from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
                       move, navigate, portal, produce, quickbar, scene,
                       scenery, sell, skills, supply, talkwnd, terrain)
@@ -139,7 +139,6 @@ TALK_SETTLE = 2
 #   回報「最後一個石頭雕像點不到」）。點一次就不管是不對的：遊戲是「自己走
 #   過去才開對話」，路上被怪打斷、被人擋住、剛好在走都會讓那一下落空 ——
 #   跟補給點 NPC 那套「沒開就再點」同一個道理（見 supply 的 DIALOG_* 說明）。
-#   ⚠ 上限交給 STEP_TIMEOUT（90 秒）大聲停，不在這裡另外設。
 # ⚠ 使用者 2026-09-02：「對話沒有就沒有，等 6 秒幹嘛，就一直試一直動就好」
 #   —— 本來 6 秒才重試一次，等得太久。收到 1 秒。
 #   ⚠ 安全性不變：底下那條「**沒有更靠近才累加**」還在，所以遊戲正在自己
@@ -158,12 +157,6 @@ CLICK_PROGRESS = 0.5       # 離目標又近了這麼多格就算有進展
 #     NPC 身上靠甚至穿過；站著點有一半機率白站，先動腳再點」）——
 #   站著不動一直重點是沒有用的。
 NUDGE_KEEP = (1.2, 0.6, 0.0)
-# 送了選項之後最多等這麼久還沒有下一頁 → 大聲停下。
-# ⛔ 這一段**不可以**用 TALK_SETTLE 那種「沒變就當結束」——伺服器回話本來
-#   就要時間，那樣會誤判成「對話結束但腳本還有選項沒送到」（使用者實遇）。
-TALK_WAIT = 10.0
-# 這麼久還沒走到就當這一步卡住（大聲停下來，不要無聲無息耗著）。
-STEP_TIMEOUT = 90.0
 # 收工前要「連續這麼久都掃不到怪」才算真的沒怪了。
 # ⚠ 實體是跟著玩家串流進來的，一拍掃不到不代表沒有。
 CLEAR_SETTLE = 3.0
@@ -190,13 +183,6 @@ GRID_REFRESH = 2.0
 #     都問一輪沒有怪物能走到就算殺光」
 #   —— 因為門會解開，這一秒走不到的怪下一秒可能就打得到了。
 #   打不到就換一隻（有別隻的話），並**立刻重問一次地形**，不記時間。
-# 一直在打卻完全沒有進展這麼久 → 大聲停下（不無聲無息耗一整晚）。
-NO_PROGRESS = 180.0
-# ★★ 尋路說「沒有路」之後還要再等多久才放棄（秒）。⛔ 不可以馬上停：
-#   副本的門是**解謎才開**的（使用者 2026-09-02），這一秒沒有路不代表等一下
-#   沒有 —— 2026-09-02 實跑就是這樣停在第 4 步（按完火炬、門還沒開）。
-#   等的期間每一拍都重讀地形，門一開就走。
-UNREACH_GRACE = 25.0
 # 重要提示在狀態列上要停留幾秒（不然同一拍的走路訊息會馬上蓋掉）。
 NOTICE_SECS = 6.0
 # 算出來的「我這一區」小於這麼多格就當錨點抓錯了（碎片區）→ 這一輪不篩選。
@@ -219,10 +205,8 @@ PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開
 #     它自己**永遠不會送第二次**；我們主動送就沒有這個限制。
 # ⚠ 使用者 2026-09-02：「打太快了，5 秒打一次封包就好」——1 秒太密。
 PORTAL_POKE = 5.0          # 每幾秒對傳點主動送一次 0x0D
-PORTAL_TIMEOUT = 180.0     # 這麼久還沒被搬走 → 結束並通知
-#   ⚠⚠ 這個上限**只管副本裡面的傳點步驟**。「進副本的入口」是
-#   **無限重試、不通知**（使用者 2026-09-02 明令）—— 進不去是暫時性失敗
-#   （副本冷卻、門口有人擋），重試一定會過，見 `_go_entrance`。
+# ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
+#   壞掉，那個拔掉」）—— 傳點過不去就一直打，出口是取消勾選。
 
 
 def _d(a, b) -> float:
@@ -258,7 +242,6 @@ class DungeonTab(BaseTab):
         self._script = None
         self._keys = None            # KeyWorker
         self._atk = None             # TargetWorker
-        self._notifier = None        # 跳通知用（第一次要通知時才建）
         self._loading = False        # 正在把設定讀回畫面（這期間不要回存）
         self._qb_sc = None           # 技能鍵標名字用的 Reader（跟著分身換）
         self._qb_ui = None
@@ -579,7 +562,6 @@ class DungeonTab(BaseTab):
     def _reset_run(self) -> None:
         self._i = 0                  # 目前跑到第幾步
         self._step_t = 0.0           # 這一步跑多久了
-        self._slow_said = False      # 「這一步比較久」講過了沒
         self._menu_i = 0             # 對話選項送到第幾個
         self._menu_t = 0.0
         self._full_req_t = 0.0       # 補救全掃的節流
@@ -1204,12 +1186,6 @@ class DungeonTab(BaseTab):
             # ★ 打起來了 → 正在數的「休息」作廢，等清乾淨再從頭數
             #   （使用者 2026-09-02：沒有可以打到的怪才算進入休息）。
             self._wait_left = 0.0
-        # 一直在打卻半隻都沒殺掉 → 大聲停下，不要無聲無息耗一整晚。
-        self._nokill_t += dt
-        if self._nokill_t > NO_PROGRESS:
-            self._stop(f"⛔ 打了 {NO_PROGRESS:.0f} 秒一隻都沒殺掉 —— 停下來"
-                       f"（打不動？被卡住？）")
-            return True
 
         mp = entity.read_pos(self._sc, self._cur.addr)
         if mp is None:
@@ -1287,19 +1263,9 @@ class DungeonTab(BaseTab):
             self._unreach_t = 0.0
         self._blocked_last = False
         self._step_t += dt
-        # ★★ 使用者 2026-09-02：「STEP_TIMEOUT 改成不通知了，就這樣吧，
-        #   讓他靜默」——逾時**不再停機、也不再跳通知**，只在狀態列講一次
-        #   「這一步比較久」然後繼續試。
-        #   ⚠ 換來的代價講明白：真的卡死不會自己停，出口是使用者取消勾選
-        #     （跟撞入口那條同一套：[[transient-failure-auto-retry]]）。
-        #   ⚠ 也順手解掉「走 500 格的長路被 90 秒判成卡住」那個誤殺
-        #     （遺落之地實測第 5 步要走 533 格）。
-        cap = PORTAL_TIMEOUT if kind == dungeon.PORTAL else STEP_TIMEOUT
-        if self._step_t > cap and not self._slow_said:
-            self._slow_said = True
-            self._notify(f"第 {self._i + 1} 步「{dungeon.describe(step)}」"
-                         f"已經超過 {cap:.0f} 秒 —— 繼續試（不會自己停）")
-
+        # ⛔ 這裡**沒有逾時**（使用者 2026-09-02：「不會有『幾秒沒到就壞掉』，
+        #   那個拔掉」）—— 慢就慢（遺落之地一段路要走 533 格），
+        #   卡住就一直試，出口是使用者自己取消勾選。
         if kind == dungeon.CLEAR:
             # 怪已經在 _fight 清掉了，走到這裡就代表沒怪。
             # ⚠ 但要沉澱一下：實體是跟著玩家串流進來的，一拍掃不到不算數。
@@ -1425,30 +1391,19 @@ class DungeonTab(BaseTab):
         """人已經站在傳點上 —— **每 PORTAL_POKE 秒主動送一次 0x0D**。
 
         使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進
-        傳送點封包」。3 分鐘那道閘在 `_run_step` 開頭（`PORTAL_TIMEOUT`）。
+        傳送點封包」。⛔ 沒有上限，過不去就一直打。
         ⚠ 遊戲自己那支有去重欄（站著不動永遠不會送第二次，見 portal.py
           檔頭）—— 主動送就沒有這個限制，所以不必退開再走回來。
         """
         self._poke_t -= dt
-        left = PORTAL_TIMEOUT - self._step_t
+        mins = self._step_t / 60.0
         if self._poke_t > 0:
             self._say(f"第 {self._i + 1} 步　站在傳點上打封包…"
-                      f"（還有 {max(left, 0):.0f} 秒）")
+                      f"（已 {mins:.1f} 分鐘）")
             return
         self._poke_t = PORTAL_POKE
         note = self._send_portal(tuple(step["to"]), step.get("model"), "傳點")
-        self._say(f"第 {self._i + 1} 步　{note}…還有 {max(left, 0):.0f} 秒")
-
-    def _warn(self, msg: str) -> None:
-        """跳通知警告使用者（跟掛機頁同一套 Notifier）。"""
-        try:
-            if self._notifier is None:
-                self._notifier = Notifier(self, title="⚠ 自動刷副本")
-            who = self.who.currentText() or "副本"
-            note = self._notifier.fire(who, msg)
-            self.status.setText(self.status.text() + f"　[{note}]")
-        except Exception:                                # noqa: BLE001
-            pass                       # 通知送不出去不該再把事情弄糟
+        self._say(f"第 {self._i + 1} 步　{note}…已 {mins:.1f} 分鐘")
 
     def _do_interact(self, step: dict, me, dt: float,
                      tag: str = "", finish=None) -> None:
@@ -1640,12 +1595,9 @@ class DungeonTab(BaseTab):
             return
         # 動過了但畫面沒換頁 —— 分兩種情況，⛔ 不可以都當成「對話結束」
         if self._talk_did == "opt":
-            if self._talk_same * gap >= TALK_WAIT:
-                self._stop(f"⛔ {tag}：送了第 "
-                           f"{menu[self._menu_i]} 項之後 {TALK_WAIT:.0f} 秒"
-                           f"都沒有下一頁 —— 停下來")
-                return
-            self._say(f"{tag}　等對話回應…")
+            # ⛔ 不設上限（使用者定）：伺服器慢就慢，一直等。
+            self._say(f"{tag}　等對話回應…"
+                      f"（已 {self._talk_same * gap:.0f} 秒）")
             return
         if self._talk_same < TALK_SETTLE:
             self._say(f"{tag}　等對話翻頁…")
@@ -1667,7 +1619,6 @@ class DungeonTab(BaseTab):
     def _next(self) -> None:
         self._i += 1
         self._step_t = 0.0
-        self._slow_said = False
         self._unreach_t = 0.0
         self._blocked_last = False
         self._menu_i = 0
@@ -1770,23 +1721,17 @@ class DungeonTab(BaseTab):
         return f"走到旁邊（留 {keep:g} 格）"
 
     def _blocked(self, dt: float, what: str, goal=None) -> None:
-        """尋路說「現在沒有路」——**不要馬上停**，重讀地形等門開。
+        """尋路說「現在沒有路」——重讀地形繼續試。**永遠不會因此停機。**
 
-        ⛔ 副本的牆是解謎才打開的（使用者 2026-09-02：「地圖之間有可能會用
-          牆壁隔開，解謎之後會打開又會變成聯通」）。馬上停＝按完機關的那一拍
-          剛好還沒開門就整趟結束（2026-09-02 實跑真的踩到，停在第 4 步）。
+        ⛔ 副本的牆是解謎才打開的，而且使用者 2026-09-02 定案「不要幾秒沒到
+          就壞掉」——所以這裡只重讀地形＋回報，不設上限。
         """
         self._unreach_t += dt
         self._blocked_last = True
         self._grid_t = 0.0                    # 下一拍就重讀地形（門可能剛開）
-        if self._unreach_t > UNREACH_GRACE:
-            self._stop(f"⛔ 第 {self._i + 1} 步：{what} —— 等了 "
-                       f"{UNREACH_GRACE:.0f} 秒地形圖還是說沒有路。"
-                       f"{self._why_unreachable(goal)}")
-            return
         self._say(f"第 {self._i + 1} 步：{what} —— 現在沒有路，"
-                  f"重讀地形等門開…{self._unreach_t:.0f}/"
-                  f"{UNREACH_GRACE:.0f} 秒")
+                  f"重讀地形繼續試（已 {self._unreach_t / 60.0:.1f} 分鐘）"
+                  f"{self._why_unreachable(goal)}")
 
     def _why_unreachable(self, goal) -> str:
         """停下來時**把證據講出來**：那一格到底是牆，還是在別的區。

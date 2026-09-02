@@ -293,22 +293,20 @@ def main() -> int:
     run(tab, 0.2)
     ck("走到了 → 前進下一步", tab._i == 1)
 
-    # ★★ 「現在沒有路」⛔ **不可以馬上停**（2026-09-02 實跑踩到）：副本的門
-    #   是解謎才開的，按完機關的那一拍門還沒開就整趟結束。要重讀地形等門開，
-    #   等超過 UNREACH_GRACE 才大聲停。
+    # ★★ 「現在沒有路」⛔ **永遠不會因此停機**（使用者 2026-09-02：
+    #   「不會有『幾秒沒到就壞掉』，那個拔掉」）——重讀地形一直試。
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     tab._nav.stuck, tab._nav.stuck_reason = True, "grid"
     run(tab, 1.0)
-    ck("★★ 說走不到 → 先等門開，不馬上停",
-       tab.run_cb.isChecked() and "等門開" in tab.status.text(),
+    ck("★★ 說走不到 → 重讀地形繼續試，不停機",
+       tab.run_cb.isChecked() and "繼續試" in tab.status.text(),
        tab.status.text())
     ck("　會一直重讀地形（門一開就走）", tab._grid_t == 0.0)
-    run(tab, dt.UNREACH_GRACE + 1)
-    ck(f"★ 等超過 {dt.UNREACH_GRACE:.0f} 秒還是沒有路 → 大聲停下",
-       not tab.run_cb.isChecked(), tab.status.text())
-    ck("　訊息講得出是哪一步", "第 1 步" in tab.status.text(),
-       tab.status.text())
-    # 門開了（不再 stuck）→ 等待計時要歸零，不會被前面累積的秒數牽連
+    run(tab, 120.0)
+    ck("★★ 兩分鐘之後**照樣還在跑**（⛔ 沒有逾時這種東西）",
+       tab.run_cb.isChecked(), tab.status.text())
+    ck("　狀態列講得出等多久了", "分鐘" in tab.status.text(), tab.status.text())
+    # 門開了（不再 stuck）→ 等待計時要歸零
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     tab._nav.stuck, tab._nav.stuck_reason = True, "grid"
     run(tab, 5.0)
@@ -405,17 +403,14 @@ def main() -> int:
     ck("★ 物件清單讀不到 ≠ 沒有 → 繼續重試，不停機也不亂點",
        tab.run_cb.isChecked() and not tab._clicked, tab.status.text())
 
-    # ★★ 使用者 2026-09-02：「STEP_TIMEOUT 改成不通知了，讓他靜默」
-    print("\n卡住：靜默繼續，不停機也不通知")
+    # ★★ 使用者 2026-09-02：「不會有『幾秒沒到就壞掉』，那個拔掉」
+    print("\n卡住：一直試，沒有逾時這種東西")
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
-    fired0 = []
-    tab._warn = lambda msg: fired0.append(msg)
-    run(tab, dt.STEP_TIMEOUT + 2)
-    ck(f"★★ 一步超過 {dt.STEP_TIMEOUT:.0f} 秒 → **不停機**，繼續試",
+    run(tab, 200.0)
+    ck("★★ 一步卡了 200 秒 → **照樣還在跑**（沒有逾時）",
        tab.run_cb.isChecked(), tab.status.text())
-    ck("　也不跳通知", fired0 == [], str(fired0))
-    ck("　但狀態列講過一次「比較久」", "已經超過" in tab.status.text(),
-       tab.status.text())
+    ck("　也沒有跳通知這種東西（_warn 已經整支拿掉）",
+       not hasattr(tab, "_warn"))
 
     print("\n收工判定（使用者定：腳本跑完 ＋ 周圍沒怪）")
     # ⚠ 先在沒怪的情況下把腳本跑完（有怪的話「休息」根本不會開始數，
@@ -531,13 +526,10 @@ def main() -> int:
        len(poked) == 1, str(poked))
     run(tab, 1.5)
     ck(f"★ 過了 {dt.PORTAL_POKE:.0f} 秒才送第二次", len(poked) == 2, str(poked))
-    fired = []
-    tab._warn = lambda msg: fired.append(msg)
-    tab._step_t = dt.PORTAL_TIMEOUT + 1
+    tab._step_t = 600.0                    # 站了十分鐘
     run(tab, 0.2)
-    ck(f"★★ 傳點撐滿 {dt.PORTAL_TIMEOUT:.0f} 秒 → 一樣**不停機、不通知**",
-       tab.run_cb.isChecked() and fired == [],
-       f"勾著={tab.run_cb.isChecked()} 通知={fired}")
+    ck("★★ 傳點站了十分鐘 → 一樣**不停機**（沒有逾時、沒有通知）",
+       tab.run_cb.isChecked(), tab.status.text())
     # 那一格附近掃不到傳點 → 只回報，⛔ 不亂送
     tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
                    pos=(50.0, 50.0))
@@ -646,14 +638,7 @@ def main() -> int:
     ck("★★ 給 KeyWorker 的玩家位址＝實體本體，⛔ 不可以再 +8",
        tab._keys.player == 0x2000, hex(tab._keys.player or 0))
 
-    # 看門狗：一直在打卻半隻都沒殺掉 → 大聲停下（沒有黑名單就靠它兜底）
-    tab = make_tab([{"do": "walk", "to": [50, 50]}])
-    tab._keys, tab._atk = FakeKeys(), FakeAtk()
-    tab._live_monsters = lambda: [FakeMon(eid=5)]
-    tab._nokill_t = dt.NO_PROGRESS + 1
-    tab._fight((10.0, 10.0), TICK)
-    ck(f"★ 打了 {dt.NO_PROGRESS:.0f} 秒一隻都沒殺掉 → 大聲停下",
-       not tab.run_cb.isChecked(), tab.status.text())
+    # ⛔ 看門狗那一組拿掉了（使用者 2026-09-02：不要「幾秒沒到就壞掉」）
 
     # 地形圖要定期重讀（機關開門會就地改掉可走格）
     tab = make_tab([{"do": "clear"}])
@@ -788,7 +773,7 @@ def main() -> int:
     # ⛔⛔ 使用者 2026-09-02 明令：「無限嘗試不需要通知」
     fired = []
     tab._warn = lambda msg: fired.append(msg)
-    tab._enter_t = dt.PORTAL_TIMEOUT * 5          # 撞了 15 分鐘
+    tab._enter_t = 900.0                          # 撞了 15 分鐘
     poked.clear()
     for _ in range(int((dt.PORTAL_POKE + 0.5) / TICK)):
         tab._go_entrance((10.0, 20.0), TICK)
@@ -831,9 +816,10 @@ def main() -> int:
     ck("★★ 送了選項但對話還沒回 → **不可以**當成「對話結束」而停掉",
        tab.run_cb.isChecked(), tab.status.text())
     ck("　而且不會重複送同一項", len(tab.sent) == 1, str(tab.sent))
-    run(tab, dt.TALK_WAIT + 1.0)
-    ck(f"★ 真的等超過 {dt.TALK_WAIT:.0f} 秒才大聲停下",
-       not tab.run_cb.isChecked(), tab.status.text())
+    run(tab, 60.0)
+    ck("★★ 等了一分鐘也**不會停**（⛔ 沒有「幾秒沒到就壞掉」）",
+       tab.run_cb.isChecked(), tab.status.text())
+    ck("　還是只送過一次", len(tab.sent) == 1, str(tab.sent))
 
     # ★★ 使用者 2026-09-02：「最後一個石頭雕像他點不到」→ 點一次就不管是
     #   不對的（遊戲是自己走過去才開對話，路上被打斷那一下就落空）。
