@@ -169,6 +169,13 @@ class MapWindow(QDialog):
         b.setToolTip("自動算一個剛好把整張圖塞進視窗的縮放。")
         b.clicked.connect(self._fit)
         bar.addWidget(b)
+        # ★ 機關解開會把牆變成路（使用者 2026-09-02）——底圖是快取的，
+        #   開了門要按這顆才會重新讀地形、重新切區。
+        b = QPushButton("重讀地形")
+        b.setToolTip("重新讀一次記憶體裡的地形圖並重新切區。\n"
+                     "解開機關把門打開之後按這顆，牆才會變成路。")
+        b.clicked.connect(tab._draw)
+        bar.addWidget(b)
         self.live_cb = QCheckBox("即時更新")
         self.live_cb.setChecked(True)
         self.live_cb.setToolTip("每半秒重畫一次，角色走到哪裡地圖上就跟著動。")
@@ -798,6 +805,39 @@ class DungeonMakeTab(BaseTab):
         self._refresh_steps()
         self.steps.setCurrentRow(self.steps.count() - 1)
         self._say_map(f"已加入：{dungeon.describe(step)}")
+        self._warn_room()
+
+    def _warn_room(self) -> None:
+        """新加的這一步跟上一步在不在同一區？不同區又沒傳點就**提醒**。
+
+        ★ 副本是好幾塊互不相通的地方拼起來的（使用者 2026-09-02），跨區的
+          點位跑起來一定「走不到」——加的當下就講，不要等跑到一半才發現。
+        ⚠ 只是**提醒不是擋下**：機關解開會把牆變成路（使用者同日提醒
+          「解謎之後會打開又會變成聯通」），現在不通不代表跑的時候不通。
+        """
+        steps = self._script.steps
+        if not self._rooms or len(steps) < 2:
+            return
+        here = steps[-1].get("to") or steps[-1].get("at")
+        if not here:
+            return
+        prev = None
+        for st in reversed(steps[:-1]):
+            if st.get("do") == dungeon.PORTAL:
+                return                     # 中間有傳點：本來就會換區，不比
+            prev = st.get("to") or st.get("at")
+            if prev:
+                break
+        if not prev:
+            return
+        a = self._rooms.get((int(prev[0]), int(prev[1])))
+        b = self._rooms.get((int(here[0]), int(here[1])))
+        if a is None or b is None or a == b:
+            return                         # 有一邊在牆上／碎片區 → 判不出來
+        self._say_map(
+            f"⚠ 這一步在第 {b} 區，上一步在第 {a} 區 —— 兩區互不相通，"
+            "中間沒有「走進傳點」的話跑起來會走不到。"
+            "（如果是機關解開才會通的門，那就沒關係，跑的時候會重讀地形。）")
 
     def _add_here(self) -> None:
         _pid, sc = self._cur()

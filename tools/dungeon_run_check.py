@@ -54,6 +54,49 @@ class FakeNav:
         return "走路中"
 
 
+class FakeMon:
+    """最小的假怪：挑目標／可達過濾／收工判定只用到這幾個欄位。"""
+
+    def __init__(self, x=10.0, y=10.0, eid=1, name="怪", addr=0x3000):
+        self.x, self.y, self.eid, self.name, self.addr = x, y, eid, name, addr
+        self.dead = False
+
+
+class FakeKeys:
+    """最小的假出手執行緒：沒怪時 _fight 會叫 set_on(False)。"""
+
+    def __init__(self):
+        self.on = None
+        self.eid = None
+
+    def set_on(self, v):
+        self.on = v
+
+
+class FakeGrid:
+    """假地形：直接給一組可走格，reachable 就回那一組。"""
+
+    def __init__(self, cells):
+        self.cells = set(cells)
+
+    def reachable(self, x, y):
+        return set(self.cells) if (x, y) in self.cells else None
+
+
+class FakeMaps:
+    """假地形快取：記 drop() 被叫幾次（Cache 有 __slots__ 不能改方法）。"""
+
+    def __init__(self, grid=None):
+        self.grid = grid
+        self.drops = 0
+
+    def drop(self):
+        self.drops += 1
+
+    def get(self, _sc):
+        return self.grid
+
+
 class FakeProp:
     def __init__(self, x, y, model, oid=0x13920001):
         self.x, self.y, self.model, self.oid = x, y, model, oid
@@ -182,7 +225,7 @@ def main() -> int:
        not tab.run_cb.isChecked(), tab.status.text())
 
     print("\n收工判定（使用者定：腳本跑完 ＋ 周圍沒怪）")
-    mons = [object()]
+    mons = [FakeMon()]
     tab = make_tab([{"do": "wait", "secs": 0.2}], mons=mons)
     run(tab, 1.0)
     ck("腳本跑完了", tab._i >= 1)
@@ -234,6 +277,66 @@ def main() -> int:
        not tab._check_jump((50.0, 10.0)))
     tab._pos_prev = None
     ck("★ 第一拍沒有基準 → 不判", not tab._check_jump((50.0, 10.0)))
+
+    # ★★ 使用者 2026-09-02：「副本很容易掃到另一個地區的怪物無法到達」
+    #   「到點位不要跟自動戰鬥互卡，在殺怪物就不要跑點位，都沒怪到點位才算到」
+    print("\n打得到的怪才算數（副本是好幾塊互不相通的地方拼起來的）")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._reach = {(10, 10), (11, 10), (12, 10)}         # 我這一區只有這幾格
+    near = FakeMon(x=11.0, y=10.0, eid=1, name="同一區")
+    far = FakeMon(x=300.0, y=200.0, eid=2, name="隔壁區")
+    tab._live_monsters = lambda: [near, far]
+    got = [m.name for m in tab._targets()]
+    ck("★ 隔壁區的怪不算數（不然挑目標→走不到→再挑同一隻，無限迴圈）",
+       got == ["同一區"], str(got))
+    tab._reach = None                                    # 讀不到地形圖
+    ck("★ 讀不到地形圖 → 不過濾（安全退化，寧可多打也不要不出手）",
+       len(tab._targets()) == 2)
+
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._reach = {(10, 10)}
+    tab._keys = FakeKeys()
+    tab._live_monsters = lambda: [FakeMon(x=300.0, y=200.0, eid=9)]
+    ck("★ 只剩打不到的怪 → 不算在打怪，腳本照跑",
+       not tab._fight((10.0, 10.0), TICK))
+    run(tab, 0.3)
+    ck("　腳本真的動了（尋路往點位走）", tab._nav.goal == (50, 50),
+       str(tab._nav.goal))
+
+    # 放生：打不到就記黑名單，別下一拍又挑同一隻
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=11.0, y=10.0, eid=7, name="打不到的")
+    tab._live_monsters = lambda: [m]
+    tab._cur = m
+    ck("放生之前挑得到它", [x.eid for x in tab._targets()] == [7])
+    tab._give_up("測試")
+    ck("★ 打不到就放生，下一拍不會再挑同一隻（不然無限迴圈）",
+       m.eid in tab._skip and tab._targets() == [], str(tab._skip))
+    ck("　放生是有時效的，不是永久除名",
+       0 < tab._skip[m.eid] - time.monotonic() <= dt.SKIP_SECS)
+
+    # 地形圖要定期重讀（機關開門會就地改掉可走格）
+    tab = make_tab([{"do": "clear"}])
+    tab._maps = FakeMaps()
+    tab._grid_t = 0.0
+    tab._refresh_grid((10.0, 10.0), TICK)
+    ck("★ 時間到就重讀地形（門開了才跟得上）", tab._maps.drops == 1)
+    tab._refresh_grid((10.0, 10.0), TICK)
+    ck("　沒到時間不重讀（不要每拍讀一整張圖）", tab._maps.drops == 1)
+    ck("　讀不到圖 → 可達集合是 None ＝不過濾", tab._reach is None)
+
+    # 門開了：同一區的格數變多 → 可達集合要跟著變（不然解完謎還說走不到）
+    tab = make_tab([{"do": "clear"}])
+    tab._maps = FakeMaps(FakeGrid({(10, 10), (11, 10)}))
+    tab._grid_t = 0.0
+    tab._refresh_grid((10.0, 10.0), TICK)
+    ck("關著的時候只有 2 格", tab._reach_n == 2, str(tab._reach_n))
+    tab._maps.grid = FakeGrid({(10, 10), (11, 10), (12, 10), (13, 10)})
+    tab._grid_t = 0.0
+    tab._refresh_grid((10.0, 10.0), TICK)
+    ck("★ 門開了 → 重讀之後可達區真的變大（不必重開分頁）",
+       tab._reach_n == 4, str(tab._reach_n))
+    ck("　而且會講出來", "地形變了" in tab.status.text(), tab.status.text())
 
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])

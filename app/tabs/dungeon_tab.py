@@ -18,6 +18,28 @@
 讓遊戲自己走過去打；不能交棒就自己走到最遠那一招射程的九成，
 剩下的射程判斷交給 `KeyWorker`（它每一招各自比自己的射程）。
 
+## ⚠⚠ 副本＝好幾塊互不相通的地方拼起來，靠傳點連（使用者 2026-09-02 提醒）
+
+> 「副本很容易掃到另一個地區的怪物無法到達這點要注意」
+> 「副本是多個地圖組合再一起靠傳點連接這點要注意」
+
+實測吞噬之間 1 一張圖切出 **7 塊互不相通的區域**（最厚的牆超過 5 格）。
+怪物是**跟著玩家串流進來的**，隔壁區的怪照樣會出現在掃描結果裡 —— 沒有處理
+的話會變成：挑最近的一隻 → 尋路說到不了 → 換一隻 → 又挑到同一隻 →
+**永遠在挑目標，腳本一步都不會前進**（就是使用者說的「跟自動戰鬥互卡」）。
+
+所以出手之前先問地形圖：**只打「站在我這一區」的怪**（`Grid.reachable()`
+泛洪一次 6ms，只有換區才重算）。打不到的怪不算數 —— 不然「都沒怪才算到點位」
+這條規矩會被隔壁區的怪永遠卡住。
+⚠ 讀不到地形圖時**不過濾**（安全退化：寧可多打，不要因為讀不到就不出手）。
+
+## 到點位跟自動戰鬥的先後（使用者 2026-09-02 定案）
+
+> 「到點位不要跟自動戰鬥互卡，在殺怪物就不要跑點位，都沒怪到點位才算到」
+
+一拍只做一件事：**打得到的怪還有一隻就先打**（腳本完全不動），
+一隻都不剩了才跑腳本。所以「到點位」這件事天生就發生在沒怪的時候。
+
 ## 三種一定要大聲停下來的情況（CLAUDE.md：只准大聲停用或安全退化）
 
 1. **腳本跟眼前這張圖對不上**（場景編號或地圖指紋）→ 取消勾選並說原因。
@@ -84,6 +106,15 @@ JUMP_TILES = 3.0
 JUMP_MAX_GAP = 0.35
 # 傳到的位置跟腳本記的出口差這麼多格就當「傳到別的地方」，大聲停下。
 LAND_TOL = 8.0
+# ★★ 地形圖多久重讀一次（秒）。使用者 2026-09-02：
+#   「地圖之間有可能會用牆壁隔開，解謎之後會打開又會變成聯通，
+#     所以記憶體地圖要即時刷新」
+#   —— 機關開門會**就地改掉可走格**，而 terrain.Cache 的身分只看
+#   (地圖物件, 寬高, 場景編號, 列指標)，門開了那四樣全都沒變 → 不重讀就
+#   一直拿舊的牆算路。一次重讀 7~8ms，兩秒一次完全不痛。
+GRID_REFRESH = 2.0
+# 打不到的怪先放生這麼久（秒）再重新考慮 —— 不設就會一直挑同一隻。
+SKIP_SECS = 60.0
 
 
 def _d(a, b) -> float:
@@ -109,8 +140,10 @@ class DungeonTab(BaseTab):
         self._scan = ScanWorker()
         self._scan.done.connect(self._on_scan)
         self._scan.start()
-        self._nav = navigate.Navigator()
+        # ⚠ 尋路跟我們自己**共用同一份**地形快取：兩份的話門開了只有一邊
+        #   會跟上，另一邊拿舊的牆算路（使用者 2026-09-02 提醒門會開關）。
         self._maps = terrain.Cache()
+        self._nav = navigate.Navigator(self._maps)
         self._reset_run()
 
         root = QVBoxLayout(self)
@@ -333,6 +366,10 @@ class DungeonTab(BaseTab):
         self._pos_prev = None        # 上一拍的位置（順移偵測用）
         self._pos_t = 0.0
         self._jumped = False         # 這一拍有沒有順移
+        self._grid_t = 0.0           # 還有多久重讀地形圖
+        self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
+        self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
+        self._skip = {}              # 放生的怪 eid → 到什麼時候可以再考慮
 
     def _on_run_toggled(self, on: bool) -> None:
         if not on:
@@ -430,6 +467,77 @@ class DungeonTab(BaseTab):
             return []
         return [m for m in self._last.mons if not m.dead]
 
+    # -- 這一區走得到哪裡 ---------------------------------------------
+    def _refresh_grid(self, me, dt: float) -> None:
+        """定期重讀地形圖，並算出「我這一區」走得到哪些格子。
+
+        ★★ 為什麼要定期重讀（使用者 2026-09-02）：機關解開會**把牆變成路**，
+          但 `terrain.Cache` 的身分是 (地圖物件, 寬高, 場景編號, 列指標)，
+          門開了那四樣一個都沒變 —— 不主動丟快取就會一直拿舊的牆算路，
+          「解完謎卻說走不到」。所以每 GRID_REFRESH 秒 `drop()` 一次。
+        ⚠ 讀不到圖就把 `_reach` 設成 None ＝**不過濾**（安全退化）：
+          寧可多打幾隻打不到的，也不要因為讀不到圖就完全不出手。
+        """
+        self._grid_t -= dt
+        stale = self._grid_t <= 0
+        if stale:
+            self._grid_t = GRID_REFRESH
+            self._maps.drop()
+        cell = (int(me[0]), int(me[1]))
+        # 沒過期、而且我還站在上次算的那一區裡 → 直接沿用
+        if not stale and self._reach is not None and cell in self._reach:
+            return
+        grid = self._maps.get(self._sc)
+        if grid is None:
+            self._reach, self._reach_n = None, 0
+            return
+        got = grid.reachable(*cell)
+        if got is None:
+            # 站在不可走格上（貼牆、剛落地）——問旁邊那圈，還是沒有就不過濾。
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                           (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                got = grid.reachable(cell[0] + dx, cell[1] + dy)
+                if got:
+                    break
+        if not got:
+            self._reach, self._reach_n = None, 0
+            return
+        # 這一區的格數變了 ＝ 門開了／關了，講出來（使用者要看得到）
+        if self._reach is not None and len(got) != self._reach_n:
+            self._say(f"地形變了：這一區從 {self._reach_n} 格變成 {len(got)} 格"
+                      f"（機關開門？）")
+        self._reach, self._reach_n = got, len(got)
+
+    def _can_reach(self, pos) -> bool:
+        """那個位置走得到嗎。⚠ 沒有可達集合（讀不到圖）一律回 True＝不過濾。"""
+        if self._reach is None:
+            return True
+        x, y = int(pos[0]), int(pos[1])
+        if (x, y) in self._reach:
+            return True
+        # 怪可能站在不可走格上（貼牆、卡在門框）——旁邊一圈有路就算走得到。
+        return any((x + dx, y + dy) in self._reach
+                   for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+
+    def _targets(self) -> list:
+        """**現在打得到**的怪：活著、走得到、而且沒被放生。
+
+        ⛔ 隔壁區的怪不能算 —— 副本是好幾塊互不相通的地方拼起來的，算進去
+          就會「挑目標→尋路說到不了→再挑同一隻」無限迴圈，腳本一步都不動
+          （使用者 2026-09-02：「到點位不要跟自動戰鬥互卡」）。
+        """
+        now = time.monotonic()
+        return [m for m in self._live_monsters()
+                if self._skip.get(m.eid, 0.0) <= now
+                and self._can_reach((m.x, m.y))]
+
+    def _give_up(self, why: str) -> None:
+        """放生現在這一隻（一段時間內不再挑它），換下一隻。"""
+        if self._cur is not None:
+            self._skip[self._cur.eid] = time.monotonic() + SKIP_SECS
+            self._say(f"{why} → 先放生「{self._cur.name}」，換下一隻")
+        self._drop_target()
+
     # ------------------------------------------------------------------
     # 主迴圈
     # ------------------------------------------------------------------
@@ -462,7 +570,12 @@ class DungeonTab(BaseTab):
         if self._check_map_change():
             return
 
+        # ⓪-2 地形圖定期重讀（機關會開門）＋算出「我這一區」走得到哪裡
+        self._refresh_grid(me, dt)
+
         # ① 先處理怪 —— 使用者定的規矩：路上有怪先殺光再去點位
+        #    ⚠ 這裡回 True 就整拍不跑腳本 ＝「在殺怪就不跑點位」；
+        #      回 False 代表**打得到的怪一隻都不剩**，才輪到腳本。
         if self._fight(me, dt):
             return
 
@@ -524,8 +637,12 @@ class DungeonTab(BaseTab):
 
     # -- 打怪 ---------------------------------------------------------
     def _fight(self, me, dt: float) -> bool:
-        """有怪就打。回 True＝這一拍在打怪，腳本先不動。"""
-        alive = self._live_monsters()
+        """**打得到的**怪還有就打。回 True＝這一拍在打怪，腳本先不動。
+
+        ⛔ 打不到的（隔壁區、地形圖說沒有路）不算數 —— 算進去的話
+          「都沒怪才算到點位」就會被永遠卡住（使用者 2026-09-02）。
+        """
+        alive = self._targets()
         if self._cur is not None:
             still = next((m for m in alive if m.eid == self._cur.eid), None)
             if still is None:
@@ -572,8 +689,9 @@ class DungeonTab(BaseTab):
                                   mp[0], mp[1])
             self._keys.set_on(False)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
-                # 地形圖說到不了 → 換一隻，別耗著。
-                self._drop_target()
+                # 地形圖說到不了 → 放生（⚠ 一定要記黑名單，不然下一拍又
+                # 挑到同一隻＝無限迴圈，腳本永遠不會前進）。
+                self._give_up("地形圖說走不到")
                 return True
         else:
             self._nav.reset()
@@ -581,9 +699,7 @@ class DungeonTab(BaseTab):
             note = "出手中"
         self._cur_t += dt
         if self._cur_t > GIVE_UP:
-            self._drop_target()
-            self._say(f"打不到「{self._cur.name if self._cur else '?'}」"
-                      f"超過 {GIVE_UP:.0f} 秒 → 換下一隻")
+            self._give_up(f"打不到超過 {GIVE_UP:.0f} 秒")
             return True
         self._say(f"打怪：{self._cur.name}　{d:.1f} 格　{note}")
         return True
@@ -752,8 +868,12 @@ class DungeonTab(BaseTab):
         self._refresh_steps()
 
     def _finish(self, dt: float) -> None:
-        """腳本跑完了 —— 還要**周圍沒有任何怪物**才算這一趟結束。"""
-        if self._live_monsters():
+        """腳本跑完了 —— 還要**周圍沒有打得到的怪**才算這一趟結束。
+
+        ⚠ 用 `_targets()` 不是 `_live_monsters()`：隔壁區有一隻永遠打不到的
+          怪就會讓這一趟永遠收不了工。
+        """
+        if self._targets():
             self._empty_since = 0.0
             return
         self._empty_since += dt
