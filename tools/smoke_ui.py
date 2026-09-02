@@ -66,6 +66,20 @@ def main() -> int:
             bad.append((name, traceback.format_exc()))
             print(f"✘ {name}：{type(exc).__name__}: {exc}")
 
+    # ⚠⚠ 分頁自己寫的 closeEvent **永遠不會被呼叫**（2026-09-02 真的踩到）：
+    #   分頁是 QTabWidget 裡的子視窗，Qt 不對它發 close 事件；關閉走的是
+    #   MainWindow.closeEvent → 逐個 tab.on_close()。寫成 closeEvent 等於
+    #   沒收尾 → 「QThread: Destroyed while thread '' is still running」，
+    #   嚴重時 0xC0000409 直接當掉。所以這裡直接擋下來。
+    for i in range(n):
+        page = tabs.widget(i)
+        if "closeEvent" in type(page).__dict__:
+            bad.append((tabs.tabText(i) + " closeEvent",
+                        "分頁不可以自己寫 closeEvent（Qt 不會呼叫它）——"
+                        "收尾請改寫 on_close()。"))
+            print(f"✘ {tabs.tabText(i)}：寫了 closeEvent，Qt 不會呼叫 → "
+                  f"改成 on_close()")
+
     # 收尾：每個分頁的 on_close 也要能跑（會停執行緒、還原 hook）
     for i in range(n):
         page = tabs.widget(i)

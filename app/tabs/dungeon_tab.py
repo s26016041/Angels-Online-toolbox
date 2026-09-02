@@ -29,16 +29,36 @@
 **永遠在挑目標，腳本一步都不會前進**（就是使用者說的「跟自動戰鬥互卡」）。
 
 所以出手之前先問地形圖：**只打「站在我這一區」的怪**（`Grid.reachable()`
-泛洪一次 6ms，只有換區才重算）。打不到的怪不算數 —— 不然「都沒怪才算到點位」
-這條規矩會被隔壁區的怪永遠卡住。
+泛洪一次 6ms）。打不到的怪不算數 —— 不然「都沒怪才算到點位」這條規矩
+會被隔壁區的怪永遠卡住。
+
+⚠⚠ **不能用距離判**（使用者 2026-09-02 特別提醒）：
+
+> 「怪物可能跟我只有隔一牆但距離只有 3~2 格，這種的要注意排除」
+
+判的是「它站的那一格在不在我這一區」。而且怪站在**可走格**上卻不在我這一區
+時就直接排除，⛔ 不可以再看它旁邊那一圈 —— 隔一格薄牆的怪，鄰居格很容易
+剛好落在我這一區，那樣就會把隔牆的怪誤判成打得到（見 `_can_reach`）。
 ⚠ 讀不到地形圖時**不過濾**（安全退化：寧可多打，不要因為讀不到就不出手）。
+
+⛔ **不記黑名單**（使用者同日明令）：
+
+> 「不要加黑名單，一直問能不能走到他那邊就好，
+>   都問一輪沒有怪物能走到就算殺光」
+
+門會解開，這一秒走不到的怪下一秒可能就打得到。所以每一拍重新問一輪，
+打不到就換一隻（只有還有別隻時才跳過剛放棄的那隻），並立刻重讀地形。
+保險是看門狗：一直在打卻 `NO_PROGRESS` 秒都沒殺掉半隻 → 大聲停下。
 
 ## 到點位跟自動戰鬥的先後（使用者 2026-09-02 定案）
 
 > 「到點位不要跟自動戰鬥互卡，在殺怪物就不要跑點位，都沒怪到點位才算到」
+> 「跑路徑的時候要把周圍怪物殺光（不包含無法到達的），要周圍完全沒有
+>   怪物才可以繼續跑」
 
-一拍只做一件事：**打得到的怪還有一隻就先打**（腳本完全不動），
-一隻都不剩了才跑腳本。所以「到點位」這件事天生就發生在沒怪的時候。
+一拍只做一件事：**走得到的怪還有一隻就先打**（腳本完全不動），
+問了一輪一隻都走不到才跑腳本。所以「到點位」這件事天生就發生在
+「周圍走得到的怪都清光」的時候。
 
 ## 三種一定要大聲停下來的情況（CLAUDE.md：只准大聲停用或安全退化）
 
@@ -113,8 +133,13 @@ LAND_TOL = 8.0
 #   (地圖物件, 寬高, 場景編號, 列指標)，門開了那四樣全都沒變 → 不重讀就
 #   一直拿舊的牆算路。一次重讀 7~8ms，兩秒一次完全不痛。
 GRID_REFRESH = 2.0
-# 打不到的怪先放生這麼久（秒）再重新考慮 —— 不設就會一直挑同一隻。
-SKIP_SECS = 60.0
+# ⛔ **沒有黑名單**（使用者 2026-09-02 明令）：
+#   「不要加黑名單，一直問能不能走到他那邊就好，
+#     都問一輪沒有怪物能走到就算殺光」
+#   —— 因為門會解開，這一秒走不到的怪下一秒可能就打得到了。
+#   打不到就換一隻（有別隻的話），並**立刻重問一次地形**，不記時間。
+# 一直在打卻完全沒有進展這麼久 → 大聲停下（不無聲無息耗一整晚）。
+NO_PROGRESS = 180.0
 
 
 def _d(a, b) -> float:
@@ -369,7 +394,9 @@ class DungeonTab(BaseTab):
         self._grid_t = 0.0           # 還有多久重讀地形圖
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
-        self._skip = {}              # 放生的怪 eid → 到什麼時候可以再考慮
+        self._grid = None            # 上次讀到的地形圖（判斷怪站的是不是可走格）
+        self._last_gave_up = None    # 剛放棄的那一隻（有別隻時先挑別隻）
+        self._nokill_t = 0.0         # 一直在打卻沒殺掉半隻多久了
 
     def _on_run_toggled(self, on: bool) -> None:
         if not on:
@@ -499,6 +526,7 @@ class DungeonTab(BaseTab):
                 got = grid.reachable(cell[0] + dx, cell[1] + dy)
                 if got:
                     break
+        self._grid = grid
         if not got:
             self._reach, self._reach_n = None, 0
             return
@@ -509,33 +537,48 @@ class DungeonTab(BaseTab):
         self._reach, self._reach_n = got, len(got)
 
     def _can_reach(self, pos) -> bool:
-        """那個位置走得到嗎。⚠ 沒有可達集合（讀不到圖）一律回 True＝不過濾。"""
+        """那個位置**現在**走得到嗎（每次都重新問，⛔ 不記黑名單）。
+
+        ⚠⚠ 使用者 2026-09-02 特別提醒的坑：
+        > 「怪物可能跟我只有隔一牆但距離只有 3~2 格，這種的要注意排除」
+
+        所以判定是「它站的那一格在不在**我這一區**」，**不是**看距離：
+        · 怪站在可走格上但不在我的可達集合裡 → **隔壁區，直接排除**
+          （⛔ 這裡不可以再看它旁邊那一圈 —— 隔一格薄牆的怪，鄰居格很可能
+            剛好落在我這一區，那樣就會把「隔牆的怪」誤判成打得到）。
+        · 怪站在**不可走格**上（貼牆、卡在門框、飛行怪）→ 它本來就不會在
+          任何一區裡，這時才看旁邊一圈有沒有我走得到的格子。
+        ⚠ 沒有可達集合（讀不到地形圖）一律回 True＝不過濾（安全退化）。
+        """
         if self._reach is None:
             return True
         x, y = int(pos[0]), int(pos[1])
         if (x, y) in self._reach:
             return True
-        # 怪可能站在不可走格上（貼牆、卡在門框）——旁邊一圈有路就算走得到。
+        if self._grid is not None and self._grid.walkable(x, y):
+            return False              # 站在可走格卻不在我這一區 ＝ 隔壁區
         return any((x + dx, y + dy) in self._reach
                    for dx in (-1, 0, 1) for dy in (-1, 0, 1))
 
     def _targets(self) -> list:
-        """**現在打得到**的怪：活著、走得到、而且沒被放生。
+        """**現在**走得到的活怪。每一拍重新問一輪，⛔ 不記黑名單。
 
-        ⛔ 隔壁區的怪不能算 —— 副本是好幾塊互不相通的地方拼起來的，算進去
-          就會「挑目標→尋路說到不了→再挑同一隻」無限迴圈，腳本一步都不動
-          （使用者 2026-09-02：「到點位不要跟自動戰鬥互卡」）。
+        使用者 2026-09-02 定案：
+        > 「不要加黑名單，一直問能不能走到他那邊就好，
+        >   都問一輪沒有怪物能走到就算殺光」
+
+        —— 門會解開，這一秒走不到的怪下一秒可能就打得到了；記黑名單會讓
+        它在名單過期前一直被忽略。
         """
-        now = time.monotonic()
         return [m for m in self._live_monsters()
-                if self._skip.get(m.eid, 0.0) <= now
-                and self._can_reach((m.x, m.y))]
+                if self._can_reach((m.x, m.y))]
 
     def _give_up(self, why: str) -> None:
-        """放生現在這一隻（一段時間內不再挑它），換下一隻。"""
+        """這一隻先放著，換一隻打。⛔ 不記黑名單，只是**立刻重問一次地形**。"""
         if self._cur is not None:
-            self._skip[self._cur.eid] = time.monotonic() + SKIP_SECS
-            self._say(f"{why} → 先放生「{self._cur.name}」，換下一隻")
+            self._last_gave_up = self._cur.eid
+            self._say(f"{why} → 先換一隻（「{self._cur.name}」等一下再問）")
+        self._grid_t = 0.0            # 下一拍就重讀地形＋重算可達區
         self._drop_target()
 
     # ------------------------------------------------------------------
@@ -651,15 +694,28 @@ class DungeonTab(BaseTab):
                 self._cur = still
         if self._cur is None:
             if not alive:
+                # ★ 問了一輪，**沒有任何一隻走得到** ＝ 這裡算殺光了
+                #   （使用者 2026-09-02 定的收斂條件）。
                 self._keys.set_on(False)
                 self._keys.eid = None
+                self._nokill_t = 0.0
+                self._last_gave_up = None
                 return False
-            # 最近的一隻。⚠ 走不走得到交給 Navigator 判斷，這裡只挑近的。
-            self._cur = min(alive, key=lambda m: _d((m.x, m.y), me))
+            # 剛放棄的那一隻先跳過 —— 但**只有在還有別隻的時候**。
+            # ⛔ 不是黑名單：只剩它一隻就照樣再問一次（門可能開了）。
+            pool = [m for m in alive if m.eid != self._last_gave_up] or alive
+            # 最近的一隻。⚠ 走不走得到已經在 _targets() 問過了。
+            self._cur = min(pool, key=lambda m: _d((m.x, m.y), me))
             self._cur_t = 0.0
             self._atk.attack(self._state, self._cur)
             self._keys.eid = self._cur.eid
             self._empty_since = 0.0
+        # 一直在打卻半隻都沒殺掉 → 大聲停下，不要無聲無息耗一整晚。
+        self._nokill_t += dt
+        if self._nokill_t > NO_PROGRESS:
+            self._stop(f"⛔ 打了 {NO_PROGRESS:.0f} 秒一隻都沒殺掉 —— 停下來"
+                       f"（打不動？被卡住？）")
+            return True
 
         mp = entity.read_pos(self._sc, self._cur.addr)
         if mp is None:
@@ -689,8 +745,7 @@ class DungeonTab(BaseTab):
                                   mp[0], mp[1])
             self._keys.set_on(False)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
-                # 地形圖說到不了 → 放生（⚠ 一定要記黑名單，不然下一拍又
-                # 挑到同一隻＝無限迴圈，腳本永遠不會前進）。
+                # 地形圖說到不了 → 換一隻，並立刻重問一次地形（門可能開了）。
                 self._give_up("地形圖說走不到")
                 return True
         else:
@@ -718,6 +773,8 @@ class DungeonTab(BaseTab):
 
     def _on_died(self, eid, _confirmed) -> None:
         if self._cur is not None and self._cur.eid == eid:
+            self._nokill_t = 0.0          # 有進展了 → 看門狗歸零
+            self._last_gave_up = None
             self._drop_target()
 
     # -- 跑腳本 -------------------------------------------------------
@@ -898,11 +955,20 @@ class DungeonTab(BaseTab):
         self.status.setText(text)
 
     # ------------------------------------------------------------------
-    def closeEvent(self, ev) -> None:                    # noqa: N802
+    def on_close(self) -> None:
+        """應用程式關閉前的收尾。
+
+        ⚠⚠ **一定要是 `on_close()` 不是 `closeEvent()`**：分頁是塞在
+          QTabWidget 裡的子視窗，Qt 根本不會對它發 close 事件 —— 主視窗
+          關閉時走的是 `MainWindow.closeEvent` → 逐個 `tab.on_close()`。
+          寫成 closeEvent 等於沒收尾，掃描執行緒還在跑就被解構，
+          Qt 丟「QThread: Destroyed while thread '' is still running」，
+          嚴重時直接 0xC0000409 當掉（跟自我監察那條同一個坑）。
+        """
+        self._timer.stop()
         self._stop(quiet=True)
         self._scan.stop()
         self._scan.wait(800)
         for sc in self._scanners.values():
             sc.close()
         self._scanners.clear()
-        super().closeEvent(ev)

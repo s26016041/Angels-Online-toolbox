@@ -1232,9 +1232,14 @@ class DungeonMakeTab(BaseTab):
         self.save_talk.setEnabled(False)
 
     # ------------------------------------------------------------------
-    def closeEvent(self, ev) -> None:                    # noqa: N802
+    def on_close(self) -> None:
+        """應用程式關閉前的收尾（⚠ 是 on_close 不是 closeEvent，見 dungeon_tab）。"""
+        self._poke_timer.stop()
         self._pw_timer.stop()
         self._pw = None
+        if self._big is not None:
+            self._big._timer.stop()      # 地圖視窗每半秒重畫，要停掉
+            self._big.close()
         # ★ 用 release() 不要 stop()：跳板是同一個 PID 共用的。
         for pid in list(self._movers):
             try:
@@ -1245,4 +1250,3 @@ class DungeonMakeTab(BaseTab):
         for sc in self._scanners.values():
             sc.close()
         self._scanners.clear()
-        super().closeEvent(ev)

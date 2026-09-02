@@ -72,15 +72,46 @@ class FakeKeys:
     def set_on(self, v):
         self.on = v
 
+    def stop(self):
+        pass
+
+    def wait(self, _ms=0):
+        pass
+
 
 class FakeGrid:
-    """假地形：直接給一組可走格，reachable 就回那一組。"""
+    """假地形：`cells` ＝我這一區走得到的格；`others` ＝別區的可走格。"""
 
-    def __init__(self, cells):
+    def __init__(self, cells, others=()):
         self.cells = set(cells)
+        self.others = set(others)
 
     def reachable(self, x, y):
         return set(self.cells) if (x, y) in self.cells else None
+
+    def walkable(self, x, y):
+        return (x, y) in self.cells or (x, y) in self.others
+
+
+class FakeAtk:
+    """最小的假「寫目標」執行緒。"""
+
+    def __init__(self):
+        self.picked = None
+        self.packets = False
+        self.engaged = False
+
+    def attack(self, _state, mon):
+        self.picked = mon
+
+    def hold_off(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def wait(self, _ms=0):
+        pass
 
 
 class FakeMaps:
@@ -282,16 +313,27 @@ def main() -> int:
     #   「到點位不要跟自動戰鬥互卡，在殺怪物就不要跑點位，都沒怪到點位才算到」
     print("\n打得到的怪才算數（副本是好幾塊互不相通的地方拼起來的）")
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
-    tab._reach = {(10, 10), (11, 10), (12, 10)}         # 我這一區只有這幾格
-    near = FakeMon(x=11.0, y=10.0, eid=1, name="同一區")
-    far = FakeMon(x=300.0, y=200.0, eid=2, name="隔壁區")
-    tab._live_monsters = lambda: [near, far]
+    # 我這一區＝x 8~10；牆在 x=11；隔壁區＝x 12~14（薄牆，只隔一格）
+    mine = {(x, 10) for x in (8, 9, 10)}
+    nextdoor = {(x, 10) for x in (12, 13, 14)}
+    tab._reach = set(mine)
+    tab._grid = FakeGrid(mine, nextdoor)
+    near = FakeMon(x=9.0, y=10.0, eid=1, name="同一區")
+    far = FakeMon(x=300.0, y=200.0, eid=2, name="很遠的隔壁區")
+    # ★★ 使用者 2026-09-02 特別點名的坑：隔一牆但距離只有 2 格
+    wall = FakeMon(x=12.0, y=10.0, eid=3, name="隔一牆只有2格")
+    tab._live_monsters = lambda: [near, far, wall]
     got = [m.name for m in tab._targets()]
-    ck("★ 隔壁區的怪不算數（不然挑目標→走不到→再挑同一隻，無限迴圈）",
+    ck("★★ 隔一牆但只有 2 格的怪 → 排除（⛔ 不可以再看它旁邊那一圈）",
        got == ["同一區"], str(got))
-    tab._reach = None                                    # 讀不到地形圖
+    onwall = FakeMon(x=11.0, y=10.0, eid=4, name="站在牆上")
+    tab._live_monsters = lambda: [onwall]
+    ck("　怪站在不可走格上（貼牆／門框）→ 看旁邊一圈，還是打得到",
+       [m.name for m in tab._targets()] == ["站在牆上"])
+    tab._reach, tab._grid = None, None                   # 讀不到地形圖
+    tab._live_monsters = lambda: [near, far, wall]
     ck("★ 讀不到地形圖 → 不過濾（安全退化，寧可多打也不要不出手）",
-       len(tab._targets()) == 2)
+       len(tab._targets()) == 3)
 
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     tab._reach = {(10, 10)}
@@ -303,17 +345,34 @@ def main() -> int:
     ck("　腳本真的動了（尋路往點位走）", tab._nav.goal == (50, 50),
        str(tab._nav.goal))
 
-    # 放生：打不到就記黑名單，別下一拍又挑同一隻
+    # ⛔ 使用者明令不要黑名單：換一隻就好，一直問它走不走得到
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     m = FakeMon(x=11.0, y=10.0, eid=7, name="打不到的")
     tab._live_monsters = lambda: [m]
     tab._cur = m
-    ck("放生之前挑得到它", [x.eid for x in tab._targets()] == [7])
+    tab._grid_t = 5.0
     tab._give_up("測試")
-    ck("★ 打不到就放生，下一拍不會再挑同一隻（不然無限迴圈）",
-       m.eid in tab._skip and tab._targets() == [], str(tab._skip))
-    ck("　放生是有時效的，不是永久除名",
-       0 < tab._skip[m.eid] - time.monotonic() <= dt.SKIP_SECS)
+    ck("★★ 放棄之後**不記黑名單**：只剩它一隻就照樣再問一次（門可能開了）",
+       [x.eid for x in tab._targets()] == [7]
+       and not hasattr(tab, "_skip"))
+    ck("　放棄會立刻重問一次地形（門開了才跟得上）", tab._grid_t == 0.0)
+    other = FakeMon(x=12.0, y=10.0, eid=8, name="另一隻")
+    tab._live_monsters = lambda: [m, other]
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    dt.entity.read_pos = lambda _sc, _addr: None    # 讀不到位置就放掉，夠測挑選
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 有別隻的時候先挑別隻（不是黑名單，只是先換一隻）",
+       tab._atk.picked is other,
+       tab._atk.picked.name if tab._atk.picked else "沒挑")
+
+    # 看門狗：一直在打卻半隻都沒殺掉 → 大聲停下（沒有黑名單就靠它兜底）
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._live_monsters = lambda: [FakeMon(eid=5)]
+    tab._nokill_t = dt.NO_PROGRESS + 1
+    tab._fight((10.0, 10.0), TICK)
+    ck(f"★ 打了 {dt.NO_PROGRESS:.0f} 秒一隻都沒殺掉 → 大聲停下",
+       not tab.run_cb.isChecked(), tab.status.text())
 
     # 地形圖要定期重讀（機關開門會就地改掉可走格）
     tab = make_tab([{"do": "clear"}])
