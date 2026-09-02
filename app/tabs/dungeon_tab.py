@@ -97,8 +97,8 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (dungeon, entity, itemname, jumpmap, locate, move,
-                      navigate, produce, quickbar, scene, scenery, sell,
-                      skills, supply, talkwnd, terrain)
+                      navigate, portal, produce, quickbar, scene, scenery,
+                      sell, skills, supply, talkwnd, terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
                                KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
@@ -200,7 +200,12 @@ MIN_REGION = 20
 #   ⚠ 送出到人真的過去約 1 秒；這麼久還沒到就再送一次（跟撞入口一樣無限重試）。
 FLY_RESEND = 8.0
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
-PORTAL_POKE = 5.0          # 每幾秒對傳點物件送一次互動
+# ★★ 使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進傳送點
+#   封包」——所以站上去之後**主動送 0x0D**（`portal.enter`，就是遊戲自己
+#   踩上去會送的那一包），不是站著等。
+#   ⚠ 遊戲那支有去重欄（物件 +0x208 記著上一個踩上來的人），所以站著不動
+#     它自己**永遠不會送第二次**；我們主動送就沒有這個限制。
+PORTAL_POKE = 1.0          # 每幾秒對傳點主動送一次 0x0D
 PORTAL_TIMEOUT = 180.0     # 這麼久還沒被搬走 → 結束並通知
 #   ⚠⚠ 這個上限**只管副本裡面的傳點步驟**。「進副本的入口」是
 #   **無限重試、不通知**（使用者 2026-09-02 明令）—— 進不去是暫時性失敗
@@ -851,25 +856,15 @@ class DungeonTab(BaseTab):
             self._say(f"去入口傳送點 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}{tail}")
             return
-        # 已經站在入口上還沒進去 → 每 PORTAL_POKE 秒補送一次互動
+        # ★ 已經站在入口上 → **一直打進傳送點封包**（不是站著等）
         self._nav.reset()
         self._poke_t -= dt
-        want = ent.get("model")
-        if want is None or self._poke_t > 0:
-            self._say(f"站在入口上等被傳進去…{tail}")
+        if self._poke_t > 0:
+            self._say(f"站在入口上打封包…{tail}")
             return
         self._poke_t = PORTAL_POKE
-        props = scenery.nearby(self._sc, (gx, gy), PROP_TOL)
-        if props is None:
-            self._say(f"物件清單讀不到，等下一次補送…{tail}")
-            return
-        hit = [p for p in props if p.model == want]
-        if not hit:
-            # ⛔ 找不到就等，**絕不就近點一個**。
-            self._say(f"入口附近找不到外觀 {want} 的物件，繼續等{tail}")
-            return
-        ok, msg = produce.click(self._mover, self._sc, hit[0])
-        self._say(f"撞入口傳送點（{'送出' if ok else msg}）…{tail}")
+        note = self._send_portal((gx, gy), ent.get("model"), "入口")
+        self._say(f"{note}…{tail}")
 
     def _check_jump(self, me) -> bool:
         """這一拍人有沒有被「搬」過去（順移）。
@@ -1212,40 +1207,43 @@ class DungeonTab(BaseTab):
 
         self._stop(f"⛔ 第 {self._i + 1} 步是不認得的動作「{kind}」")
 
-    def _poke_portal(self, step: dict, dt: float) -> None:
-        """人已經站在傳點上但沒被搬走 —— 每 PORTAL_POKE 秒補送一次互動。
+    def _send_portal(self, at, want, tag: str) -> str:
+        """對那個傳點**主動送一次 0x0D**（＝踩上去那一包）。回一句說明。
 
-        使用者 2026-09-02：「如果失敗就在傳送點每 5 秒送一次，如果 3 分鐘
-        都這樣就結束跳通知警告使用者」。3 分鐘那道閘在 `_run_step` 開頭
-        （`PORTAL_TIMEOUT`），這裡只負責補送。
-        ⚠ 沒記外觀編號（舊腳本）就只站著等：⛔ 不可以就近亂點一個東西。
+        使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進
+        傳送點封包」。用 `portal.enter` —— 它會**當場重讀重驗**那個物件
+        （+0x1D0 每次載圖重配，用舊值送就是送到別的東西身上）。
+        ⛔ 找不到對應的觸發物件就只回報，**絕不就近送一個**。
+        """
+        trigs = portal.nearby(self._sc, at, PROP_TOL)
+        if trigs is None:
+            return "物件清單讀不到，等下一次"
+        hit = [t for t in trigs if want is None or t.model == want]
+        if not hit:
+            return f"附近找不到{'外觀 %d 的' % want if want else ''}傳點物件"
+        pf = move.pathfinder_this(self._sc)
+        if not pf:
+            return "讀不到自己的實體（載圖中？）"
+        ok, msg = portal.enter(self._mover, self._sc, hit[0], pf)
+        return f"{tag}：{msg}" if not ok else f"{tag}：已送 0x0D"
+
+    def _poke_portal(self, step: dict, dt: float) -> None:
+        """人已經站在傳點上 —— **每 PORTAL_POKE 秒主動送一次 0x0D**。
+
+        使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進
+        傳送點封包」。3 分鐘那道閘在 `_run_step` 開頭（`PORTAL_TIMEOUT`）。
+        ⚠ 遊戲自己那支有去重欄（站著不動永遠不會送第二次，見 portal.py
+          檔頭）—— 主動送就沒有這個限制，所以不必退開再走回來。
         """
         self._poke_t -= dt
         left = PORTAL_TIMEOUT - self._step_t
-        want = step.get("model")
-        if want is None:
-            self._say(f"第 {self._i + 1} 步　站在傳點上等被傳走…"
+        if self._poke_t > 0:
+            self._say(f"第 {self._i + 1} 步　站在傳點上打封包…"
                       f"（還有 {max(left, 0):.0f} 秒）")
             return
-        if self._poke_t > 0:
-            self._say(f"第 {self._i + 1} 步　站在傳點上等被傳走…"
-                      f"下次補送 {self._poke_t:.1f} 秒（還有 {max(left, 0):.0f} 秒）")
-            return
         self._poke_t = PORTAL_POKE
-        ax, ay = step["to"]
-        props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
-        if props is None:
-            self._say("物件清單讀不到，等下一次補送…")
-            return
-        hit = [p for p in props if p.model == want]
-        if not hit:
-            # ⛔ 找不到就等，**絕不就近點一個**（點錯東西比不點危險）。
-            self._say(f"第 {self._i + 1} 步　傳點附近找不到外觀 {want} 的物件，"
-                      f"繼續等（還有 {max(left, 0):.0f} 秒）")
-            return
-        ok, msg = produce.click(self._mover, self._sc, hit[0])
-        self._say(f"第 {self._i + 1} 步　站在傳點上，補送互動"
-                  f"（{'送出' if ok else msg}）…還有 {max(left, 0):.0f} 秒")
+        note = self._send_portal(tuple(step["to"]), step.get("model"), "傳點")
+        self._say(f"第 {self._i + 1} 步　{note}…還有 {max(left, 0):.0f} 秒")
 
     def _warn(self, msg: str) -> None:
         """跳通知警告使用者（跟掛機頁同一套 Notifier）。"""

@@ -158,6 +158,18 @@ class FakeMaps:
         return self.grid
 
 
+class FakeTrig:
+    """假觸發物件（傳點）：portal.nearby / portal.enter 用得到的欄位。"""
+
+    def __init__(self, x, y, model, oid=0x13920001):
+        self.x, self.y, self.model, self.oid = x, y, model, oid
+        self.addr = 0x4000
+        self.select_id = 0x5E140000
+
+    def dist(self, p):
+        return ((self.x - p[0]) ** 2 + (self.y - p[1]) ** 2) ** 0.5
+
+
 class FakeProp:
     def __init__(self, x, y, model, oid=0x13920001):
         self.x, self.y, self.model, self.oid = x, y, model, oid
@@ -243,6 +255,14 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
         p for p in props
         if around is None or p.dist(around) <= r]
     dt.produce.click = lambda *a, **k: (True, "點了")
+    # ⚠ 傳點那條會叫 portal（讀記憶體）——測試裡換成假的
+    tab.portal_sent = []
+    dt.portal.nearby = lambda _sc, around=None, r=0: [
+        t for t in getattr(tab, "trigs", [])
+        if around is None or t.dist(around) <= r]
+    dt.portal.enter = lambda _mv, _sc, t, _pf: (
+        tab.portal_sent.append(t.model), (True, "已送出 0x0D"))[1]
+    dt.move.pathfinder_this = lambda _sc: 0x2000
     tab.sent = []
     dt.sell.talk = lambda _mv, code: (tab.sent.append(code), True)[1]
     tab.left = []
@@ -487,12 +507,12 @@ def main() -> int:
 
     # ★★ 傳點站上去沒被搬走 → 每 PORTAL_POKE 秒補送一次，撐 PORTAL_TIMEOUT
     #   （使用者 2026-09-02：「在傳送點每 5 秒送一次，3 分鐘就結束跳通知」）
-    poked = []
     tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
-                   pos=(50.0, 50.0), props=[FakeProp(50.0, 50.0, 60123)])
-    dt.produce.click = lambda _mv, _sc, p: (poked.append(p.model), (True, "點了"))[1]
+                   pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(50.0, 50.0, 60123)]
+    poked = tab.portal_sent
     run(tab, 0.3)
-    ck("★ 站在傳點上 → 立刻補送第一次互動", poked == [60123], str(poked))
+    ck("★ 站在傳點上 → 立刻打第一發 0x0D", poked == [60123], str(poked))
     run(tab, dt.PORTAL_POKE - 1.0)
     ck(f"　{dt.PORTAL_POKE:.0f} 秒還沒到不重送（⛔ 不是每拍狂送）",
        len(poked) == 1, str(poked))
@@ -507,13 +527,13 @@ def main() -> int:
     ck("　而且**跳通知警告使用者**", len(fired) == 1, str(fired))
     ck("　通知講得出是傳點過不去", "傳點" in (fired[0] if fired else ""),
        str(fired))
-    # 沒記外觀編號的舊腳本 → 只站著等，⛔ 不可以就近亂點
-    poked.clear()
-    tab = make_tab([{"do": "portal", "to": [50, 50]}], pos=(50.0, 50.0),
-                   props=[FakeProp(50.0, 50.0, 60123)])
+    # 附近沒有對應的傳點物件 → 只回報，⛔ 不就近送一個
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(50.0, 50.0, 69999)]      # 外觀對不上
     run(tab, 2.0)
-    ck("★ 沒記外觀編號 → 只站著等，⛔ 不就近亂點一個", poked == [], str(poked))
-    dt.produce.click = lambda *a, **k: (True, "點了")
+    ck("★ 外觀對不上 → ⛔ 不就近送一個", tab.portal_sent == [],
+       str(tab.portal_sent))
 
     # 出口對不對得上（腳本記了 land 就要驗）
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
@@ -731,10 +751,9 @@ def main() -> int:
     ck("★ 沒到就再送一次（無限重試、不通知）", len(flown) == 2, str(flown))
     ck("　還勾著（⛔ 不因為飛不過去就停）", tab.run_cb.isChecked())
 
-    poked = []
-    tab = make_tab([{"do": "clear"}], pos=(50.0, 50.0),
-                   props=[FakeProp(10.0, 20.0, 60777)])
-    dt.produce.click = lambda _mv, _sc, p: (poked.append(p.model), (True, "點了"))[1]
+    tab = make_tab([{"do": "clear"}], pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(10.0, 20.0, 60777)]
+    poked = tab.portal_sent
     tab._script.scene = 76
     tab._script.entrance = ent
     tab._phase = "enter"
@@ -742,7 +761,7 @@ def main() -> int:
     ck("★ 還在外面 → 先走去入口", tab._nav.goal == (10, 20), str(tab._nav.goal))
     ck("　還沒到就不亂送", poked == [], str(poked))
     tab._go_entrance((10.0, 20.0), TICK)
-    ck("★ 站到入口上 → 立刻撞一次", poked == [60777], str(poked))
+    ck("★ 站到入口上 → 立刻打第一發 0x0D", poked == [60777], str(poked))
     for _ in range(int((dt.PORTAL_POKE - 1.0) / TICK)):
         tab._go_entrance((10.0, 20.0), TICK)
     ck(f"　{dt.PORTAL_POKE:.0f} 秒沒到不重送", len(poked) == 1, str(poked))
@@ -756,7 +775,7 @@ def main() -> int:
     poked.clear()
     for _ in range(int((dt.PORTAL_POKE + 0.5) / TICK)):
         tab._go_entrance((10.0, 20.0), TICK)
-    ck("★★ 撞不進去**無限重試**：15 分鐘後照樣在勾著、照樣補送",
+    ck("★★ 撞不進去**無限重試**：15 分鐘後照樣在勾著、照樣打封包",
        tab.run_cb.isChecked() and poked == [60777],
        f"勾著={tab.run_cb.isChecked()} 送={poked}")
     ck("★★ 而且**不通知**（這是暫時性失敗，出口是使用者自己取消勾選）",
