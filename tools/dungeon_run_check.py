@@ -934,12 +934,16 @@ def main() -> int:
     run(tab, 0.3)
     ck("　站穩了才點下去", len(clicks2) == 1, str(clicks2))
     # 點完遊戲自己在走過去 → 只要還在靠近就不要插手重點
-    for k in range(6):
-        tab._pos = [20.5 + 3.0 - k * 0.6, 20.0]   # 一直更靠近
-        run(tab, 1.5)
+    #   ⚠ 要像真的走路那樣**每一拍都更近一點**（使用者要求重試收到 1 秒，
+    #     用「1.5 秒才動一格」的假走法會被判成停住不動）。
+    d = 4.0
+    for _ in range(30):
+        d -= 0.12
+        tab._pos = [20.1 + d, 20.2]
+        run(tab, TICK)
     ck("★★ 遊戲正在走過去（一直更靠近）→ **不插手重點**",
        len(clicks2) == 1, str(clicks2))
-    run(tab, dt.CLICK_RETRY + 1.0)               # 停在原地不動了
+    run(tab, dt.CLICK_RETRY + 0.5)               # 停在原地不動了
     ck("　真的停住不動才重點", len(clicks2) >= 2, str(clicks2))
     dt.entity.is_walking = lambda _sc, _p: False
 
