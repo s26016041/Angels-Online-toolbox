@@ -957,24 +957,32 @@ def main() -> int:
        not dungeon.validate_entrance(
            {"scene": 71, "to": [1, 2], "menu": [99]})[0])
 
-    fake = FakeTalk([(1, 2), ()])
-    tab = make_tab([{"do": "clear"}], pos=(11.0, 20.0),
-                   props=[FakeProp(10.0, 20.0, 60777)])
-    wire(tab, fake)
+    # ★★ 使用者 2026-09-02 更正：「要去撞他自己會產生對話，所以點點看沒用」
+    #   → 入口是**撞（0x0D）出對話**，再選第 N 項；⛔ 不是用點的。
+    tab = make_tab([{"do": "clear"}], pos=(10.0, 20.0))
+    tab.trigs = [FakeTrig(10.0, 20.0, 60777)]
     tab._script.scene = 76
     tab._script.entrance = ent2
     tab._phase = "enter"
     dt.entity.is_walking = lambda _sc, _p: False
-    for _ in range(int(6.0 / TICK)):          # ⚠ 入口那條要直接叫 _go_entrance
+    pages = {"i": 0}                      # 0＝沒對話；撞了才變 1（有選項）
+    dt.talkwnd.page = lambda _sc: dt.talkwnd.Page(
+        is_talk=pages["i"] == 0, options=((1, 2) if pages["i"] else ()),
+        sig=(pages["i"],))
+    real_enter = dt.portal.enter
+    dt.portal.enter = lambda mv, sc, t, pf: (pages.__setitem__("i", 1),
+                                             real_enter(mv, sc, t, pf))[1]
+    for _ in range(int(3.0 / TICK)):      # ⚠ 入口那條要直接叫 _go_entrance
         if not tab.run_cb.isChecked():
             break
         tab._go_entrance(tab._my_pos(), TICK)
     from app.game import supply as _sup3
-    ck("★★ 對話式入口 → 走對話（送第 1 項），不是打 0x0D",
-       tab.sent == [_sup3.talk_option(1)] and tab.portal_sent == [],
-       f"選項{tab.sent} 0x0D{tab.portal_sent}")
-    ck("　對話走完**不前進步驟**（要等場景真的變）",
+    ck("★★ 撞入口（打 0x0D）", tab.portal_sent == [60777], str(tab.portal_sent))
+    ck("★★ 撞出對話之後才送第 1 項（⛔ 不是用點的）",
+       tab.sent == [_sup3.talk_option(1)], str(tab.sent))
+    ck("　還沒進去 → 不前進步驟、階段還是 enter",
        tab._i == 0 and tab._phase == "enter", f"步{tab._i} {tab._phase}")
+    dt.portal.enter = real_enter
 
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])

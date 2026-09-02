@@ -206,8 +206,6 @@ MIN_REGION = 20
 #   實測表裡 `地底廣場(LV70~80)副本進入點` 就是一個合法目的地。
 #   ⚠ 送出到人真的過去約 1 秒；這麼久還沒到就再送一次（跟撞入口一樣無限重試）。
 FLY_RESEND = 8.0
-# 入口對話走完之後等多久再點一次（沒進去的話）。
-ENTER_TALK_GAP = 3.0
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
 # ★★ 使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進傳送點
 #   封包」——所以站上去之後**主動送 0x0D**（`portal.enter`，就是遊戲自己
@@ -491,6 +489,7 @@ class DungeonTab(BaseTab):
         self._fly = None             # 要飛去哪個傳送點（jumpmap.Entry）
         self._fly_t = 0.0            # 還有多久重送一次趴趴GO
         self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
+        self._enter_sig = None       # 撞入口之前的對話簽章（判「跳對話了沒」）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -829,20 +828,6 @@ class DungeonTab(BaseTab):
         self._say(f"趴趴GO去「{self._fly.name}」（{why}）"
                   f"　已試 {self._fly_total / 60.0:.1f} 分鐘")
 
-    def _entrance_talked(self) -> None:
-        """入口那段對話走完了 —— **不前進步驟**，重來一輪等場景變。
-
-        真的進去了是靠 `_check_map_change()` 認的；對話走完卻還在外面
-        （選錯／伺服器拒收／副本有冷卻）就再點一次，跟撞入口一樣無限重試。
-        """
-        self._clicked = False
-        self._menu_i = 0
-        self._talk_sig = self._talk_base = None
-        self._talk_same, self._talk_did, self._nudge = 0, "", 0
-        self._click_t, self._click_best = 0.0, None
-        self._menu_t = ENTER_TALK_GAP
-        self._say("入口對話走完了，等看看有沒有進去…")
-
     def _go_entrance(self, me, dt: float) -> None:
         """還在外面：走去入口傳送點，撞進去。
 
@@ -865,19 +850,6 @@ class DungeonTab(BaseTab):
         #   的訊號，不是等一下就好）。
         mins = self._enter_t / 60.0
         tail = f"（已試 {mins:.1f} 分鐘）"
-        # ★★ 有些副本門口是「點下去 → 選第 1 項」才進得去（使用者 2026-09-02）
-        #   —— 記了 menu 就照對話那一套走（走站位、站穩才點、自動翻頁、
-        #   選項照記的送），不是打 0x0D。
-        #   ⚠ 走完對話**不前進步驟**：真的進去了是靠換圖偵測認的
-        #   （`_check_map_change` 會把 phase 轉成 "run"）。
-        if ent.get("menu"):
-            step = {"at": list(ent["to"]), "model": ent.get("model"),
-                    "menu": list(ent["menu"]), "gap": ent.get("gap")}
-            if ent.get("stand"):
-                step["stand"] = list(ent["stand"])
-            self._do_interact(step, me, dt, tag=f"進副本入口{tail}",
-                              finish=self._entrance_talked)
-            return
         if _d((gx, gy), me) > PORTAL_NEAR:
             if _d((gx, gy), me) <= NAV_DEAD:
                 note = self._walk_onto(gx, gy)
@@ -896,11 +868,53 @@ class DungeonTab(BaseTab):
             return
         # ★ 已經站在入口上 → **一直打進傳送點封包**（不是站著等）
         self._nav.reset()
+        menu = [n for n in (ent.get("menu") or []) if n]
+        gap = float(ent.get("gap") or MENU_GAP)
+        # ★★ 有些副本門口是**撞上去它自己跳對話**，還要選第 1 項才進得去
+        #   （使用者 2026-09-02：「要去撞他自己會產生對話，所以點點看沒用」）
+        #   —— 所以這裡是「一邊打 0x0D，一邊看對話有沒有跳出來」，
+        #   ⛔ 不是用點的（0x05 對這種門口沒有用）。
+        pg = talkwnd.page(self._sc)
+        if pg is not None:
+            if self._enter_sig is None:
+                self._enter_sig = pg.sig          # 還沒撞出對話 → 記個基準
+            elif pg.sig != self._enter_sig:
+                # 對話跳出來了（或翻頁了）→ 照記的走
+                self._enter_sig = pg.sig
+                self._menu_t = gap
+                if pg.has_options:
+                    if self._menu_i >= len(menu):
+                        # ⛔ 跳出選項但腳本沒記要選哪一項 —— 絕不亂選。
+                        self._stop(f"⛔ 入口跳出 {len(pg.options)} 個選項，"
+                                   f"但腳本沒有記要選第幾項 —— 停下來")
+                        return
+                    n = menu[self._menu_i]
+                    if n not in pg.options:
+                        self._stop(f"⛔ 入口要選第 {n} 項，"
+                                   f"但這一頁只有 {list(pg.options)} —— 停下來")
+                        return
+                    if sell.talk(self._mover, supply.talk_option(n)):
+                        self._menu_i += 1
+                        self._say(f"入口對話：已送第 {n} 項"
+                                  f"（{self._menu_i}/{len(menu)}）{tail}")
+                    else:
+                        self._say(f"入口對話：第 {n} 項送不出去，重試{tail}")
+                else:
+                    ok, why = talkwnd.close_page(self._mover, self._sc)
+                    self._say(f"入口對話：沒有選項的那一頁 → 按確定"
+                              f"（{'送出' if ok else why}）{tail}")
+                return
+        # 對話沒動靜 → 照節奏再撞一次（撞了才會跳對話）
+        self._menu_t -= dt
+        if self._menu_t > 0:
+            self._say(f"站在入口上等對話…{tail}")
+            return
         self._poke_t -= dt
         if self._poke_t > 0:
             self._say(f"站在入口上打封包…{tail}")
             return
         self._poke_t = PORTAL_POKE
+        self._menu_i = 0                      # 重撞一次＝對話從頭走
         note = self._send_portal((gx, gy), ent.get("model"), "入口")
         self._say(f"{note}…{tail}")
 

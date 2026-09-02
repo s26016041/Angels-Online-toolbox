@@ -232,7 +232,14 @@ def main() -> int:
         ck(f"★ 內建「{p.stem}」讀得進來", sc is not None, why)
         if sc is None:
             continue
-        ck(f"　「{p.stem}」有蓋地圖章", sc.scene is not None and bool(sc.map))
+        # ⚠ 還沒加步驟的腳本（只先記了入口）本來就還沒蓋章 —— 那是正常的
+        #   半成品，不算壞掉（章是第一步存進來時才蓋的）。
+        if sc.steps:
+            ck(f"　「{p.stem}」有蓋地圖章",
+               sc.scene is not None and bool(sc.map))
+        else:
+            ck(f"　「{p.stem}」還沒有步驟（只記了入口）→ 沒蓋章是正常的",
+               sc.scene is None)
         bad = [dungeon.validate(st)[1] for st in sc.steps
                if not dungeon.validate(st)[0]]
         ck(f"　「{p.stem}」每一步都合格", not bad, "；".join(bad))
