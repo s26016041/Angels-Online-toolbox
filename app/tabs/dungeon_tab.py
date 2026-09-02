@@ -92,6 +92,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
+from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
@@ -258,6 +259,7 @@ class DungeonTab(BaseTab):
         self._keys = None            # KeyWorker
         self._atk = None             # TargetWorker
         self._notifier = None        # 跳通知用（第一次要通知時才建）
+        self._loading = False        # 正在把設定讀回畫面（這期間不要回存）
         self._qb_sc = None           # 技能鍵標名字用的 Reader（跟著分身換）
         self._qb_ui = None
         self._scan = ScanWorker()
@@ -275,7 +277,7 @@ class DungeonTab(BaseTab):
         bar.addWidget(QLabel("分身"))
         self.who = QComboBox()
         self.who.setFixedWidth(240)
-        self.who.currentIndexChanged.connect(lambda: self._stop("換了分身"))
+        self.who.currentIndexChanged.connect(self._on_who_changed)
         bar.addWidget(self.who)
         b = QPushButton("重新整理")
         b.setToolTip("重新列出目前開著的遊戲分身。")
@@ -289,7 +291,7 @@ class DungeonTab(BaseTab):
         self.files = QComboBox()
         self.files.setFixedWidth(240)
         self.files.setToolTip("在「副本腳本製作」那一頁做出來的腳本。")
-        self.files.currentIndexChanged.connect(lambda: self._stop("換了腳本"))
+        self.files.currentIndexChanged.connect(self._on_file_changed)
         sbar.addWidget(self.files)
         b = QPushButton("重新整理")
         b.setToolTip("重新讀取腳本資料夾。")
@@ -332,6 +334,17 @@ class DungeonTab(BaseTab):
         root.addWidget(g)
 
         rbar = QHBoxLayout()
+        # ★ 使用者 2026-09-02：「改一下自動刷副本，我可以選擇從哪開始」
+        rbar.addWidget(QLabel("從第"))
+        self.start_box = QComboBox()
+        self.start_box.setFixedWidth(210)
+        self.start_box.setToolTip(
+            "從腳本的第幾步開始跑（做腳本／卡住重跑時很方便）。\n"
+            "⚠ 前面的步驟會直接跳過 —— 該開的門沒開就會走不到。")
+        self.start_box.currentIndexChanged.connect(self._save_settings)
+        rbar.addWidget(self.start_box)
+        rbar.addWidget(QLabel("步開始"))
+        rbar.addSpacing(12)
         self.run_cb = QCheckBox("自動刷副本")
         self.run_cb.setToolTip(
             "勾起來就照腳本開始跑：路上有怪先清光，再去下一個點位。\n"
@@ -355,6 +368,7 @@ class DungeonTab(BaseTab):
         self._timer.timeout.connect(self._tick)
         self._timer.start(TICK_MS)
         self._reload_files()
+        self._load_settings()
 
     # ------------------------------------------------------------------
     # 分身與腳本
@@ -363,6 +377,7 @@ class DungeonTab(BaseTab):
         if not self._scanners:
             self.reload_instances()
         self._reload_files()
+        self._load_settings()
 
     def reload_instances(self, force_names: bool = False) -> None:
         self._stop(quiet=True)
@@ -392,9 +407,99 @@ class DungeonTab(BaseTab):
             self.who.addItem(
                 f"{preload.name_of(w.pid, sc, acc, force=force_names)}"
                 f"（{acc}）", w.pid)
+        # ★ 挑回上次用的那一台（使用者 2026-09-02：設定要記在使用者那邊）
+        last = str(config.get("dungeon.last_account", "") or "")
+        if last:
+            self.who.blockSignals(True)
+            for i in range(self.who.count()):
+                if f"（{last}）" in self.who.itemText(i):
+                    self.who.setCurrentIndex(i)
+                    break
+            self.who.blockSignals(False)
         self.who.blockSignals(False)
         if not self._scanners:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")
+        self._load_settings()
+
+    # ------------------------------------------------------------------
+    # 設定（存在使用者那邊的 config.json，使用者 2026-09-02 要求）
+    # ------------------------------------------------------------------
+    def _key(self, field: str) -> str:
+        """設定鍵。⚠ 帶帳號 —— 每個分身各自記自己的腳本／技能鍵／起始步驟。"""
+        return f"dungeon.{self._account()}.{field}"
+
+    def _account(self) -> str:
+        """目前選的分身帳號（拿不到就用 'default'，設定照樣存得住）。"""
+        txt = self.who.currentText() or ""
+        if "（" in txt and txt.endswith("）"):
+            return txt[txt.rindex("（") + 1:-1]
+        return txt or "default"
+
+    def _save_settings(self) -> None:
+        """把這一頁的設定寫回 config。⚠ `config.set` 不寫檔，要接 `save()`
+        （[[config-set-needs-save]]，已經復發兩次）。"""
+        if self._loading:
+            return
+        config.set(self._key("script"), self.files.currentText())
+        config.set(self._key("vks"), self._picked_keys())
+        config.set(self._key("start"), int(self.start_box.currentIndex()))
+        config.set("dungeon.last_account", self._account())
+        config.save()
+
+    def _load_settings(self) -> None:
+        """把設定讀回畫面。⚠ 讀的期間要擋住 `_save_settings`（不然邊讀邊寫
+        會把還沒讀到的欄位用預設值蓋掉）。"""
+        self._loading = True
+        try:
+            name = str(config.get(self._key("script"), "") or "")
+            i = self.files.findText(name)
+            if i >= 0:
+                self.files.setCurrentIndex(i)
+            self._refresh_start_box()
+            vks = config.get(self._key("vks"), None)
+            if isinstance(vks, list) and vks:
+                for cb, vk, _lab in self._key_cbs:
+                    cb.setChecked(vk in vks)
+                self._sync_key_btn()
+            st = int(config.get(self._key("start"), 0) or 0)
+            if 0 <= st < self.start_box.count():
+                self.start_box.setCurrentIndex(st)
+        finally:
+            self._loading = False
+
+    def _refresh_start_box(self) -> None:
+        """把「從第幾步開始」的下拉重建成目前這份腳本的步驟。
+
+        ⚠ 重建會觸發 currentIndexChanged → 先擋訊號，不然會把剛讀回來的
+          設定又覆蓋掉（[[qt-ui-pitfalls]] 那條「高頻清單不可 clear()」的
+          鄰居坑：重建清單一定要擋訊號）。
+        """
+        path = self.files.currentData()
+        steps = []
+        if path:
+            from pathlib import Path
+            sc, _why = dungeon.load(Path(path))
+            steps = sc.steps if sc else []
+        keep = self.start_box.currentIndex()
+        self.start_box.blockSignals(True)
+        self.start_box.clear()
+        for i, st in enumerate(steps):
+            self.start_box.addItem(f"{i + 1}. {dungeon.describe(st)}"[:60], i)
+        if not steps:
+            self.start_box.addItem("1", 0)
+        if 0 <= keep < self.start_box.count():
+            self.start_box.setCurrentIndex(keep)
+        self.start_box.blockSignals(False)
+
+    def _on_file_changed(self) -> None:
+        self._stop("換了腳本")
+        self._refresh_start_box()
+        self._save_settings()
+
+    def _on_who_changed(self) -> None:
+        # 換分身＝換一個人的設定（腳本／技能鍵／起始步驟各記各的）
+        self._stop("換了分身")
+        self._load_settings()
 
     def _reload_files(self) -> None:
         keep = self.files.currentText()
@@ -414,6 +519,7 @@ class DungeonTab(BaseTab):
         self._sync_key_btn()
         if self._keys is not None:
             self._keys.vks = self._picked_keys()
+        self._save_settings()
 
     def _picked_keys(self) -> list[int]:
         vks = [vk for cb, vk, _lab in self._key_cbs if cb.isChecked()]
@@ -579,6 +685,10 @@ class DungeonTab(BaseTab):
             return
         self._pid, self._sc, self._script = int(pid), sc, script
         self._reset_run()
+        # ★ 從第幾步開始（使用者 2026-09-02）。⚠ 只在「已經在副本裡」時有效；
+        #   還要先撞入口的話，進去之後照樣從這一步開始。
+        self._i = max(0, min(self.start_box.currentIndex(),
+                             len(script.steps) - 1)) if script.steps else 0
         self._phase = phase
         self._fly = fly
         self._map_key = here

@@ -1073,6 +1073,44 @@ def main() -> int:
 
     # ★★ 製作頁：使用者 2026-09-02「按 1 就進副本，無法設定」——
     #   按了選項人就被傳走，所以選項要在**按下的當下**就記進入口。
+    # ★★ 使用者 2026-09-02：「改一下自動刷副本，我可以選擇從哪開始」＋
+    #   「自動刷副本的設定也都要記錄在使用者那邊」
+    print("\n從第幾步開始 ＋ 設定記在使用者那邊")
+    steps5 = [{"do": "walk", "to": [i, i]} for i in range(1, 6)]
+    tab = make_tab(steps5)
+    tab.start_box.clear()
+    for i, st in enumerate(steps5):
+        tab.start_box.addItem(f"{i + 1}", i)
+    tab.start_box.setCurrentIndex(2)          # 從第 3 步開始
+    tab._reset_run()
+    tab._i = max(0, min(tab.start_box.currentIndex(), len(steps5) - 1))
+    run(tab, 0.3)
+    ck("★★ 選了從第 3 步開始 → 真的從第 3 步跑",
+       tab._nav.goal == (3, 3), str(tab._nav.goal))
+
+    from app.config import config as _cfg
+    tab._account = lambda: "測試帳號"
+    tab._loading = False
+    tab._save_settings()
+    ck("★ 設定寫進 config（起始步驟）",
+       _cfg.get("dungeon.測試帳號.start") == 2,
+       str(_cfg.get("dungeon.測試帳號.start")))
+    ck("　技能鍵也存了", isinstance(_cfg.get("dungeon.測試帳號.vks"), list))
+    ck("　記得上次是哪一台分身",
+       _cfg.get("dungeon.last_account") == "測試帳號")
+    # ⚠ 這裡要擋訊號：直接動下拉會觸發 `_save_settings`，把剛存的 2 蓋成 0
+    #   （真的操作介面時本來就該存，所以是測試要配合，不是程式的問題）。
+    tab.start_box.blockSignals(True)
+    tab.start_box.setCurrentIndex(0)
+    tab.start_box.blockSignals(False)
+    # ⚠ `_load_settings` 會先照「目前選的腳本檔」重建下拉；測試裡沒有真的檔，
+    #   所以把重建換掉 —— 要驗的是「有沒有把索引讀回來」。
+    tab._refresh_start_box = lambda: None
+    tab._load_settings()
+    ck("★★ 重讀設定 → 起始步驟回到第 3 步",
+       tab.start_box.currentIndex() == 2,
+       str(tab.start_box.currentIndex()))
+
     print("\n製作頁：入口的選項自動記進去")
     from app.tabs.dungeon_make_tab import DungeonMakeTab
     mk = DungeonMakeTab()
