@@ -984,6 +984,23 @@ def main() -> int:
        tab._i == 0 and tab._phase == "enter", f"步{tab._i} {tab._phase}")
     dt.portal.enter = real_enter
 
+    # ★★ 使用者 2026-09-02 實遇：「他就在門口一直打封包，打封包了也沒按 1」
+    #   —— 走到那裡時對話**已經開著**（撞過一次／上一輪留的），舊碼把那一頁
+    #   當基準，之後永遠「沒變」就只剩打封包。⛔ 不可以只看「簽章變了」。
+    tab = make_tab([{"do": "clear"}], pos=(10.0, 20.0))
+    tab.trigs = [FakeTrig(10.0, 20.0, 60777)]
+    tab._script.scene = 76
+    tab._script.entrance = ent2
+    tab._phase = "enter"
+    dt.talkwnd.page = lambda _sc: dt.talkwnd.Page(   # 一開始就開著、而且不變
+        is_talk=True, options=(1, 2), sig=("一直是這一頁",))
+    for _ in range(int(1.0 / TICK)):
+        tab._go_entrance(tab._my_pos(), TICK)
+    ck("★★ 一到門口對話就已經開著（簽章從頭到尾沒變）→ **照樣送第 1 項**",
+       tab.sent == [_sup3.talk_option(1)], str(tab.sent))
+    ck("　同一頁不會一直重送", tab.sent == [_sup3.talk_option(1)],
+       str(tab.sent))
+
     print("\n打怪的時機")
     tab = make_tab([{"do": "clear"}])
     tab._keys, tab._atk = FakeKeys(), FakeAtk()

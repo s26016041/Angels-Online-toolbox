@@ -489,7 +489,7 @@ class DungeonTab(BaseTab):
         self._fly = None             # 要飛去哪個傳送點（jumpmap.Entry）
         self._fly_t = 0.0            # 還有多久重送一次趴趴GO
         self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
-        self._enter_sig = None       # 撞入口之前的對話簽章（判「跳對話了沒」）
+        self._enter_acted = None     # 入口對話「已經動過」的那一頁（防重複送）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -874,35 +874,44 @@ class DungeonTab(BaseTab):
         #   （使用者 2026-09-02：「要去撞他自己會產生對話，所以點點看沒用」）
         #   —— 所以這裡是「一邊打 0x0D，一邊看對話有沒有跳出來」，
         #   ⛔ 不是用點的（0x05 對這種門口沒有用）。
+        # ⚠⚠ 這裡**不能**用「簽章跟一開始不一樣才處理」（2026-09-02 使用者實遇
+        #   「在門口一直打封包，也沒按 1」）：第一次讀到的時候對話**已經開著**
+        #   （撞過一次了／上一輪留下的），那一頁就被當成基準，之後永遠「沒變」，
+        #   於是只剩打封包。→ 改成**看內容**：這一頁有選項就送，
+        #   只用「這一頁動過了沒」（`_enter_acted`）防重複。
         pg = talkwnd.page(self._sc)
-        if pg is not None:
-            if self._enter_sig is None:
-                self._enter_sig = pg.sig          # 還沒撞出對話 → 記個基準
-            elif pg.sig != self._enter_sig:
-                # 對話跳出來了（或翻頁了）→ 照記的走
-                self._enter_sig = pg.sig
-                self._menu_t = gap
-                if pg.has_options:
-                    if self._menu_i >= len(menu):
-                        # ⛔ 跳出選項但腳本沒記要選哪一項 —— 絕不亂選。
-                        self._stop(f"⛔ 入口跳出 {len(pg.options)} 個選項，"
-                                   f"但腳本沒有記要選第幾項 —— 停下來")
-                        return
-                    n = menu[self._menu_i]
-                    if n not in pg.options:
-                        self._stop(f"⛔ 入口要選第 {n} 項，"
-                                   f"但這一頁只有 {list(pg.options)} —— 停下來")
-                        return
-                    if sell.talk(self._mover, supply.talk_option(n)):
-                        self._menu_i += 1
-                        self._say(f"入口對話：已送第 {n} 項"
-                                  f"（{self._menu_i}/{len(menu)}）{tail}")
-                    else:
-                        self._say(f"入口對話：第 {n} 項送不出去，重試{tail}")
+        if pg is not None and pg.sig != self._enter_acted:
+            if pg.has_options and menu:
+                n = menu[min(self._menu_i, len(menu) - 1)]
+                if n not in pg.options:
+                    self._stop(f"⛔ 入口要選第 {n} 項，"
+                               f"但這一頁只有 {list(pg.options)} —— 停下來")
+                    return
+                if sell.talk(self._mover, supply.talk_option(n)):
+                    self._enter_acted = pg.sig
+                    self._menu_i = min(self._menu_i + 1, len(menu))
+                    self._menu_t = gap
+                    # ⚠ 剛動過對話就別馬上又去撞門（撞一次會把進度歸零，
+                    #   變成「送一項→撞→再送一項」空轉）——讓伺服器先回。
+                    self._poke_t = PORTAL_POKE
+                    self._say(f"入口對話：已送第 {n} 項"
+                              f"（{self._menu_i}/{len(menu)}）{tail}")
                 else:
-                    ok, why = talkwnd.close_page(self._mover, self._sc)
-                    self._say(f"入口對話：沒有選項的那一頁 → 按確定"
-                              f"（{'送出' if ok else why}）{tail}")
+                    self._say(f"入口對話：第 {n} 項送不出去，重試{tail}")
+                return
+            if pg.has_options and not menu:
+                # ⛔ 跳出選項但腳本沒記要選哪一項 —— 絕不亂選。
+                self._stop(f"⛔ 入口跳出 {len(pg.options)} 個選項，"
+                           f"但腳本沒有記要選第幾項 —— 停下來")
+                return
+            if self._menu_i > 0:
+                # 選項送完之後那一頁沒有選項 → 按確定翻過去
+                ok, why = talkwnd.close_page(self._mover, self._sc)
+                self._enter_acted = pg.sig
+                self._menu_t = gap
+                self._poke_t = PORTAL_POKE
+                self._say(f"入口對話：沒有選項的那一頁 → 按確定"
+                          f"（{'送出' if ok else why}）{tail}")
                 return
         # 對話沒動靜 → 照節奏再撞一次（撞了才會跳對話）
         self._menu_t -= dt
@@ -914,7 +923,9 @@ class DungeonTab(BaseTab):
             self._say(f"站在入口上打封包…{tail}")
             return
         self._poke_t = PORTAL_POKE
-        self._menu_i = 0                      # 重撞一次＝對話從頭走
+        # 重撞一次＝對話從頭走，剛剛那一頁的「動過了」也作廢（可以再送一次）
+        self._menu_i = 0
+        self._enter_acted = None
         note = self._send_portal((gx, gy), ent.get("model"), "入口")
         self._say(f"{note}…{tail}")
 
