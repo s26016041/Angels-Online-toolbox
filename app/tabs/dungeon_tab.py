@@ -486,7 +486,13 @@ class DungeonTab(BaseTab):
     def _my_pos(self):
         if not self._player:
             return None
-        return entity.read_pos(self._sc, self._player + 8)
+        # ⚠⚠ `s.player` 是 `entity.snapshot()` 掃 VT_PLAYER 找到的位址，
+        #   **已經是實體本體**（＝`pathfinder_this() + 8`）—— 這裡再 +8 讀到的
+        #   是後面 8 bytes，實測回 (0.0, 0.0)：順移偵測、走到沒、傳點落點驗證
+        #   全部拿 (0,0) 在算。2026-09-02 修。
+        #   （`bag.player_entity()` 回的才是 pf 那一種，那邊要 +8，見
+        #     [[entity-coordinates]]「差 8 bytes」那條。）
+        return entity.read_pos(self._sc, self._player)
 
     def _live_monsters(self) -> list:
         """掃描結果裡還活著的怪。⚠ 屍體會在清單裡賴很久，一定要濾掉。"""
