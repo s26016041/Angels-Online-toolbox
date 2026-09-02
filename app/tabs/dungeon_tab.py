@@ -158,6 +158,9 @@ MIN_REGION = 20
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
 PORTAL_POKE = 5.0          # 每幾秒對傳點物件送一次互動
 PORTAL_TIMEOUT = 180.0     # 這麼久還沒被搬走 → 結束並通知
+#   ⚠⚠ 這個上限**只管副本裡面的傳點步驟**。「進副本的入口」是
+#   **無限重試、不通知**（使用者 2026-09-02 明令）—— 進不去是暫時性失敗
+#   （副本冷卻、門口有人擋），重試一定會過，見 `_go_entrance`。
 
 
 def _d(a, b) -> float:
@@ -710,6 +713,7 @@ class DungeonTab(BaseTab):
         使用者 2026-09-02 定案：
         > 「如果在副本裡面會直接執行 json 開始跑；如果不在就會去撞副本傳點，
         >   如果撞了沒效就會每 5 秒送一次傳送直到成功，然後執行 json」
+        > 「無限嘗試不需要通知」（同日補充）
 
         ⚠ 進去了是靠 `_check_map_change()` 認的（場景會變）——這裡只負責
           「走過去 ＋ 撞不進去就補送」。
@@ -717,42 +721,45 @@ class DungeonTab(BaseTab):
         ent = self._script.entrance or {}
         gx, gy = ent.get("to", [0, 0])
         self._enter_t += dt
-        if self._enter_t > PORTAL_TIMEOUT:
-            self._stop(f"⛔ 撞了 {PORTAL_TIMEOUT:.0f} 秒還是沒進得去副本 —— 停下來")
-            self._warn(f"進不去副本：{dungeon.describe_entrance(ent)} "
-                       f"撞了 {PORTAL_TIMEOUT:.0f} 秒都沒反應。")
-            return
-        left = PORTAL_TIMEOUT - self._enter_t
+        # ⛔⛔ **這一階段不設上限、也不通知**（使用者 2026-09-02 明令：
+        #   「無限嘗試不需要通知」）。進不去副本是**暫時性失敗**——副本有
+        #   冷卻、有人在門口擋、剛好被打斷都會這樣，重試一定會過；
+        #   出口是使用者自己把勾選拿掉（[[transient-failure-auto-retry]]）。
+        #   ⚠ 只有進到副本**之後**的傳點才有 3 分鐘上限＋通知（那是走不通
+        #   的訊號，不是等一下就好）。
+        mins = self._enter_t / 60.0
+        tail = f"（已試 {mins:.1f} 分鐘）"
         if _d((gx, gy), me) > PORTAL_NEAR:
             note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
             if self._nav.stuck and self._nav.stuck_reason == "grid":
-                self._blocked(dt, f"走不到入口 ({gx}, {gy})", (gx, gy))
+                # ⛔ 這裡不用 `_blocked()`：那支等過寬限就會停，跟「無限嘗試」
+                #   衝突。改成重讀地形繼續試（人牆散開、門開了就走得到）。
+                self._grid_t = 0.0
+                self._say(f"去入口 ({gx}, {gy})：現在算不出路，重讀地形再試"
+                          f"{tail}")
                 return
             self._say(f"去入口傳送點 ({gx}, {gy})"
-                      f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
+                      f"　剩 {_d((gx, gy), me):.1f} 格　{note}{tail}")
             return
         # 已經站在入口上還沒進去 → 每 PORTAL_POKE 秒補送一次互動
         self._nav.reset()
         self._poke_t -= dt
         want = ent.get("model")
         if want is None or self._poke_t > 0:
-            self._say(f"站在入口上等被傳進去…"
-                      f"（還有 {max(left, 0):.0f} 秒）")
+            self._say(f"站在入口上等被傳進去…{tail}")
             return
         self._poke_t = PORTAL_POKE
         props = scenery.nearby(self._sc, (gx, gy), PROP_TOL)
         if props is None:
-            self._say("物件清單讀不到，等下一次補送…")
+            self._say(f"物件清單讀不到，等下一次補送…{tail}")
             return
         hit = [p for p in props if p.model == want]
         if not hit:
             # ⛔ 找不到就等，**絕不就近點一個**。
-            self._say(f"入口附近找不到外觀 {want} 的物件，繼續等"
-                      f"（還有 {max(left, 0):.0f} 秒）")
+            self._say(f"入口附近找不到外觀 {want} 的物件，繼續等{tail}")
             return
         ok, msg = produce.click(self._mover, self._sc, hit[0])
-        self._say(f"撞入口傳送點（{'送出' if ok else msg}）…"
-                  f"還有 {max(left, 0):.0f} 秒")
+        self._say(f"撞入口傳送點（{'送出' if ok else msg}）…{tail}")
 
     def _check_jump(self, me) -> bool:
         """這一拍人有沒有被「搬」過去（順移）。

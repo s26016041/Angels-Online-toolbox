@@ -596,13 +596,26 @@ def main() -> int:
     for _ in range(int(1.5 / TICK)):
         tab._go_entrance((10.0, 20.0), TICK)
     ck(f"★ 過了 {dt.PORTAL_POKE:.0f} 秒才送第二次", len(poked) == 2, str(poked))
+    # ⛔⛔ 使用者 2026-09-02 明令：「無限嘗試不需要通知」
     fired = []
     tab._warn = lambda msg: fired.append(msg)
-    tab._enter_t = dt.PORTAL_TIMEOUT + 1
-    tab._go_entrance((10.0, 20.0), TICK)
-    ck(f"★★ 撞滿 {dt.PORTAL_TIMEOUT:.0f} 秒還進不去 → 停下來",
-       not tab.run_cb.isChecked(), tab.status.text())
-    ck("　而且跳通知", len(fired) == 1 and "進不去副本" in fired[0], str(fired))
+    tab._enter_t = dt.PORTAL_TIMEOUT * 5          # 撞了 15 分鐘
+    poked.clear()
+    for _ in range(int((dt.PORTAL_POKE + 0.5) / TICK)):
+        tab._go_entrance((10.0, 20.0), TICK)
+    ck("★★ 撞不進去**無限重試**：15 分鐘後照樣在勾著、照樣補送",
+       tab.run_cb.isChecked() and poked == [60777],
+       f"勾著={tab.run_cb.isChecked()} 送={poked}")
+    ck("★★ 而且**不通知**（這是暫時性失敗，出口是使用者自己取消勾選）",
+       fired == [], str(fired))
+    ck("　狀態列會講已經試多久", "分鐘" in tab.status.text(),
+       tab.status.text())
+    # 走不到入口也不停（人牆／門），只重讀地形繼續試
+    tab._nav.stuck, tab._nav.stuck_reason = True, "grid"
+    tab._go_entrance((50.0, 50.0), TICK)
+    ck("★ 算不出路也不停，重讀地形再試",
+       tab.run_cb.isChecked() and tab._grid_t == 0.0, tab.status.text())
+    tab._nav.stuck = False
     dt.produce.click = lambda *a, **k: (True, "點了")
 
     print("\n不認得的動作")
