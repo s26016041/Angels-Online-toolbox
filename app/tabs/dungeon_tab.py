@@ -536,10 +536,17 @@ class DungeonTab(BaseTab):
         """
         path = self.files.currentData()
         steps = []
+        sc = None
         if path:
             from pathlib import Path
             sc, _why = dungeon.load(Path(path))
             steps = sc.steps if sc else []
+        # ★ 選了腳本就把流程列在下面，不必等按「自動刷副本」（使用者 2026-09-03）。
+        #   跑的時候不動（那時清單是進度，由 _refresh_steps 自己刷）。
+        if not self.run_cb.isChecked():
+            self._script = sc
+            self._i = 0
+            self._refresh_steps()
         keep = self.start_box.currentIndex()
         self.start_box.blockSignals(True)
         self.start_box.clear()
