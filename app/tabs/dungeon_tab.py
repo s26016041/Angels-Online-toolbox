@@ -207,6 +207,11 @@ GIVE_UP = 15.0
 #   ⛔ 不是黑名單（使用者 9/2 明令）：只是**放棄之後這麼多秒內不再挑它**，時間到
 #   照樣再問一次走不走得到（門可能開了）。冷卻中如果沒有別隻可打 → 先跑腳本。
 GIVEUP_COOL = 20.0
+# ★★★ 追怪的路徑上限（使用者 2026-09-03 定：「路徑超過 30 格就當沒看到」）。
+#   病灶：往怪物走 → 走到一半怪掉出遊戲的串流範圍（掃不到）→ 改去點位 →
+#   一靠近又掃到 → 再追 …… 無限輪迴。所以**直線距離**或 **A* 路徑**超過這個
+#   數就當沒看到（不追、也不算在「殺光了沒」裡）；隔 GIVEUP_COOL 秒再問一次。
+MAX_CHASE = 30.0
 # ★★ 順移判定（傳點那一步的完成訊號，使用者 2026-09-02 定案）：
 #   「人被傳走不會換地圖，有順移就算吧，有時候傳點之間也很短」
 #   —— 所以不能用「離傳點多遠」判，要用**一拍之間跳了多少**：
@@ -738,6 +743,8 @@ class DungeonTab(BaseTab):
         self._grid = None            # 上次讀到的地形圖（判斷怪站的是不是可走格）
         self._last_gave_up = None    # 剛放棄的那一隻（有別隻時先挑別隻）
         self._gave_up = {}           # eid → 放棄的時間（冷卻用，見 GIVEUP_COOL）
+        self._toofar = {}            # eid → 判定「路太遠」的時間（見 MAX_CHASE）
+        self._me = None              # 這一拍我的位置（_targets 用）
         self._nokill_t = 0.0         # 一直在打卻沒殺掉半隻多久了
 
     def _on_run_toggled(self, on: bool) -> None:
@@ -1014,8 +1021,15 @@ class DungeonTab(BaseTab):
         —— 門會解開，這一秒走不到的怪下一秒可能就打得到了；記黑名單會讓
         它在名單過期前一直被忽略。
         """
+        now = time.monotonic()
+        for eid, t0 in list(self._toofar.items()):
+            if now - t0 > GIVEUP_COOL:
+                del self._toofar[eid]           # 時間到再問一次
+        me = self._me
         return [m for m in self._live_monsters()
-                if self._can_reach((m.x, m.y))]
+                if m.eid not in self._toofar
+                and (me is None or _d((m.x, m.y), me) <= MAX_CHASE)
+                and self._can_reach((m.x, m.y))]
 
     def _give_up(self, why: str) -> None:
         """這一隻先放著，換一隻打。⛔ 不記黑名單，只是**立刻重問一次地形**。"""
@@ -1050,6 +1064,7 @@ class DungeonTab(BaseTab):
         if me is None:
             self._say("讀不到自己的位置，這一拍不動")
             return
+        self._me = me
 
         # ⓪-0 全自動循環的外圈（補給／飛回入口／組隊）—— 這幾段自己會換圖，
         #   不能給下面的「地圖變了就停」抓到。
@@ -1370,8 +1385,23 @@ class DungeonTab(BaseTab):
                 return False
             # 剛放棄的那一隻先跳過 —— 但**只有在還有別隻的時候**。
             pool = [m for m in fresh if m.eid != self._last_gave_up] or fresh
-            # 最近的一隻。⚠ 走不走得到已經在 _targets() 問過了。
-            self._cur = min(pool, key=lambda m: _d((m.x, m.y), me))
+            # 最近的一隻。⚠ 走不走得到已經在 _targets() 問過了；這裡再用 A* 量
+            #   **實際路徑**（直線 10 格、繞牆 40 格的那種）超過 MAX_CHASE 就當沒看到。
+            pick = None
+            for m in sorted(pool, key=lambda m: _d((m.x, m.y), me)):
+                if self._grid is not None and _d((m.x, m.y), me) > 1.0:
+                    rt = self._grid.route(me, (m.x, m.y), max_cost=MAX_CHASE)
+                    if rt is None:
+                        self._toofar[m.eid] = now
+                        self._say(f"「{m.name}」路徑超過 {MAX_CHASE:.0f} 格 → 當沒看到")
+                        continue
+                pick = m
+                break
+            if pick is None:
+                self._keys.set_on(False)
+                self._keys.eid = None
+                return False                       # 都太遠 → 跑腳本
+            self._cur = pick
             self._cur_t = 0.0
             self._atk.attack(self._state, self._cur)
             self._keys.eid = self._cur.eid

@@ -748,6 +748,37 @@ def main() -> int:
     tab._fight((10.0, 10.0), TICK)
     ck("★ 冷卻到了照樣再挑它（門可能開了）", tab._atk.picked is lone)
 
+    # ★★★ 2026-09-03 使用者定：「路徑超過 30 格就當沒看到」（往怪走→掃不到→
+    #   去點位→又掃到→再追 的輪迴）。直線太遠不算；直線近但繞路太長也不算。
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._me = (10.0, 10.0)
+    far = FakeMon(x=45.0, y=10.0, eid=91, name="直線35格")
+    around = FakeMon(x=13.0, y=10.0, eid=92, name="隔牆繞40格")   # 直線最近、但要繞
+    ok_m = FakeMon(x=14.0, y=10.0, eid=93, name="正常")
+    tab._live_monsters = lambda: [far, around, ok_m]
+    tab._reach = None                            # 不過濾可達區，只看距離／路徑
+    ck(f"★ 直線超過 {dt.MAX_CHASE:.0f} 格 → 不在目標裡",
+       [m.eid for m in tab._targets()] == [92, 93], str([m.eid for m in tab._targets()]))
+
+    class FakeGridChase:                       # ⚠ 別叫 FakeGrid：main() 後面有同名的
+        def route(self, start, goal, relax=4, max_cost=None):
+            n = abs(goal[0] - start[0]) + abs(goal[1] - start[1])
+            if goal[0] == 13.0:                  # 隔牆那隻要繞 40 格
+                n = 40
+            return None if (max_cost is not None and n > max_cost) else [(0, 0)] * int(n)
+    tab._grid = FakeGridChase()
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    dt.entity.read_pos = lambda _sc, _addr: None
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 直線近但 A* 路徑超過上限 → 跳過它、挑正常那隻",
+       tab._atk.picked is ok_m and 92 in tab._toofar,
+       f"{tab._atk.picked and tab._atk.picked.name} toofar={list(tab._toofar)}")
+    ck("　被判太遠的那隻之後也不算在「殺光了沒」裡",
+       [m.eid for m in tab._targets()] == [93])
+    tab._live_monsters = lambda: [around]
+    tab._cur = None
+    ck("★ 只剩路太遠的 → 不追、跑腳本", not tab._fight((10.0, 10.0), TICK))
+
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
     #   第二個病灶）：KeyWorker 拿它讀「我離目標多遠」，讀成 (0,0) 就每一招
     #   都判超出射程 → 完全不出手。
