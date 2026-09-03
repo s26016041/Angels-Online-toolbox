@@ -202,6 +202,11 @@ JOIN_GAP = 0.5             # 分身每隔這麼久按一次「同意」
 TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 # 打不到（走不過去）這麼久就放棄這一隻，換下一隻。
 GIVE_UP = 15.0
+# ★★ 剛放棄的怪**冷卻**（使用者 2026-09-03 實機：「一下掃到怪物一下走路，兩個一直
+#   輪迴」＝在轉角追一隻追不到的怪 → 放棄 → 走腳本 → 掃到它又追 → …）。
+#   ⛔ 不是黑名單（使用者 9/2 明令）：只是**放棄之後這麼多秒內不再挑它**，時間到
+#   照樣再問一次走不走得到（門可能開了）。冷卻中如果沒有別隻可打 → 先跑腳本。
+GIVEUP_COOL = 20.0
 # ★★ 順移判定（傳點那一步的完成訊號，使用者 2026-09-02 定案）：
 #   「人被傳走不會換地圖，有順移就算吧，有時候傳點之間也很短」
 #   —— 所以不能用「離傳點多遠」判，要用**一拍之間跳了多少**：
@@ -732,6 +737,7 @@ class DungeonTab(BaseTab):
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
         self._grid = None            # 上次讀到的地形圖（判斷怪站的是不是可走格）
         self._last_gave_up = None    # 剛放棄的那一隻（有別隻時先挑別隻）
+        self._gave_up = {}           # eid → 放棄的時間（冷卻用，見 GIVEUP_COOL）
         self._nokill_t = 0.0         # 一直在打卻沒殺掉半隻多久了
 
     def _on_run_toggled(self, on: bool) -> None:
@@ -1015,7 +1021,9 @@ class DungeonTab(BaseTab):
         """這一隻先放著，換一隻打。⛔ 不記黑名單，只是**立刻重問一次地形**。"""
         if self._cur is not None:
             self._last_gave_up = self._cur.eid
-            self._say(f"{why} → 先換一隻（「{self._cur.name}」等一下再問）")
+            self._gave_up[self._cur.eid] = time.monotonic()
+            self._say(f"{why} → 先換一隻（「{self._cur.name}」"
+                      f"{GIVEUP_COOL:.0f} 秒後再問）")
         self._grid_t = 0.0            # 下一拍就重讀地形＋重算可達區
         self._drop_target()
 
@@ -1346,9 +1354,22 @@ class DungeonTab(BaseTab):
                 self._nokill_t = 0.0
                 self._last_gave_up = None
                 return False
+            # ★ 剛放棄的怪在冷卻中先不挑（見 GIVEUP_COOL）；冷卻中又沒別隻
+            #   → **先跑腳本**（不然就是「追→放棄→掃到→再追」的輪迴）。
+            now = time.monotonic()
+            for eid, t0 in list(self._gave_up.items()):
+                if now - t0 > GIVEUP_COOL:
+                    del self._gave_up[eid]
+            fresh = [m for m in alive if m.eid not in self._gave_up]
+            if not fresh:
+                left = max(GIVEUP_COOL - (now - min(self._gave_up.values())), 0.0)
+                self._say(f"周圍 {len(alive)} 隻怪都是剛放棄追不到的"
+                          f"（{left:.0f} 秒後再問）→ 先跑腳本")
+                self._keys.set_on(False)
+                self._keys.eid = None
+                return False
             # 剛放棄的那一隻先跳過 —— 但**只有在還有別隻的時候**。
-            # ⛔ 不是黑名單：只剩它一隻就照樣再問一次（門可能開了）。
-            pool = [m for m in alive if m.eid != self._last_gave_up] or alive
+            pool = [m for m in fresh if m.eid != self._last_gave_up] or fresh
             # 最近的一隻。⚠ 走不走得到已經在 _targets() 問過了。
             self._cur = min(pool, key=lambda m: _d((m.x, m.y), me))
             self._cur_t = 0.0
@@ -1421,6 +1442,7 @@ class DungeonTab(BaseTab):
         self._scan_t = 0.0
 
     def _on_died(self, eid, _confirmed) -> None:
+        self._gave_up.pop(eid, None)
         if self._cur is not None and self._cur.eid == eid:
             self._nokill_t = 0.0          # 有進展了 → 看門狗歸零
             self._last_gave_up = None

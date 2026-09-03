@@ -731,6 +731,23 @@ def main() -> int:
        tab._atk.picked is other,
        tab._atk.picked.name if tab._atk.picked else "沒挑")
 
+    # ★★ 2026-09-03 使用者實機：轉角「掃到怪→走路」無限輪迴 → 剛放棄的怪冷卻
+    #   GIVEUP_COOL 秒內不再挑；冷卻中沒別隻就先跑腳本；冷卻到了照樣再問。
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    lone = FakeMon(x=11.0, y=10.0, eid=77, name="轉角那隻")
+    tab._live_monsters = lambda: [lone]
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._cur = lone
+    tab._give_up("追不到")
+    ck("★ 放棄後冷卻中、又只剩它 → 不追，先跑腳本",
+       not tab._fight((10.0, 10.0), TICK) and tab._atk.picked is None,
+       str(tab._atk.picked))
+    ck("　_targets() 照樣每拍重問（沒有黑名單）",
+       [x.eid for x in tab._targets()] == [77])
+    tab._gave_up[77] -= dt.GIVEUP_COOL + 1     # 冷卻到了
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 冷卻到了照樣再挑它（門可能開了）", tab._atk.picked is lone)
+
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
     #   第二個病灶）：KeyWorker 拿它讀「我離目標多遠」，讀成 (0,0) 就每一招
     #   都判超出射程 → 完全不出手。
