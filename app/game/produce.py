@@ -134,12 +134,12 @@ def _send(mover, scanner, opcode: int, body_len: int,
 # 配方、同樣站在檯子旁，面板沒開送出去 20 秒毫無反應；面板開著 3 秒後材料
 # −1、產物 +1）。面板是伺服器開的，我們這邊唯一能做的就是**跟遊戲一樣點它**。
 #
-# 點一個東西 ＝ 封包 0x05(實體ID, 動作碼)，函式就是 `attack.THIRD_FN`
-# （反組譯 0x559FE0：`push 8 / push 5` → 建包 → `mov [封包+2],實體ID`
-#  → `mov [0x9B6664],實體ID` → `mov [封包+6],動作碼` → 送出）。
-# ★ 不必再登記一個位址：那支已經在 `locate.SIGS` 裡（attack.THIRD_FN），
-#   打怪的第二包用的就是它，點檯子只是動作碼給 0。
-CLICK_ACTION = 0                # 點場景物件時遊戲自己送的動作碼就是 0
+# 怎麼點：**叫遊戲自己那支**（`supply.click_object` → TryAct），見下面 `click()`。
+# ⚠ 舊做法是自己送封包 0x05(實體ID, 0)（`attack.THIRD_FN`，反組譯 0x559FE0 的
+#   `push 8 / push 5`）—— 2026-09-03 已**整條刪掉**改用官方那支（使用者：
+#   「都改新的、留下一種對話方式就好」）。差別是官方那支自己判距離＋視線、
+#   不夠近會用官方尋路走過去；盲送 0x05 太遠伺服器直接不理。
+#   （`attack.THIRD_FN` 本身還在，打怪第二包還在用它。）
 # 製作面板的 Lua 全域：開著是執行期代號、關著是 0（跟 WND_BANK 同一招）。
 WND_MAKE = "WND_MAKE"
 
@@ -159,21 +159,45 @@ def panel_open(scanner) -> bool | None:
 
 
 def click(mover, scanner, prop) -> tuple[bool, str]:
-    """點一個場景物件（＝送 0x05）。`prop` 是 `scenery.Prop`。
+    """點一個場景物件 —— **跟滑鼠點一模一樣**：官方的 `TryAct(eid, 3)`。
+    `prop` 是 `scenery.Prop`（製作檯、副本的對話物件、雕像、公佈欄都是這個）。
 
-    ⚠ **送出前當場重驗那個 ID 還指著同一個東西**（CLAUDE.md 的鐵則）：
-      物件會被回收、表格那一格會被別的東西佔走，上一拍讀到的 ID 不能信。
+    ★★ 2026-09-03 使用者定調「都改新的、留下一種對話方式就好」——
+      舊做法（自己送封包 `0x05(oid, 0)`）已經**刪掉**，不再保留第二條路。
+      官方那支好在哪：
+        · **它自己判距離＋視線**；不夠近就用**官方尋路走一步**，下一發接著走。
+          舊的盲送太遠伺服器直接不理，只能靠呼叫端「沒反應→自己靠近再點」硬撐。
+        · 送出去的是遊戲自己那一組封包（面向 0x07 ＋ 點選 0x05），不是我們拼的。
+    ⚠⚠ 一度以為「場景物件不在實體管理器裡所以不能用這支」——**那是錯的**：
+      `[pf+0xB0]`（TryAct 查表用的）跟 `move.MGR_PTR` 是**同一個管理器、同一張表**，
+      NPC 跟場景物件都在裡面，差別只是我們用 `+0x1D0`(oid) 還是 `+0xBC`(eid)。
+      實測（黑狐 永夜城「靜態-公佈欄1」10.4 格外）：連叫 3 發＝官方尋路走到
+      1.5 格 → 排行榜視窗開了。
+    ⚠ 回 True 只代表**這一發送進去了**（TryAct 對 kind 3 的回傳恆為 1），
+      **不代表點到了** —— 呼叫端一律看「面板／對話頁有沒有變」。還沒走到的
+      那幾發也是 True（它在走路），照原本的重試節奏再叫一次即可。
+    ⚠ **送出前當場重驗那個物件還在**（CLAUDE.md 鐵則）：物件會被回收、
+      表格那一格會被別的東西佔走，上一拍讀到的位址不能信。
+    ⚠ 定位失敗（改版）＝**大聲停用**，不退回舊路（只留一種做法）。
+    ★★★ 2026-09-03 實機 A/B（黑狐 遺落之地分流6「靜態-廢棄機器人1」）：
+      先把對話收乾淨、退到 5.5 格外，**只用這一支**每 0.4 秒叫一發 ——
+      第1發走到 3.3 格、第2發走到 1.3 格、**第3發對話就開了**（約 1.2 秒）。
+      舊的盲送 0x05 貼著點也開得起來，但它不會自己走 —— 使用者要的就是
+      「跟滑鼠點一樣」：走過去＋開對話都交給遊戲。
+    ⚠ 製作檯（開製作面板）也走這一支了。⚠ 那個情境**還沒驗過**：當天線上
+      五隻都是戰鬥角色，站在永夜城製作檯前 1.1 格新舊兩種點法都不開面板
+      （面板是伺服器開的，八成是沒有那個生產職業）。真的開不了就把這支換回
+      `attack.THIRD_FN(prop.oid, 0)`（一行的事）。
     """
-    from app.game import attack, scenery
+    from app.game import scenery, supply
     if not (mover and mover.active):
         return False, "跳板沒裝好"
-    if not attack.THIRD_FN:
+    if not supply.TRY_ACT_FN:
         return False, "點選函式定位失敗（遊戲改版？）—— 這個功能停用"
     if not scenery.still_there(scanner, prop):
         return False, "那個東西已經不在了（換地圖／走出視野？）"
-    if mover.call_sync(attack.THIRD_FN, prop.oid, CLICK_ACTION,
-                       timeout=CALL_TIMEOUT) is None:
-        return False, "點選排不進去（指令槽忙碌）"
+    if not supply.click_object(mover, scanner, prop.addr):
+        return False, "點選排不進去（指令槽忙碌／讀不到 eid）"
     return True, f"已點 ({prop.x:.0f},{prop.y:.0f})"
 
 
