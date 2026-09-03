@@ -1536,7 +1536,7 @@ class CharProducePage(QWidget):
                     c["pi"] = k
                     break
         p = props[min(c["pi"], len(props) - 1)]
-        ok, msg = produce.click_bench(self._mover, self.sc, p)
+        ok, msg = produce.click(self._mover, self.sc, p)
         c["poked"] = p if ok else None
         if not ok:
             return f"⚠ 點製作檯沒送出（{msg}）"

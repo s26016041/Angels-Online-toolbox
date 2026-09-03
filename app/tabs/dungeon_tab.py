@@ -138,6 +138,13 @@ TALK_SETTLE = 2
 # 按了確定、視窗還在 → 隔多久補送一次（[[confirm-and-resend]]：送出去
 # 不代表做到了；補送確定是安全的，翻頁了就是翻頁）。
 CLOSE_RETRY = 1.5
+# ★★ 2026-09-03 使用者實機卡死：「按確定 → 視窗還在 → 再按」**永遠出不來**。
+#   現場驗屍（黑狐 遺落之地分流6）：畫面上**根本沒有對話框**，但
+#   `WND_MESSAGE` 還指著一個 id 對得上的視窗物件、遊戲自己的 `ismessageend`
+#   也回「還沒結束」（那個 byte [視窗+0x148] ＝ 0）——**殘留狀態**，
+#   來源是之前跟 NPC 講過話沒把對話框 destroy 掉（見 supply.leave_npc）。
+#   → 按了這麼多次確定、對話頁一格都沒變，就當它是殘留：destroy 掉、當結束。
+CLOSE_GIVEUP = 6
 # 「有沒有視窗」要**叫進遊戲**問（call_sync 會等它做完），
 # 所以答案快取這麼久，⛔ 不要每拍問。
 WND_TTL = 0.3
@@ -580,6 +587,7 @@ class DungeonTab(BaseTab):
         self._talk_did = ""          # 這一頁做過什麼（"opt"／"close"）
         self._talk_seen = False      # 這一步**看過**對話視窗開起來沒
         self._close_t = 0.0          # 按了確定之後等多久了
+        self._close_n = 0            # 確定按了幾次還是沒換頁（見 CLOSE_GIVEUP）
         self._wnd = None             # 上一次問到的「有沒有對話視窗」
         self._wnd_t = 0.0            # 那是什麼時候問的
         self._talk_base = None       # 點下去那一刻的簽章（判「有沒有點到」）
@@ -727,7 +735,7 @@ class DungeonTab(BaseTab):
             # ★ 停機也要把對話框收掉，不然人會帶著框走來走去。
             try:
                 talkwnd.close_window(self._mover, self._sc)
-                supply.leave_npc(self._mover)
+                supply.leave_npc(self._mover, self._sc)
             except Exception:                            # noqa: BLE001
                 pass
         if self._mover is not None and self._pid is not None:
@@ -1503,6 +1511,16 @@ class DungeonTab(BaseTab):
                     return
                 self._say(f"{tag}　一直在動（被推？）—— 不等了，直接點")
             self._still_t = 0.0
+            # ★★ 還沒點就說「對話視窗開著」＝**上一段對話的殘留**（每一步收尾
+            #   都會 destroy，所以正常情況這裡一定是沒有）。不先收掉的話下面
+            #   整段會以為對話已經開了 → 一路按確定 → 永遠不點物件（使用者
+            #   2026-09-03 實機卡死就是這樣）。
+            if self._wnd_open(dt):
+                talkwnd.close_window(self._mover, self._sc)
+                supply.leave_npc(self._mover, self._sc)
+                self._wnd, self._wnd_t = None, 0.0
+                self._say(f"{tag}　先收掉上一段留下的對話框再點")
+                return
             props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
             if props is None:
                 # ⚠ 讀不到 ≠ 沒有。等下一拍再試，不要當成「這裡沒東西」。
@@ -1517,9 +1535,6 @@ class DungeonTab(BaseTab):
             # ★ 基準要在**點下去之前**讀：點完對話可能立刻就開了，
             #   那時再讀就跟第一頁一樣，永遠判不出「有沒有點到」。
             pg0 = talkwnd.page(self._sc)
-            # ★★ `produce.click` 2026-09-03 起就是**官方點法**（TryAct，跟滑鼠
-            #   點一模一樣）：它自己判距離＋視線，不夠近會用**官方尋路**幫我們
-            #   走最後一段 —— 下面那個「點了沒反應 → 自己靠近再點」現在只是保險。
             ok, msg = produce.click(self._mover, self._sc, hit[0])
             if not ok:
                 self._say(f"點不下去（{msg}），重試中…")
@@ -1531,7 +1546,7 @@ class DungeonTab(BaseTab):
             self._talk_same, self._click_t, self._nudge = 0, 0.0, 0
             self._click_best = None
             self._talk_did = ""
-            self._talk_seen, self._close_t = False, 0.0
+            self._talk_seen, self._close_t, self._close_n = False, 0.0, 0
             self._wnd, self._wnd_t = None, 0.0   # 強制重問一次
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
@@ -1606,7 +1621,7 @@ class DungeonTab(BaseTab):
                            f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
                            f" —— 停下來（NPC 的對話跟腳本記的不一樣？）")
                 return
-            supply.leave_npc(self._mover)
+            supply.leave_npc(self._mover, self._sc)
             finish()
             return
         if pg is None:
@@ -1617,7 +1632,7 @@ class DungeonTab(BaseTab):
                     self._menu_i += 1
                 self._say(f"{tag}　讀不到對話狀態 → 照腳本送第 {n} 項")
                 return
-            supply.leave_npc(self._mover)
+            supply.leave_npc(self._mover, self._sc)
             finish()
             return
         # ⚠⚠ 這些全域**關掉對話還會留著**，所以一切以「簽章變了＝換頁了」為準：
@@ -1629,7 +1644,7 @@ class DungeonTab(BaseTab):
             if self._talk_did == "opt":
                 self._menu_i += 1           # 有換頁 ＝ 剛剛那一項真的送到了
             self._talk_sig, self._talk_same, self._talk_did = pg.sig, 0, ""
-            self._close_t = 0.0
+            self._close_t, self._close_n = 0.0, 0   # 有換頁＝真的有反應
         else:
             self._talk_same += 1
         if not self._talk_did:
@@ -1678,10 +1693,29 @@ class DungeonTab(BaseTab):
             self._close_t += gap
             if self._close_t >= CLOSE_RETRY:
                 self._close_t = 0.0
+                self._close_n += 1
+                if self._close_n >= CLOSE_GIVEUP:
+                    # ★ 按了這麼多次、對話頁一格都沒變 ＝ 那個「視窗還在」是
+                    #   殘留（見 CLOSE_GIVEUP）。destroy 掉當這段對話結束，
+                    #   ⛔ 不要再無限按下去（會整趟卡死）。
+                    talkwnd.close_window(self._mover, self._sc)
+                    supply.leave_npc(self._mover, self._sc)
+                    self._wnd, self._wnd_t = None, 0.0
+                    self._close_n = 0
+                    if self._menu_i < len(menu):
+                        self._stop(f"⛔ {tag}：確定按了 {CLOSE_GIVEUP} 次對話頁"
+                                   f"都沒變，腳本還有 "
+                                   f"{len(menu) - self._menu_i} 個選項沒送到"
+                                   f" —— 停下來")
+                        return
+                    self._say(f"{tag}　確定按不動＝殘留的對話框，收掉當結束")
+                    finish()
+                    return
                 ok, why = talkwnd.close_page(self._mover, self._sc)
                 self._wnd_t = 0.0
                 self._say(f"{tag}　確定沒反應 → 再按一次"
-                          f"（{'送出' if ok else why}）")
+                          f"（{self._close_n}/{CLOSE_GIVEUP}，"
+                          f"{'送出' if ok else why}）")
                 return
             self._say(f"{tag}　等對話翻頁…")
             return
@@ -1699,7 +1733,7 @@ class DungeonTab(BaseTab):
         #   要把對話框點掉避免 BUG」——`messageclose` 只通知伺服器，
         #   畫面上那個框要叫 Lua 的 DestroyMessageWnd 才會收。
         talkwnd.close_window(self._mover, self._sc)
-        supply.leave_npc(self._mover)
+        supply.leave_npc(self._mover, self._sc)
         finish()
 
     def _next(self) -> None:

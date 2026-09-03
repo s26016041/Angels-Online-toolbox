@@ -209,7 +209,7 @@ def enter(mover, scanner, route: EventMap, sub: int = 0,
 
     # ⚠ 失敗收尾一定要送「離開 NPC」：對話開著角色被伺服器鎖住不能走
     #   （見 supply.leave_npc），不送的話人會定在 NPC 旁邊動不了。
-    supply.leave_npc(mover)
+    supply.leave_npc(mover, scanner)
     # ★ 失敗原因分兩種講清楚（講錯方向會害人往錯的地方查）：
     #   看得到他＝對話沒吃到／等級不夠；看不到他＝活動下架或被移走。
     if supply.find_npc(scanner, route.npc_id) is None:

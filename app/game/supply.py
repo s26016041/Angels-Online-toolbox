@@ -347,11 +347,14 @@ def find_npc(scanner, npc_id: int):
 def click_object(mover, scanner, ent_addr: int, kind: int = KIND_TALK) -> bool:
     """**官方點法**：對場上任何一個東西送一發 `TryAct(eid, kind)`。
 
-    ⚠⚠ 「場上任何一個東西」是字面意思：NPC 跟**場景物件（雕像／公佈欄／副本
-      裡那些對話物件）在同一張物件表裡**，`+0xBC` 都查得到（2026-09-03 實測：
-      永夜城「靜態-公佈欄1」+0xBC 查表命中、連叫 3 發走過去並開了視窗）。
-      —— 一開始我寫「場景物件不在實體管理器裡所以不能用這支」是**錯的**。
-    kind：3＝互動／講話（NPC 對話、物件對話都是它）、4＝攻擊。
+    ⛔⛔ **只給「NPC 人物」用，不要拿去點場景物件**（2026-09-03 使用者實機回報）：
+      我一度把副本的物件點擊也改成這支，結果**副本點不到物件、怪物掃描與戰鬥
+      也跟著怪怪的** —— 已全部退回舊的自送 0x05（`produce.click`）。
+      推測原因：TryAct 成功那條會順手設**自動走路狀態機 mode 1**（把角色往目標
+      拉）並寫互動狀態欄 `[pf+0x34C]/[pf+0x354]`，副本每拍重點就一直在拉人、
+      跟我們自己的走位／打怪搶。⚠ NPC 那條是「講完話就結束」所以沒事。
+      （單發實測公佈欄會開視窗是真的，但**能開窗 ≠ 放進每拍重試的迴圈裡安全**。）
+    kind：3＝互動／講話。
     回 True 只代表**這一發送進去了**（TryAct 對 kind 3 的回傳恆為 1，不能當
     「成功了」用）；到底有沒有點到，看對話框／視窗有沒有變。
     """
@@ -505,13 +508,19 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
     return False
 
 
-def leave_npc(mover) -> None:
+def leave_npc(mover, scanner=None) -> None:
     """送「離開 NPC 互動」包 ＝ 泛用送包(0x22, 0)。
 
     ⚠⚠ **對話開著／交易開著時角色被伺服器鎖住不能走**（實測 walk 位移=0，
       見 `_bank_close`、`REPAIR_CLOSE_FN` 的說明）。所以任何「開了 NPC 對話但
       沒走完流程」的路徑收尾都要叫這支，不然人就卡在原地。
     ★ 送包走 `attack.SELECT_FN`（泛用送包，AOB 已定位）——**不准在別處寫死第二份**。
+    ⚠⚠ **給了 scanner 就順手把對話框 destroy 掉**（2026-09-03 使用者實機卡死）：
+      0x22 只是跟伺服器說「不講了」，畫面上那個對話框**不會消失**，`WND_MESSAGE`
+      也一直指著那個視窗物件（id 還對得上、遊戲自己的 `ismessageend` 也回
+      「還沒結束」）。留著的話**後面每一個用「有沒有對話視窗」判斷的功能都會被
+      它騙**——刷副本就是這樣整趟卡死：以為對話已經開著 → 從頭到尾不去點物件 →
+      一路按確定。收尾一定要 destroy（跟 `_bank_close` 叫 `DestroyBankWnd` 同理）。
     ⚠ 失敗不吵：這是收尾動作，叫不動最多是視窗還在，不該把整趟判成失敗。
     """
     try:
@@ -519,6 +528,13 @@ def leave_npc(mover) -> None:
             with mover.lock:
                 mover.call_sync(attack.SELECT_FN, LEAVE_NPC_CODE, 0,
                                 timeout=CALL_TIMEOUT)
+    except Exception:                                      # noqa: BLE001
+        pass
+    if scanner is None:
+        return
+    try:
+        from app.game import talkwnd
+        talkwnd.close_window(mover, scanner)
     except Exception:                                      # noqa: BLE001
         pass
 
@@ -536,7 +552,7 @@ def close_sale(mover, scanner) -> None:
       `OnNPCSaleClose` 就是 X 鈕那支，無參數；叫完 WND_NPCSALE → 0（實測）。
     ⚠ 失敗不吵：這是收尾動作，叫不動最多是框還在，不該把整趟判成失敗。
     """
-    leave_npc(mover)
+    leave_npc(mover, scanner)
     try:
         lua.call(mover, scanner, "OnNPCSaleClose")
     except Exception:                                      # noqa: BLE001
@@ -959,7 +975,7 @@ def _bank_close(mover, scanner) -> None:
     ★ 送包走 `attack.SELECT_FN`（泛用送包，AOB 已定位）——擷取時的 0x5D29C1 就是它
       8/11 改版後的位址，**不准在這裡寫死第二份**（改版位移後呼叫舊位址＝跳進亂碼）。
     """
-    leave_npc(mover)
+    leave_npc(mover, scanner)
     try:
         lua.call(mover, scanner, "game.closebank")
         lua.call(mover, scanner, "DestroyBankWnd")

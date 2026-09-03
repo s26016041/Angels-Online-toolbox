@@ -12,8 +12,7 @@
 
 1. 「重新掃描」列出附近**可互動的物件**（`scenery.nearby`，跟製作檯同一族：
    vtable 對得上、採集種類 0、選定 id 合法 —— 純裝飾點了沒反應的會被排掉）。
-2. 選一個按「點點看」→ 走 `produce.click()`（＝**叫遊戲自己那支**點，
-   跟滑鼠點一模一樣；太遠它會用官方尋路自己走過去）。
+2. 選一個按「點點看」→ 走 `produce.click()`（＝封包 `0x05`，跟遊戲自己點一樣）。
 3. 遊戲把對話框開起來，使用者**看著遊戲畫面**按介面上的「第 N 項」按鈕，
    工具送 `talkaction`（`sell.talk` + `supply.talk_option`）並把 N 記進路徑。
 4. 「把這一步存進腳本」→ 存成 `{"do":"interact","at":[x,y],"model":…,"menu":[…]}`。
@@ -1276,7 +1275,7 @@ class DungeonMakeTab(BaseTab):
             return
         prop = self._props[i]
         before = self._dialog_token(sc)
-        ok, msg = produce.click_bench(mv, sc, prop)
+        ok, msg = produce.click(mv, sc, prop)
         if not ok:
             self.status.setText(f"⚠ 點不下去：{msg}")
             return
@@ -1407,7 +1406,7 @@ class DungeonMakeTab(BaseTab):
         if mv is None:
             return
         closed = talkwnd.close_window(mv, sc)
-        supply.leave_npc(mv)
+        supply.leave_npc(mv, sc)
         self.status.setText("已關掉對話框並送出離開互動" if closed
                             else "已送出離開互動（⚠ 對話框沒關成，再按一次）")
 
