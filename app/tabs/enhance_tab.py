@@ -65,8 +65,8 @@ PICK_WIDTH = 3
 REFRESH_MS = 400               # 背包多久對一次帳
 RUN_MS = 200                   # 強化狀態機多久跑一拍
 HIST_MAX = 300
-# 選裝備時「寶石等限 ≤」自動填成 裝備等級 − 這個數（使用者 2026-09-03 定），仍可手改
-GEM_CAP_BELOW = 15
+# 選裝備時「寶石等限 ≤」自動填成 裝備等級 − 這個數（使用者 2026-09-03 定 15 → 同日改 10），仍可手改
+GEM_CAP_BELOW = 10
 
 COLOUR_OF = {
     enhance.SUCCESS: "#7CFC7C",
