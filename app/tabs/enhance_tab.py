@@ -120,46 +120,49 @@ class BagGrid(QWidget):
     def paintEvent(self, _ev) -> None:                   # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, False)
-        rows = max(1, (len(self._gears) + COLS - 1) // COLS)
-        for row in range(rows):
-            for col in range(COLS):
-                x = PAD + col * CELL
-                y = PAD + row * CELL
-                cell = QRect(x, y, CELL - 2, CELL - 2)
-                p.fillRect(cell, QColor(CELL_BG))
-                p.setPen(QPen(QColor(CELL_EDGE), 1))
-                p.drawRect(cell)
-                idx = row * COLS + col
-                if idx >= len(self._gears):
-                    continue
-                g = self._gears[idx]
-                pm = itemicon.pixmap(g.icon_id)
-                if pm is not None and not pm.isNull():
-                    w = min(pm.width(), CELL - 8)
-                    h = min(pm.height(), CELL - 8)
-                    p.drawPixmap(x + (CELL - 2 - w) // 2,
-                                 y + (CELL - 2 - h) // 2,
-                                 pm.scaled(w, h, Qt.KeepAspectRatio,
-                                           Qt.SmoothTransformation))
-                else:
-                    # 沒有圖就顯示名字前兩個字 —— 安全退化，不抓別張圖頂替
-                    p.setPen(QColor("#DDDDDD"))
-                    p.drawText(cell, Qt.AlignCenter, g.name[:2])
-                if g.enhance:
-                    # 右下角標「+N」。先用黑底描一遍再畫紫字，
-                    # 不然疊在亮色圖示上會看不見（背包.png 的數量也是這樣描邊）。
-                    box = cell.adjusted(0, 0, -3, -2)
-                    p.setPen(QColor(0, 0, 0, 200))
-                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        p.drawText(box.translated(dx, dy),
-                                   Qt.AlignRight | Qt.AlignBottom,
-                                   f"+{g.enhance}")
-                    p.setPen(QColor("#E0B0FF"))
-                    p.drawText(box, Qt.AlignRight | Qt.AlignBottom,
+        if not self._gears:
+            # ★ 沒東西就不畫任何格子（使用者 2026-09-03：不要有空的背景框）
+            p.setPen(QColor("#888888"))
+            p.drawText(QRect(PAD, PAD, COLS * CELL, CELL), Qt.AlignVCenter,
+                       "背包裡沒有可強化的裝備")
+            p.end()
+            return
+        # 有幾件就畫幾格，不補滿整列
+        for idx, g in enumerate(self._gears):
+            row, col = divmod(idx, COLS)
+            x = PAD + col * CELL
+            y = PAD + row * CELL
+            cell = QRect(x, y, CELL - 2, CELL - 2)
+            p.fillRect(cell, QColor(CELL_BG))
+            p.setPen(QPen(QColor(CELL_EDGE), 1))
+            p.drawRect(cell)
+            pm = itemicon.pixmap(g.icon_id)
+            if pm is not None and not pm.isNull():
+                w = min(pm.width(), CELL - 8)
+                h = min(pm.height(), CELL - 8)
+                p.drawPixmap(x + (CELL - 2 - w) // 2,
+                             y + (CELL - 2 - h) // 2,
+                             pm.scaled(w, h, Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation))
+            else:
+                # 沒有圖就顯示名字前兩個字 —— 安全退化，不抓別張圖頂替
+                p.setPen(QColor("#DDDDDD"))
+                p.drawText(cell, Qt.AlignCenter, g.name[:2])
+            if g.enhance:
+                # 右下角標「+N」。先用黑底描一遍再畫紫字，
+                # 不然疊在亮色圖示上會看不見（背包.png 的數量也是這樣描邊）。
+                box = cell.adjusted(0, 0, -3, -2)
+                p.setPen(QColor(0, 0, 0, 200))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    p.drawText(box.translated(dx, dy),
+                               Qt.AlignRight | Qt.AlignBottom,
                                f"+{g.enhance}")
-                if g.serial == self._serial:
-                    p.setPen(QPen(QColor(PICK_EDGE), PICK_WIDTH))
-                    p.drawRect(cell.adjusted(1, 1, -1, -1))
+                p.setPen(QColor("#E0B0FF"))
+                p.drawText(box, Qt.AlignRight | Qt.AlignBottom,
+                           f"+{g.enhance}")
+            if g.serial == self._serial:
+                p.setPen(QPen(QColor(PICK_EDGE), PICK_WIDTH))
+                p.drawRect(cell.adjusted(1, 1, -1, -1))
         p.end()
 
     def mousePressEvent(self, ev) -> None:               # noqa: N802
