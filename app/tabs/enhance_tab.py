@@ -11,11 +11,18 @@
 所以按下去就是一路打到目標為止（使用者指定不要每發確認），中途只要
 **裝備不見了或退等就立刻停**，下面的紀錄會用紅字寫清楚。
 
+自動打孔（2026-09-03）
+---------------------
+選好裝備 → 設「打孔到 N 孔」與「寶石等限 ≤ L 級」→ 按「自動打孔」：
+用一般 N星打孔錘打孔（祝福錘不用；星級要夠這件裝備的等級），有空孔就先拿
+等限 ≤ L 的寶石鑲進去（好寶石不動），打到目標孔數為止，**最後一孔留空**。
+規則與封包出處見 `app/game/holes.py`。
+
 背後
 ----
 * 讀：`app/game/gear.py`（已強化次數 +0x52、孔 +0x51、寶石 +0x3D、進階屬性 +0x0C）
 * 送：`app/game/enhance.py` —— 就是「對物品使用物品」那一包（代號 0x2E），
-  跟你自己在遊戲裡按確定送的完全一樣。
+  跟你自己在遊戲裡按確定送的完全一樣；打孔／鑲嵌也是同一包（`holes.py`）。
 * 圖：`app/game/itemicon.py`（遊戲自己的圖示，編號從記憶體讀）
 """
 from __future__ import annotations
@@ -40,9 +47,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.config import config
 from app.core import charname, injector, preload, window as win
 from app.core.memory import MemoryScanner
-from app.game import bag, enhance, gear, itemicon, itemname, locate, move
+from app.game import bag, enhance, gear, holes, itemicon, itemname, locate, move
 from app.tabs.base_tab import BaseTab
 
 # 模擬背包的樣子（照使用者給的 背包.png：深色格子牆＋圖示置中）
@@ -196,14 +204,16 @@ class EnhanceTab(BaseTab):
         self._scanners: dict[int, MemoryScanner] = {}
         self._movers: dict[int, move.Mover] = {}
         self._sig: tuple | None = None
-        self._run: enhance.Run | None = None
+        self._run: enhance.Run | holes.Run | None = None
 
         root = QVBoxLayout(self)
 
         hint = QLabel(
             "只列「背包裡」可以強化的裝備（身上穿的不會出現）。滑鼠移上去看說明，"
             "點一下選起來，選好要強化到幾次再按下面的按鈕。"
-            "⚠ 一般強化錘失敗會讓裝備直接消失，按下去就會一路打到目標為止。")
+            "⚠ 一般強化錘失敗會讓裝備直接消失，按下去就會一路打到目標為止。\n"
+            "自動打孔：用一般 N星打孔錘打孔（祝福錘不用），有空孔先鑲「等限 ≤ 你設的等級」"
+            "的寶石，打到目標孔數為止，最後一孔留空給你自己鑲。⚠ 打孔失敗裝備會毀損。")
         hint.setWordWrap(True)
         root.addWidget(hint)
 
@@ -221,6 +231,11 @@ class EnhanceTab(BaseTab):
         self.hammer_lbl = QLabel("強化錘 —")
         self.hammer_lbl.setStyleSheet("font-weight: bold;")
         bar.addWidget(self.hammer_lbl)
+        self.hole_lbl = QLabel("打孔錘 —　寶石 —")
+        self.hole_lbl.setStyleSheet("font-weight: bold;")
+        self.hole_lbl.setToolTip(
+            "背包裡能用的一般打孔錘（祝福錘不算）與查得到等限的寶石。")
+        bar.addWidget(self.hole_lbl)
         root.addLayout(bar)
 
         box = QGroupBox("模擬背包（可強化的裝備）")
@@ -254,6 +269,38 @@ class EnhanceTab(BaseTab):
         self.stop_btn.clicked.connect(self._on_stop)
         act.addWidget(self.stop_btn)
         root.addLayout(act)
+
+        act2 = QHBoxLayout()
+        act2.addStretch(1)
+        act2.addWidget(QLabel("打孔到"))
+        self.hole_target = QSpinBox()
+        self.hole_target.setRange(1, holes.MAX_HOLES)
+        self.hole_target.setSuffix(" 孔")
+        self.hole_target.setValue(
+            int(config.get("enhance.hole_target", holes.MAX_HOLES)))
+        self.hole_target.setFixedWidth(72)
+        self.hole_target.setToolTip(
+            f"要打到幾個孔（遊戲上限 {holes.MAX_HOLES}）。到了就停，最後一孔留空。")
+        act2.addWidget(self.hole_target)
+        act2.addWidget(QLabel("寶石等限 ≤"))
+        self.gem_cap = QSpinBox()
+        self.gem_cap.setRange(0, holes.LEVEL_SANE)
+        self.gem_cap.setSingleStep(10)
+        self.gem_cap.setSuffix(" 級")
+        self.gem_cap.setValue(int(config.get("enhance.gem_cap", 20)))
+        self.gem_cap.setFixedWidth(84)
+        self.gem_cap.setToolTip(
+            "只拿「裝備等限」不超過這個數字的寶石去鑲（當墊子用），好寶石不會動。\n"
+            "寶石的等限＝說明文字那行「裝備等限：N級」。")
+        act2.addWidget(self.gem_cap)
+        self.hole_btn = QPushButton("自動打孔")
+        self.hole_btn.setToolTip(
+            "用一般 N星打孔錘打孔，有空孔先鑲寶石，直到孔數到目標（最後一孔留空）。\n"
+            "⚠ 打孔失敗裝備會毀損，一旦毀損或驗不出結果就立刻停。\n"
+            "祝福打孔錘不會用；錘子挑「星級夠這件裝備等級」裡最低的那種。")
+        self.hole_btn.clicked.connect(self._on_go_holes)
+        act2.addWidget(self.hole_btn)
+        root.addLayout(act2)
 
         self.status = QLabel("　")
         root.addWidget(self.status)
@@ -342,13 +389,28 @@ class EnhanceTab(BaseTab):
         if sc is None:
             return
         self.grid.scanner = sc
-        gears, complete = gear.in_bag(sc)
-        got = enhance.find_hammer(sc)
-        if got:
-            self.hammer_lbl.setText(f"強化錘 {got[1]} 個")
+        gears, _complete = gear.in_bag(sc)
+        # 一次掃描同時數強化錘、打孔錘、寶石（別各掃一遍）
+        items, scanned = bag.scan(sc)
+        n_hammer = sum(it.count for it in items
+                       if it.type_id == enhance.HAMMER_TYPE)
+        if n_hammer or scanned:
+            self.hammer_lbl.setText(f"強化錘 {n_hammer} 個")
         else:
-            self.hammer_lbl.setText("強化錘 0 個" if complete else "強化錘 —")
-        sig = (pid, tuple((g.serial, g.enhance, g.slot) for g in gears))
+            self.hammer_lbl.setText("強化錘 —")
+        hs, _ = holes.hammers(sc, items, scanned)
+        gs, _ = holes.gems(sc, items, scanned)
+        if hs or gs or scanned:
+            by_star: dict[int, int] = {}
+            for h in hs:
+                by_star[h.star] = by_star.get(h.star, 0) + h.count
+            stars = "、".join(f"{s}星×{n}" for s, n in sorted(by_star.items()))
+            self.hole_lbl.setText(
+                f"打孔錘 {stars or '0'}　寶石 {sum(g.count for g in gs)} 顆")
+        else:
+            self.hole_lbl.setText("打孔錘 —　寶石 —")
+        sig = (pid, tuple((g.serial, g.enhance, g.slot, g.holes, g.gems_filled)
+                          for g in gears))
         if sig != self._sig:
             self._sig = sig
             self.grid.set_gears(gears)
@@ -362,11 +424,16 @@ class EnhanceTab(BaseTab):
             self.pick_lbl.setText("還沒選裝備")
         else:
             self.pick_lbl.setText(
-                f"已選：{g.name}（目前 +{g.enhance}）")
+                f"已選：{g.name}（目前 +{g.enhance}、{g.holes} 孔 "
+                f"已鑲 {len(g.gems_filled)}、{g.base.get('level', '?')} 級）")
             low = min(g.enhance + 1, enhance.MAX_LEVEL)
             self.target.setMinimum(low)
             if self.target.value() < low:
                 self.target.setValue(low)
+            hlow = min(g.holes + 1, holes.MAX_HOLES)
+            self.hole_target.setMinimum(hlow)
+            if self.hole_target.value() < hlow:
+                self.hole_target.setValue(hlow)
         self._update_buttons()
 
     def _update_buttons(self) -> None:
@@ -375,6 +442,8 @@ class EnhanceTab(BaseTab):
         ok = (g is not None and not running
               and g.enhance < enhance.MAX_LEVEL)
         self.go_btn.setEnabled(bool(ok))
+        self.hole_btn.setEnabled(bool(g is not None and not running
+                                      and g.holes < holes.MAX_HOLES))
         self.stop_btn.setEnabled(running)
         self.who.setEnabled(not running)
 
@@ -401,6 +470,29 @@ class EnhanceTab(BaseTab):
         self._run = enhance.Run(sc, mv, g.slot, g.serial, target, g.name)
         self._log(f"開始：{g.name} +{g.enhance} → +{target}", "#7CD8FF")
         self.status.setText(f"強化中… {g.name} → +{target}")
+        self._run_timer.start(RUN_MS)
+        self._update_buttons()
+
+    def _on_go_holes(self) -> None:
+        pid, sc = self._cur()
+        g = self.grid.selected()
+        if sc is None or g is None:
+            return
+        mv = self._mover(pid)
+        if mv is None:
+            return
+        target = self.hole_target.value()
+        cap = self.gem_cap.value()
+        config.set("enhance.hole_target", target)
+        config.set("enhance.gem_cap", cap)
+        config.save()                      # ★ set() 不寫檔，要接 save()
+        if target <= g.holes:
+            self.status.setText("目標比目前的孔數還低 —— 不用打")
+            return
+        self._run = holes.Run(sc, mv, g.slot, g.serial, target, cap, g.name)
+        self._log(f"開始打孔：{g.name} {g.holes} 孔 → {target} 孔"
+                  f"（寶石等限 ≤ {cap} 級）", "#7CD8FF")
+        self.status.setText(f"打孔中… {g.name} → {target} 孔")
         self._run_timer.start(RUN_MS)
         self._update_buttons()
 

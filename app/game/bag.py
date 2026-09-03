@@ -106,6 +106,9 @@ ITEM_ENERGY = 0xA0
 TMPL_ICON = 0x00            # 圖示編號（原型介面）
 # ★ 出處：gettype 0x53370E ＝ [[this+0x58]+0x18]（上面的反組譯欄位表）
 TMPL_KIND = 0x18            # 分類代號（1:1 對到 item.xml 的「物品類別」，見下）
+# ★ 物品等級（item.xml「物品等級」，拿背包實物對表 74/74 全中，見 gear.py）。
+#   打孔錘的星級 ＝ 這個值 // 10（0星=1、1星=11、13星=130），裝備能不能打也是比它。
+TMPL_LEVEL = 0x34
 TMPL_DURA_MAX = 0xDC        # ★ 耐久上限；> 0 ＝ 這是裝備／武器
 # ★ 出處：反組譯算單價的主分支（單價＝範本+0x104；分支全貌見下面 0x602391 那段）
 TMPL_PRICE = 0x104          # 售價；<= 0 = 這東西賣不掉
@@ -228,6 +231,8 @@ class Item:
     time_limit: int = 0     # +0x2E 時限；0 = 沒時限
     decomp_value: int = 0   # 範本 +0x10C 分解值；> 0 = 拆得成晶能
     icon_id: int = 0        # 範本 +0x00 圖示編號（0 = 沒讀到），見 itemicon.py
+    level: int = 0          # 範本 +0x34 物品等級（打孔錘星級、裝備等級都看它）
+    param1: int = 0         # 範本 +0x108 動態資料1（寶石＝效果編號、祝福錘＝1）
 
     @property
     def name(self) -> str:
@@ -435,7 +440,7 @@ def scan(scanner, first: int = FIRST_SLOT,
     # ★ 讀不到的格子只會壞那一格，不會讓整個背包變空（見 read_ptrs）
     ptrs, complete = read_ptrs(scanner, begin + lo * 4, hi - lo + 1)
 
-    tmpl_cache: dict[int, tuple[int, int, int, int, int, int]] = {}
+    tmpl_cache: dict[int, tuple[int, int, int, int, int, int, int, int]] = {}
     out: list[Item] = []
     for offset, ptr in enumerate(ptrs):
         if not ptr:
@@ -454,8 +459,8 @@ def scan(scanner, first: int = FIRST_SLOT,
         dura = struct.unpack_from("<H", b, ITEM_DURA)[0]
         tlimit = struct.unpack_from("<I", b, ITEM_TIMELIMIT)[0]
         tmpl = struct.unpack_from("<I", b, ITEM_TMPL)[0]
-        kind, price, grade, dmax, param2, icon = tmpl_cache.get(
-            tmpl, (0, 0, 0, 0, 0, 0))
+        kind, price, grade, dmax, param2, icon, level, param1 = tmpl_cache.get(
+            tmpl, (0, 0, 0, 0, 0, 0, 0, 0))
         if tmpl and tmpl not in tmpl_cache:
             traw = scanner._read_bytes(tmpl, TMPL_SPAN)
             if traw:
@@ -466,12 +471,15 @@ def scan(scanner, first: int = FIRST_SLOT,
                 dmax = struct.unpack_from("<I", tb, TMPL_DURA_MAX)[0]
                 param2 = struct.unpack_from("<i", tb, TMPL_PARAM2)[0]
                 icon = struct.unpack_from("<I", tb, TMPL_ICON)[0]
-            tmpl_cache[tmpl] = (kind, price, grade, dmax, param2, icon)
+                level = struct.unpack_from("<i", tb, TMPL_LEVEL)[0]
+                param1 = struct.unpack_from("<i", tb, TMPL_PARAM1)[0]
+            tmpl_cache[tmpl] = (kind, price, grade, dmax, param2, icon,
+                                level, param1)
         out.append(Item(slot=lo + offset, serial=serial, stamp=stamp,
                         type_id=type_id, count=count_, dura=dura,
                         kind=kind, price=price, grade=grade, dura_max=dmax,
                         time_limit=tlimit, decomp_value=param2,
-                        icon_id=icon))
+                        icon_id=icon, level=level, param1=param1))
     # ★★★ 最後一道：**容器同步好了嗎**。換頻道／傳送會斷線重連，重連後容器
     #   會先配好格數、物品才由伺服器一件件推過來 —— 那段空窗裡上面每一格都
     #   「讀取成功但是空的」，`complete` 是 True，結果跟「真的一件都沒有」

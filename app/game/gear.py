@@ -68,7 +68,7 @@ assert OFF_ENHANCE < bag.ITEM_SPAN
 # 拿背包實物對 `setting/base/item*.xml` 找出來的（每一欄都是 N/N 全中）：
 TMPL_FLAGS = 0x14           # 旗標；bit 0xC 決定攻擊速度那行印原值還是換算值
                             #   （出處：0x5F04FC 與 0x5EFE26 兩支互補的判斷）
-TMPL_LEVEL = 0x34           # 物品等級      74/74
+TMPL_LEVEL = bag.TMPL_LEVEL # 物品等級      74/74（★ 定義在 bag.py，這裡只是別名）
 TMPL_SKILL_LEVEL = 0x4C     # 技能等限      47/47
 TMPL_HP = 0x58              # 最大HP        （提示框 0x5EFF79）
 TMPL_MP = 0x60              # 最大MP        （同上，item.xml 全量比對）
