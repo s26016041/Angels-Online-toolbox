@@ -190,6 +190,7 @@ class FakeTalk:
         self.closes = 0
         self.i_lock = False           # True ＝ 送了動作也不換頁（伺服器沒回）
         self.unknown = False          # True ＝ 問不到有沒有視窗（叫不動）
+        self.ended = True             # 按確定那一頁是不是最後一頁（message_ended）
 
     def opened(self):
         if self.i < 0:
@@ -235,6 +236,7 @@ class FakeTalk:
 def wire(tab, fake):
     dt.talkwnd.page = fake.page
     dt.talkwnd.window_open = fake.window_open
+    dt.talkwnd.message_ended = lambda _sc: fake.ended
     dt.talkwnd.close_page = fake.close
     dt.talkwnd.close_window = lambda *_a: True
     real = dt.sell.talk
@@ -536,6 +538,40 @@ def main() -> int:
 
     # ★★★ 「到底有沒有對話視窗」＝硬訊號（使用者 2026-09-02：
     #   「對話後關視窗太慢了，不知道在等啥，請要明確知道有沒有視窗」）
+    # ★★★ 2026-09-03 確定＝messageclose＋destroy 之後：**不是最後一頁**時視窗會
+    #   先不見、下一頁稍後才重建 —— 這段空窗不可以當「對話走完」（會誤停）。
+    print("\n按完確定視窗暫時不見（不是最後一頁）→ 要等下一頁，不能誤判走完")
+    talk_step2 = {"do": "interact", "at": [20, 20], "model": 60307,
+                  "menu": [1], "gap": 0.2}
+    fake = FakeTalk([(), (1,)])                 # 過場頁 → 有選項的頁
+    fake.ended = False                          # 過場頁不是最後一頁
+    tab = make_tab([talk_step2], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    gone = {"n": 0}
+
+    def close_then_reopen(_mv, _sc):
+        """按確定 → 視窗先不見（destroy），過幾拍伺服器才送下一頁。"""
+        fake.closes += 1
+        fake.i = -2                             # -2 ＝ 視窗不見、但下一頁還沒來
+        gone["n"] = 0
+        return True, "送出"
+    real_wo = fake.window_open
+
+    def wo(_mv, _sc):
+        if fake.i == -2:
+            gone["n"] += 1
+            if gone["n"] >= 3:                  # 「一趟來回」之後下一頁到了
+                fake.i = 1
+            return False
+        return real_wo(_mv, _sc)
+    dt.talkwnd.close_page = close_then_reopen
+    dt.talkwnd.window_open = wo
+    run(tab, 3.0)
+    ck("★ 視窗暫時不見時**沒有**誤判成走完（分頁沒停）", tab.run_cb.isChecked(),
+       tab.status.text())
+    ck("★ 下一頁到了照樣把第 1 項送到", 10 in tab.sent, f"送出 {tab.sent}")
+
     print("\n有沒有對話視窗（硬訊號）")
     fake = FakeTalk([()])                       # 一頁沒有選項的對話
     one = {"do": "interact", "at": [20, 20], "model": 60307, "menu": [],

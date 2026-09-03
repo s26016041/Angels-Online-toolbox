@@ -134,6 +134,50 @@ def find_spot(scanner) -> Spot | None:
     return _locate_cmd(scanner, FIND_CMD, "_find")
 
 
+# ★ `ismessageend` 指令本體（0x53CC9F，2026-09-03 反組譯）：
+#     wnd = 依代號查視窗(GetWindowById)；查不到 → 1（結束）
+#     否則 → byte [wnd + 0x148]                 ← 伺服器隨這一頁送來的「最後一頁」旗標
+#   OnUpdateMessage（Lua）就是拿它決定要不要顯示「結束」。
+#   GetWindowById = `[管理器 + (代號 & 0x1FFF)*4 + 0x20]`，再驗 `[物件+0x10] == 代號`。
+#   ⚠ 這幾個是結構偏移（允許寫死，出處如上），改版靠 patch-doctor 重驗。
+MSG_END_OFF = 0x148
+WND_SLOT_MASK = 0x1FFF
+WND_TABLE_OFF = 0x20
+WND_ID_OFF = 0x10
+
+
+def _wnd_object(scanner) -> int | None:
+    """對話視窗物件的位址（純讀，照 GetWindowById 走一遍）；沒有／讀不到回 None。"""
+    spot = find_spot(scanner)
+    if spot is None:
+        return None
+    mgr = _u32(scanner, spot.world_ptr)
+    g = lua.globals_of(scanner, [WND_NAME]) or {}
+    wnd = int(g.get(WND_NAME) or 0) & 0xFFFFFFFF
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000 or not wnd:
+        return None
+    obj = _u32(scanner, mgr + (wnd & WND_SLOT_MASK) * 4 + WND_TABLE_OFF)
+    if not obj or not 0x10000 < obj < 0x7FFF0000:
+        return None
+    return obj if _u32(scanner, obj + WND_ID_OFF) == wnd else None
+
+
+def message_ended(scanner) -> bool | None:
+    """現在這一頁是不是**最後一頁**（＝遊戲 `ismessageend` 回的那個旗標）。
+
+    純讀。**沒有視窗回 None**（不是 True）——呼叫端拿它分「按了確定之後要不要
+    等下一頁」：False＝伺服器還有下一頁會來，要等；True＝按完就結束。
+    """
+    try:
+        obj = _wnd_object(scanner)
+        if not obj:
+            return None
+        raw = scanner._read_bytes(obj + MSG_END_OFF, 1)
+        return bool(bytes(raw)[0]) if raw else None
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 def window_open(mover, scanner) -> bool | None:
     """對話視窗**現在**開著嗎。**讀不到／叫不動回 None**（＝不知道）。
 

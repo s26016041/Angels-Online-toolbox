@@ -145,6 +145,13 @@ CLOSE_RETRY = 1.5
 #   來源是之前跟 NPC 講過話沒把對話框 destroy 掉（見 supply.leave_npc）。
 #   → 按了這麼多次確定、對話頁一格都沒變，就當它是殘留：destroy 掉、當結束。
 CLOSE_GIVEUP = 6
+# ★★ 2026-09-03 「確定」改成跟遊戲的確定鈕一樣＝messageclose＋**destroy**
+#   （見 talkwnd.close_page）。後果：按完確定視窗**當場**不見；如果伺服器接著
+#   還有下一頁，它會過一小段時間（一趟來回）用 ShowMessageWnd **重新建一個**。
+#   所以「視窗不見了」在剛按完確定的那一小段時間**不等於對話結束** —— 要等
+#   CLOSE_GRACE 秒沒有新視窗出現，才算真的走完（不然過場頁後面還有選項的
+#   腳本會被誤判成「對話關掉了但選項沒送到」而停機）。
+CLOSE_GRACE = 1.6
 # 「有沒有視窗」要**叫進遊戲**問（call_sync 會等它做完），
 # 所以答案快取這麼久，⛔ 不要每拍問。
 WND_TTL = 0.3
@@ -588,6 +595,8 @@ class DungeonTab(BaseTab):
         self._talk_seen = False      # 這一步**看過**對話視窗開起來沒
         self._close_t = 0.0          # 按了確定之後等多久了
         self._close_n = 0            # 確定按了幾次還是沒換頁（見 CLOSE_GIVEUP）
+        self._gone_t = 0.0           # 按了確定之後視窗不見多久了（見 CLOSE_GRACE）
+        self._page_ended = None      # 按確定那一刻這頁是不是最後一頁（talkwnd.message_ended）
         self._wnd = None             # 上一次問到的「有沒有對話視窗」
         self._wnd_t = 0.0            # 那是什麼時候問的
         self._talk_base = None       # 點下去那一刻的簽章（判「有沒有點到」）
@@ -1547,6 +1556,7 @@ class DungeonTab(BaseTab):
             self._click_best = None
             self._talk_did = ""
             self._talk_seen, self._close_t, self._close_n = False, 0.0, 0
+            self._gone_t = 0.0
             self._wnd, self._wnd_t = None, 0.0   # 強制重問一次
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
@@ -1616,6 +1626,21 @@ class DungeonTab(BaseTab):
             # ★★★ 開過又不見了 ＝ 這段對話**真的**走完了（使用者 2026-09-02：
             #   「對話後關視窗太慢了，不知道在等啥」）—— 不必等它「穩定」、
             #   也不必再叫 DestroyMessageWnd（視窗本來就沒了）。
+            # ⚠ 但**剛按完確定**那一小段不算：確定會 destroy 視窗，下一頁要等
+            #   伺服器回來才重建（見 CLOSE_GRACE）。這段時間內只能「等下一頁」。
+            if self._talk_did == "opt":
+                # ★ 送了選項、對話就直接結束（視窗不見）＝伺服器收到那一項並
+                #   拿它收尾了（「帶我去」這種最後一項就是這樣）。那一項算送到，
+                #   ⛔ 不可以判成「選項沒送到」而停機（2026-09-03 回歸抓到）。
+                self._menu_i += 1
+                self._talk_did = ""
+            if (self._talk_did == "close" and self._page_ended is False
+                    and self._gone_t < CLOSE_GRACE):
+                self._gone_t += gap
+                self._wnd_t = 0.0                # 下一拍再問一次有沒有新視窗
+                self._say(f"{tag}　按了確定，等下一頁…"
+                          f"（{self._gone_t:.1f}/{CLOSE_GRACE:.1f} 秒）")
+                return
             if self._menu_i < len(menu):
                 self._stop(f"⛔ {tag}：對話已經關掉了，"
                            f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
@@ -1645,6 +1670,7 @@ class DungeonTab(BaseTab):
                 self._menu_i += 1           # 有換頁 ＝ 剛剛那一項真的送到了
             self._talk_sig, self._talk_same, self._talk_did = pg.sig, 0, ""
             self._close_t, self._close_n = 0.0, 0   # 有換頁＝真的有反應
+            self._gone_t = 0.0
         else:
             self._talk_same += 1
         if not self._talk_did:
@@ -1675,11 +1701,16 @@ class DungeonTab(BaseTab):
                 # 視窗確定開著就直接按，不用等（使用者嫌慢）。
                 self._say(f"{tag}　等對話出現…")
                 return
+            # ★ 按之前先問遊戲「這是不是最後一頁」（ismessageend 那個旗標）：
+            #   最後一頁 → 按完視窗不見就立刻收工（使用者要快）；
+            #   不是 → 視窗不見只是 destroy 了，要等伺服器把下一頁送來。
+            self._page_ended = talkwnd.message_ended(self._sc)
             ok, why = talkwnd.close_page(self._mover, self._sc)
-            self._talk_did, self._close_t = "close", 0.0
+            self._talk_did, self._close_t, self._gone_t = "close", 0.0, 0.0
             self._wnd_t = 0.0                # 按了確定 → 下一拍重問視窗
             self._say(f"{tag}　沒有選項的那一頁 → 按確定"
-                      f"（{'送出' if ok else why}）")
+                      f"（{'送出' if ok else why}"
+                      f"{'，最後一頁' if self._page_ended else ('，還有下一頁' if self._page_ended is False else '')}）")
             return
         # 動過了但畫面沒換頁 —— 分兩種情況，⛔ 不可以都當成「對話結束」
         if self._talk_did == "opt":
