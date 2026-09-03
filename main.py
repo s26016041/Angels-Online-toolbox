@@ -107,9 +107,16 @@ def _selftest() -> int:
     print(f"[selftest] 已載入分頁數 = {count}")
     if count <= 0:
         print("[selftest] 失敗：沒有任何分頁被載入（打包遺漏了 app.* 子模組？）")
-        return 1
-    print("[selftest] 成功：分頁載入正常。")
-    return 0
+        rc = 1
+    else:
+        print("[selftest] 成功：分頁載入正常。")
+        rc = 0
+    # ★★ 一定要走正常的關閉流程（MainWindow.closeEvent → 每個分頁 on_close()）。
+    #   2026-09-03 踩到：副本分頁在建構時就啟動掃描 QThread，這裡直接 return 的話
+    #   執行緒還在跑就被解構 → Qt 中止，整個 selftest 明明印了「成功」卻回 127，
+    #   build_local／release 全被擋下。正式啟動關視窗本來就會走這條，selftest 也要。
+    window.close()
+    return rc
 
 
 def _trace(stage: str) -> None:
