@@ -111,6 +111,7 @@ class Gem:
     min_level: int
     max_level: int
     count: int
+    icon_id: int = 0            # 範本 +0x00 圖示編號（寶石背包畫圖用）
 
 
 def star_of(level: int) -> int:
@@ -187,7 +188,7 @@ def gems(scanner, items: list[bag.Item] | None = None,
         if lv is None:
             continue                                # 表讀不到 → 這顆不用
         out.append(Gem(it.slot, it.type_id, it.name, it.param1, lv[0], lv[1],
-                       it.count))
+                       it.count, it.icon_id))
     out.sort(key=lambda g: (g.min_level, g.slot))
     return out, complete
 
@@ -201,10 +202,21 @@ def pick_hammer(hs: list[Hammer], gear_level: int) -> Hammer | None:
     return None
 
 
-def pick_gem(gs: list[Gem], gear_level: int, cap: int) -> Gem | None:
-    """等限 ≤ cap、而且這件裝備鑲得進去（最低 ≤ 物品等級 ≤ 上限）的最便宜那顆。"""
+def pick_gem(gs: list[Gem], gear_level: int, cap: int,
+             gem_type: int | None = None) -> Gem | None:
+    """這件裝備鑲得進去（最低 ≤ 物品等級 ≤ 上限）的寶石裡挑一顆。
+
+    二選一（使用者 2026-09-03）：
+    * `gem_type` 有給 → **只用那一種**（等限上限 `cap` 不看）；
+    * 沒給 → 等限 ≤ `cap` 裡最便宜的那顆。
+    """
     for g in sorted(gs, key=lambda g: (g.min_level, g.slot)):
-        if g.min_level <= cap and g.min_level <= gear_level <= g.max_level:
+        if gem_type is not None:
+            if g.type_id != gem_type:
+                continue
+        elif g.min_level > cap:
+            continue
+        if g.min_level <= gear_level <= g.max_level:
             return g
     return None
 
@@ -220,13 +232,15 @@ class Run:
     """把一件裝備打到目標孔數的狀態機；由分頁每一拍呼叫 `tick()`。"""
 
     def __init__(self, scanner, mover, gear_slot: int, serial: int,
-                 target: int, gem_cap: int, name: str = "") -> None:
+                 target: int, gem_cap: int, name: str = "",
+                 gem_type: int | None = None) -> None:
         self.sc = scanner
         self.mover = mover
         self.slot = gear_slot
         self.serial = serial
         self.target = max(1, min(int(target), MAX_HOLES))
         self.gem_cap = int(gem_cap)
+        self.gem_type = int(gem_type) if gem_type else None   # 指定寶石（二選一）
         self.name = name
         self.done = False
         self.sent_at = 0.0
@@ -297,12 +311,17 @@ class Run:
 
     def _send_inlay(self, g: gear.Gear, level: int, idx: int) -> list[Event]:
         gs, complete = gems(self.sc)
-        gem = pick_gem(gs, level, self.gem_cap)
+        gem = pick_gem(gs, level, self.gem_cap, self.gem_type)
         if gem is None:
             if not complete and self._wait_readable("gem"):
                 return []
             if not complete:
                 return self._stop(BLOCKED, "背包掃不完整，讀不到寶石")
+            if self.gem_type is not None:
+                want = itemname.of(self.gem_type) or f"種類 {self.gem_type}"
+                return self._stop(BLOCKED,
+                                  f"背包裡沒有能鑲的「{want}」（用完了，或它鑲不進 "
+                                  f"{level} 級的裝備）—— 第 {idx + 1} 孔還空著")
             return self._stop(BLOCKED,
                               f"沒有能鑲的寶石（等限 ≤ {self.gem_cap} 級、"
                               f"而且要鑲得進 {level} 級的裝備）—— 第 {idx + 1} 孔還空著")

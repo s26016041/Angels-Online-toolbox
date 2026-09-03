@@ -40,12 +40,16 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QToolTip,
     QVBoxLayout,
     QWidget,
 )
+
+from dataclasses import dataclass
+from typing import Callable
 
 from app.config import config
 from app.core import charname, injector, preload, window as win
@@ -78,57 +82,83 @@ COLOUR_OF = {
 }
 
 
-class BagGrid(QWidget):
-    """模擬背包：一格一件裝備，滑過看說明、點一下選起來。"""
+@dataclass
+class Cell:
+    """模擬背包的一格（裝備背包與寶石背包共用同一種畫法）。"""
 
-    picked = Signal(int)                    # 送出被選中的 serial
+    key: int                        # 選取／hover 認這個：裝備＝serial、寶石＝種類 ID
+    icon_id: int
+    name: str
+    payload: object = None          # 選起來要交回去的東西（gear.Gear／holes.Gem）
+    badge: str = ""                 # 右下角小字：裝備 "+N"、寶石 "×k"
+    badge_colour: str = "#E0B0FF"
+    tooltip: Callable[[], str] | None = None   # 滑過才算（裝備的提示要讀範本）
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+
+class IconGrid(QWidget):
+    """模擬背包：一格一個東西，滑過看說明、點一下選起來。有幾個就畫幾格。"""
+
+    picked = Signal(int)                    # 送出被選中的 key（0 ＝ 沒選）
+
+    def __init__(self, empty_text: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._gears: list[gear.Gear] = []
-        self._serial = 0
+        self._cells: list[Cell] = []
+        self._key = 0
         self._hover = 0
-        self.scanner = None            # 算寶石加成要讀寶石的範本
+        self._empty = empty_text
         self.setMouseTracking(True)
-        self.setMinimumHeight(CELL * 3)
+        self.setMinimumHeight(CELL + PAD * 2)
 
     # ------------------------------------------------------------------
-    def set_gears(self, gears: list[gear.Gear]) -> None:
-        self._gears = gears
-        if self._serial and all(g.serial != self._serial for g in gears):
-            self._serial = 0                # 選的那件不見了（強化失敗）
+    def set_cells(self, cells: list[Cell]) -> None:
+        self._cells = cells
+        if self._key and all(c.key != self._key for c in cells):
+            self._key = 0                   # 選的那個不見了（打掉了／用完了）
             self.picked.emit(0)
-        rows = max(1, (len(gears) + COLS - 1) // COLS)
+        rows = max(1, (len(cells) + COLS - 1) // COLS)
         self.setMinimumHeight(rows * CELL + PAD * 2)
         self.update()
 
-    def selected(self) -> gear.Gear | None:
-        for g in self._gears:
-            if g.serial == self._serial:
-                return g
+    def select(self, key: int) -> bool:
+        """程式端選一格（例如把上次選的寶石找回來）；不在清單裡回 False。"""
+        if not any(c.key == key for c in self._cells):
+            return False
+        self._key = key
+        self.picked.emit(key)
+        self.update()
+        return True
+
+    def selected_cell(self) -> Cell | None:
+        for c in self._cells:
+            if c.key == self._key:
+                return c
         return None
 
-    def _at(self, pos) -> gear.Gear | None:
+    def selected(self):
+        c = self.selected_cell()
+        return c.payload if c is not None else None
+
+    def _at(self, pos) -> Cell | None:
         col = (pos.x() - PAD) // CELL
         row = (pos.y() - PAD) // CELL
         if col < 0 or col >= COLS or row < 0:
             return None
         idx = row * COLS + col
-        return self._gears[idx] if 0 <= idx < len(self._gears) else None
+        return self._cells[idx] if 0 <= idx < len(self._cells) else None
 
     # ------------------------------------------------------------------
     def paintEvent(self, _ev) -> None:                   # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, False)
-        if not self._gears:
+        if not self._cells:
             # ★ 沒東西就不畫任何格子（使用者 2026-09-03：不要有空的背景框）
             p.setPen(QColor("#888888"))
             p.drawText(QRect(PAD, PAD, COLS * CELL, CELL), Qt.AlignVCenter,
-                       "背包裡沒有可強化的裝備")
+                       self._empty)
             p.end()
             return
-        # 有幾件就畫幾格，不補滿整列
-        for idx, g in enumerate(self._gears):
+        # 有幾個就畫幾格，不補滿整列
+        for idx, c in enumerate(self._cells):
             row, col = divmod(idx, COLS)
             x = PAD + col * CELL
             y = PAD + row * CELL
@@ -136,7 +166,7 @@ class BagGrid(QWidget):
             p.fillRect(cell, QColor(CELL_BG))
             p.setPen(QPen(QColor(CELL_EDGE), 1))
             p.drawRect(cell)
-            pm = itemicon.pixmap(g.icon_id)
+            pm = itemicon.pixmap(c.icon_id)
             if pm is not None and not pm.isNull():
                 w = min(pm.width(), CELL - 8)
                 h = min(pm.height(), CELL - 8)
@@ -147,45 +177,77 @@ class BagGrid(QWidget):
             else:
                 # 沒有圖就顯示名字前兩個字 —— 安全退化，不抓別張圖頂替
                 p.setPen(QColor("#DDDDDD"))
-                p.drawText(cell, Qt.AlignCenter, g.name[:2])
-            if g.enhance:
-                # 右下角標「+N」。先用黑底描一遍再畫紫字，
+                p.drawText(cell, Qt.AlignCenter, c.name[:2])
+            if c.badge:
+                # 右下角小字。先用黑底描一遍再畫，
                 # 不然疊在亮色圖示上會看不見（背包.png 的數量也是這樣描邊）。
                 box = cell.adjusted(0, 0, -3, -2)
                 p.setPen(QColor(0, 0, 0, 200))
                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     p.drawText(box.translated(dx, dy),
-                               Qt.AlignRight | Qt.AlignBottom,
-                               f"+{g.enhance}")
-                p.setPen(QColor("#E0B0FF"))
-                p.drawText(box, Qt.AlignRight | Qt.AlignBottom,
-                           f"+{g.enhance}")
-            if g.serial == self._serial:
+                               Qt.AlignRight | Qt.AlignBottom, c.badge)
+                p.setPen(QColor(c.badge_colour))
+                p.drawText(box, Qt.AlignRight | Qt.AlignBottom, c.badge)
+            if c.key == self._key:
                 p.setPen(QPen(QColor(PICK_EDGE), PICK_WIDTH))
                 p.drawRect(cell.adjusted(1, 1, -1, -1))
         p.end()
 
     def mousePressEvent(self, ev) -> None:               # noqa: N802
-        g = self._at(ev.position().toPoint())
-        self._serial = g.serial if g else 0
-        self.picked.emit(self._serial)
+        c = self._at(ev.position().toPoint())
+        self._key = c.key if c else 0
+        self.picked.emit(self._key)
         self.update()
 
     def mouseMoveEvent(self, ev) -> None:                # noqa: N802
-        g = self._at(ev.position().toPoint())
-        if g is None:
+        c = self._at(ev.position().toPoint())
+        if c is None:
             QToolTip.hideText()
             self._hover = 0
             return
         # ⚠ 只有換格子才重畫提示 —— 每次滑鼠移動都 showText 會讓提示一直閃。
-        if g.serial != self._hover:
-            self._hover = g.serial
-            QToolTip.showText(ev.globalPosition().toPoint(),
-                              _tooltip_html(g, self.scanner), self)
+        if c.key != self._hover:
+            self._hover = c.key
+            text = c.tooltip() if c.tooltip else html.escape(c.name)
+            QToolTip.showText(ev.globalPosition().toPoint(), text, self)
 
     def sizeHint(self) -> QSize:                         # noqa: N802
-        rows = max(1, (len(self._gears) + COLS - 1) // COLS)
+        rows = max(1, (len(self._cells) + COLS - 1) // COLS)
         return QSize(COLS * CELL + PAD * 2, rows * CELL + PAD * 2)
+
+
+def _gear_cells(gears: list[gear.Gear], scanner) -> list[Cell]:
+    return [Cell(key=g.serial, icon_id=g.icon_id, name=g.name, payload=g,
+                 badge=f"+{g.enhance}" if g.enhance else "",
+                 tooltip=(lambda g=g: _tooltip_html(g, scanner)))
+            for g in gears]
+
+
+def _gem_cells(gems: list[holes.Gem]) -> list[Cell]:
+    """寶石背包：**同一種寶石合成一格**（各堆數量加總），等限低的排前面。"""
+    by_type: dict[int, list[holes.Gem]] = {}
+    for gm in gems:
+        by_type.setdefault(gm.type_id, []).append(gm)
+    out: list[Cell] = []
+    for type_id, stacks in by_type.items():
+        first = stacks[0]
+        n = sum(s.count for s in stacks)
+        out.append(Cell(key=type_id, icon_id=first.icon_id, name=first.name,
+                        payload=first, badge=f"×{n}", badge_colour="#FFFFFF",
+                        tooltip=(lambda gm=first, n=n: _gem_tooltip_html(gm, n))))
+    out.sort(key=lambda c: (c.payload.min_level, c.key))
+    return out
+
+
+def _gem_tooltip_html(gm: holes.Gem, n: int) -> str:
+    lines = [(gm.name, "#FFFFFF"),
+             (f"裝備等限：{gm.min_level}級", "#7CD8FF"),
+             (f"（可鑲 {gm.min_level}～{gm.max_level} 級的裝備）", "#888888"),
+             (f"數量 ×{n}", "#DDDDDD")]
+    parts = [f"<div style='color:{colour}'>{html.escape(text)}</div>"
+             for text, colour in lines]
+    return ("<div style='background:#0d1b21; padding:4px'>"
+            + "".join(parts) + "</div>")
 
 
 def _tooltip_html(g: gear.Gear, scanner=None) -> str:
@@ -245,7 +307,7 @@ class EnhanceTab(BaseTab):
 
         box = QGroupBox("模擬背包（可強化的裝備）")
         box_lay = QVBoxLayout(box)
-        self.grid = BagGrid()
+        self.grid = IconGrid("背包裡沒有可強化的裝備")
         self.grid.picked.connect(self._on_picked)
         area = QScrollArea()
         area.setWidget(self.grid)
@@ -253,6 +315,21 @@ class EnhanceTab(BaseTab):
         area.setMinimumHeight(CELL * 3 + 12)
         box_lay.addWidget(area)
         root.addWidget(box)
+
+        gem_box = QGroupBox("寶石背包（點一顆 ＝ 打孔時只鑲這一種）")
+        gem_lay = QVBoxLayout(gem_box)
+        self.gem_grid = IconGrid("背包裡沒有寶石")
+        self.gem_grid.picked.connect(self._on_gem_picked)
+        gem_area = QScrollArea()
+        gem_area.setWidget(self.gem_grid)
+        gem_area.setWidgetResizable(True)
+        gem_area.setMinimumHeight(CELL + 12)
+        gem_area.setMaximumHeight(CELL * 2 + 12)
+        gem_lay.addWidget(gem_area)
+        root.addWidget(gem_box)
+        self._gem_sig: tuple | None = None
+        # 上次選的寶石種類（config），寶石背包一列出來就幫他選回去
+        self._want_gem = int(config.get("enhance.gem_type", 0) or 0)
 
         act = QHBoxLayout()
         self.pick_lbl = QLabel("還沒選裝備")
@@ -288,16 +365,31 @@ class EnhanceTab(BaseTab):
         act2.addWidget(self.hole_target)
         act2.addWidget(QLabel("孔"))
         act2.addSpacing(12)
-        act2.addWidget(QLabel("寶石等限 ≤"))
+        # 寶石怎麼挑 —— 二選一（使用者 2026-09-03）：等限以下 vs 指定一種
+        self.gem_cap_rb = QRadioButton("寶石等限 ≤")
+        self.gem_cap_rb.setToolTip(
+            "只拿「裝備等限」不超過右邊數字的寶石去鑲（當墊子用），好寶石不會動。")
+        act2.addWidget(self.gem_cap_rb)
         self.gem_cap = QSpinBox()
         self.gem_cap.setRange(0, holes.LEVEL_SANE)
         self.gem_cap.setSingleStep(10)
         self.gem_cap.setFixedWidth(60)
         self.gem_cap.setToolTip(
-            f"選裝備時自動填「裝備等級 − {GEM_CAP_BELOW}」，要改自己打。\n"
-            "只拿「裝備等限」不超過這個數字的寶石去鑲（當墊子用），好寶石不會動。")
+            f"選裝備時自動填「裝備等級 − {GEM_CAP_BELOW}」，要改自己打。")
         act2.addWidget(self.gem_cap)
         act2.addWidget(QLabel("級"))
+        act2.addSpacing(8)
+        self.gem_pick_rb = QRadioButton("用選的寶石：")
+        self.gem_pick_rb.setToolTip("只鑲下面寶石背包裡點起來的那一種；用完就停。")
+        act2.addWidget(self.gem_pick_rb)
+        self.gem_pick_lbl = QLabel("（還沒選）")
+        act2.addWidget(self.gem_pick_lbl)
+        if config.get("enhance.gem_mode", "cap") == "pick":
+            self.gem_pick_rb.setChecked(True)
+        else:
+            self.gem_cap_rb.setChecked(True)
+        self.gem_cap_rb.toggled.connect(self._on_gem_mode)
+        act2.addSpacing(8)
         self._cap_serial = 0             # 上次自動填等限時選的是哪件
         self.hole_btn = QPushButton("自動打孔")
         self.hole_btn.setToolTip(
@@ -394,7 +486,6 @@ class EnhanceTab(BaseTab):
         pid, sc = self._cur()
         if sc is None:
             return
-        self.grid.scanner = sc
         gears, _complete = gear.in_bag(sc)
         # 一次掃描同時數強化錘、打孔錘、寶石（別各掃一遍）
         items, scanned = bag.scan(sc)
@@ -419,9 +510,17 @@ class EnhanceTab(BaseTab):
                           for g in gears))
         if sig != self._sig:
             self._sig = sig
-            self.grid.set_gears(gears)
+            self.grid.set_cells(_gear_cells(gears, sc))
             self._on_picked(self.grid.selected().serial
                             if self.grid.selected() else 0)
+        gem_sig = (pid, tuple(sorted((g.type_id, g.slot, g.count) for g in gs)))
+        if gem_sig != self._gem_sig:
+            self._gem_sig = gem_sig
+            self.gem_grid.set_cells(_gem_cells(gs))
+            # 上次選的那種寶石一出現就選回去（只做一次；他點別顆就以他的為準）
+            if self._want_gem and self.gem_grid.selected() is None:
+                if self.gem_grid.select(self._want_gem):
+                    self._want_gem = 0
         self._update_buttons()
 
     def _on_picked(self, _serial: int) -> None:
@@ -454,10 +553,31 @@ class EnhanceTab(BaseTab):
         ok = (g is not None and not running
               and g.enhance < enhance.MAX_LEVEL)
         self.go_btn.setEnabled(bool(ok))
-        self.hole_btn.setEnabled(bool(g is not None and not running
+        gem_ok = (self.gem_cap_rb.isChecked()
+                  or self.gem_grid.selected() is not None)
+        self.hole_btn.setEnabled(bool(g is not None and not running and gem_ok
                                       and g.holes < holes.MAX_HOLES))
+        self.gem_cap.setEnabled(self.gem_cap_rb.isChecked())
         self.stop_btn.setEnabled(running)
         self.who.setEnabled(not running)
+
+    def _on_gem_picked(self, key: int) -> None:
+        c = self.gem_grid.selected_cell()
+        if c is None:
+            self.gem_pick_lbl.setText("（還沒選）")
+        else:
+            self.gem_pick_lbl.setText(c.name)
+            self.gem_pick_rb.setChecked(True)   # 點了寶石就是要用它
+            self._want_gem = 0
+            config.set("enhance.gem_type", int(key))
+            config.save()
+        self._update_buttons()
+
+    def _on_gem_mode(self, _checked: bool) -> None:
+        config.set("enhance.gem_mode",
+                   "cap" if self.gem_cap_rb.isChecked() else "pick")
+        config.save()
+        self._update_buttons()
 
     # ------------------------------------------------------------------
     def _log(self, text: str, colour: str = "#DDDDDD") -> None:
@@ -501,9 +621,19 @@ class EnhanceTab(BaseTab):
         if target <= g.holes:
             self.status.setText("目標比目前的孔數還低 —— 不用打")
             return
-        self._run = holes.Run(sc, mv, g.slot, g.serial, target, cap, g.name)
-        self._log(f"開始打孔：{g.name} {g.holes} 孔 → {target} 孔"
-                  f"（寶石等限 ≤ {cap} 級）", "#7CD8FF")
+        gem_type = None
+        how = f"寶石等限 ≤ {cap} 級"
+        if self.gem_pick_rb.isChecked():
+            c = self.gem_grid.selected_cell()
+            if c is None:
+                self.status.setText("選了「用選的寶石」但還沒點寶石")
+                return
+            gem_type = int(c.key)
+            how = f"只鑲 {c.name}"
+        self._run = holes.Run(sc, mv, g.slot, g.serial, target, cap, g.name,
+                              gem_type=gem_type)
+        self._log(f"開始打孔：{g.name} {g.holes} 孔 → {target} 孔（{how}）",
+                  "#7CD8FF")
         self.status.setText(f"打孔中… {g.name} → {target} 孔")
         self._run_timer.start(RUN_MS)
         self._update_buttons()

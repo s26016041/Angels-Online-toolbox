@@ -223,6 +223,13 @@ g = holes.pick_gem(gs, 500, 100)
 check("裝備 500 級 > 等級上限 450 → None", g is None, f"實得 {g}")
 g = holes.pick_gem(gs, 120, 100)
 check("等限 100 時仍挑最便宜的（20 不是 80）", g and g.min_level == 20, f"實得 {g}")
+g = holes.pick_gem(gs, 120, 10, gem_type=3105)
+check("指定寶石 3105 → 不看等限上限、只用它", g and g.type_id == 3105, f"實得 {g}")
+g = holes.pick_gem(gs, 50, 100, gem_type=3105)
+check("指定寶石但裝備 50 級 < 它的最低 80 → None", g is None, f"實得 {g}")
+g = holes.pick_gem(gs, 120, 100, gem_type=4242)
+check("指定的寶石不在背包 → None（不拿別種頂替）", g is None, f"實得 {g}")
+check("寶石帶圖示編號", all(hasattr(x, "icon_id") for x in gs))
 
 print()
 print("③ 快樂路徑：2 孔鑲滿 → 打孔 → 鑲 → 打孔 → 到 4 孔停，最後一孔留空")
@@ -262,6 +269,27 @@ r = fresh(target=3)
 set_world(holes_=1, gems=(0,))
 r.tick()
 check("第一發是鑲嵌不是打孔", STRIKES == [(21, 50)], f"STRIKES={STRIKES}")
+
+print()
+print("④b 指定寶石：只鑲那一種；沒了就停，不拿別種頂替")
+
+r = holes.Run(None, None, GEAR_SLOT, SERIAL, 3, 40, "測試戰靴", gem_type=3105)
+STRIKES.clear()
+set_world(holes_=1, gems=(0,), gems_in_bag=[
+    holes.Gem(21, 3092, "瑕疵的紅寶石", 2, 20, 450, 5),
+    holes.Gem(30, 3105, "完美的黃寶石", 15, 80, 450, 1)])
+r.tick()
+check("指定 3105 → 鑲的是格 30 那顆（不是便宜的格 21）", STRIKES == [(30, 50)],
+      f"STRIKES={STRIKES}")
+
+r = holes.Run(None, None, GEAR_SLOT, SERIAL, 3, 40, "測試戰靴", gem_type=3105)
+STRIKES.clear()
+set_world(holes_=1, gems=(0,), gems_in_bag=[
+    holes.Gem(21, 3092, "瑕疵的紅寶石", 2, 20, 450, 5)])
+evs = r.tick()
+check("指定的寶石用完了 → BLOCKED、訊息點名它、一發不送",
+      r.done and kinds(evs) == [enhance.BLOCKED] and "完美的黃寶石" in evs[0].text
+      and STRIKES == [], f"實得 {[e.text for e in evs]} STRIKES={STRIKES}")
 
 print()
 print("⑤ 打孔後那格空了（確定讀到）→ 裝備毀損，停")
