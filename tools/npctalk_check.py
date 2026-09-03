@@ -87,6 +87,8 @@ CLOCK = Clock()
 supply.time = CLOCK                 # ⚠ 假時鐘要 patch 進 supply 的命名空間
 MOVER, SC = FakeMover(), FakeSC()
 
+REAL_WAIT = supply._wait_dialog     # ④ 要用它本人（②會換成替身）
+
 print("① 人被傳走之後不會在新地圖亂走（每一輪先問 confirm）")
 walked = []
 supply.find_npc = lambda sc, nid: None          # 新地圖上當然找不到那隻 NPC
@@ -118,8 +120,12 @@ supply._wait_arrival = lambda *a, **k: True
 seen: list[float] = []
 
 
-def fake_wait_dialog(sc, base, timeout=supply.DIALOG_TIMEOUT):
+AGAIN_SEEN: list = []
+
+
+def fake_wait_dialog(sc, base, timeout=supply.DIALOG_TIMEOUT, again=None):
     seen.append(timeout)
+    AGAIN_SEEN.append(again)
     return False                                 # 一律「沒開」，逼它換站位
 
 
@@ -138,6 +144,16 @@ supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=1,
                    confirm=lambda: False, confirm_timeout=0.1)
 check(f"遠處點 → 留 {supply.DIALOG_TIMEOUT:.0f} 秒",
       seen == [supply.DIALOG_TIMEOUT], f"實得 {seen}")
+check("等對話框時有給「補點」的回呼（官方那個重試迴圈）",
+      bool(AGAIN_SEEN) and all(callable(x) for x in AGAIN_SEEN),
+      f"實得 {AGAIN_SEEN}")
+
+clicked: list = []
+supply._click_npc = lambda m, s_, ent: clicked.append(ent) or True
+AGAIN_SEEN[-1]()
+check("補點前**重新找那隻 NPC**（不吃上一拍的實體位址）",
+      clicked == [0x1000], f"實得 {clicked}")
+supply._click_npc = lambda *a, **k: True
 
 print()
 print("③ 人牆卡住時 _approach_npc 不磨滿逾時")
@@ -158,6 +174,28 @@ supply._npc_gap = lambda sc, nid: (GAP_SEQ.pop(0) if GAP_SEQ
 REAL_APPROACH(MOVER, SC, 1, timeout=20.0)
 check("走得動就照走到位（不是一卡住就放棄）", not GAP_SEQ,
       f"還剩 {GAP_SEQ}")
+
+print()
+print("④ 等對話框的期間會一直補點（TryAct：這也是「還沒走到就繼續走」的動力）")
+supply._dialog_token = lambda sc: 7              # 一直是基準值 = 對話框沒開
+supply.move.pathfinder_this = lambda sc: 0       # 讀不到玩家物件 → 走「沒在走路」那條
+hits: list = []
+t0 = CLOCK.t
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT,
+                   again=lambda: hits.append(1))
+check("沒開就回 False", opened is False)
+check(f"3 秒內補點 {supply.DIALOG_NEAR_TIMEOUT / supply.CLICK_REPEAT:.0f} 次上下",
+      2 <= len(hits) <= 12, f"實得 {len(hits)} 次")
+check("⛔ 有補點就不准用「停住 0.8 秒就放棄」早退",
+      CLOCK.t - t0 >= supply.DIALOG_NEAR_TIMEOUT,
+      f"只花了 {CLOCK.t - t0:.1f} 秒")
+
+CLOCK.t = t0
+hits.clear()
+opened = REAL_WAIT(SC, 7, supply.DIALOG_TIMEOUT)  # 沒給 again ＝ 舊行為
+check("沒給補點回呼時，站著不動 0.8 秒就早退（舊行為不變）",
+      opened is False and CLOCK.t - t0 < supply.DIALOG_TIMEOUT,
+      f"花了 {CLOCK.t - t0:.1f} 秒")
 
 print()
 if FAILS:

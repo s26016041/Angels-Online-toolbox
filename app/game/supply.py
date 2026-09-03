@@ -29,15 +29,37 @@ from app.game import (attack, bag, gather, quickbar, robot, itemname, scene,
 BUY_OPCODE = 0x27          # 跟 NPC 買
 
 # ★★★ 開交易的完整序列（2026-08-14 嵐狐實測跨圖冷交易 39→44 確認）：
-#   ① 點 NPC＝呼叫**自動走路/互動狀態機** 0x54A520(this=pathfinder_this, 模式1, 目標eid, 0)
-#      → 客戶端走到 NPC 旁自動互動、開對話框（WND_MESSAGE）。
+#   ① 點 NPC → 開對話框（WND_MESSAGE）。
 #      ⚠ 手動用 WALK_FN 走過去**不會**觸發它；opcode 0x07 只是面向不是點擊。
+#      ⚠⚠ 2026-09-03 起這一步改叫 **TRY_ACT_FN（官方滑鼠點真正動手那支）**，
+#          舊的自動走路狀態機 0x54A520 退成備援 —— 原因見 TRY_ACT_FN 的檔頭。
 #   ② talkaction(10)「我要買東西」→ 開販售頁（WND_NPCSALE）、伺服器端交易開啟。
 #   ③ 買（0x27）。
 #   ⚠ talkaction(10) 碼是對的，但**一定要先用 0x54A520 開真對話**才有效（少了它 talkaction 無效）。
 INTERACT_FN = 0x0054A520   # ★ AOB 定位（locate.py supply.INTERACT_FN）：thiscall ecx=玩家物件−8
 # ★ 出處同上段實測序列①：0x54A520 的第一參數，1＝走到 NPC 並互動（開對話）。
 INTERACT_MODE = 1
+
+# ★★★ 2026-09-03 使用者「貼在 NPC 臉上都說不到話，滑鼠點卻很正常」→ 反組譯出
+#   **官方滑鼠點 NPC 是兩步，我們以前只做了第二步**：
+#     ① TryAct(eid, kind)＝真正動手那支：當拍判距離(0x508DF6)＋視線(0x5B87E4)，
+#        過了就直接開對話（0x5065E7 → 事件 "R011" → 送 0x07 面向 ＋ 0x05 點選）；
+#        不在範圍就**用官方尋路自己走一步**，下一拍再叫就繼續走。
+#     ② 只有 ① 沒做到才設自動走路狀態機 INTERACT_FN(mode=1)。
+#   而 ② 會先把倒數 [pf+0x41B0] 設成 **20 拍**、歸零才第一次嘗試 —— 貼臉也要空等；
+#   [pf+0x41A0]（動作鎖）不是 0 時更是整包寫進延後槽 [pf+0x41B8] **不執行**，
+#   對我們看起來就是「點了沒反應」，然後上層開始橋位置 → 就是那個「超卡」。
+#   ★ 實機（2026-09-03 黑狐 永夜城 銀行小姐艾寶）：6.4 格叫一次 → 官方尋路走到
+#     1.4 格；再叫一次 → **0.13 秒對話框就開了**。
+#   ⚠ 回傳值**不能**當「成功了沒」：kind 3 走完 0x5065E7 是 `mov al,1` 收尾
+#     （實測貼近成功那次也回 1）→ 成功與否一律看對話框代號有沒有變（_wait_dialog）。
+TRY_ACT_FN = 0x00506784    # ★ AOB 定位（locate.py supply.TRY_ACT_FN）：thiscall ecx=pathfinder_this
+# ★ 出處：自動走路狀態機 mode 1 的每拍動作就是 TryAct(eid, 3)（0x5493D9），
+#   而點擊處理式對 NPC 也是先叫 TryAct(eid, 3) 再視情況設 mode 1（0x5AC8E0）。
+KIND_TALK = 3
+# 等對話框的期間每隔多久補叫一次 TryAct（＝官方狀態機那個 20 拍重試，我們做得比它勤）。
+# 它同時也是「還沒走到就繼續往前走」的動力來源，所以不能只叫一次就乾等。
+CLICK_REPEAT = 0.35
 # ★ 出處同上段實測序列②：TALK_OPTION1＝對話第一個選項（商人＝我要買東西）。
 TALK_BUY = 10
 # ★ 對話選單的「第 N 項」碼：TALK_OPTION1=10 … TALK_OPTION10=19（擷取實測，
@@ -81,7 +103,11 @@ DIALOG_TIMEOUT = 12.0      # 點 NPC 後等對話框的上限（0x54A520 會自�
 #   走過去」的。⚠ 差別在**人擠人的時候**：被別的玩家推著滑動 → `is_walking`
 #   一直是 True → 底下那個「停住 0.8 秒就放棄」的快路徑永遠不觸發，舊寫法就
 #   卡滿 12 秒才肯換站位（天使學園廣場實測）。所以要有這個硬上限。
-DIALOG_NEAR_TIMEOUT = 3.0
+# ★★ 2026-09-03 再壓到 1.2 秒：實測貼身叫 TryAct **0.13 秒**對話框就開，
+#   而且 WND_MESSAGE 的代號**是那個視窗物件的位址**（同一個視窗重開會拿到
+#   同一個值）→ 除了「這個 session 第一次開」以外根本看不到邊沿。等久了也等
+#   不到，只是白等；等不到就照送選項（下面「驗不了」那條），成沒成看目標視窗。
+DIALOG_NEAR_TIMEOUT = 1.2
 DIALOG_STILL_GRACE = 0.8   # 角色停住這麼久還沒開對話框＝這次點沒成功，馬上去調位置
                            # （判太早無害：基準只記一次，晚到的對話下一輪立刻接上）
 # ★ 走近 NPC 時「連續這麼久沒更靠近」＝被卡住了（人牆／伺服器退回移動）
@@ -319,17 +345,27 @@ def find_npc(scanner, npc_id: int):
 # 開交易 + 買
 # ---------------------------------------------------------------------------
 def _click_npc(mover, scanner, npc_ent: int) -> bool:
-    """點 NPC：呼叫自動走路/互動狀態機（0x54A520），客戶端會走到它旁邊互動、開對話。
+    """點 NPC ＝ **跟滑鼠點同一件事**：叫官方的 `TryAct(eid, KIND_TALK)`。
 
-    ⚠ 目標用 **eid**（實體 +0xBC），不是選定 id；this = pathfinder_this()（玩家物件−8）。
+    在互動範圍內 → 當場開對話；不在範圍 → 它用官方尋路幫我們走一步
+    （呼叫端每 `CLICK_REPEAT` 秒再叫一次就會一路走到、然後開對話）。
+    ⚠ 目標用 **eid**（實體 +0xBC），不是選定 id；this = pathfinder_this()。
+    ⚠ 回 True 只代表**這一發送進去了**，不代表對話開了（見 TRY_ACT_FN 檔頭：
+      kind 3 一律 `mov al,1` 收尾）。開沒開一律由 `_wait_dialog` 的邊沿偵測判。
+    ⚠ TryAct 定位失敗才退回舊路（自動走路狀態機 INTERACT_FN）—— 那條會慢
+      20 拍、動作鎖著時還會整包被延後，但總比整個功能停掉好。
     """
-    if not INTERACT_FN:               # 定位失敗（改版？）→ 大聲停用，不亂叫
-        return False
     pf = move.pathfinder_this(scanner)
     if not pf:
         return False
     eid = _u32(scanner, npc_ent + 0xBC)
     if not eid:
+        return False
+    if TRY_ACT_FN:
+        with mover.lock:
+            return mover.call_sync(TRY_ACT_FN, eid, KIND_TALK, ecx=pf,
+                                   timeout=CALL_TIMEOUT) is not None
+    if not INTERACT_FN:               # 兩支都定位失敗（改版？）→ 大聲停用，不亂叫
         return False
     with mover.lock:
         return mover.call_sync(INTERACT_FN, INTERACT_MODE, eid, 0, ecx=pf,
@@ -406,7 +442,8 @@ def _dialog_token(scanner):
     return g[DIALOG_WND]
 
 
-def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT) -> bool:
+def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
+                 again=None) -> bool:
     """點 NPC 後等對話框**真的開了**：DIALOG_WND 變成「非 0 且 ≠ baseline」才算。
 
     ★ 用「值變了」不用「非 0」（見 _dialog_token 的坑）；視窗代號是遞增配號
@@ -419,17 +456,28 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT) -> bool:
       `is_walking` 一直是 True，快路徑永遠不觸發 → 傻等滿 timeout 才換站位
       （使用者 2026-08-27 回報）。所以貼身點的時候呼叫端要傳
       `DIALOG_NEAR_TIMEOUT`（3 秒）當硬上限，別靠這裡的走路判斷。
+
+    again（2026-09-03 加，配合 TryAct）：每 `CLICK_REPEAT` 秒補叫一次「點」。
+      ★ 官方就是這樣做的（狀態機每 20 拍重叫一次 TryAct），而且**這也是走路的
+        動力**：還沒到位的那幾發 TryAct 每一發都會往 NPC 走一步。
+      ⚠ 有 again 的時候就**不再用「停住 0.8 秒就放棄」的快路徑** —— 那條是給
+        「只點一次、乾等」用的；現在我們一直在重點，早退只會白白換站位。
     """
     if baseline is None:                 # 讀不到基準（改版把全域名換了？）→ 交給呼叫端安全退化
         return False
     pf = move.pathfinder_this(scanner)
     t0 = time.time()
     last_walk = t0
+    last_click = t0                      # 進來之前呼叫端剛點過一次
     while time.time() - t0 < timeout:
         now = _dialog_token(scanner)
         if now is not None and now != baseline and now != 0:
             return True
-        if pf and entity.is_walking(scanner, pf + 8):
+        if again is not None:
+            if time.time() - last_click >= CLICK_REPEAT:
+                last_click = time.time()
+                again()
+        elif pf and entity.is_walking(scanner, pf + 8):
             last_walk = time.time()
         elif time.time() - last_walk > DIALOG_STILL_GRACE:
             return False
@@ -559,12 +607,11 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                 _approach_npc(mover, scanner, npc_id)
                 walked = True
                 found = find_npc(scanner, npc_id) or found
-            elif not walked and gap is not None:
-                # 已在點擊距離內但站著沒動＝點了 ~50% 開不了、白站一秒（8/14
-                # flaky 實測）→ 先向前穿過 NPC 製造「剛走近」再點（往前靠，不是退）。
-                _nudge_toward(mover, scanner, npc_id, NUDGE_STEPS[1])
-                walked = True
-                found = find_npc(scanner, npc_id) or found
+            # ⚠ 2026-09-03 拿掉「已在距離內但站著沒動過腳 → 先穿過 NPC 再點」：
+            #   那是 8/14 為了**舊的**點擊（自動走路狀態機）50% 白站才加的暖身動作。
+            #   改叫 TryAct 之後，站著不動點下去實測 0.13 秒對話框就開（黑狐 永夜城
+            #   銀行小姐艾寶，兩次都中）—— 這個暖身只剩「每趟白走一段」的成本。
+            #   點不開時的補救仍然在（下面 fails>0 那條 _nudge_toward 階梯）。
         walked = True
         npc_ent, _ = found
         # ★ 點下去的當下離多遠 → 決定要等對話框多久（見 DIALOG_NEAR_TIMEOUT）：
@@ -574,17 +621,34 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         wait_dlg = (DIALOG_NEAR_TIMEOUT
                     if gap_now is not None and gap_now <= CLICK_RANGE + 1.0
                     else DIALOG_TIMEOUT)
-        if not _click_npc(mover, scanner, npc_ent):  # 0x54A520 開對話（一次一發）
+        if not _click_npc(mover, scanner, npc_ent):  # TryAct：到位就開對話，沒到就走一步
             time.sleep(0.5)
             continue
+        # ★ 等對話框的期間每 CLICK_REPEAT 秒補點一次（＝官方那個重試迴圈）。
+        #   ⚠ 每一發都**重新找那隻 NPC**：實體會被回收／換一格，上一拍的位址不能信
+        #     （CLAUDE.md「交給遊戲的位址送出前當場重驗」）。
+        def _again(_m=mover, _s=scanner, _id=npc_id):
+            f = find_npc(_s, _id)
+            return bool(f) and _click_npc(_m, _s, f[0])
+
         if base is None:                             # 安全退化：全域讀不到才走盲等照送
             _wait_still(scanner, timeout=12.0)
             time.sleep(TALK_GAP)
-        elif _wait_dialog(scanner, base, wait_dlg):
+        elif _wait_dialog(scanner, base, wait_dlg, again=_again):
             if not _wait_arrival(scanner, npc_id):
                 fails += 1                           # 對話開了但人沒到位（被擋/太遠）
                 continue                             # → 絕不送購買選項，調位置重來
             time.sleep(0.2)                          # 人到位了，緩一小拍再送選項
+        elif _dialog_token(scanner) and _wait_arrival(scanner, npc_id,
+                                                      timeout=2.0):
+            # ★★ 沒看到邊沿 **≠** 對話框沒開：**本來就開著**的時候代號一動也不動
+            #   （2026-09-03 黑狐銀行實測：對話框開著再點，WND_MESSAGE 3 秒沒變，
+            #     但兩個選項照送、WND_BANK 真的開了）。舊寫法把這種「驗不了」當成
+            #   「沒開」→ 跳過選項 → 換站位重點 → 再點還是不會變 …… 磨滿 25 秒。
+            #   ⚠ 這正是本專案復發七次的「讀不到≠沒有」（bag-false-empty-guards）。
+            #   → 人到位（停穩且 ≤ TALK_RANGE）且代號非 0 就照送選項，
+            #     成沒成一律交給最後那道視窗檢查判。
+            time.sleep(0.2)
         else:
             fails += 1
             continue                                 # 確認沒開對話 → 馬上調位置重點
