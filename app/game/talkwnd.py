@@ -238,6 +238,8 @@ def page(scanner) -> Page | None:
 #   ⚠ `messageclose` 那個封包只是**告訴伺服器**「我按了確定」，畫面上的框
 #     是客戶端 UI 自己收掉的 —— 只送封包會變成「帶著對話框到處跑」
 #     （使用者 2026-09-02 回報）。Lua 開關視窗是安全操作（[[lua-engine]]）。
+# ★ 對話視窗**確定鈕**的 Lua 處理式（倒 bytecode：messageclose ＋ window.destroy）。
+CLOSE_BTN_FN = "OnMessageClose"
 CLOSE_WND_FN = "DestroyMessageWnd"
 
 
@@ -257,25 +259,43 @@ def close_window(mover, scanner) -> bool:
 
 
 def close_page(mover, scanner) -> tuple[bool, str]:
-    """把現在這一頁「無異議對話」按掉（送 `messageclose`）。
+    """把現在這一頁「無異議對話」按掉 ＝ **跟遊戲的確定鈕一模一樣**。
 
-    回 (叫下去了嗎, 說明)。⚠ 只保證叫下去了 —— 對話有沒有真的翻頁要看畫面
-    （製作頁就是給人在旁邊看的），跑的時候靠「下一步做得成」當證據。
+    ★★★ 2026-09-03 實機（黑狐 遺落之地分流6）抓到「確定沒反應→再按→卡住」的
+      真兇：對話視窗的確定鈕是 Lua `OnMessageClose(視窗代號)`，倒出來的 bytecode
+      只做兩件事 ——
+          game.messageclose(視窗代號)   ← 通知伺服器（我們以前只做這件）
+          window.destroy(視窗代號)      ← **把視窗物件銷毀**（我們以前沒做）
+      少了第二件，視窗物件一直留在管理器裡：`WND_MESSAGE` 查得到、遊戲自己的
+      `ismessageend` 也回「還沒結束」、對話頁簽章一格不變 → 呼叫端只能一直
+      「確定沒反應→再按一次」。所以這裡直接叫那顆按鈕的 Lua 處理式，
+      跟滑鼠按下去走的是同一段程式；叫不動才退回舊路（C 函式）＋destroy。
+    ⚠ Lua 呼叫不可以太密（[[lua-engine]]）：這支一頁只按一次，呼叫端有節流。
+    回 (叫下去了嗎, 說明)。對話有沒有真的翻頁要看「視窗還在不在／簽章變了沒」。
     """
     if not (mover and mover.active):
         return False, "跳板沒裝好"
+    g = lua.globals_of(scanner, [WND_NAME]) or {}
+    wnd = g.get(WND_NAME)
+    if not wnd:
+        # 讀不到就別亂送 —— 參數錯的話遊戲會拿去查別的視窗。
+        return False, f"⚠ 讀不到 {WND_NAME}（對話視窗代號）"
+    try:
+        ok, _val = lua.call(mover, scanner, CLOSE_BTN_FN, int(wnd))
+        if ok:
+            return True, "已按「確定」（messageclose＋destroy）"
+    except Exception:                                      # noqa: BLE001
+        ok = False
+    # 安全退化：Lua 叫不動 → 照舊送 messageclose（C 函式），再補 destroy。
     spot = locate(scanner)
     if spot is None:
         return False, "⚠ 找不到 messageclose 的進入點（官方改寫了？）—— 已停用"
     world = _u32(scanner, spot.world_ptr)
     if not world or not 0x10000 < world < 0x7FFF0000:
         return False, "⚠ 讀不到世界物件"
-    g = lua.globals_of(scanner, [WND_NAME]) or {}
-    wnd = g.get(WND_NAME)
-    if not wnd:
-        # 讀不到就別亂送 —— 參數錯的話遊戲會拿去查別的視窗。
-        return False, f"⚠ 讀不到 {WND_NAME}（對話視窗代號）"
     with mover.lock:
         ok = mover.call_sync(spot.close_fn, int(wnd), ecx=world,
                              timeout=CALL_TIMEOUT) is not None
-    return (ok, "已送出「確定」") if ok else (False, "指令槽忙，等下一輪")
+    if ok:
+        close_window(mover, scanner)
+    return (ok, "已送出「確定」(退化路)") if ok else (False, "指令槽忙，等下一輪")
