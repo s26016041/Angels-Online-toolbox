@@ -503,6 +503,26 @@ def leave_npc(mover) -> None:
         pass
 
 
+def close_sale(mover, scanner) -> None:
+    """跟商人買完的收尾：送離開包 **＋ 真的把畫面上那個「商店」框關掉**。
+
+    ⚠⚠ 2026-09-03 實測到的**假成功**：只送 0x22（`leave_npc`）不會關掉販售視窗，
+      `WND_NPCSALE` 就一直非 0 → **下一趟**補給進 `_engage_npc` 的第一句
+      `if done(): return True` 直接命中 → **跳過點 NPC**（實測 0.04 秒回 True、
+      人一步都沒動），接著 `buy()` 把購買包送進一個早就結束的交易 —— 什麼都
+      沒買到卻一路回報成功。（黑狐 永夜城：開商店 → 送離開包 → 走開 → 再叫一次
+      就重現。）這是 CLAUDE.md 說的「安靜地做錯事」，一律當 bug 修。
+    ★ 關法照銀行那套（`_bank_close`）：送離開包 → 叫遊戲自己的視窗關閉處理式。
+      `OnNPCSaleClose` 就是 X 鈕那支，無參數；叫完 WND_NPCSALE → 0（實測）。
+    ⚠ 失敗不吵：這是收尾動作，叫不動最多是框還在，不該把整趟判成失敗。
+    """
+    leave_npc(mover)
+    try:
+        lua.call(mover, scanner, "OnNPCSaleClose")
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
 def _wait_for(ok, timeout: float) -> bool:
     """輪詢等 `ok()` 成立；成立馬上回 True（取代「睡滿固定秒數再看一眼」）。"""
     t0 = time.time()
@@ -804,10 +824,23 @@ def _repair_close(mover, scanner) -> bool:
     """關維修畫面（repairclose 0x5906CB）：送「離開 NPC」包 0x5D29C1(0x22,0) 並關窗。
     ⚠ 不叫這支，修完角色會卡住不能走（伺服器端還在維修互動）。它自己讀全域、
       無參數（ecx 不影響）；沒開窗時它會自己 no-op，多叫無害。"""
-    if not REPAIR_CLOSE_FN:
-        return False
-    with mover.lock:
-        return mover.call_sync(REPAIR_CLOSE_FN, timeout=CALL_TIMEOUT) is not None
+    ok = False
+    if REPAIR_CLOSE_FN:
+        with mover.lock:
+            ok = mover.call_sync(REPAIR_CLOSE_FN,
+                                 timeout=CALL_TIMEOUT) is not None
+    # ⚠⚠ repairclose **只送離開包，畫面上那個「修理」框不會關**（2026-09-03 截圖
+    #   實證：叫兩次還在、WND_REPAIR 一直非 0）。留著的話下一趟 `_engage_npc`
+    #   會被它騙成「維修視窗已經開著」→ 跳過點 NPC → 全修送進空的互動（同
+    #   `close_sale` 檔頭那個假成功）。→ 補叫遊戲自己的 X 鈕處理式把它 destroy。
+    #   ⚠ `OnRepairClose` **要帶視窗代號**（不帶會噴 repair.lua:7 bad argument）。
+    try:
+        w = (lua.globals_of(scanner, (WND_REPAIR,)) or {}).get(WND_REPAIR)
+        if w:
+            lua.call(mover, scanner, "OnRepairClose", w)
+    except Exception:                                      # noqa: BLE001
+        pass
+    return ok
 
 
 def run_repair(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
@@ -1116,6 +1149,15 @@ SETTLE = 0.8              # 送出後等背包更新再對帳
 
 
 def run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, str]:
+    """跟商人買 —— **收尾一定把販售視窗關掉**（`close_sale` 檔頭的假成功）。"""
+    try:
+        return _run_buy(mover, scanner, npc_id, fallback, ledger)
+    finally:
+        if mover is not None and getattr(mover, "active", False):
+            close_sale(mover, scanner)
+
+
+def _run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, str]:
     """跑一次「商人購買」：讀清單 → 開交易 → 把不足的買到目標數量。
 
     npc_id: 這城補給商（藥水雜貨商人）的確切編號（NPC_TABLE 給）；fallback: .MPC 表座標。
@@ -1229,6 +1271,17 @@ def _fill_target(budget: int, gold, groups: list[tuple[int, int, int]]) -> int:
 
 def run_potion_fill(mover, scanner, npc_id: int, fallback,
                     plan: dict, say=None, ledger=None) -> tuple[bool, str]:
+    """補藥水 —— **收尾一定把販售視窗關掉**（同 run_buy，見 `close_sale`）。"""
+    try:
+        return _run_potion_fill(mover, scanner, npc_id, fallback, plan,
+                                say, ledger)
+    finally:
+        if mover is not None and getattr(mover, "active", False):
+            close_sale(mover, scanner)
+
+
+def _run_potion_fill(mover, scanner, npc_id: int, fallback,
+                     plan: dict, say=None, ledger=None) -> tuple[bool, str]:
     """把精靈頁放的藥水**買到負重 95%**。假設角色已在補給商附近（跟 run_buy 同一站）。
 
     plan = {"HP": [種類id…], "MP": […]}（robot.potion_buy_ids 給的，只含「真藥水」）。

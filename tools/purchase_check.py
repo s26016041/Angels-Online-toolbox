@@ -102,6 +102,19 @@ ok, _m, got, _n = run([(1905, 50)], [{1905: 10}, {1905: 50}],
 check("照樣買齊成功", ok is True)
 check("沒有任何記帳", got == [])
 
+print("⑦ 收尾一定關販售視窗（不然下一趟會被殘留視窗騙成假成功）")
+CLOSED: list = []
+_real_close = supply.close_sale
+supply.close_sale = lambda m, s: CLOSED.append(1)
+try:
+    run([(1905, 50)], [{1905: 10}, {1905: 50}])
+    check("買成功也關窗", len(CLOSED) == 1, f"實得 {len(CLOSED)}")
+    CLOSED.clear()
+    run([(1905, 50)], [{1905: 10}, {1905: 10}], buy_ok=False)
+    check("買失敗也關窗（try/finally）", len(CLOSED) == 1, f"實得 {len(CLOSED)}")
+finally:
+    supply.close_sale = _real_close
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
