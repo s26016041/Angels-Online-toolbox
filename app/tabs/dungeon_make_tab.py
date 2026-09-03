@@ -797,14 +797,21 @@ class DungeonMakeTab(BaseTab):
         #   還在同一張圖 —— 走出去了還繼續加，等於把兩張圖的座標混在一份
         #   腳本裡，跑起來一定亂走。
         here, _grid = self._here_key()
+        # ★ 插在**選到的那一步後面**，不是永遠塞到最後（使用者 2026-09-03：
+        #   「點前面步驟加入新流程，要直接加在他下面」）。沒選或選的是最後
+        #   一步 → 跟以前一樣接在最後。下面的「上一步」「該在哪張圖」全部
+        #   以插入點為準，不是以最後一步為準。
+        row = self.steps.currentRow()
+        n = len(self._script.steps)
+        at = row + 1 if 0 <= row < n - 1 else n
         if self._script.scene is None:
             if not self._stamp_map(quiet=True):
                 self._say_map("⚠ 讀不到目前場景，這一步沒有存")
                 return
         else:
             steps = self._script.steps
-            prev = dungeon.map_at(self._script, len(steps) - 1)
-            last = steps[-1] if steps else None
+            prev = dungeon.map_at(self._script, at - 1)
+            last = steps[at - 1] if at > 0 else None
             # ★ 剛走過傳點：把「傳到哪張圖」記進那一步 —— 是我們**看到**的
             #   （人現在就站在那），不是猜的。這也是腳本唯一准許換圖的時機。
             if (last is not None and last.get("do") == dungeon.PORTAL
@@ -816,9 +823,9 @@ class DungeonMakeTab(BaseTab):
                 me = self._me(self._cur()[1])
                 if me is not None and not last.get("land"):
                     last["land"] = [round(me[0], 1), round(me[1], 1)]
-                self._say_map(f"第 {len(steps)} 步的傳點會到"
+                self._say_map(f"第 {at} 步的傳點會到"
                               f"「{scene.scene_name(here)}」（{here}）—— 已記住")
-            want = dungeon.map_at(self._script)
+            want = dungeon.map_at(self._script, at)
             if want is None:
                 want = prev              # 傳點還沒走過 → 應該還在傳點前那張
             if here is not None and want is not None and here != want:
@@ -829,13 +836,13 @@ class DungeonMakeTab(BaseTab):
                     "　換圖只能靠「加入『走進傳點』」那一步 ——"
                     "整份重來請按「重新蓋章」。")
                 return
-        self._script.add(step)
+        self._script.add(step, at)
         self._refresh_steps()
-        self.steps.setCurrentRow(self.steps.count() - 1)
-        self._say_map(f"已加入：{dungeon.describe(step)}")
-        self._warn_room()
+        self.steps.setCurrentRow(at)
+        self._say_map(f"已加入（第 {at + 1} 步）：{dungeon.describe(step)}")
+        self._warn_room(at)
 
-    def _warn_room(self) -> None:
+    def _warn_room(self, idx: int | None = None) -> None:
         """新加的這一步跟上一步在不在同一區？不同區又沒傳點就**提醒**。
 
         ★ 副本是好幾塊互不相通的地方拼起來的（使用者 2026-09-02），跨區的
@@ -844,13 +851,15 @@ class DungeonMakeTab(BaseTab):
           「解謎之後會打開又會變成聯通」），現在不通不代表跑的時候不通。
         """
         steps = self._script.steps
-        if not self._rooms or len(steps) < 2:
+        if idx is None or not 0 <= idx < len(steps):
+            idx = len(steps) - 1          # 沒給就看最後一步（舊行為）
+        if not self._rooms or idx < 1:
             return
-        here = steps[-1].get("to") or steps[-1].get("at")
+        here = steps[idx].get("to") or steps[idx].get("at")
         if not here:
             return
         prev = None
-        for st in reversed(steps[:-1]):
+        for st in reversed(steps[:idx]):
             if st.get("do") == dungeon.PORTAL:
                 return                     # 中間有傳點：本來就會換區，不比
             prev = st.get("to") or st.get("at")
