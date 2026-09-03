@@ -65,6 +65,8 @@ PICK_WIDTH = 3
 REFRESH_MS = 400               # 背包多久對一次帳
 RUN_MS = 200                   # 強化狀態機多久跑一拍
 HIST_MAX = 300
+# 選裝備時「寶石等限 ≤」自動填成 裝備等級 − 這個數（使用者 2026-09-03 定），仍可手改
+GEM_CAP_BELOW = 15
 
 COLOUR_OF = {
     enhance.SUCCESS: "#7CFC7C",
@@ -275,24 +277,25 @@ class EnhanceTab(BaseTab):
         act2.addWidget(QLabel("打孔到"))
         self.hole_target = QSpinBox()
         self.hole_target.setRange(1, holes.MAX_HOLES)
-        self.hole_target.setSuffix(" 孔")
         self.hole_target.setValue(
             int(config.get("enhance.hole_target", holes.MAX_HOLES)))
-        self.hole_target.setFixedWidth(72)
+        self.hole_target.setFixedWidth(52)
         self.hole_target.setToolTip(
             f"要打到幾個孔（遊戲上限 {holes.MAX_HOLES}）。到了就停，最後一孔留空。")
         act2.addWidget(self.hole_target)
+        act2.addWidget(QLabel("孔"))
+        act2.addSpacing(12)
         act2.addWidget(QLabel("寶石等限 ≤"))
         self.gem_cap = QSpinBox()
         self.gem_cap.setRange(0, holes.LEVEL_SANE)
         self.gem_cap.setSingleStep(10)
-        self.gem_cap.setSuffix(" 級")
-        self.gem_cap.setValue(int(config.get("enhance.gem_cap", 20)))
-        self.gem_cap.setFixedWidth(84)
+        self.gem_cap.setFixedWidth(60)
         self.gem_cap.setToolTip(
-            "只拿「裝備等限」不超過這個數字的寶石去鑲（當墊子用），好寶石不會動。\n"
-            "寶石的等限＝說明文字那行「裝備等限：N級」。")
+            f"選裝備時自動填「裝備等級 − {GEM_CAP_BELOW}」，要改自己打。\n"
+            "只拿「裝備等限」不超過這個數字的寶石去鑲（當墊子用），好寶石不會動。")
         act2.addWidget(self.gem_cap)
+        act2.addWidget(QLabel("級"))
+        self._cap_serial = 0             # 上次自動填等限時選的是哪件
         self.hole_btn = QPushButton("自動打孔")
         self.hole_btn.setToolTip(
             "用一般 N星打孔錘打孔，有空孔先鑲寶石，直到孔數到目標（最後一孔留空）。\n"
@@ -434,6 +437,12 @@ class EnhanceTab(BaseTab):
             self.hole_target.setMinimum(hlow)
             if self.hole_target.value() < hlow:
                 self.hole_target.setValue(hlow)
+            # ★ 只在「換了一件」時自動填等限 —— 打孔中孔數變了也會走到這裡，
+            #   每拍都填會把使用者手改的值洗掉
+            lvl = g.base.get("level")
+            if lvl is not None and g.serial != self._cap_serial:
+                self._cap_serial = g.serial
+                self.gem_cap.setValue(max(0, int(lvl) - GEM_CAP_BELOW))
         self._update_buttons()
 
     def _update_buttons(self) -> None:
@@ -484,8 +493,8 @@ class EnhanceTab(BaseTab):
         target = self.hole_target.value()
         cap = self.gem_cap.value()
         config.set("enhance.hole_target", target)
-        config.set("enhance.gem_cap", cap)
         config.save()                      # ★ set() 不寫檔，要接 save()
+        # 寶石等限不存：每次選裝備都會自動填「裝備等級 − GEM_CAP_BELOW」
         if target <= g.holes:
             self.status.setText("目標比目前的孔數還低 —— 不用打")
             return
