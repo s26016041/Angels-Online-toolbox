@@ -131,7 +131,10 @@ TALK_KEEP = 1.2
 # 腳本裡的座標跟現場物件對得起來的最大誤差（格）。
 PROP_TOL = 3.0
 # 送完一個對話動作之後等多久再看下一頁。
-MENU_GAP = 0.8
+# ★ 對話動作之間的節奏（點→選項→確定）。使用者 2026-09-03：「把間隔直接刪掉，
+#   不給輸入；預設 0.5；不會跟使用者說」→ 製作頁的欄位拿掉、腳本裡舊的 gap
+#   一律忽略，就用這一個值。
+MENU_GAP = 0.5
 # 按了確定之後連續這麼多輪都沒換頁 ＝ 這段對話走完了（那些全域關掉還會
 # 留著，只能靠「不再變化」判結束，見 talkwnd.page 的說明）。
 TALK_SETTLE = 2
@@ -1013,7 +1016,7 @@ class DungeonTab(BaseTab):
         # ★ 已經站在入口上 → **一直打進傳送點封包**（不是站著等）
         self._nav.reset()
         menu = [n for n in (ent.get("menu") or []) if n]
-        gap = float(ent.get("gap") or MENU_GAP)
+        gap = MENU_GAP
         # ★★ 有些副本門口是**撞上去它自己跳對話**，還要選第 1 項才進得去
         #   （使用者 2026-09-02：「要去撞他自己會產生對話，所以點點看沒用」）
         #   —— 所以這裡是「一邊打 0x0D，一邊看對話有沒有跳出來」，
@@ -1560,7 +1563,7 @@ class DungeonTab(BaseTab):
             self._wnd, self._wnd_t = None, 0.0   # 強制重問一次
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
-            self._menu_t = float(step.get("gap") or MENU_GAP)
+            self._menu_t = MENU_GAP
             self._say(f"{tag}　已點外觀 {hit[0].model}")
             return
 
@@ -1569,7 +1572,7 @@ class DungeonTab(BaseTab):
         #   → 腳本裡**只記要選第幾項**，沒有選項的那些頁自己按確定過掉。
         #   ⚠ 舊腳本裡記的 0（過場）直接忽略：現在是自動的，再送一次會多按。
         menu = [n for n in (step.get("menu") or []) if n]
-        gap = float(step.get("gap") or MENU_GAP)
+        gap = MENU_GAP
         self._menu_t -= dt
         if self._menu_t > 0:
             return

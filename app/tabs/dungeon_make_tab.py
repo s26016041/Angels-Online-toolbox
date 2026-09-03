@@ -489,19 +489,7 @@ class DungeonMakeTab(BaseTab):
         self.menu_lbl = QLabel("已選路徑：（先按「點點看」試一個物件）")
         ph2.addWidget(self.menu_lbl)
         ph2.addStretch(1)
-        # ★ 使用者 2026-09-02：「太快說話可能會出現無異議對話」——所以每一步
-        #   自己記「點下去之後隔多久送選項、選項之間隔多久」。
-        ph2.addWidget(QLabel("選項間隔"))
-        self.gap_secs = QDoubleSpinBox()
-        self.gap_secs.setRange(0.2, 30.0)
-        self.gap_secs.setSingleStep(0.5)
-        self.gap_secs.setDecimals(1)
-        self.gap_secs.setValue(1.5)
-        self.gap_secs.setSuffix(" 秒")
-        self.gap_secs.setToolTip(
-            "點下去之後隔多久才送第一個選項，以及選項之間隔多久。\n"
-            "太快送出去，伺服器那邊對話還沒準備好就會被拒絕。")
-        ph2.addWidget(self.gap_secs)
+        # ⚠ 「選項間隔」欄位已拿掉（使用者 2026-09-03：不給輸入、固定用 dungeon_tab.MENU_GAP）。
         b = QPushButton("清掉路徑")
         b.setToolTip("選錯了重來（不會影響已存的步驟）。")
         b.clicked.connect(self._clear_menu)
@@ -996,7 +984,6 @@ class DungeonMakeTab(BaseTab):
         if self._menu:
             # 門口要選第幾項（0＝沒有選項那種頁跑的時候會自動過，不必記）
             ent["menu"] = [n for n in self._menu if n]
-            ent["gap"] = round(self.gap_secs.value(), 1)
         # ⚠ 重記一次＝從頭來過，舊的選項路徑不留（不然會疊起來）
         at = getattr(self, "_poked_at", None)
         if at:
@@ -1357,7 +1344,6 @@ class DungeonMakeTab(BaseTab):
         if self._entrance_here():
             ent = self._script.entrance
             ent.setdefault("menu", []).append(n)
-            ent["gap"] = round(self.gap_secs.value(), 1)
             self._refresh_stamp()
             self.status.setText(
                 f"已送第 {n} 項，並記進**入口**的選項路徑"
@@ -1421,8 +1407,7 @@ class DungeonMakeTab(BaseTab):
         step = {"do": dungeon.INTERACT,
                 "at": [round(pr.x, 1), round(pr.y, 1)],
                 "model": pr.model,
-                "menu": list(self._menu),
-                "gap": round(self.gap_secs.value(), 1)}
+                "menu": list(self._menu)}
         # ★ 站位：點下去那一刻的位置（讀不到就不寫，跑的時候退回「靠近物件」）
         at = getattr(self, "_poked_at", None)
         if at:

@@ -416,11 +416,10 @@ def describe(step: dict) -> str:
         # ★ 有名字就印名字（「惡魔系雕像01（60049）」）—— 光看編號認不出是什麼
         #   東西（2026-09-02 使用者回報）。查不到就退回只顯示編號。
         who = mapobj.label(m) if isinstance(m, int) else f"外觀 {m}"
-        gap = step.get("gap")
         st = step.get("stand")
         where = f"　站位 ({st[0]:g}, {st[1]:g})" if st else ""
-        return (f"對話 ({x}, {y})　{who}{where}{tail}"
-                + (f"　間隔 {gap} 秒" if gap and menu else ""))
+        # ⚠ 舊腳本的 "gap" 照舊接受但**不印也不用**（2026-09-03 間隔固定，見 dungeon_tab.MENU_GAP）
+        return f"對話 ({x}, {y})　{who}{where}{tail}"
     if kind == CLEAR:
         return "清光周圍的怪"
     if kind == WAIT:

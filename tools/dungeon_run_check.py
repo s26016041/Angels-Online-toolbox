@@ -395,17 +395,18 @@ def main() -> int:
     ck("★ 送完會送「離開互動」（不送伺服器會以為還在講話）",
        len(tab.left) >= 1, str(tab.left))
 
-    # ★ 每一步自己的選項間隔（使用者：太快說話會出現無異議對話）
+    # ★ 2026-09-03 使用者：「把間隔直接刪掉、預設 0.5、不跟使用者說」——
+    #   腳本裡舊的 "gap" 一律忽略，節奏固定 dungeon_tab.MENU_GAP。
     slow = {"do": "interact", "at": [20, 20], "model": 60307,
             "menu": [1, 2], "gap": 5.0}
     tab = make_tab([slow], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     run(tab, 0.3)
     ck("點下去了", tab._clicked)
-    run(tab, 2.0)
-    ck("★ 間隔 5 秒時，2 秒還不送選項", tab.sent == [], str(tab.sent))
-    run(tab, 4.0)
-    ck("★ 過了 5 秒才送第一個", len(tab.sent) == 1, str(tab.sent))
+    run(tab, dt.MENU_GAP * 2 + 0.3)
+    ck(f"★ 腳本寫 gap=5 也**忽略**：{dt.MENU_GAP} 秒節奏就送第一項",
+       len(tab.sent) >= 1, str(tab.sent))
+    ck(f"　MENU_GAP 固定 0.5（使用者定）", dt.MENU_GAP == 0.5, str(dt.MENU_GAP))
 
     # ★★ 使用者 2026-09-02 定案：**不比外觀** —— 機關被啟動過外觀會換
     #   （實測 60335 廢棄機器人2 → 60301 門開關火，同一格同一個東西）。
@@ -567,7 +568,7 @@ def main() -> int:
         return real_wo(_mv, _sc)
     dt.talkwnd.close_page = close_then_reopen
     dt.talkwnd.window_open = wo
-    run(tab, 3.0)
+    run(tab, dt.MENU_GAP * 12)
     ck("★ 視窗暫時不見時**沒有**誤判成走完（分頁沒停）", tab.run_cb.isChecked(),
        tab.status.text())
     ck("★ 下一頁到了照樣把第 1 項送到", 10 in tab.sent, f"送出 {tab.sent}")
@@ -581,10 +582,10 @@ def main() -> int:
     wire(tab, fake)
     run(tab, 0.2)
     ck("　點下去了", tab._clicked and fake.i == 0)
-    run(tab, 0.3)
+    run(tab, dt.MENU_GAP + 0.2)
     ck("★★ 視窗確定開著 → **馬上**按確定（不必等它「穩定」）",
        fake.closes >= 1, f"按了{fake.closes}次")
-    run(tab, 0.3)
+    run(tab, dt.MENU_GAP + 0.2)
     ck("★★★ 視窗不見了 → **立刻**收工，不用等 TALK_SETTLE",
        tab._i == 1, f"還在第{tab._i + 1}步：{tab.status.text()}")
     ck("　收工前會送「離開互動」", len(tab.left) >= 1, str(tab.left))
@@ -938,7 +939,7 @@ def main() -> int:
         "walk_exact": lambda _s, _sc, _p, x, y: moved3.append(("exact", 0.0)),
     })()
     dt.entity.is_walking = lambda _sc, _p: False
-    run(tab, dt.CLICK_RETRY * 4 + 1.0)
+    run(tab, (dt.CLICK_RETRY + dt.MENU_GAP * 2) * 5 + 1.0)
     ck(f"★★ 點了 {dt.CLICK_RETRY:.0f} 秒沒反應 → **再點一次**（不是點一次就不管）",
        len(clicks) >= 2, str(len(clicks)))
     ck("　而且還在跑（上限交給 STEP_TIMEOUT 大聲停）", tab.run_cb.isChecked())
