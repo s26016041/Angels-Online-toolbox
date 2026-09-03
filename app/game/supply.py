@@ -344,6 +344,28 @@ def find_npc(scanner, npc_id: int):
 # ---------------------------------------------------------------------------
 # 開交易 + 買
 # ---------------------------------------------------------------------------
+def click_object(mover, scanner, ent_addr: int, kind: int = KIND_TALK) -> bool:
+    """**官方點法**：對場上任何一個東西送一發 `TryAct(eid, kind)`。
+
+    ⚠⚠ 「場上任何一個東西」是字面意思：NPC 跟**場景物件（雕像／公佈欄／副本
+      裡那些對話物件）在同一張物件表裡**，`+0xBC` 都查得到（2026-09-03 實測：
+      永夜城「靜態-公佈欄1」+0xBC 查表命中、連叫 3 發走過去並開了視窗）。
+      —— 一開始我寫「場景物件不在實體管理器裡所以不能用這支」是**錯的**。
+    kind：3＝互動／講話（NPC 對話、物件對話都是它）、4＝攻擊。
+    回 True 只代表**這一發送進去了**（TryAct 對 kind 3 的回傳恆為 1，不能當
+    「成功了」用）；到底有沒有點到，看對話框／視窗有沒有變。
+    """
+    pf = move.pathfinder_this(scanner)
+    if not (pf and TRY_ACT_FN and mover and mover.active):
+        return False
+    eid = _u32(scanner, ent_addr + 0xBC)
+    if not eid:
+        return False
+    with mover.lock:
+        return mover.call_sync(TRY_ACT_FN, eid, kind, ecx=pf,
+                               timeout=CALL_TIMEOUT) is not None
+
+
 def _click_npc(mover, scanner, npc_ent: int) -> bool:
     """點 NPC ＝ **跟滑鼠點同一件事**：叫官方的 `TryAct(eid, KIND_TALK)`。
 
@@ -355,16 +377,14 @@ def _click_npc(mover, scanner, npc_ent: int) -> bool:
     ⚠ TryAct 定位失敗才退回舊路（自動走路狀態機 INTERACT_FN）—— 那條會慢
       20 拍、動作鎖著時還會整包被延後，但總比整個功能停掉好。
     """
+    if TRY_ACT_FN:
+        return click_object(mover, scanner, npc_ent)
     pf = move.pathfinder_this(scanner)
     if not pf:
         return False
     eid = _u32(scanner, npc_ent + 0xBC)
     if not eid:
         return False
-    if TRY_ACT_FN:
-        with mover.lock:
-            return mover.call_sync(TRY_ACT_FN, eid, KIND_TALK, ecx=pf,
-                                   timeout=CALL_TIMEOUT) is not None
     if not INTERACT_FN:               # 兩支都定位失敗（改版？）→ 大聲停用，不亂叫
         return False
     with mover.lock:

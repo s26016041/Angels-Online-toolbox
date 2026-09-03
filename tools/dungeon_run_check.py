@@ -249,6 +249,7 @@ def wire(tab, fake):
         fake.opened()
         return True, "點了"
     dt.produce.click = click
+    dt.produce.click_official = click
 
 
 def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
@@ -277,6 +278,7 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
         p for p in props
         if around is None or p.dist(around) <= r]
     dt.produce.click = lambda *a, **k: (True, "點了")
+    dt.produce.click_official = dt.produce.click
     # ⚠ 傳點那條會叫 portal（讀記憶體）——測試裡換成假的
     tab.portal_sent = []
     dt.portal.nearby = lambda _sc, around=None, r=0: [
@@ -856,6 +858,7 @@ def main() -> int:
        tab.run_cb.isChecked() and tab._grid_t == 0.0, tab.status.text())
     tab._nav.stuck = False
     dt.produce.click = lambda *a, **k: (True, "點了")
+    dt.produce.click_official = dt.produce.click
 
     # ★★ 使用者 2026-09-02：「進入副本前不要自動打怪」＋「進入副本完全不
     #   打怪一直往點位走，請優先打怪再往點位走」
@@ -896,6 +899,7 @@ def main() -> int:
     wire(tab, never)
     clicks = []
     dt.produce.click = lambda *_a, **_k: (clicks.append(1), (True, "點了"))[1]
+    dt.produce.click_official = dt.produce.click
     moved3 = []
     tab._mover = type("M", (), {
         "walk_near": lambda _s, _sc, _p, x, y, k: moved3.append(("near", k)),
@@ -995,6 +999,7 @@ def main() -> int:
     wire(tab, never2)
     dt.produce.click = lambda *_a, **_k: (clicks2.append(1),
                                           (True, "點了"))[1]
+    dt.produce.click_official = dt.produce.click
     run(tab, 0.5)
     ck("★★ 還在走路 → **先站穩再點**（走著點人沒到，對話開不起來）",
        clicks2 == [], str(clicks2))
@@ -1014,6 +1019,7 @@ def main() -> int:
     wire(tab, never3)
     dt.produce.click = lambda *_a, **_k: (clicks2.append(1),
                                           (True, "點了"))[1]
+    dt.produce.click_official = dt.produce.click
     run(tab, 0.3)
     ck("　站著不動的話馬上就點", len(clicks2) == 1, str(clicks2))
     # 點完遊戲自己在走過去 → 只要還在靠近就不要插手重點

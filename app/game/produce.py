@@ -177,6 +177,36 @@ def click(mover, scanner, prop) -> tuple[bool, str]:
     return True, f"已點 ({prop.x:.0f},{prop.y:.0f})"
 
 
+def click_official(mover, scanner, prop) -> tuple[bool, str]:
+    """**跟滑鼠點一模一樣**地點一個場景物件：官方的 `TryAct(eid, 3)`。
+
+    跟上面 `click()`（自己送 0x05）差在哪：
+      · TryAct **自己判距離＋視線**；不夠近就用**官方尋路走一步**，下一發接著走。
+        `click()` 是盲送——太遠伺服器直接不理，我們只能自己走、自己重試。
+      · 送出去的封包是遊戲自己那一組（面向 0x07 ＋ 點選 0x05），不是我們拼的。
+    ★ 2026-09-03 實測（黑狐 永夜城「靜態-公佈欄1」，10.4 格外）：
+      連叫 3 發＝走到 1.5 格 → `WND_HITPARADEWIN` 開了。**場景物件跟 NPC 走同一支**
+      （兩者都在同一張物件表裡，`+0xBC` 查得到 —— 一開始以為場景物件不在實體
+      管理器裡，那是錯的，實測推翻）。
+    ⚠ 回 True 只代表「這一發送進去了」，**不代表點到了**（TryAct 的 al 對 kind 3
+      恆為 1）——「有沒有點到」一律由呼叫端看對話頁／視窗有沒有變。
+    ⚠ 還沒到位的那幾發回的也是 True（它在走路）——呼叫端本來就在重試迴圈裡，
+      照原節奏再叫一次即可。
+    ⚠ TryAct 定位失敗（改版）→ 自動退回 `click()`，功能不會整條斷掉。
+    """
+    from app.game import scenery, supply
+    if not (mover and mover.active):
+        return False, "跳板沒裝好"
+    if not supply.TRY_ACT_FN:
+        return click(mover, scanner, prop)          # 安全退化：走舊的 0x05
+    # ★ 送出前當場重驗（同 click()）：物件會被回收、那一格會被別的東西佔走。
+    if not scenery.still_there(scanner, prop):
+        return False, "那個東西已經不在了（換地圖／走出視野？）"
+    if not supply.click_object(mover, scanner, prop.addr):
+        return False, "點選排不進去（指令槽忙碌／讀不到 eid）"
+    return True, f"已點 ({prop.x:.0f},{prop.y:.0f})"
+
+
 # ---------------------------------------------------------------------------
 # 開一整批製作：選配方 → 設數量 → makeadd → makestart，讓**客戶端自己續做整批**
 # ---------------------------------------------------------------------------

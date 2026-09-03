@@ -1517,7 +1517,14 @@ class DungeonTab(BaseTab):
             # ★ 基準要在**點下去之前**讀：點完對話可能立刻就開了，
             #   那時再讀就跟第一頁一樣，永遠判不出「有沒有點到」。
             pg0 = talkwnd.page(self._sc)
-            ok, msg = produce.click(self._mover, self._sc, hit[0])
+            # ★★ 2026-09-03 起改用**官方點法**（`TryAct`，跟滑鼠點一模一樣）：
+            #   它自己判距離＋視線，不夠近會用**官方尋路**幫我們走最後一段
+            #   —— 舊的 `produce.click` 是盲送 0x05，太遠伺服器直接不理，
+            #   只能靠下面那個「點了沒反應 → 自己靠近再點」硬撐。
+            #   ⚠ 場景物件（雕像／機器人）跟 NPC **在同一張物件表**，+0xBC 都
+            #     查得到 —— 實測見 `produce.click_official`。定位失敗會自動退回
+            #     舊的 0x05，功能不會斷。
+            ok, msg = produce.click_official(self._mover, self._sc, hit[0])
             if not ok:
                 self._say(f"點不下去（{msg}），重試中…")
                 return
@@ -1586,7 +1593,7 @@ class DungeonTab(BaseTab):
                 self._nudge += 1
                 how = (self._walk_onto(tx, ty) if keep <= 0
                        else self._walk_beside(tx, ty, keep))
-                ok, msg = produce.click(self._mover, self._sc, hit[0])
+                ok, msg = produce.click_official(self._mover, self._sc, hit[0])
                 self._say(f"{tag}　點了沒反應 → 靠近一點"
                           f"（留 {keep:g} 格，{how}）再點"
                           f"（{'送出' if ok else msg}）")
