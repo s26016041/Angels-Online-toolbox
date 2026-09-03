@@ -76,6 +76,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 
 from PySide6.QtCore import QTimer
@@ -98,8 +99,8 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
-                      move, navigate, portal, produce, quickbar, scene,
-                      scenery, sell, skills, supply, talkwnd, terrain)
+                      move, navigate, portal, produce, quickbar, robot, scene,
+                      scenery, sell, skills, supply, talkwnd, team, terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
                                KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
@@ -187,6 +188,18 @@ NUDGE_KEEP = (1.2, 0.6, 0.0)
 # 收工前要「連續這麼久都掃不到怪」才算真的沒怪了。
 # ⚠ 實體是跟著玩家串流進來的，一拍掃不到不代表沒有。
 CLEAR_SETTLE = 3.0
+# ★★★ 全自動循環（使用者 2026-09-03 定案）：
+#   組隊 → 刷（飛／撞入口／跑腳本）→ 腳本跑完且周圍沒怪 → **回程補給**（跟掛機
+#   同一套 supply.run_full_supply）→ 趴趴GO 回離入口最近的傳送點 → 退組再組隊 → 循環。
+#   「從第幾步開始」有選 → **只跑單輪**（不組隊、不補給、跑完就停）。
+#   自動組隊兩種：綁定分身（刷副本這隻當隊長、均分、分身自動同意；分身只要在隊伍
+#   裡就好，人在哪不管）／遊戲自動組隊（遊戲裡自己設定，我們只做「退組 → 等隊伍
+#   名單出現人」）。
+PARTY_MODES = (("none", "不組隊"), ("bind", "綁定分身"), ("auto", "遊戲自動組隊"))
+LEAVE_GAP = 1.0            # 退組沒清空就每隔這麼久再送一次
+INVITE_GAP = 2.0           # 邀請沒進隊就每隔這麼久再邀一次
+JOIN_GAP = 0.5             # 分身每隔這麼久按一次「同意」
+TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 # 打不到（走不過去）這麼久就放棄這一隻，換下一隻。
 GIVE_UP = 15.0
 # ★★ 順移判定（傳點那一步的完成訊號，使用者 2026-09-02 定案）：
@@ -263,6 +276,7 @@ class DungeonTab(BaseTab):
     def build_ui(self) -> None:
         self._scanners: dict[int, MemoryScanner] = {}
         self._hwnds: dict[int, int] = {}
+        self._titles: dict[int, str] = {}   # pid → 視窗標題（看分流用）
         self._mover = None
         self._pid = None
         self._sc = None
@@ -366,6 +380,26 @@ class DungeonTab(BaseTab):
         rbar.addWidget(self.prog)
         root.addLayout(rbar)
 
+        pbar = QHBoxLayout()
+        pbar.addWidget(QLabel("自動組隊"))
+        self.party_box = QComboBox()
+        for data, label in PARTY_MODES:
+            self.party_box.addItem(label, data)
+        self.party_box.setToolTip(
+            "綁定分身：開跑先把你跟綁定的分身都退組，再由你邀請它（均分）；\n"
+            "遊戲自動組隊：先退組，等遊戲自己配到隊伍才開跑（要先在遊戲裡打開）。\n"
+            "每一趟刷完 → 回程補給 → 趴趴GO回入口 → 退組再組隊 → 循環。")
+        self.party_box.currentIndexChanged.connect(self._on_party_changed)
+        pbar.addWidget(self.party_box)
+        pbar.addWidget(QLabel("綁定分身"))
+        self.partner_box = QComboBox()
+        self.partner_box.setFixedWidth(240)
+        self.partner_box.setToolTip("「綁定分身」模式要組的那一台（要跟你在同一個分流）。")
+        self.partner_box.currentIndexChanged.connect(self._save_settings)
+        pbar.addWidget(self.partner_box)
+        pbar.addStretch(1)
+        root.addLayout(pbar)
+
         self.steps = QListWidget()
         self.steps.setSelectionMode(QListWidget.NoSelection)
         root.addWidget(self.steps, 1)
@@ -414,6 +448,7 @@ class DungeonTab(BaseTab):
             acc = charname.account_from_title(w.title)
             self._scanners[w.pid] = sc
             self._hwnds[w.pid] = w.hwnd
+            self._titles[w.pid] = w.title
             self.who.addItem(
                 f"{preload.name_of(w.pid, sc, acc, force=force_names)}"
                 f"（{acc}）", w.pid)
@@ -429,6 +464,7 @@ class DungeonTab(BaseTab):
         self.who.blockSignals(False)
         if not self._scanners:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")
+        self._refresh_partner_box()
         self._load_settings()
 
     # ------------------------------------------------------------------
@@ -453,6 +489,10 @@ class DungeonTab(BaseTab):
         config.set(self._key("script"), self.files.currentText())
         config.set(self._key("vks"), self._picked_keys())
         config.set(self._key("start"), int(self.start_box.currentIndex()))
+        config.set(self._key("party"), self.party_box.currentData() or "none")
+        config.set(self._key("partner"),
+                   self.partner_box.currentText().split("（")[-1].rstrip("）")
+                   if self.partner_box.currentIndex() >= 0 else "")
         config.set("dungeon.last_account", self._account())
         config.save()
 
@@ -466,6 +506,16 @@ class DungeonTab(BaseTab):
             if i >= 0:
                 self.files.setCurrentIndex(i)
             self._refresh_start_box()
+            mode = str(config.get(self._key("party"), "none") or "none")
+            j = self.party_box.findData(mode)
+            self.party_box.setCurrentIndex(j if j >= 0 else 0)
+            self._refresh_partner_box()
+            want = str(config.get(self._key("partner"), "") or "")
+            if want:
+                for k in range(self.partner_box.count()):
+                    if f"（{want}）" in self.partner_box.itemText(k):
+                        self.partner_box.setCurrentIndex(k)
+                        break
             vks = config.get(self._key("vks"), None)
             if isinstance(vks, list) and vks:
                 for cb, vk, _lab in self._key_cbs:
@@ -510,6 +560,26 @@ class DungeonTab(BaseTab):
         # 換分身＝換一個人的設定（腳本／技能鍵／起始步驟各記各的）
         self._stop("換了分身")
         self._load_settings()
+
+    def _on_party_changed(self) -> None:
+        self.partner_box.setEnabled(self.party_box.currentData() == "bind")
+        self._save_settings()
+
+    def _refresh_partner_box(self) -> None:
+        """綁定分身的候選＝其他開著的分身（排掉自己）。"""
+        keep = self.partner_box.currentText()
+        me = self.who.currentData()
+        self.partner_box.blockSignals(True)
+        self.partner_box.clear()
+        for i in range(self.who.count()):
+            pid = self.who.itemData(i)
+            if pid != me:
+                self.partner_box.addItem(self.who.itemText(i), pid)
+        k = self.partner_box.findText(keep)
+        if k >= 0:
+            self.partner_box.setCurrentIndex(k)
+        self.partner_box.blockSignals(False)
+        self.partner_box.setEnabled(self.party_box.currentData() == "bind")
 
     def _reload_files(self) -> None:
         keep = self.files.currentText()
@@ -622,6 +692,23 @@ class DungeonTab(BaseTab):
         self._pos_t = 0.0
         self._jumped = False         # 這一拍有沒有順移
         self._grid_t = 0.0           # 還有多久重讀地形圖
+        # ---- 全自動循環（見 PARTY_MODES 的說明）----
+        self._loop = False           # 要不要循環（「從第幾步」有選＝單輪不循環）
+        self._cycle = "go"           # go（飛／撞入口／跑）／supply／back／team
+        self._party = "none"         # 組隊模式
+        self._team_sub = ""          # leave／invite／wait
+        self._team_t = 0.0           # 下一次送退組／邀請的倒數
+        self._join_t = 0.0           # 分身下一次按同意的倒數
+        self._team_note_t = 0.0
+        self._ppid = None            # 綁定分身 pid
+        self._psc = None
+        self._pmover = None
+        self._partner_name = ""
+        self._rounds = 0             # 循環跑了幾趟
+        self._supply_thread = None
+        self._supply_result = None
+        self._supply_progress = ""
+        self._supply_gen = 0
         self._unreach_t = 0.0        # 「沒有路」連續多久了（等門開）
         self._blocked_last = False   # 上一拍是不是卡在「沒有路」
         self._notice = ""            # 要停留幾秒的提示
@@ -709,6 +796,32 @@ class DungeonTab(BaseTab):
         self._phase = phase
         self._fly = fly
         self._map_key = here
+        # ★★★ 全自動循環（使用者 2026-09-03）：「從第幾步」有選 → 只跑單輪。
+        self._loop = self._i == 0
+        self._party = (self.party_box.currentData() or "none") if self._loop else "none"
+        if self._party == "bind":
+            ppid = self.partner_box.currentData()
+            psc = self._scanners.get(ppid) if ppid is not None else None
+            if psc is None or ppid == int(pid):
+                self._stop("⛔ 綁定分身：先在「綁定分身」選另一台開著的分身")
+                return
+            mine = charname.channel_from_title(self._titles.get(int(pid), ""))
+            his = charname.channel_from_title(self._titles.get(ppid, ""))
+            if mine and his and mine != his:
+                # 跨分流組不了隊（實測：邀請送得出去、對方永遠收不到）
+                self._stop(f"⛔ 綁定分身在「{his}」、你在「{mine}」—— 跨分流組不了隊，"
+                           "先把它換到同一個分流")
+                return
+            try:
+                self._pmover = move.acquire(ppid, injector.process_path(ppid), self)
+            except Exception as exc:                     # noqa: BLE001
+                self._stop(f"⚠ 綁定分身裝不了跳板：{exc}")
+                return
+            self._ppid, self._psc = ppid, psc
+            self._partner_name = self.partner_box.currentText().split("（")[0].strip()
+        if self._party != "none":
+            self._cycle = "team"
+            self._team_begin()
         self._refresh_steps()
         self._atk = TargetWorker(sc)
         self._atk.died.connect(self._on_died)
@@ -750,6 +863,13 @@ class DungeonTab(BaseTab):
                 supply.leave_npc(self._mover, self._sc)
             except Exception:                            # noqa: BLE001
                 pass
+        if self._pmover is not None and self._ppid is not None:
+            try:
+                move.release(self._ppid, self)
+            except Exception:                            # noqa: BLE001
+                pass
+            self._pmover = None
+        self._supply_gen += 1            # 背景補給還在跑的話，結果不要再收
         if self._mover is not None and self._pid is not None:
             # ★ release() 不是 stop()：跳板是同一個 PID 共用的。
             try:
@@ -914,6 +1034,11 @@ class DungeonTab(BaseTab):
         me = self._my_pos()
         if me is None:
             self._say("讀不到自己的位置，這一拍不動")
+            return
+
+        # ⓪-0 全自動循環的外圈（補給／飛回入口／組隊）—— 這幾段自己會換圖，
+        #   不能給下面的「地圖變了就停」抓到。
+        if self._cycle_tick(dt):
             return
 
         # ⓪ 人被搬走了嗎？順移要**每一拍**都採樣，不然錯過那一下就看不到了。
@@ -1801,7 +1926,178 @@ class DungeonTab(BaseTab):
                   f"{self._empty_since:.1f}/{CLEAR_SETTLE:.0f} 秒")
         if self._empty_since >= CLEAR_SETTLE:
             self._done = True
-            self._stop("✔ 這一趟結束：腳本跑完，周圍也沒有怪了")
+            if not self._loop:
+                self._stop("✔ 這一趟結束：腳本跑完，周圍也沒有怪了")
+                return
+            self._rounds += 1
+            self._start_supply_trip()
+
+    # -- 全自動循環：補給 → 飛回入口 → 組隊 --------------------------------
+    def _cycle_tick(self, dt: float) -> bool:
+        """外圈這一拍有事做就回 True（呼叫端整拍不跑內圈）。"""
+        if self._cycle == "supply":
+            self._supply_tick(dt)
+            return True
+        if self._cycle == "team":
+            self._team_tick(dt)
+            return True
+        if self._cycle == "back":
+            self._back_tick(dt)
+            return True
+        return False
+
+    def _start_supply_trip(self) -> None:
+        """這一趟刷完 → 跑一次**跟掛機同一套**的回程補給（存倉→修裝→買水），
+        回程改跳到**離入口最近的傳送點**（back_to＝入口座標＋入口那張圖）。
+        整趟是背景執行緒（阻塞式、幾十秒到幾分鐘），`_supply_tick` 每拍輪詢。"""
+        ent = self._script.entrance or {}
+        ex, ey = (ent.get("to") or [None, None])[:2]
+        back = ((ex, ey, ent.get("scene"))
+                if ent.get("scene") is not None and ex is not None else None)
+        if self._keys is not None:
+            self._keys.set_on(False)
+            self._keys.eid = None
+        if self._atk is not None and hasattr(self._atk, "hold_off"):
+            self._atk.hold_off()
+        self._drop_target()
+        try:
+            plan = robot.potion_buy_ids(self._mover, self._sc, self._pid)
+        except Exception:                                # noqa: BLE001
+            plan = None
+        self._supply_gen += 1
+        gen, mv, sc = self._supply_gen, self._mover, self._sc
+        self._supply_result = None
+        self._supply_progress = "出發"
+        self._i = 0                       # 下一趟從頭跑
+        self._done = False
+        self._empty_since = 0.0
+
+        def _worker():
+            try:
+                res = supply.run_full_supply(
+                    mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
+                    back_to=back, potions=plan)
+            except Exception as exc:                      # noqa: BLE001
+                res = (False, f"補給出錯：{exc}")
+            if gen == self._supply_gen:
+                self._supply_result = res
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._supply_thread = t
+        t.start()
+        self._cycle = "supply"
+        self._say(f"✔ 第 {self._rounds} 趟結束 → 回程補給…")
+
+    def _supply_tick(self, dt: float) -> None:
+        res = self._supply_result
+        if res is None:
+            self._say(f"第 {self._rounds} 趟結束 → 補給中：{self._supply_progress}")
+            return
+        ok, why = res
+        self._notify(("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
+        self._supply_result = None
+        if not self._plan_route():
+            return
+        self._cycle = "back"
+
+    def _plan_route(self) -> bool:
+        """照現在人在哪決定下一段（跟開跑時同一套）：別張圖 → 飛；入口那張圖 →
+        撞入口；副本裡 → 直接跑。回 False＝已經 _stop 了。"""
+        here = scene.map_key(scene.current_id(self._sc))
+        ent = self._script.entrance or {}
+        self._map_key = here
+        self._fly = None
+        self._drop_target()
+        self._nav.reset()
+        if here is not None and self._script.scene is not None and here != self._script.scene:
+            if not ent:
+                self._stop("⛔ 這份腳本沒記入口傳送點，回不去副本")
+                return False
+            if here != ent.get("scene"):
+                ex, ey = (ent.get("to") or [None, None])[:2]
+                self._fly = jumpmap.nearest(ent["scene"], ex, ey)
+                if self._fly is None:
+                    self._stop(f"⛔ 趴趴GO沒有到「{scene.scene_name(ent.get('scene'))}」的傳送點")
+                    return False
+                self._phase = "fly"
+                self._fly_t, self._fly_total = 0.0, 0.0
+            else:
+                self._phase = "enter"
+                self._enter_t = 0.0
+                self._poke_t = 0.0
+        else:
+            self._phase = "run"
+            self._grid_t = 0.0
+        return True
+
+    def _back_tick(self, dt: float) -> None:
+        """補給完 → 用趴趴GO飛回入口那張圖（落地才輪到組隊）。"""
+        if self._phase == "fly":
+            if self._check_map_change():
+                if self._phase != "fly":           # 落地了（入口那張圖或副本裡）
+                    self._team_begin()
+                return
+            self._go_fly(dt)
+            return
+        self._team_begin()
+
+    def _team_begin(self) -> None:
+        """進入組隊段：先退組（兩隻都退），再邀請／等遊戲配隊。"""
+        if self._party == "none":
+            self._cycle = "go"
+            return
+        self._cycle = "team"
+        self._team_sub = "leave"
+        self._team_t = 0.0
+        self._join_t = 0.0
+        self._team_note_t = 0.0
+
+    def _team_tick(self, dt: float) -> None:
+        mine = team.members(self._sc)
+        self._team_t -= dt
+        self._join_t -= dt
+        if self._team_sub == "leave":
+            his = team.members(self._psc) if self._psc is not None else []
+            if mine is None or his is None:
+                self._say("組隊：讀不到隊伍狀態，等下一拍…")
+                return
+            if not mine and not his:
+                self._team_sub = "invite" if self._party == "bind" else "wait"
+                self._team_t = 0.0
+                return
+            if self._team_t <= 0:
+                self._team_t = LEAVE_GAP
+                if mine:
+                    team.leave(self._mover)
+                if his and self._pmover is not None:
+                    team.leave(self._pmover)
+            self._say("組隊：先退組…（等隊伍名單清空）")
+            return
+        if self._team_sub == "wait":
+            # 遊戲自動組隊（遊戲裡設定）：只等隊伍名單出現人
+            if mine:
+                self._notify(f"組到隊了（{len(mine)} 人）→ 開跑")
+                self._cycle = "go"
+                return
+            self._say("退組了，等遊戲自動組隊…（隊伍名單有人就開跑）")
+            return
+        if self._team_sub == "invite":
+            names = {m.name for m in (mine or [])}
+            if self._partner_name in names:
+                self._notify(f"已跟「{self._partner_name}」組隊（均分）→ 開跑")
+                self._cycle = "go"
+                return
+            if self._team_t <= 0:
+                self._team_t = INVITE_GAP
+                ok, why = team.invite(self._mover, self._partner_name, team.SHARE_EVEN)
+                if not ok:
+                    self._say(f"組隊：邀請送不出去（{why}），重試中…")
+                    return
+            if self._join_t <= 0 and self._pmover is not None:
+                self._join_t = JOIN_GAP
+                team.join(self._pmover, self._psc)
+            self._say(f"組隊：邀請「{self._partner_name}」入隊中（均分）…")
+            return
 
     # ------------------------------------------------------------------
     def _refresh_steps(self) -> None:

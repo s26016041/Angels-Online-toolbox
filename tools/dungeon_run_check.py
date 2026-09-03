@@ -301,6 +301,9 @@ def run(tab, secs: float) -> None:
     for _ in range(int(secs / TICK)):
         if not tab.run_cb.isChecked():
             return
+        # 外圈（補給／飛回入口／組隊）有事就先跑外圈（跟真的 _tick 一樣）
+        if tab._cycle_tick(TICK):
+            continue
         if tab._i >= len(tab._script.steps):
             tab._finish(TICK)
             continue
@@ -1247,6 +1250,113 @@ def main() -> int:
        str(mk._script.entrance["menu"]))
     mk.on_close()
 
+    # =====================================================================
+    # ★★★ 全自動循環（使用者 2026-09-03）：刷完 → 補給 → 飛回入口 → 退組再組隊 → 循環
+    # =====================================================================
+    print("\n全自動循環：刷完 → 補給 → 飛回入口 → 組隊")
+
+    class FakeEntry:
+        name, jump_id = "入口旁", 7
+
+    class FakeSc:
+        _is_partner = True
+
+    def loop_tab(party="bind", start=0):
+        tab = make_tab([{"do": "walk", "to": [10, 10]}], pos=(10.5, 10.0))
+        tab._script.scene = 98
+        tab._script.entrance = {"scene": 90, "to": [294.2, 14.7],
+                                "model": 60001, "menu": [1]}
+        tab._loop = start == 0
+        tab._party = party if tab._loop else "none"
+        tab._i = start
+        tab._pid = 1
+        tab._ppid, tab._psc, tab._pmover = 2, FakeSc(), object()
+        tab._partner_name = "小黑"
+        tab._targets = lambda: []
+        tab._drop_target = lambda: None
+        return tab
+
+    world = {"here": 98, "mine": [], "his": [], "left": [], "invited": [],
+             "joined": 0, "flown": []}
+
+    class M:
+        def __init__(self, n):
+            self.name = n
+    dt.team.members = lambda sc: list(world["his"] if sc is not None and
+                                      getattr(sc, "_is_partner", False)
+                                      else world["mine"])
+    dt.team.leave = lambda mv: (world["left"].append(id(mv)), True)[1]
+    dt.team.invite = lambda mv, name, share: (world["invited"].append((name, share)),
+                                              (True, ""))[1]
+    dt.team.join = lambda mv, sc: (world.__setitem__("joined", world["joined"] + 1),
+                                   (True, ""))[1]
+    dt.scene.current_id = lambda sc, **k: world["here"]
+    dt.jumpmap.nearest = lambda scene_id, x, y: FakeEntry()
+    dt.jumpmap.teleport = lambda mv, sc, jid: (world["flown"].append(jid),
+                                               (True, "送出"))[1]
+
+    # ① 單輪（從第幾步有選）：跑完就停，不補給
+    tab = loop_tab("bind", start=0)
+    tab._loop = False
+    tab._pos = [10.5, 10.0]
+    run(tab, 0.3)                       # 第 1 步走到了 → _i=1 → _finish
+    run(tab, dt.CLEAR_SETTLE + 0.5)
+    ck("單輪：跑完就停（不進補給）", not tab.run_cb.isChecked()
+       and tab._cycle == "go", f"{tab._cycle} {tab.status.text()}")
+
+    # ② 循環：跑完 → 進「補給」段（不停機），補給完 → 飛回入口 → 組隊 → 開跑
+    tab = loop_tab("bind")
+    started = []
+    tab._start_supply_trip = lambda: (started.append(1),
+                                      setattr(tab, "_i", 0),   # 真的那支會歸零
+                                      setattr(tab, "_cycle", "supply"))[1]
+    tab._pos = [10.5, 10.0]
+    run(tab, 0.3)
+    run(tab, dt.CLEAR_SETTLE + 0.5)
+    ck("★ 循環：跑完不停機，改去補給", tab.run_cb.isChecked() and started
+       and tab._cycle == "supply", f"{tab._cycle} {tab.status.text()}")
+    # 補給回來了：人在城裡（別張圖）→ 要飛
+    world["here"] = 26
+    tab._supply_result = (True, "都夠了")
+    run(tab, 0.3)
+    ck("★ 補給完 → 人在別張圖 → 趴趴GO飛回入口那張圖", tab._cycle == "back"
+       and tab._phase == "fly" and world["flown"], f"{tab._cycle}/{tab._phase}")
+    # 落地入口那張圖 → 組隊段：先退組（兩隻都要清空）
+    world["here"] = 90
+    world["mine"], world["his"] = [M("小黑")], [M("黑狐")]
+    run(tab, 0.3)
+    ck("★ 落地 → 進組隊段，先退組（兩隻都送）", tab._cycle == "team"
+       and tab._team_sub == "leave" and len(world["left"]) >= 2,
+       f"{tab._cycle}/{tab._team_sub} left={len(world['left'])}")
+    world["mine"], world["his"] = [], []
+    run(tab, 0.3)
+    ck("　名單清空 → 換成邀請", tab._team_sub == "invite", tab._team_sub)
+    run(tab, 0.5)
+    ck("★ 刷副本這隻當隊長邀請綁定分身、**均分**、分身按同意",
+       world["invited"] and world["invited"][0] == ("小黑", dt.team.SHARE_EVEN)
+       and world["joined"] >= 1, f"{world['invited']} joined={world['joined']}")
+    world["mine"] = [M("小黑")]
+    run(tab, 0.6)
+    ck("★ 分身出現在名單 → 組隊完成 → 回到「去撞入口」", tab._cycle == "go"
+       and tab._phase == "enter", f"{tab._cycle}/{tab._phase}")
+
+    # ③ 遊戲自動組隊：退組 → 等名單有人 → 開跑
+    tab = loop_tab("auto")
+    tab._ppid = tab._psc = tab._pmover = None
+    world.update(mine=[M("路人")], his=[], left=[], invited=[], joined=0, here=90)
+    tab._phase = "enter"
+    tab._team_begin()
+    run(tab, 0.3)
+    ck("自動組隊：先退組", tab._team_sub == "leave" and world["left"], tab._team_sub)
+    world["mine"] = []
+    run(tab, 0.3)
+    ck("　清空後改成等遊戲配隊（不邀請任何人）", tab._team_sub == "wait"
+       and not world["invited"], f"{tab._team_sub} {world['invited']}")
+    run(tab, 1.0)
+    ck("　沒隊伍就一直等（不停機）", tab.run_cb.isChecked() and tab._cycle == "team")
+    world["mine"] = [M("路人甲"), M("路人乙")]
+    run(tab, 0.3)
+    ck("★ 名單出現人 → 開跑", tab._cycle == "go", tab._cycle)
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
