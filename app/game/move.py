@@ -357,6 +357,24 @@ class Mover:
         return self._active
 
     @property
+    def installed(self) -> bool:
+        """遊戲的 IAT 現在**還指著我這一份**跳板嗎。
+
+        ⚠⚠ 2026-09-03 使用者實機事故：`active` 只代表「我裝過而且區塊還讀得到」，
+          **不代表 IAT 還指著我**。別人（另一個行程的工具、上一輪沒收乾淨的
+          孤兒清除、手動還原）只要把 IAT 換掉，我們送的每一個呼叫就會寫進一塊
+          **沒有人在跑**的區塊 —— 旗標舉著沒人收，`call_sync` 全部逾時，
+          畫面上看起來就是「點不到物件／走不動／打不到」，而且**不會有任何錯誤**。
+          當天就是這樣：黑狐的 IAT 指回真正的 PeekMessageA，副本整趟等於在空轉。
+        """
+        if not (self._active and self._pm and self._iat and self._block):
+            return False
+        try:
+            return self._pm.read_uint(self._iat) == self._block + _CODE
+        except Exception:                      # noqa: BLE001
+            return False
+
+    @property
     def gone(self) -> bool:
         """跳板讀不到了 —— 遊戲行程已經不在（跟「還沒裝」要分得開）。"""
         return self._gone
@@ -545,6 +563,11 @@ class Mover:
           機率很低，但一秒二十幾次、五個分身、掛好幾個小時 ——
           正好就是「偶爾、掛久了才當、完全重現不出來」的樣子。
         """
+        # ★★ 先確認 IAT 還指著我們這一份（見 `installed`）——不然旗標舉了
+        #   沒有人會來收，呼叫端只會看到「逾時」而完全不知道跳板已經被換掉。
+        if not self.installed:
+            self._sink()
+            return False
         if not self._active:
             return False
         if not fn:
@@ -902,8 +925,11 @@ class Mover:
                 from app.core import injector
 
                 self._pm.write_uint(self._block + _FLAG, 0)
-                injector.SendCapture._protect(self._pm, self._iat, 8, 0x40)
-                self._pm.write_uint(self._iat, self._orig)
+                # ⚠ IAT 已經不是我們的了（別人換掉／已經還原過）就別動它 ——
+                #   硬寫回自己的 `_orig` 會把**別人的** hook 拆掉。
+                if self._pm.read_uint(self._iat) == self._block + _CODE:
+                    injector.SendCapture._protect(self._pm, self._iat, 8, 0x40)
+                    self._pm.write_uint(self._iat, self._orig)
             except Exception:               # noqa: BLE001
                 pass
             self._active = False
@@ -942,9 +968,15 @@ def acquire(pid: int, exe_path: str, owner) -> "Mover":
     """
     with _shared_lock:
         mv = _shared.get(pid)
-        if mv is not None and mv.active:
+        if mv is not None and mv.active and mv.installed:
             _owners.setdefault(pid, set()).add(owner)
             return mv
+        if mv is not None and not mv.installed:
+            # ★ 快取裡那份的 IAT 已經被別人換掉了 → 它是死的，重裝一份。
+            #   ⛔ 不叫 mv.stop()：現在 IAT 指的是別人的東西，寫回我們的
+            #     `_orig` 會把別人的 hook 也拆掉（start() 的孤兒清除會處理）。
+            _shared.pop(pid, None)
+            _owners.pop(pid, None)
         # 沒有、或上一份已經被 stop 掉了 → 裝一份新的
         mv = Mover(pid, exe_path)
     # ⚠ start() 會讀寫遊戲記憶體、還會 import keystone（第一次要幾百毫秒），
