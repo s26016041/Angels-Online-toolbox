@@ -104,7 +104,7 @@ from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
                                KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
-                               TargetWorker)
+                               STUCK_EPS, TargetWorker)
 
 TICK_MS = 100
 # 掃描節奏。★ 使用者 2026-09-02：「趕路掃描改成可接受最快，這個很糟糕，
@@ -200,19 +200,39 @@ LEAVE_GAP = 1.0            # 退組沒清空就每隔這麼久再送一次
 INVITE_GAP = 2.0           # 邀請沒進隊就每隔這麼久再邀一次
 JOIN_GAP = 0.5             # 分身每隔這麼久按一次「同意」
 TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
-# 打不到（走不過去）這麼久就放棄這一隻，換下一隻。
+# ★★ **沒進展**這麼久就放棄這一隻，換下一隻。
+#   ⚠⚠ 2026-09-04 使用者：「自動刷副本會漏怪物，而且很嚴重，很明顯有怪卻會
+#     先去走點位」—— 根因之一就在這裡：這個計時器原本從挑到目標那一刻起
+#     **無條件**累加，怪血厚一點（副本 70~80 級）15 秒打不死就被「放棄」、
+#     進 GIVEUP_COOL 冷卻，冷卻中沒別隻可打就去跑腳本 —— 人被怪追著打、
+#     腳本卻在走點位。掛機頁（farm_tab STUCK_ENGAGED）早就是「沒進展才算」，
+#     這裡照它：**目標掉血**或**自己有移動（離錨點 > STUCK_EPS）**都歸零，
+#     只有「站著不動、血也一滴不掉」才累加（＝被地形擋線／走不過去）。
 GIVE_UP = 15.0
 # ★★ 剛放棄的怪**冷卻**（使用者 2026-09-03 實機：「一下掃到怪物一下走路，兩個一直
 #   輪迴」＝在轉角追一隻追不到的怪 → 放棄 → 走腳本 → 掃到它又追 → …）。
 #   ⛔ 不是黑名單（使用者 9/2 明令）：只是**放棄之後這麼多秒內不再挑它**，時間到
 #   照樣再問一次走不走得到（門可能開了）。冷卻中如果沒有別隻可打 → 先跑腳本。
 GIVEUP_COOL = 20.0
-# ★★★ 追怪的路徑上限（使用者 2026-09-03 定：超過就當沒看到；先說 30，
-#   我建議 25 —— 怪掉出掃描是離開了遊戲的串流範圍，30 太貼那個邊 —— 他改 25）。
+# ★★★ 追怪的直線距離上限（使用者 2026-09-03 先說 30、我建議 25；
+#   **2026-09-04 使用者改回 30**：「刷新格數改 30 格以上才不理」）。
 #   病灶：往怪物走 → 走到一半怪掉出遊戲的串流範圍（掃不到）→ 改去點位 →
-#   一靠近又掃到 → 再追 …… 無限輪迴。所以**直線距離**或 **A* 路徑**超過這個
-#   數就當沒看到（不追、也不算在「殺光了沒」裡）；隔 GIVEUP_COOL 秒再問一次。
-MAX_CHASE = 25.0
+#   一靠近又掃到 → 再追 …… 無限輪迴。所以超過這個數就當沒看到
+#   （不追、也不算在「殺光了沒」裡）。
+#   ⚠ 9/4 實機純讀：開闊地圖上掃得到 37 格外的怪，串流範圍比 30 寬，30 安全。
+MAX_CHASE = 30.0
+# ★ A* 路徑的上限 ＝ MAX_CHASE × 這個倍數。⚠ 不能直接拿 MAX_CHASE 當路徑上限：
+#   A* 走的是八方向格子距離，**天生比直線長最多 8%**（octile），9/4 實機五台
+#   純讀全部如此（直線 31.5 → 路徑 34.2、18.4 → 19.0）；原本兩個門檻同一個數，
+#   直線 23~25 格的怪路徑一算就超過 → 「路徑超過 25 格 → 當沒看到」白丟。
+#   再留一點繞路餘裕（隔一根柱子那種）。真正的大繞路（直線 10 繞 40）照樣擋。
+PATH_SLACK = 1.25
+# ★★ 「路太遠」不是黑名單：判定當下記住**雙方站哪**，只要**任一方移動超過
+#   這麼多格**就重新問一次（我們沿腳本走近了、或牠追過來了都算）；兩邊都
+#   沒動才吃 GIVEUP_COOL 的冷卻（防在邊界上一秒追一秒放的抖動）。
+#   ⚠⚠ 9/4 之前是純時間冷卻：怪在 26 格被記成「太遠」→ 腳本往牠那邊走 →
+#     走到牠面前 5 格還在冷卻 → 照樣不理牠 ＝「明顯有怪卻先去走點位」。
+RECHECK_MOVE = 3.0
 # ★★ 順移判定（傳點那一步的完成訊號，使用者 2026-09-02 定案）：
 #   「人被傳走不會換地圖，有順移就算吧，有時候傳點之間也很短」
 #   —— 所以不能用「離傳點多遠」判，要用**一拍之間跳了多少**：
@@ -744,8 +764,11 @@ class DungeonTab(BaseTab):
         self._grid = None            # 上次讀到的地形圖（判斷怪站的是不是可走格）
         self._last_gave_up = None    # 剛放棄的那一隻（有別隻時先挑別隻）
         self._gave_up = {}           # eid → 放棄的時間（冷卻用，見 GIVEUP_COOL）
-        self._toofar = {}            # eid → 判定「路太遠」的時間（見 MAX_CHASE）
+        self._toofar = {}            # eid → (判定時間, 我站哪, 牠站哪)（見 RECHECK_MOVE）
         self._me = None              # 這一拍我的位置（_targets 用）
+        self._left_out = (0, 0, 0)       # 上一輪 _targets 不打的怪：(太遠, 路太遠冷卻, 走不到)
+        self._anchor = None          # 打怪進度用：上次「有移動」時站的位置
+        self._last_hp = -1           # 打怪進度用：上次看到的目標血量
         self._nokill_t = 0.0         # 一直在打卻沒殺掉半隻多久了
 
     def _on_run_toggled(self, on: bool) -> None:
@@ -1023,22 +1046,50 @@ class DungeonTab(BaseTab):
         它在名單過期前一直被忽略。
         """
         now = time.monotonic()
-        for eid, t0 in list(self._toofar.items()):
-            if now - t0 > GIVEUP_COOL:
-                del self._toofar[eid]           # 時間到再問一次
         me = self._me
-        return [m for m in self._live_monsters()
-                if m.eid not in self._toofar
-                and (me is None or _d((m.x, m.y), me) <= MAX_CHASE)
-                and self._can_reach((m.x, m.y))]
+        out: list = []
+        far = cool = unreach = 0
+        for m in self._live_monsters():
+            pos = (m.x, m.y)
+            if me is not None and _d(pos, me) > MAX_CHASE:
+                far += 1
+                continue
+            mark = self._toofar.get(m.eid)
+            if mark is not None:
+                t0, me0, pos0 = mark
+                if (now - t0 > GIVEUP_COOL
+                        or (me is not None and _d(me, me0) >= RECHECK_MOVE)
+                        or _d(pos, pos0) >= RECHECK_MOVE):
+                    del self._toofar[m.eid]     # 時間到／有人移動了 → 再問一次
+                else:
+                    cool += 1
+                    continue
+            if not self._can_reach(pos):
+                unreach += 1
+                continue
+            out.append(m)
+        self._left_out = (far, cool, unreach)
+        return out
+
+    def _left_out_note(self) -> str:
+        """上一輪 `_targets()` 不打的怪各是為什麼（給狀態列，一定要講得出來）。"""
+        far, cool, unreach = self._left_out
+        parts = []
+        if far:
+            parts.append(f"{far} 隻超過 {MAX_CHASE:.0f} 格")
+        if cool:
+            parts.append(f"{cool} 隻路太遠冷卻中")
+        if unreach:
+            parts.append(f"{unreach} 隻走不到（隔壁區／沒有路）")
+        return "、".join(parts)
 
     def _give_up(self, why: str) -> None:
         """這一隻先放著，換一隻打。⛔ 不記黑名單，只是**立刻重問一次地形**。"""
         if self._cur is not None:
             self._last_gave_up = self._cur.eid
             self._gave_up[self._cur.eid] = time.monotonic()
-            self._say(f"{why} → 先換一隻（「{self._cur.name}」"
-                      f"{GIVEUP_COOL:.0f} 秒後再問）")
+            self._notify(f"{why} → 先換一隻（「{self._cur.name}」"
+                         f"{GIVEUP_COOL:.0f} 秒後再問）")
         self._grid_t = 0.0            # 下一拍就重讀地形＋重算可達區
         self._drop_target()
 
@@ -1363,8 +1414,8 @@ class DungeonTab(BaseTab):
                     self._scan.force_full(self._pid)
                 skipped = len(self._live_monsters())
                 if skipped:
-                    self._say(f"周圍 {skipped} 隻怪**全部走不到**"
-                              f"（隔壁區／沒有路）→ 當作這裡清光了")
+                    self._say(f"周圍 {skipped} 隻怪都不打：{self._left_out_note()}"
+                              f" → 當作這裡清光了")
                 self._keys.set_on(False)
                 self._keys.eid = None
                 self._nokill_t = 0.0
@@ -1387,14 +1438,18 @@ class DungeonTab(BaseTab):
             # 剛放棄的那一隻先跳過 —— 但**只有在還有別隻的時候**。
             pool = [m for m in fresh if m.eid != self._last_gave_up] or fresh
             # 最近的一隻。⚠ 走不走得到已經在 _targets() 問過了；這裡再用 A* 量
-            #   **實際路徑**（直線 10 格、繞牆 40 格的那種）超過 MAX_CHASE 就當沒看到。
+            #   **實際路徑**（直線 10 格、繞牆 40 格的那種）超過 MAX_CHASE×PATH_SLACK 就先不追。
             pick = None
+            limit = MAX_CHASE * PATH_SLACK
             for m in sorted(pool, key=lambda m: _d((m.x, m.y), me)):
                 if self._grid is not None and _d((m.x, m.y), me) > 1.0:
-                    rt = self._grid.route(me, (m.x, m.y), max_cost=MAX_CHASE)
+                    rt = self._grid.route(me, (m.x, m.y), max_cost=limit)
                     if rt is None:
-                        self._toofar[m.eid] = now
-                        self._say(f"「{m.name}」路徑超過 {MAX_CHASE:.0f} 格 → 當沒看到")
+                        self._toofar[m.eid] = (now, me, (m.x, m.y))
+                        # ⚠ 用 _notify：用 _say 會被同一拍的走路訊息蓋掉，
+                        #   使用者永遠看不到「為什麼不打」。
+                        self._notify(f"「{m.name}」繞路超過 {limit:.0f} 格"
+                                     f"（直線 {_d((m.x, m.y), me):.0f}）→ 先不追")
                         continue
                 pick = m
                 break
@@ -1404,6 +1459,8 @@ class DungeonTab(BaseTab):
                 return False                       # 都太遠 → 跑腳本
             self._cur = pick
             self._cur_t = 0.0
+            self._anchor = None
+            self._last_hp = -1
             self._atk.attack(self._state, self._cur)
             self._keys.eid = self._cur.eid
             self._empty_since = 0.0
@@ -1451,9 +1508,22 @@ class DungeonTab(BaseTab):
             self._nav.reset()
             self._keys.set_on(True)
             note = "出手中"
-        self._cur_t += dt
+        # ★★ 「沒進展」才累加（照掛機頁 STUCK_ENGAGED 的算法，見 GIVE_UP）：
+        #   · 離錨點動了 > STUCK_EPS ＝ 真的在走（撞牆抖動只有 0.5 格，不算）
+        #   · 目標掉血 ＝ 打得到、正在打（血厚打 30 秒也不放棄）
+        #   兩樣都沒有 ＝ 站著發呆／被地形擋線，這才是要換怪的情況。
+        #   ⚠ hp 是 TargetWorker 讀回的「目標血量」（遊戲收到選定包才填）。
+        hp = self._atk.hp
+        if self._anchor is None or _d(me, self._anchor) > STUCK_EPS:
+            self._anchor = me
+            self._cur_t = 0.0
+        elif 0 < hp < self._last_hp:
+            self._cur_t = 0.0
+        else:
+            self._cur_t += dt
+        self._last_hp = hp
         if self._cur_t > GIVE_UP:
-            self._give_up(f"打不到超過 {GIVE_UP:.0f} 秒")
+            self._give_up(f"{GIVE_UP:.0f} 秒沒進展（沒掉血、也沒移動）")
             return True
         left = len(alive)
         self._say(f"打怪：{self._cur.name}　{d:.1f} 格　{note}"
@@ -1463,6 +1533,8 @@ class DungeonTab(BaseTab):
     def _drop_target(self) -> None:
         self._cur = None
         self._cur_t = 0.0
+        self._anchor = None
+        self._last_hp = -1
         if self._keys is not None:
             self._keys.set_on(False)
             self._keys.eid = None
@@ -2194,7 +2266,10 @@ class DungeonTab(BaseTab):
         live = len(self._live_monsters())
         if not live:
             return "（周圍 0 隻怪）"
-        return f"（周圍 {live} 隻怪，走得到 {len(self._targets())} 隻）"
+        n = len(self._targets())
+        why = self._left_out_note()
+        return (f"（周圍 {live} 隻怪，走得到 {n} 隻"
+                + (f"；{why}" if why and n < live else "") + "）")
 
     def _busy_walking(self) -> bool:
         """正在走路嗎（正在走就別再送，重下指令會把上一段打斷）。"""

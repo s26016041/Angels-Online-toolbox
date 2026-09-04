@@ -111,6 +111,7 @@ class FakeAtk:
         self.picked = None
         self.packets = False
         self.engaged = False
+        self.hp = 0                 # 目標血量（真的那支是 TargetWorker 讀回來的）
 
     def attack(self, _state, mon):
         self.picked = mon
@@ -778,6 +779,92 @@ def main() -> int:
     tab._live_monsters = lambda: [around]
     tab._cur = None
     ck("★ 只剩路太遠的 → 不追、跑腳本", not tab._fight((10.0, 10.0), TICK))
+    ck("　狀態列講得出「為什麼不打」（不是籠統的『走不到』）",
+       "繞路" in tab.status.text() or "冷卻" in tab.status.text(), tab.status.text())
+
+    # ★★★ 2026-09-04 使用者：「很明顯有怪卻會先去走點位」——「路太遠」原本是
+    #   純時間冷卻：怪 26 格被記太遠 → 腳本走到牠面前還在冷卻 → 照樣不理。
+    #   改成：任一方移動 ≥ RECHECK_MOVE 就重問；兩邊都沒動才吃 GIVEUP_COOL。
+    ck("　兩邊都沒動 → 冷卻中還是不算（防邊界抖動）",
+       [m.eid for m in tab._targets()] == [] and 92 in tab._toofar)
+    tab._me = (10.0 + dt.RECHECK_MOVE + 0.5, 10.0)           # 我沿腳本走近了
+    ck("★★ 我移動超過 RECHECK_MOVE 格 → 立刻重問（不等冷卻）",
+       [m.eid for m in tab._targets()] == [92] and 92 not in tab._toofar,
+       str(list(tab._toofar)))
+    tab._me = (10.0, 10.0)
+    tab._toofar[92] = (time.monotonic(), (10.0, 10.0), (13.0, 10.0))
+    around.x = 13.0 + dt.RECHECK_MOVE + 0.5                  # 牠追過來了
+    ck("★★ 牠移動超過 RECHECK_MOVE 格 → 立刻重問",
+       [m.eid for m in tab._targets()] == [92] and 92 not in tab._toofar)
+    around.x = 13.0
+    tab._toofar[92] = (time.monotonic() - dt.GIVEUP_COOL - 1, (10.0, 10.0), (13.0, 10.0))
+    ck("　冷卻到了也重問", [m.eid for m in tab._targets()] == [92])
+
+    # ★ A* 是八方向格子距離，天生比直線長 8%；上限要留 PATH_SLACK，
+    #   不然直線 28 格的怪路徑一算 30.2 就被丟掉。
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._me = (10.0, 10.0)
+    edge = FakeMon(x=38.0, y=10.0, eid=94, name="直線28繞路31")
+    tab._live_monsters = lambda: [edge]
+    tab._reach = None
+
+    class FakeGridSlack:
+        def route(self, start, goal, relax=4, max_cost=None):
+            return None if (max_cost is not None and 31 > max_cost) else [(0, 0)] * 31
+    tab._grid = FakeGridSlack()
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    dt.entity.read_pos = lambda _sc, _addr: None
+    tab._fight((10.0, 10.0), TICK)
+    ck(f"★ 直線 28、路徑 31（< {dt.MAX_CHASE:.0f}×{dt.PATH_SLACK}）→ 照打",
+       tab._atk.picked is edge and 94 not in tab._toofar)
+    tab._live_monsters = lambda: [edge, FakeMon(x=45.0, y=10.0, eid=95, name="直線35")]
+    ck("　狀態列的盤點講得出「幾隻超過 30 格」",
+       f"1 隻超過 {dt.MAX_CHASE:.0f} 格" in tab._mon_note(), tab._mon_note())
+
+    # ★★★ 2026-09-04 使用者：「漏怪物很嚴重」的另一根：GIVE_UP 原本從挑到目標起
+    #   無條件累加 —— 血厚的怪 15 秒打不死就被放棄、進冷卻、去走點位。
+    #   改成掛機頁那套「沒進展才算」：掉血歸零、自己有移動歸零。
+    print("\n打怪的放棄計時只算「沒進展」（2026-09-04）")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tank = FakeMon(x=11.0, y=10.0, eid=55, name="血厚的")
+    tab._live_monsters = lambda: [tank]
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    dt.entity.read_pos = lambda _sc, _addr: (11.0, 10.0)
+    hp = 100
+    for i in range(int(30 / TICK)):                  # 打 30 秒，每 0.5 秒掉 1 滴血
+        if i % 5 == 0 and hp > 1:
+            hp -= 1
+        tab._atk.hp = hp
+        tab._fight((10.0, 10.0), TICK)
+    ck("★★ 站著打 30 秒、血一直在掉 → 不放棄（以前 15 秒就丟掉去走點位）",
+       tab._cur is tank and not tab._gave_up, f"cur={tab._cur} gave_up={tab._gave_up}")
+    ck("　出手是開著的", tab._keys.on is True)
+
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._live_monsters = lambda: [tank]
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._atk.hp = 100                                 # 選定了、血填了、但一滴都不掉
+    for _ in range(int((dt.GIVE_UP + 0.5) / TICK)):
+        tab._fight((10.0, 10.0), TICK)
+    ck(f"★ 站著 {dt.GIVE_UP:.0f} 秒血一滴不掉（被地形擋線）→ 才放棄換一隻",
+       tab._cur is None and 55 in tab._gave_up, f"cur={tab._cur}")
+    ck("　放棄的原因看得到（_notify 不會被走路訊息蓋掉）",
+       "沒進展" in tab.status.text(), tab.status.text())
+
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    runner = FakeMon(x=30.0, y=10.0, eid=56, name="一直跑的")
+    tab._live_monsters = lambda: [runner]
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._atk.hp = 0
+    dt.entity.read_pos = lambda _sc, _addr: (runner.x, 10.0)
+    x = 10.0
+    for _ in range(int(25 / TICK)):                   # 追 25 秒，每拍走 0.3 格、牠也跑
+        x += 0.3
+        runner.x += 0.3
+        tab._fight((x, 10.0), TICK)
+    ck("★ 一直在追（自己有在移動）→ 不放棄", tab._cur is runner and not tab._gave_up,
+       f"cur={tab._cur} gave_up={tab._gave_up}")
+    dt.entity.read_pos = lambda _sc, _addr: None
 
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
     #   第二個病灶）：KeyWorker 拿它讀「我離目標多遠」，讀成 (0,0) 就每一招
