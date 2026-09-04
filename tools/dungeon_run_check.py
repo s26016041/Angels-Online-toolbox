@@ -48,9 +48,10 @@ class FakeNav:
     def reset(self, goal=None):
         self.goal = goal
 
-    def step(self, _sc, _mv, _pobj, gx, gy):
+    def step(self, _sc, _mv, _pobj, gx, gy, arrive=None):
         self.calls += 1
         self.goal = (gx, gy)
+        self.arrive = arrive
         return "走路中"
 
 
@@ -102,6 +103,12 @@ class FakeGrid:
 
     def walkable(self, x, y):
         return (x, y) in self.cells or (x, y) in self.others
+
+    def line_free(self, a, b):
+        return not getattr(self, "wall_between", False)
+
+    def route(self, start, goal, relax=4, max_cost=None):
+        return [(int(start[0]), int(start[1])), (int(goal[0]), int(goal[1]))]
 
 
 class FakeAtk:
@@ -762,6 +769,9 @@ def main() -> int:
        [m.eid for m in tab._targets()] == [92, 93], str([m.eid for m in tab._targets()]))
 
     class FakeGridChase:                       # ⚠ 別叫 FakeGrid：main() 後面有同名的
+        def line_free(self, a, b):
+            return True
+
         def route(self, start, goal, relax=4, max_cost=None):
             n = abs(goal[0] - start[0]) + abs(goal[1] - start[1])
             if goal[0] == 13.0:                  # 隔牆那隻要繞 40 格
@@ -809,6 +819,9 @@ def main() -> int:
     tab._reach = None
 
     class FakeGridSlack:
+        def line_free(self, a, b):
+            return True
+
         def route(self, start, goal, relax=4, max_cost=None):
             return None if (max_cost is not None and 31 > max_cost) else [(0, 0)] * 31
     tab._grid = FakeGridSlack()
@@ -864,6 +877,104 @@ def main() -> int:
         tab._fight((x, 10.0), TICK)
     ck("★ 一直在追（自己有在移動）→ 不放棄", tab._cur is runner and not tab._gave_up,
        f"cur={tab._cur} gave_up={tab._gave_up}")
+    dt.entity.read_pos = lambda _sc, _addr: None
+
+    # ★★★ 2026-09-04 使用者：「怪物跟我中間有障礙物的話不會繞過去，會卡住盯著怪物」
+    print("\n怪跟我之間有障礙物 → 繞過去，不站著盯（2026-09-04）")
+
+    class FakeMover:
+        def __init__(self):
+            self.near = []
+            self.active = True
+
+        def walk_near(self, _sc, _p, x, y, keep):
+            self.near.append((x, y, keep))
+            return True
+
+    # ① 直線沒牆、只差最後 (want, 3] 格：近戰 want=1.5、怪在 2.5 格 →
+    #    以前尋路器 3 格內不動、我們也不補 → 站著盯。現在直走補上。
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=12.5, y=10.0, eid=61, name="站在2.5格的弓手")
+    tab._live_monsters = lambda: [m]
+    tab._keys, tab._atk, tab._mover = FakeKeys(), FakeAtk(), FakeMover()
+    tab._keys.min_range = 1
+    tab._grid = FakeGrid({(x, 10) for x in range(8, 16)})
+    dt.entity.read_pos = lambda _sc, _addr: (12.5, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★★ 近戰離怪 2.5 格（尋路器死區）→ 直走過去補最後一段",
+       tab._mover.near and tab._nav.calls == 0 and tab._keys.on is False,
+       f"near={tab._mover.near} nav={tab._nav.calls} on={tab._keys.on}")
+    ck("　留的距離比攻擊距離短一點（走進去才打得到）",
+       tab._mover.near and tab._mover.near[-1][2] < 1.5, str(tab._mover.near))
+    dt.entity.read_pos = lambda _sc, _addr: (11.2, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("　走進 1.5 格 → 出手", tab._keys.on is True)
+
+    # ② 數字上在射程內但中間有牆 → 不站著放，照 A* 繞（3 格內 arrive=0）
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=12.0, y=10.0, eid=62, name="薄牆對面")
+    tab._live_monsters = lambda: [m]
+    tab._keys, tab._atk, tab._mover = FakeKeys(), FakeAtk(), FakeMover()
+    tab._keys.min_range = 12                              # 遠程：want 10.8
+    g = FakeGrid({(x, 10) for x in range(8, 16)})
+    g.wall_between = True
+    tab._grid = g
+    dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★★ 直線 2 格但隔著牆 → 不出手、叫尋路器繞過去",
+       tab._keys.on is False and tab._nav.calls == 1 and not tab._mover.near,
+       f"on={tab._keys.on} nav={tab._nav.calls} near={tab._mover.near}")
+    ck("　3 格內把尋路器的「到了」門檻壓到 0（不然它不動）",
+       tab._nav.arrive == 0.0, str(tab._nav.arrive))
+    ck("　狀態列講得出「隔著障礙物」", "障礙物" in tab.status.text(), tab.status.text())
+    g.wall_between = False
+    tab._fight((10.0, 10.0), TICK)
+    ck("　繞到沒牆了 → 出手", tab._keys.on is True)
+    dt.entity.read_pos = lambda _sc, _addr: (17.0, 10.0)
+    g.wall_between = True
+    tab._fight((10.0, 10.0), TICK)
+    ck("　7 格外隔牆 → 一樣繞（門檻也是 0：一路繞到看得到為止，不是走到 3 格就停）",
+       tab._nav.calls == 2 and tab._nav.arrive == 0.0, str(tab._nav.arrive))
+
+    # ③ 真訊號兜底：地形圖看不出牆（矮欄杆）、站在射程內 3 秒零傷害 → 貼身繞打
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=16.0, y=10.0, eid=63, name="欄杆後面")
+    tab._live_monsters = lambda: [m]
+    tab._keys, tab._atk, tab._mover = FakeKeys(), FakeAtk(), FakeMover()
+    tab._keys.min_range = 12
+    tab._keys.selected = True
+    tab._atk.hp = 100
+    tab._grid = FakeGrid({(x, 10) for x in range(8, 20)})
+    dt.entity.read_pos = lambda _sc, _addr: (16.0, 10.0)
+    for _ in range(int(2.0 / TICK)):
+        tab._fight((10.0, 10.0), TICK)
+    ck("站 2 秒零傷害 → 還在出手（沒到門檻）", tab._keys.on is True and not tab._push_in)
+    for _ in range(int(1.5 / TICK)):
+        tab._fight((10.0, 10.0), TICK)
+    ck(f"★★ 站 {dt.PUSH_IN_SECS:.0f} 秒血一滴不掉 → 貼身繞打（攻擊距離壓到 {dt.MELEE_RANGE:g}）",
+       tab._push_in and tab._keys.on is False and tab._nav.calls >= 1,
+       f"push={tab._push_in} on={tab._keys.on} nav={tab._nav.calls}")
+    ck("　⛔ 沒有換怪", tab._cur is m and not tab._gave_up)
+    ck("　原因看得到", "零傷害" in tab.status.text(), tab.status.text())
+    tab._atk.hp = 90                                      # 傷害進來了
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 一掉血就解除貼身、回到原本射程出手", not tab._push_in and tab._keys.on is True,
+       f"push={tab._push_in} on={tab._keys.on}")
+
+    # ④ 貼身 ≤ NO_PATH_NEED 格的零傷害不觸發（那不是擋線）
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=12.0, y=10.0, eid=64, name="貼身的")
+    tab._live_monsters = lambda: [m]
+    tab._keys, tab._atk, tab._mover = FakeKeys(), FakeAtk(), FakeMover()
+    tab._keys.min_range = 12
+    tab._keys.selected = True
+    tab._atk.hp = 100
+    tab._grid = FakeGrid({(x, 10) for x in range(8, 20)})
+    dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
+    for _ in range(int(5.0 / TICK)):
+        tab._fight((10.0, 10.0), TICK)
+    ck(f"貼身 2 格零傷害 5 秒 → 不算擋線、不貼身繞打（交給 {dt.GIVE_UP:.0f} 秒收尾）",
+       not tab._push_in and tab._cur is m)
     dt.entity.read_pos = lambda _sc, _addr: None
 
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的

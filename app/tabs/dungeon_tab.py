@@ -103,8 +103,9 @@ from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
                       scenery, sell, skills, supply, talkwnd, team, terrain)
 from app.tabs.base_tab import BaseTab
 from app.tabs.farm_tab import (DEFAULT_KEY, FULL_HUNT_GAP, HANDOFF_RANGE,
-                               KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
-                               STUCK_EPS, TargetWorker)
+                               KeyWorker, MELEE_RANGE, MODE_PACKET, NO_PATH_NEED,
+                               PUSH_IN_SECS, ScanWorker, SKILL_KEYS, STUCK_EPS,
+                               TargetWorker)
 
 TICK_MS = 100
 # 掃描節奏。★ 使用者 2026-09-02：「趕路掃描改成可接受最快，這個很糟糕，
@@ -209,6 +210,16 @@ TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 #     這裡照它：**目標掉血**或**自己有移動（離錨點 > STUCK_EPS）**都歸零，
 #     只有「站著不動、血也一滴不掉」才累加（＝被地形擋線／走不過去）。
 GIVE_UP = 15.0
+# ★★★ 怪跟我之間有障礙物（使用者 2026-09-04：「怪物跟我中間有障礙物的話不會
+#   繞過去，會卡住盯著怪物」）。以前 `_fight` 只看**直線距離**：數字上在射程內
+#   就站著出手，技能被牆擋住＝零傷害，站到 GIVE_UP 才換怪；而且離怪 3 格內
+#   尋路器（navigate.ARRIVE）什麼都不做、我們又沒補最後一段 → 近戰角色離怪
+#   2.5 格永遠走不過去，同樣是「盯著怪」。三道修法：
+#   ① 站著出手前先問地形圖 `Grid.line_free()`：中間有牆就**照 A* 繞過去**
+#      （3 格內傳 arrive=0 給尋路器，不然它不動）。
+#   ② 直線沒牆、只差最後那 (want, 3] 格 → `walk_near` 直走補上（不尋路）。
+#   ③ 真訊號兜底（照掛機頁 PUSH_IN_SECS）：打得到卻 3 秒零傷害 → 把攻擊距離
+#      壓到 MELEE_RANGE 貼身走過去，掉血就解除。⛔ 不換怪。
 # ★★ 剛放棄的怪**冷卻**（使用者 2026-09-03 實機：「一下掃到怪物一下走路，兩個一直
 #   輪迴」＝在轉角追一隻追不到的怪 → 放棄 → 走腳本 → 掃到它又追 → …）。
 #   ⛔ 不是黑名單（使用者 9/2 明令）：只是**放棄之後這麼多秒內不再挑它**，時間到
@@ -769,6 +780,7 @@ class DungeonTab(BaseTab):
         self._left_out = (0, 0, 0)       # 上一輪 _targets 不打的怪：(太遠, 路太遠冷卻, 走不到)
         self._anchor = None          # 打怪進度用：上次「有移動」時站的位置
         self._last_hp = -1           # 打怪進度用：上次看到的目標血量
+        self._push_in = False        # 打得到卻零傷害 → 正在貼身繞打（見 GIVE_UP 下方）
         self._nokill_t = 0.0         # 一直在打卻沒殺掉半隻多久了
 
     def _on_run_toggled(self, on: bool) -> None:
@@ -1461,6 +1473,7 @@ class DungeonTab(BaseTab):
             self._cur_t = 0.0
             self._anchor = None
             self._last_hp = -1
+            self._push_in = False
             self._atk.attack(self._state, self._cur)
             self._keys.eid = self._cur.eid
             self._empty_since = 0.0
@@ -1482,7 +1495,14 @@ class DungeonTab(BaseTab):
         self._keys.player = self._player
         # 能交棒（整輪都是快捷鍵招式）就走到 12 格讓遊戲自己走過去打；
         # 不能交棒就自己走近一點，各招的射程由 KeyWorker 自己比。
-        handoff = self._keys.handoff
+        # ⚠ 貼身繞打中不交棒：客戶端自己走的那段會停在「數字上打得到」的地方，
+        #   正是被牆擋住的位置；這時要我們自己照 A* 走到貼身。
+        # ★ 掉血＝傷害進得來＝沒被擋線 → **這一拍**就解除貼身（放在算射程之前，
+        #   不然要多走一拍才回到原本的射程）。hp 是 TargetWorker 讀回的目標血量。
+        hp = self._atk.hp
+        if 0 < hp < self._last_hp:
+            self._push_in = False
+        handoff = self._keys.handoff and not self._push_in
         self._keys.reach = HANDOFF_RANGE if handoff else 0.0
         self._keys.client_walk = handoff
         # 兩條執行緒對「現在是不是用封包打」要有共識（照抄掛機那邊的算法）：
@@ -1496,24 +1516,41 @@ class DungeonTab(BaseTab):
         #   都打得到；寫死 2.5 格的話遠程角色會白走十幾格貼到怪臉上。
         mr = self._keys.min_range
         want = HANDOFF_RANGE if handoff else max(1.5, (mr or 3) * 0.9)
-        if d > want:
-            note = self._nav.step(self._sc, self._mover, self._player,
-                                  mp[0], mp[1])
+        if self._push_in:
+            want = min(want, MELEE_RANGE)          # 零傷害 → 貼身打（見 GIVE_UP 下方）
+        # ★ 中間有牆就不算「打得到」：站著放只會零傷害（使用者 2026-09-04）。
+        los = self._line_free(me, mp)
+        in_range = d <= want and los
+        if not in_range:
             self._keys.set_on(False)
-            if self._nav.stuck and self._nav.stuck_reason == "grid":
-                # 地形圖說到不了 → 換一隻，並立刻重問一次地形（門可能開了）。
-                self._give_up("地形圖說走不到")
-                return True
+            if los and d <= NAV_DEAD:
+                # ★ 直線沒牆、只差最後那 (want, 3] 格：尋路器 3 格內不動作，
+                #   這一段以前沒人負責 → 近戰離怪 2.5 格站著盯（同 walk_near 檔頭
+                #   「站在 2.2 格卡 8.2 秒」那個坑）。直走補上，不尋路。
+                note = self._walk_beside(mp[0], mp[1], max(0.5, want - 0.5))
+            else:
+                # 有牆 → 照 A* 繞。⚠ 3 格內要把尋路器的「到了」門檻壓到 0，
+                #   不然「隔一道薄牆直線 2 格」它什麼都不做。
+                note = self._nav.step(self._sc, self._mover, self._player,
+                                      mp[0], mp[1],
+                                      arrive=navigate.ARRIVE if los else 0.0)
+                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                    # 地形圖說到不了 → 換一隻，並立刻重問一次地形（門可能開了）。
+                    self._give_up("地形圖說走不到")
+                    return True
+            if not los:
+                note = f"隔著障礙物 → 繞過去（{note}）"
+            elif self._push_in:
+                note = f"貼身繞打 → {note}"
         else:
             self._nav.reset()
             self._keys.set_on(True)
-            note = "出手中"
+            note = "貼身出手中" if self._push_in else "出手中"
         # ★★ 「沒進展」才累加（照掛機頁 STUCK_ENGAGED 的算法，見 GIVE_UP）：
         #   · 離錨點動了 > STUCK_EPS ＝ 真的在走（撞牆抖動只有 0.5 格，不算）
         #   · 目標掉血 ＝ 打得到、正在打（血厚打 30 秒也不放棄）
         #   兩樣都沒有 ＝ 站著發呆／被地形擋線，這才是要換怪的情況。
         #   ⚠ hp 是 TargetWorker 讀回的「目標血量」（遊戲收到選定包才填）。
-        hp = self._atk.hp
         if self._anchor is None or _d(me, self._anchor) > STUCK_EPS:
             self._anchor = me
             self._cur_t = 0.0
@@ -1522,6 +1559,15 @@ class DungeonTab(BaseTab):
         else:
             self._cur_t += dt
         self._last_hp = hp
+        # ★ 真訊號兜底（照掛機頁 PUSH_IN_SECS）：站在射程內、選定也送了、
+        #   PUSH_IN_SECS 秒血一滴不掉 ＝ 十之八九被地形擋線（line_free 只是代理，
+        #   矮欄杆／斜角縫它看不出來）→ 壓到 MELEE_RANGE 貼身走過去，⛔ 不換怪。
+        #   ⚠ 貼身 ≤ NO_PATH_NEED 格的空揮不算（那不是擋線，是還沒出手）。
+        if (in_range and not self._push_in and self._keys.selected
+                and self._cur_t >= PUSH_IN_SECS and d > NO_PATH_NEED):
+            self._push_in = True
+            self._notify(f"「{self._cur.name}」打得到卻 {PUSH_IN_SECS:.0f} 秒零傷害"
+                         f"（隔著障礙物？）→ 繞過去貼身打")
         if self._cur_t > GIVE_UP:
             self._give_up(f"{GIVE_UP:.0f} 秒沒進展（沒掉血、也沒移動）")
             return True
@@ -1535,6 +1581,7 @@ class DungeonTab(BaseTab):
         self._cur_t = 0.0
         self._anchor = None
         self._last_hp = -1
+        self._push_in = False
         if self._keys is not None:
             self._keys.set_on(False)
             self._keys.eid = None
@@ -2270,6 +2317,16 @@ class DungeonTab(BaseTab):
         why = self._left_out_note()
         return (f"（周圍 {live} 隻怪，走得到 {n} 隻"
                 + (f"；{why}" if why and n < live else "") + "）")
+
+    def _line_free(self, a, b) -> bool:
+        """我跟那個位置之間有沒有牆（地形圖代理，讀不到圖一律當沒牆）。"""
+        grid = self._grid
+        if grid is None:
+            return True
+        try:
+            return bool(grid.line_free(a, b))
+        except Exception:                                # noqa: BLE001
+            return True
 
     def _busy_walking(self) -> bool:
         """正在走路嗎（正在走就別再送，重下指令會把上一段打斷）。"""

@@ -138,8 +138,15 @@ class Navigator:
         return True
 
     # -- 主迴圈 -------------------------------------------------------
-    def step(self, scanner, mover, player_obj, gx: float, gy: float) -> str:
-        """走一步。回傳給狀態列看的說明。"""
+    def step(self, scanner, mover, player_obj, gx: float, gy: float,
+             arrive: float = ARRIVE) -> str:
+        """走一步。回傳給狀態列看的說明。
+
+        arrive: 離目標這麼近就當到了（預設 ARRIVE 3 格）。
+          ★ 副本打怪「隔一道薄牆、直線 2 格但要繞 20 格」的情況要傳 0：
+            不然 3 格內這支什麼都不做，呼叫端又不能直走（會撞牆）
+            → 站著盯怪。這一支只有這個門檻是可調的，路照樣是 A* 算的。
+        """
         goal = (gx, gy)
         if self.goal is None or _d(self.goal, goal) > 1.0:
             self.reset(goal)
@@ -151,7 +158,7 @@ class Navigator:
         if here is None:
             self.note = "⚠ 讀不到座標"
             return self.note
-        if _d(here, goal) <= ARRIVE:
+        if _d(here, goal) <= arrive:
             self.note = "到了"
             return self.note
 
