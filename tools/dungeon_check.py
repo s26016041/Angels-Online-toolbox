@@ -252,6 +252,45 @@ def main() -> int:
         #   ＝章跟步驟不是同一張圖（2026-09-02 真的發生過，章是門口那張）。
         ck(f"　★「{p.stem}」座標都在章裡那張圖的範圍內", not out, str(out))
 
+    # -- 存檔位置／內建判定（2026-09-04：exe 裡「儲存」內建腳本會寫進
+    #    PyInstaller 暫存目錄、關程式就消失還不報錯；「開啟資料夾」也開錯地方）--
+    ck("跑原始碼：save_folder 就是專案 assets/副本",
+       dungeon.save_folder() == dungeon.folder())
+    ck("跑原始碼：專案裡的腳本算內建",
+       dungeon.is_builtin(dungeon.folder() / "x.json"))
+    ck("跑原始碼：使用者資料夾的不算內建",
+       not dungeon.is_builtin(dungeon.user_folder() / "x.json"))
+    ck("內建名單有「吞噬之間」", "吞噬之間" in dungeon.builtin_names())
+    old_frozen, old_appdata = dungeon.frozen, os.environ.get("APPDATA")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["APPDATA"] = td
+        dungeon.frozen = lambda: True
+        try:
+            sf = dungeon.save_folder()
+            ck("★ exe：save_folder 改到使用者資料夾（不是解壓目錄）",
+               sf == Path(td) / dungeon.APP_DIR_NAME / "副本" and sf.is_dir(),
+               str(sf))
+            ck("★ exe：save_folder ≠ folder", sf != dungeon.folder())
+            ck("exe：內建腳本標「內建」",
+               dungeon.source_label(dungeon.folder() / "x.json") == "內建")
+            ck("exe：使用者資料夾的標「自己做的」",
+               dungeon.source_label(sf / "x.json") == "自己做的")
+            # 使用者自己做的要列得出來；跟內建同名的以內建為準（使用者 9/2 定案）
+            dummy = json.dumps({"name": "t", "steps": []})
+            (sf / "吞噬之間.json").write_text(dummy, encoding="utf-8")
+            (sf / "我的測試副本.json").write_text(dummy, encoding="utf-8")
+            listed = {p.stem: p for p in dungeon.list_scripts()}
+            ck("★ exe：使用者自己做的腳本列得出來",
+               listed.get("我的測試副本") == sf / "我的測試副本.json")
+            ck("exe：同名時以內建為準（自製的被蓋住 → 製作頁存檔前要擋）",
+               listed.get("吞噬之間") == dungeon.folder() / "吞噬之間.json")
+        finally:
+            dungeon.frozen = old_frozen
+            if old_appdata is None:
+                os.environ.pop("APPDATA", None)
+            else:
+                os.environ["APPDATA"] = old_appdata
+
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
 

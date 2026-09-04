@@ -625,8 +625,12 @@ class DungeonMakeTab(BaseTab):
         self.files.blockSignals(True)
         self.files.clear()
         self.files.addItem("（未命名）", None)
+        # ★ exe 裡標出來源（2026-09-04）：內建的改了存不回去、自己做的才存得住，
+        #   不標使用者分不出來。跑原始碼兩邊都存得住，不必標。
+        tag = dungeon.frozen()
         for p in dungeon.list_scripts():
-            self.files.addItem(p.stem, str(p))
+            label = p.stem + (f"（{dungeon.source_label(p)}）" if tag else "")
+            self.files.addItem(label, str(p))
         if keep:
             i = self.files.findData(keep)
             if i >= 0:
@@ -742,6 +746,15 @@ class DungeonMakeTab(BaseTab):
         if self._path is None:
             self._save_as()
             return
+        # ★★ exe 裡「儲存」內建腳本＝寫進 PyInstaller 解壓目錄，關程式就消失
+        #   還不報錯（2026-09-04 發現）。改導到使用者資料夾另存一份，名字帶
+        #   「-自訂」免得跟內建同名被蓋住看不到。
+        if dungeon.frozen() and dungeon.is_builtin(self._path):
+            self.status.setText(
+                f"「{self._script.name}」是內建腳本，存不回程式裡 —— "
+                f"改存成你自己的一份（{dungeon.save_folder()}）")
+            self._save_as(default=f"{self._script.name}-自訂")
+            return
         try:
             self._script.save(self._path)
         except Exception as e:                           # noqa: BLE001
@@ -749,13 +762,24 @@ class DungeonMakeTab(BaseTab):
             return
         self.status.setText(f"已存 {self._path}")
 
-    def _save_as(self) -> None:
+    def _save_as(self, default: str = "") -> None:
         # ⛔ 不開「另存新檔」的檔案對話框（使用者 2026-09-02 定案）：路徑是
         #   我們決定的（專案 assets/副本），使用者只要給個名字。
         name, ok = QInputDialog.getText(
-            self, "另存新檔", "腳本名稱：", text=self._script.name or "副本")
+            self, "另存新檔", "腳本名稱：",
+            text=default or self._script.name or "副本")
         name = name.strip()
         if not ok or not name:
+            return
+        # ⛔ exe 裡不准跟內建同名：清單以內建為準，同名的自製檔會被蓋住
+        #   看不到 —— 存進去等於憑空消失。擋下來請他換名字。
+        if (dungeon.frozen() and name in dungeon.builtin_names()
+                and dungeon.save_folder() != dungeon.folder()):
+            QMessageBox.warning(
+                self, "另存新檔",
+                f"「{name}」是內建腳本的名字，自己做的同名檔會被內建那份蓋住"
+                f"看不到。\n請換一個名字（例如「{name}-自訂」）。")
+            self._save_as(default=f"{name}-自訂")
             return
         path = dungeon.save_folder() / f"{name}.json"
         if path.exists() and QMessageBox.question(
@@ -768,11 +792,14 @@ class DungeonMakeTab(BaseTab):
         self._reload_files(keep=str(self._path))
 
     def _open_folder(self) -> None:
+        # ★ 開的是**存得住**的那個資料夾（2026-09-04 修）：以前接 folder()，
+        #   exe 裡會開到 PyInstaller 的暫存目錄，跟按鈕提示寫的不是同一個地方。
         import os
+        target = dungeon.save_folder()
         try:
-            os.startfile(str(dungeon.folder()))          # noqa: S606
+            os.startfile(str(target))                    # noqa: S606
         except Exception:                                # noqa: BLE001
-            self.status.setText(f"腳本資料夾：{dungeon.folder()}")
+            self.status.setText(f"腳本資料夾：{target}")
 
     # ------------------------------------------------------------------
     # 步驟

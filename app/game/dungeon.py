@@ -117,11 +117,18 @@ def folder() -> Path:
     return p
 
 
-def user_folder() -> Path:
-    r"""舊版存過腳本的地方（`%APPDATA%\AngelsOnlineToolbox\副本`）。
+def frozen() -> bool:
+    """是不是打包成 exe 在跑（PyInstaller 解壓目錄裡的資源關掉程式就沒了）。"""
+    return hasattr(sys, "_MEIPASS") or bool(getattr(sys, "frozen", False))
 
-    ⚠ 只為了**還讀得到**舊檔而留（不主動建）：2026-09-02 之前存的腳本都在
-      這裡，直接改路徑會讓使用者的腳本憑空消失。
+
+def user_folder() -> Path:
+    r"""使用者自己做的腳本放的地方（`%APPDATA%\AngelsOnlineToolbox\副本`）。
+
+    - exe 裡：這是製作分頁**唯一**存得住的地方（`save_folder()`），使用者自己
+      做的腳本都在這；自動刷副本會把這裡跟內建的合起來列（`list_scripts()`）。
+    - 跑原始碼：只為了**還讀得到**舊檔而留（不主動建）—— 2026-09-02 之前存的
+      腳本都在這裡，直接改路徑會讓使用者的腳本憑空消失。
     """
     base = os.environ.get("APPDATA")
     if not base:
@@ -136,11 +143,37 @@ def save_folder() -> Path:
     打包成 exe 之後專案目錄在 PyInstaller 的暫存區（關掉程式就沒了），
     退回使用者資料夾 —— 安全退化，不要安靜地存進一個等下會被刪掉的地方。
     """
-    if hasattr(sys, "_MEIPASS") or getattr(sys, "frozen", False):
+    if frozen():
         p = user_folder()
         p.mkdir(parents=True, exist_ok=True)
         return p
     return folder()
+
+
+def is_builtin(path) -> bool:
+    """這份是不是**我們發出去的內建腳本**（放在 `folder()` 那個資料夾）。
+
+    ⚠ exe 裡內建腳本在 PyInstaller 解壓目錄，寫回去＝關程式就消失還不報錯
+      （2026-09-04 發現的洞）；製作分頁靠這個判斷「儲存要不要改導到使用者資料夾」。
+    """
+    try:
+        return Path(path).resolve().parent == folder().resolve()
+    except OSError:
+        return False
+
+
+def builtin_names() -> set[str]:
+    """內建腳本的檔名（不含 .json）。同名的自製腳本會被內建那份蓋住看不到
+    （`list_scripts()` 以內建為準，使用者 2026-09-02 定案），存檔前先擋。"""
+    try:
+        return {p.stem for p in folder().glob("*.json")}
+    except OSError:
+        return set()
+
+
+def source_label(path) -> str:
+    """給選單標來源：內建（我們發的）／自己做的（使用者資料夾）。"""
+    return "內建" if is_builtin(path) else "自己做的"
 
 
 def list_scripts() -> list[Path]:
