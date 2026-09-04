@@ -1714,6 +1714,7 @@ class DungeonTab(BaseTab):
         dist = _d(mp, me) if (mp and me) else None
         if mp:
             self._keys.pos = (round(mp[0]), round(mp[1]))
+            self._keys.pos_f = (mp[0], mp[1])       # 量距離用原始座標
 
         # ── 每 _path_gap 秒問一次地形圖「我跟這隻怪之間有沒有地形」 ──
         self._path_t += dt

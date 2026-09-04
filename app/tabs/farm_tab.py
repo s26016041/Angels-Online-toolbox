@@ -709,6 +709,12 @@ class KeyWorker(_Paced):
         self.eid = None             # 現在要打誰
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
+        # ★★ 目標的**原始**座標（沒四捨五入）—— 出手前量距離要用這份。
+        #   2026-09-05 使用者回報「近戰有時卡住不打」：`pos` 是給施放封包用的
+        #   整數格，拿它算距離最多差 0.71 格；近戰 reach 只有 2.0，UI 判「打得到」
+        #   的位置有 12%（1.7~2.0 帶內 37%）在這裡被判成超出射程、整輪跳過。
+        #   遠程 reach 12 感覺不到，所以只有近戰卡。見 memory melee-stall-candidates。
+        self.pos_f: tuple[float, float] = (0.0, 0.0)
         # ★ 出手前自己再量一次距離用的玩家物件位址（見 step()）。
         self.player = None
         # ⚠ `reach` **只有交棒那一輪才有值**（總距離）。平常是 0 ＝ 沒有單一
@@ -1034,6 +1040,7 @@ class KeyWorker(_Paced):
         #   當屍體丟掉。每殺一隻換一次目標，這個窗口每一輪都存在。
         eid, mover = self.eid, self.mover
         mode, packets, pos = self.mode, self.packets, self.pos
+        pos_f = self.pos_f if self.pos_f != (0.0, 0.0) else pos
         vks = list(self.vks) or [DEFAULT_KEY]
         try:
             if eid is None:
@@ -1155,11 +1162,12 @@ class KeyWorker(_Paced):
             #   這裡只多讀一次玩家座標（微秒級），目標座標用 UI 上一拍給的。
             # ★ 順便把「現在離目標多遠」留下來：底下每一招要各自驗自己的射程。
             dist_now = None
+            # ⚠ 用 pos_f（原始座標）不用 pos（封包用的整數格）：見 pos_f 的說明。
             if self.player and pos != (0.0, 0.0):
                 me_now = entity.read_pos(self.sc, self.player)
                 if me_now:
-                    dist_now = math.hypot(pos[0] - me_now[0],
-                                          pos[1] - me_now[1])
+                    dist_now = math.hypot(pos_f[0] - me_now[0],
+                                          pos_f[1] - me_now[1])
             in_reach = not (self.reach and dist_now is not None
                             and dist_now > self.reach)
             if not (in_reach and now >= self._next_round):
@@ -5781,6 +5789,7 @@ class CharFarmPage(QWidget):
         #   所以改回來。帶座標實測不影響傷害（同一批怪交替測 3 對 3 都打得到）。
         if mp:
             self._keys.pos = (round(mp[0]), round(mp[1]))
+            self._keys.pos_f = (mp[0], mp[1])       # 量距離用原始座標
 
         # 接近規則（改用封包攻擊後，接近**完全由我們自己走**，不靠按鍵）：
         #   ① 中間有障礙物（尋路點數 > 1）→ 走到怪臉上
