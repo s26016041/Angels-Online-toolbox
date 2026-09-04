@@ -94,14 +94,17 @@ import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMenu,
     QPushButton,
+    QRadioButton,
     QToolButton,
     QVBoxLayout,
     QWidgetAction,
@@ -111,12 +114,15 @@ from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
+from app.core.notifier import Notifier
 from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
-                      move, navigate, portal, produce, quickbar, robot, scene,
-                      scenery, sell, skills, supply, talkwnd, team, terrain)
+                      move, navigate, player, portal, produce, quickbar, robot,
+                      scene, scenery, sell, skills, supply, talkwnd, team,
+                      terrain)
 from app.tabs.base_tab import BaseTab
-from app.tabs.farm_tab import (DEFAULT_KEY, KeyWorker, MODE_PACKET, ScanWorker,
-                               SKILL_KEYS, TargetWorker)
+from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, KeyWorker,
+                               MODE_PACKET, ScanWorker, SKILL_KEYS,
+                               TargetWorker)
 
 TICK_MS = 100
 # 掃描節奏。★ 使用者 2026-09-02：「趕路掃描改成可接受最快，這個很糟糕，
@@ -269,6 +275,18 @@ GRID_REFRESH = 2.0
 #   打不到就換一隻（有別隻的話），並**立刻重問一次地形**，不記時間。
 # 重要提示在狀態列上要停留幾秒（不然同一拍的走路訊息會馬上蓋掉）。
 NOTICE_SECS = 6.0
+# ★ 通知（使用者 2026-09-05：「自動刷副本死掉或出問題也要通知，跟自動掛機一樣」）。
+#   · 停機原因開頭是這幾個符號＝「出問題」→ 送通知；「已停止」「換了腳本」那種
+#     使用者自己按的不送。⚠ 只有**開跑之後**的停機才通知（`_started`）：
+#     開跑前的檢查（沒選分身、腳本讀不進來）人就在電腦前按，響警報是吵人。
+#   · 通知那一列的設定**跟自動掛機共用同一份**（`farm.notify_on` 等，見
+#     farm_tab._nkey）—— 使用者只要填一次 Telegram 群組。
+PROBLEM_MARKS = ("⛔", "⚠", "☠")
+NOTIFY_PREFIX = "farm"
+# ★ 角色死亡：HP ≤ 0（跟掛機頁同一個訊號 `player.read().hp`）。每 DEATH_POLL 秒
+#   讀一次、連續 DEATH_HITS 次才算（單次讀到 0 可能是物件搬家瞬間的垃圾值）。
+DEATH_POLL = 0.5
+DEATH_HITS = 2
 # 算出來的「我這一區」小於這麼多格就當錨點抓錯了（碎片區）→ 這一輪不篩選。
 # ⚠ 跟 dungeon.rooms() 的 min_cells 同一個道理：實測這張圖有 9/4/2 格的
 #   零星角落，錨在那上面會把整張圖的怪都判成走不到。
@@ -343,6 +361,47 @@ class DungeonTab(BaseTab):
         self._reset_run()
 
         root = QVBoxLayout(self)
+
+        # 通知列（最上面，跟自動掛機那一頁同一套、同一份設定）
+        nbar = QHBoxLayout()
+        self.notify_cb = QCheckBox("啟用通知")
+        self.notify_cb.setChecked(True)
+        self.notify_cb.setToolTip(
+            "通知總開關：角色死亡、刷副本出狀況停下來時通知。\n"
+            "這一列跟自動掛機那一頁是同一份設定，改一邊全部跟著改。\n"
+            "關掉只是不通知，該停還是會停。")
+        self.notify_cb.toggled.connect(self._save_notify)
+        nbar.addWidget(self.notify_cb)
+        nbar.addSpacing(10)
+        nbar.addWidget(QLabel("通知方式"))
+        self.rb_sound = QRadioButton("音效警報")
+        self.rb_tg = QRadioButton("Telegram")
+        grp = QButtonGroup(self)
+        grp.addButton(self.rb_sound)
+        grp.addButton(self.rb_tg)
+        self.rb_sound.setChecked(True)
+        self.rb_sound.toggled.connect(self._save_notify)
+        self.rb_tg.toggled.connect(self._save_notify)
+        nbar.addWidget(self.rb_sound)
+        nbar.addWidget(self.rb_tg)
+        self.tg_id = QLineEdit()
+        self.tg_id.setPlaceholderText("Telegram 群組/房間 ID")
+        self.tg_id.setFixedWidth(220)
+        self.tg_id.editingFinished.connect(self._save_notify)
+        nbar.addWidget(self.tg_id)
+        self.test_btn = QPushButton("測試通知")
+        self.test_btn.setToolTip("立刻送一則測試通知，確認設定會不會通。")
+        self.test_btn.clicked.connect(
+            lambda: self.notify("這是一則測試通知。"))
+        nbar.addWidget(self.test_btn)
+        nbar.addStretch(1)
+        root.addLayout(nbar)
+        self._prefix = NOTIFY_PREFIX
+        self._notifier = Notifier(
+            self, "⚠ 自動刷副本警報",
+            lambda: ("telegram" if self.rb_tg.isChecked() else "sound",
+                     self.tg_id.text()))
+        _NOTIFY_PAGES.add(self)
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("分身"))
@@ -454,12 +513,14 @@ class DungeonTab(BaseTab):
         self.status = QLabel("　")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
+        self._notifier.failed.connect(self.status.setText)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(TICK_MS)
         self._reload_files()
         self._load_settings()
+        self._load_notify()
 
     # ------------------------------------------------------------------
     # 分身與腳本
@@ -711,6 +772,10 @@ class DungeonTab(BaseTab):
     # 開始／停止
     # ------------------------------------------------------------------
     def _reset_run(self) -> None:
+        self._started = False        # 真的開跑了沒（開跑後的停機才通知）
+        self._stats = None           # 角色屬性基準（讀 HP 判死亡用）
+        self._death_poll = 0.0
+        self._dead_hits = 0          # HP ≤ 0 連續讀到幾次
         self._i = 0                  # 目前跑到第幾步
         self._step_t = 0.0           # 這一步跑多久了
         self._menu_i = 0             # 對話選項送到第幾個
@@ -910,6 +975,7 @@ class DungeonTab(BaseTab):
         self._keys.mover = self._mover
         self._keys.vks = self._picked_keys()
         self._keys.start()
+        self._started = True
         if phase == "fly":
             self.status.setText(
                 f"「{script.name}」：先用趴趴GO飛去「{fly.name}」，"
@@ -959,8 +1025,12 @@ class DungeonTab(BaseTab):
             self.run_cb.blockSignals(True)
             self.run_cb.setChecked(False)
             self.run_cb.blockSignals(False)
+        started, self._started = self._started, False
         if why and not quiet:
             self.status.setText(why)
+            # ★ 開跑之後因為「出問題」停下來 → 通知（使用者 2026-09-05）
+            if started and why[:1] in PROBLEM_MARKS:
+                self.notify(why)
 
     # ------------------------------------------------------------------
     # 掃描
@@ -1100,6 +1170,10 @@ class DungeonTab(BaseTab):
             self._say("讀不到自己的位置，這一拍不動")
             return
         self._me = me
+
+        # ⓪-00 死了嗎？（使用者 2026-09-05：死掉要通知）—— 死了就停＋通知
+        if self._check_death(dt):
+            return
 
         # ⓪-0 全自動循環的外圈（補給／飛回入口／組隊）—— 這幾段自己會換圖，
         #   不能給下面的「地圖變了就停」抓到。
@@ -2500,6 +2574,87 @@ class DungeonTab(BaseTab):
         else:
             self._notice = ""
         self.status.setText(text)
+
+    def _check_death(self, dt: float) -> bool:
+        """角色死了嗎 → 停機＋通知；回 True＝這一拍到此為止。
+
+        訊號跟掛機頁一樣：`player.read().hp <= 0`。基準位址從掃描快照拿
+        （`s.stats`），沒有就 `locate_fast`；讀不到（物件搬家）就丟掉重找、
+        **不算死**。連續 DEATH_HITS 次 ≤ 0 才算 —— 單次可能是搬家瞬間的垃圾值。
+        """
+        self._death_poll += dt
+        if self._death_poll < DEATH_POLL:
+            return False
+        self._death_poll = 0.0
+        # ⚠ 讀失敗（分身關了、物件搬家）一律**不算死**，下一輪再試。
+        try:
+            if not self._stats:
+                self._stats = (getattr(self._last, "stats", None)
+                               or player.locate_fast(self._sc))
+                if not self._stats:
+                    return False
+            st = player.read(self._sc, self._stats)
+        except Exception:                                # noqa: BLE001
+            self._stats = None
+            self._dead_hits = 0
+            return False
+        if st is None:
+            self._stats = None
+            self._dead_hits = 0
+            return False
+        if st.hp > 0:
+            self._dead_hits = 0
+            return False
+        self._dead_hits += 1
+        if self._dead_hits < DEATH_HITS:
+            return False
+        self._stop("☠ 角色死亡 —— 自動刷副本已停止（復活後要自己重新開跑）")
+        return True
+
+    # -- 通知（跟自動掛機那一頁同一套、同一份設定）-----------------------
+    def notify(self, msg: str) -> None:
+        """送警報通知（受「啟用通知」總開關管；關掉只是不送，該停還是停）。"""
+        if self._notifier is None or not self.notify_cb.isChecked():
+            return
+        who = self.who.currentText() or "自動刷副本"
+        note = self._notifier.fire(who, msg)
+        self.status.setText(self.status.text() + f"　[{note}]")
+
+    def _nkey(self, field: str) -> str:
+        """通知那一列的設定鍵 —— 跟自動掛機共用（不含帳號，所有分身共用）。"""
+        return f"{self._prefix}.{field}"
+
+    def _load_notify(self) -> None:
+        """把共用的通知設定套到畫面上（別的分頁改了也會被叫到）。"""
+        on = config.get(self._nkey("notify_on"), True)
+        method = config.get(self._nkey("notify"), "sound")
+        room = config.get(self._nkey("tg_id"), "")
+        keep, self._loading = self._loading, True
+        try:
+            self.notify_cb.setChecked(bool(on))
+            if str(method) == "telegram":
+                self.rb_tg.setChecked(True)
+            else:
+                self.rb_sound.setChecked(True)
+            self.tg_id.setText(str(room or ""))
+        finally:
+            self._loading = keep
+
+    def _save_notify(self) -> None:
+        """通知那一列改了 → 存進共用鍵，掛機頁與其他分頁同步跟著變。"""
+        if self._loading:
+            return
+        config.set(self._nkey("notify_on"), self.notify_cb.isChecked())
+        config.set(self._nkey("notify"),
+                   "telegram" if self.rb_tg.isChecked() else "sound")
+        config.set(self._nkey("tg_id"), self.tg_id.text().strip())
+        config.save()
+        for page in list(_NOTIFY_PAGES):
+            try:
+                if page is not self and page._prefix == self._prefix:
+                    page._load_notify()
+            except RuntimeError:                 # 那一頁的 C++ 物件已被刪掉
+                pass
 
     def _notify(self, text: str) -> None:
         """停留幾秒的提示（地形變了、可達區怪怪的…）。"""

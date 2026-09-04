@@ -64,6 +64,17 @@ class FakeMon:
         self.hp_zero = False
 
 
+class FakeNotifier:
+    """假通知器：只記「送了什麼」，不響、不跳視窗。"""
+
+    def __init__(self):
+        self.fired = []
+
+    def fire(self, who, msg):
+        self.fired.append((who, msg))
+        return "假通知"
+
+
 class FakeKeys:
     """最小的假出手執行緒：沒怪時 _fight 會叫 set_on(False)。"""
 
@@ -300,6 +311,8 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     tab._me = tuple(pos)
     tab._my_pos = lambda: tuple(tab._pos)
     dt.entity.read_live_hp = lambda _sc, m: (True, "", (m.x, m.y), -1)
+    tab._notifier = FakeNotifier()          # ⚠ 真的會響警報＋跳視窗
+    dt.player.locate_fast = lambda _sc: None   # 死亡判定的基準：測試裡自己塞
     tab._live_monsters = lambda: list(mons)
     tab._refresh_steps = lambda: None
     # ⚠ 掃描是真的 QThread：測試裡換成假的（也順便收掉，不然一堆殘留執行緒）
@@ -1010,6 +1023,67 @@ def main() -> int:
         E(0x3300, 4, 5, "沒讀到血", 12.0, 10.0, kind=4, state="", hp=-1)]
     live = [x.eid for x in dt.DungeonTab._live_monsters(tab)]
     ck("★ 掃描快照：血量 0 與 'Dead' 都當屍體濾掉、−1 留著", live == [1, 4], str(live))
+
+    # ★★ 通知（使用者 2026-09-05：「死掉或出問題也要通知，跟自動掛機一樣」）
+    print("通知")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab._stop("⛔ 地圖變了，停下來")
+    ck("★ 開跑後因為出問題停機 → 通知", len(fake.fired) == 1 and "地圖變了" in fake.fired[0][1],
+       str(fake.fired))
+    ck("　通知後 run_cb 是關的、狀態列有寫", not tab.run_cb.isChecked()
+       and "地圖變了" in tab.status.text())
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab._stop("已停止")
+    ck("　使用者自己按停 → 不通知", fake.fired == [])
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._stop("⚠ 腳本讀不進來：壞掉")           # _started 還是 False
+    ck("　開跑前的檢查沒過 → 不通知（人就在電腦前）", fake.fired == [])
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab.notify_cb.blockSignals(True)          # ⚠ 別讓測試寫進使用者的 config
+    tab.notify_cb.setChecked(False)
+    tab.notify_cb.blockSignals(False)
+    tab._stop("⛔ 出事了")
+    ck("　關掉「啟用通知」→ 不通知，但照樣停", fake.fired == [] and not tab.run_cb.isChecked())
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab._stop("✔ 這一趟結束")
+    ck("　正常跑完 → 不通知", fake.fired == [])
+
+    # 角色死亡：HP ≤ 0 連續 DEATH_HITS 次 → 停機＋通知
+    class St:
+        def __init__(self, hp):
+            self.hp = hp
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab._stats = 0x5000
+    dt.player.read = lambda _sc, _base: St(120)
+    for _ in range(int(2.0 / TICK)):
+        tab._check_death(TICK)
+    ck("活著（HP 120）→ 不停", tab.run_cb.isChecked() and fake.fired == [])
+    dt.player.read = lambda _sc, _base: None
+    for _ in range(int(2.0 / TICK)):
+        tab._check_death(TICK)
+    ck("　讀不到（物件搬家）→ 不算死、基準丟掉重找", tab.run_cb.isChecked()
+       and fake.fired == [] and tab._stats is None)
+    tab._stats = 0x5000
+    dt.player.read = lambda _sc, _base: St(0)
+    tab._check_death(dt.DEATH_POLL)
+    ck("　HP 0 只讀到一次 → 還不算", tab.run_cb.isChecked())
+    dead = False
+    for _ in range(int(2.0 / TICK)):
+        dead = tab._check_death(TICK) or dead
+    ck("★ HP 0 連續兩次 → 停機＋通知「角色死亡」", dead and not tab.run_cb.isChecked()
+       and len(fake.fired) == 1 and "死亡" in fake.fired[0][1], str(fake.fired))
+    dt.player.read = lambda _sc, _base: None
 
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
     #   第二個病灶）：KeyWorker 拿它讀「我離目標多遠」，讀成 (0,0) 就每一招
