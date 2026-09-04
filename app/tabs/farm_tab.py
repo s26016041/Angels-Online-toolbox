@@ -80,7 +80,7 @@ from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
-from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list, fit_spin,
+from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list, fit_spin,
                                mall_buys_dialog, mall_buys_widget, no_elide,
                                record_mall_buy)
 
@@ -6587,6 +6587,8 @@ class FarmTab(ClientWatchMixin, BaseTab):
     """
 
     TAB_TITLE = "自動掛機"
+
+    GROUP = GROUP_AUTO
     ORDER = 5
     ATTACK_MODE = MODE_PACKET         # 頁面上的「攻擊型態」會覆寫這個
     SETTINGS_PREFIX = "farm"          # 設定存在 config 的哪個前綴底下

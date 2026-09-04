@@ -151,7 +151,7 @@ from app.game import (bag, balls, ballswap, entity, gather, itemname, mall,
                       jumpmap, locate, lua, move,
                       navigate, produce, recall, recipes, robot, scene, scenery,
                       supply)
-from app.tabs.base_tab import (BaseTab, ClientWatchMixin, fit_list,
+from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list,
                                no_elide, mall_buys_dialog,
                                record_mall_buy)
 
@@ -2233,7 +2233,9 @@ class ProduceTab(ClientWatchMixin, BaseTab):
     勾勾的意向記憶見 ClientWatchMixin（存程式記憶體，不進 config）。"""
 
     TAB_TITLE = "自動生產"
-    ORDER = 6                        # 緊接在自動掛機（5）後面
+
+    GROUP = GROUP_AUTO
+    ORDER = 8                        # 緊接在自動掛機（5）後面
 
     def build_ui(self) -> None:
         self._pages: dict[int, CharProducePage] = {}

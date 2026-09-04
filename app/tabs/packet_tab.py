@@ -40,13 +40,14 @@ from PySide6.QtWidgets import (
 
 from app.core import injector
 from app.core import window as win
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_DEV, BaseTab
 
 MAX_ROWS = 500  # 封包表最多保留列數
 
 
 class PacketTab(BaseTab):
     TAB_TITLE = "封包 / 登入攔截"
+    GROUP = GROUP_DEV
     ORDER = 60
 
     def build_ui(self) -> None:

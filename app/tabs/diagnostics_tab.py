@@ -33,11 +33,12 @@ from PySide6.QtWidgets import (
 )
 
 from app.core import window as win
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_DEV, BaseTab
 
 
 class DiagnosticsTab(BaseTab):
     TAB_TITLE = "視窗診斷"
+    GROUP = GROUP_DEV
     ORDER = 90
 
     def build_ui(self) -> None:

@@ -48,7 +48,7 @@ from app.core.memory import (
     ScanCancelled,
     working_set_mb,
 )
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_DEV, BaseTab
 
 # 結果表格最多顯示的列數（候選可能很多，全塞會拖垮介面）。
 RESULT_DISPLAY_LIMIT = 2000
@@ -112,6 +112,7 @@ class ScanWorker(QThread):
 
 class MemoryTab(BaseTab):
     TAB_TITLE = "記憶體掃描"
+    GROUP = GROUP_DEV
     ORDER = 50
 
     def build_ui(self) -> None:

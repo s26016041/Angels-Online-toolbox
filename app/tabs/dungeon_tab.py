@@ -119,7 +119,7 @@ from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
                       move, navigate, player, portal, produce, quickbar, robot,
                       scene, scenery, sell, skills, supply, talkwnd, team,
                       terrain)
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_AUTO, BaseTab
 from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, KeyWorker,
                                MODE_PACKET, ScanWorker, SKILL_KEYS,
                                TargetWorker)
@@ -335,7 +335,8 @@ def _pick(items):
 
 class DungeonTab(BaseTab):
     TAB_TITLE = "自動刷副本"
-    ORDER = 7                        # 排在副本腳本製作（6）後面
+    GROUP = GROUP_AUTO
+    ORDER = 6                        # 排在副本腳本製作（6）後面
 
     # ------------------------------------------------------------------
     def build_ui(self) -> None:

@@ -88,7 +88,7 @@ from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
 from app.game import (channel, entity, jumpmap, locate, login, move, navigate,
                       robot, scene, team, terrain)
-from app.tabs.base_tab import BaseTab, fit_spin
+from app.tabs.base_tab import GROUP_LAUNCH, BaseTab, fit_spin
 
 COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "隊伍", "狀態")
 (COL_PICK, COL_NAME, COL_ACCT, COL_SRV, COL_CHAN, COL_MAP, COL_TEAM,
@@ -148,6 +148,7 @@ def _acct(title: str) -> str:
 
 class MultiTab(BaseTab):
     TAB_TITLE = "分身總控"
+    GROUP = GROUP_LAUNCH
     ORDER = 12                       # 排在自動登入（10）後面
 
     # ------------------------------------------------------------------

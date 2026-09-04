@@ -61,7 +61,7 @@ from app.core.memory import MemoryScanner
 from app.game import bag, energy, itemname, locate, move
 # fit_spin：數字框寬度照最大值算 —— 寫死的話上下箭頭會把數字擠掉
 # （使用者回報過「框框被砍到一半」）。
-from app.tabs.base_tab import BaseTab, fit_spin
+from app.tabs.base_tab import GROUP_CHORES, BaseTab, fit_spin
 
 # 按下晶化到結果寫進記憶體要多久。實測 106ms（嵐狐按 3 次都一樣），取 3 倍餘裕。
 SETTLE_MS = 300
@@ -89,6 +89,7 @@ STATE_RELOCATE_GAP = 5.0
 
 class EnergyTab(BaseTab):
     TAB_TITLE = "能量晶化"
+    GROUP = GROUP_CHORES
     ORDER = 45
 
     def build_ui(self) -> None:

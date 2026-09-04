@@ -67,7 +67,7 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import bag, inventory, locate, move, recall, roulette
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
 # ★ 這次活動的關鍵字。換別的活動就改這一行（整個分頁本來就是活動限定的）。
 KEY = "啤酒節"
@@ -130,6 +130,7 @@ def spent(before: dict[int, int], after: dict[int, int]) -> bool:
 
 class EventTab(BaseTab):
     TAB_TITLE = "活動"
+    GROUP = GROUP_CHORES
     ORDER = 48                       # 排在販賣裝備（47）後面
 
     def build_ui(self) -> None:

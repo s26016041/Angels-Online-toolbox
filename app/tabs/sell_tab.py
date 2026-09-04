@@ -64,7 +64,7 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import bag, locate, move, sell
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
 COLS = ("賣", "格", "名稱", "品質", "數量", "耐久", "單價", "小計")
 (COL_CHECK, COL_SLOT, COL_NAME, COL_GRADE, COL_COUNT, COL_DURA,
@@ -114,6 +114,7 @@ SETTLE_MS = 900
 
 class SellTab(BaseTab):
     TAB_TITLE = "販賣裝備"
+    GROUP = GROUP_CHORES
     ORDER = 47                       # 排在能量晶化（45）後面
 
     def build_ui(self) -> None:

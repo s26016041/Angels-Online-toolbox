@@ -61,7 +61,7 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import (bag, dungeon, entity, locate, lua, mapobj, move, produce,
                       scene, scenery, sell, supply, talkwnd)
-from app.tabs.base_tab import BaseTab, fit_spin
+from app.tabs.base_tab import GROUP_AUTO, BaseTab, fit_spin
 
 # 房間配色（互不相通的連通區各給一色）。第 7 間之後循環用。
 ROOM_COLORS = [
@@ -265,7 +265,8 @@ class MapWindow(QDialog):
 
 class DungeonMakeTab(BaseTab):
     TAB_TITLE = "副本腳本製作"
-    ORDER = 6                       # 排在自動掛機（5）後面
+    GROUP = GROUP_AUTO
+    ORDER = 7                       # 排在自動掛機（5）後面
 
     # ------------------------------------------------------------------
     def build_ui(self) -> None:
@@ -355,6 +356,15 @@ class DungeonMakeTab(BaseTab):
         sv = QVBoxLayout(stepbox)
         self.steps = QListWidget()
         self.steps.setSelectionMode(QAbstractItemView.SingleSelection)
+        # ★ 至少看得到 5 步（使用者 2026-09-05：「步驟那欄太窄」）。下面的對話
+        #   方框、狀態列一長，這格是唯一會被壓縮的，壓到剩兩三行就很難編。
+        #   用字高算，不寫死像素 —— DPI 放大時才跟得上。
+        #   ⚠ 用真的列高（sizeHintForRow）不用字高：列有內距，實測一列約 30px、
+        #   字高只有 20 —— 用字高算出來的下限只放得下 4 列。
+        self.steps.addItem("量列高用")
+        row_h = self.steps.sizeHintForRow(0)
+        self.steps.clear()
+        self.steps.setMinimumHeight(row_h * 5 + self.steps.frameWidth() * 2 + 4)
         sv.addWidget(self.steps, 1)
         sh = QHBoxLayout()
         for text, tip, fn in (

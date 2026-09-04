@@ -57,7 +57,7 @@ from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import bag, dailygift, exchange, itemname, locate, move
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
 TICK_MS = 200             # 領獎：一拍送一包（6 格 × 5 台 ≈ 6 秒，不急）
 OPEN_WAIT_MS = 900        # 開兌換商店 → 等伺服器回清單
@@ -96,6 +96,7 @@ _entries: dict[int, exchange.Entry] = {}
 
 class DailyTab(BaseTab):
     TAB_TITLE = "領取每日"
+    GROUP = GROUP_CHORES
     ORDER = 46                       # 排在能量晶化（45）與販賣裝備（47）之間
 
     def build_ui(self) -> None:

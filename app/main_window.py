@@ -1,9 +1,14 @@
 """主視窗。
 
 負責：
-1. 建立 QTabWidget 分頁容器。
+1. 建立「左邊分類 → 右邊該分類的分頁」兩層容器。
+   ★ 2026-09-05 使用者：「功能頁面太多，不好選要使用的頁面」—— 17 頁塞在一排
+     分頁列上會變成左右捲動、名字被切掉。改成左側直排 4 個分類（見
+     base_tab.GROUPS），右邊只放該分類的分頁；視窗從 940 放寬到 1040，多出來的
+     100 px 剛好給分類欄 —— **每一頁拿到的內容區跟以前一模一樣**，不必跑版。
 2. 自動掃描 app/tabs/ 底下所有模組，找出 BaseTab 的子類別並掛上分頁。
-   → 新增功能時只要在 tabs/ 丟一個新檔案，不必修改這裡。
+   → 新增功能時只要在 tabs/ 丟一個新檔案（設好 GROUP），不必修改這裡。
+3. 記住上次停在哪個分類、哪一頁，下次開啟直接回到那裡（多開時每台常常都開同一頁）。
 """
 from __future__ import annotations
 
@@ -12,15 +17,27 @@ import inspect
 import pkgutil
 import traceback
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
+    QWidget,
 )
 
 from app import __app_name__, __version__, tabs as tabs_pkg
-from app.tabs.base_tab import BaseTab
+from app.config import config
+from app.tabs.base_tab import GROUPS, BaseTab
+
+# 左側分類欄的寬度。視窗也放寬同樣的量（940 → 1040），內容區維持 940 不變。
+SIDEBAR_W = 100
+KEY_GROUP = "ui.last_group"     # 上次停在哪個分類（名稱）
+KEY_PAGE = "ui.last_page"       # 上次停在哪一頁（TAB_TITLE）
 
 
 class MainWindow(QMainWindow):
@@ -29,12 +46,31 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{__app_name__} v{__version__}")
         # 固定視窗大小：各分頁的內容（收益監控的角色卡、封包分頁的兩張表）都放在
         # 可捲動區裡，視窗本身不需要、也不該跟著內容一起長高。固定尺寸讓多開時
-        # 每次打開的位置與大小都一致。寬度要放得下封包分頁的欄位。
-        self.setFixedSize(940, 700)
+        # 每次打開的位置與大小都一致。
+        # ★ 1040 = 原本的 940 + 左側分類欄 SIDEBAR_W（使用者 2026-09-05 同意放大）。
+        self.setFixedSize(940 + SIDEBAR_W, 700)
 
-        self.tabs = QTabWidget()
-        self.tabs.setMovable(True)
-        self.setCentralWidget(self.tabs)
+        central = QWidget()
+        lay = QHBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        # 左：分類（直排）。右：每個分類一個 QTabWidget，疊在 QStackedWidget 裡。
+        self.groups = QListWidget()
+        self.groups.setFixedWidth(SIDEBAR_W)
+        self.groups.setFocusPolicy(Qt.NoFocus)
+        self.groups.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.groups.setStyleSheet(
+            "QListWidget { border: none; border-right: 1px solid #c8c8c8;"
+            "  background: #f3f3f3; font-size: 13px; }"
+            "QListWidget::item { padding: 12px 4px; }"
+            "QListWidget::item:selected { background: #ffffff; color: #000;"
+            "  border-left: 3px solid #3d7bd9; font-weight: bold; }")
+        self.stack = QStackedWidget()
+        lay.addWidget(self.groups)
+        lay.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+        # 分類名稱 → 那一組的 QTabWidget（只放有分頁的分類）
+        self._tabs_by_group: dict[str, QTabWidget] = {}
 
         self.setStatusBar(QStatusBar())
 
@@ -47,8 +83,13 @@ class MainWindow(QMainWindow):
 
         self._loaded_tabs: list[BaseTab] = []
         self._load_tabs()
-
-        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._restore_last()
+        # ⚠ 訊號**載完才接**：addTab 會對每一組的第一頁發 currentChanged，
+        #   開機時逐頁 on_show() 等於把所有分頁都跑一遍（跟以前一樣只顯示的那頁才跑）。
+        self.groups.currentRowChanged.connect(self._on_group_changed)
+        for tw in self._tabs_by_group.values():
+            tw.currentChanged.connect(
+                lambda i, tw=tw: self._on_tab_changed(tw, i))
 
         # 自動更新：背景查有沒有新版，有才跳提示。開發模式與關掉自動檢查時完全不動作。
         from app.update_ui import UpdateManager
@@ -89,8 +130,24 @@ class MainWindow(QMainWindow):
         found.sort(key=lambda c: (c.ORDER, c.TAB_TITLE))
         return found
 
+    def _group_tabs(self, group: str) -> QTabWidget:
+        """那個分類的 QTabWidget；第一次用到才建（沒分頁的分類不出現在左邊）。"""
+        tw = self._tabs_by_group.get(group)
+        if tw is None:
+            tw = QTabWidget()
+            tw.setMovable(True)
+            self._tabs_by_group[group] = tw
+            self.stack.addWidget(tw)
+            self.groups.addItem(QListWidgetItem(group))
+        return tw
+
     def _load_tabs(self) -> None:
         tab_classes = self._discover_tab_classes()
+        # ★ 分類照 GROUPS 的順序出現，不是照「哪個分頁先被載到」。
+        #   GROUP 沒登記在 GROUPS 裡的分頁排到最後一個分類 —— 寧可放錯格也不能不見。
+        order = {g: i for i, g in enumerate(GROUPS)}
+        tab_classes.sort(key=lambda c: (order.get(c.GROUP, len(GROUPS)),
+                                        c.ORDER, c.TAB_TITLE))
         for cls in tab_classes:
             if not getattr(cls, "ENABLED", True):
                 continue
@@ -106,7 +163,8 @@ class MainWindow(QMainWindow):
                 )
                 continue
             self._loaded_tabs.append(tab)
-            self.tabs.addTab(tab, cls.TAB_TITLE)
+            group = cls.GROUP if cls.GROUP in order else GROUPS[-1]
+            self._group_tabs(group).addTab(tab, cls.TAB_TITLE)
 
         if not self._loaded_tabs:
             self.statusBar().showMessage("尚未載入任何分頁")
@@ -125,13 +183,86 @@ class MainWindow(QMainWindow):
             )
 
     # ------------------------------------------------------------------
+    # 給測試／其他模組用的查詢
+    # ------------------------------------------------------------------
+    def pages(self) -> list[tuple[str, str, BaseTab]]:
+        """所有分頁，照畫面上的順序：(分類, 標題, 分頁物件)。"""
+        out = []
+        for i in range(self.groups.count()):
+            group = self.groups.item(i).text()
+            tw = self._tabs_by_group[group]
+            for j in range(tw.count()):
+                out.append((group, tw.tabText(j), tw.widget(j)))
+        return out
+
+    def show_page(self, page: QWidget) -> bool:
+        """切到那一頁（左邊分類與右邊分頁一起切）。找不到回 False。"""
+        for i in range(self.groups.count()):
+            tw = self._tabs_by_group[self.groups.item(i).text()]
+            j = tw.indexOf(page)
+            if j >= 0:
+                self.groups.setCurrentRow(i)
+                self.stack.setCurrentIndex(i)
+                tw.setCurrentIndex(j)
+                return True
+        return False
+
+    def current_page(self) -> BaseTab | None:
+        tw = self.stack.currentWidget()
+        if isinstance(tw, QTabWidget):
+            w = tw.currentWidget()
+            if isinstance(w, BaseTab):
+                return w
+        return None
+
+    # ------------------------------------------------------------------
+    # 記住上次停在哪
+    # ------------------------------------------------------------------
+    def _restore_last(self) -> None:
+        group = config.get(KEY_GROUP, "")
+        title = config.get(KEY_PAGE, "")
+        for g, t, page in self.pages():
+            if g == group and t == title:
+                self.show_page(page)
+                page.on_show()
+                return
+        if self.groups.count():
+            self.groups.setCurrentRow(0)
+            self.stack.setCurrentIndex(0)
+            page = self.current_page()
+            if page is not None:
+                page.on_show()
+
+    def _remember(self) -> None:
+        page = self.current_page()
+        row = self.groups.currentRow()
+        if page is None or row < 0:
+            return
+        tw = self.stack.currentWidget()
+        config.set(KEY_GROUP, self.groups.item(row).text())
+        config.set(KEY_PAGE, tw.tabText(tw.indexOf(page)))
+        config.save()          # ⚠ config.set 不寫檔，要接 save()
+
+    # ------------------------------------------------------------------
     # 事件
     # ------------------------------------------------------------------
-    def _on_tab_changed(self, index: int) -> None:
-        if 0 <= index < self.tabs.count():
-            widget = self.tabs.widget(index)
+    def _on_group_changed(self, row: int) -> None:
+        if row < 0:
+            return
+        self.stack.setCurrentIndex(row)
+        page = self.current_page()
+        if page is not None:
+            page.on_show()
+        self._remember()
+
+    def _on_tab_changed(self, tw: QTabWidget, index: int) -> None:
+        if tw is not self.stack.currentWidget():
+            return                     # 不是畫面上那一組（開機時逐組建立會觸發）
+        if 0 <= index < tw.count():
+            widget = tw.widget(index)
             if isinstance(widget, BaseTab):
                 widget.on_show()
+        self._remember()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名慣例)
         try:

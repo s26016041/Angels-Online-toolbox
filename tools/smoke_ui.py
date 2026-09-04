@@ -41,16 +41,19 @@ def main() -> int:
         traceback.print_exc()
         return 1
 
-    tabs = win.tabs if hasattr(win, "tabs") else None
-    if tabs is None:
-        print("✘ 找不到主視窗的分頁容器（tabs），這支測試要跟著改")
+    # ★ 2026-09-05 主視窗改成「左邊分類、右邊分頁」兩層：用 pages() 列全部、
+    #   show_page() 切過去（分類與分頁一起切）。
+    pages = win.pages() if hasattr(win, "pages") else None
+    if pages is None:
+        print("✘ 找不到主視窗的 pages()，這支測試要跟著改")
         return 1
 
-    n = tabs.count()
-    print(f"共 {n} 個分頁\n")
-    for i in range(n):
-        name = tabs.tabText(i)
-        page = tabs.widget(i)
+    n = len(pages)
+    groups = sorted({g for g, _t, _p in pages},
+                    key=[g for g, _t, _p in pages].index)
+    print(f"共 {n} 個分頁、{len(groups)} 個分類：{'／'.join(groups)}\n")
+    for group, name, page in pages:
+        name = f"{group}｜{name}"
         try:
             # ★★ **直接呼叫 on_show()**，不要只用 setCurrentIndex()。
             #   分頁是在 on_show() 裡才真的建出來的，而它是掛在 Qt 訊號上的
@@ -59,7 +62,8 @@ def main() -> int:
             #   一路 ✔ 到底（2026-08-07 第一版就是這樣，差點又放過同一個 bug）。
             if hasattr(page, "on_show"):
                 page.on_show()
-            tabs.setCurrentIndex(i)
+            if not win.show_page(page):
+                raise RuntimeError("show_page() 找不到這一頁")
             app.processEvents()
             print(f"✔ {name}")
         except Exception as exc:                       # noqa: BLE001
@@ -71,25 +75,23 @@ def main() -> int:
     #   MainWindow.closeEvent → 逐個 tab.on_close()。寫成 closeEvent 等於
     #   沒收尾 → 「QThread: Destroyed while thread '' is still running」，
     #   嚴重時 0xC0000409 直接當掉。所以這裡直接擋下來。
-    for i in range(n):
-        page = tabs.widget(i)
+    for _group, title, page in pages:
         if "closeEvent" in type(page).__dict__:
-            bad.append((tabs.tabText(i) + " closeEvent",
+            bad.append((title + " closeEvent",
                         "分頁不可以自己寫 closeEvent（Qt 不會呼叫它）——"
                         "收尾請改寫 on_close()。"))
-            print(f"✘ {tabs.tabText(i)}：寫了 closeEvent，Qt 不會呼叫 → "
+            print(f"✘ {title}：寫了 closeEvent，Qt 不會呼叫 → "
                   f"改成 on_close()")
 
     # 收尾：每個分頁的 on_close 也要能跑（會停執行緒、還原 hook）
-    for i in range(n):
-        page = tabs.widget(i)
+    for _group, title, page in pages:
         if hasattr(page, "on_close"):
             try:
                 page.on_close()
             except Exception as exc:                   # noqa: BLE001
-                bad.append((tabs.tabText(i) + " on_close",
+                bad.append((title + " on_close",
                             traceback.format_exc()))
-                print(f"✘ {tabs.tabText(i)} on_close：{exc}")
+                print(f"✘ {title} on_close：{exc}")
 
     if bad:
         print(f"\n{len(bad)} 個分頁有問題：\n")

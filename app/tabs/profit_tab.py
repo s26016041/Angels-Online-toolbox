@@ -44,7 +44,7 @@ from app.core.alarm import Alarm, AlarmDialog
 from app.core.memory import MemoryScanner
 from app.game import items, locate
 from app.game.watcher import StatsWorker
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_LAUNCH, BaseTab
 
 TEXT = "#e6e8ef"
 TEXT_MUT = "#9aa2b8"
@@ -499,6 +499,7 @@ class CharCard(QFrame):
 # ---------------------------------------------------------------------------
 class ProfitTab(BaseTab):
     TAB_TITLE = "收益監控"
+    GROUP = GROUP_LAUNCH
     ORDER = 4   # 產品主畫面，排最前面
 
     # Telegram 是在背景執行緒送的，不能直接碰 UI；用訊號把結果帶回主執行緒。

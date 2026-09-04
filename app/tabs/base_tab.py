@@ -1,13 +1,24 @@
 """分頁基底類別。
 
 所有工具分頁都繼承 BaseTab。主視窗靠這個共同介面來自動載入分頁：
-每個分頁只要設定 TAB_TITLE（分頁標題）與 ORDER（排序），
+每個分頁只要設定 TAB_TITLE（分頁標題）、GROUP（左側分類）與 ORDER（排序），
 並實作 build_ui() 建立自己的介面即可。
 """
 from __future__ import annotations
 
 import threading
 import time
+
+# ★ 左側分類（主視窗照這個順序排）。2026-09-05 使用者定案：
+#   開機與總控：自動登入、分身總控、遊戲總控、收益監控 —— 開遊戲第一件事、看全局
+#   長時間自動化：自動掛機、自動刷副本、副本腳本製作、自動生產 —— 勾起來就掛著
+#   角色雜務：領取每日、能量晶化、販賣裝備、強化裝備、活動 —— 按一下做完就走
+#   開發工具：記憶體掃描、封包／登入攔截、視窗診斷 —— 使用者自己抓 bug 用（⛔ 不隱藏）
+GROUP_LAUNCH = "開機與總控"
+GROUP_AUTO = "長時間自動化"
+GROUP_CHORES = "角色雜務"
+GROUP_DEV = "開發工具"
+GROUPS = (GROUP_LAUNCH, GROUP_AUTO, GROUP_CHORES, GROUP_DEV)
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -70,6 +81,9 @@ class BaseTab(QWidget):
     ORDER: int = 100
     # 設為 False 可讓自動載入器略過此分頁（例如尚未完成的功能）。
     ENABLED: bool = True
+    # ★ 左側分類（見 GROUPS）。2026-09-05 使用者：分頁太多不好選 → 主視窗改成
+    #   「左邊分類、右邊該分類的分頁」。沒設就落在最後一個分類，不會不見。
+    GROUP: str = "角色雜務"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

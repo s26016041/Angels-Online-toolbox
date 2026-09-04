@@ -64,7 +64,7 @@ from app.core import charname, injector, nethealth, netstat, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.game import locate, login, move
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_LAUNCH, BaseTab
 
 # ★ 角色固定第 1 個（0 起算 = 0），不給使用者選 —— 使用者指定。
 #   會這樣定是因為選到空的角色格時伺服器直接斷線（見 login.enter_game 的檢查）。
@@ -129,6 +129,7 @@ def _spawn(fn) -> None:
 
 class LoginTab(BaseTab):
     TAB_TITLE = "自動登入"
+    GROUP = GROUP_LAUNCH
     ORDER = 10
 
     def build_ui(self) -> None:

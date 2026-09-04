@@ -38,7 +38,7 @@ from app.config import config
 from app.core import charname, preload
 from app.core.memory import MemoryScanner
 from app.game import locate, unfreeze
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_LAUNCH, BaseTab
 
 # 純維護用，掃慢一點（省 CPU）；使用者也說「不用太快」。
 REFRESH_MS = 3000
@@ -54,6 +54,7 @@ def _acct(title: str) -> str:
 
 class MasterTab(BaseTab):
     TAB_TITLE = "遊戲總控"
+    GROUP = GROUP_LAUNCH
     ORDER = 13                       # 排在分身總控（12）後面
 
     def build_ui(self) -> None:

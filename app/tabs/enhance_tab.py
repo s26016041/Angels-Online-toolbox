@@ -55,7 +55,7 @@ from app.config import config
 from app.core import charname, injector, preload, window as win
 from app.core.memory import MemoryScanner
 from app.game import bag, enhance, gear, holes, itemicon, itemname, locate, move
-from app.tabs.base_tab import BaseTab
+from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
 # 模擬背包的樣子（照使用者給的 背包.png：深色格子牆＋圖示置中）
 CELL = 46
@@ -264,6 +264,7 @@ def _tooltip_html(g: gear.Gear, scanner=None) -> str:
 
 class EnhanceTab(BaseTab):
     TAB_TITLE = "強化裝備"
+    GROUP = GROUP_CHORES
     ORDER = 49                       # 排在活動（48）後面
 
     # ------------------------------------------------------------------
