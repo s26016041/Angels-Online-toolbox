@@ -122,6 +122,16 @@ ATT_STATES = ("Att", "Att2", "Cast")
 OFF_STATE = 0x12C
 STATE_MAX = 8             # 讀幾 bytes；最長的是 'Att2'
 
+# ★★ 怪自己的血量**百分比**（0~100）。**未交戰時是 0xFFFFFFFF**，伺服器只在
+#   交戰後才填（2026-08-06 定位：盯官方掛正在打的怪、找「單調下降且值域 0~100」
+#   的欄位，再跟狀態物件的目標血量 OFF_TARGET+4 交叉比對 20/21 相符，
+#   見 memory melee-attack-range）。⚠ 結構偏移，屬「大更新改版面才會壞」那類。
+#   → **恰好等於 0 ＝ 打死了**（−1 是「還沒交戰」，不是 0）。
+#   2026-09-05 使用者：副本裡的柱子死掉屍體會留一段時間、動畫狀態**不會**變
+#   'Dead'，只看 OFF_STATE 會一直對著屍體出手 → 血量歸零就當作打死了。
+OFF_HP_PCT = 0x288
+HP_PCT_NONE = 0xFFFFFFFF   # 還沒交戰（讀回來當 −1）
+
 # ★ 負重（只有自己的物件有意義）。2026-08-11 五台實測：現值一律小於上限、
 #   五台的上限各不相同（廚狐 34860、其他 11308~13084），跟遊戲介面對得上。
 #   ⚠ 這兩個是**結構偏移**，屬於「大更新改版面才會壞」那一類（CLAUDE.md）。
@@ -188,6 +198,13 @@ class Entity:
     y: float = 0.0
     kind: int = -1            # 見 OFF_KIND；-1 = 沒讀到
     state: str = ""           # 動畫狀態，見 OFF_STATE
+    hp: int = -1              # 血量百分比，見 OFF_HP_PCT；-1 = 沒交戰／沒讀到
+
+    @property
+    def hp_zero(self) -> bool:
+        """血量歸零＝打死了（屍體動畫狀態不一定會變 'Dead'，柱子就不會）。
+        ⚠ 只認**恰好 0**：−1 是沒交戰／讀不到，一律當活的。"""
+        return self.hp == 0
 
     @property
     def dead(self) -> bool:
@@ -389,7 +406,19 @@ def _entity_from_blob(addr: int, blob: bytes) -> Entity | None:
                   name,
                   (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS,
                   kind=struct.unpack_from("<I", blob, OFF_KIND)[0],
-                  state=state)
+                  state=state,
+                  hp=_hp_pct(struct.unpack_from("<I", blob, OFF_HP_PCT)[0]))
+
+
+def _hp_pct(raw: int) -> int:
+    """OFF_HP_PCT 的原始值 → 百分比；0xFFFFFFFF（沒交戰）→ −1。"""
+    return -1 if raw == HP_PCT_NONE else raw
+
+
+def read_hp_pct(scanner, addr: int) -> int:
+    """怪的血量百分比；**讀不到回 −1**（⛔ 不能回 0 —— 0 會被當成打死了）。"""
+    raw = scanner._read_bytes(addr + OFF_HP_PCT, 4)
+    return _hp_pct(struct.unpack("<I", raw)[0]) if raw else -1
 
 
 def _build_slow(scanner, addr: int) -> Entity | None:
@@ -408,7 +437,8 @@ def _build_slow(scanner, addr: int) -> Entity | None:
     return Entity(addr, _u32(scanner, addr + OFF_ID),
                   _u32(scanner, addr + OFF_TYPE), name, *pos,
                   kind=_u32(scanner, addr + OFF_KIND),
-                  state=read_state(scanner, addr))
+                  state=read_state(scanner, addr),
+                  hp=read_hp_pct(scanner, addr))
 
 
 def _build(scanner, addrs: list[int]) -> list[Entity]:
@@ -673,12 +703,35 @@ def read_live(scanner, ent: Entity) -> tuple[bool, str, tuple[float, float] | No
     if not blob:
         return (is_alive(scanner, ent), read_state(scanner, ent.addr),
                 read_pos(scanner, ent.addr))
+    return _live_from_blob(blob, ent)
+
+
+def _live_from_blob(blob: bytes, ent: Entity):
     alive = (struct.unpack_from("<I", blob, 0)[0] == VT_ENTITY
              and struct.unpack_from("<I", blob, OFF_ID)[0] == ent.eid)
     try:
-        state = blob[OFF_STATE:OFF_STATE + STATE_MAX].split(b"\x00")[0] \
-            .decode("ascii")
+        state = blob[OFF_STATE:OFF_STATE + STATE_MAX].split(b"\x00")[0]             .decode("ascii")
     except UnicodeDecodeError:
         state = ""
     vx, vy = struct.unpack_from("<II", blob, OFF_POS_X)
     return alive, state, ((vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS)
+
+
+# 再多讀到血量欄（+0x288）—— 物件本體超過 0x500 bytes，這段一定在同一物件裡。
+LIVE_HP_SPAN = OFF_HP_PCT + 4
+
+
+def read_live_hp(scanner, ent: Entity
+                 ) -> tuple[bool, str, tuple[float, float] | None, int]:
+    """`read_live` 再加一個值：(物件還在嗎, 動畫狀態, 座標, **血量百分比**)。
+
+    血量 **0 ＝ 打死了**、−1 ＝ 沒交戰或讀不到（當活的）。副本用這支：
+    柱子那種死了動畫狀態不變 'Dead' 的，只有血量能分出死活。
+    """
+    blob = scanner._read_bytes(ent.addr, LIVE_HP_SPAN)
+    if not blob:
+        alive, state, pos = read_live(scanner, ent)
+        return alive, state, pos, read_hp_pct(scanner, ent.addr)
+    alive, state, pos = _live_from_blob(blob, ent)
+    return alive, state, pos, _hp_pct(
+        struct.unpack_from("<I", blob, OFF_HP_PCT)[0])

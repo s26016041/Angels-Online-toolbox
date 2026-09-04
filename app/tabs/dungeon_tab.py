@@ -23,6 +23,11 @@
 各自改，改一邊不會拖垮另一邊。三個刻意的差別：
   · **沒有任何冷卻／黑名單**（掛機的 `_killed`、`_cool_unreach` 全部不抄）：
     放棄就換一隻（有別隻時先挑別隻），沒別隻就再問同一隻。
+  · **血量歸零就當作打死了**（使用者 2026-09-05）：副本裡的柱子死掉屍體會留
+    一段時間、動畫狀態不變 'Dead'，只看狀態會一直對屍體出手。所以挑目標
+    （`_live_monsters`／`_candidates`）與正在打的那隻（`_fight`）都多看一眼
+    實體 +0x288 的血量（`entity.read_live_hp`），恰好 0 ＝ 屍體、不挑不打；
+    −1（沒交戰）照打。⛔ 不是黑名單 —— 每拍當場重讀，沒有記任何 eid。
   · 直線超過 `MAX_CHASE`(30) 的怪整個不看（不追、也不算在「殺光了沒」裡）。
   · 走不走得到用本頁的 `_can_reach`（薄牆規則，見下），不用掛機的 nearest_open 放寬。
 
@@ -978,10 +983,17 @@ class DungeonTab(BaseTab):
         return entity.read_pos(self._sc, self._player)
 
     def _live_monsters(self) -> list:
-        """掃描結果裡還活著的怪。⚠ 屍體會在清單裡賴很久，一定要濾掉。"""
+        """掃描結果裡還活著的怪。⚠ 屍體會在清單裡賴很久，一定要濾掉。
+
+        ★ 死活看兩個訊號，任一個成立就是屍體（使用者 2026-09-05）：
+          · 動畫狀態 'Dead'（一般怪）
+          · **血量歸零**（`Entity.hp_zero`，實體 +0x288 恰好 0）—— 副本裡的
+            柱子死掉屍體會留一段時間、動畫狀態**不會**變 'Dead'，只看狀態
+            就會一直對著屍體出手。血量 −1（沒交戰）一律當活的。
+        """
         if self._last is None:
             return []
-        return [m for m in self._last.mons if not m.dead]
+        return [m for m in self._last.mons if not m.dead and not m.hp_zero]
 
     # -- 這一區走得到哪裡 ---------------------------------------------
     def _refresh_grid(self, me, dt: float) -> None:
@@ -1383,8 +1395,9 @@ class DungeonTab(BaseTab):
         for m in self._live_monsters():
             if not m.eid:
                 continue                 # eid=0 挑到整條攻擊鏈都會空轉
-            alive, st, p = entity.read_live(self._sc, m)
-            if not alive or st == "Dead" or p is None:
+            # ★ 血量也當場重讀：0 ＝ 打死了（柱子屍體狀態不會變 'Dead'）
+            alive, st, p, hp = entity.read_live_hp(self._sc, m)
+            if not alive or st == "Dead" or hp == 0 or p is None:
                 continue
             d = _d(p, me) if me is not None else 0.0
             if d > MAX_CHASE:
@@ -1595,10 +1608,19 @@ class DungeonTab(BaseTab):
                 self._last_gave_up = None
                 return False
         m = self._cur
-        # ★ 正在打的那隻不在掃描結果裡 → 先去舊位址驗一次物件：還在而且不是屍體
+        # ★ 正在打的這隻每拍當場重讀一次：物件還在嗎／動畫狀態／血量。
+        alive, st, _lp, hp_ent = entity.read_live_hp(self._sc, m)
+        # ★★ 血量歸零＝打死了，屍體還在也不管（使用者 2026-09-05：副本裡的
+        #   柱子死掉屍體會留一段時間、狀態不變 'Dead'，不看血量會一直對屍體出手）。
+        #   ⚠ 只認恰好 0：−1 是沒交戰／讀不到，照打。
+        if alive and hp_ent == 0:
+            self._say(f"「{m.name}」血量歸零＝打死了（屍體還在）→ 換下一隻")
+            self._last_gave_up = None
+            self._drop_target()
+            return True
+        # ★ 正在打的那隻不在掃描結果裡 → 用剛才那次讀取驗物件：還在而且不是屍體
         #   ＝掃描漏了（照打＋補一次全掃）；物件沒了才**連續兩拍**判沒了。
         if not any(x.eid == m.eid for x in self._live_monsters()):
-            alive, st, _p = entity.read_live(self._sc, m)
             if alive and st != "Dead":
                 self._gone = 0
                 now = time.monotonic()

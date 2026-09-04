@@ -61,6 +61,7 @@ class FakeMon:
     def __init__(self, x=10.0, y=10.0, eid=1, name="怪", addr=0x3000):
         self.x, self.y, self.eid, self.name, self.addr = x, y, eid, name, addr
         self.dead = False
+        self.hp_zero = False
 
 
 class FakeKeys:
@@ -298,7 +299,7 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     tab._pos = list(pos)
     tab._me = tuple(pos)
     tab._my_pos = lambda: tuple(tab._pos)
-    dt.entity.read_live = lambda _sc, m: (True, "", (m.x, m.y))
+    dt.entity.read_live_hp = lambda _sc, m: (True, "", (m.x, m.y), -1)
     tab._live_monsters = lambda: list(mons)
     tab._refresh_steps = lambda: None
     # ⚠ 掃描是真的 QThread：測試裡換成假的（也順便收掉，不然一堆殘留執行緒）
@@ -967,13 +968,48 @@ def main() -> int:
     dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
     tab._fight((10.0, 10.0), TICK)
     tab._live_monsters = lambda: []
-    dt.entity.read_live = lambda _sc, e: (False, "", None)
+    dt.entity.read_live_hp = lambda _sc, e: (False, "", None, -1)
     tab._fight((10.0, 10.0), TICK)
     ck("掃描少一拍 → 還不放（可能只是漏掃）", tab._cur is m)
     tab._fight((10.0, 10.0), TICK)
     ck("★ 連續兩拍不在、物件也沒了 → 放掉", tab._cur is None)
-    dt.entity.read_live = lambda _sc, e: (True, "", (e.x, e.y))
+    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
     dt.entity.read_pos = lambda _sc, _addr: None
+
+    # ★★ 血量歸零＝打死了（使用者 2026-09-05：副本裡的柱子死掉屍體會留一段時間、
+    #   動畫狀態不變 'Dead'，只看狀態會一直對屍體出手）。血量 −1＝沒交戰，當活的。
+    print("血量歸零＝打死了")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=12.0, y=10.0, eid=68, name="柱子")
+    tab._live_monsters = lambda: [m]
+    tab._keys, tab._atk, tab._mover = FakeKeys(), FakeAtk(), FakeMover()
+    tab._reach, tab._grid = None, FakeGridOpen()
+    dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("鎖定柱子", tab._cur is m)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 35)
+    tab._fight((10.0, 10.0), TICK)
+    ck("　血量 35%、狀態 Wait → 照打", tab._cur is m)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 血量 0、狀態還是 Wait（屍體殘留）→ 立刻放掉",
+       tab._cur is None and "血量歸零" in tab.status.text(), tab.status.text())
+    tab._fight((10.0, 10.0), TICK)
+    ck("★ 屍體不會再被挑到（血量 0 的候選直接跳過）", tab._cur is None)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
+    tab._fight((10.0, 10.0), TICK)
+    ck("　血量 −1（沒交戰）→ 當活的、照挑", tab._cur is m)
+    dt.entity.read_pos = lambda _sc, _addr: None
+    # 掃描快照那一層（Entity.hp_zero）也要濾
+    E = dt.entity.Entity
+    tab._last = type("S", (), {})()
+    tab._last.mons = [
+        E(0x3000, 1, 5, "活的", 12.0, 10.0, kind=4, state="Wait", hp=-1),
+        E(0x3100, 2, 5, "柱子屍體", 12.0, 10.0, kind=4, state="Wait", hp=0),
+        E(0x3200, 3, 5, "一般屍體", 12.0, 10.0, kind=4, state="Dead", hp=0),
+        E(0x3300, 4, 5, "沒讀到血", 12.0, 10.0, kind=4, state="", hp=-1)]
+    live = [x.eid for x in dt.DungeonTab._live_monsters(tab)]
+    ck("★ 掃描快照：血量 0 與 'Dead' 都當屍體濾掉、−1 留著", live == [1, 4], str(live))
 
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
     #   第二個病灶）：KeyWorker 拿它讀「我離目標多遠」，讀成 (0,0) 就每一招
