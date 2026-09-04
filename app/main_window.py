@@ -59,12 +59,19 @@ class MainWindow(QMainWindow):
         self.groups.setFixedWidth(SIDEBAR_W)
         self.groups.setFocusPolicy(Qt.NoFocus)
         self.groups.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # ★ 顏色**全部用系統調色盤**，不自己配色（使用者 2026-09-05：「左邊顏色
+        #   看不清，而且要顏色統一」）：背景＝視窗底色、選中＝跟其他清單一樣的
+        #   反白色（藍底白字），沒選中＝一般文字色。只調字級與行距。
+        #   ⚠ 選中要指名 palette(highlight)：清單設了 NoFocus，不指名的話 Qt 會用
+        #     「沒焦點」那組淡灰反白，就是原本看不清的原因之一。
         self.groups.setStyleSheet(
-            "QListWidget { border: none; border-right: 1px solid #c8c8c8;"
-            "  background: #f3f3f3; font-size: 13px; }"
-            "QListWidget::item { padding: 12px 4px; }"
-            "QListWidget::item:selected { background: #ffffff; color: #000;"
-            "  border-left: 3px solid #3d7bd9; font-weight: bold; }")
+            "QListWidget { border: none; border-right: 1px solid palette(mid);"
+            "  background: palette(window); font-size: 13px; }"
+            # ⚠ 字級 13 是「長時間自動化」六個字在 100px 寬剛好放得下的上限；
+            #   14 會被省略成「長時間自動…」。
+            "QListWidget::item { padding: 14px 4px; color: palette(window-text); }"
+            "QListWidget::item:selected { background: palette(highlight);"
+            "  color: palette(highlighted-text); }")
         self.stack = QStackedWidget()
         lay.addWidget(self.groups)
         lay.addWidget(self.stack, 1)
