@@ -117,35 +117,6 @@ class Grid:
                     return False
         return self.walkable(x1, y1)
 
-    def line_free(self, a, b) -> bool:
-        """兩格**之間**有沒有牆（兩端自己那一格不算）。拿來當「技能會不會被
-        地形擋線」的代理判斷：中間全是可走格 → 大概打得到；有牆 → 先繞。
-
-        ★ 跟 `clear_line()` 差在**不看兩端**：角色常站在標成不可走的格上
-          （貼牆、石頭邊），怪也常站在牆邊／門框上 —— 看兩端的話幾乎永遠 False。
-        ⚠ 只是代理：不可走 ≠ 一定擋子彈（水面、矮欄杆）。判錯的代價只是
-          多走幾格靠近一點，真訊號仍是目標血量（見 dungeon_tab PUSH_IN）。
-        """
-        x0, y0 = int(a[0]), int(a[1])
-        x1, y1 = int(b[0]), int(b[1])
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        x, y = x0, y0
-        while True:
-            e2 = err * 2
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-            if (x, y) == (x1, y1):
-                return True
-            if not self.walkable(x, y):
-                return False
-
     def reachable(self, tx: int, ty: int) -> set | None:
         """所有「走得到 (tx,ty)」的格子（同一個連通區）。那一格不能走回 None。
 
