@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass
 
 from app.game import itemname, quickbar
@@ -178,6 +179,44 @@ WORN_LAST = 11
 DOLL_WORN_FIRST = 242
 # ★ 出處同上：DOLL_SLOT_END＝249（遊戲自己的 Lua 全域常數）
 DOLL_WORN_LAST = 249
+
+# ★★★ 「放得進東西」的格子 —— 照抄遊戲「從商城倉庫領取」本體算空格的方法
+#   （0x5D336A，2026-09-04 反組譯：它要驗「背包夠不夠放」時就是這樣數的）：
+#
+#       for s in 20..69:                        ; 角色自己的 50 格
+#           if not 擴充通行證 and s >= 60: 略過   ; ← 60~69 要有通行證才開
+#           if 第 s 格是空的: n += 1
+#       for s in 70 .. 70 + 背包容量 - 1:        ; 穿著的背包給的格子
+#           if 第 s 格是空的: n += 1
+#
+#   擴充通行證（0x5AEFF6）＝容器**第 742 格**（0x2E6）的物品：有、而且 +0x2E
+#     時限是 0（永久）或還沒到期（跟 time() 的 Unix 秒比）→ 60~69 可用。
+#   背包容量（0x5AABD3）＝穿在**第 7 格**的背包：
+#       範本 +0x108（動態資料1＝基本格數）
+#     + 物品 +0x0C 起 5 個進階屬性裡編號 0x30 的值加總（0x532E67；高 6 位編號、
+#       低 26 位值，同 gear.OFF_ADV）
+#     + 物品 +0xB0 起 5 個 byte 裡等於 0x30 那一格對應的 +0xB8+i*4（0x532E9E）
+#     沒穿背包＝0 → 70 起全部不可用。
+#   隔壁 0x5AF037 也印證：格號落在 (70+容量-1, 0xA9] 就跳字串 0x109F（格子沒開）。
+#
+#   ⚠⚠ 2026-09-04 使用者回報「換技能球會『領取商品失敗』」的根因：舊版
+#     `mall.free_slot()` 把 20~169 **全當可用格**，角色那 40 格一滿就挑到 60
+#     （鎖住的）→ 伺服器拒收。實測五台：背包都是 30 格（開學-旅行背包，範本
+#     +0x108 = 30），東西全落在 70~99、60~69 與 100 以上一件都沒有 —— 吻合。
+#   ★ 讀不到一律往「少算」退（少幾格＝下一輪重試；多算＝送錯格）。
+CHAR_OPEN_LAST = 0x3B        # 20~59：不用通行證就能放
+CHAR_PASS_FIRST = 0x3C       # 60~69：要擴充通行證
+CHAR_PASS_LAST = 0x45
+EXT_FIRST = 0x46             # 70 起：穿著的背包給的格子
+BAG_WORN_SLOT = 7            # 穿著的背包在第 7 格（0x5AABD3 `push 7`）
+PASS_SLOT = 0x2E6            # 擴充通行證在第 742 格（0x5AEFF6 `push 0x2e6`）
+BAG_CAP_ATTR = 0x30          # 「背包格數」的屬性編號（兩處都比 0x30）
+ITEM_ADV = 0x0C              # 進階屬性 5 個 u32（同 gear.OFF_ADV）
+ITEM_ADV_N = 5
+ITEM_EXTRA_ID = 0xB0         # 5 個 byte 編號…（0x532E9E）
+ITEM_EXTRA_VAL = 0xB8        # …對應的 5 個 u32 值
+ITEM_EXTRA_N = 5
+ITEM_CAP_SPAN = ITEM_EXTRA_VAL + ITEM_EXTRA_N * 4   # 算容量要讀到這裡
 
 GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）
 # ★ 出處：gold() 那段反組譯（0x508C24 取第 0 格）＋五台實測第 0 格種類恆為 1
@@ -593,3 +632,75 @@ def synced(scanner) -> bool:
         return False                     # 還沒進場／換地圖中／定位失敗
     begin, count = got
     return count >= 1 and _gold_slot_ok(scanner, begin)
+
+
+# -- 放得進東西的格子 -------------------------------------------------------
+
+def _slot_ptr(scanner, begin: int, count: int, slot: int) -> int:
+    """容器第 slot 格的物品指標；沒這格／空格／讀不到／不像指標一律回 0。"""
+    if not 0 <= slot < count:
+        return 0
+    ptr = _u32(scanner, begin + slot * 4)
+    return ptr if 0x10000 < ptr < 0x7FFF0000 else 0
+
+
+def pass_ok(scanner, begin: int, count: int, now: float | None = None) -> bool:
+    """60~69 開了嗎（第 742 格的擴充通行證還有效）。讀不到＝沒開（少算）。"""
+    ptr = _slot_ptr(scanner, begin, count, PASS_SLOT)
+    if not ptr:
+        return False
+    raw = scanner._read_bytes(ptr + ITEM_TIMELIMIT, 4)
+    if not raw:
+        return False
+    until = struct.unpack("<I", bytes(raw))[0]
+    if until == 0:
+        return True                          # 永久
+    return until > (time.time() if now is None else now)
+
+
+def bag_capacity(scanner, begin: int, count: int) -> int:
+    """穿著的背包給幾格（70 起算）。沒穿／讀不到範本＝0（少算）。"""
+    ptr = _slot_ptr(scanner, begin, count, BAG_WORN_SLOT)
+    if not ptr:
+        return 0
+    raw = scanner._read_bytes(ptr, ITEM_CAP_SPAN)
+    if not raw:
+        return 0
+    b = bytes(raw)
+    tmpl = struct.unpack_from("<I", b, ITEM_TMPL)[0]
+    if not 0x10000 < tmpl < 0x7FFF0000:
+        return 0
+    traw = scanner._read_bytes(tmpl + TMPL_PARAM1, 4)
+    if not traw:
+        return 0                             # 基本格數讀不到 → 整個當 0
+    cap = struct.unpack("<i", bytes(traw))[0]
+    for i in range(ITEM_ADV_N):
+        v = struct.unpack_from("<I", b, ITEM_ADV + i * 4)[0]
+        if (v >> 26) == BAG_CAP_ATTR:
+            cap += v & 0x3FFFFFF
+    for i in range(ITEM_EXTRA_N):
+        if b[ITEM_EXTRA_ID + i] == BAG_CAP_ATTR:
+            cap += struct.unpack_from("<i", b, ITEM_EXTRA_VAL + i * 4)[0]
+    # 超過賣東西視窗那段（0xA9）的格子遊戲自己也不認（0x5AF037）
+    return max(0, min(cap, LAST_SLOT - EXT_FIRST + 1))
+
+
+def usable_slots(scanner, head_=None, now: float | None = None
+                 ) -> list[int] | None:
+    """遊戲認定**放得進東西**的背包格號，由小到大；容器讀不到回 None。
+
+    ⚠⚠ 要交給伺服器的「目標背包格號」（領商城倉庫、以後任何塞東西進背包的
+      封包）**只能從這張清單挑**，不能拿 `FIRST_SLOT~LAST_SLOT` 直接挑：
+      那段是「賣東西視窗會看的格子」，裡面有一半是還沒開的格 —— 送過去就是
+      「領取商品失敗」（2026-09-04 換球實錄）。算法出處見 CHAR_OPEN_LAST 上方。
+    · `head_`：已經問過 `head()` 的話把 (表頭, 格數) 傳進來省一趟。
+    """
+    got = head_ if head_ is not None else head(scanner)
+    if got is None:
+        return None
+    begin, count = got
+    out = list(range(FIRST_SLOT, CHAR_OPEN_LAST + 1))
+    if pass_ok(scanner, begin, count, now):
+        out += range(CHAR_PASS_FIRST, CHAR_PASS_LAST + 1)
+    out += range(EXT_FIRST, EXT_FIRST + bag_capacity(scanner, begin, count))
+    return out

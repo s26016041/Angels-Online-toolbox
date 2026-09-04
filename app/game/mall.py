@@ -58,6 +58,9 @@
   ⚠ 遊戲自己的「右鍵領取」那條路（`getmallbagitem`）第二個參數是**沒初始化
     的堆疊值**（0x592552 只 push 了一個參數給 ret 8 的函式）—— 我們不學它，
     照 `dropmallitem` 那條**版面正確**的路走：明確給一個空背包格號。
+  ⚠⚠ 目標格號**只能是遊戲認定「開著」的格**（`bag.usable_slots()`：20~59、
+    有擴充通行證才有 60~69、穿著的背包給的 70 起）。送一個鎖住的格號伺服器
+    就回「領取商品失敗」—— 2026-09-04 換技能球踩到（角色 40 格滿了挑到 60）。
 
 ✅ **2026-08-21 實機驗證（三包全通）**：
    · 領取：嵐狐把商城倉庫裡的經驗加倍卡（流水號 1636596）領進背包成功。
@@ -256,16 +259,25 @@ def storage(scanner) -> list[tuple[int, int, int]] | None:
 
 
 def _free_slots(scanner) -> list[int] | None:
-    """背包所有空格（陣列索引）。整袋沒讀完就回 None，不猜。"""
+    """背包**放得進東西**的空格（陣列索引）。整袋沒讀完就回 None，不猜。
+
+    ⚠⚠ 只從 `bag.usable_slots()` 挑 —— 那是遊戲自己「領商城倉庫」本體算
+      空格的範圍（20~59 ＋ 有通行證才開的 60~69 ＋ 穿著的背包給的 70 起）。
+      舊版拿 `FIRST_SLOT~LAST_SLOT`（賣東西視窗的範圍）當可用格，角色那
+      40 格一滿就挑到鎖住的第 60 格 → 伺服器回「領取商品失敗」
+      （使用者 2026-09-04 換技能球實錄）。
+    """
     got = bag.head(scanner)
     if got is None:
         return None
     items, complete = bag.scan(scanner)
     if not complete:
         return None
+    usable = bag.usable_slots(scanner, got)
+    if usable is None:
+        return None
     used = {it.slot for it in items}
-    return [s for s in range(bag.FIRST_SLOT, bag.LAST_SLOT + 1)
-            if s not in used]
+    return [s for s in usable if s not in used]
 
 
 def free_slot(scanner) -> int | None:
