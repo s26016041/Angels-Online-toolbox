@@ -261,6 +261,13 @@ JUMP_TILES = 3.0
 JUMP_MAX_GAP = 0.35
 # 傳到的位置跟腳本記的出口差這麼多格就當「傳到別的地方」，大聲停下。
 LAND_TOL = 8.0
+# ★★ 順移要「從傳點上跳走」才算是傳點搬的（2026-09-05 使用者實機：無限塔第 41／52
+#   步人還在 10 多格外走過去，伺服器把位置拉回幾格（[[whitefox-rollback]] 那種丟包
+#   修正）→ 一拍跳 ≥3 格 → 被當成「傳點把人送到別的地方」大聲停下，其實根本沒踩到傳點）。
+#   → 跳之前站的位置離腳本記的傳點要在這個距離內；不在＝不是傳點搬的，不算、繼續走。
+#   ⚠ 這不是「離傳點多遠判完成」（那條 ⛔）：判完成仍看一拍跳了多少；這裡只擋
+#     「人根本不在傳點上」的跳動。落點對得上 `land` 的一律算（觸發範圍比記的寬也吃得到）。
+PORTAL_FROM = 6.0
 # ★★ 地形圖多久重讀一次（秒）。使用者 2026-09-02：
 #   「地圖之間有可能會用牆壁隔開，解謎之後會打開又會變成聯通，
 #     所以記憶體地圖要即時刷新」
@@ -809,7 +816,7 @@ class DungeonTab(BaseTab):
         self._map_key = None         # 現在**應該**在哪一張圖（走過傳點可能換）
         self._pos_prev = None        # 上一拍的位置（順移偵測用）
         self._pos_t = 0.0
-        self._jumped = False         # 這一拍有沒有順移
+        self._jumped = None          # 這一拍有沒有順移：有＝跳之前站的位置 (x, y)
         self._grid_t = 0.0           # 還有多久重讀地形圖
         # ---- 全自動循環（見 PARTY_MODES 的說明）----
         self._loop = False           # 要不要循環（「從第幾步」有選＝單輪不循環）
@@ -1346,21 +1353,23 @@ class DungeonTab(BaseTab):
         note = self._send_portal((gx, gy), ent.get("model"), "入口")
         self._say(f"{note}…{tail}")
 
-    def _check_jump(self, me) -> bool:
-        """這一拍人有沒有被「搬」過去（順移）。
+    def _check_jump(self, me):
+        """這一拍人有沒有被「搬」過去（順移）。回**跳之前站的位置** (x, y)，沒有回 None。
 
         ★ 傳點的完成訊號就是它（使用者 2026-09-02：「人被傳走不會換地圖，
           有順移就算吧，有時候傳點之間也很短」）—— 用距離門檻會漏掉短傳點，
           用速度就分得出來：跑步一拍最多 0.6 格，順移一拍好幾十格。
         ⚠ 兩次取樣隔太久（畫面卡住、剛開始跑）一律**不判**，只重設基準 ——
           寧可漏一次（下一拍還會再看），不要誤判成傳送了就跳下一步。
+        ★ 回跳之前的位置是給傳點那一步驗「是不是**從傳點上**跳走的」（`PORTAL_FROM`）
+          —— 伺服器拉回位置也是一拍跳好幾格，人不在傳點上就不算。
         """
         now = time.monotonic()
         prev, prev_t = self._pos_prev, self._pos_t
         self._pos_prev, self._pos_t = me, now
         if prev is None or now - prev_t > JUMP_MAX_GAP:
-            return False
-        return _d(prev, me) >= JUMP_TILES
+            return None
+        return prev if _d(prev, me) >= JUMP_TILES else None
 
     def _check_map_change(self) -> bool:
         """換圖了就處理掉。回 True＝這一拍不要再往下跑。
@@ -1948,22 +1957,34 @@ class DungeonTab(BaseTab):
             # ★ 完成條件**不是**「走到那一格」而是「人被搬走了」——踩上傳點
             #   的下一瞬間人就被移走，那一格永遠不會「到達」。
             #   換圖那種由 `_check_map_change` 接手；同一張圖裡的順移看這裡。
+            gx, gy = step["to"]
             if self._jumped:
+                frm = self._jumped                 # 跳之前站的位置
                 land = step.get("land")
-                if land and _d(land, me) > LAND_TOL:
+                near_land = bool(land) and _d(land, me) <= LAND_TOL
+                from_portal = _d((gx, gy), frm) <= PORTAL_FROM
+                if not near_land and not from_portal:
+                    # ★ 人不在傳點上就跳了 ＝ 不是傳點搬的（伺服器拉回／被擊退）
+                    #   → 不算完成、更不能當「傳到別的地方」停下
+                    #   （2026-09-05 無限塔第 41／52 步的誤停就是這個）。
+                    self._notify(f"第 {self._i + 1} 步　位置一拍跳了 "
+                                 f"{_d(frm, me):.0f} 格，但跳之前離傳點 "
+                                 f"{_d((gx, gy), frm):.0f} 格（不在傳點上）"
+                                 f"→ 不算傳送，繼續走")
+                elif land and not near_land:
                     self._stop(
                         f"⛔ 第 {self._i + 1} 步：傳點把人送到 "
                         f"({me[0]:.0f}, {me[1]:.0f})，"
                         f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— "
                         f"差 {_d(land, me):.0f} 格，停下來")
                     return
-                self._drop_target()
-                self._scan.force_full(self._pid)   # 順移到新的一區＝新的怪
-                self._say(f"第 {self._i + 1} 步　傳點過了，落在 "
-                          f"({me[0]:.0f}, {me[1]:.0f})")
-                self._next()
-                return
-            gx, gy = step["to"]
+                else:
+                    self._drop_target()
+                    self._scan.force_full(self._pid)   # 順移到新的一區＝新的怪
+                    self._say(f"第 {self._i + 1} 步　傳點過了，落在 "
+                              f"({me[0]:.0f}, {me[1]:.0f})")
+                    self._next()
+                    return
             if _d((gx, gy), me) <= PORTAL_NEAR:
                 # ★ 已經站在傳點上卻沒被搬走 → 每 PORTAL_POKE 秒對它送一次
                 #   互動（有些傳點要點一下才走）。⛔ 不是每一拍狂送：那是

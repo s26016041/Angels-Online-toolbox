@@ -513,7 +513,7 @@ def main() -> int:
     tab._pos = [50.2, 50.2]
     run(tab, 0.3)
     ck("★ 就算站上去了也還是不算完成", tab._i == 0, str(tab._i))
-    tab._jumped = True
+    tab._jumped = (50.2, 50.2)          # 從傳點上跳走（跳之前站的位置）
     run(tab, 0.1)
     ck("★ 順移了 → 這一步完成", tab._i == 1)
 
@@ -699,15 +699,43 @@ def main() -> int:
     # 出口對不對得上（腳本記了 land 就要驗）
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
     tab._pos = [201.0, 41.0]
-    tab._jumped = True
+    tab._jumped = (50.0, 50.5)
     run(tab, 0.1)
     ck("★ 傳到腳本記的出口 → 過", tab._i == 1, tab.status.text())
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}])
     tab._pos = [12.0, 300.0]
-    tab._jumped = True
+    tab._jumped = (50.0, 50.5)
     run(tab, 0.1)
     ck("★ 傳到別的地方 → 大聲停下（不拿別處的座標繼續跑）",
        not tab.run_cb.isChecked(), tab.status.text())
+
+    # ★★ 2026-09-05 使用者實機（無限塔第 41／52 步）：人還在 10 多格外走過去，
+    #   伺服器把位置拉回幾格（一拍跳 ≥3 格）→ 舊版當成「傳點把人送到別的地方」
+    #   大聲停下，其實根本沒踩到傳點。→ 跳之前不在傳點上＝不算傳送，繼續走。
+    tab = make_tab([{"do": "portal", "to": [141.3, 277.6],
+                     "land": [47.5, 278.5]}], pos=(128.0, 270.0))
+    tab._jumped = (134.0, 270.0)              # 跳之前離傳點 10 格
+    run(tab, 0.1)
+    ck("★★ 不在傳點上就跳了（伺服器拉回）→ 不停、不算完成",
+       tab.run_cb.isChecked() and tab._i == 0, tab.status.text())
+    ck("　照樣往傳點走", tab._nav.goal == (141.3, 277.6), str(tab._nav.goal))
+    ck("　狀態列講得出「不算傳送」", "不算傳送" in tab.status.text(),
+       tab.status.text())
+    tab = make_tab([{"do": "portal", "to": [50, 50]}], pos=(30.0, 30.0))
+    tab._jumped = (36.0, 30.0)
+    run(tab, 0.1)
+    ck("★ 沒記出口的舊腳本：不在傳點上跳了一樣不算",
+       tab._i == 0 and tab.run_cb.isChecked(), tab.status.text())
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}],
+                   pos=(201.0, 41.0))
+    tab._jumped = (43.0, 50.0)                # 離傳點 7 格（比 PORTAL_FROM 遠）
+    run(tab, 0.1)
+    ck("★ 跳之前離傳點 7 格但落在記的出口 → 照樣算過（觸發範圍比記的寬）",
+       tab._i == 1, tab.status.text())
+    tab = make_tab([{"do": "portal", "to": [50, 50]}], pos=(80.0, 50.0))
+    tab._jumped = (52.0, 51.0)                # 站在傳點上跳走、沒記出口
+    run(tab, 0.1)
+    ck("★ 從傳點上跳走、腳本沒記出口 → 算過", tab._i == 1, tab.status.text())
 
     # 順移偵測本身：速度分得出「走的」跟「傳的」
     tab = make_tab([{"do": "clear"}])
@@ -715,7 +743,8 @@ def main() -> int:
     ck("★ 走路一拍動 0.5 格 → 不是順移",
        not tab._check_jump((10.5, 10.0)))
     tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic()
-    ck("★ 一拍跳 40 格 → 是順移", tab._check_jump((50.0, 10.0)))
+    ck("★ 一拍跳 40 格 → 是順移，而且回的是跳之前站的位置",
+       tab._check_jump((50.0, 10.0)) == (10.0, 10.0))
     tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic() - 5.0
     ck("★ 兩次取樣隔 5 秒 → 不判（可能是走過去的），只重設基準",
        not tab._check_jump((50.0, 10.0)))
