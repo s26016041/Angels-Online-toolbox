@@ -89,6 +89,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 
@@ -125,6 +126,13 @@ from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, KeyWorker,
                                TargetWorker)
 
 TICK_MS = 100
+# ★ 執行紀錄（2026-09-05 使用者回報「exe 跑一跑會卡住、py 跑就正常」）：exe 沒有主控台、
+#   狀態列一閃就過，出事時完全沒有證據可以比對。開跑就寫 %APPDATA%\AngelsOnlineToolbox\
+#   dungeon_run.log：狀態列（每秒最多一行）、提示、鎖定了哪隻怪（含候選排名：直線距離／
+#   路徑長度／為什麼不打）、停機原因。exe 與 py 各跑一次就能對照。超過 RUNLOG_MAX 就重來。
+RUNLOG_NAME = "dungeon_run.log"
+RUNLOG_MAX = 5_000_000
+RUNLOG_GAP = 1.0
 # 掃描節奏。★ 使用者 2026-09-02：「趕路掃描改成可接受最快，這個很糟糕，
 #   不管是打怪還是刷副本」——**兩檔都用掛機頁驗過的 0.15 秒**
 #   （farm_tab.REFRESH_GAP：掃一次 35ms、執行緒跑 LowPriority、不影響畫面，
@@ -367,6 +375,11 @@ class DungeonTab(BaseTab):
         #   會跟上，另一邊拿舊的牆算路（使用者 2026-09-02 提醒門會開關）。
         self._maps = terrain.Cache()
         self._nav = navigate.Navigator(self._maps)
+        self._runlog = None            # 執行紀錄檔（開跑才開，見 RUNLOG_NAME）
+        self._runlog_last = ""
+        self._runlog_t = 0.0
+        self._runlog_step = -1
+        self._rank_note = ""           # 上一次挑目標的候選排名（寫進紀錄用）
         self._reset_run()
 
         root = QVBoxLayout(self)
@@ -1026,6 +1039,7 @@ class DungeonTab(BaseTab):
         self._keys.vks = self._picked_keys()
         self._keys.start()
         self._started = True
+        self._runlog_open()
         if phase == "fly":
             self.status.setText(
                 f"「{script.name}」：先用趴趴GO飛去「{fly.name}」，"
@@ -1076,6 +1090,7 @@ class DungeonTab(BaseTab):
             self.run_cb.setChecked(False)
             self.run_cb.blockSignals(False)
         started, self._started = self._started, False
+        self._runlog_close(why)
         if why and not quiet:
             self.status.setText(why)
             # ★ 開跑之後因為「出問題」停下來 → 通知（使用者 2026-09-05）
@@ -1577,13 +1592,18 @@ class DungeonTab(BaseTab):
                 return (d, d, mon)
             return None
         best = None
+        rank = []
         for d, mon, pos in pool:
             limit = best[0] if best is not None else cap
             if limit is not None and d >= limit:
                 break
             c = self._path_cost(grid, me, pos, max_cost=limit)
+            rank.append(f"{mon.name}@{d:.1f}→{'無路' if c is None else f'{c:.1f}'}")
             if c is not None and (best is None or c < best[0]):
                 best = (c, d, mon)
+        # 給執行紀錄看的：算過路徑的候選（直線→路徑），沒算到的是直線已經比最佳路徑遠
+        self._rank_note = "、".join(rank) + (f"（其餘 {len(pool) - len(rank)} 隻直線更遠）"
+                                              if len(pool) > len(rank) else "")
         return best
 
     def _pick_next(self) -> bool:
@@ -1638,6 +1658,10 @@ class DungeonTab(BaseTab):
         self._keys.eid = mon.eid
         self._keys.set_on(True)
         self._say(f"鎖定「{mon.name}」　距離 {d:.1f} 格")
+        self._runlog_write(
+            f"鎖定 {mon.name} eid={mon.eid} 直線 {d:.1f}　候選：{self._rank_note or '（沒地形圖，照直線）'}"
+            + (f"　不打：{self._left_out_note()}" if self._left_out_note() else ""),
+            force=True)
 
     def _switch_closer(self, cur, dist: float | None) -> bool:
         """趕路途中冒出**路徑明顯更短**的怪就改打牠；真的換了回 True。
@@ -2639,6 +2663,62 @@ class DungeonTab(BaseTab):
         else:
             self._notice = ""
         self.status.setText(text)
+        self._runlog_write(text, throttle=True)
+
+    # -- 執行紀錄（見 RUNLOG_NAME 的說明）------------------------------------
+    def _runlog_open(self) -> None:
+        """開跑時開紀錄檔並寫一行表頭。開不了就算了（紀錄不能影響功能）。"""
+        try:
+            from app import __version__
+            from app.core.crashlog import log_dir
+            p = log_dir() / RUNLOG_NAME
+            if p.exists() and p.stat().st_size > RUNLOG_MAX:
+                p.unlink()
+            self._runlog = p.open("a", encoding="utf-8")
+        except Exception:                                # noqa: BLE001
+            self._runlog = None
+            return
+        self._runlog_last, self._runlog_t, self._runlog_step = "", 0.0, -1
+        frozen = bool(getattr(sys, "frozen", False))
+        self._runlog_write(
+            f"=== 開跑 v{__version__} {'exe' if frozen else 'py'}　帳號={self._account()}"
+            f"　腳本={self._script.name}（{len(self._script.steps)} 步，從第 {self._i + 1} 步）"
+            f"　循環={self._loop}　組隊={self._party}　phase={self._phase}", force=True)
+
+    def _runlog_write(self, text: str, throttle: bool = False,
+                      force: bool = False) -> None:
+        """寫一行：時間 [第幾步/共幾步] (我的位置) 文字。
+        `throttle`＝狀態列那種每拍都在變的，同一步內每 RUNLOG_GAP 秒最多一行；
+        內容沒變一律不重寫。"""
+        f = self._runlog
+        if f is None:
+            return
+        now = time.monotonic()
+        if not force:
+            if text == self._runlog_last:
+                return
+            if (throttle and self._i == self._runlog_step
+                    and now - self._runlog_t < RUNLOG_GAP):
+                return
+        self._runlog_last, self._runlog_t, self._runlog_step = text, now, self._i
+        try:
+            me = self._me
+            pos = f"({me[0]:.1f},{me[1]:.1f})" if me else "(?)"
+            n = len(self._script.steps) if self._script else 0
+            f.write(f"{time.strftime('%H:%M:%S')} [{self._i + 1}/{n}] {pos} {text}\n")
+            f.flush()
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _runlog_close(self, why: str) -> None:
+        if self._runlog is None:
+            return
+        self._runlog_write(f"=== 停止：{why}", force=True)
+        try:
+            self._runlog.close()
+        except Exception:                                # noqa: BLE001
+            pass
+        self._runlog = None
 
     def _check_death(self, dt: float) -> bool:
         """角色死了嗎 → 停機＋通知；回 True＝這一拍到此為止。
@@ -2725,6 +2805,7 @@ class DungeonTab(BaseTab):
         """停留幾秒的提示（地形變了、可達區怪怪的…）。"""
         self._notice, self._notice_t = text, time.monotonic() + NOTICE_SECS
         self.status.setText(text)
+        self._runlog_write(f"★ {text}", force=True)
 
     def _mon_note(self) -> str:
         """狀態列上的怪物盤點：看得到幾隻、其中幾隻走得到。
