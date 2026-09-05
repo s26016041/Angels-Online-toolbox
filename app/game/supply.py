@@ -1646,17 +1646,24 @@ def run_full_supply(mover, scanner, say=None,
             f"（回程點：{back.name}）" if back else "（⚠ 沒有回程傳送點）"))
 
     # 2. 天使之翼回城
-    slot = _wing_slot(scanner)
-    if slot is None:
-        return False, f"背包沒有{itemname.label(recall.RECALL_ITEM)}（回程道具）"
-    if not recall.use_item(mover, slot):
-        return False, "回程道具送不出去"
-    note("用天使之翼回城中…")
-    home = _wait_map_change(scanner, here, WING_WAIT)
-    if home is None:
-        return False, "回城後地圖沒變（回程可能失敗）"
-    note(f"回到 {scene.scene_name(home)}")
-    time.sleep(1.0)                       # 落地穩定一下
+    # ★ 已經站在補給城裡（死亡「回標記點」復活後、或人本來就在城裡）→ 不燒翼、不等換圖。
+    #   2026-09-05 自動刷副本「死亡當成一場 → 復活回城 → 補給」要走這條；以前會卡在
+    #   「回城後地圖沒變」整趟失敗。只認 NPC_TABLE 有的城 —— 不在表裡就照舊用翼。
+    if NPC_TABLE.get(here):
+        home = here
+        note(f"已在 {scene.scene_name(home)}，不用回城")
+    else:
+        slot = _wing_slot(scanner)
+        if slot is None:
+            return False, f"背包沒有{itemname.label(recall.RECALL_ITEM)}（回程道具）"
+        if not recall.use_item(mover, slot):
+            return False, "回程道具送不出去"
+        note("用天使之翼回城中…")
+        home = _wait_map_change(scanner, here, WING_WAIT)
+        if home is None:
+            return False, "回城後地圖沒變（回程可能失敗）"
+        note(f"回到 {scene.scene_name(home)}")
+        time.sleep(1.0)                   # 落地穩定一下
 
     # ── 回程收尾（★★ 不准射後不理）────────────────────────────
     # 「送出去≠到得了」是這個專案抓過的真根因（memory jump-back-channel-fix，

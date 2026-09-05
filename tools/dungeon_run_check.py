@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,6 +19,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PySide6.QtWidgets import QApplication                # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
+
+# ⚠⚠ 測試會按勾選框／改設定 → 分頁的 _save_settings 會寫 config：一律改寫到暫存檔，
+#   **不准動使用者的 config.json**（2026-09-05 抓到：副本設定的測試值 3 場／90 分被寫進
+#   使用者的 dungeon.default 底下，下次開程式就吃到）。
+import tempfile                                           # noqa: E402
+from pathlib import Path                                  # noqa: E402
+
+from app.config import config as _config                  # noqa: E402
+
+_config._path = Path(tempfile.mkdtemp(prefix="ao_dungeon_check_")) / "config.json"
+_config._data = {}
 
 from app.game import dungeon                              # noqa: E402
 from app.tabs import dungeon_tab as dt                    # noqa: E402
@@ -1159,7 +1171,8 @@ def main() -> int:
     tab._stop("✔ 這一趟結束")
     ck("　正常跑完 → 不通知", fake.fired == [])
 
-    # 角色死亡：HP ≤ 0 連續 DEATH_HITS 次 → 停機＋通知
+    # 角色死亡：HP ≤ 0 連續 DEATH_HITS 次 → ★ 死在副本裡＝當成一場（使用者 2026-09-05）：
+    #   送「回標記點」復活 → 換到標記點那張圖 → 沒循環就停（✔，不警報）
     class St:
         def __init__(self, hp):
             self.hp = hp
@@ -1183,8 +1196,60 @@ def main() -> int:
     dead = False
     for _ in range(int(2.0 / TICK)):
         dead = tab._check_death(TICK) or dead
-    ck("★ HP 0 連續兩次 → 停機＋通知「角色死亡」", dead and not tab.run_cb.isChecked()
+    ck("★★ HP 0 連續兩次（在副本裡）→ 不停機、不警報，進「復活」段、算一趟",
+       dead and tab.run_cb.isChecked() and fake.fired == [] and tab._cycle == "revive"
+       and tab._rounds == 1, f"{tab._cycle} rounds={tab._rounds} fired={fake.fired}")
+    revived = []
+    dt.revive.to_mark = lambda mv: (revived.append(1), True)[1]
+    closed = []
+    dt.revive.close_window = lambda mv, sc: (closed.append(1), (True, ""))[1]
+    dt.scene.current_id = lambda sc, **k: 98
+    dt.scene.map_key = lambda v: v
+    tab._map_key = 98
+    tab._revive_map = 98
+    run(tab, 1.0)
+    ck("　死亡未滿 3 秒 → 還不送「回標記點」", not revived and "秒後" in tab.status.text(),
+       tab.status.text())
+    run(tab, dt.REVIVE_AFTER)
+    ck("★ 滿 3 秒 → 送「回標記點」", len(revived) == 1, str(revived))
+    run(tab, dt.REVIVE_RETRY + 0.2)
+    ck("　送了還沒活 → 每 5 秒重送", len(revived) == 2, str(revived))
+    dt.player.read = lambda _sc, _base: St(100)
+    run(tab, dt.DEATH_POLL + 0.1)
+    ck("　活了 → 關死亡視窗（一次）；還在死掉那張圖 → 等換圖", closed == [1]
+       and tab._cycle == "revive" and "換圖" in tab.status.text(), tab.status.text())
+    run(tab, dt.DEATH_POLL * 3)
+    ck("　　關窗只叫一次", closed == [1], str(closed))
+    dt.scene.current_id = lambda sc, **k: 26                 # 傳回標記點（城）了
+    run(tab, dt.DEATH_POLL + dt.REVIVE_SETTLE + 0.6)
+    ck("★ 換到標記點那張圖、穩 1 秒 → 沒循環 → 停（✔ 不警報）",
+       not tab.run_cb.isChecked() and "✔" in tab.status.text()
+       and "死亡當成刷完" in tab.status.text() and fake.fired == [],
+       f"{tab.status.text()} fired={fake.fired}")
+
+    # 死在**副本外**（趕路／補給途中）照舊：停機＋通知
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab._stats = 0x5000
+    tab._phase = "fly"
+    dt.player.read = lambda _sc, _base: St(0)
+    for _ in range(int(2.0 / TICK)):
+        tab._check_death(TICK)
+    ck("★ 死在副本外（phase=fly）→ 停機＋通知", not tab.run_cb.isChecked()
        and len(fake.fired) == 1 and "死亡" in fake.fired[0][1], str(fake.fired))
+
+    # 復活一直沒成功 → REVIVE_MAX 兜底停機＋通知
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = tab._notifier
+    tab._started = True
+    tab._stats = 0x5000
+    dt.player.read = lambda _sc, _base: St(0)
+    for _ in range(int(2.0 / TICK)):
+        tab._check_death(TICK)
+    run(tab, dt.REVIVE_MAX + 1.0)
+    ck("★ 復活超過上限沒成功 → 停機＋通知", not tab.run_cb.isChecked()
+       and len(fake.fired) == 1 and "復活" in fake.fired[0][1], str(fake.fired))
     dt.player.read = lambda _sc, _base: None
 
     # ⚠⚠ 交給 KeyWorker 的玩家位址不可以 +8（2026-09-02「完全不打怪物」的
@@ -1974,6 +2039,287 @@ def main() -> int:
     world["mine"] = [M("路人甲"), M("路人乙")]
     run(tab, 0.3)
     ck("★ 名單出現人 → 開跑", tab._cycle == "go", tab._cycle)
+
+    # =====================================================================
+    # ★★★ 副本設定（使用者 2026-09-05）：刷 N 場 → 回程補給飛回掛機記錄點 → 交給掛機頁
+    #   → 休息 → 停掛機再刷。⛔ 這裡不換掉分頁自己的邏輯，只替換「跟遊戲／掛機頁講話」。
+    # =====================================================================
+    print("\n副本設定：刷 N 場 → 回去掛機 → 休息 → 再刷")
+
+    class FakeFarm:
+        """假掛機頁：記「誰被叫去開／關掛機」，記錄點固定在 (100, 200, 場景 26)。"""
+
+        def __init__(self, home=(100.0, 200.0, 26)):
+            self.home = home
+            self.calls = []
+
+        def farm_home(self, pid):
+            return self.home
+
+        def set_farming(self, pid, on):
+            self.calls.append((pid, bool(on)))
+            return True, ("掛機已開始" if on else "掛機已停止")
+
+    class FakeWorker:
+        class _Sig:
+            def connect(self, *_a):
+                pass
+        died = _Sig()
+
+        def __init__(self, *_a, **_k):
+            self.packets = False
+            self.mode = None
+            self.mover = None
+            self.vks = []
+            self.eid = None
+            self.on = None
+
+        def start(self, *_a):
+            pass
+
+        def set_on(self, v):
+            self.on = v
+
+        def hold_off(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def wait(self, _ms=0):
+            return True
+
+    supplies = []          # 每一趟 run_full_supply 的 back_to
+    # ⚠ 假補給要**卡著**等測試放行（gate）：立刻回結果的話，finish_round 那幾拍裡
+    #   _supply_tick 就已經把 cycle 推到下一段，測「進補給了沒」永遠測不到。
+    supply_gate = threading.Event()
+
+    def fake_supply(mv, sc, say=None, back_to=None, potions=None, **_k):
+        supplies.append(back_to)
+        supply_gate.wait(3.0)
+        return True, "都夠了"
+
+    dt.supply.run_full_supply = fake_supply
+    dt.robot.potion_buy_ids = lambda *_a, **_k: None
+    dt.move.acquire = lambda pid, path, owner: FakeMover()
+    dt.move.release = lambda *_a, **_k: None
+    dt.injector.process_path = lambda _pid: ""
+    dt.TargetWorker = FakeWorker
+    dt.KeyWorker = FakeWorker
+    dt.dungeon.check_map = lambda *a, **k: (True, "")
+    dt.scene.map_key = lambda v: v
+    dt.scene.same_map = lambda a, b: a == b
+    dt.scene.current_id = lambda sc, **k: world["here"]
+
+    def sched_tab(rounds, rest_min, farm, here=98):
+        tab = loop_tab("none")
+        tab._ppid = tab._psc = tab._pmover = None
+        tab._farm = FakeFarm()
+        tab._runlog_open = lambda: None            # 別真的寫 %APPDATA% 的紀錄檔
+        tab._maps = FakeMaps(FakeGrid({(10, 10)}))
+        tab.sched_cb.setChecked(True)
+        tab._sched_rounds, tab._sched_rest_min, tab._sched_farm = rounds, rest_min, farm
+        tab._sched_reset()
+        tab._sched_begin()
+        world["here"] = here
+        supplies.clear()
+        supply_gate.clear()
+        return tab
+
+    def wait_supply(tab):
+        """放行假補給、等背景執行緒回結果（最多 2 秒），再跑幾拍讓 _supply_tick 收。"""
+        supply_gate.set()
+        for _ in range(200):
+            if tab._supply_result is not None or tab._cycle != "supply":
+                break
+            time.sleep(0.01)
+        run(tab, 0.2)
+        supply_gate.clear()
+
+    def finish_round(tab):
+        """讓這一趟「跑完」：站在最後一步的點位、周圍沒怪、等 CLEAR_SETTLE。"""
+        tab._i = 0
+        tab._pos = [10.5, 10.0]
+        tab._done = False
+        tab._empty_since = 0.0
+        run(tab, 0.3)
+        run(tab, dt.CLEAR_SETTLE + 0.5)
+
+    # ① 勾了副本設定 → 一定循環（「循環打副本」不管勾沒勾）
+    tab = sched_tab(2, 120, True)
+    tab.loop_cb.setChecked(False)
+    _i, loop, _party = tab._round_plan(1)
+    ck("★ 勾了副本設定就一定循環（循環打副本沒勾也一樣）", loop)
+    ck("　「循環打副本」變灰、按鈕可按", not tab.loop_cb.isEnabled()
+       and tab.sched_btn.isEnabled())
+    tab.sched_cb.setChecked(False)
+    ck("　取消副本設定 → 循環打副本恢復、按鈕變灰", tab.loop_cb.isEnabled()
+       and not tab.sched_btn.isEnabled())
+    tab.sched_cb.setChecked(True)
+
+    # ② 刷 2 場：第 1 場刷完照舊補給回入口；第 2 場刷完補給改飛回掛機記錄點
+    tab = sched_tab(2, 120, True)
+    finish_round(tab)
+    ck("★ 第 1 場刷完 → 進補給（批次還沒滿）", tab._cycle == "supply"
+       and tab._batch_done == 1 and not tab._batch_end,
+       f"{tab._cycle} done={tab._batch_done}")
+    wait_supply(tab)
+    ck("　補給的回程＝入口（不是掛機記錄點）", supplies and supplies[-1][2] == 90,
+       str(supplies))
+    ck("　補完照舊要飛回入口（人在副本裡→直接跑）", tab._cycle in ("back", "go")
+       and tab._batch_done == 1, f"{tab._cycle}")
+    tab._cycle = "go"
+    tab._phase = "run"
+    finish_round(tab)
+    ck("★★ 第 2 場刷完 → 這一批滿了 → 補給、回程改指到掛機記錄點",
+       tab._cycle == "supply" and tab._batch_end
+       and tab._batch_home == (100.0, 200.0, 26), f"{tab._cycle} home={tab._batch_home}")
+    ck("　狀態列講得出要交給掛機頁", "掛機" in tab.status.text(), tab.status.text())
+    world["here"] = 26                              # 補給飛回來了：人在掛機那張圖
+    wait_supply(tab)
+    ck("　run_full_supply 收到的 back_to 就是掛機記錄點", supplies[-1] == (100.0, 200.0, 26),
+       str(supplies[-1]))
+    ck("★★ 補完 → 交給掛機頁（叫它開掛機）→ 進休息", tab._cycle == "rest"
+       and tab._farm.calls == [(1, True)] and tab._rest_farm,
+       f"{tab._cycle} calls={tab._farm.calls}")
+    ck("　休息交棒後跳板／執行緒都還掉了（不跟掛機頁搶角色）",
+       tab._mover is None and tab._keys is None and tab._atk is None)
+    ck("　勾選還勾著（休息完要再接手）", tab.run_cb.isChecked())
+    ck("　休息倒數＝2 小時", abs(tab._rest_left - 7200) < 1, str(tab._rest_left))
+    run(tab, 1.5)
+    ck("　休息中狀態列有倒數、有「掛機照跑」", "休息中" in tab.status.text()
+       and "掛機照跑" in tab.status.text(), tab.status.text())
+    # 休息時間到 → 停掛機 → 重新接手：★ 先回程補給一趟（使用者 2026-09-05：從掛機點去刷
+    #   副本前先補給，免得藥水不足死掉）→ 補完人在掛機那張圖 → 飛回入口
+    tab._rest_left = 0.05
+    n_sup = len(supplies)
+    run(tab, 0.3)
+    ck("★★ 休息結束 → 叫掛機頁停掛機 → **先補給**（不是直接飛）",
+       tab._farm.calls[-1] == (1, False) and tab.run_cb.isChecked()
+       and tab._cycle == "supply" and "補給" in tab.status.text(),
+       f"calls={tab._farm.calls} cycle={tab._cycle} {tab.status.text()}")
+    ck("　新一批場數從 0 數", tab._batch_done == 0 and tab._sched["rounds"] == 2)
+    ck("　趟數跨批次累計（顯示用）", tab._rounds == 2, str(tab._rounds))
+    ck("　重新接手有裝回跳板與執行緒", tab._mover is not None and tab._keys is not None)
+    wait_supply(tab)
+    ck("　開刷前那趟補給的回程＝入口那張圖", len(supplies) == n_sup + 1
+       and supplies[-1][2] == 90, str(supplies[-1:]))
+    ck("　補完 → 人在別張圖 → 飛回入口", tab._cycle == "back" and tab._phase == "fly",
+       f"{tab._cycle}/{tab._phase}")
+
+    # ②b ★ 死在副本裡＝當成一場：第 1 場死 → 復活 → 補給回入口；第 2 場死 → 批次滿 →
+    #   補給回程指到掛機記錄點（跟正常刷完一模一樣的路）
+    def die(tab):
+        dt.player.read = lambda _sc, _base: St(0)
+        tab._stats = 0x5000
+        tab._check_death(dt.DEATH_POLL)
+        tab._check_death(dt.DEATH_POLL)
+
+    def revive_flow(tab, land=26):
+        run(tab, dt.REVIVE_AFTER + 0.6)                  # 送「回標記點」
+        dt.player.read = lambda _sc, _base: St(100)      # 活了
+        world["here"] = land                             # 傳到標記點那張圖
+        run(tab, dt.DEATH_POLL + dt.REVIVE_SETTLE + 0.6)
+
+    revived.clear()
+    tab = sched_tab(2, 120, True)
+    tab._map_key = 98
+    die(tab)
+    ck("★ 第 1 場死了 → 進復活段、算一場、不警報", tab._cycle == "revive"
+       and tab._batch_done == 1 and tab._rounds == 1 and tab._notifier.fired == [],
+       f"{tab._cycle} done={tab._batch_done}")
+    revive_flow(tab)
+    ck("　復活到城 → 回程補給（批次沒滿 → 回程＝入口）", tab._cycle == "supply"
+       and not tab._batch_end and revived, f"{tab._cycle} end={tab._batch_end}")
+    wait_supply(tab)
+    ck("　補給的 back_to＝入口", supplies[-1][2] == 90, str(supplies[-1]))
+    world["here"] = 98                                    # 假裝又進了副本
+    tab._cycle, tab._phase, tab._map_key = "go", "run", 98
+    die(tab)
+    revive_flow(tab)
+    ck("★★ 第 2 場又死 → 批次滿 → 補給回程指到掛機記錄點", tab._cycle == "supply"
+       and tab._batch_end and tab._batch_home == (100.0, 200.0, 26),
+       f"{tab._cycle} end={tab._batch_end} home={tab._batch_home}")
+    wait_supply(tab)
+    ck("　補完交給掛機頁、進休息", tab._cycle == "rest" and tab._farm.calls == [(1, True)],
+       f"{tab._cycle} {tab._farm.calls}")
+    dt.player.read = lambda _sc, _base: None
+
+    # ③ 休息期間使用者自己取消「自動刷副本」→ 只停排程，掛機照跑
+    tab = sched_tab(1, 60, True)
+    finish_round(tab)
+    world["here"] = 26
+    wait_supply(tab)
+    ck("1 場就滿：刷完直接交棒進休息", tab._cycle == "rest" and tab._farm.calls == [(1, True)],
+       f"{tab._cycle} {tab._farm.calls}")
+    tab._stop("已停止")
+    ck("★ 休息中取消 → 掛機頁**沒有**被叫停（掛機照跑）", tab._farm.calls == [(1, True)],
+       str(tab._farm.calls))
+    ck("　狀態列提醒掛機照跑", "掛機照跑" in tab.status.text(), tab.status.text())
+    ck("　排程狀態清乾淨", tab._sched is None and not tab._rest_farm)
+
+    # ④ 0 場＝測試路：什麼都不刷，直接補給→飛回記錄點→交棒，做完就停
+    tab = sched_tab(0, 120, True)
+    tab._sched_reset()
+    world["here"] = 98
+    # 走 _on_run_toggled 的那一段（0 場不看人在哪、不比對地圖）
+    tab._rounds = 0
+    tab._sched_begin()
+    ok = tab._attach(1, tab._sc, tab._script)
+    tab._started = True
+    tab._end_batch()
+    ck("★ 0 場：一開跑就進補給、回程指到掛機記錄點", ok and tab._cycle == "supply"
+       and tab._batch_end and tab._batch_home == (100.0, 200.0, 26),
+       f"{tab._cycle} {tab._batch_home}")
+    world["here"] = 26
+    wait_supply(tab)
+    ck("　補完交棒、然後**停下來**（不進休息）", tab._farm.calls == [(1, True)]
+       and not tab.run_cb.isChecked() and "停止" in tab.status.text(),
+       f"{tab._farm.calls} {tab.run_cb.isChecked()} {tab.status.text()}")
+
+    # ⑤ 沒勾「回去掛機」：批次滿了照舊補給回入口，補完原地休息、不碰掛機頁
+    tab = sched_tab(1, 30, False)
+    finish_round(tab)
+    ck("沒勾回去掛機：補給回程＝入口", tab._cycle == "supply" and tab._batch_end
+       and tab._batch_home is None, f"{tab._cycle} {tab._batch_home}")
+    wait_supply(tab)
+    ck("　補完進休息、沒叫掛機頁", tab._cycle == "rest" and not tab._farm.calls
+       and not tab._rest_farm, f"{tab._cycle} {tab._farm.calls}")
+    ck("　休息倒數＝30 分", abs(tab._rest_left - 1800) < 1, str(tab._rest_left))
+    ck("　狀態列沒有「掛機照跑」", "掛機照跑" not in tab.status.text(), tab.status.text())
+
+    # ⑥ 掛機頁沒有巡邏點 → 大聲停下來（⛔ 不猜地方）
+    tab = sched_tab(1, 60, True)
+    tab._farm.home = None
+    finish_round(tab)
+    ck("★ 掛機頁沒有記錄點 → 停機＋說原因", not tab.run_cb.isChecked()
+       and "⛔" in tab.status.text() and "記錄點" in tab.status.text(), tab.status.text())
+
+    # ⑦ 補給回來沒落在記錄點那張圖 → 還是交棒，但要警報
+    tab = sched_tab(1, 60, True)
+    finish_round(tab)
+    world["here"] = 26 + 1                          # 落在別張圖
+    wait_supply(tab)
+    ck("★ 落錯圖：照樣交棒進休息，但有警報", tab._cycle == "rest"
+       and tab._farm.calls == [(1, True)]
+       and any("沒落在" in m for _w, m in tab._notifier.fired),
+       f"{tab._cycle} fired={tab._notifier.fired}")
+
+    # ⑧ 設定視窗：值進去、按確定回存；取消不動
+    tab = sched_tab(4, 120, True)
+    dlg = tab._sched_dialog()
+    ck("視窗預設值＝4 場／2 小時 0 分／勾回去掛機", dlg._rounds.value() == 4
+       and dlg._hours.value() == 2 and dlg._mins.value() == 0 and dlg._farm.isChecked())
+    dlg._rounds.setValue(3)
+    dlg._hours.setValue(1)
+    dlg._mins.setValue(30)
+    dlg._farm.setChecked(False)
+    tab._apply_sched_dialog(dlg)
+    ck("　按確定 → 三個值回存", tab._sched_rounds == 3 and tab._sched_rest_min == 90
+       and tab._sched_farm is False,
+       f"{tab._sched_rounds} {tab._sched_rest_min} {tab._sched_farm}")
+    ck("　按鈕提示跟著變", "3 場" in tab.sched_btn.toolTip() and "1 小時 30 分" in tab.sched_btn.toolTip(),
+       tab.sched_btn.toolTip())
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0

@@ -6719,6 +6719,46 @@ class FarmTab(ClientWatchMixin, BaseTab):
                 and not page.train_cb.isChecked()):
             page.train_cb.setChecked(True)
 
+    # -- 給別的分頁用：自動刷副本「全部場次結束後回去掛機」交棒（2026-09-05）------
+    def page_for(self, pid: int):
+        """那一台分身的掛機頁。掛機頁還沒開過（沒對過帳）就先對一次帳把頁建出來
+        —— 使用者可能整個 session 都待在刷副本頁。"""
+        self._watch_start()
+        return self._pages.get(int(pid))
+
+    def farm_home(self, pid: int):
+        """那一台「回去掛機」要飛回的記錄點 (x, y, 場景編號)；沒有就回 None。
+
+        跟按「開始掛機」的 `_pick_home` 同一個優先序（目前地圖的巡邏點 → 清單第一個
+        有記地圖的巡邏點），⛔ 但**沒有**「完全沒設巡邏點就用當下位置」那條退路：
+        叫這支的時候人還在副本裡，「當下位置」＝副本裡的一格，飛回去等於把掛機
+        開在副本／城裡（安靜地做錯事）。沒有巡邏點就回 None 讓呼叫端大聲停下來。
+        """
+        page = self.page_for(pid)
+        if page is None:
+            return None
+        spots = [s for s in page._spots if s[2] is not None]
+        if not spots:
+            return None
+        here = page.cur_scene()
+        pick = next((s for s in spots
+                     if here is not None and scene.same_map(s[2], here)),
+                    spots[0])
+        return (float(pick[0]), float(pick[1]), int(pick[2]))
+
+    def set_farming(self, pid: int, on: bool) -> tuple[bool, str]:
+        """把那一台的「開始掛機」勾上／放掉 —— 當成使用者親手點的（意向一起記，
+        斷線重登才會接回去）。回 (成功?, 說明)。"""
+        page = self.page_for(pid)
+        if page is None:
+            return False, "掛機頁找不到這台分身"
+        if page._halted:
+            return False, f"掛機頁已停用：{page._halted}"
+        if page.run_cb.isChecked() != bool(on):
+            page.run_cb.setChecked(bool(on))
+        self._note_farm_intent(page)
+        return True, ("掛機已開始" if on else "掛機已停止")
+
     def _client_new(self, w) -> None:
         """接上一台新分身。開失敗就先跳過 —— 下一拍對帳會再試。"""
         sc = MemoryScanner()
