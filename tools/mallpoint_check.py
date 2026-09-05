@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -109,6 +110,12 @@ BALL, OTHER = 4937, 4938
 sc = FakeMem()
 sc.set_goods({363: (BALL, 1, 45), 364: (BALL, 2, 90), 400: (OTHER, 1, 60)})
 
+
+def settle(val: int) -> None:
+    """擺點數並當作「已經穩定讀到很久」—— 預檢要同一個值撐滿 POINTS_SETTLE 秒才擋。"""
+    sc.set_points(val)
+    mall._pt_seen[0] = (val, time.monotonic() - mall.POINTS_SETTLE - 1.0)
+
 print("① 點數讀得到")
 sc.set_points(152)
 check("讀到 152", mall.points(sc) == 152, f"實得 {mall.points(sc)!r}")
@@ -134,7 +141,7 @@ check("兩顆只要買一顆＝45", mall.quote(sc, two)[:2] == (45, 1),
 sc.set_storage([])
 
 print("⑤ 點數不夠 → 擋下、訊息帶得起通知")
-sc.set_points(36)
+settle(36)
 why = mall.blocked(sc, two)
 check("擋下來了", bool(why), f"實得 {why!r}")
 check("認得出是點數不足", mall.short_of_points(why or ""), f"實得 {why!r}")
@@ -172,15 +179,75 @@ class FakeGate:
 g = mall.cheapest(sc, BALL)
 check("最省的一份是 45 點那筆", g is not None and g.price == 45,
       f"實得 {g!r}")
-real_gate = mall.actiongate
+real_gate, real_settle = mall.actiongate, mall.POINTS_SETTLE
 mall.actiongate = FakeGate()
+mall.POINTS_SETTLE = 0.3                       # 盯的那段縮短，測試別等 3 秒
 try:
     ok, msg = mall.buy(FakeMover(), sc, g)
 finally:
-    mall.actiongate = real_gate
+    mall.actiongate, mall.POINTS_SETTLE = real_gate, real_settle
 check("沒買成", not ok)
 check("一發都沒送", not sent, f"實得送了 {sent}")
 check("說得出是點數不足", mall.short_of_points(msg), f"實得 {msg}")
+
+print("⑨ 一拍讀到 0 不算沒錢：同一個「不夠」要撐滿 POINTS_SETTLE 秒才擋（2026-09-05）")
+mall._pt_seen.clear()
+sc.set_points(0)
+why = mall.blocked(sc, two)
+check("第一次讀到 0 → 先擋住不動手", bool(why), f"實得 {why!r}")
+check("　但不帶 SHORT_TAG（不通知）", not mall.short_of_points(why or ""),
+      f"實得 {why!r}")
+sc.set_points(152)
+check("下一拍讀到 152 → 不擋", mall.blocked(sc, two) is None,
+      f"實得 {mall.blocked(sc, two)!r}")
+sc.set_points(0)
+why = mall.blocked(sc, two)
+check("又變回 0 → 重新起算，還是不通知",
+      bool(why) and not mall.short_of_points(why or ""), f"實得 {why!r}")
+mall._pt_seen[0] = (0, time.monotonic() - mall.POINTS_SETTLE - 1.0)
+why = mall.blocked(sc, two)
+check("0 撐滿 POINTS_SETTLE 秒 → 才是真的不夠、帶 SHORT_TAG",
+      mall.short_of_points(why or ""), f"實得 {why!r}")
+check("　講得出差多少", "差 90 點" in (why or ""), f"實得 {why!r}")
+sc.mem.pop(MGR + mall.POINTS_OFF)
+check("讀不到 → 歷史清掉、不擋", mall.blocked(sc, two) is None
+      and 0 not in mall._pt_seen, f"實得 {mall.blocked(sc, two)!r}")
+sc.set_points(36)
+
+print("⑩ buy() 送出前不夠就盯一段：途中變夠就不擋、一直不夠才擋")
+
+
+class FlipMem(FakeMem):
+    """點數前兩次讀是 0、之後 152（＝伺服器回填晚了一拍那種）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    def _read_bytes(self, addr: int, size: int):
+        if addr == MGR + mall.POINTS_OFF:
+            self.reads += 1
+            return struct.pack("<I", 0 if self.reads <= 2 else 152)
+        return super()._read_bytes(addr, size)
+
+
+fm = FlipMem()
+fm.set_goods({363: (BALL, 1, 45)})
+mall.POINTS_SETTLE = 1.0
+try:
+    t0 = time.monotonic()
+    check("前兩拍 0、第三拍 152 → 不算不夠",
+          mall.confirmed_short(fm, 45) is None)
+    check("　變夠就馬上放行，沒等滿整段", time.monotonic() - t0 < 0.9,
+          f"等了 {time.monotonic() - t0:.2f} 秒")
+    t0 = time.monotonic()
+    check("一直 36 → 盯滿才回 36", mall.confirmed_short(sc, 45) == 36)
+    check("　有盯滿 POINTS_SETTLE 秒", time.monotonic() - t0 >= 0.9,
+          f"只等了 {time.monotonic() - t0:.2f} 秒")
+    sc.mem.pop(MGR + mall.POINTS_OFF)
+    check("讀不到 → None（不是沒錢）", mall.confirmed_short(sc, 45) is None)
+finally:
+    mall.POINTS_SETTLE = real_settle
 
 print()
 if FAILS:

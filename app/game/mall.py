@@ -105,6 +105,17 @@ ST_SERIAL, ST_ITEM, ST_COUNT = 0x00, 0x04, 0x08
 POINTS_OFF = 0xD0EC
 # 合理性上界（驗不過就當讀到垃圾回 None）。
 POINTS_MAX = 100_000_000
+# ★★ 點數讀到「不夠」要**連續一段時間都這樣**才算數（2026-09-05 使用者實機：
+#   經驗球滿了先通知「商城點數不足，目前只有 0 點」，幾秒後又「已從商城買到」——
+#   商品表明明載入了、這四個 byte 卻有一小段時間是 0（使用者當時自己開了商城；
+#   伺服器回商城資料時這一格被重寫／還沒填回來）。一拍讀到 0 就下「沒錢」的結論
+#   ＝拿瞬間值當事實（[[bag-false-empty-guards]] 同一個坑，只是這次是暫時 0 不是讀不到）。
+#   → 純讀預檢（`blocked`）：值變了就重新起算，同一個「不夠」的值要撐滿 POINTS_SETTLE
+#     秒才擋、才通知；送出前那道（`buy`）：不夠就再盯 POINTS_SETTLE 秒，途中變夠就照買。
+#   ⚠ 只是延後幾秒下結論，不是放寬：真的沒錢照樣擋、照樣講差多少。
+POINTS_SETTLE = 3.0
+# 每台最近一次讀到的點數與「從什麼時候開始一直是這個值」（給 `points_settled`）。
+_pt_seen: dict[int, tuple[int, float]] = {}
 
 # ★ 出處：反組譯 mallbuy 本體 0x5D49BE 的 `push 7 / push 0x12B`
 #   （建包 0x50E1C2 的兩個參數＝內文長度、封包代號）。
@@ -312,6 +323,41 @@ def points(scanner) -> int | None:
     return val if 0 <= val <= POINTS_MAX else None
 
 
+def points_settled(scanner) -> tuple[int | None, float]:
+    """`points()` 加上「這個值已經連續讀到幾秒」：回 `(點數, 秒)`。
+
+    值變了（或讀不到）就重新起算 —— 呼叫端拿秒數跟 `POINTS_SETTLE` 比，
+    沒撐滿就別下「不夠」的結論（見 POINTS_SETTLE 的說明）。讀不到回 `(None, 0.0)`。
+    """
+    pid = getattr(scanner, "pid", 0) or 0
+    val = points(scanner)
+    now = time.monotonic()
+    if val is None:
+        _pt_seen.pop(pid, None)
+        return None, 0.0
+    seen = _pt_seen.get(pid)
+    if seen is None or seen[0] != val:
+        _pt_seen[pid] = (val, now)
+        return val, 0.0
+    return val, now - seen[1]
+
+
+def confirmed_short(scanner, need: int) -> int | None:
+    """送出前用：點數不夠**而且盯了 POINTS_SETTLE 秒都還不夠**才回那個數；
+    夠／讀不到回 None（讀不到不是「沒錢」的證據）。
+
+    ⚠ 會 sleep（最多 POINTS_SETTLE 秒），只准在背景執行緒叫。
+    """
+    end = time.monotonic() + POINTS_SETTLE
+    while True:
+        have = points(scanner)
+        if have is None or have >= need:
+            return None
+        if time.monotonic() >= end:
+            return have
+        time.sleep(POLL)
+
+
 def loaded(scanner) -> bool:
     """商品表**有沒有資料**（不是「讀不到」，是「這台還沒跟伺服器要過」）。"""
     return goods(scanner) is not None
@@ -436,8 +482,13 @@ def blocked(scanner, need: list) -> str | None:
     # ★★★ 點數不夠 —— 這是**唯一不會自己好**的擋法（要儲值），所以訊息要
     #   講清楚差多少，呼叫端看到 `short_of_points()` 會通知使用者。
     #   ⚠ `points()` 回 None ＝ 不知道（不是 0 點）→ 不擋，讓後面照常試。
-    have_pt = points(scanner)
+    #   ⚠ 剛讀到「不夠」不算數：同一個值要撐滿 POINTS_SETTLE 秒（見那條說明）——
+    #     這段期間回一句**不帶 SHORT_TAG** 的擋法（不動手、也不通知）。
+    have_pt, age = points_settled(scanner)
     if have_pt is not None and count and have_pt < total:
+        if age < POINTS_SETTLE:
+            return (f"商城點數讀到 {have_pt} 點（要 {total} 點）"
+                    f"—— 再確認一次才算不夠")
         return (f"{SHORT_TAG}：補 {count} 顆要 {total} 點，"
                 f"目前只有 {have_pt} 點（差 {total - have_pt} 點）")
     return None
@@ -507,8 +558,10 @@ def buy(mover, scanner, g: Goods, say=None) -> tuple[bool, str]:
     # ★★ 送出**前當場重讀**點數：預檢是幾秒前算的，而且補第二顆時第一顆
     #   已經扣過錢了 —— 不夠就別送，免得白送三發（每發等滿 6 秒節流）再失敗。
     #   ⚠ `points()` 回 None ＝ 不知道 → 照送（讀不到不是「沒錢」的證據）。
-    have_pt = points(scanner)
-    if have_pt is not None and have_pt < g.price:
+    #   ⚠ 剛要過商城資料那一格可能暫時是 0 → 不夠就再盯 POINTS_SETTLE 秒
+    #     （`confirmed_short`），途中變夠就照買。
+    have_pt = confirmed_short(scanner, g.price)
+    if have_pt is not None:
         return False, (f"{SHORT_TAG}：買「{g.name}」要 {g.price} 點，"
                        f"目前只有 {have_pt} 點")
     before = storage(scanner)
