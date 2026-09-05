@@ -162,6 +162,33 @@ def _wnd_object(scanner) -> int | None:
     return obj if _u32(scanner, obj + WND_ID_OFF) == wnd else None
 
 
+def window_present(scanner) -> bool | None:
+    """對話視窗**物件**現在在不在 —— **純讀**，照 GetWindowById 走一遍，不佔指令槽。
+
+    True＝管理器那一格有物件而且代號對得上；False＝代號是 0 或那一格沒物件；
+    None＝**讀不到**（位址推不出來／管理器指標不合理／Lua 全域讀不到）——
+    呼叫端不可以把 None 當成「沒有」。
+    ⚠ 跟 `window_open` 一樣分不出「殘留的物件」跟「真的開著」（要找到顯示旗標才行），
+      但拿來當「沒在等對話卻有對話框 → 收掉」的訊號剛剛好：殘留的本來就該收。
+    """
+    spot = find_spot(scanner)
+    if spot is None:
+        return None
+    mgr = _u32(scanner, spot.world_ptr)
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000:
+        return None
+    g = lua.globals_of(scanner, [WND_NAME])
+    if g is None:
+        return None
+    wnd = int(g.get(WND_NAME) or 0) & 0xFFFFFFFF
+    if not wnd:
+        return False
+    obj = _u32(scanner, mgr + (wnd & WND_SLOT_MASK) * 4 + WND_TABLE_OFF)
+    if not obj or not 0x10000 < obj < 0x7FFF0000:
+        return False
+    return _u32(scanner, obj + WND_ID_OFF) == wnd
+
+
 def message_ended(scanner) -> bool | None:
     """現在這一頁是不是**最後一頁**（＝遊戲 `ismessageend` 回的那個旗標）。
 

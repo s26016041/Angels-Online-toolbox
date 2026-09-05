@@ -185,6 +185,15 @@ CLOSE_GRACE = 1.6
 # 「有沒有視窗」要**叫進遊戲**問（call_sync 會等它做完），
 # 所以答案快取這麼久，⛔ 不要每拍問。
 WND_TTL = 0.3
+# ★ 使用者 2026-09-05：「副本自動跑的時候，我們沒在等對話的時候跳出來，要幫我把不該出現的
+#   對話關掉」—— 走路／打怪／傳點／休息期間對話框（劇情、撞到 NPC、機關）冒出來會把人
+#   困住（伺服器認為還在互動，人走不動）。純讀 `talkwnd.window_present` 每 STRAY_WND_POLL 秒
+#   看一次；有就 destroy＋送離開互動，兩次之間至少隔 STRAY_WND_GAP（Lua 不可以叫太密）。
+#   ⛔ 對話那一步（interact）與撞入口不管：那兩段本來就在等對話。
+#   ⚠ 一次純讀實測 ~38ms（黑狐，幾乎全是 lua.globals_of 走全域表）—— 跑在 UI 執行緒上，
+#     所以一秒一次（4%）就好，晚一秒關掉沒差；⛔ 別改成每拍。
+STRAY_WND_POLL = 1.0
+STRAY_WND_GAP = 2.0
 # ★★ 點下去之後這麼久都沒有任何對話反應 → **再點一次**（使用者 2026-09-02
 #   回報「最後一個石頭雕像點不到」）。點一次就不管是不對的：遊戲是「自己走
 #   過去才開對話」，路上被怪打斷、被人擋住、剛好在走都會讓那一下落空 ——
@@ -910,6 +919,9 @@ class DungeonTab(BaseTab):
         self._pos_t = 0.0
         self._jumped = None          # 這一拍有沒有順移：有＝跳之前站的位置 (x, y)
         self._map_settle = 0.0       # 換圖後等座標跟上，這個時刻之前不算任何東西
+        self._stray_t = 0.0          # 多久之後再看一次有沒有不該出現的對話框
+        self._stray_closed = 0.0     # 上次關掉的時刻（節流）
+        self._stray_n = 0            # 這一趟關掉幾次（狀態列／紀錄）
         self._grid_t = 0.0           # 還有多久重讀地形圖
         # ---- 全自動循環（見 PARTY_MODES 的說明）----
         self._loop = False           # 要不要循環（＝「循環打副本」勾選框，見 _round_plan）
@@ -1311,6 +1323,10 @@ class DungeonTab(BaseTab):
                 and self._script.steps[self._i].get("do") == dungeon.PORTAL
                 and self._portal_transit(self._script.steps[self._i], me)):
             return
+
+        # ⓪-4 沒在等對話卻跳出對話框 → 關掉（使用者 2026-09-05，見 STRAY_WND_POLL）
+        if self._phase == "run":
+            self._stray_dialog(dt)
 
         # ① 先處理怪 —— 使用者定的規矩：路上有怪先殺光再去點位
         #    ⚠ 這裡回 True 就整拍不跑腳本 ＝「在殺怪就不跑點位」；
@@ -2228,6 +2244,42 @@ class DungeonTab(BaseTab):
         self._poke_t = PORTAL_POKE
         note = self._send_portal(tuple(step["to"]), step.get("model"), "傳點")
         self._say(f"第 {self._i + 1} 步　{note}…已 {mins:.1f} 分鐘")
+
+    def _stray_dialog(self, dt: float) -> bool:
+        """沒在等對話的時候跳出對話框 → 關掉。回 True＝這一拍關了一個。
+
+        只在腳本跑步驟（走路／傳點／休息／清怪／跑完等收工）與打怪期間看；
+        對話那一步自己管（點之前先收殘留、點完就是在等對話），撞入口那段也在等對話。
+        純讀判斷（不佔指令槽）；關法＝ Lua DestroyMessageWnd ＋ 送離開互動
+        （只 destroy 的話伺服器還當你在互動，人走不動 —— 見 supply.leave_npc）。
+        """
+        steps = self._script.steps if self._script else []
+        step = steps[self._i] if self._i < len(steps) else None
+        if step is not None and step.get("do") == dungeon.INTERACT:
+            return False
+        self._stray_t -= dt
+        if self._stray_t > 0:
+            return False
+        self._stray_t = STRAY_WND_POLL
+        try:
+            present = talkwnd.window_present(self._sc)
+        except Exception:                                # noqa: BLE001
+            present = None
+        if not present:                                  # False／None 都不動手
+            return False
+        now = time.monotonic()
+        if now - self._stray_closed < STRAY_WND_GAP or self._mover is None:
+            return False
+        self._stray_closed = now
+        self._stray_n += 1
+        try:
+            talkwnd.close_window(self._mover, self._sc)
+            supply.leave_npc(self._mover, self._sc)
+        except Exception:                                # noqa: BLE001
+            pass
+        self._wnd, self._wnd_t = None, 0.0
+        self._notify(f"跳出不該出現的對話框 → 關掉（這一趟第 {self._stray_n} 次）")
+        return True
 
     def _wnd_open(self, dt: float) -> bool | None:
         """對話視窗現在開著沒（True／False／**None＝問不到**）。

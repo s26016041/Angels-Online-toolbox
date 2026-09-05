@@ -280,6 +280,8 @@ class FakeTalk:
 def wire(tab, fake):
     dt.talkwnd.page = fake.page
     dt.talkwnd.window_open = fake.window_open
+    # 純讀那支（沒在等對話時看有沒有對話框）跟 window_open 看同一個假狀態
+    dt.talkwnd.window_present = lambda _sc: fake.window_open(None, None)
     dt.talkwnd.message_ended = lambda _sc: fake.ended
     dt.talkwnd.close_page = fake.close
     dt.talkwnd.close_window = lambda *_a: True
@@ -1657,6 +1659,38 @@ def main() -> int:
     ck("　又放棄 → 又記住新位置", tab._hopeless.get(77) == (19.5, 10.0), str(tab._hopeless))
     tab._after_map_change()
     ck("★ 換圖 → 全部重新問", tab._hopeless == {}, str(tab._hopeless))
+
+    # ★ 使用者 2026-09-05：「副本自動跑的時候，我們沒在等對話的時候跳出來，要幫我把不該
+    #   出現的對話關掉」
+    print("\n沒在等對話卻跳出對話框 → 關掉")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}, {"do": "interact", "at": [20, 20],
+                                                     "model": 60307, "menu": [1]}])
+    tab._mover = object()
+    closed = []
+    dt.talkwnd.close_window = lambda *_a: closed.append(1) or True
+    dt.talkwnd.window_present = lambda _sc: True          # 對話框冒出來了
+    tab._stray_dialog(1.1)
+    ck("★★ 走路那一步冒出對話框 → destroy＋送離開互動、狀態列講出來",
+       closed == [1] and tab.left == [1] and "對話框" in tab.status.text(),
+       f"closed={closed} left={tab.left} {tab.status.text()}")
+    tab._stray_dialog(1.1)
+    ck("　兩秒內不重複關（Lua 不可以叫太密）", closed == [1], str(closed))
+    tab._stray_closed = 0.0
+    tab._stray_dialog(1.1)
+    ck("　還在 → 隔了間隔再關一次", closed == [1, 1], str(closed))
+    tab._i = 1                                             # 換到對話那一步
+    tab._stray_closed = 0.0
+    tab._stray_dialog(1.1)
+    ck("★ 對話那一步不管（本來就在等對話）", closed == [1, 1], str(closed))
+    tab._i = 0
+    tab._stray_closed = 0.0
+    dt.talkwnd.window_present = lambda _sc: None           # 讀不到
+    tab._stray_dialog(1.1)
+    ck("　讀不到 ≠ 有對話框 → 不動手", closed == [1, 1], str(closed))
+    dt.talkwnd.window_present = lambda _sc: False
+    tab._stray_dialog(1.1)
+    ck("　沒有對話框 → 不動手", closed == [1, 1], str(closed))
+    dt.talkwnd.close_window = lambda *_a: True
 
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])
