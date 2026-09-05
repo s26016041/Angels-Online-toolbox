@@ -236,6 +236,11 @@ TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 #   病灶：往怪物走 → 走到一半怪掉出遊戲的串流範圍（掃不到）→ 改去點位 →
 #   一靠近又掃到 → 再追 …… 無限輪迴。9/4 純讀：開闊地圖掃得到 37 格外的怪，30 安全。
 MAX_CHASE = 30.0
+# ★★ 放棄過的怪只要**還站在原地**就不再挑（使用者 2026-09-05：「走不過去的怪物應該要直接
+#   無視」）。病灶：劇情王會瞬移到旁邊一個走不過去也打不到的位置，15 秒沒進展放棄後
+#   沒別隻可挑 → 立刻又挑回牠 → 永遠卡在那。⚠ 這不是黑名單：以**牠的位置**為鍵，
+#   牠移動超過這麼多格、換區／換圖、或這一區的格數變了（門開了）就重新問。
+HOPELESS_MOVE = 3.0
 WALK_GAP = 0.4                  # 貼身微調多久送一次移動
 WALK_GAP_FAR = 0.30             # 趕路（離目標 > FAR_ENOUGH）時的冷卻
 FAR_ENOUGH = 6.0
@@ -942,7 +947,8 @@ class DungeonTab(BaseTab):
         #      的狀態，換目標一律走 _engage() 整組重設 ----
         self._last_gave_up = None    # 剛換掉的那一隻（有別隻時先挑別隻；⛔ 不是黑名單）
         self._me = None              # 這一拍我的位置（挑目標／算路徑用）
-        self._left_out = (0, 0)      # 上一輪不打的怪：(超過 MAX_CHASE, 走不到)
+        self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
+        self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
         self._anchor = None          # 卡住偵測的錨點（淨位移 > STUCK_EPS 才重設）
         self._last_hp = -1           # 上一拍看到的目標血量
@@ -1219,6 +1225,7 @@ class DungeonTab(BaseTab):
         if self._reach is not None and len(got) != self._reach_n:
             self._notify(f"地形變了：這一區從 {self._reach_n} 格變成 "
                          f"{len(got)} 格（機關開門／關門？）")
+            self._hopeless.clear()       # 門開了 → 放棄過的怪重新問一輪
         self._reach, self._reach_n = got, len(got)
 
     def _can_reach(self, pos) -> bool:
@@ -1294,6 +1301,16 @@ class DungeonTab(BaseTab):
 
         # ⓪-2 地形圖定期重讀（機關會開門）＋算出「我這一區」走得到哪裡
         self._refresh_grid(me, dt)
+
+        # ⓪-3 ★★ 傳點那一步的「人被搬走了」要在**打怪之前**就認（2026-09-05 黑狐實錄）：
+        #   第 24 步踩上傳點的同一拍，落點旁邊就有怪 → `_fight` 先回 True →
+        #   `_run_step` 沒跑到 → `_jumped` 下一拍就被蓋掉 → 步驟停在 24，打完怪
+        #   還要走回 149 格外、另一區的傳點 → 「走不到傳點…屬於另一區」卡死。
+        if (self._phase == "run" and self._jumped
+                and self._i < len(self._script.steps)
+                and self._script.steps[self._i].get("do") == dungeon.PORTAL
+                and self._portal_transit(self._script.steps[self._i], me)):
+            return
 
         # ① 先處理怪 —— 使用者定的規矩：路上有怪先殺光再去點位
         #    ⚠ 這裡回 True 就整拍不跑腳本 ＝「在殺怪就不跑點位」；
@@ -1479,6 +1496,7 @@ class DungeonTab(BaseTab):
         self._state, self._player = None, None      # 等下一次（強制全）掃描重抓
         self._pos_prev, self._pos_t = None, 0.0     # 新圖第一拍不准判成順移
         self._me = None
+        self._hopeless.clear()                      # 換圖＝全新的怪
 
     def _check_map_change(self) -> bool:
         """換圖了就處理掉。回 True＝這一拍不要再往下跑。
@@ -1585,7 +1603,7 @@ class DungeonTab(BaseTab):
         """
         me = self._me
         pool: list = []
-        far = unreach = 0
+        far = unreach = hopeless = 0
         for m in self._live_monsters():
             if not m.eid:
                 continue                 # eid=0 挑到整條攻擊鏈都會空轉
@@ -1593,6 +1611,13 @@ class DungeonTab(BaseTab):
             alive, st, p, hp = entity.read_live_hp(self._sc, m)
             if not alive or st == "Dead" or hp == 0 or p is None:
                 continue
+            # ★ 放棄過、而且還站在原地 → 不挑（HOPELESS_MOVE）；牠動了就重新問
+            stuck_at = self._hopeless.get(m.eid)
+            if stuck_at is not None:
+                if _d(p, stuck_at) <= HOPELESS_MOVE:
+                    hopeless += 1
+                    continue
+                del self._hopeless[m.eid]
             d = _d(p, me) if me is not None else 0.0
             if d > MAX_CHASE:
                 far += 1
@@ -1602,7 +1627,7 @@ class DungeonTab(BaseTab):
                 continue
             pool.append((d, m, p))
         pool.sort(key=lambda t: t[0])
-        self._left_out = (far, unreach)
+        self._left_out = (far, unreach, hopeless)
         return pool
 
     def _targets(self) -> list:
@@ -1611,12 +1636,14 @@ class DungeonTab(BaseTab):
 
     def _left_out_note(self) -> str:
         """上一輪不打的怪各是為什麼（給狀態列，一定要講得出來）。"""
-        far, unreach = self._left_out
+        far, unreach, hopeless = self._left_out
         parts = []
         if far:
             parts.append(f"{far} 隻超過 {MAX_CHASE:.0f} 格")
         if unreach:
             parts.append(f"{unreach} 隻走不到（隔壁區／沒有路）")
+        if hopeless:
+            parts.append(f"{hopeless} 隻放棄過還站在原地（走不到／打不中）")
         return "、".join(parts)
 
     def _path_cost(self, grid, me, pos, max_cost: float | None = None
@@ -1786,7 +1813,11 @@ class DungeonTab(BaseTab):
         m = self._cur
         if m is not None:
             self._last_gave_up = m.eid
-            self._notify(f"「{m.name}」{why} → 換一隻")
+            # ★ 記下牠現在站哪：牠不動就不再挑（使用者 2026-09-05「走不過去的怪物直接無視」）。
+            #   位置當場重讀；讀不到就用掃描時的座標（寧可記一個大概的，也不要記不到）。
+            _alive, _st, p, _hp = entity.read_live_hp(self._sc, m)
+            self._hopeless[m.eid] = tuple(p) if p else (m.x, m.y)
+            self._notify(f"「{m.name}」{why} → 換一隻（牠不動就不再挑）")
         self._drop_target()
         self._grid_t = 0.0
         self._pick_next()
@@ -2074,35 +2105,24 @@ class DungeonTab(BaseTab):
         if kind == dungeon.PORTAL:
             # ★ 完成條件**不是**「走到那一格」而是「人被搬走了」——踩上傳點
             #   的下一瞬間人就被移走，那一格永遠不會「到達」。
-            #   換圖那種由 `_check_map_change` 接手；同一張圖裡的順移看這裡。
+            #   換圖那種由 `_check_map_change` 接手；同一張圖裡的順移看這裡
+            #   （正常情況 `_tick` ⓪-3 已經先認過了，這裡是保險）。
             gx, gy = step["to"]
-            if self._jumped:
-                frm = self._jumped                 # 跳之前站的位置
-                land = step.get("land")
-                near_land = bool(land) and _d(land, me) <= LAND_TOL
-                from_portal = _d((gx, gy), frm) <= PORTAL_FROM
-                if not near_land and not from_portal:
-                    # ★ 人不在傳點上就跳了 ＝ 不是傳點搬的（伺服器拉回／被擊退）
-                    #   → 不算完成、更不能當「傳到別的地方」停下
-                    #   （2026-09-05 無限塔第 41／52 步的誤停就是這個）。
-                    self._notify(f"第 {self._i + 1} 步　位置一拍跳了 "
-                                 f"{_d(frm, me):.0f} 格，但跳之前離傳點 "
-                                 f"{_d((gx, gy), frm):.0f} 格（不在傳點上）"
-                                 f"→ 不算傳送，繼續走")
-                elif land and not near_land:
-                    self._stop(
-                        f"⛔ 第 {self._i + 1} 步：傳點把人送到 "
-                        f"({me[0]:.0f}, {me[1]:.0f})，"
-                        f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— "
-                        f"差 {_d(land, me):.0f} 格，停下來")
-                    return
-                else:
-                    self._drop_target()
-                    self._scan.force_full(self._pid)   # 順移到新的一區＝新的怪
-                    self._say(f"第 {self._i + 1} 步　傳點過了，落在 "
-                              f"({me[0]:.0f}, {me[1]:.0f})")
-                    self._next()
-                    return
+            if self._jumped and self._portal_transit(step, me):
+                return
+            # ★★ 保險（2026-09-05 黑狐實錄的殘局）：人已經站在腳本記的出口這一側、
+            #   而傳點本身在**另一區**走不到 —— 就是已經傳過來了（順移那一拍被別的
+            #   事蓋掉）。⚠ 一定要「傳點走不到」才算：出口跟傳點在同一區的短傳點
+            #   （「有時候傳點之間也很短」）不能只憑離出口近就當過了。
+            land = step.get("land")
+            if (land and _d(land, me) <= LAND_TOL and self._reach is not None
+                    and not self._can_reach((gx, gy))):
+                self._notify(f"第 {self._i + 1} 步　人已經在出口這一側、傳點在另一區"
+                             f" → 當作傳過了")
+                self._drop_target()
+                self._scan.force_full(self._pid)
+                self._next()
+                return
             if _d((gx, gy), me) <= PORTAL_NEAR:
                 # ★ 已經站在傳點上卻沒被搬走 → 每 PORTAL_POKE 秒對它送一次
                 #   互動（有些傳點要點一下才走）。⛔ 不是每一拍狂送：那是
@@ -2133,6 +2153,43 @@ class DungeonTab(BaseTab):
             return
 
         self._stop(f"⛔ 第 {self._i + 1} 步是不認得的動作「{kind}」")
+
+    def _portal_transit(self, step: dict, me) -> bool:
+        """這一拍的順移是不是「傳點把人搬走了」。回 True＝這一步處理完（過了或停機），
+        呼叫端這一拍不要再做別的；False＝不是傳點搬的，照常。
+
+        三分（見 PORTAL_FROM／LAND_TOL 的說明）：
+          · 落點在記的出口 8 格內 → 過（觸發範圍比記的寬也吃得到）；
+          · 跳之前在傳點 6 格內、落點卻對不上出口 → 傳到別的地方，大聲停；
+          · 跳之前根本不在傳點上 → 伺服器拉回／被擊退，不算，繼續。
+        """
+        gx, gy = step["to"]
+        frm = self._jumped                     # 跳之前站的位置
+        land = step.get("land")
+        near_land = bool(land) and _d(land, me) <= LAND_TOL
+        from_portal = _d((gx, gy), frm) <= PORTAL_FROM
+        if not near_land and not from_portal:
+            # ★ 人不在傳點上就跳了 ＝ 不是傳點搬的（伺服器拉回／被擊退）
+            #   → 不算完成、更不能當「傳到別的地方」停下
+            #   （2026-09-05 無限塔第 41／52 步的誤停就是這個）。
+            self._notify(f"第 {self._i + 1} 步　位置一拍跳了 "
+                         f"{_d(frm, me):.0f} 格，但跳之前離傳點 "
+                         f"{_d((gx, gy), frm):.0f} 格（不在傳點上）"
+                         f"→ 不算傳送，繼續走")
+            return False
+        if land and not near_land:
+            self._stop(
+                f"⛔ 第 {self._i + 1} 步：傳點把人送到 "
+                f"({me[0]:.0f}, {me[1]:.0f})，"
+                f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— "
+                f"差 {_d(land, me):.0f} 格，停下來")
+            return True
+        self._drop_target()
+        self._scan.force_full(self._pid)       # 順移到新的一區＝新的怪
+        self._hopeless.clear()
+        self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f})")
+        self._next()
+        return True
 
     def _send_portal(self, at, want, tag: str) -> str:
         """對那個傳點**主動送一次 0x0D**（＝踩上去那一包）。回一句說明。

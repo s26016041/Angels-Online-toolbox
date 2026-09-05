@@ -750,6 +750,39 @@ def main() -> int:
     run(tab, 0.1)
     ck("★ 從傳點上跳走、腳本沒記出口 → 算過", tab._i == 1, tab.status.text())
 
+    # ★★★ 2026-09-05 黑狐實錄（無限塔第 24 步）：踩上傳點的同一拍落點旁邊有怪 →
+    #   _fight 先回 True → _run_step 沒跑到 → 順移被下一拍蓋掉 → 步驟停在 24，
+    #   打完怪還走回另一區的傳點 → 「走不到傳點…屬於另一區」卡死。
+    #   → 傳點的順移要在 _tick 裡、打怪之前就認。
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]},
+                    {"do": "clear"}], pos=(201.0, 41.0))
+    tab._map_key = 110
+    dt.scene.current_id = lambda _sc, **_k: 110
+    dt.scene.map_key = lambda v: v
+    tab._maps = FakeMaps()
+    tab._fight = lambda _me, _dt: True             # 一直在打怪
+    tab._state, tab._player = 0x1000, 0x2000       # make_tab 的 _reset_run 會清掉
+    tab._pos_prev, tab._pos_t = (50.0, 50.5), time.monotonic()   # 上一拍站在傳點上
+    tab._tick()
+    ck("★★★ 踩傳點那一拍旁邊有怪（打怪中）→ 傳點照樣算過、步驟前進",
+       tab._i == 1, f"i={tab._i} {tab.status.text()}")
+
+    # ★★ 保險：順移那一拍真的漏掉了 → 人在出口這一側、傳點在另一區 → 當作傳過了
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]},
+                    {"do": "clear"}], pos=(201.0, 41.0))
+    tab._grid = FakeGrid({(201, 41)}, others={(50, 50)})    # 傳點可走但不在我這區
+    tab._reach = {(201, 41)}
+    run(tab, 0.1)
+    ck("★★ 站在出口旁、傳點在另一區走不到 → 當作傳過了", tab._i == 1,
+       f"i={tab._i} {tab.status.text()}")
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]},
+                    {"do": "clear"}], pos=(201.0, 41.0))
+    tab._grid = FakeGrid({(201, 41), (50, 50)})
+    tab._reach = {(201, 41), (50, 50)}                       # 傳點跟出口同一區（短傳點）
+    run(tab, 0.1)
+    ck("　傳點走得到（同一區）→ 不能只憑離出口近就當過了，照樣往傳點走",
+       tab._i == 0 and tab._nav.goal == (50, 50), f"i={tab._i} goal={tab._nav.goal}")
+
     # ★★ 2026-09-05 無限塔第 54 步「剩 3.5 格　走完這條路線 → 重算收尾」原地不動：
     #   目標那格地形圖說不可走、最短路的終點被放寬到 3 格外、人站在那裡
     #   → 尋路器舉 exhausted → 剩下那段要**直走**（walk_exact），不是站著等重算。
@@ -817,9 +850,10 @@ def main() -> int:
     ck("　腳本真的動了（尋路往點位走）", tab._nav.goal == (50, 50),
        str(tab._nav.goal))
 
-    # ⛔⛔ 使用者兩次明令（9/2、9/4）：不要黑名單、不要冷卻 —— 放棄就換一隻，
-    #   沒別隻就再問同一隻。
-    print("\n⛔ 沒有黑名單、沒有冷卻：放棄就換一隻，沒別隻就再問同一隻（2026-09-04）")
+    # ⛔ 使用者 9/2、9/4 明令：不要黑名單、不要冷卻 —— 放棄就換一隻。
+    # ★ 2026-09-05 補：「走不過去的怪物應該要直接無視」→ 放棄過的怪只要**還站在原地**
+    #   就不再挑（以牠的位置為鍵、不記時間；牠動了／換圖／門開就重問）。
+    print("\n放棄就換一隻；沒別隻而牠還站在原地 → 不再挑（2026-09-05）")
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     m = FakeMon(x=11.0, y=10.0, eid=7, name="打不到的")
     tab._live_monsters = lambda: [m]
@@ -827,17 +861,21 @@ def main() -> int:
     tab._cur = m
     tab._grid_t = 5.0
     tab._give_up("測試")
-    ck("★★ 放棄之後只剩它一隻 → **馬上再挑它**（門可能開了；⛔ 沒有冷卻）",
-       tab._cur is m and tab._atk.picked is m and tab._last_gave_up == 7,
-       f"cur={tab._cur} last={tab._last_gave_up}")
+    ck("★★ 放棄之後只剩它一隻、牠沒動 → **不再挑**（走不過去的直接無視）",
+       tab._cur is None and tab._atk.picked is None and tab._last_gave_up == 7
+       and tab._hopeless.get(7) == (11.0, 10.0),
+       f"cur={tab._cur} last={tab._last_gave_up} hopeless={tab._hopeless}")
     ck("　放棄會立刻重問一次地形（門開了才跟得上）", tab._grid_t == 0.0)
-    ck("　沒有任何冷卻／黑名單欄位", not hasattr(tab, "_gave_up")
+    ck("　沒有時間型冷卻／黑名單欄位", not hasattr(tab, "_gave_up")
        and not hasattr(tab, "_toofar") and not hasattr(tab, "_killed"))
+    m.x = 15.0                                        # 牠動了 4 格
+    ck("★ 牠動了 → 重新挑得到", tab._pick_next() and tab._cur is m,
+       f"cur={tab._cur}")
     other = FakeMon(x=12.0, y=10.0, eid=8, name="另一隻")
     tab._live_monsters = lambda: [m, other]
     tab._cur = m
     tab._give_up("測試2")
-    ck("★ 有別隻的時候先挑別隻（不是黑名單，只是先換一隻）",
+    ck("★ 有別隻的時候挑別隻",
        tab._cur is other and tab._atk.picked is other,
        tab._atk.picked.name if tab._atk.picked else "沒挑")
 
@@ -983,7 +1021,7 @@ def main() -> int:
     tab._fight((10.0, 10.0), TICK)
     ck("★ 一掉血就解除貼身、記成打傷過", not tab._push_in and tab._hurt)
 
-    # 沒進展 15 秒 → 換一隻；只剩它就再挑它（⛔ 沒有冷卻）
+    # 沒進展 15 秒 → 放棄；只剩它而牠還站在原地 → 不再挑（2026-09-05 走不過去的直接無視）
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     m = FakeMon(x=16.0, y=10.0, eid=64, name="打不中的")
     tab._live_monsters = lambda: [m]
@@ -995,12 +1033,14 @@ def main() -> int:
     dt.entity.read_pos = lambda _sc, _addr: (16.0, 10.0)
     for _ in range(int((dt.STUCK_ENGAGED + 0.5) / TICK)):
         tab._fight((10.0, 10.0), TICK)
-    ck(f"★ 交戰中 {dt.STUCK_ENGAGED:.0f} 秒沒進展 → 換一隻；只剩它 → 馬上再挑它",
-       tab._last_gave_up == 64 and tab._cur is m and tab._stuck < 1.0,
-       f"last={tab._last_gave_up} cur={tab._cur} stuck={tab._stuck}")
+    ck(f"★ 交戰中 {dt.STUCK_ENGAGED:.0f} 秒沒進展 → 放棄；只剩它、牠沒動 → 不再挑",
+       tab._cur is None and tab._hopeless.get(64) == (16.0, 10.0),
+       f"cur={tab._cur} hopeless={tab._hopeless}")
     ck("　原因看得到", "沒進展" in tab.status.text(), tab.status.text())
+    ck("　打怪那一支回 False → 腳本照跑", not tab._fight((10.0, 10.0), TICK))
     other = FakeMon(x=20.0, y=10.0, eid=65, name="另一隻")
     tab._live_monsters = lambda: [m, other]
+    tab._hopeless.clear()
     tab._last_gave_up = None
     for _ in range(int((dt.STUCK_ENGAGED + 0.5) / TICK)):
         tab._fight((10.0, 10.0), TICK)
@@ -1028,8 +1068,9 @@ def main() -> int:
     g.nopath = True
     for _ in range(int(1.0 / TICK)):
         tab._fight((10.0, 10.0), TICK)
-    ck(f"★ 尋路連續 {dt.UNREACH_HITS} 次算不出 → 換一隻（沒別隻就再問它）",
-       tab._last_gave_up == 66 and "走不到" in tab.status.text(), tab.status.text())
+    ck(f"★ 尋路連續 {dt.UNREACH_HITS} 次算不出 → 放棄；沒別隻而牠沒動 → 不再挑",
+       66 in tab._hopeless and tab._cur is None and "走不到" in tab.status.text(),
+       f"hopeless={tab._hopeless} cur={tab._cur} {tab.status.text()}")
 
     # 目標從掃描消失、物件也沒了 → 兩拍後放掉（一拍漏掃不算）
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
@@ -1590,6 +1631,32 @@ def main() -> int:
        tab._player is None and tab._state is None and tab._pos_prev is None
        and tab._map_settle > time.monotonic(),
        f"player={tab._player} settle={tab._map_settle - time.monotonic():.2f}")
+
+    # ★★ 使用者 2026-09-05：「走不過去的怪物應該要直接無視」—— 劇情王瞬移到旁邊一個
+    #   走不過去也打不到的位置，放棄後沒別隻就又挑回牠 → 永遠卡住。
+    #   → 放棄過的怪只要還站在原地就不再挑（以牠的位置為鍵，不是黑名單）。
+    print("\n放棄過還站在原地的怪不再挑")
+    boss = FakeMon(15.0, 10.0, eid=77, name="劇情王")
+    tab = make_tab([{"do": "clear"}], pos=(10.0, 10.0), mons=[boss])
+    tab._me = (10.0, 10.0)
+    ck("一開始挑得到", [m.eid for _dd, m, _p in tab._candidates()] == [77])
+    tab._cur = boss
+    tab._give_up("15 秒沒進展（打不中？）")
+    ck("★★ 放棄後牠沒動 → 不再挑，狀態列講得出「放棄過」",
+       tab._candidates() == [] and "放棄過" in tab._left_out_note(),
+       f"{tab._candidates()} {tab._left_out_note()}")
+    ck("　到點位／收工的判定也不算牠（_targets 空）", tab._targets() == [])
+    ck("　不是黑名單：沒有記時間，只有記位置", tab._hopeless.get(77) == (15.0, 10.0),
+       str(tab._hopeless))
+    boss.x = 19.5                                 # 牠走了 4.5 格
+    ck("★ 牠動了（> HOPELESS_MOVE）→ 重新問、挑得到",
+       [m.eid for _dd, m, _p in tab._candidates()] == [77] and 77 not in tab._hopeless,
+       f"{tab._candidates()} {tab._hopeless}")
+    tab._cur = boss
+    tab._give_up("走不到")
+    ck("　又放棄 → 又記住新位置", tab._hopeless.get(77) == (19.5, 10.0), str(tab._hopeless))
+    tab._after_map_change()
+    ck("★ 換圖 → 全部重新問", tab._hopeless == {}, str(tab._hopeless))
 
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])
