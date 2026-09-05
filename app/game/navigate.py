@@ -146,6 +146,11 @@ class Navigator:
             self.note = "⛔ 地形圖顯示到不了那裡"
             return False
         self._grid_fail = 0
+        # ★ 算得出路就**不再是 stuck**（2026-09-05 黑狐實錄）：換圖那一瞬間拿舊圖座標
+        #   算了兩次「沒有路」→ stuck=grid；之後座標對了、路也算出來了，但 stuck 只有
+        #   reset() 會清 → 呼叫端每拍看到 stuck 就一直喊「走不到…重讀地形」（人其實在走）。
+        self.stuck = False
+        self.stuck_reason = ""
         self._route = [(float(x) + 0.5, float(y) + 0.5) for x, y in wp]
         self._ri = 0
         self._best = None

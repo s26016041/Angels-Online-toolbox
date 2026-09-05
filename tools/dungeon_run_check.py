@@ -511,6 +511,18 @@ def main() -> int:
     run(tab, 0.5)
     ck("★ 站到傳點上**不算**完成（會被搬走，那一格不會到達）", tab._i == 0)
     ck("　還沒到就一直往傳點走", tab._nav.goal == (50, 50), str(tab._nav.goal))
+    # ★★ 2026-09-05 黑狐實錄：人停在傳點 2.3 格外（被物件擋住），隔空送 0x0D 沒用
+    #   → 進了 PORTAL_NEAR 但還沒真的站上去，要一直用 walk_exact 往那格踩。
+    stepped = []
+    tab._mover = type("M", (), {
+        "walk_exact": lambda _s, _sc, _p, x, y: stepped.append((x, y)) or True,
+    })()
+    dt.entity.is_walking = lambda _sc, _p: False
+    tab._exact_sent = 0.0
+    tab._pos = [50.0, 52.2]                   # 2.2 格：在 PORTAL_NEAR 內、PORTAL_ON 外
+    run(tab, 0.2)
+    ck("★★ 進了 2.5 格但還沒踩上去 → 直走踩到傳點那格（walk_exact）",
+       stepped and stepped[0] == (50, 50), str(stepped))
     tab._pos = [50.2, 50.2]
     run(tab, 0.3)
     ck("★ 就算站上去了也還是不算完成", tab._i == 0, str(tab._i))
@@ -1572,6 +1584,12 @@ def main() -> int:
     ck("★★ 進副本的那一刻要求全掃（不然 30 秒內看不到新圖的怪）",
        tab._scan.fulls == 1 and tab._phase == "run",
        f"全掃{tab._scan.fulls} phase={tab._phase}")
+    # ★ 2026-09-05 黑狐實錄：換圖後座標還是舊圖的值約一秒 → 舊玩家物件要丟掉、
+    #   MAP_SETTLE 內不准算（不然拿舊座標在新圖尋路＝「走不到…屬於另一區」）。
+    ck("★★ 換圖 → 丟掉舊玩家物件、順移基準歸零、進入等座標期",
+       tab._player is None and tab._state is None and tab._pos_prev is None
+       and tab._map_settle > time.monotonic(),
+       f"player={tab._player} settle={tab._map_settle - time.monotonic():.2f}")
 
     print("\n不認得的動作")
     tab = make_tab([{"do": "walk", "to": [1, 1]}])

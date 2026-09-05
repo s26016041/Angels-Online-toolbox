@@ -230,6 +230,20 @@ SENT.clear()
 step(nav, 96.0, 0.0)
 check("目標可走、最後一段 4.5 格 → 照走", SENT == [(100.5, 0.5)], f"實得 {SENT}")
 
+print("⑦ ★ 判過 stuck=grid 之後路算出來了 → 不再是 stuck（2026-09-05 黑狐換圖實錄）")
+nav, maps = build(None)
+SENT.clear()
+POS[0], POS[1] = 0.0, 0.0
+WALKING[0] = False
+step(nav)
+step(nav)
+check("先讓它 stuck=grid", nav.stuck is True and nav.stuck_reason == "grid")
+maps.grid.wp = list(GOAL_WP)             # 座標對了／門開了 → 現在算得出路
+step(nav)
+check("★ 路算出來了 → stuck 清掉、真的送走路",
+      nav.stuck is False and nav.stuck_reason == "" and SENT == [(10.5, 0.5)],
+      f"stuck={nav.stuck} reason={nav.stuck_reason!r} sent={SENT}")
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))

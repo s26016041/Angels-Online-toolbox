@@ -270,6 +270,12 @@ JUMP_TILES = 3.0
 JUMP_MAX_GAP = 0.35
 # 傳到的位置跟腳本記的出口差這麼多格就當「傳到別的地方」，大聲停下。
 LAND_TOL = 8.0
+# ★★ 換圖之後要等座標跟上（2026-09-05 黑狐實錄）：場景編號已經變了，玩家座標卻還是
+#   舊圖的值約 1 秒（(286.8,164.9) → 一秒後才變 (122.5,50.5)）。拿舊座標在新圖上算
+#   可達區／尋路 → 「走不到 (133, 62)…屬於另一區」，尋路器連判兩次沒路就 stuck，
+#   之後座標對了它也不會自己好 → 就是使用者說的「位置不對、到不了、卡住」。
+#   → 換圖後這麼久內什麼都不算（順便丟掉舊的玩家物件，等下一次全掃）。
+MAP_SETTLE = 1.0
 # ★★ 順移要「從傳點上跳走」才算是傳點搬的（2026-09-05 使用者實機：無限塔第 41／52
 #   步人還在 10 多格外走過去，伺服器把位置拉回幾格（[[whitefox-rollback]] 那種丟包
 #   修正）→ 一拍跳 ≥3 格 → 被當成「傳點把人送到別的地方」大聲停下，其實根本沒踩到傳點）。
@@ -316,6 +322,11 @@ MIN_REGION = 20
 #   ⚠ 送出到人真的過去約 1 秒；這麼久還沒到就再送一次（跟撞入口一樣無限重試）。
 FLY_RESEND = 8.0
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
+# ★★ 比 PORTAL_NEAR 更近的「真的踩在那格上」門檻（2026-09-05 黑狐實錄，無限塔第 35 步）：
+#   路線最後一段被傳點物件擋住，人停在 2.3 格外；隔空送 0x0D 一分多鐘伺服器都不理
+#   （遊戲自己那支是「站在我這一格上的是誰」才送）。第 18 步 1.9 格就過了。
+#   → 進了 PORTAL_NEAR 還沒到這麼近，就一直用 walk_exact 往那格踩（不尋路）。
+PORTAL_ON = 0.8
 # ★★ 使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進傳送點
 #   封包」——所以站上去之後**主動送 0x0D**（`portal.enter`，就是遊戲自己
 #   踩上去會送的那一包），不是站著等。
@@ -871,6 +882,7 @@ class DungeonTab(BaseTab):
         self._pos_prev = None        # 上一拍的位置（順移偵測用）
         self._pos_t = 0.0
         self._jumped = None          # 這一拍有沒有順移：有＝跳之前站的位置 (x, y)
+        self._map_settle = 0.0       # 換圖後等座標跟上，這個時刻之前不算任何東西
         self._grid_t = 0.0           # 還有多久重讀地形圖
         # ---- 全自動循環（見 PARTY_MODES 的說明）----
         self._loop = False           # 要不要循環（＝「循環打副本」勾選框，見 _round_plan）
@@ -1245,6 +1257,11 @@ class DungeonTab(BaseTab):
         if self._cycle_tick(dt):
             return
 
+        # ⓪-1 剛換圖 → 座標要一秒才跟上（見 MAP_SETTLE），這期間什麼都不算。
+        if time.monotonic() < self._map_settle:
+            self._say("剛換圖，等座標跟上…")
+            return
+
         # ⓪ 人被搬走了嗎？順移要**每一拍**都採樣，不然錯過那一下就看不到了。
         self._jumped = self._check_jump(me)
         # 換圖了嗎？—— 座標是**跟著地圖**的，圖一換舊座標全部沒有意義。
@@ -1343,6 +1360,9 @@ class DungeonTab(BaseTab):
             return
         # ★ 已經站在入口上 → **一直打進傳送點封包**（不是站著等）
         self._nav.reset()
+        # ★ 沒真的站上去就直走踩上去（同副本裡傳點那條：入口那格常是牆，A* 停在旁邊）。
+        if _d((gx, gy), me) > PORTAL_ON:
+            self._walk_onto(gx, gy)
         menu = [n for n in (ent.get("menu") or []) if n]
         gap = MENU_GAP
         # ★★ 有些副本門口是**撞上去它自己跳對話**，還要選第 1 項才進得去
@@ -1427,6 +1447,17 @@ class DungeonTab(BaseTab):
             return None
         return prev if _d(prev, me) >= JUMP_TILES else None
 
+    def _after_map_change(self) -> None:
+        """換圖了：舊圖的座標／玩家物件／順移基準全部作廢，等 MAP_SETTLE 秒再算。
+
+        ⚠ 玩家物件不清掉的話 `_my_pos()` 會繼續讀到舊圖的座標（實錄約一秒），
+          拿它在新圖上算可達區與路徑全是垃圾（見 MAP_SETTLE 的說明）。
+        """
+        self._map_settle = time.monotonic() + MAP_SETTLE
+        self._state, self._player = None, None      # 等下一次（強制全）掃描重抓
+        self._pos_prev, self._pos_t = None, 0.0     # 新圖第一拍不准判成順移
+        self._me = None
+
     def _check_map_change(self) -> bool:
         """換圖了就處理掉。回 True＝這一拍不要再往下跑。
 
@@ -1436,6 +1467,7 @@ class DungeonTab(BaseTab):
         here = scene.map_key(scene.current_id(self._sc, allow_scan=False))
         if here is None or self._map_key is None or here == self._map_key:
             return False
+        self._after_map_change()
         if self._phase == "fly":
             # 飛到了：落在入口那張圖 → 去撞入口；直接落在副本裡 → 開跑。
             ent = self._script.entrance or {}
@@ -2054,6 +2086,13 @@ class DungeonTab(BaseTab):
                 #   互動（有些傳點要點一下才走）。⛔ 不是每一拍狂送：那是
                 #   洪水，伺服器會擋（跟補給點 NPC 同一個道理）。
                 self._nav.reset()
+                # ★★ 2026-09-05 黑狐實錄（無限塔第 35 步）：傳點那一格在地形圖上是**牆**，
+                #   A* 把終點放寬到旁邊 → 人停在 2.1 格外；隔空送 0x0D 伺服器不理
+                #   （遊戲自己那支是「站在我這一格上的是誰」才送），站了一分多鐘都沒過。
+                #   第 18 步過得去是因為那格可走、路線終點就在格上、走過去就踩到了。
+                #   → 沒真的站上去（> PORTAL_ON）就**直走踩上去**（不尋路；製作時人就站過那格）。
+                if _d((gx, gy), me) > PORTAL_ON:
+                    self._walk_onto(gx, gy)
                 self._poke_portal(step, dt)
                 return
             if _d((gx, gy), me) <= NAV_DEAD:
