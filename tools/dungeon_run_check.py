@@ -43,6 +43,7 @@ class FakeNav:
         self.goal = None
         self.stuck = False
         self.stuck_reason = ""
+        self.exhausted = False        # 最短路走完人卻還離目標 >3 格（見 navigate）
         self.calls = 0
 
     def reset(self, goal=None):
@@ -736,6 +737,23 @@ def main() -> int:
     tab._jumped = (52.0, 51.0)                # 站在傳點上跳走、沒記出口
     run(tab, 0.1)
     ck("★ 從傳點上跳走、腳本沒記出口 → 算過", tab._i == 1, tab.status.text())
+
+    # ★★ 2026-09-05 無限塔第 54 步「剩 3.5 格　走完這條路線 → 重算收尾」原地不動：
+    #   目標那格地形圖說不可走、最短路的終點被放寬到 3 格外、人站在那裡
+    #   → 尋路器舉 exhausted → 剩下那段要**直走**（walk_exact），不是站著等重算。
+    tab = make_tab([{"do": "walk", "to": [44, 263]}], pos=(47.5, 264.0))
+    walked_x = []
+    tab._mover = type("M", (), {
+        "walk_exact": lambda _s, _sc, _p, x, y: walked_x.append((x, y)),
+    })()
+    dt.entity.is_walking = lambda _sc, _p: False
+    tab._nav.exhausted = True
+    run(tab, 0.3)
+    ck("★★ 尋路器說最短路只能到這（exhausted）→ 直走到點位（walk_exact）",
+       bool(walked_x) and walked_x[0] == (44, 263), str(walked_x))
+    ck("　沒被當成走不到（不進 _blocked）", "沒有路" not in tab.status.text(),
+       tab.status.text())
+    ck("　還在跑、步驟沒跳", tab.run_cb.isChecked() and tab._i == 0)
 
     # 順移偵測本身：速度分得出「走的」跟「傳的」
     tab = make_tab([{"do": "clear"}])

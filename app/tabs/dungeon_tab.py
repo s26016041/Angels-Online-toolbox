@@ -1273,9 +1273,8 @@ class DungeonTab(BaseTab):
             if _d((gx, gy), me) <= NAV_DEAD:
                 note = self._walk_onto(gx, gy)
             else:
-                note = self._nav.step(self._sc, self._mover, self._player,
-                                      gx, gy)
-                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                note, no_path = self._go_to(gx, gy)
+                if no_path:
                     # ⛔ 這裡不用 `_blocked()`：那支等過寬限就會停，跟「無限
                     #   嘗試」衝突。改成重讀地形繼續試（人牆散開就走得到）。
                     self._grid_t = 0.0
@@ -1943,9 +1942,8 @@ class DungeonTab(BaseTab):
             if _d((gx, gy), me) <= NAV_DEAD:
                 note = self._walk_onto(gx, gy)
             else:
-                note = self._nav.step(self._sc, self._mover, self._player,
-                                      gx, gy)
-                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                note, no_path = self._go_to(gx, gy)
+                if no_path:
                     self._blocked(dt, f"走不到 ({gx}, {gy})", (gx, gy))
                     return
             self._say(f"第 {self._i + 1} 步　走到 ({gx}, {gy})"
@@ -1995,9 +1993,8 @@ class DungeonTab(BaseTab):
             if _d((gx, gy), me) <= NAV_DEAD:
                 note = self._walk_onto(gx, gy)
             else:
-                note = self._nav.step(self._sc, self._mover, self._player,
-                                      gx, gy)
-                if self._nav.stuck and self._nav.stuck_reason == "grid":
+                note, no_path = self._go_to(gx, gy)
+                if no_path:
                     self._blocked(dt, f"走不到傳點 ({gx}, {gy})", (gx, gy))
                     return
             self._say(f"第 {self._i + 1} 步　走進傳點 ({gx}, {gy})"
@@ -2088,9 +2085,8 @@ class DungeonTab(BaseTab):
                 if _d((sx, sy), me) <= NAV_DEAD:
                     note = self._walk_onto(sx, sy)
                 else:
-                    note = self._nav.step(self._sc, self._mover, self._player,
-                                          sx, sy)
-                    if self._nav.stuck and self._nav.stuck_reason == "grid":
+                    note, no_path = self._go_to(sx, sy)
+                    if no_path:
                         self._blocked(dt, f"走不到對話站位 ({sx}, {sy})",
                                       (sx, sy))
                         return
@@ -2107,6 +2103,10 @@ class DungeonTab(BaseTab):
                 if self._nav.stuck and self._nav.stuck_reason == "grid":
                     self._blocked(dt, f"走不到對話點 ({ax}, {ay})", (ax, ay))
                     return
+                if self._nav.exhausted:
+                    # 最短路走完還差 >3 格（物件站在不可走格上）→ 走到旁邊，
+                    #   ⛔ 不用 `_go_to`：那支是走到那一格本身，會踩上物件。
+                    note = f"{self._walk_beside(ax, ay, TALK_KEEP)}（{note}）"
             self._say(f"{tag}　走去對話點 ({ax}, {ay})"
                       f"　剩 {_d((ax, ay), me):.1f} 格　{note}"
                       f"　{self._mon_note()}")
@@ -2704,6 +2704,26 @@ class DungeonTab(BaseTab):
             return bool(entity.is_walking(self._sc, self._player))
         except Exception:                                # noqa: BLE001
             return False
+
+    def _go_to(self, gx: float, gy: float) -> tuple[str, bool]:
+        """走向 (gx, gy)（點位／傳點／站位／入口共用）。回 `(說明, 地形圖說沒路)`。
+
+        三段：
+          · ≤ NAV_DEAD(3)：尋路器不動作 → `_walk_onto` 直走（9/2 那個門檻打架的修法）。
+          · 否則交給 `Navigator`（讀地形圖算最短路）。
+          · ★ 尋路器舉 `exhausted`（最短路走完了、人站在離目標最近的可走格上，
+            卻還差 > 3 格）＝目標那格**地形圖說不可走但製作時人真的站在那**
+            （貼牆／石頭邊常這樣）→ 剩下的一樣直走，不尋路。
+            2026-09-05 無限塔第 54 步「剩 3.5 格 → 重算收尾」原地無限轉就是缺這一段。
+        ⚠ 「地形圖說沒路」回 True 由呼叫端自己決定要 `_blocked()` 還是只重讀地形
+          （入口那條是無限重試、不走 `_blocked`）。
+        """
+        note = self._nav.step(self._sc, self._mover, self._player, gx, gy)
+        if self._nav.stuck and self._nav.stuck_reason == "grid":
+            return note, True
+        if self._nav.exhausted:
+            note = f"{self._walk_onto(gx, gy)}（{note}）"
+        return note, False
 
     def _walk_onto(self, gx: float, gy: float) -> str:
         """**走到那一格本身**（點位、傳點用）。不留距離、不尋路。

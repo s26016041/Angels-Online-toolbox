@@ -48,6 +48,13 @@ SEND_GRACE = 0.30
 
 ARRIVE = 3.0             # 離目標這麼近就算到了
 NEAR_SUB = 3.0           # 離路線上的轉折點這麼近就算走到了
+# ★★ **最後一個轉折點**要走到這麼近才算走完（不能用 NEAR_SUB 3 格）。
+#   2026-09-05 無限塔第 54 步實錄：目標 3.5 格外（> arrive 3），最短路的終點被放寬到
+#   最近的可走格、離人 ≤3 格 → 舊版一拍就把整條路「走完」（人一步沒動）→
+#   「走完這條路線 → 重算收尾」→ 重算出同一條 → 又一拍走完 → **原地無限重算**。
+#   最後一段走到 1 格內才算，人才會真的往終點走；到了終點還差目標 > arrive
+#   ＝目標那格地形圖說不可走（見 `exhausted`），交給呼叫端直走收尾。
+LAST_SUB = 1.0
 STALL_TRIES = 4          # 同一個轉折點連續這麼多拍沒進展就重算
 # 最短路走不動（多半是被怪／別的玩家擋在路上）最多從頭重算幾次。
 # 超過就認輸並讓呼叫端換目標 —— 無限重算會讓巡邏永遠停在同一個地方。
@@ -88,6 +95,14 @@ class Navigator:
         #             照使用者的規矩要一直重試，不准拿它停掉掛機
         #             （[[transient-failure-auto-retry]]）
         self.stuck_reason = ""
+        # ★★ 「最短路走完了，人卻還離目標 > arrive」＝目標那格在地形圖上不可走、
+        #   終點被放寬到最近的可走格（GOAL_RELAX 最多 4 格）而人已經站在那裡。
+        #   這**不是 stuck**（路是通的，只是圖跟實際站得住的格不一致：貼牆／石頭邊
+        #   常被標成不可走，製作時人卻真的站在那）→ 呼叫端拿它決定**直走收尾**。
+        #   ⚠ 舉著這面旗時**不重算**（重算只會算出同一條、還會把呼叫端的直走打斷）；
+        #     只有被推得比舉旗時更遠（> 1 格）才重新規劃。
+        self.exhausted = False
+        self._exh_d = 0.0                    # 舉旗時離目標幾格
         self._route: list | None = None      # 目前這條最短路的轉折點
         self._ri = 0                         # 走到第幾個轉折點
         self._best = None                    # 對目前轉折點的最佳距離
@@ -161,6 +176,11 @@ class Navigator:
         if _d(here, goal) <= arrive:
             self.note = "到了"
             return self.note
+        if self.exhausted:
+            # 呼叫端正在直走收尾 → 沒被推遠就不重算（見 `exhausted` 的說明）。
+            if _d(here, goal) <= self._exh_d + 1.0:
+                return self.note
+            self.exhausted = False
 
         # ★★★ 唯一的規劃方式：讀地形圖自己算最短路（見 terrain.py）。
         #   整張圖 5~8ms 讀完、A* 12~19ms 算完，而且是真正的最短路。
@@ -181,16 +201,25 @@ class Navigator:
             return self.note
 
         # ── 照最短路一個轉折點一個轉折點走 ────────────────────
-        while (self._ri < len(self._route)
-               and _d(here, self._route[self._ri]) <= NEAR_SUB):
+        while self._ri < len(self._route):
+            # ★ 最後一個轉折點要走到 LAST_SUB 才算（見那條的說明），中間的用 NEAR_SUB。
+            near = LAST_SUB if self._ri == len(self._route) - 1 else NEAR_SUB
+            if _d(here, self._route[self._ri]) > near:
+                break
             self._ri += 1
             self._go_now = True     # 到點了 → 下一拍立刻送下一段
             self._best = None
             self._replans = 0       # ★ 走到一個轉折點＝真的有進展（見 REPLAN_MAX）
         if self._ri >= len(self._route):
-            # 路線走完了還沒到（終點被放寬到最近的可走格）→ 重算一次收尾。
+            # 路線走完了還沒到 ＝ 終點被放寬到最近的可走格、人已經站在那裡。
+            # ⛔ 不重算（算出來還是同一條，2026-09-05 無限塔第 54 步就是這樣原地轉）
+            #   → 舉 `exhausted`，交給呼叫端直走收尾。
             self._route = None
-            self.note = "走完這條路線 → 重算收尾"
+            self._go_now = False
+            self.exhausted = True
+            self._exh_d = _d(here, goal)
+            self.note = (f"最短路只能到這裡（目標那格地形圖說不可走，"
+                         f"還差 {self._exh_d:.1f} 格）")
             return self.note
 
         pt = self._route[self._ri]

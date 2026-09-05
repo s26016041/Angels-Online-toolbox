@@ -195,6 +195,41 @@ check("reset 之後 stuck 清掉", nav.stuck is False)
 check("reset 之後 stuck_reason 也清掉", nav.stuck_reason == "",
       f"實得 {nav.stuck_reason!r}")
 
+print("⑥ ★ 最後一段不能用 3 格當走完（2026-09-05 無限塔第 54 步原地無限重算）")
+# 目標 (100,0) 那格地形圖說不可走 → 最短路的終點被放寬到 (96,0)，離目標 4 格。
+nav, maps = build([(96, 0)])
+SENT.clear()
+POS[0], POS[1] = 93.0, 0.0
+WALKING[0] = False
+step(nav)
+check("離放寬後的終點 3.5 格 → 還要走過去（舊版一拍就當「走完」）",
+      SENT == [(96.5, 0.5)], f"實得 {SENT}")
+check("　還沒舉 exhausted", nav.exhausted is False)
+step(nav, 96.3, 0.2)                     # 真的走到終點旁（1 格內）
+check("★ 站在放寬後的終點、離目標還 3.7 格 → exhausted（不是 stuck）",
+      nav.exhausted is True and nav.stuck is False,
+      f"exhausted={nav.exhausted} stuck={nav.stuck} note「{nav.note}」")
+check("　訊息講得出「最短路只能到這裡」", "最短路只能到這裡" in nav.note,
+      f"實得「{nav.note}」")
+asked, sent_n = maps.grid.asked, len(SENT)
+step(nav)                                # 呼叫端直走收尾中
+step(nav, 96.9, 0.0)                     # 越走越近（還沒進 arrive 3 格）
+check("　舉旗期間**不重算、不送走路**（重算會把直走打斷）",
+      maps.grid.asked == asked and len(SENT) == sent_n,
+      f"asked {asked}→{maps.grid.asked}　sent {sent_n}→{len(SENT)}")
+check("　旗還舉著", nav.exhausted is True)
+step(nav, 90.0, 0.0)                     # 被推遠了（比舉旗時遠 >1 格）
+check("★ 被推得比舉旗時遠 → 放下旗、重新規劃",
+      nav.exhausted is False and maps.grid.asked == asked + 1,
+      f"exhausted={nav.exhausted} asked {asked}→{maps.grid.asked}")
+nav.reset()
+check("reset 之後 exhausted 也清掉", nav.exhausted is False)
+# 目標本身可走：最後一段 4.5 格也不會被當走完
+nav, maps = build([(100, 0)])
+SENT.clear()
+step(nav, 96.0, 0.0)
+check("目標可走、最後一段 4.5 格 → 照走", SENT == [(100.5, 0.5)], f"實得 {SENT}")
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
