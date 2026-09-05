@@ -5291,6 +5291,11 @@ class CharFarmPage(QWidget):
         self._killed.clear()
         self._since_scan = SCAN_NOW        # 清單裡挑不到的話，立刻重掃
         self._cur = None
+        # ★ 使用者親手重開掛機＝重新數「連續幾趟補給回來還是見底／還是壞的」。
+        #   2026-09-05 雪狐實錄：兩趟補給失敗停機後，人走回巡邏點按「開始掛機」，
+        #   第一次體檢就因為舊的 _dry_trips 還是 2 → 連一趟都沒跑就再通知一次同一句停機。
+        self._dry_trips = 0
+        self._broken_trips = 0
         self._pick_home()                  # 記錄點：巡邏點優先（見 _pick_home）
         # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
         #   學法：直讀快捷欄那格（quickbar.py），通常當場拿到；讀不到才退回

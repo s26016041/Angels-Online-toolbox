@@ -1456,6 +1456,10 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
 #   由 tools/build_supply_merchants.py 從 GAMEDATA/map 的 .MPC 自動抽）。
 
 WING_WAIT = 12.0       # 回城後等地圖變的上限（秒）
+# ★ 2026-09-05 雪狐實錄：兩趟補給都回「回城後地圖沒變」停機，人卻已經在主城、翼 50→48
+#   —— 翼確實生效、只是換圖晚於 12 秒（慢載圖）。所以 12 秒沒變先看翼有沒有**少一張**：
+#   少了＝傳送在路上，再多等這麼久；沒少＝那一下真的沒生效，照舊算失敗（不盲等）。
+WING_WAIT_LATE = 20.0
 JUMP_TRIES = 3         # 回程趴趴GO 最多重送幾次（★ 送出去≠到得了，見 run_full_supply）
 JUMP_WAIT = 10.0       # 每次送出後等落地的上限（秒）
 WALK_TIMEOUT = 90.0    # 走到 NPC 的上限（秒）——銀行常在城另一頭（永夜城實測離落點 176 格），
@@ -1480,6 +1484,18 @@ def _wing_slot(scanner):
         return None
     got = inventory.find_by_type(scanner, h[0], recall.RECALL_ITEM)
     return got[0] if got else None
+
+
+def _wing_count(scanner):
+    """背包裡天使之翼**總數**（可疊物品散在幾格都加起來）；讀不到回 None。
+    給「翼用掉了沒」當證據用（見 WING_WAIT_LATE）。"""
+    h = bag.head(scanner)
+    if not h:
+        return None
+    try:
+        return int(inventory.count_by_type(scanner, h[0], recall.RECALL_ITEM))
+    except Exception:                                      # noqa: BLE001
+        return None
 
 
 def _wait_map_change(scanner, from_map: int, timeout: float):
@@ -1656,12 +1672,21 @@ def run_full_supply(mover, scanner, say=None,
         slot = _wing_slot(scanner)
         if slot is None:
             return False, f"背包沒有{itemname.label(recall.RECALL_ITEM)}（回程道具）"
+        before = _wing_count(scanner)
         if not recall.use_item(mover, slot):
             return False, "回程道具送不出去"
         note("用天使之翼回城中…")
         home = _wait_map_change(scanner, here, WING_WAIT)
         if home is None:
-            return False, "回城後地圖沒變（回程可能失敗）"
+            # ★ 12 秒沒換圖：翼少了一張＝傳送在路上（慢載圖），再等；沒少＝沒生效
+            after = _wing_count(scanner)
+            if before is not None and after is not None and after >= before:
+                return False, "回城後地圖沒變、翼也沒少（回程道具沒生效）"
+            note(f"翼用掉了但還沒換圖，再等 {WING_WAIT_LATE:.0f} 秒…")
+            home = _wait_map_change(scanner, here, WING_WAIT_LATE)
+            if home is None:
+                return False, (f"翼用掉了但等了 {WING_WAIT + WING_WAIT_LATE:.0f} 秒"
+                               "地圖還沒變（回程可能失敗）")
         note(f"回到 {scene.scene_name(home)}")
         time.sleep(1.0)                   # 落地穩定一下
 
