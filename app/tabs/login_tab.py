@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app import theme
 from app.config import config
 from app.core import charname, injector, nethealth, netstat, preload
 from app.core import window as win
@@ -254,7 +255,7 @@ class LoginTab(BaseTab):
         ar_row.addWidget(self.ar_hist_btn)
         self.ar_lbl = QLabel("")
         self.ar_lbl.setWordWrap(True)
-        self.ar_lbl.setStyleSheet("color: #9aa2b8;")
+        self.ar_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         ar_row.addWidget(self.ar_lbl, 1)
         root.addLayout(ar_row)
 
@@ -284,7 +285,7 @@ class LoginTab(BaseTab):
         self._ar_hist_table: QTableWidget | None = None
 
         self.status_label = QLabel("就緒")
-        self.status_label.setStyleSheet("color: #9aa2b8;")
+        self.status_label.setStyleSheet(f"color: {theme.TEXT_MUT};")
         self.status_label.setWordWrap(True)
         root.addWidget(self.status_label)
         root.addStretch(1)
@@ -876,7 +877,7 @@ class LoginTab(BaseTab):
         hint = QLabel(f"從程式開啟以來的自動回連事件，最新的在最上面"
                       f"（最多保留 {AR_HISTORY_MAX} 筆，關閉程式就清空）。")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #9aa2b8;")
+        hint.setStyleSheet(f"color: {theme.TEXT_MUT};")
         lay.addWidget(hint)
         tbl = QTableWidget(0, len(AR_HIST_COLS))
         tbl.setHorizontalHeaderLabels(AR_HIST_COLS)

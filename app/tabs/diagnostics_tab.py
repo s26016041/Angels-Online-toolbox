@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app import theme
 from app.core import window as win
 from app.tabs.base_tab import GROUP_DEV, BaseTab
 
@@ -117,7 +118,7 @@ class DiagnosticsTab(BaseTab):
 
         self.status = QLabel("就緒")
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #9aa2b8;")
+        self.status.setStyleSheet(f"color: {theme.TEXT_MUT};")
         root.addWidget(self.status)
 
         self._windows: list[win.WindowInfo] = []

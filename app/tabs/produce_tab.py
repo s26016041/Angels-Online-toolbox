@@ -143,6 +143,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import theme
 from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
@@ -356,7 +357,7 @@ class CharProducePage(QWidget):
         run_bar.addWidget(self.ball_cb)
         # ★★ 現況／為什麼沒動作一定要看得到（2026-08-22 使用者回報）。
         self._ball_lbl = QLabel("經驗球：—")
-        self._ball_lbl.setStyleSheet("color: #9aa2b8;")
+        self._ball_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         run_bar.addSpacing(6)
         run_bar.addWidget(self._ball_lbl)
         run_bar.addSpacing(12)
@@ -426,7 +427,7 @@ class CharProducePage(QWidget):
         # ★ 只騙「要不要觸發」那一下，之後每一步讀的都是真資料。
         test_bar = QHBoxLayout()
         test_lbl = QLabel("測試：")
-        test_lbl.setStyleSheet("color: #9aa2b8;")
+        test_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         test_bar.addWidget(test_lbl)
         self.test_full_btn = QPushButton("假裝負重 96%")
         self.test_full_btn.setToolTip(
@@ -444,7 +445,7 @@ class CharProducePage(QWidget):
         root.addLayout(test_bar)
 
         self.status = QLabel("待命中")
-        self.status.setStyleSheet("color: #9aa2b8;")
+        self.status.setStyleSheet(f"color: {theme.TEXT_MUT};")
         root.addWidget(self.status)
         root.addStretch(1)
 
@@ -469,7 +470,7 @@ class CharProducePage(QWidget):
 
         top = QHBoxLayout()
         self.weight_lbl = QLabel("負重：讀取中")
-        self.weight_lbl.setStyleSheet("color: #9aa2b8;")
+        self.weight_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         top.addWidget(self.weight_lbl)
         top.addSpacing(12)
         # ⚠ 單位/說明放框外，不要用 setPrefix/setSuffix（qt-ui-pitfalls）
@@ -506,7 +507,7 @@ class CharProducePage(QWidget):
         self.mark_bench_btn.clicked.connect(self._mark_bench)
         row.addWidget(self.mark_bench_btn)
         self.bench_lbl = QLabel("")
-        self.bench_lbl.setStyleSheet("color: #9aa2b8;")
+        self.bench_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         row.addWidget(self.bench_lbl)
         row.addStretch(1)
         v.addLayout(row)
@@ -560,7 +561,7 @@ class CharProducePage(QWidget):
         """製作檯那一行的文字：還沒找過就直說，找過就顯示地圖與座標。"""
         if not self._bench:
             self.bench_lbl.setText("製作檯：還沒標（站到檯子旁按「記下製作檯位置」）")
-            self.bench_lbl.setStyleSheet("color: #9aa2b8;")
+            self.bench_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
             self.bench_lbl.setToolTip(
                 "還沒標製作檯：站到檯子旁邊一格按「記下製作檯位置」。\n"
                 "沒標也會自動找，但手動標最準。")
@@ -569,7 +570,7 @@ class CharProducePage(QWidget):
         where = scene.scene_name(sid) if sid is not None else "未標記地圖"
         text = f"製作檯：{where} ({x:.0f}, {y:.0f})"
         self.bench_lbl.setText(text)
-        self.bench_lbl.setStyleSheet("color: #9aa2b8;")
+        self.bench_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         self.bench_lbl.setToolTip(
             text + "　（要換位置就站到新位置再按一次）")
 
@@ -597,13 +598,13 @@ class CharProducePage(QWidget):
             wt = None
         if wt is None:
             self.weight_lbl.setText("負重：讀不到")
-            self.weight_lbl.setStyleSheet("color: #e0b040;")
+            self.weight_lbl.setStyleSheet(f"color: {theme.WARN};")
             return
         cur, cap = wt
         pct = cur * 100.0 / cap
         self.weight_lbl.setText(f"負重：{cur} / {cap}（{pct:.0f}%）")
         self.weight_lbl.setStyleSheet(
-            f"color: {'#e0b040' if pct >= 95 else '#9aa2b8'};")
+            f"color: {theme.WARN if pct >= 95 else theme.TEXT_MUT};")
 
     # ------------------------------------------------------------------
     # -- 開始生產 --------------------------------------------------------
@@ -1140,7 +1141,7 @@ class CharProducePage(QWidget):
 
         grand = sum(int(r.get("total", 0)) for r in log)
         head = QLabel(f"共 {len(log)} 次捐獻，累計名聲 {grand}")
-        head.setStyleSheet("font-weight: bold; color: #d0d4e0;")
+        head.setStyleSheet(f"font-weight: bold; color: {theme.TEXT};")
         lay.addWidget(head)
 
         lst = QListWidget()
@@ -2087,7 +2088,7 @@ class CharProducePage(QWidget):
     def _note(self, msg: str, warn: bool = False, bad: bool = False) -> None:
         self.status.setText(msg)
         self.status.setToolTip(msg)                # 太長被截掉時滑鼠看全文
-        color = "#e06060" if bad else ("#e0b040" if warn else "#9aa2b8")
+        color = theme.BAD if bad else (theme.WARN if warn else theme.TEXT_MUT)
         self.status.setStyleSheet(f"color: {color};")
 
     # ------------------------------------------------------------------
@@ -2246,7 +2247,7 @@ class ProduceTab(ClientWatchMixin, BaseTab):
 
         bar = QHBoxLayout()
         self.found = QLabel("尚未偵測")
-        self.found.setStyleSheet("color: #9aa2b8;")
+        self.found.setStyleSheet(f"color: {theme.TEXT_MUT};")
         bar.addWidget(self.found)
         # AOB 自動定位的結果。平常是空的；改版讓位址位移時要在這裡說出來。
         self.locate_lbl = QLabel("")
@@ -2323,10 +2324,10 @@ class ProduceTab(ClientWatchMixin, BaseTab):
         if failed:
             text = (f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（相關功能已停用）："
                     + "、".join(failed[:3]))
-            color = "#e0b040"
+            color = theme.WARN
         elif moved:
             text = f"偵測到遊戲改版，已自動重新定位 {len(moved)} 個位址"
-            color = "#7fc97f"
+            color = theme.OK
         self.locate_lbl.setText(text)
         self.locate_lbl.setToolTip(text)
         self.locate_lbl.setStyleSheet(f"color: {color};" if color else "")

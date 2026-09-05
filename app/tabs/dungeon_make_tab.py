@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import theme
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
@@ -123,8 +124,8 @@ class _IconPeek(QLabel):
         super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet(
-            "background:#20242c; color:#d8dde6; border:1px solid #55606f;"
-            " padding:6px;")
+            f"background: {theme.PANEL_HDR}; color: {theme.TEXT};"
+            f" border: 1px solid {theme.BORDER_HL}; border-radius: 6px; padding: 6px;")
 
     def show_for(self, model: int, at) -> None:
         pm = mapobj.pixmap(model)
@@ -480,6 +481,7 @@ class DungeonMakeTab(BaseTab):
         #   talkaction(0x0B) 完全不同，所以要有自己的按鈕、也自己記一格。
         b = QPushButton("過場")
         b.setFixedWidth(46)
+        b.setStyleSheet("padding-left: 0; padding-right: 0;")   # 窄鈕，主題內距塞不下
         b.setToolTip(
             "這一頁**沒有選項**（只有文字＋確定）→ 按這顆過掉它，往下看下一頁。\n"
             "⚠ 不會記進腳本 —— 跑的時候「沒有選項就自己按到出現選項或結束」\n"
@@ -489,6 +491,8 @@ class DungeonMakeTab(BaseTab):
         for n in range(1, dungeon.MENU_MAX + 1):
             b = QPushButton(str(n))
             b.setFixedWidth(34)
+            # 34px 的窄鈕塞不下主題的左右 14px 內距，數字會被切掉（截圖實拍到）
+            b.setStyleSheet("padding-left: 0; padding-right: 0;")
             b.setToolTip(f"送出對話選單的第 {n} 項，並記進這一步的路徑。")
             b.clicked.connect(lambda _=False, k=n: self._send_option(k))
             oh.addWidget(b)

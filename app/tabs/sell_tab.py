@@ -77,7 +77,7 @@ HIST_MAX = 500              # 表格只留最近這麼多筆（使用者指定�
 
 # 名稱與品質欄的字色，**直接用遊戲自己那三個顏色**（見 app/game/bag.py）：
 # 普通不上色（跟著佈景走＝白）、優質 #00F7FF 青藍、頂級 #FFCE10 橘金。
-# 佈景是深色的（app/theme.py BG = #1e2230），這兩個亮色在上面都很清楚。
+# 佈景是深色的（app/theme.py 的 BG），這兩個亮色在上面都很清楚。
 GRADE_FG = {bag.GRADE_FINE: QColor("#00F7FF"), bag.GRADE_TOP: QColor("#FFCE10")}
 
 def _refill(table, stretch_col: int, fill) -> None:

@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
+from app import theme
 from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
@@ -555,7 +556,7 @@ class _NoteLabel(QLabel):
 
     def __init__(self, hide_when_empty: bool = True) -> None:
         super().__init__("")
-        self.setStyleSheet("color: #9aa2b8;")
+        self.setStyleSheet(f"color: {theme.TEXT_MUT};")
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setMinimumWidth(0)
         self._full = ""
@@ -1979,7 +1980,7 @@ class CharFarmPage(QWidget):
         #   「滿了沒買新的換上，看不出來問題在哪」）—— 十個安靜的 return
         #   讓「功能沒動」跟「功能沒開」長得一模一樣。
         self._ball_lbl = QLabel("經驗球：—")
-        self._ball_lbl.setStyleSheet("color: #9aa2b8;")
+        self._ball_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         ball_bar.addSpacing(6)
         ball_bar.addWidget(self._ball_lbl)
         # ⛔ 臨時的「測試換球」鈕已拆掉（2026-08-21 三包實機驗證完成：
@@ -5397,7 +5398,7 @@ class CharFarmPage(QWidget):
         except Exception:                      # noqa: BLE001
             pass
         self.status.setText(reason)
-        self.status.setStyleSheet("color: #e06060;")
+        self.status.setStyleSheet(f"color: {theme.DANGER};")
 
     def _check_game_gone(self, dt: float) -> bool:
         """遊戲視窗還在不在？已經關掉就停用這一台並回 True。
@@ -6611,7 +6612,7 @@ class FarmTab(ClientWatchMixin, BaseTab):
 
         bar = QHBoxLayout()
         self.found = QLabel("尚未偵測")
-        self.found.setStyleSheet("color: #9aa2b8;")
+        self.found.setStyleSheet(f"color: {theme.TEXT_MUT};")
         bar.addWidget(self.found)
         # ★ AOB 自動定位的結果。平常是空的；遊戲改版讓位址位移時會在這裡說出來，
         #   不然使用者只會看到「怪怪的」卻不知道發生什麼事（上次改版就是這樣）。
@@ -6643,15 +6644,15 @@ class FarmTab(ClientWatchMixin, BaseTab):
             parts.append(
                 f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（相關功能已停用）："
                 + "、".join(failed[:3]))
-            color = "#e0b040"
+            color = theme.WARN
         elif moved:
             parts.append(f"偵測到遊戲改版，已自動重新定位 {len(moved)} 個位址")
-            color = "#7fc97f"
+            color = theme.OK
         if stale:
             # 位址跟得上 ≠ 資料表跟得上：AOB 救位址，救不了抄來的內容
             #（射程/地圖編號）。這條要一直亮到重新核對＋蓋章為止。
             parts.append("⚠ " + stale)
-            color = "#e0b040"
+            color = theme.WARN
         text = "　".join(parts)
         self.locate_lbl.setText(text)
         self.locate_lbl.setToolTip(text)   # 條太長被截掉時滑鼠移上去看全文

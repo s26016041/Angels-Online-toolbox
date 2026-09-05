@@ -162,12 +162,9 @@ class EnergyTab(BaseTab):
         # ⚠ 紅字（使用者指定）：這顆會把一般背包裡**所有**可分解的東西拆掉，
         #   拆掉就回不來了，跟只認兩種編號的那顆不是同一個風險等級。
         self.decomp_all_btn = QPushButton("自動分解全部")
-        # ⚠ 一定要連 :disabled 一起寫：只寫 color 的話，widget 樣式的優先度會
-        #   蓋掉主題的 QPushButton:disabled，跑起來按鈕變灰了字還是紅的。
-        #   底色／邊框沿用主題（這裡只改文字顏色，兩張樣式表是疊加的）。
-        self.decomp_all_btn.setStyleSheet(
-            f"QPushButton {{ color: {theme.DANGER}; font-weight: bold; }}"
-            "QPushButton:disabled { color: #6b7288; }")
+        # 紅字／停用變灰都由 app/theme.py 的 QPushButton[danger="true"] 那段負責
+        # （以前在這裡自己寫樣式表，:disabled 沒一起寫就會「按鈕灰了字還是紅的」）。
+        self.decomp_all_btn.setProperty("danger", True)
         self.decomp_all_btn.setToolTip(
             "⚠ 把一般背包裡所有能分解的東西全部拆成晶能。\n"
             "點裝／造型放在一般背包也會被拆掉，開跑前先收好。\n"
@@ -180,7 +177,7 @@ class EnergyTab(BaseTab):
         self.pause_btn.clicked.connect(lambda: self._stop_decomp("手動暫停"))
         drow.addWidget(self.pause_btn)
         self.decomp_lbl = QLabel("")
-        self.decomp_lbl.setStyleSheet("color: #9aa2b8;")
+        self.decomp_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         drow.addWidget(self.decomp_lbl)
         drow.addStretch(1)
         root.addLayout(drow)
@@ -255,7 +252,7 @@ class EnergyTab(BaseTab):
         self.all_cb.toggled.connect(self._on_all_toggled)
         arow.addWidget(self.all_cb)
         self.auto_lbl = QLabel("")
-        self.auto_lbl.setStyleSheet("color: #9aa2b8;")
+        self.auto_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
         arow.addWidget(self.auto_lbl)
         arow.addStretch(1)
         root.addLayout(arow)
@@ -285,7 +282,7 @@ class EnergyTab(BaseTab):
         root.addWidget(self.log)
 
         self.status = QLabel("尚未選擇分身")
-        self.status.setStyleSheet("color: #9aa2b8;")
+        self.status.setStyleSheet(f"color: {theme.TEXT_MUT};")
         root.addWidget(self.status)
 
         self._auto_n = 0

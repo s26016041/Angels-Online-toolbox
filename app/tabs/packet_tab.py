@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app import theme
 from app.core import injector
 from app.core import window as win
 from app.tabs.base_tab import GROUP_DEV, BaseTab
@@ -82,7 +83,7 @@ class PacketTab(BaseTab):
 
         self.status = QLabel("就緒")
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #9aa2b8;")
+        self.status.setStyleSheet(f"color: {theme.TEXT_MUT};")
         root.addWidget(self.status)
 
         # 即時輪詢環狀緩衝

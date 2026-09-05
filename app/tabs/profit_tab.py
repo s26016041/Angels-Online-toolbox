@@ -46,14 +46,9 @@ from app.game import items, locate
 from app.game.watcher import StatsWorker
 from app.tabs.base_tab import GROUP_LAUNCH, BaseTab
 
-TEXT = "#e6e8ef"
-TEXT_MUT = "#9aa2b8"
-ACCENT = "#6c8cff"
-SUCCESS = "#33c17f"
-DANGER = "#ff6b6b"
-GOLD = "#e0a458"
-PANEL = "#262b3b"
-BORDER = "#3a4056"
+# 顏色一律取自主題（以前這裡自己抄一份色碼，主題改色時這一頁不會跟著變）。
+from app.theme import (ACCENT, BASE, BORDER, DANGER, GOLD, PANEL, SUCCESS, TEXT,
+                       TEXT_MUT)
 
 
 def _sheet(widget, css: str) -> None:
@@ -216,7 +211,7 @@ class CharCard(QFrame):
         self.setObjectName("charCard")
         self.setStyleSheet(
             f"QFrame#charCard {{ background: {PANEL}; border: 1px solid {BORDER};"
-            f" border-radius: 6px; }}")
+            f" border-radius: 10px; }}")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -279,6 +274,7 @@ class CharCard(QFrame):
         # 計時 / 速率
         btns = QHBoxLayout()
         self.start_btn = QPushButton("開始計算")
+        self.start_btn.setProperty("primary", True)   # 主要動作 → 主色（見 app/theme.py）
         self.start_btn.clicked.connect(self._toggle)
         self.reset_btn = QPushButton("重設")
         self.reset_btn.clicked.connect(self._reset)
@@ -434,7 +430,7 @@ class CharCard(QFrame):
             # 固定寬度：條子拉到跟卡片一樣寬會把右邊的數字擠到很遠，讀起來反而吃力
             bar.setFixedSize(BAR_WIDTH, 14)
             bar.setStyleSheet(
-                f"QProgressBar {{ background: #1b1f2b; border: 1px solid {BORDER};"
+                f"QProgressBar {{ background: {BASE}; border: 1px solid {BORDER};"
                 f" border-radius: 3px; }}"
                 f"QProgressBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}")
             info = QLabel()

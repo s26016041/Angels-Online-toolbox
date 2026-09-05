@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app import theme
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
@@ -180,7 +181,7 @@ class DailyTab(BaseTab):
         root.addWidget(self.log)
 
         self.status = QLabel("")
-        self.status.setStyleSheet("color: #9aa2b8;")
+        self.status.setStyleSheet(f"color: {theme.TEXT_MUT};")
         root.addWidget(self.status)
 
         # ⚠ 單次觸發：每一步自己決定下一步要隔多久（開商店要等伺服器回話，

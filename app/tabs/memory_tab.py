@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import theme
 from app.core import window as win
 from app.core.memory import (
     STRING_ENCODINGS,
@@ -206,7 +207,7 @@ class MemoryTab(BaseTab):
         lay.addWidget(self.proc_table)
 
         self.attached_label = QLabel("尚未選定程序")
-        self.attached_label.setStyleSheet("color: #9aa2b8;")
+        self.attached_label.setStyleSheet(f"color: {theme.TEXT_MUT};")
         lay.addWidget(self.attached_label)
 
         base_row = QHBoxLayout()
@@ -261,7 +262,7 @@ class MemoryTab(BaseTab):
         lay.addWidget(self.progress)
 
         self.scan_status = QLabel("尚未搜尋")
-        self.scan_status.setStyleSheet("color: #9aa2b8;")
+        self.scan_status.setStyleSheet(f"color: {theme.TEXT_MUT};")
         lay.addWidget(self.scan_status)
         return box
 
@@ -398,7 +399,7 @@ class MemoryTab(BaseTab):
         self.attached_label.setText(
             f"已選定：PID {w.pid}（{bits} 位元）— {w.title}{write_note}{base_note}"
         )
-        self.attached_label.setStyleSheet("color: #33c17f;")
+        self.attached_label.setStyleSheet(f"color: {theme.OK};")
         self._clear_results()
         self.scan_status.setText("已選定程序，可開始首次搜尋。")
         self._update_enabled()
