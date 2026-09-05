@@ -180,8 +180,8 @@ QGroupBox {
     background-color: $PANEL;
     border: 1px solid $BORDER;
     border-radius: $RADIUS_LG px;
-    margin-top: 16px;
-    padding: 14px 6px 6px 6px;
+    margin-top: 14px;
+    padding: 12px 6px 4px 6px;
     font-weight: 600;
 }
 QGroupBox::title {
@@ -350,7 +350,9 @@ QListView, QListWidget {
     selection-background-color: $SEL_BG;
     selection-color: $TEXT;
 }
-QListView::item { padding: 5px 8px; border-radius: 4px; }
+/* 上下 3px：視窗高度固定 700，列表列高每多 1px、五列就多 5px（副本腳本製作頁實測 5px 會把
+   步驟清單撐到蓋住下面的按鈕）。 */
+QListView::item { padding: 3px 8px; border-radius: 4px; }
 QListView::item:hover { background-color: $PANEL_HOV; }
 QListView::item:selected { background-color: $SEL_BG; color: $TEXT; }
 

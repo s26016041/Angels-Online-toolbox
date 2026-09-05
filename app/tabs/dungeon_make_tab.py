@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -290,7 +292,20 @@ class DungeonMakeTab(BaseTab):
         self._poke_base = None            # 點下去之前的對話框代號
         self._poke_until = 0.0
 
-        root = QVBoxLayout(self)
+        # ★ 整頁放進可捲動區（跟自動掛機／記憶體掃描一樣）。主視窗固定 1040x700，
+        #   這一頁「步驟至少 5 列」＋對話方框加起來塞不下時，Qt 會把清單壓到比最小
+        #   尺寸還小 → 清單蓋住底下的 ↑↓刪除 三顆鈕（2026-09-05 使用者回報）。
+        #   有捲軸就永遠不會壓，頂多要捲一下。捲軸固定顯示，免得在邊界抖動。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        body = QWidget()
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        root = QVBoxLayout(body)
 
         # ── 分身 ───────────────────────────────────────────
         bar = QHBoxLayout()
@@ -366,6 +381,11 @@ class DungeonMakeTab(BaseTab):
         row_h = self.steps.sizeHintForRow(0)
         self.steps.clear()
         self.steps.setMinimumHeight(row_h * 5 + self.steps.frameWidth() * 2 + 4)
+        # ⚠ 垂直用 Ignored：清單預設 sizeHint 是 256px 高，這一頁有自動換行的標籤
+        #   （heightForWidth），捲動區會照**偏好**高度排版 → 明明放得下也硬長出捲軸、
+        #   對話方框被推到看不見。Ignored＝偏好高度不算數，只守上面那個最小值，
+        #   放得下就剛好填滿、放不下才捲。
+        self.steps.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         sv.addWidget(self.steps, 1)
         sh = QHBoxLayout()
         for text, tip, fn in (
