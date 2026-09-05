@@ -54,7 +54,8 @@ from typing import Callable
 from app.config import config
 from app.core import charname, injector, preload, window as win
 from app.core.memory import MemoryScanner
-from app.game import bag, enhance, gear, holes, itemicon, itemname, locate, move
+from app.game import (bag, enhance, gear, holes, itemdesc, itemicon, itemname,
+                      locate, move)
 from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
 # 模擬背包的樣子（照使用者給的 背包.png：深色格子牆＋圖示置中）
@@ -241,8 +242,11 @@ def _gem_cells(gems: list[holes.Gem], scanner=None) -> list[Cell]:
 
 
 def _gem_tooltip_html(gm: holes.Gem, n: int, scanner=None) -> str:
-    """跟遊戲的寶石說明同一份內容（使用者 2026-09-06：「寶石裡面加什麼素質跟敘述都沒寫」）：
-    武器／防具／盾牌各加什麼、裝備等限、數量。加成那幾行**滑過才讀記憶體**（讀不到就不印）。"""
+    """寶石說明（使用者 2026-09-06：「寶石裡面加什麼素質跟敘述都沒寫」「兩個都做」）：
+    · 有表就印**遊戲原文**（itemdesc，資源包文字3：可鑲嵌於…／武器：…／防具：…／盾牌：…／等限）；
+    · 記憶體算出來的加成（holes.gem_effects）拿來**對帳**：原文裡找不到那一項就亮警示
+      （＝說明表過期，[[table-is-authority]]：顯示以表為準、警示讓人知道要重跑）；
+      沒有表（改版新寶石）就退回印記憶體那幾行。加成**滑過才讀記憶體**，讀不到就不印。"""
     lines = [(gm.name, "#FFFFFF")]
     effects = []
     if scanner is not None:
@@ -250,12 +254,23 @@ def _gem_tooltip_html(gm: holes.Gem, n: int, scanner=None) -> str:
             effects = holes.gem_effects(scanner, gm.type_id)
         except Exception:                                # noqa: BLE001
             effects = []
-    if effects:
-        lines.append(("可鑲嵌於已打孔的裝備上，以加強能力：", "#C8C8C8"))
+    text = itemdesc.lines(gm.type_id)
+    if text:
+        lines += [(t, "#C8C8C8") for t in text]
+        blob = "\n".join(text)
+        miss = [f"{label}：{attr} {val:+d}" for label, attr, val in effects
+                if val and f"{attr} {val:+d}" not in blob]
+        if miss:
+            lines.append(("⚠ 記憶體算出來的跟說明對不上（說明表過期？重跑 build_item_desc）："
+                          + "／".join(miss), "#FFB020"))
+    elif effects:
+        lines.append(("加什麼（說明表沒有這顆，讀記憶體）：", "#C8C8C8"))
         for label, attr, val in effects:
             lines.append((f"{label}：{attr} {val:+d}" if val else f"{label}：{attr}", "#7CFC7C"))
-    lines += [(f"裝備等限：{gm.min_level}級", "#7CD8FF"),
-              (f"（可鑲 {gm.min_level}～{gm.max_level} 級的裝備）", "#888888"),
+        lines.append((f"裝備等限：{gm.min_level}級", "#7CD8FF"))
+    else:
+        lines.append((f"裝備等限：{gm.min_level}級", "#7CD8FF"))
+    lines += [(f"（可鑲 {gm.min_level}～{gm.max_level} 級的裝備）", "#888888"),
               (f"數量 ×{n}", "#DDDDDD")]
     parts = [f"<div style='color:{colour}'>{html.escape(text)}</div>"
              for text, colour in lines]

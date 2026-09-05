@@ -287,13 +287,14 @@ py tools\recheck_tables.py        # 要進遊戲，最後會直接給結論
 * **全對** → 不必解包。`py tools\stamp_tables.py` 蓋章，掛機頁警示就熄。
 * **對不上** → 先看下面那招能不能自己補；真的補不了才請使用者重新解包
   （`D:\RPGViewer` 是 GUI，我們代跑不了），然後
-  `build_item_names / build_jumpmap / build_skills / build_skill_names /
+  `build_item_names / build_item_desc / build_jumpmap / build_skills / build_skill_names /
   build_skill_range / build_item_icons` 重跑一輪再蓋章。
 
 ### ⚠ 官方改版**新增道具**時要重跑 `build_item_icons.py`
 
-`assets/item_icons.zip`（4560 張 PNG、**8.5MB —— exe 就是被它撐大的**）是從
-`GAMEDATA\shape\item\*.SHP` 解出來打包的。新道具的圖不在包裡 → 強化裝備分頁
+`assets/item_icons.zip`（4560 張原始 .SHP＋換色索引、**7.0MB**；2026-09-06 起執行時
+自己解圖＋照遊戲換色，見 app/game/iconbias.py）是從 `GAMEDATA\shape\item\*.SHP` 打包的。
+`assets/item_desc.tsv.gz`（物品說明原文）跟名稱表同一批字串檔，`build_item_desc.py`。新道具的圖不在包裡 → 強化裝備分頁
 那格會是空白（安全退化，不會做錯事），但看起來就像壞了。
 
     py tools\build_item_icons.py

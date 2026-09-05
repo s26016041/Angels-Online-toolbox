@@ -252,6 +252,17 @@ check("　第二組效果也列（武器再加魔攻，範本沒那欄＝0）",
       ("武器", "魔攻", 0) in eff and eff[0] == ("武器", "雷電攻擊", 24), str(eff))
 check("　範本讀不到 → 空清單（介面不印、不猜）", holes.gem_effects(FakeScanner({}), 3105) == [])
 
+print("②c 說明原文表（itemdesc，資源包文字3）")
+from app.game import itemdesc                                       # noqa: E402
+check("表載得到（> 3 萬筆）", itemdesc.count() > 30000, str(itemdesc.count()))
+d = itemdesc.lines(3105)
+check("完美的黃寶石的原文＝可鑲嵌…／武器：雷電攻擊 +24／防具：靈敏 +10／盾牌：雷電防禦 +5／裝備等限：80級",
+      d == ["可鑲嵌於已打孔之裝備上，以加強能力。", "武器：雷電攻擊 +24", "防具：靈敏 +10",
+            "盾牌：雷電防禦 +5", "裝備等限：80級"], str(d))
+check("記憶體算的三行每一項都在原文裡（表跟記憶體對得上）",
+      all(f"{a} {v:+d}" in "\n".join(d) for _l, a, v in holes.gem_effects(effects_scanner(), 3105)))
+check("查不到 → 空", itemdesc.of(99999999) == "" and itemdesc.lines(99999999) == [])
+
 g = holes.pick_gem(gs, 120, 40)
 check("等限 ≤ 40、裝備 120 級 → 挑瑕疵（20）", g and g.type_id == 3092, f"實得 {g}")
 g = holes.pick_gem(gs, 120, 10)

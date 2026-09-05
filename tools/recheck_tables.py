@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
-from app.game import (bag, dailygift, energy, entity, itemicon,  # noqa: E402
+from app.game import (bag, dailygift, energy, entity, itemdesc, itemicon,  # noqa: E402
                       itemname, locate, monsters, skillcost, skills)
 from app.paths import resource                        # noqa: E402
 
@@ -318,6 +318,22 @@ def check_item_names(sc, tabs, lines):
             + ("　← 新道具，重新解包才會有" if unnamed else ""), True)
 
 
+def check_item_desc(sc, tabs, lines):
+    """物品說明表（只驗**涵蓋率**：說明在字串資源檔，記憶體裡沒有真相可比）。
+    寶石那幾行素質記憶體算得出來（holes.gem_effects），對不上時提示框自己會亮警示。"""
+    if not itemdesc.count():
+        lines.append("    說明表沒載到 —— 跑 py tools\build_item_desc.py 產生")
+        return "assets/item_desc.tsv.gz 讀不到", False
+    its = bag.items(sc)
+    if not its:
+        return "背包讀不到東西", False
+    missing = sorted({i.type_id for i in its if not itemdesc.of(i.type_id)})
+    if missing:
+        lines.append(f"    這些種類查不到說明（提示框只印記憶體算的）：{missing[:20]}")
+    return (f"說明表 {itemdesc.count()} 筆；背包 {len(its)} 件，查不到說明 {len(missing)} 種"
+            + ("　← 新道具，重跑 build_item_desc.py" if missing else ""), True)
+
+
 def check_item_icons(sc, tabs, lines):
     """道具圖示包（只驗**涵蓋率**：圖在資源包，記憶體裡沒有圖可比）。
 
@@ -357,6 +373,8 @@ CHECKS = (
      "只影響顯示：查不到就顯示成編號，不會做錯事", False),
     ("item_icons.zip（道具圖示）", check_item_icons,
      "只影響顯示：查不到就沒有圖示，不會做錯事", False),
+    ("item_desc（物品說明原文）", check_item_desc,
+     "只影響顯示：查不到就只印記憶體算的素質，不會做錯事", False),
 )
 
 
