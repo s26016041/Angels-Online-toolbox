@@ -1584,15 +1584,25 @@ def main() -> int:
     #   按了選項人就被傳走，所以選項要在**按下的當下**就記進入口。
     # ★★ 使用者 2026-09-02：「改一下自動刷副本，我可以選擇從哪開始」＋
     #   「自動刷副本的設定也都要記錄在使用者那邊」
-    print("\n從第幾步開始 ＋ 設定記在使用者那邊")
+    # ★ 2026-09-05 改：「從第幾步開始」是一個**開關**——沒打開下拉是灰的、一律從
+    #   第 1 步；開關與選了第幾步都**不記錄**（預設關）。
+    print("\n從第幾步開始（開關，不記錄）＋ 設定記在使用者那邊")
     steps5 = [{"do": "walk", "to": [i, i]} for i in range(1, 6)]
     tab = make_tab(steps5)
     tab.start_box.clear()
     for i, st in enumerate(steps5):
         tab.start_box.addItem(f"{i + 1}", i)
-    tab.start_box.setCurrentIndex(2)          # 從第 3 步開始
+    tab.start_box.setCurrentIndex(2)          # 下拉選第 3 步，但開關沒開
+    ck("★ 開關預設關、下拉是灰的",
+       not tab.start_cb.isChecked() and not tab.start_box.isEnabled())
+    ck("★ 開關沒開 → 就算下拉選了第 3 步也從第 1 步",
+       tab._round_plan(5)[0] == 0, str(tab._round_plan(5)))
+    tab.start_cb.setChecked(True)
+    ck("★ 開關打開 → 下拉亮起來、真的從第 3 步",
+       tab.start_box.isEnabled() and tab._round_plan(5)[0] == 2,
+       str(tab._round_plan(5)))
     tab._reset_run()
-    tab._i = max(0, min(tab.start_box.currentIndex(), len(steps5) - 1))
+    tab._i = tab._round_plan(len(steps5))[0]
     run(tab, 0.3)
     ck("★★ 選了從第 3 步開始 → 真的從第 3 步跑",
        tab._nav.goal == (3, 3), str(tab._nav.goal))
@@ -1600,30 +1610,28 @@ def main() -> int:
     from app.config import config as _cfg
     tab._account = lambda: "測試帳號"
     tab._loading = False
+    _cfg.set("dungeon.測試帳號.start", 4)     # 舊版留下的值，新版不准再讀它
     tab._save_settings()
-    ck("★ 設定寫進 config（起始步驟）",
-       _cfg.get("dungeon.測試帳號.start") == 2,
+    ck("★ 「從第幾步」不存進 config（舊值原封不動）",
+       _cfg.get("dungeon.測試帳號.start") == 4,
        str(_cfg.get("dungeon.測試帳號.start")))
-    ck("　技能鍵也存了", isinstance(_cfg.get("dungeon.測試帳號.vks"), list))
+    ck("　技能鍵有存", isinstance(_cfg.get("dungeon.測試帳號.vks"), list))
     ck("　記得上次是哪一台分身",
        _cfg.get("dungeon.last_account") == "測試帳號")
-    # ⚠ 這裡要擋訊號：直接動下拉會觸發 `_save_settings`，把剛存的 2 蓋成 0
-    #   （真的操作介面時本來就該存，所以是測試要配合，不是程式的問題）。
-    tab.start_box.blockSignals(True)
-    tab.start_box.setCurrentIndex(0)
-    tab.start_box.blockSignals(False)
     # ⚠ `_load_settings` 會先照「目前選的腳本檔」重建下拉；測試裡沒有真的檔，
-    #   所以把重建換掉 —— 要驗的是「有沒有把索引讀回來」。
+    #   所以把重建換掉 —— 要驗的是「重讀設定會把開關關掉、不套用舊的 start」。
     tab._refresh_start_box = lambda: None
     tab._load_settings()
-    ck("★★ 重讀設定 → 起始步驟回到第 3 步",
-       tab.start_box.currentIndex() == 2,
-       str(tab.start_box.currentIndex()))
+    ck("★★ 重讀設定 → 開關回到關、下拉灰掉、不套用舊值",
+       not tab.start_cb.isChecked() and not tab.start_box.isEnabled()
+       and tab._round_plan(5)[0] == 0,
+       f"cb={tab.start_cb.isChecked()} idx={tab.start_box.currentIndex()}")
 
     # ★★ 使用者 2026-09-05：「多一個選項是循環打副本，打勾就會一直跑，不然只打一場；
     #   勾了循環就算從中間開始也會繼續跑下一場 —— 從中間開始只有我開的那場，後面從頭」
     print("\n循環打副本勾選框 ＋ 「從第幾步」只管第一場")
     tab.party_box.setCurrentIndex(tab.party_box.findData("bind"))
+    tab.start_cb.setChecked(True)             # 開關打開、下拉還在第 3 步
     tab.loop_cb.setChecked(True)
     ck("★★ 勾循環、從第 3 步開始 → 這一場從第 3 步、要循環、組隊照選",
        tab._round_plan(5) == (2, True, "bind"), str(tab._round_plan(5)))

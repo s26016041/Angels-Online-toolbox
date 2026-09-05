@@ -474,13 +474,20 @@ class DungeonTab(BaseTab):
 
         rbar = QHBoxLayout()
         # ★ 使用者 2026-09-02：「改一下自動刷副本，我可以選擇從哪開始」
-        rbar.addWidget(QLabel("從第"))
+        # ★ 2026-09-05 改成**開關**（使用者：「開關沒打開選項要變灰色，也不需要紀錄
+        #   之前選哪一步開始的；預設都是關閉的」）—— 開關與選的步驟都**不存 config**，
+        #   每次開程式／換分身都是關的、下拉是灰的。
+        self.start_cb = QCheckBox("從第")
+        self.start_cb.setToolTip(
+            "打開才會從右邊選的那一步開始跑（做腳本／卡住重跑時用）；沒打開一律從第 1 步。\n"
+            "⚠ 前面的步驟會直接跳過 —— 該開的門沒開就會走不到。\n"
+            "這個開關跟選的步驟不會記住，每次開程式都是關的。")
+        self.start_cb.toggled.connect(self._on_start_toggled)
+        rbar.addWidget(self.start_cb)
         self.start_box = QComboBox()
         self.start_box.setFixedWidth(210)
-        self.start_box.setToolTip(
-            "從腳本的第幾步開始跑（做腳本／卡住重跑時很方便）。\n"
-            "⚠ 前面的步驟會直接跳過 —— 該開的門沒開就會走不到。")
-        self.start_box.currentIndexChanged.connect(self._save_settings)
+        self.start_box.setEnabled(False)
+        self.start_box.setToolTip("從腳本的第幾步開始跑（要先打開左邊的開關）。")
         rbar.addWidget(self.start_box)
         rbar.addWidget(QLabel("步開始"))
         rbar.addSpacing(12)
@@ -610,17 +617,22 @@ class DungeonTab(BaseTab):
             return txt[txt.rindex("（") + 1:-1]
         return txt or "default"
 
+    def _on_start_toggled(self, on: bool) -> None:
+        """「從第幾步開始」的開關：沒打開下拉是灰的（而且一律從第 1 步）。不存設定。"""
+        self.start_box.setEnabled(bool(on))
+
     def _round_plan(self, nsteps: int) -> tuple[int, bool, str]:
         """開跑時照畫面決定 `(從第幾步開始, 要不要循環, 組隊模式)`。
 
         ★ 使用者 2026-09-05 定案：
           · 「循環打副本」勾著才循環，沒勾只打一場（跑完就停、不組隊、不補給）。
-          · 「從第幾步開始」**只管按下開跑的這一場**；循環的下一趟一律從第 1 步
+          · 「從第幾步開始」是**開關**：沒打開一律第 1 步；打開才看下拉。而且它
+            **只管按下開跑的這一場**；循環的下一趟一律從第 1 步
             （`_start_supply_trip` 會把 `_i` 歸零）。
         ⚠ 跟 9/3 那版不同：以前是「從第幾步有選＝單輪」，現在單不單輪只看勾選框。
         """
         i = (max(0, min(self.start_box.currentIndex(), nsteps - 1))
-             if nsteps else 0)
+             if nsteps and self.start_cb.isChecked() else 0)
         loop = bool(self.loop_cb.isChecked())
         party = (self.party_box.currentData() or "none") if loop else "none"
         return i, loop, party
@@ -632,7 +644,7 @@ class DungeonTab(BaseTab):
             return
         config.set(self._key("script"), self.files.currentText())
         config.set(self._key("vks"), self._picked_keys())
-        config.set(self._key("start"), int(self.start_box.currentIndex()))
+        # ⛔ 「從第幾步開始」的開關與步驟**不存**（使用者 2026-09-05：不需要紀錄）。
         config.set(self._key("loop"), bool(self.loop_cb.isChecked()))
         config.set(self._key("party"), self.party_box.currentData() or "none")
         config.set(self._key("partner"),
@@ -651,6 +663,8 @@ class DungeonTab(BaseTab):
             if i >= 0:
                 self.files.setCurrentIndex(i)
             self._refresh_start_box()
+            # 「從第幾步開始」每次讀設定（開程式／換分身）都回到關（不記錄）。
+            self.start_cb.setChecked(False)
             self.loop_cb.setChecked(bool(config.get(self._key("loop"), True)))
             mode = str(config.get(self._key("party"), "none") or "none")
             j = self.party_box.findData(mode)
@@ -667,9 +681,6 @@ class DungeonTab(BaseTab):
                 for cb, vk, _lab in self._key_cbs:
                     cb.setChecked(vk in vks)
                 self._sync_key_btn()
-            st = int(config.get(self._key("start"), 0) or 0)
-            if 0 <= st < self.start_box.count():
-                self.start_box.setCurrentIndex(st)
         finally:
             self._loading = False
 
