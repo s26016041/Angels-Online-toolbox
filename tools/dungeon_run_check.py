@@ -1666,30 +1666,39 @@ def main() -> int:
     tab = make_tab([{"do": "walk", "to": [50, 50]}, {"do": "interact", "at": [20, 20],
                                                      "model": 60307, "menu": [1]}])
     tab._mover = object()
-    closed = []
-    dt.talkwnd.close_window = lambda *_a: closed.append(1) or True
+    fk = FakeTalk([(1, 2, 3)])
+    wire(tab, fk)                                          # close_page → fk.closes
+    destroyed = []
+    dt.talkwnd.close_window = lambda *_a: destroyed.append(1) or True
     dt.talkwnd.window_present = lambda _sc: True          # 對話框冒出來了
     tab._stray_dialog(1.1)
-    ck("★★ 走路那一步冒出對話框 → destroy＋送離開互動、狀態列講出來",
-       closed == [1] and tab.left == [1] and "對話框" in tab.status.text(),
-       f"closed={closed} left={tab.left} {tab.status.text()}")
+    ck("★★ 走路那一步冒出對話框 → 按遊戲的確定鈕（伺服器知道結束）＋送離開互動、狀態列講出來",
+       fk.closes == 1 and destroyed == [] and tab.left == [1] and "對話框" in tab.status.text(),
+       f"closes={fk.closes} destroyed={destroyed} left={tab.left} {tab.status.text()}")
     tab._stray_dialog(1.1)
-    ck("　兩秒內不重複關（Lua 不可以叫太密）", closed == [1], str(closed))
+    ck("　兩秒內不重複關（Lua 不可以叫太密）", fk.closes == 1, str(fk.closes))
     tab._stray_closed = 0.0
     tab._stray_dialog(1.1)
-    ck("　還在 → 隔了間隔再關一次", closed == [1, 1], str(closed))
+    ck("　還在 → 隔了間隔再關一次", fk.closes == 2, str(fk.closes))
     tab._i = 1                                             # 換到對話那一步
     tab._stray_closed = 0.0
     tab._stray_dialog(1.1)
-    ck("★ 對話那一步不管（本來就在等對話）", closed == [1, 1], str(closed))
+    ck("★ 對話那一步不管（本來就在等對話）", fk.closes == 2, str(fk.closes))
     tab._i = 0
     tab._stray_closed = 0.0
     dt.talkwnd.window_present = lambda _sc: None           # 讀不到
     tab._stray_dialog(1.1)
-    ck("　讀不到 ≠ 有對話框 → 不動手", closed == [1, 1], str(closed))
+    ck("　讀不到 ≠ 有對話框 → 不動手", fk.closes == 2, str(fk.closes))
     dt.talkwnd.window_present = lambda _sc: False
     tab._stray_dialog(1.1)
-    ck("　沒有對話框 → 不動手", closed == [1, 1], str(closed))
+    ck("　沒有對話框 → 不動手", fk.closes == 2, str(fk.closes))
+    # 確定鈕叫不動（Lua 讀不到 WND_MESSAGE）→ 退回 destroy
+    dt.talkwnd.window_present = lambda _sc: True
+    dt.talkwnd.close_page = lambda *_a: (False, "讀不到")
+    tab._stray_closed = 0.0
+    tab._stray_dialog(1.1)
+    ck("　確定鈕叫不動 → 退回 destroy＋離開互動", destroyed == [1] and len(tab.left) == 3,
+       f"destroyed={destroyed} left={tab.left}")
     dt.talkwnd.close_window = lambda *_a: True
 
     print("\n不認得的動作")

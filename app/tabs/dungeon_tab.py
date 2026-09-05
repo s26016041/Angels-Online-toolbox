@@ -133,6 +133,9 @@ TICK_MS = 100
 RUNLOG_NAME = "dungeon_run.log"
 RUNLOG_MAX = 5_000_000
 RUNLOG_GAP = 1.0
+# 狀態列裡含這些字的一律寫（不吃每秒一行的節流）：對話的每一個動作都要對得回來。
+RUNLOG_ALWAYS = ("已點", "已送", "按確定", "點了沒反應", "收掉", "對話結束", "跳出",
+                 "傳點過了", "當作傳過", "不算傳送", "沒有選項", "跳出選項")
 # 掃描節奏。★ 使用者 2026-09-02：「趕路掃描改成可接受最快，這個很糟糕，
 #   不管是打怪還是刷副本」——**兩檔都用掛機頁驗過的 0.15 秒**
 #   （farm_tab.REFRESH_GAP：掃一次 35ms、執行緒跑 LowPriority、不影響畫面，
@@ -2272,14 +2275,37 @@ class DungeonTab(BaseTab):
             return False
         self._stray_closed = now
         self._stray_n += 1
+        self._dismiss_dialog("沒在等對話")
+        self._notify(f"跳出不該出現的對話框 → 關掉（這一趟第 {self._stray_n} 次）")
+        return True
+
+    def _dismiss_dialog(self, why: str) -> None:
+        """把**不是這一步要的**對話框收掉，照人按的方式：先按遊戲自己的確定鈕
+        （`talkwnd.close_page`＝Lua OnMessageClose＝messageclose＋destroy，**伺服器也知道
+        對話結束**），Lua 叫不動才退回只 destroy；最後送離開互動。
+
+        ⚠ 為什麼不能只 destroy＋離開互動（2026-09-05 無限塔第 4 趟）：第 25 步清怪時從雕像 B
+          (54,194) 旁邊跑過，牠的自動對話跳出來；到第 28 步才用「destroy＋離開互動」收掉再點
+          雕像 A —— 之後第 29 步到 B 時牠已經是啟動後的外觀 60370。伺服器那邊 B 的對話很可能
+          從來沒被正常結束，後面送的選項落到哪一個對話身上都說不準。走遊戲自己的關法最保險。
+        """
+        ok = False
         try:
-            talkwnd.close_window(self._mover, self._sc)
+            ok, _msg = talkwnd.close_page(self._mover, self._sc)
+        except Exception:                                # noqa: BLE001
+            ok = False
+        if not ok:
+            try:
+                talkwnd.close_window(self._mover, self._sc)
+            except Exception:                            # noqa: BLE001
+                pass
+        try:
             supply.leave_npc(self._mover, self._sc)
         except Exception:                                # noqa: BLE001
             pass
         self._wnd, self._wnd_t = None, 0.0
-        self._notify(f"跳出不該出現的對話框 → 關掉（這一趟第 {self._stray_n} 次）")
-        return True
+        self._runlog_write(f"收掉對話框（{why}）：{'確定鈕' if ok else 'destroy'}＋離開互動",
+                           force=True)
 
     def _wnd_open(self, dt: float) -> bool | None:
         """對話視窗現在開著沒（True／False／**None＝問不到**）。
@@ -2367,9 +2393,7 @@ class DungeonTab(BaseTab):
             #   整段會以為對話已經開了 → 一路按確定 → 永遠不點物件（使用者
             #   2026-09-03 實機卡死就是這樣）。
             if self._wnd_open(dt):
-                talkwnd.close_window(self._mover, self._sc)
-                supply.leave_npc(self._mover, self._sc)
-                self._wnd, self._wnd_t = None, 0.0
+                self._dismiss_dialog(f"{tag} 點之前殘留的")
                 self._say(f"{tag}　先收掉上一段留下的對話框再點")
                 return
             props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
@@ -2404,6 +2428,12 @@ class DungeonTab(BaseTab):
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
             self._menu_t = MENU_GAP
             self._say(f"{tag}　已點外觀 {hit[0].model}")
+            # ★ 外觀跟腳本記的不一樣＝機關**已經被啟動過**（無限塔雕像 60369→60370、
+            #   60394→60395；2026-09-05 第 4 趟第 29 步就是這樣：到的時候已經是 60370，
+            #   對話沒有選項可按，後面石像就一直生）。不擋（9/2 定案照位置認），但要講。
+            if want_model is not None and hit[0].model != want_model:
+                self._notify(f"{tag}　⚠ 外觀是 {hit[0].model}，腳本記的是 {want_model}"
+                             f" —— 這個機關已經被啟動過了？（經過時自動對話／上一趟留的）")
             return
 
         # ★★★ 走對話（使用者 2026-09-02 定案）：
@@ -2516,7 +2546,10 @@ class DungeonTab(BaseTab):
         else:
             self._talk_same += 1
         if not self._talk_did:
-            # 這一頁還沒動過 → 決定要做什麼
+            # 這一頁還沒動過 → 決定要做什麼（先把這一頁長什麼樣寫進紀錄，事後才對得回來）
+            self._runlog_write(f"{tag}　對話頁：選項 {list(pg.options) or '無'}　"
+                               f"腳本要送第 {menu[self._menu_i] if self._menu_i < len(menu) else '－'} 項"
+                               f"（已送 {self._menu_i}/{len(menu)}）", force=True)
             if pg.has_options:
                 if self._menu_i >= len(menu):
                     # ⛔ 跳出選項但腳本沒說要選哪一項 —— **絕不亂選**。
@@ -2867,7 +2900,10 @@ class DungeonTab(BaseTab):
         if not force:
             if text == self._runlog_last:
                 return
-            if (throttle and self._i == self._runlog_step
+            # ★ 對話那幾個關鍵動作**不節流**（2026-09-05 無限塔第 29 步查不出「有沒有送第 1 項」：
+            #   點、送選項、按確定常在同一秒內接連發生，被每秒一行吃掉，事後無法對帳）。
+            key = any(k in text for k in RUNLOG_ALWAYS)
+            if (throttle and not key and self._i == self._runlog_step
                     and now - self._runlog_t < RUNLOG_GAP):
                 return
         self._runlog_last, self._runlog_t, self._runlog_step = text, now, self._i
