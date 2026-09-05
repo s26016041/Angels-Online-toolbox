@@ -242,36 +242,28 @@ def _gem_cells(gems: list[holes.Gem], scanner=None) -> list[Cell]:
 
 
 def _gem_tooltip_html(gm: holes.Gem, n: int, scanner=None) -> str:
-    """寶石說明（使用者 2026-09-06：「寶石裡面加什麼素質跟敘述都沒寫」「兩個都做」）：
-    · 有表就印**遊戲原文**（itemdesc，資源包文字3：可鑲嵌於…／武器：…／防具：…／盾牌：…／等限）；
-    · 記憶體算出來的加成（holes.gem_effects）拿來**對帳**：原文裡找不到那一項就亮警示
-      （＝說明表過期，[[table-is-authority]]：顯示以表為準、警示讓人知道要重跑）；
-      沒有表（改版新寶石）就退回印記憶體那幾行。加成**滑過才讀記憶體**，讀不到就不印。"""
+    """寶石說明（使用者 2026-09-06）：**GAMEDATA 的原文是最權威、不會錯**（itemdesc，
+    資源包文字3：可鑲嵌於…／武器：…／防具：…／盾牌：…／裝備等限），有表就印表、
+    ⛔ 不拿記憶體去對它、不加警示；表沒那顆（改版後還沒重跑 build_item_desc）才退回印
+    記憶體算的加成（holes.gem_effects，滑過才讀，讀不到就不印）。
+    ⛔ 「可鑲 N～M 級」那行使用者說不要（原文已有裝備等限）。"""
     lines = [(gm.name, "#FFFFFF")]
-    effects = []
-    if scanner is not None:
-        try:
-            effects = holes.gem_effects(scanner, gm.type_id)
-        except Exception:                                # noqa: BLE001
-            effects = []
     text = itemdesc.lines(gm.type_id)
     if text:
         lines += [(t, "#C8C8C8") for t in text]
-        blob = "\n".join(text)
-        miss = [f"{label}：{attr} {val:+d}" for label, attr, val in effects
-                if val and f"{attr} {val:+d}" not in blob]
-        if miss:
-            lines.append(("⚠ 記憶體算出來的跟說明對不上（說明表過期？重跑 build_item_desc）："
-                          + "／".join(miss), "#FFB020"))
-    elif effects:
-        lines.append(("加什麼（說明表沒有這顆，讀記憶體）：", "#C8C8C8"))
-        for label, attr, val in effects:
-            lines.append((f"{label}：{attr} {val:+d}" if val else f"{label}：{attr}", "#7CFC7C"))
-        lines.append((f"裝備等限：{gm.min_level}級", "#7CD8FF"))
     else:
+        effects = []
+        if scanner is not None:
+            try:
+                effects = holes.gem_effects(scanner, gm.type_id)
+            except Exception:                            # noqa: BLE001
+                effects = []
+        if effects:
+            lines.append(("加什麼（說明表沒有這顆，讀記憶體）：", "#C8C8C8"))
+            for label, attr, val in effects:
+                lines.append((f"{label}：{attr} {val:+d}" if val else f"{label}：{attr}", "#7CFC7C"))
         lines.append((f"裝備等限：{gm.min_level}級", "#7CD8FF"))
-    lines += [(f"（可鑲 {gm.min_level}～{gm.max_level} 級的裝備）", "#888888"),
-              (f"數量 ×{n}", "#DDDDDD")]
+    lines.append((f"數量 ×{n}", "#DDDDDD"))
     parts = [f"<div style='color:{colour}'>{html.escape(text)}</div>"
              for text, colour in lines]
     return ("<div style='background:#0d1b21; padding:4px'>"
@@ -303,15 +295,8 @@ class EnhanceTab(BaseTab):
         self._run: enhance.Run | holes.Run | None = None
 
         root = QVBoxLayout(self)
-
-        hint = QLabel(
-            "只列「背包裡」可以強化的裝備（身上穿的不會出現）。滑鼠移上去看說明，"
-            "點一下選起來，選好要強化到幾次再按下面的按鈕。"
-            "⚠ 一般強化錘失敗會讓裝備直接消失，按下去就會一路打到目標為止。\n"
-            "自動打孔：用一般 N星打孔錘打孔（祝福錘不用），有空孔先鑲「等限 ≤ 你設的等級」"
-            "的寶石，打到目標孔數為止，最後一孔留空給你自己鑲。⚠ 打孔失敗裝備會毀損。")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
+        # ⛔ 最上面那段使用說明使用者 2026-09-06 說不要（「那堆說明文字不要寫」）；
+        #   規則都在檔頭 docstring 與各按鈕的 tooltip 裡。
 
         bar = QHBoxLayout()
         bar.addWidget(QLabel("分身"))
