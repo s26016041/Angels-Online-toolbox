@@ -24,11 +24,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# 編出來的檔名（AngelsOnlineToolbox.spec 的 APP_NAME；build_local.py 也認這個）。
 EXE_NAME = "天使之戀AO工具箱"
-# 0.2.5 以前的檔名。那些版本的自動更新是「寫死比對這個資產名稱」，所以每次發布都要
-# 一併上傳一份同內容、舊檔名的副本，否則他們永遠找不到更新、靜靜卡在舊版。
-# 0.2.6 之後的版本改成「找不到正式檔名就取任何 .exe」，等舊版都汰換完就能移除這段。
-LEGACY_EXE_NAME = "AngelsOnlineToolbox"
+# ★ Release 只上傳**一份** exe、用這個英文檔名（使用者 2026-09-05 定：「之後上傳一份
+#   .exe 就好，中文檔案名稱那個不用了」）。這個名字同時是 0.2.5 以前的更新程式寫死
+#   比對的資產名；0.2.6 之後的更新程式找不到正式檔名會退而取任何 .exe —— 所以只傳
+#   這一份，新舊版本都抓得到。（v0.4.79 以前是兩份：中文檔名＋這個。）
+ASSET_NAME = "AngelsOnlineToolbox"
 
 
 def sh(cmd: list[str]) -> int:
@@ -125,27 +127,24 @@ def main() -> None:
     size_mb = exe.stat().st_size // (1024 * 1024)
     print(f"\n✓ 編譯完成：{exe}（約 {size_mb} MB）")
 
-    # 舊檔名的副本：給 0.2.5 以前的版本抓（它們寫死比對舊資產名稱）
-    legacy = ROOT / "dist" / f"{LEGACY_EXE_NAME}.exe"
-    shutil.copy2(exe, legacy)
-    print(f"✓ 另存舊檔名副本供舊版自動更新使用：{legacy.name}")
+    # 只上傳一份、英文檔名（見 ASSET_NAME 的說明）：把編出來的複製成那個名字。
+    asset = ROOT / "dist" / f"{ASSET_NAME}.exe"
+    shutil.copy2(exe, asset)
+    print(f"✓ 發布用檔名：{asset.name}")
 
-    # 建立 Release（gh 會順便建 tag）並上傳兩份 .exe
+    # 建立 Release（gh 會順便建 tag）並上傳那一份 .exe
     print("\n建立 GitHub Release 並上傳 .exe…")
     rc = sh([
         "gh", "release", "create", tag,
         "--target", target,
         "--title", tag,
         "--notes", f"天使之戀工具箱 {tag}\n\n由 release.py 自動編譯發布。\n\n"
-                   f"下載 `{EXE_NAME}.exe` 即可。"
-                   f"（`{LEGACY_EXE_NAME}.exe` 是同一個檔案，"
-                   f"只是為了讓 0.2.5 以前的版本能自動更新而保留的舊檔名。）",
-        str(exe), str(legacy),
+                   f"下載 `{ASSET_NAME}.exe` 即可。",
+        str(asset),
     ])
     if rc != 0:
         die("建立 Release 失敗，請看上面 gh 的訊息。")
-    print(f"\n✅ 已發布 {tag} 到 GitHub Releases，"
-          f"並上傳 {EXE_NAME}.exe 與 {LEGACY_EXE_NAME}.exe")
+    print(f"\n✅ 已發布 {tag} 到 GitHub Releases，並上傳 {ASSET_NAME}.exe")
 
 
 if __name__ == "__main__":

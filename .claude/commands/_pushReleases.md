@@ -36,7 +36,7 @@
 1. 改 VERSION（無結尾換行，格式如 0.4.5）→ git commit
 2. git push origin main         # ★ 先推上去，再花時間編 exe
 3. py build_local.py            # 編譯 + 冒煙測試，⛔ 沒 ✅ 就不准往下發版
-4. py release.py                # 讀 VERSION → 編 exe → gh 建 Release（含上傳兩份 exe）
+4. py release.py                # 讀 VERSION → 編 exe → gh 建 Release（只上傳一份 AngelsOnlineToolbox.exe）
 ```
 
 注意事項（踩過的坑，詳見 memory `packaging-and-release`）：
@@ -46,6 +46,9 @@
 - 建置輸出很長：導到 log 檔（scratchpad），只看結尾判定，別整份倒進對話。
 - `release.py` 自己會**再編一次 exe ＋ 跑一次冒煙測試**才建 Release，所以第 3 步的
   `build_local.py` 是「快點失敗」用的前哨，不是唯一的閘門。
-- Release 頁上的 `AO.exe` 是 GitHub 濾掉中文檔名的常態，不是上傳壞掉。
+- ★ Release **只上傳一份 `AngelsOnlineToolbox.exe`**（使用者 2026-09-05 定：「之後上傳一份
+  .exe 就好，中文檔案名稱那個不用了」）。編出來的仍是 `天使之戀AO工具箱.exe`，
+  `release.py` 會複製成英文檔名再傳；⛔ 不要再傳中文檔名那份。
+  （v0.4.79 以前傳兩份，中文檔名在 Release 頁會被濾成 `AO.exe`，那不是壞掉。）
 - 平常另外要發版前必須先問過使用者（memory `ask-before-release`）；
   唯有使用者主動下這個指令時視同已同意。

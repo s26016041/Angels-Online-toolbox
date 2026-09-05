@@ -31,10 +31,10 @@ from pathlib import Path
 
 REPO = "s26016041/Angels-Online-toolbox"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
-ASSET_NAME = "天使之戀AO工具箱.exe"
-# 0.2.5 以前的檔名。那些版本的更新程式是寫死找這個名字的，所以發布時要一併上傳
-# 一份同內容、舊檔名的資產，否則他們會永遠找不到更新、靜靜卡在舊版。
-LEGACY_ASSET_NAME = "AngelsOnlineToolbox.exe"
+# ★ Release 只有一份 exe、就叫這個名字（使用者 2026-09-05 定：「上傳一份 .exe 就好，
+#   中文檔案名稱那個不用了」；v0.4.79 以前是中文檔名＋這個各一份）。
+#   找不到就退而取任何 .exe（見 pick_asset），所以檔名再改也不會讓舊版失聯。
+ASSET_NAME = "AngelsOnlineToolbox.exe"
 TIMEOUT = 15.0
 UA = {"User-Agent": "AngelsOnlineToolbox-Updater"}
 
@@ -115,14 +115,7 @@ def latest_release() -> dict | None:
             sys.stderr.write(f"[update] 查詢最新版本失敗 —— {_last_error[0]}\n")
         return None
     tag = data.get("tag_name") or ""
-    assets = data.get("assets") or []
-    # 先找正式檔名，找不到就退而取任何 .exe —— 這樣以後再改名也不會讓舊版失聯
-    # （0.2.5 之前是寫死比對檔名的，改名時就得靠 LEGACY_ASSET_NAME 補一份）。
-    picked = next((a for a in assets if a.get("name") == ASSET_NAME), None)
-    if picked is None:
-        picked = next(
-            (a for a in assets
-             if str(a.get("name", "")).lower().endswith(".exe")), None)
+    picked = pick_asset(data.get("assets") or [])
     if picked is None:
         return None
     return {
@@ -131,6 +124,20 @@ def latest_release() -> dict | None:
         "size": int(picked.get("size") or 0),
         "notes": (data.get("body") or "").strip(),
     }
+
+
+def pick_asset(assets: list) -> dict | None:
+    """挑要下載的資產：先找正式檔名，找不到就退而取**任何 .exe**；都沒有回 None。
+
+    退路是給「檔名改了」用的：0.2.5 以前寫死比對檔名的版本，靠 Release 上那一份
+    `AngelsOnlineToolbox.exe` 就抓得到；之後的版本不管 Release 叫什麼名字都抓得到。
+    """
+    picked = next((a for a in assets if a.get("name") == ASSET_NAME), None)
+    if picked is None:
+        picked = next(
+            (a for a in assets
+             if str(a.get("name", "")).lower().endswith(".exe")), None)
+    return picked
 
 
 def check() -> dict | None:
