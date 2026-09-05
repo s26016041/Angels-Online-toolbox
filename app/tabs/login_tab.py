@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -54,9 +55,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from app import theme
@@ -72,10 +75,20 @@ from app.tabs.base_tab import GROUP_LAUNCH, BaseTab
 CHAR_SLOT = 0
 MAX_CLIENTS = 5               # 使用者指定：天使之戀最多開 5 台
 
-(COL_DEL, COL_PICK, COL_ACCT, COL_PWD, COL_PROT,
- COL_NOTE, COL_SRV, COL_CHAN) = range(8)
-ACCT_COLS = ("", "選擇", "帳號", "密碼", "保護密碼", "備註", "伺服器", "頻道")
+# ★ ▲▼ 兩欄＝調整帳號順序（使用者 2026-09-06：「改一下我可以改變帳號排序」）。
+#   順序有意義：一鍵登入照清單順序把帳號填進視窗（第一個帳號進第一台空視窗）。
+#   跟 ✕ 一樣是純文字格、點擊由 cellClicked 接（使用者不要按鈕框）。
+(COL_DEL, COL_UP, COL_DOWN, COL_PICK, COL_ACCT, COL_PWD, COL_PROT,
+ COL_NOTE, COL_SRV, COL_CHAN) = range(10)
+ACCT_COLS = ("", "▲", "▼", "選擇", "帳號", "密碼", "保護密碼", "備註", "伺服器", "頻道")
 ACCT_ROWS_SHOWN = 5           # 使用者指定：清單至少看得到 5 列
+# ★ 表格高度跟著筆數長（2026-09-06 使用者：「帳號列表有 5 個但只看得到 4 個，拉桿拉到底
+#   也看不到第 5 個」）：以前的最小高度是建構時用「預設列高 × 7」估的，實際列高／表頭
+#   高度都是顯示時才定案（主題 polish、字型），估少了就塞不下；整頁又是固定 700px 高的
+#   視窗，塞不下時 Qt 會把控制項硬壓到比最小尺寸還小（farm_tab 同一個坑）。
+#   → 每次重建清單後用**實際**表頭高＋列高算，列數最多算到 ACCT_ROWS_MAX（再多才用表格
+#     自己的捲軸），整頁放進可捲動區，怎樣都不會被壓扁或切掉。
+ACCT_ROWS_MAX = 8
 # ⚠ 列高要比預設高一點：那兩個下拉（伺服器／頻道）塞進儲存格之後，
 #   用預設列高會把字上下切掉（使用者回報）。加的量用字高算，不寫死像素。
 ROW_PAD = 10
@@ -143,7 +156,19 @@ class LoginTab(BaseTab):
         self._job: dict | None = None
         self._srv_cache: list[tuple[str, int]] = []
 
-        root = QVBoxLayout(self)
+        # ★ 內容放進可捲動區（跟掛機頁同一個理由）：主視窗固定 940x700，帳號多、字型大、
+        #   狀態字一長整頁就塞不下，Qt 會把控制項硬壓到比最小尺寸還小 —— 2026-09-06
+        #   使用者「5 個帳號只看得到 4 個」就是清單被壓扁。有捲軸就永遠不會壓，頂多捲一下。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)   # 固定住，免得抖（見 farm_tab）
+        body = QWidget()
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        root = QVBoxLayout(body)
 
         # --- 遊戲設定 ---
         game_box = QGroupBox("遊戲設定")
@@ -189,7 +214,7 @@ class LoginTab(BaseTab):
         cred_lay.addWidget(self._wrap(QLabel(
             "勾「選擇」的帳號會被一鍵登入處理（可以勾很多個）。"
             "密碼、保護密碼、備註、伺服器、頻道點兩下就能改，改完立刻存。"
-            "最前面的 ✕ 點一下就刪掉那一列。")))
+            "最前面的 ✕ 點一下就刪掉那一列；▲▼ 調整順序（一鍵登入照這個順序填視窗）。")))
         self.acct_table = QTableWidget(0, len(ACCT_COLS))
         self.acct_table.setHorizontalHeaderLabels(list(ACCT_COLS))
         self.acct_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -203,6 +228,8 @@ class LoginTab(BaseTab):
         #   伺服器改名就會把字切掉（使用者回報伺服器與頻道被切）。
         fm = self.acct_table.fontMetrics()
         self.acct_table.setColumnWidth(COL_DEL, fm.horizontalAdvance("✕") + 16)
+        self.acct_table.setColumnWidth(COL_UP, fm.horizontalAdvance("▲") + 16)
+        self.acct_table.setColumnWidth(COL_DOWN, fm.horizontalAdvance("▼") + 16)
         self.acct_table.setColumnWidth(COL_PICK, fm.horizontalAdvance("選擇") + 24)
         self.acct_table.setColumnWidth(COL_PROT, fm.horizontalAdvance("保護密碼") + 24)
         # 下拉要留出「最長的選項 + 下拉箭頭 + 內距」
@@ -213,8 +240,8 @@ class LoginTab(BaseTab):
         # ⚠ 列高也要加高：儲存格裡塞了下拉之後，用預設列高會把字上下切掉。
         vh = self.acct_table.verticalHeader()
         vh.setDefaultSectionSize(max(vh.defaultSectionSize(), fm.height() + ROW_PAD * 2))
-        rh = vh.defaultSectionSize()
-        self.acct_table.setMinimumHeight(rh * (ACCT_ROWS_SHOWN + 2))
+        # 高度在 _fit_table_height() 用實際列高算（每次重建清單都重算，見 ACCT_ROWS_MAX）
+        self.acct_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.acct_table.itemChanged.connect(self._on_item_changed)
         self.acct_table.itemSelectionChanged.connect(self._on_row_selected)
         # ✕ 是純文字不是按鈕（使用者不要那個框），所以點擊由這裡接。
@@ -371,6 +398,16 @@ class LoginTab(BaseTab):
             x.setForeground(QColor("#d06a6a"))
             x.setToolTip("刪掉這一列")
             self.acct_table.setItem(r, COL_DEL, x)
+            # ▲▼ 調順序：第一列的 ▲、最後一列的 ▼ 淡掉（按了也沒事）
+            for col, glyph, tip, edge in ((COL_UP, "▲", "往上移一格", r == 0),
+                                          (COL_DOWN, "▼", "往下移一格",
+                                           r == len(self._accounts) - 1)):
+                mv = QTableWidgetItem(glyph)
+                mv.setFlags(Qt.ItemIsEnabled)
+                mv.setTextAlignment(Qt.AlignCenter)
+                mv.setForeground(QColor(theme.TEXT_MUT if edge else theme.TEXT))
+                mv.setToolTip(tip)
+                self.acct_table.setItem(r, col, mv)
 
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -401,6 +438,20 @@ class LoginTab(BaseTab):
 
             self._fill_channels(r, a)
         self._loading_table = False
+        self._fit_table_height()
+
+    def _fit_table_height(self) -> None:
+        """表格最小高度＝**實際**表頭高＋（筆數，至少 ACCT_ROWS_SHOWN、最多 ACCT_ROWS_MAX）×
+        實際列高＋框線。每次重建清單都重算 —— 5 筆就一定看得到 5 筆（2026-09-06）。"""
+        t = self.acct_table
+        rows = min(max(t.rowCount(), ACCT_ROWS_SHOWN), ACCT_ROWS_MAX)
+        rh = t.rowHeight(0) if t.rowCount() else t.verticalHeader().defaultSectionSize()
+        hh = t.horizontalHeader()
+        head = hh.height() if hh.height() > 0 else hh.sizeHint().height()
+        extra = t.frameWidth() * 2 + 2
+        if t.horizontalScrollBar().isVisible():
+            extra += t.horizontalScrollBar().height()
+        t.setMinimumHeight(head + rows * rh + extra)
 
     def _fill_channels(self, row: int, a: dict) -> None:
         """把某一列的頻道下拉重填成「這個伺服器實際有幾個分流」。"""
@@ -452,9 +503,27 @@ class LoginTab(BaseTab):
         self._set_status(f"已新增帳號 {acct}")
 
     def _on_cell_clicked(self, row: int, col: int) -> None:
-        """點到最前面那個 ✕ 就刪掉那一列。"""
-        if col == COL_DEL and 0 <= row < len(self._accounts):
+        """點到最前面那個 ✕ 就刪掉那一列；▲▼ 調順序。"""
+        if not (0 <= row < len(self._accounts)):
+            return
+        if col == COL_DEL:
             self._delete(self._accounts[row]["account"])
+        elif col == COL_UP:
+            self._move(row, -1)
+        elif col == COL_DOWN:
+            self._move(row, +1)
+
+    def _move(self, row: int, delta: int) -> None:
+        """把第 row 列往上（-1）／往下（+1）移一格，順序立刻存檔（一鍵登入照這個順序）。"""
+        j = row + delta
+        if not (0 <= row < len(self._accounts) and 0 <= j < len(self._accounts)):
+            return
+        acc = self._accounts
+        acc[row], acc[j] = acc[j], acc[row]
+        self._save_accounts()
+        self._rebuild_table()
+        self.acct_table.selectRow(j)          # 選取跟著那一列走，連按幾下就一直移
+        self._set_status(f"已把帳號 {acc[j]['account']} 移到第 {j + 1} 列")
 
     def _delete(self, account: str) -> None:
         """✕ 按鈕：刪掉這個帳號。用帳號而不是列號 —— 列號會因為重建而過期。"""
