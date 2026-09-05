@@ -1620,6 +1620,33 @@ def main() -> int:
        tab.start_box.currentIndex() == 2,
        str(tab.start_box.currentIndex()))
 
+    # ★★ 使用者 2026-09-05：「多一個選項是循環打副本，打勾就會一直跑，不然只打一場；
+    #   勾了循環就算從中間開始也會繼續跑下一場 —— 從中間開始只有我開的那場，後面從頭」
+    print("\n循環打副本勾選框 ＋ 「從第幾步」只管第一場")
+    tab.party_box.setCurrentIndex(tab.party_box.findData("bind"))
+    tab.loop_cb.setChecked(True)
+    ck("★★ 勾循環、從第 3 步開始 → 這一場從第 3 步、要循環、組隊照選",
+       tab._round_plan(5) == (2, True, "bind"), str(tab._round_plan(5)))
+    tab.loop_cb.setChecked(False)
+    ck("★★ 沒勾循環 → 只打一場：不循環、不組隊（起始步驟照舊）",
+       tab._round_plan(5) == (2, False, "none"), str(tab._round_plan(5)))
+    tab.start_box.blockSignals(True)
+    tab.start_box.setCurrentIndex(0)
+    tab.start_box.blockSignals(False)
+    tab.loop_cb.setChecked(True)
+    ck("　勾循環、從第 1 步 → 跟以前一樣（循環＋組隊）",
+       tab._round_plan(5) == (0, True, "bind"), str(tab._round_plan(5)))
+    tab._save_settings()
+    ck("★ 循環勾選存進 config", _cfg.get("dungeon.測試帳號.loop") is True,
+       str(_cfg.get("dungeon.測試帳號.loop")))
+    tab.loop_cb.setChecked(False)              # 會觸發存檔 → False
+    tab.loop_cb.blockSignals(True)
+    tab.loop_cb.setChecked(True)               # 畫面先弄髒，看讀回來有沒有蓋掉
+    tab.loop_cb.blockSignals(False)
+    tab._load_settings()
+    ck("★★ 重讀設定 → 循環勾選讀回來（沒勾）", not tab.loop_cb.isChecked())
+    tab.loop_cb.setChecked(True)
+
     print("\n製作頁：入口的選項自動記進去")
     from app.tabs.dungeon_make_tab import DungeonMakeTab
     mk = DungeonMakeTab()
@@ -1704,6 +1731,25 @@ def main() -> int:
     run(tab, dt.CLEAR_SETTLE + 0.5)
     ck("單輪：跑完就停（不進補給）", not tab.run_cb.isChecked()
        and tab._cycle == "go", f"{tab._cycle} {tab.status.text()}")
+
+    # ①b ★★ 使用者 2026-09-05：勾了循環、從中間開始 → 這一場照樣跑完就補給，
+    #   下一趟從第 1 步（「從中間開始只有我開的那場，後面還是要從頭」）。
+    tab = make_tab([{"do": "walk", "to": [10, 10]}, {"do": "walk", "to": [12, 12]}],
+                   pos=(12.5, 12.0))
+    tab._i = 1                          # 從第 2 步（最後一步）開始
+    tab._loop, tab._party = True, "none"
+    tab._targets = lambda: []
+    tab._drop_target = lambda: None
+    started2 = []
+    tab._start_supply_trip = lambda: (started2.append(1),
+                                      setattr(tab, "_i", 0),   # 真的那支會歸零
+                                      setattr(tab, "_cycle", "supply"))[1]
+    run(tab, 0.3)
+    run(tab, dt.CLEAR_SETTLE + 0.5)
+    ck("★★ 勾循環＋從中間開始：跑完不停機、進補給", tab.run_cb.isChecked()
+       and started2 and tab._cycle == "supply", f"{tab._cycle} {tab.status.text()}")
+    ck("　下一趟從第 1 步", tab._i == 0, str(tab._i))
+    ck("　趟數有算", tab._rounds == 1, str(tab._rounds))
 
     # ② 循環：跑完 → 進「補給」段（不停機），補給完 → 飛回入口 → 組隊 → 開跑
     tab = loop_tab("bind")

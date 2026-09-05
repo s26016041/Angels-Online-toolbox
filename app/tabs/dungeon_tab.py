@@ -209,7 +209,8 @@ CLEAR_SETTLE = 3.0
 # ★★★ 全自動循環（使用者 2026-09-03 定案）：
 #   組隊 → 刷（飛／撞入口／跑腳本）→ 腳本跑完且周圍沒怪 → **回程補給**（跟掛機
 #   同一套 supply.run_full_supply）→ 趴趴GO 回離入口最近的傳送點 → 退組再組隊 → 循環。
-#   「從第幾步開始」有選 → **只跑單輪**（不組隊、不補給、跑完就停）。
+#   ★ 2026-09-05 改：循不循環看「循環打副本」勾選框（沒勾＝只打一場：不組隊、不補給、
+#     跑完就停）；「從第幾步開始」只管按下開跑的那一場，下一趟一律從第 1 步。
 #   自動組隊兩種：綁定分身（刷副本這隻當隊長、均分、分身自動同意；分身只要在隊伍
 #   裡就好，人在哪不管）／遊戲自動組隊（遊戲裡自己設定，我們只做「退組 → 等隊伍
 #   名單出現人」）。
@@ -489,6 +490,18 @@ class DungeonTab(BaseTab):
             "整份腳本跑完而且周圍沒有怪 = 這一趟結束。")
         self.run_cb.toggled.connect(self._on_run_toggled)
         rbar.addWidget(self.run_cb)
+        # ★ 使用者 2026-09-05：「多一個選項是循環打副本，打勾就會一直跑，不然只打一場；
+        #   勾了循環，就算從中間開始也會繼續跑下一場 —— 從中間開始只有我開的那場，
+        #   後面還是要從頭。」
+        self.loop_cb = QCheckBox("循環打副本")
+        self.loop_cb.setChecked(True)
+        self.loop_cb.setToolTip(
+            "勾著：每一趟刷完 → 回程補給 → 趴趴GO回入口 →（有選組隊就）退組再組隊 → "
+            "從第 1 步再跑一趟，一直循環。\n"
+            "沒勾：只打一場，跑完就停（不組隊、不補給）。\n"
+            "⚠「從第幾步開始」只影響你按下開跑的那一場；後面每一趟都從第 1 步。")
+        self.loop_cb.toggled.connect(self._save_settings)
+        rbar.addWidget(self.loop_cb)
         rbar.addStretch(1)
         self.prog = QLabel("－")
         rbar.addWidget(self.prog)
@@ -597,6 +610,21 @@ class DungeonTab(BaseTab):
             return txt[txt.rindex("（") + 1:-1]
         return txt or "default"
 
+    def _round_plan(self, nsteps: int) -> tuple[int, bool, str]:
+        """開跑時照畫面決定 `(從第幾步開始, 要不要循環, 組隊模式)`。
+
+        ★ 使用者 2026-09-05 定案：
+          · 「循環打副本」勾著才循環，沒勾只打一場（跑完就停、不組隊、不補給）。
+          · 「從第幾步開始」**只管按下開跑的這一場**；循環的下一趟一律從第 1 步
+            （`_start_supply_trip` 會把 `_i` 歸零）。
+        ⚠ 跟 9/3 那版不同：以前是「從第幾步有選＝單輪」，現在單不單輪只看勾選框。
+        """
+        i = (max(0, min(self.start_box.currentIndex(), nsteps - 1))
+             if nsteps else 0)
+        loop = bool(self.loop_cb.isChecked())
+        party = (self.party_box.currentData() or "none") if loop else "none"
+        return i, loop, party
+
     def _save_settings(self) -> None:
         """把這一頁的設定寫回 config。⚠ `config.set` 不寫檔，要接 `save()`
         （[[config-set-needs-save]]，已經復發兩次）。"""
@@ -605,6 +633,7 @@ class DungeonTab(BaseTab):
         config.set(self._key("script"), self.files.currentText())
         config.set(self._key("vks"), self._picked_keys())
         config.set(self._key("start"), int(self.start_box.currentIndex()))
+        config.set(self._key("loop"), bool(self.loop_cb.isChecked()))
         config.set(self._key("party"), self.party_box.currentData() or "none")
         config.set(self._key("partner"),
                    self.partner_box.currentText().split("（")[-1].rstrip("）")
@@ -622,6 +651,7 @@ class DungeonTab(BaseTab):
             if i >= 0:
                 self.files.setCurrentIndex(i)
             self._refresh_start_box()
+            self.loop_cb.setChecked(bool(config.get(self._key("loop"), True)))
             mode = str(config.get(self._key("party"), "none") or "none")
             j = self.party_box.findData(mode)
             self.party_box.setCurrentIndex(j if j >= 0 else 0)
@@ -819,7 +849,7 @@ class DungeonTab(BaseTab):
         self._jumped = None          # 這一拍有沒有順移：有＝跳之前站的位置 (x, y)
         self._grid_t = 0.0           # 還有多久重讀地形圖
         # ---- 全自動循環（見 PARTY_MODES 的說明）----
-        self._loop = False           # 要不要循環（「從第幾步」有選＝單輪不循環）
+        self._loop = False           # 要不要循環（＝「循環打副本」勾選框，見 _round_plan）
         self._cycle = "go"           # go（飛／撞入口／跑）／supply／back／team
         self._party = "none"         # 組隊模式
         self._team_sub = ""          # leave／invite／wait
@@ -941,14 +971,11 @@ class DungeonTab(BaseTab):
         self._reset_run()
         # ★ 從第幾步開始（使用者 2026-09-02）。⚠ 只在「已經在副本裡」時有效；
         #   還要先撞入口的話，進去之後照樣從這一步開始。
-        self._i = max(0, min(self.start_box.currentIndex(),
-                             len(script.steps) - 1)) if script.steps else 0
+        # ★★★ 循環與否看「循環打副本」勾選框（使用者 2026-09-05），見 `_round_plan`。
+        self._i, self._loop, self._party = self._round_plan(len(script.steps))
         self._phase = phase
         self._fly = fly
         self._map_key = here
-        # ★★★ 全自動循環（使用者 2026-09-03）：「從第幾步」有選 → 只跑單輪。
-        self._loop = self._i == 0
-        self._party = (self.party_box.currentData() or "none") if self._loop else "none"
         if self._party == "bind":
             ppid = self.partner_box.currentData()
             psc = self._scanners.get(ppid) if ppid is not None else None
@@ -969,7 +996,10 @@ class DungeonTab(BaseTab):
                 return
             self._ppid, self._psc = ppid, psc
             self._partner_name = self.partner_box.currentText().split("（")[0].strip()
-        if self._party != "none":
+        # ★ 從中間開跑的那一場**不先退組再組隊**：人已經在副本裡跑到一半，這時退組
+        #   等於把自己踢出隊伍（分身也一起）。組隊留給下一趟的循環（`_back_tick`
+        #   飛回入口後照樣「退組再組隊」）。
+        if self._party != "none" and self._i == 0:
             self._cycle = "team"
             self._team_begin()
         self._refresh_steps()
