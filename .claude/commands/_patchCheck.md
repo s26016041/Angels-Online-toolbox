@@ -298,18 +298,18 @@ py tools\recheck_tables.py        # 要進遊戲，最後會直接給結論
 
 | 重跑指令 | 產生 | 給誰用／過期後果 |
 |---|---|---|
-| `py toolsuild_item_names.py` | `assets/item_names.tsv.gz` | 物品名稱；過期＝新道具顯示成編號 |
-| `py toolsuild_item_desc.py` | `assets/item_desc.tsv.gz` | 物品說明原文（寶石提示框）；過期＝新寶石只印記憶體算的加成 |
-| `py toolsuild_item_icons.py` | `assets/item_icons.zip` | 道具圖示（原始 .SHP＋換色索引，執行時 `iconbias` 照遊戲換色）；過期＝新道具沒圖 |
-| `py toolsuild_jumpmap.py` | `assets/jumpmap.tsv`、`jumpmap_class.tsv` | 趴趴GO 傳送點；⛔ 過期＝傳錯地方 |
-| `py toolsuild_skills.py` | `assets/skills.tsv.gz` | buff 持續時間／MP；⛔ 過期＝補 buff 時間點錯 |
-| `py toolsuild_skill_range.py` | `assets/skill_range.tsv.gz` | 技能射程；⛔ 過期＝走位停太遠零傷害 |
-| `py toolsuild_skill_names.py` | `assets/skill_names.tsv.gz` | 技能名稱（快捷鍵標名）；過期＝顯示編號 |
-| `py toolsuild_scene_names.py` | 寫回 `app/game/scene.py` 裡的地圖名表（151 筆；`--check` 只比對） | 地圖名稱；過期＝顯示場景編號 |
-| `py toolsuild_mapobj.py` | `assets/mapobj_names.tsv.gz` | 場景物件名（副本製作頁）；過期＝顯示外觀編號 |
-| `py toolsuild_mapobj_icons.py` | `assets/mapobj_icons.zip` | 場景物件縮圖（副本製作頁）；過期＝沒圖 |
-| `py toolsuild_supply_merchants.py` | `assets/supply_merchants.json` | 補給城的買／修／銀行 NPC；⛔ 過期＝補給找不到人 |
-| `py toolsuild_supply_shop.py` | `assets/supply_shop.json` | 補給店販售表（藥水編號／單價）；⛔ 過期＝買錯或購買紀錄沒單價 |
+| `py tools\build_item_names.py` | `assets/item_names.tsv.gz` | 物品名稱；過期＝新道具顯示成編號 |
+| `py tools\build_item_desc.py` | `assets/item_desc.tsv.gz` | 物品說明原文（寶石提示框）；過期＝新寶石只印記憶體算的加成 |
+| `py tools\build_item_icons.py` | `assets/item_icons.zip` | 道具圖示（原始 .SHP＋換色索引，執行時 `iconbias` 照遊戲換色）；過期＝新道具沒圖 |
+| `py tools\build_jumpmap.py` | `assets/jumpmap.tsv`、`jumpmap_class.tsv` | 趴趴GO 傳送點；⛔ 過期＝傳錯地方 |
+| `py tools\build_skills.py` | `assets/skills.tsv.gz` | buff 持續時間／MP；⛔ 過期＝補 buff 時間點錯 |
+| `py tools\build_skill_range.py` | `assets/skill_range.tsv.gz` | 技能射程；⛔ 過期＝走位停太遠零傷害 |
+| `py tools\build_skill_names.py` | `assets/skill_names.tsv.gz` | 技能名稱（快捷鍵標名）；過期＝顯示編號 |
+| `py tools\build_scene_names.py` | 寫回 `app/game/scene.py` 裡的地圖名表（151 筆；`--check` 只比對） | 地圖名稱；過期＝顯示場景編號 |
+| `py tools\build_mapobj.py` | `assets/mapobj_names.tsv.gz` | 場景物件名（副本製作頁）；過期＝顯示外觀編號 |
+| `py tools\build_mapobj_icons.py` | `assets/mapobj_icons.zip` | 場景物件縮圖（副本製作頁）；過期＝沒圖 |
+| `py tools\build_supply_merchants.py` | `assets/supply_merchants.json` | 補給城的買／修／銀行 NPC；⛔ 過期＝補給找不到人 |
+| `py tools\build_supply_shop.py` | `assets/supply_shop.json` | 補給店販售表（藥水編號／單價）；⛔ 過期＝買錯或購買紀錄沒單價 |
 
 跑完 → `py tools
 echeck_tables.py` 全對 → `py tools\stamp_tables.py` 蓋章。
@@ -322,8 +322,8 @@ echeck_tables.py` 全對 → `py tools\stamp_tables.py` 蓋章。
 `assets/item_desc.tsv.gz`（物品說明原文）跟名稱表同一批字串檔。新道具的圖不在包裡 →
 強化裝備分頁那格會是空白（安全退化，不會做錯事），但看起來就像壞了。
 
-    py toolsuild_item_icons.py
-    py toolsuild_item_desc.py
+    py tools\build_item_icons.py
+    py tools\build_item_desc.py
 
 ⚠ 它們吃的是**解包後的 GAMEDATA**，跟 `build_item_names.py` 同一份 —— 所以
 「要不要重新解包」的判斷跟名稱表綁在一起：**要重解包就一起重跑**。
