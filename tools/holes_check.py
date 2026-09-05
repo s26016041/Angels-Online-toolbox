@@ -213,6 +213,45 @@ check("兩顆寶石認得、等限由低到高",
 check("扭蛋（分類 33）不算寶石", all(g.slot != 74 for g in gs))
 check("沒效果編號的不用", all(g.slot != 23 for g in gs))
 
+print("②b 寶石加什麼（gem_effects）：範本 +0x108 → 效果列三組 × 分類欄 → 寶石範本那一欄")
+ITABLE, TMPL = 0x32000000, 0x04C00000
+GRP = gear.GEM_GROUPS
+
+
+def effects_scanner(armor_codes=(14,) * 7, groups2=()) -> FakeScanner:
+    reads = {
+        (gear.ITEM_TABLE_PTR, 4): struct.pack("<I", ITABLE),
+        (ITABLE + 3105 * 4, 4): struct.pack("<I", TMPL),
+        (TMPL + bag.TMPL_PARAM1, 4): struct.pack("<I", 15),
+        (gear.JEWEL_TABLE_PTR, 4): struct.pack("<I", TABLE),
+        (TABLE + 15 * 4, 4): struct.pack("<I", ROW),
+        # 完美的黃寶石：武器 雷電攻擊(18)、防具 靈敏(14)、盾 雷電防禦(22)；第二、三組 0
+        (ROW + GRP[0] + 0x00, 4): struct.pack("<I", 18),
+        (ROW + GRP[0] + 0x20, 4): struct.pack("<I", 22),
+        (TMPL + 0x88, 4): struct.pack("<i", 24),          # 雷電攻擊
+        (TMPL + 0x84, 4): struct.pack("<i", 10),          # 靈敏
+        (TMPL + 0x8C, 4): struct.pack("<i", 5),           # 雷電防禦
+        (TMPL + 0x74, 4): struct.pack("<i", 3),           # 防禦（給「七欄不一樣」那題）
+    }
+    for off, code in zip((0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C), armor_codes):
+        reads[(ROW + GRP[0] + off, 4)] = struct.pack("<I", code)
+    for grp_i, off, code in groups2:
+        reads[(ROW + GRP[grp_i] + off, 4)] = struct.pack("<I", code)
+    return FakeScanner(reads)
+
+
+eff = holes.gem_effects(effects_scanner(), 3105)
+check("★ 完美的黃寶石 ＝ 武器：雷電攻擊 +24／防具：靈敏 +10／盾牌：雷電防禦 +5（跟資源包說明一樣）",
+      eff == [("武器", "雷電攻擊", 24), ("防具", "靈敏", 10), ("盾牌", "雷電防禦", 5)], str(eff))
+eff = holes.gem_effects(effects_scanner(armor_codes=(14, 10, 14, 14, 14, 14, 14)), 3105)
+check("　防具七欄不一樣 → 逐欄列（衣服：防禦力 +3），不合寫",
+      ("衣服", "防禦力", 3) in eff and ("頭飾", "靈敏", 10) in eff
+      and not any(x[0] == "防具" for x in eff), str(eff))
+eff = holes.gem_effects(effects_scanner(groups2=((1, 0x00, 11),)), 3105)
+check("　第二組效果也列（武器再加魔攻，範本沒那欄＝0）",
+      ("武器", "魔攻", 0) in eff and eff[0] == ("武器", "雷電攻擊", 24), str(eff))
+check("　範本讀不到 → 空清單（介面不印、不猜）", holes.gem_effects(FakeScanner({}), 3105) == [])
+
 g = holes.pick_gem(gs, 120, 40)
 check("等限 ≤ 40、裝備 120 級 → 挑瑕疵（20）", g and g.type_id == 3092, f"實得 {g}")
 g = holes.pick_gem(gs, 120, 10)

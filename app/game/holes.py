@@ -172,6 +172,61 @@ def jewel_levels(scanner, effect: int) -> tuple[int, int] | None:
     return lo, hi
 
 
+# 寶石效果表一列三組（+0x00/+0x24/+0x48）裡，照裝備分類挑的欄位 → 說明文字的三種標的。
+# 「防具」＝頭飾／衣服／手套／鞋子／披風／飾品／背包七欄（jeweleffect.xml 影響裝備2~8）；
+# 遊戲說明文字把它們合寫成一行「防具：」—— 883 列裡七欄全部相同，這裡照樣合寫；
+# 真的不同就逐欄列出（不猜）。
+GEM_TARGETS = (("武器", (0x00,)),
+               ("防具", (0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C)),
+               ("盾牌", (0x20,)))
+GEM_SLOT_NAMES = {0x04: "頭飾", 0x08: "衣服", 0x0C: "手套", 0x10: "鞋子",
+                  0x14: "披風", 0x18: "飾品", 0x1C: "背包"}
+
+
+def gem_effects(scanner, type_id: int) -> list[tuple[str, str, int]]:
+    """這種寶石鑲上去加什麼：[(標的, 屬性名, 數值)]，跟遊戲說明文字那三行同一份資料。
+
+    ★ 全部讀記憶體（使用者 2026-09-06：「寶石裡面加什麼素質跟敘述都沒寫」）：
+      寶石範本 `+0x108` 效果編號 → 寶石效果表那一列（`gear._jewel_row`）→ 三組 × 照分類
+      挑欄 ＝ **屬性代號**（`gear.ATTR_NAMES` 那組編號）→ 數值是**寶石自己範本**的那一欄
+      （`gear.ATTR_OFFSET`）—— 跟 `gear.gem_bonus` 算綠字加成同一條路，只是不限定一種裝備。
+      ✅ 對帳：完美的黃寶石 3105 資源包說明「武器：雷電攻擊 +24／防具：靈敏 +10／
+      盾牌：雷電防禦 +5」＝效果列 15（電傷／靈敏／電抗）× 範本 靈敏 10、雷電攻擊 24、
+      雷電防禦 5。
+    ⚠ 讀不到範本／效果列回空清單（介面就不印那幾行，不猜）；認不得的代號印「屬性N」。
+    """
+    tmpl = gear.item_template(scanner, type_id)
+    if not tmpl:
+        return []
+    effect = _u32(scanner, tmpl + bag.TMPL_PARAM1)
+    row = gear._jewel_row(scanner, effect) if effect else 0
+    if not row:
+        return []
+    out: list[tuple[str, str, int]] = []
+    for label, fields in GEM_TARGETS:
+        per_field: list[tuple[int, list[tuple[str, int]]]] = []
+        for off in fields:
+            lines: list[tuple[str, int]] = []
+            for grp in gear.GEM_GROUPS:
+                code = _u32(scanner, row + grp + off)
+                if not code:
+                    continue
+                offs = gear.ATTR_OFFSET.get(code)
+                if not offs:
+                    lines.append((gear.attr_name(code), 0))
+                    continue
+                raw = scanner._read_bytes(tmpl + offs[0], 4)
+                val = struct.unpack("<i", bytes(raw))[0] if raw else 0
+                lines.append((gear.attr_name(code), val))
+            per_field.append((off, lines))
+        if len(fields) > 1 and len({tuple(x[1]) for x in per_field}) > 1:
+            for off, lines in per_field:          # 七欄不一樣 → 逐欄列（不合寫）
+                out.extend((GEM_SLOT_NAMES.get(off, label), n, v) for n, v in lines)
+        else:
+            out.extend((label, n, v) for n, v in per_field[0][1])
+    return out
+
+
 def gems(scanner, items: list[bag.Item] | None = None,
          complete: bool = True) -> tuple[list[Gem], bool]:
     """(背包裡查得到等限的寶石 —— 等限由低到高, 背包掃完了嗎)。"""

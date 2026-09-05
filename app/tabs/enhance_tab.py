@@ -223,8 +223,9 @@ def _gear_cells(gears: list[gear.Gear], scanner) -> list[Cell]:
             for g in gears]
 
 
-def _gem_cells(gems: list[holes.Gem]) -> list[Cell]:
-    """寶石背包：**同一種寶石合成一格**（各堆數量加總），等限低的排前面。"""
+def _gem_cells(gems: list[holes.Gem], scanner=None) -> list[Cell]:
+    """寶石背包：**同一種寶石合成一格**（各堆數量加總），等限低的排前面。
+    `scanner`：滑過時讀「這顆加什麼」（範本＋效果表，見 holes.gem_effects）；沒給就不印那幾行。"""
     by_type: dict[int, list[holes.Gem]] = {}
     for gm in gems:
         by_type.setdefault(gm.type_id, []).append(gm)
@@ -234,16 +235,28 @@ def _gem_cells(gems: list[holes.Gem]) -> list[Cell]:
         n = sum(s.count for s in stacks)
         out.append(Cell(key=type_id, icon_id=first.icon_id, name=first.name,
                         payload=first, badge=f"×{n}", badge_colour="#FFFFFF",
-                        tooltip=(lambda gm=first, n=n: _gem_tooltip_html(gm, n))))
+                        tooltip=(lambda gm=first, n=n: _gem_tooltip_html(gm, n, scanner))))
     out.sort(key=lambda c: (c.payload.min_level, c.key))
     return out
 
 
-def _gem_tooltip_html(gm: holes.Gem, n: int) -> str:
-    lines = [(gm.name, "#FFFFFF"),
-             (f"裝備等限：{gm.min_level}級", "#7CD8FF"),
-             (f"（可鑲 {gm.min_level}～{gm.max_level} 級的裝備）", "#888888"),
-             (f"數量 ×{n}", "#DDDDDD")]
+def _gem_tooltip_html(gm: holes.Gem, n: int, scanner=None) -> str:
+    """跟遊戲的寶石說明同一份內容（使用者 2026-09-06：「寶石裡面加什麼素質跟敘述都沒寫」）：
+    武器／防具／盾牌各加什麼、裝備等限、數量。加成那幾行**滑過才讀記憶體**（讀不到就不印）。"""
+    lines = [(gm.name, "#FFFFFF")]
+    effects = []
+    if scanner is not None:
+        try:
+            effects = holes.gem_effects(scanner, gm.type_id)
+        except Exception:                                # noqa: BLE001
+            effects = []
+    if effects:
+        lines.append(("可鑲嵌於已打孔的裝備上，以加強能力：", "#C8C8C8"))
+        for label, attr, val in effects:
+            lines.append((f"{label}：{attr} {val:+d}" if val else f"{label}：{attr}", "#7CFC7C"))
+    lines += [(f"裝備等限：{gm.min_level}級", "#7CD8FF"),
+              (f"（可鑲 {gm.min_level}～{gm.max_level} 級的裝備）", "#888888"),
+              (f"數量 ×{n}", "#DDDDDD")]
     parts = [f"<div style='color:{colour}'>{html.escape(text)}</div>"
              for text, colour in lines]
     return ("<div style='background:#0d1b21; padding:4px'>"
@@ -517,7 +530,7 @@ class EnhanceTab(BaseTab):
         gem_sig = (pid, tuple(sorted((g.type_id, g.slot, g.count) for g in gs)))
         if gem_sig != self._gem_sig:
             self._gem_sig = gem_sig
-            self.gem_grid.set_cells(_gem_cells(gs))
+            self.gem_grid.set_cells(_gem_cells(gs, sc))
             # 上次選的那種寶石一出現就選回去（只做一次；他點別顆就以他的為準）
             if self._want_gem and self.gem_grid.selected() is None:
                 if self.gem_grid.select(self._want_gem):

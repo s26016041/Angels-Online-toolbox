@@ -148,6 +148,17 @@ SIGS: tuple[Sig, ...] = (
     Sig("jumpmap", "CONN_PTR", "data", 5,
         "89 70 02 FF 35 D0 67 9B 00 E8 ?? ?? ?? ?? 59 59 5E C9 C2 04 00",
         0x009B67D0),
+    # ★ 圖示換色的兩張查表（RGB565↔HSV）的指標（2026-09-06，app/game/iconbias.py）。
+    #   錨在調色盤換色本體 0x682234：`mov eax,[A]; mov ecx,ebx; mov edi,[lo]; mov edx,[hi];
+    #   movzx eax,word [eax+ecx*2]; mov esi,eax; and esi,3F; cmp esi,edi; jl; cmp esi,edx; jle`。
+    #   ⚠ 直接色那條 0x682466 幾乎同一串（`movzx ecx` vs `movzx eax`）—— 特徵蓋到
+    #   `0F B7 04 48 8B F0` 才分得開。只給 tools/icon_bias_probe.py 對表用，產品不讀。
+    Sig("iconbias", "TABLE_A_PTR", "data", 1,
+        "A1 08 2E A0 00 8B CB 8B 3D 18 2E A0 00 8B 15 1C 2E A0 00 0F B7 04 48 8B F0 83 E6 3F 3B F7 7C 04 3B F2 7E 13",
+        0x00A02E08),
+    Sig("iconbias", "TABLE_B_PTR", "data", 2,
+        "8B 0D 0C 2E A0 00 C1 E0 05 0B C2 C1 E0 06 0B C6 0F B7 04 41 EB 02 8B C3",
+        0x00A02E0C),
     # 賣東西前那包「對話動作」（UI 指令表裡的 talkaction）。跟 attack.ACTION_FN
     # 長得幾乎一樣，只差 push 的代號（0x0B vs 0x07）—— 特徵一定要蓋到那兩個
     # push，不然兩支會互相命中。已驗過在模組內唯一。
