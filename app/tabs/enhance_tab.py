@@ -454,7 +454,7 @@ class EnhanceTab(BaseTab):
         self._sig = None
         if not self._scanners:
             self.status.setText("找不到分身 —— 遊戲開著嗎？")
-            self.grid.set_gears([])
+            self.grid.set_cells([])           # ⚠ 46f441c 改名漏了這一處：遊戲沒開時整頁炸 AttributeError
             return
         self.status.setText(f"找到 {len(self._scanners)} 個分身")
         self._refresh()
