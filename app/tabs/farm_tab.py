@@ -219,6 +219,88 @@ def _elapsed_text(secs: float) -> str:
     if s < 3600:
         return f"{s // 60} 分"
     return f"{s // 3600} 小時 {s % 3600 // 60} 分"
+
+
+def loot_panel(parent, lt, on_reset, note: str = "") -> QWidget:
+    """把一台的收穫累計器（`loot.Loot`）畫成一張表（新的在上面），摘要掛在表的上方。
+
+    掛機頁的「獲得物品」與自動刷副本頁的「副本收益」**共用這一支**（2026-09-06
+    使用者：「跟自動掛機的紀錄一樣就好」）—— 表長什麼樣只在這裡改。
+    `on_reset`＝按「重新計算」時做什麼（各頁自己歸零＋重建基準），按完就地重畫。
+    `note`＝表頭後面多講一句（副本收益要說「只算人在副本裡的時候」）。
+    ⛔ **不算金幣**（使用者 2026-08-28：「錢不算好了」）—— 只數東西。
+    ⚠ 一次性快照：開的當下有什麼畫什麼，**不即時刷新**（使用者指定「不用刷頻」；
+      高頻改表也是 qt-ui-pitfalls 那個坑）。
+    """
+    panel = QWidget(parent)
+    v = QVBoxLayout(panel)
+    v.setContentsMargins(0, 0, 0, 0)
+    lab = QLabel()
+    lab.setStyleSheet("font-weight: bold;")
+    lab.setWordWrap(True)
+    v.addWidget(lab)
+
+    tbl = QTableWidget(0, 4)
+    tbl.setHorizontalHeaderLabels(["圖示", "物品", "數量", "最後獲得"])
+    tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+    tbl.verticalHeader().setVisible(False)
+    tbl.setIconSize(QSize(LOOT_ICON, LOOT_ICON))
+    v.addWidget(tbl, 1)
+
+    bar = QHBoxLayout()
+    bar.addStretch(1)
+    reset_btn = QPushButton("重新計算")
+    reset_btn.setToolTip("把累計歸零，從現在這一刻重新開始算。")
+    bar.addWidget(reset_btn)
+    v.addLayout(bar)
+
+    def fill() -> None:
+        rows = lt.rows()
+        total = sum(n for _t, n, _i, _s in rows)
+        since = _elapsed_text(time.time() - lt.since)
+        head = (f"{len(rows)} 種 / {total:,} 件　"
+                f"起算 {time.strftime('%m/%d %H:%M', time.localtime(lt.since))}"
+                f"（{since}）")
+        if not rows:
+            head += f"　—— 還沒對到新東西（每 {LOOT_GAP:.0f} 秒對帳一次背包）"
+        if note:
+            head += f"　{note}"
+        lab.setText(head)
+        # ⚠ 追加式的表不 clear()（qt-ui-pitfalls）；這裡是整批重畫，
+        #   而且只有兩個時機（開視窗、按重新計算），設列數就夠。
+        tbl.setRowCount(len(rows))
+        for i, (tid, qty, icon_id, ts) in enumerate(rows):
+            icon_it = QTableWidgetItem()
+            pm = itemicon.pixmap(icon_id) if icon_id else None
+            if pm is not None and not pm.isNull():
+                icon_it.setIcon(QIcon(pm))
+            else:
+                # 沒有這張圖（改版新道具、圖包沒重建）→ 留白，
+                # **不拿別張圖頂替**（itemicon 檔頭的規矩）。
+                icon_it.setText("—")
+                icon_it.setTextAlignment(Qt.AlignCenter)
+            tbl.setItem(i, 0, icon_it)
+            cells = (itemname.label(tid), f"{qty:,}",
+                     time.strftime("%m/%d %H:%M:%S", time.localtime(ts)))
+            for col, text in enumerate(cells, start=1):
+                it = QTableWidgetItem(text)
+                if col == 2:                  # 數量靠右
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                tbl.setItem(i, col, it)
+            tbl.setRowHeight(i, LOOT_ICON + 8)
+        # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
+        for col, w in enumerate((LOOT_ICON + 12, 240, 80)):
+            tbl.setColumnWidth(col, w)
+        tbl.horizontalHeader().setStretchLastSection(True)
+
+    fill()
+    reset_btn.clicked.connect(lambda: (on_reset(), fill()))
+    # 給離線測試摸得到（不重跑排版邏輯就能驗內容）
+    panel._head, panel._tbl, panel._fill = lab, tbl, fill
+    panel._reset_btn = reset_btn
+    return panel
+
+
 # ★★ 「背包裡找不到回程道具」要**連續確認幾次**才准停機（每次間隔就是
 #   GEAR_CHECK_GAP）。⚠ 不可以改回「第一次就停機」：換頻道／傳送後重連時，
 #   容器與內容是**分批到齊**的 —— 使用者 2026-08-09 回報「裝備壞掉卻說我
@@ -3432,72 +3514,11 @@ class CharFarmPage(QWidget):
           會就地重畫一次（那時表本來就是空的）。
         ★ 回的是**內容**不是視窗：產品介面把它塞進「紀錄」那個三分頁視窗
           （`_logs_dialog`），單獨開窗（離線測試）走 `_loot_dialog`。
+        ★ 畫表的本體在模組層的 `loot_panel()`：自動刷副本頁的「副本收益」
+          （2026-09-06 使用者：「跟自動掛機的紀錄一樣就好」）用同一支畫，
+          兩邊才不會長歪。
         """
-        panel = QWidget(self)
-        v = QVBoxLayout(panel)
-        v.setContentsMargins(0, 0, 0, 0)
-        lab = QLabel()
-        lab.setStyleSheet("font-weight: bold;")
-        lab.setWordWrap(True)
-        v.addWidget(lab)
-
-        tbl = QTableWidget(0, 4)
-        tbl.setHorizontalHeaderLabels(["圖示", "物品", "數量", "最後獲得"])
-        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        tbl.verticalHeader().setVisible(False)
-        tbl.setIconSize(QSize(LOOT_ICON, LOOT_ICON))
-        v.addWidget(tbl, 1)
-
-        bar = QHBoxLayout()
-        bar.addStretch(1)
-        reset_btn = QPushButton("重新計算")
-        reset_btn.setToolTip("把累計歸零，從現在這一刻重新開始算。")
-        bar.addWidget(reset_btn)
-        v.addLayout(bar)
-
-        def fill() -> None:
-            rows = self._loot.rows()
-            total = sum(n for _t, n, _i, _s in rows)
-            since = _elapsed_text(time.time() - self._loot.since)
-            head = (f"{len(rows)} 種 / {total:,} 件　"
-                    f"起算 {time.strftime('%m/%d %H:%M', time.localtime(self._loot.since))}"
-                    f"（{since}）")
-            if not rows:
-                head += f"　—— 還沒對到新東西（每 {LOOT_GAP:.0f} 秒對帳一次背包）"
-            lab.setText(head)
-            # ⚠ 追加式的表不 clear()（qt-ui-pitfalls）；這裡是整批重畫，
-            #   而且只有兩個時機（開視窗、按重新計算），設列數就夠。
-            tbl.setRowCount(len(rows))
-            for i, (tid, qty, icon_id, ts) in enumerate(rows):
-                icon_it = QTableWidgetItem()
-                pm = itemicon.pixmap(icon_id) if icon_id else None
-                if pm is not None and not pm.isNull():
-                    icon_it.setIcon(QIcon(pm))
-                else:
-                    # 沒有這張圖（改版新道具、圖包沒重建）→ 留白，
-                    # **不拿別張圖頂替**（itemicon 檔頭的規矩）。
-                    icon_it.setText("—")
-                    icon_it.setTextAlignment(Qt.AlignCenter)
-                tbl.setItem(i, 0, icon_it)
-                cells = (itemname.label(tid), f"{qty:,}",
-                         time.strftime("%m/%d %H:%M:%S", time.localtime(ts)))
-                for col, text in enumerate(cells, start=1):
-                    it = QTableWidgetItem(text)
-                    if col == 2:                  # 數量靠右
-                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    tbl.setItem(i, col, it)
-                tbl.setRowHeight(i, LOOT_ICON + 8)
-            # 欄寬手動給、最後一欄補滿 —— 不用 ResizeToContents（qt-ui-pitfalls）。
-            for col, w in enumerate((LOOT_ICON + 12, 240, 80)):
-                tbl.setColumnWidth(col, w)
-            tbl.horizontalHeader().setStretchLastSection(True)
-
-        fill()
-        reset_btn.clicked.connect(lambda: (self._reset_loot(), fill()))
-        # 給離線測試摸得到（不重跑排版邏輯就能驗內容）
-        panel._head, panel._tbl, panel._fill = lab, tbl, fill
-        panel._reset_btn = reset_btn
-        return panel
+        return loot_panel(self, self._loot, self._reset_loot)
 
     def _loot_dialog(self) -> QDialog:
         """單獨開一張「獲得物品」（離線測試／有需要時單開）。"""

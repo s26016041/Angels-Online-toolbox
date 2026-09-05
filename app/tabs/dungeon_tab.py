@@ -101,6 +101,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -108,6 +109,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidgetAction,
@@ -115,18 +118,18 @@ from PySide6.QtWidgets import (
 
 from app import theme
 from app.config import config
-from app.core import charname, injector, preload
+from app.core import charname, injector, netstat, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (dungeon, entity, itemname, jumpmap, locate, mapobj,
+from app.game import (dungeon, entity, itemname, jumpmap, locate, loot, mapobj,
                       move, navigate, player, portal, produce, quickbar, revive,
                       robot, scene, scenery, sell, skills, supply, talkwnd,
                       team, terrain)
 from app.tabs.base_tab import GROUP_AUTO, BaseTab, fit_spin
-from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, FarmTab, KeyWorker,
-                               MODE_PACKET, ScanWorker, SKILL_KEYS,
-                               TargetWorker)
+from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, LOOT_GAP, FarmTab,
+                               KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
+                               TargetWorker, loot_panel)
 
 TICK_MS = 100
 # ★ 執行紀錄（2026-09-05 使用者回報「exe 跑一跑會卡住、py 跑就正常」）：exe 沒有主控台、
@@ -252,9 +255,47 @@ TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 #     活動 NPC 的對話（eventmap），跟掛機頁巡邏點右鍵「飛過去」同一套，⛔ 不是無腦趴趴GO。
 #   · 休息期間使用者自己取消「自動刷副本」→ 掛機照跑（只停排程；要停去掛機頁關）。
 #   · 預設值＝使用者指定：連續刷 4 場、休息 2 小時、勾回去掛機；「副本設定」本身預設不勾。
-SCHED_DEFAULTS = {"rounds": 4, "rest_min": 120, "farm": True}
+#   · ★ 2026-09-06 使用者：「當進不去副本就直接當成 N 輪完成了，直接去巡邏點」——
+#     副本有鎖（一段時間只能進幾次），在入口撞了 `give_up_min` 分鐘都進不去＝這一批
+#     的額度用完了 → 當成這一批 N 場刷完，走同一條「回程補給 → 飛回掛機記錄點 →
+#     交給掛機頁 → 休息 → 再刷」。0 ＝ 一直撞（9/2 那條「無限嘗試不通知」）。
+#     ⚠ 只有勾了「副本設定」才有這條；沒勾（單純循環）照舊無限撞。
+#     ⚠ 預設 3 分鐘＝使用者 9/2 給副本裡傳點的那個數（「3 分鐘都這樣就結束」），
+#       可在「副本設定」視窗改。
+SCHED_DEFAULTS = {"rounds": 4, "rest_min": 120, "farm": True, "give_up_min": 3}
 REST_NOTE = 1.0            # 休息倒數狀態列多久刷一次
 REST_LOG = 60.0            # 休息倒數多久寫一行執行紀錄（每秒寫兩小時就是七千行）
+# ★★★ 斷線＝當成一場（使用者 2026-09-06）：
+#   「斷線不管是連線斷了還是閃退，都算完成一場，直接回程當完成。但要注意這遊戲副本
+#     斷線後會在副本出現然後倒數 5 秒自動把你傳回城鎮，所以要小心不要壞掉。
+#     你可以不管怎樣都使用天使之翼回程，這樣就不會判斷錯誤、也不需要判斷你在哪，
+#     可以直接跑補給。」
+#   偵測（每 OFFLINE_POLL 秒、跟自動回連同一套三個訊號，[[auto-reconnect]]）：
+#     · 遊戲視窗消失（閃退／被關掉）→ 立刻。
+#     · 遊戲行程冒出 #32770 原生對話框（崩潰錯誤視窗）連 OFFLINE_DIALOG_TICKS 拍 → 立刻。
+#     · 跟伺服器的 TCP 連線消失滿 OFFLINE_TCP_GRACE 秒（同 login_tab.AR_TCP_GRACE，
+#       吃下換頻／傳送那種一兩秒的瞬斷）。⚠ 斷線時記憶體照讀、數值全凍住，
+#       「讀不到」永遠不會發生（[[disconnect-behavior]]）—— 只能看 TCP。
+#   處置：這一趟算刷完（場數＋1）→ 還掉跳板／執行緒 → 等**同一個帳號**回到線上
+#   （自動回連會登回來，pid 多半換了；手動登也行）→ 接上新視窗 → 等 OFFLINE_SETTLE
+#   秒**而且**地圖連續 OFFLINE_MAP_STILL 秒沒變（吃掉那個「5 秒倒數傳回城」）→
+#   照「一趟刷完」的路走：回程補給（run_full_supply 自己會用天使之翼回城、已在城就
+#   不燒翼 —— 不必判人在哪）→ 下一場；這一批滿了 → 回掛機記錄點；沒勾循環 → 停。
+#   ⛔ 等回線**不設上限**（[[transient-failure-auto-retry]]），出口是取消勾選。
+OFFLINE_POLL = 2.0
+OFFLINE_TCP_GRACE = 30.0
+OFFLINE_DIALOG_TICKS = 2
+OFFLINE_SETTLE = 8.0
+OFFLINE_MAP_STILL = 3.0
+# ★ 重要事件紀錄（使用者 2026-09-06：「完整完成幾場、因死亡完成幾場、斷線完成幾場、
+#   什麼原因卡住等等」）：記憶體裡留 EVENTS_MAX 筆、關程式清空（跟自動回連的紀錄同規矩）。
+#   「卡住」＝同一段（同一步／撞入口／等組隊）超過 STUCK_EVENT_SECS 沒前進就記一筆
+#   （帶當時狀態列文字；一段只記一次）—— **純紀錄、不改行為**（9/2「沒有幾秒沒到就
+#   壞掉」那條還在）。
+EVENTS_MAX = 500
+STUCK_EVENT_SECS = 300.0
+EVENT_ROUND_KINDS = (("full", "完整完成"), ("death", "死亡當成完成"),
+                     ("offline", "斷線當成完成"), ("noentry", "進不去當成完成"))
 # ---------------------------------------------------------------------------
 # 打怪流程的數字 —— **從掛機頁抄一份**（使用者 2026-09-04：「複製一份幾乎一樣的
 # 不要共用」）。⛔ 不要改成 import farm_tab 的：兩邊要能各自調。
@@ -426,6 +467,16 @@ class DungeonTab(BaseTab):
         self._sched_rounds = SCHED_DEFAULTS["rounds"]
         self._sched_rest_min = SCHED_DEFAULTS["rest_min"]
         self._sched_farm = SCHED_DEFAULTS["farm"]
+        self._sched_give_up_min = SCHED_DEFAULTS["give_up_min"]
+        self._acct = ""              # 開跑那台的帳號（斷線後靠它認「同一個帳號回來了」）
+        # 副本收益（照帳號各一份；只在人在副本裡跑腳本時對帳，見 _loot_tick）
+        self._loots: dict[str, loot.Loot] = {}
+        self._loot_dlg = None
+        # 重要事件（時間, 帳號, 種類, 文字），新的在前；視窗開著時插列更新
+        self._events: list[tuple[str, str, str, str]] = []
+        self._events_dlg = None
+        self._events_tbl = None
+        self._events_head = None
         self._qb_sc = None           # 技能鍵標名字用的 Reader（跟著分身換）
         self._qb_ui = None
         self._scan = ScanWorker()
@@ -622,6 +673,23 @@ class DungeonTab(BaseTab):
         self.partner_box.currentIndexChanged.connect(self._save_settings)
         pbar.addWidget(self.partner_box)
         pbar.addStretch(1)
+        # ★ 兩顆紀錄鈕（使用者 2026-09-06）：副本收益＝只算人在副本裡跑腳本那段撿到的
+        #   東西（表跟自動掛機的「獲得物品」同一支畫）；重要事件＝幾場完整完成／死亡／
+        #   斷線／進不去當完成、停機原因、卡住。兩個視窗都是非強制回應（開著照跑）。
+        self.loot_btn = QPushButton("副本收益")
+        self.loot_btn.setToolTip(
+            "只算**人在副本裡跑腳本**那段期間背包多出來的東西（同一物品累加）；\n"
+            "趕路、補給、休息期間不記帳，所以補給買的藥水不會混進來。\n"
+            "跟自動掛機的「獲得物品」同一張表；不算金幣；關程式清空。")
+        self.loot_btn.clicked.connect(self._show_loot)
+        pbar.addWidget(self.loot_btn)
+        self.events_btn = QPushButton("重要事件")
+        self.events_btn.setToolTip(
+            "這次開程式以來自動刷副本發生的大事：每一場怎麼結束（完整／死亡／斷線／進不去）、\n"
+            "補給結果、交給掛機頁／休息、斷線回線、停機原因、同一段超過 5 分鐘沒前進。\n"
+            "上面有各帳號的場數統計；關程式清空。")
+        self.events_btn.clicked.connect(self._show_events)
+        pbar.addWidget(self.events_btn)
         root.addLayout(pbar)
 
         self.steps = QListWidget()
@@ -740,10 +808,13 @@ class DungeonTab(BaseTab):
         """按鈕的滑鼠提示＝目前的設定值（不開視窗也看得到）。"""
         h, m = divmod(max(0, int(self._sched_rest_min)), 60)
         rest = ((f"{h} 小時" if h else "") + (f" {m} 分" if m else "")).strip() or "不休息"
+        gu = max(0, int(self._sched_give_up_min))
         self.sched_btn.setToolTip(
             f"目前：連續刷 {self._sched_rounds} 場 → 休息 {rest} 再刷一次"
             + ("；全部場次結束後回自動掛機的點位開掛機" if self._sched_farm
                else "；全部場次結束後留在原地休息")
+            + (f"；在入口撞超過 {gu} 分鐘進不去＝當這一批刷完" if gu
+               else "；進不去就一直撞")
             + "\n點開改設定（連續刷 0 場＝不刷、直接回去掛機，測試用）。")
 
     def _sched_dialog(self) -> QDialog:
@@ -787,6 +858,21 @@ class DungeonTab(BaseTab):
             "活動地圖（暴走穗海農場那種）走活動 NPC 的對話進場，不是無腦趴趴GO。")
         dlg._farm.setChecked(bool(self._sched_farm))
         v.addWidget(dlg._farm)
+        # ★ 進不去副本（使用者 2026-09-06）：撞這麼久都沒進去＝這一批的額度用完了
+        r3 = QHBoxLayout()
+        r3.addWidget(QLabel("在入口撞超過"))
+        dlg._give_up = QSpinBox()
+        dlg._give_up.setRange(0, 999)
+        dlg._give_up.setValue(max(0, int(self._sched_give_up_min)))
+        dlg._give_up.setToolTip(
+            "站在入口上每 5 秒送一次進入封包，連續這麼多分鐘都沒進去 → 當成副本鎖住了：\n"
+            "這一批 N 場直接算刷完，走同一條路回程補給、飛回掛機記錄點交給掛機、休息後再試。\n"
+            "0 ＝ 一直撞、永遠不放棄。")
+        fit_spin(dlg._give_up)
+        r3.addWidget(dlg._give_up)
+        r3.addWidget(QLabel("分鐘還進不去 → 當這一批刷完（0＝一直撞）"))
+        r3.addStretch(1)
+        v.addLayout(r3)
         btns = QHBoxLayout()
         btns.addStretch(1)
         ok = QPushButton("確定")
@@ -810,6 +896,7 @@ class DungeonTab(BaseTab):
         self._sched_rounds = int(dlg._rounds.value())
         self._sched_rest_min = int(dlg._hours.value()) * 60 + int(dlg._mins.value())
         self._sched_farm = bool(dlg._farm.isChecked())
+        self._sched_give_up_min = int(dlg._give_up.value())
         self._sched_tip()
         self._save_settings()
 
@@ -838,6 +925,7 @@ class DungeonTab(BaseTab):
         config.set(self._key("sched_rounds"), int(self._sched_rounds))
         config.set(self._key("sched_rest_min"), int(self._sched_rest_min))
         config.set(self._key("sched_farm"), bool(self._sched_farm))
+        config.set(self._key("sched_give_up_min"), int(self._sched_give_up_min))
         config.set(self._key("party"), self.party_box.currentData() or "none")
         config.set(self._key("partner"),
                    self.partner_box.currentText().split("（")[-1].rstrip("）")
@@ -865,6 +953,8 @@ class DungeonTab(BaseTab):
                                                  SCHED_DEFAULTS["rest_min"])
             self._sched_farm = bool(config.get(self._key("sched_farm"),
                                                SCHED_DEFAULTS["farm"]))
+            self._sched_give_up_min = self._cfg_int(self._key("sched_give_up_min"),
+                                                    SCHED_DEFAULTS["give_up_min"])
             self.sched_cb.setChecked(bool(config.get(self._key("sched_on"), False)))
             # 值沒變 toggled 不會發 → 按鈕灰不灰、提示文字要自己對一次
             self._on_sched_toggled(self.sched_cb.isChecked())
@@ -1114,8 +1204,26 @@ class DungeonTab(BaseTab):
         self._poke_t = 0.0           # 還有多久對傳點補送一次互動
         # "fly"＝趴趴GO去入口那張圖、"enter"＝撞入口、"run"＝跑腳本
         self._phase = "run"
-        self._enter_t = 0.0          # 撞入口撞多久了
+        self._enter_t = 0.0          # 撞入口撞多久了（含走過去的路）
+        self._poke_total = 0.0       # **站在入口上**打封包打多久了（「進不去」看這個）
         self._fly = None             # 要飛去哪個傳送點（jumpmap.Entry）
+        # ---- 斷線＝當成一場（見 OFFLINE_POLL 的說明）----
+        self._offline_poll = 0.0     # 多久沒查斷線了
+        self._tcp_lost_s = 0.0       # TCP 連線連續不見幾秒了（寬限用）
+        self._dialog_hits = 0        # 連續幾拍看到崩潰對話框
+        self._offline_why = ""       # 斷線原因（狀態列／紀錄）
+        self._offline_next = "round" # 回線後接哪條：round＝這趟刷完那條、presupply＝休息完再刷
+        self._offline_t = 0.0        # 等回線等多久了
+        self._off_poll = 0.0
+        self._off_world_t = None     # 回線後第一次讀到場景的時刻（_offline_t）
+        self._off_map = None         # 回線後看到的地圖（連續沒變才動）
+        self._off_map_t = 0.0
+        # ---- 副本收益／卡住偵測（純紀錄）----
+        self._loot_live = False      # 上一拍有沒有在對帳（False→True 要先 rebase）
+        self._loot_t = 0.0
+        self._stuck_key = None       # 現在在哪一段 (cycle, phase, 第幾步)
+        self._stuck_t = 0.0          # 這一段停了多久
+        self._stuck_noted = False    # 這一段記過「卡住」了
         self._fly_t = 0.0            # 還有多久重送一次趴趴GO
         self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
         self._enter_acted = None     # 入口對話「已經動過」的那一頁（防重複送）
@@ -1186,6 +1294,7 @@ class DungeonTab(BaseTab):
                 return
             self._started = True
             self._runlog_open()
+            self._event("info", f"開跑「{script.name}」：副本設定 0 場 → 直接回去掛機（測試）")
             self._end_batch()
             return
         self._launch(int(pid), sc, script)
@@ -1269,6 +1378,7 @@ class DungeonTab(BaseTab):
             self._refresh_steps()
             self._started = True
             self._runlog_open()
+            self._event("info", f"休息結束 → 停掛機 → 先回程補給一趟再去刷「{script.name}」")
             self._start_supply_trip(
                 note=f"「{script.name}」：休息完 → 先回程補給一趟（免得藥水不足死掉），"
                      f"再去副本")
@@ -1282,6 +1392,10 @@ class DungeonTab(BaseTab):
         self._refresh_steps()
         self._started = True
         self._runlog_open()
+        self._event("info", f"開跑「{script.name}」（從第 {self._i + 1} 步"
+                            f"，{'循環' if self._loop else '只打一場'}"
+                            + (f"，副本設定 {self._sched['rounds']} 場" if self._sched else "")
+                            + f"，{ {'fly': '先飛去入口那張圖', 'enter': '先撞入口'}.get(phase, '人已在副本裡') }）")
         if phase == "fly":
             self.status.setText(
                 f"「{script.name}」：先用趴趴GO飛去「{fly.name}」，"
@@ -1307,6 +1421,9 @@ class DungeonTab(BaseTab):
         self._pid, self._sc, self._script = pid, sc, script
         self._reset_run()
         self._rounds = rounds            # 趟數跨批次累計（只拿來顯示）
+        # 帳號：斷線後靠它認「同一個帳號回來了」（標題讀不到就退回下拉選的那個）
+        self._acct = (charname.account_from_title(self._titles.get(pid, ""))
+                      or self._account())
         self._atk = TargetWorker(sc)
         self._atk.died.connect(self._on_died)
         self._atk.packets = True
@@ -1365,6 +1482,10 @@ class DungeonTab(BaseTab):
         # ★ 休息期間交給掛機頁了 → 掛機**照跑**（使用者 2026-09-05 選的：只停排程）
         farm_on = self._rest_farm
         self._sched_reset()
+        self._cycle = "go"               # 等回線／休息那類外圈狀態一併收掉
+        if started and why:
+            # 開跑之後的每一次停機都進重要事件（出問題的標「停機」，自己按的標一般）
+            self._event("stop" if why[:1] in PROBLEM_MARKS else "info", f"停止：{why}")
         self._runlog_close(why)
         if why and not quiet:
             if farm_on:
@@ -1500,6 +1621,18 @@ class DungeonTab(BaseTab):
         if self._cycle == "rest":
             self._rest_tick(dt)
             return
+        # ⓪-000 斷線了 → 等同一個帳號回到線上（不掃描、不讀不寫；見 OFFLINE_POLL）
+        if self._cycle == "offline":
+            self._offline_tick(dt)
+            return
+        # ⓪-0000 斷線／閃退偵測：一定要在最前面 —— 閃退之後底下每一段都在讀一個
+        #   不存在的行程（掛機頁 _check_game_gone 同一個理由），斷線則是數值全凍住、
+        #   打怪／走路永遠「沒進展」。
+        if self._check_offline(dt):
+            return
+        # 純紀錄：同一段停太久記一筆「卡住」；副本收益只在副本裡對帳
+        self._stuck_watch(dt)
+        self._loot_tick(dt)
         sc = self._sc
 
         # 掃描節奏：有怪要快、趕路可以慢
@@ -1650,6 +1783,15 @@ class DungeonTab(BaseTab):
             return
         # ★ 已經站在入口上 → **一直打進傳送點封包**（不是站著等）
         self._nav.reset()
+        # ★★ 進不去副本（使用者 2026-09-06）：站在入口上撞了這麼久都沒進去＝副本鎖住了
+        #   → 當成這一批 N 場刷完，走「回程補給 → 飛回掛機記錄點 → 交給掛機 → 休息」。
+        #   ⚠ 只有勾了副本設定才有（沒勾照舊無限撞）；只算**站在入口上**的時間，
+        #     走過去的路不算。
+        self._poke_total += dt
+        give_up = float((self._sched or {}).get("give_up", 0.0) or 0.0)
+        if give_up > 0 and self._poke_total >= give_up:
+            self._on_no_entry()
+            return
         # ★ 沒真的站上去就直走踩上去（同副本裡傳點那條：入口那格常是牆，A* 停在旁邊）。
         if _d((gx, gy), me) > PORTAL_ON:
             self._walk_onto(gx, gy)
@@ -1773,6 +1915,7 @@ class DungeonTab(BaseTab):
             elif here == ent.get("scene"):
                 self._phase = "enter"
                 self._enter_t = 0.0
+                self._poke_total = 0.0
                 self._poke_t = 0.0
                 self._notify(f"飛到「{scene.scene_name(here)}」→ 去撞入口")
             else:
@@ -2906,9 +3049,11 @@ class DungeonTab(BaseTab):
         if self._empty_since >= CLEAR_SETTLE:
             self._done = True
             if not self._loop:
+                self._event("full", "第 1 趟：完整完成（腳本跑完、周圍沒怪；沒勾循環）")
                 self._stop("✔ 這一趟結束：腳本跑完，周圍也沒有怪了")
                 return
             self._rounds += 1
+            self._event("full", f"第 {self._rounds} 趟：完整完成（腳本跑完、周圍沒怪）")
             # ★ 副本設定：這一批刷夠場數 → 最後一趟的補給改飛回掛機記錄點／進休息
             if self._sched is not None:
                 self._batch_done += 1
@@ -2922,6 +3067,9 @@ class DungeonTab(BaseTab):
         """外圈這一拍有事做就回 True（呼叫端整拍不跑內圈）。"""
         if self._cycle == "rest":
             self._rest_tick(dt)
+            return True
+        if self._cycle == "offline":
+            self._offline_tick(dt)
             return True
         if self._cycle == "revive":
             self._revive_tick(dt)
@@ -3008,6 +3156,8 @@ class DungeonTab(BaseTab):
             return
         ok, why = res
         self._notify(("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
+        self._event("info" if ok else "warn",
+                    ("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
         self._supply_result = None
         if self._batch_end:
             # ★ 副本設定：這一批刷完的那趟補給 → 進休息（不飛回入口）
@@ -3041,6 +3191,7 @@ class DungeonTab(BaseTab):
             else:
                 self._phase = "enter"
                 self._enter_t = 0.0
+                self._poke_total = 0.0
                 self._poke_t = 0.0
         else:
             self._phase = "run"
@@ -3134,7 +3285,8 @@ class DungeonTab(BaseTab):
             return
         self._sched = {"rounds": max(0, int(self._sched_rounds)),
                        "rest": max(0, int(self._sched_rest_min)) * 60.0,
-                       "farm": bool(self._sched_farm)}
+                       "farm": bool(self._sched_farm),
+                       "give_up": max(0, int(self._sched_give_up_min)) * 60.0}
 
     def _end_batch(self) -> None:
         """這一批刷夠場數了（或「0 場」的測試路）→ 最後一趟回程補給：勾了「回去掛機」
@@ -3188,6 +3340,7 @@ class DungeonTab(BaseTab):
                 f"{self._fmt_secs(self._rest_left)} 再刷{note}")
         self.status.setText(text)
         self._runlog_write(f"★ {text}", force=True)
+        self._event("info", text)
 
     def _rest_tick(self, dt: float) -> None:
         self._rest_left -= dt
@@ -3207,7 +3360,12 @@ class DungeonTab(BaseTab):
             self._runlog_write(text, force=True)
 
     def _resume_batch(self) -> None:
-        """休息結束（或沒設休息）→ 停掛機、重新接手、再刷一批。"""
+        """休息結束（或沒設休息）→ 停掛機、重新接手、再刷一批。
+
+        ★ 休息期間分身可能斷線重登過（pid 換了）、或現在根本不在線上 —— 接手前先照帳號
+          找一次視窗：換了 pid 就接新的；不在線上就進「等回線」，回來再先補給。
+          ⚠ 以前直接拿休息前的 pid/scanner 開跑，重登過就是對著一個死掉的行程裝跳板。
+        """
         self._teardown()
         if self._rest_farm:
             ok, why = self._set_farming(False)
@@ -3215,6 +3373,14 @@ class DungeonTab(BaseTab):
             if not ok:
                 self._notify(f"⚠ 停掛機：{why}")
         self._notify("副本設定：休息結束 → 先回程補給一趟，再去刷下一批")
+        w = self._find_client()
+        sc = self._adopt_client(w) if w is not None else None
+        if sc is None:
+            self._event("info", "休息結束，但分身不在線上（斷線／重登中？）→ 等回線再先補給再刷")
+            self._offline_why = "休息結束時分身不在線上"
+            self._offline_next = "presupply"
+            self._offline_begin()
+            return
         self._launch(self._pid, self._sc, self._script, presupply=True)
 
     def _farm_tab(self):
@@ -3412,10 +3578,15 @@ class DungeonTab(BaseTab):
         self._cycle = "revive"
         last = (self._sched is not None
                 and self._batch_done >= self._sched["rounds"])
-        self._notify(f"☠ 死了 —— 當成第 {self._rounds} 趟刷完 → 復活回城 → 回程補給 → "
-                     + ("這一批滿了，回去掛機" if last and self._sched["farm"] else
-                        "這一批滿了，進休息" if last else
-                        "下一場" if self._loop else "停止"))
+        nxt = ("這一批滿了，回去掛機" if last and self._sched["farm"] else
+               "這一批滿了，進休息" if last else
+               "下一場" if self._loop else "停止")
+        self._event("death", f"第 {self._rounds} 趟：死亡當成完成（第 {self._i + 1} 步）"
+                             f"→ 復活回城 → 回程補給 → {nxt}")
+        text = f"☠ 死了 —— 當成第 {self._rounds} 趟刷完 → 復活回城 → 回程補給 → {nxt}"
+        self._notify(text)
+        # ★ 使用者 2026-09-06：「死亡跟無法進入副本那些的還是要通知」—— 流程照走，但要響。
+        self.notify(text)
 
     def _revive_tick(self, dt: float) -> None:
         """復活段：死亡滿 REVIVE_AFTER 秒送「回標記點」→ 活過來（順手關死亡視窗）→
@@ -3482,6 +3653,463 @@ class DungeonTab(BaseTab):
             self._end_batch()
             return
         self._start_supply_trip()
+
+    # -- 斷線＝當成一場（見 OFFLINE_POLL 的說明）--------------------------------
+    def _check_offline(self, dt: float) -> bool:
+        """這一台斷線／閃退了嗎？是就記一場、進「等回線」，回 True＝這一拍到此為止。"""
+        self._offline_poll += dt
+        if self._offline_poll < OFFLINE_POLL:
+            return False
+        elapsed, self._offline_poll = self._offline_poll, 0.0
+        why = self._offline_reason(elapsed)
+        if why is None:
+            return False
+        self._on_offline(why)
+        return True
+
+    def _offline_reason(self, elapsed: float = OFFLINE_POLL) -> str | None:
+        """三個訊號任一成立就回原因；None＝還連著。
+
+        · 視窗／行程沒了：`alive()` 只有**明確問到已結束**才回 False（查詢失敗回 True）。
+        · 崩潰對話框：遊戲 UI 全是 DirectX 畫的，行程冒出 #32770 原生視窗＝崩潰處理器
+          彈的錯誤（[[auto-reconnect]]，五台在線零誤報）；連兩拍才算。
+        · TCP：`established_pids()` 查不到任何連線＝API 出錯，當還連著（寧可漏報）；
+          這台的連線不見要滿 OFFLINE_TCP_GRACE 秒（換頻／傳送的瞬斷實測一兩秒）。
+        """
+        sc, pid = self._sc, self._pid
+        try:
+            if not sc.alive():
+                return "遊戲視窗消失（閃退／被關閉）"
+        except Exception:                                # noqa: BLE001
+            pass                                         # 問不到＝還活著
+        try:
+            boxes = list(win.crash_dialogs({pid})) if pid is not None else []
+        except Exception:                                # noqa: BLE001
+            boxes = []
+        if boxes:
+            self._dialog_hits += 1
+            if self._dialog_hits >= OFFLINE_DIALOG_TICKS:
+                return f"崩潰（錯誤視窗「{boxes[0].title}」）"
+        else:
+            self._dialog_hits = 0
+        try:
+            est = netstat.established_pids()
+        except Exception:                                # noqa: BLE001
+            est = set()
+        if not est or pid in est:
+            self._tcp_lost_s = 0.0
+            return None
+        # 用心跳累加（不用 monotonic）：跟其他倒數同一個時鐘，離線測試也控得住
+        self._tcp_lost_s += elapsed
+        if self._tcp_lost_s >= OFFLINE_TCP_GRACE:
+            return f"連線中斷（跟伺服器的連線消失超過 {OFFLINE_TCP_GRACE:.0f} 秒）"
+        return None
+
+    def _on_offline(self, why: str) -> None:
+        """斷線／閃退＝**當成一場刷完**（使用者 2026-09-06）。不管人當時在哪一段
+        （副本裡、趕路、補給、復活中）都算 —— 使用者原話「不管是連線斷了還是閃退都算
+        完成一場，直接回程當完成」。之後：還掉跳板 → 等同一個帳號回線 → 回程補給那條路。
+        ★ 要通知（使用者同日：「死亡跟無法進入副本那些的還是要通知」—— 斷線同一類）；
+          流程照走，登入由自動回連處理。"""
+        self._rounds += 1
+        if self._sched is not None:
+            self._batch_done += 1
+        where = {"go": {"fly": "趴趴GO去入口途中", "enter": "撞入口時",
+                        "run": f"副本裡第 {self._i + 1} 步"}.get(self._phase, self._phase),
+                 "supply": "補給途中", "back": "飛回入口途中", "team": "組隊時",
+                 "revive": "復活途中"}.get(self._cycle, self._cycle)
+        self._event("offline", f"第 {self._rounds} 趟：斷線當成完成（{where}）—— {why}")
+        self._teardown()
+        self.notify(f"⚠ 斷線（{why}，{where}）—— 當成第 {self._rounds} 趟刷完"
+                    + ("，等回線後回程補給繼續" if self._loop else "，沒勾循環 → 停止"))
+        if not self._loop:
+            self._stop(f"✔ 第 {self._rounds} 趟結束（斷線當成刷完：{why}）—— 沒勾循環，停止")
+            return
+        self._offline_why = why
+        self._offline_next = "round"
+        self._offline_begin()
+
+    def _offline_begin(self) -> None:
+        self._cycle = "offline"
+        self._offline_t = 0.0
+        self._off_poll = OFFLINE_POLL            # 第一拍就查
+        self._off_world_t = None
+        self._off_map = None
+        self._off_map_t = 0.0
+        text = (f"斷線（{self._offline_why}）→ 等「{self._acct}」回到線上…"
+                "（自動回連會登回來；回線後先回程補給）")
+        self.status.setText(text)
+        self._runlog_write(f"★ {text}", force=True)
+
+    def _offline_tick(self, dt: float) -> None:
+        """等回線：每 OFFLINE_POLL 秒照帳號找一次視窗 → 接上 → 等站穩 → 接回流程。
+
+        ★★ 「站穩」＝回線後讀得到場景起算滿 OFFLINE_SETTLE 秒、**而且**地圖連續
+          OFFLINE_MAP_STILL 秒沒變 —— 使用者 2026-09-06 提醒：副本斷線重登會先出現在
+          副本裡、倒數 5 秒被傳回城；在那 5 秒內動手，換圖就把補給／走路整組打斷。
+        """
+        self._offline_t += dt
+        self._off_poll += dt
+        if self._off_poll < OFFLINE_POLL:
+            return
+        self._off_poll = 0.0
+        mins = self._offline_t / 60.0
+        w = self._find_client()
+        if w is None:
+            self._off_world_t = None
+            self._say(f"斷線（{self._offline_why}）→ 等「{self._acct}」回到線上…"
+                      f"（已等 {mins:.1f} 分鐘）")
+            return
+        sc = self._adopt_client(w)
+        if sc is None:
+            self._say(f"「{self._acct}」回來了（pid {w.pid}）但接不上（開不了記憶體），再試…")
+            return
+        try:
+            here = scene.map_key(scene.current_id(sc))
+        except Exception:                                # noqa: BLE001
+            here = None
+        if here is None:
+            self._off_world_t = None
+            self._say(f"「{self._acct}」回到線上了 → 等進到世界（讀得到場景）…")
+            return
+        now = self._offline_t
+        if self._off_world_t is None:
+            self._off_world_t = now
+            self._off_map, self._off_map_t = here, now
+        elif here != self._off_map:
+            self._off_map, self._off_map_t = here, now
+        waited, still = now - self._off_world_t, now - self._off_map_t
+        if waited < OFFLINE_SETTLE or still < OFFLINE_MAP_STILL:
+            left = max(OFFLINE_SETTLE - waited, OFFLINE_MAP_STILL - still)
+            self._say(f"回線了（{scene.scene_name(here)}）→ 等 {left:.0f} 秒站穩"
+                      "（斷線重登會倒數 5 秒被傳回城，先讓它傳完）…")
+            return
+        self._after_reconnect(w, sc, here)
+
+    def _find_client(self):
+        """同一個帳號、已登入（標題有帳號）、而且跟伺服器**連著**的那個視窗；沒有回 None。
+        ⚠ 登入畫面的視窗標題沒有帳號（charname.account_from_title 回空字串），
+          自動回連重登的過程不會被誤認成回來了。"""
+        acct = self._acct
+        if not acct:
+            return None
+        try:
+            wins = preload.windows()
+        except Exception:                                # noqa: BLE001
+            return None
+        try:
+            est = netstat.established_pids()
+        except Exception:                                # noqa: BLE001
+            est = set()
+        for w in wins:
+            if charname.account_from_title(w.title) != acct:
+                continue
+            if est and w.pid not in est:
+                continue
+            return w
+        return None
+
+    def _adopt_client(self, w):
+        """接上這個視窗：pid 沒變就沿用 scanner；換了就開新的、收掉舊的、把下拉那一項
+        的 pid 換掉（⛔ 不重建下拉：重建會觸發「換了分身」把整趟停掉）。回 scanner，
+        開不了回 None。"""
+        old = self._pid
+        if w.pid == old and self._sc is not None:
+            sc = self._sc                                # 同一個行程回來了（手動重登）
+        else:
+            sc = self._scanners.get(w.pid)
+            if sc is None:
+                sc = MemoryScanner()
+                try:
+                    sc.open(w.pid)
+                except Exception:                        # noqa: BLE001
+                    return None
+                try:
+                    locate.warm(sc)
+                except Exception:                        # noqa: BLE001
+                    pass
+                self._scanners[w.pid] = sc
+        if old is not None and old != w.pid:
+            osc = self._scanners.pop(old, None)
+            if osc is not None and osc is not sc:
+                try:
+                    osc.close()
+                except Exception:                        # noqa: BLE001
+                    pass
+            self._hwnds.pop(old, None)
+            self._titles.pop(old, None)
+            try:
+                preload.forget(old)
+            except Exception:                            # noqa: BLE001
+                pass
+            for i in range(self.who.count()):
+                if self.who.itemData(i) == old:
+                    self.who.setItemData(i, w.pid)
+                    break
+            for i in range(self.partner_box.count()):
+                if self.partner_box.itemData(i) == old:
+                    self.partner_box.setItemData(i, w.pid)
+                    break
+        self._pid, self._sc = w.pid, sc
+        self._hwnds[w.pid] = w.hwnd
+        self._titles[w.pid] = w.title
+        return sc
+
+    def _after_reconnect(self, w, sc, here) -> None:
+        """回線站穩了 → 重新裝跳板／執行緒 → 照斷線前記的下一步走。"""
+        loop, party, nxt = self._loop, self._party, self._offline_next
+        if not self._attach(w.pid, sc, self._script):
+            return                                       # 已經 _stop 了
+        self._started = True
+        self._loop, self._party = loop, party
+        self._map_key = here
+        self._reattach_partner()
+        self._event("info", f"回到線上（pid {w.pid}，{scene.scene_name(here)}）→ 回程補給")
+        if nxt == "presupply":
+            self._start_supply_trip(
+                note=f"「{self._script.name}」：回線了 → 先回程補給一趟再去副本")
+            return
+        if self._sched is not None and self._batch_done >= self._sched["rounds"]:
+            self._end_batch()
+            return
+        self._start_supply_trip()
+
+    def _reattach_partner(self) -> None:
+        """綁定分身也可能跟著斷線重登（pid 換了）：照帳號重找、重裝跳板；
+        找不到就這之後不組隊（大聲講，不猜）。"""
+        if self._party != "bind":
+            return
+        txt = self.partner_box.currentText() or ""
+        acct = txt[txt.rindex("（") + 1:-1] if "（" in txt and txt.endswith("）") else ""
+        pw = None
+        try:
+            est = netstat.established_pids()
+            for cand in preload.windows():
+                if (acct and charname.account_from_title(cand.title) == acct
+                        and (not est or cand.pid in est)):
+                    pw = cand
+                    break
+        except Exception:                                # noqa: BLE001
+            pw = None
+        if pw is None or pw.pid == self._pid:
+            self._party = "none"
+            self._event("warn", f"⚠ 綁定分身「{acct}」不在線上 → 這之後不組隊")
+            self._notify(f"⚠ 綁定分身「{acct}」不在線上 → 這之後不組隊")
+            return
+        psc = self._scanners.get(pw.pid)
+        if psc is None:
+            psc = MemoryScanner()
+            try:
+                psc.open(pw.pid)
+                locate.warm(psc)
+            except Exception:                            # noqa: BLE001
+                self._party = "none"
+                self._event("warn", f"⚠ 綁定分身「{acct}」接不上 → 這之後不組隊")
+                return
+            self._scanners[pw.pid] = psc
+        try:
+            self._pmover = move.acquire(pw.pid, injector.process_path(pw.pid), self)
+        except Exception as exc:                         # noqa: BLE001
+            self._party = "none"
+            self._event("warn", f"⚠ 綁定分身裝不了跳板：{exc} → 這之後不組隊")
+            return
+        self._ppid, self._psc = pw.pid, psc
+        self._partner_name = txt.split("（")[0].strip()
+
+    # -- 進不去副本＝當這一批刷完（見 SCHED_DEFAULTS 的 give_up_min）-----------------
+    def _on_no_entry(self) -> None:
+        sch = self._sched
+        mins = self._poke_total / 60.0
+        self._batch_done = sch["rounds"]
+        text = (f"在入口撞了 {mins:.0f} 分鐘都進不去（副本鎖住？）→ 當成這一批 "
+                f"{sch['rounds']} 場刷完 → 回程補給"
+                + ("、飛回掛機記錄點交給掛機" if sch["farm"] else "")
+                + f"、休息 {self._fmt_secs(sch['rest'])} 再試")
+        self._event("noentry", text)
+        self._notify(f"⚠ {text}")
+        self.notify(f"⚠ {text}")          # 使用者 2026-09-06：無法進入副本要通知
+        self._end_batch()
+
+    # -- 卡住偵測（純紀錄，不改行為）---------------------------------------------
+    def _stuck_watch(self, dt: float) -> None:
+        """同一段（同一步／撞入口／飛／等組隊）超過 STUCK_EVENT_SECS 沒前進 → 記一筆。
+        補給／飛回入口／復活／休息不算（各有自己的收尾）。"""
+        if self._cycle == "go":
+            key = ("go", self._phase, self._i if self._phase == "run" else -1)
+        elif self._cycle == "team":
+            key = ("team", self._team_sub, -1)
+        else:
+            key = None
+        if key != self._stuck_key:
+            self._stuck_key, self._stuck_t, self._stuck_noted = key, 0.0, False
+            return
+        if key is None or self._stuck_noted:
+            return
+        self._stuck_t += dt
+        if self._stuck_t < STUCK_EVENT_SECS:
+            return
+        self._stuck_noted = True
+        if key[0] == "team":
+            where = f"等組隊（{self._team_sub}）"
+        elif self._phase == "fly":
+            where = "趴趴GO去入口那張圖"
+        elif self._phase == "enter":
+            where = "撞入口"
+        else:
+            step = (self._script.steps[self._i]
+                    if self._script and self._i < len(self._script.steps) else None)
+            where = (f"第 {self._i + 1} 步 {dungeon.describe(step)}" if step
+                     else "腳本跑完等周圍沒怪")
+        self._event("stuck", f"卡住：{where} 超過 {STUCK_EVENT_SECS / 60:.0f} 分鐘沒前進"
+                             f" —— {self.status.text()[:140]}")
+
+    # -- 副本收益（只在人在副本裡跑腳本時對帳；表跟掛機頁同一支）-------------------
+    def _loot_for(self, acct: str | None = None) -> loot.Loot:
+        acct = acct or self._acct or self._account()
+        lt = self._loots.get(acct)
+        if lt is None:
+            lt = self._loots[acct] = loot.Loot()
+        return lt
+
+    def _loot_tick(self, dt: float) -> None:
+        """每 LOOT_GAP 秒對帳一次背包 —— **只在 cycle=go、phase=run**（人在副本裡跑腳本）。
+        離開那段（補給／趕路／復活）不對帳；回來時先 `rebase()` 丟掉舊基準，補給買的
+        東西才不會被算成「剛獲得」。讀不到整拍作廢（loot.py 自己擋）；對帳出錯不影響流程。"""
+        live = self._cycle == "go" and self._phase == "run" and self._sc is not None
+        if not live:
+            self._loot_live = False
+            return
+        lt = self._loot_for()
+        if not self._loot_live:
+            self._loot_live = True
+            lt.rebase()
+            self._loot_t = LOOT_GAP              # 進來第一拍就建基準
+        self._loot_t += dt
+        if self._loot_t < LOOT_GAP:
+            return
+        self._loot_t = 0.0
+        try:
+            lt.update(self._sc, self._acct or None)
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _reset_loot(self, lt: loot.Loot) -> None:
+        """「重新計算」：歸零；正在副本裡就當場重建基準（掛機頁同一個理由）。"""
+        lt.reset()
+        if self._loot_live and self._sc is not None:
+            try:
+                lt.update(self._sc, self._acct or None)
+            except Exception:                            # noqa: BLE001
+                pass
+            self._loot_t = 0.0
+
+    def _show_loot(self) -> None:
+        """「副本收益」鈕：非強制回應的視窗（開著照跑），開的當下畫一次。"""
+        if self._loot_dlg is not None and self._loot_dlg.isVisible():
+            self._loot_dlg.raise_()
+            self._loot_dlg.activateWindow()
+            return
+        acct = self._acct or self._account()
+        lt = self._loot_for(acct)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"副本收益 — {self.who.currentText() or acct}")
+        v = QVBoxLayout(dlg)
+        panel = loot_panel(dlg, lt, lambda: self._reset_loot(lt),
+                           note="（只算人在副本裡跑腳本的時候）")
+        v.addWidget(panel)
+        dlg.resize(640, 460)
+        dlg._panel = panel
+        self._loot_dlg = dlg
+        dlg.show()
+
+    # -- 重要事件（記憶體裡 EVENTS_MAX 筆、關程式清空）--------------------------------
+    def _event(self, kind: str, text: str) -> None:
+        """記一筆：時間／帳號／種類／文字。視窗開著時**插一列**（qt-ui-pitfalls 5d：
+        追加式紀錄表不整張重畫）。同一行也寫進執行紀錄檔（不節流）。"""
+        row = (time.strftime("%m/%d %H:%M:%S"), self._acct or self._account(), kind, text)
+        self._events.insert(0, row)
+        del self._events[EVENTS_MAX:]
+        self._runlog_write(f"◆ {text}", force=True)
+        tbl = self._events_tbl
+        if tbl is not None and self._events_dlg is not None and self._events_dlg.isVisible():
+            try:
+                tbl.insertRow(0)
+                for c, cell in enumerate(self._event_cells(row)):
+                    tbl.setItem(0, c, QTableWidgetItem(cell))
+                while tbl.rowCount() > EVENTS_MAX:
+                    tbl.removeRow(tbl.rowCount() - 1)
+                if self._events_head is not None:
+                    self._events_head.setText(self._events_summary())
+            except RuntimeError:                         # 視窗已被刪掉
+                self._events_tbl = self._events_dlg = self._events_head = None
+
+    @staticmethod
+    def _event_cells(row) -> tuple[str, str, str]:
+        ts, acct, _kind, text = row
+        return ts, acct, text
+
+    def _events_summary(self) -> str:
+        """各帳號的場數統計：完整完成／死亡當成完成／斷線當成完成／進不去當成完成，
+        另加停機幾次、卡住幾次。"""
+        per: dict[str, dict[str, int]] = {}
+        for _ts, acct, kind, _text in self._events:
+            per.setdefault(acct, {})
+            per[acct][kind] = per[acct].get(kind, 0) + 1
+        if not per:
+            return "還沒有事件 —— 開跑之後每一場怎麼結束、停機原因、卡住都會記在這裡。"
+        lines = []
+        for acct, cnt in per.items():
+            parts = [f"{label} {cnt.get(k, 0)} 場" for k, label in EVENT_ROUND_KINDS]
+            extra = []
+            if cnt.get("stop"):
+                extra.append(f"停機 {cnt['stop']} 次")
+            if cnt.get("stuck"):
+                extra.append(f"卡住 {cnt['stuck']} 次")
+            lines.append(f"{acct}：" + "／".join(parts)
+                         + (f"（{'、'.join(extra)}）" if extra else ""))
+        return "\n".join(lines)
+
+    def _show_events(self) -> None:
+        """「重要事件」鈕：開（或叫回）事件視窗。非強制回應，開著照跑、有新事件就插列。"""
+        if self._events_dlg is not None and self._events_dlg.isVisible():
+            self._events_dlg.raise_()
+            self._events_dlg.activateWindow()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("自動刷副本 — 重要事件")
+        dlg.resize(760, 420)
+        lay = QVBoxLayout(dlg)
+        head = QLabel(self._events_summary())
+        head.setWordWrap(True)
+        head.setStyleSheet("font-weight: bold;")
+        lay.addWidget(head)
+        hint = QLabel(f"從程式開啟以來的事件，最新的在最上面"
+                      f"（最多保留 {EVENTS_MAX} 筆，關閉程式就清空）。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.TEXT_MUT};")
+        lay.addWidget(hint)
+        tbl = QTableWidget(0, 3)
+        tbl.setHorizontalHeaderLabels(["時間", "帳號", "事件"])
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.NoSelection)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setAlternatingRowColors(True)
+        tbl.setWordWrap(False)
+        hh = tbl.horizontalHeader()
+        # ⚠ 不開 ResizeToContents（qt-ui-pitfalls 5d）：前兩欄照字寬釘一次，「事件」吃剩下的。
+        fm = tbl.fontMetrics()
+        hh.setSectionResizeMode(QHeaderView.Stretch)
+        for col, sample in ((0, "00/00 00:00:00"), (1, "w" * 14)):
+            hh.setSectionResizeMode(col, QHeaderView.Fixed)
+            hh.resizeSection(col, fm.horizontalAdvance(sample) + 24)
+        tbl.setRowCount(len(self._events))
+        for r, row in enumerate(self._events):
+            for c, cell in enumerate(self._event_cells(row)):
+                tbl.setItem(r, c, QTableWidgetItem(cell))
+        lay.addWidget(tbl, 1)
+        self._events_dlg, self._events_tbl, self._events_head = dlg, tbl, head
+        dlg._tbl, dlg._head = tbl, head
+        dlg.show()
 
     # -- 通知（跟自動掛機那一頁同一套、同一份設定）-----------------------
     def notify(self, msg: str) -> None:

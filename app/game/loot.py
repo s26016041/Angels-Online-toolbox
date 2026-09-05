@@ -77,6 +77,17 @@ class Loot:
             self._pending: dict[int, int] = {}         # 買來的待扣帳
             self._who: str | None = None               # 上一拍是哪隻角色
 
+    def rebase(self) -> None:
+        """丟掉基準、**累計保留** —— 下一拍只重建基準、不算收穫。
+
+        ★ 給「只在某段期間記帳」的用法（自動刷副本的「副本收益」：只算人在副本裡
+          跑腳本那段，補給／趕路期間不對帳）。暫停期間背包一定變了（補給買了兩百瓶
+          藥水），恢復對帳時拿暫停前的舊基準去比，整袋買來的東西會被算成「剛獲得」——
+          所以恢復前先把基準丟掉，第一拍只建基準。⚠ 不是 reset()：累計要留著。
+        """
+        with self._lock:
+            self._prev = None
+
     def rows(self) -> list[tuple[int, int, int, float]]:
         """[(種類id, 累計數量, 圖示編號, 最後獲得時間)]，**新的在上面**。
 

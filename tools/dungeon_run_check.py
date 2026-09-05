@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import time
+import types
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +37,50 @@ from app.tabs import dungeon_tab as dt                    # noqa: E402
 
 PASS = FAIL = 0
 TICK = dt.TICK_MS / 1000.0
+
+# ★ 斷線偵測（2026-09-06）：分頁每 2 秒查一次 TCP 表／崩潰對話框／視窗清單 —— 真的表裡
+#   當然沒有假 pid，不假掉的話每個跑超過 30 秒的測試都會被判成「斷線」。各測試改 NET。
+#   視窗標題照真的格式「Angels Online Global - 帳號(分流)」，account_from_title 用真的。
+NET = {"est": {1}, "wins": [], "dialogs": []}
+dt.netstat.established_pids = lambda: set(NET["est"])
+dt.win.crash_dialogs = lambda pids: [d for d in NET["dialogs"] if d.pid in pids]
+dt.preload.windows = lambda: list(NET["wins"])
+dt.preload.forget = lambda _pid: None
+dt.locate.warm = lambda _sc: None
+
+
+class FakeWin:
+    """假遊戲視窗（preload.windows() 回的那種）。"""
+
+    def __init__(self, pid, acct="acct", hwnd=0x10):
+        self.pid, self.hwnd = pid, hwnd
+        self.title = f"Angels Online Global - {acct}(雅典娜-3)"
+        self.class_name = "_MIDAGEONL_"
+
+
+class FakeAliveSc:
+    """假 scanner：`alive()` 可控（閃退＝False）；open/close 都不做事。"""
+
+    def __init__(self, alive=True):
+        self.alive_ = alive
+        self.closed = False
+        self.opened = None
+
+    def alive(self):
+        return self.alive_
+
+    def open(self, pid):
+        self.opened = pid
+
+    def close(self):
+        self.closed = True
+
+
+def net_reset(pid=1, acct="acct"):
+    """網路／視窗假狀態回到「這台在線」。"""
+    NET["est"] = {pid}
+    NET["wins"] = [FakeWin(pid, acct)]
+    NET["dialogs"] = []
 
 
 def ck(name: str, cond: bool, note: str = "") -> None:
@@ -317,6 +362,8 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     tab._script = dungeon.Script(name="t", steps=list(steps))
     tab._sc = object()
     tab._pid = 1
+    tab._acct = "acct"
+    net_reset()
     tab._mover = object()
     tab._state = 0x1000
     tab._player = 0x2000
@@ -359,12 +406,21 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     return tab
 
 
-def run(tab, secs: float) -> None:
+def run(tab, secs: float, watch: bool = False) -> None:
+    """`watch=True`＝也跑斷線偵測／卡住偵測／收益對帳那幾支（真的 _tick 一開頭做的事）。"""
     for _ in range(int(secs / TICK)):
         if not tab.run_cb.isChecked():
             return
+        if watch and tab._cycle != "offline" and tab._check_offline(TICK):
+            continue
+        if watch:
+            tab._stuck_watch(TICK)
+            tab._loot_tick(TICK)
         # 外圈（補給／飛回入口／組隊）有事就先跑外圈（跟真的 _tick 一樣）
         if tab._cycle_tick(TICK):
+            continue
+        if watch and tab._phase == "enter":            # 撞入口那段（真的 _tick 也是這順序）
+            tab._go_entrance(tab._my_pos(), TICK)
             continue
         if tab._i >= len(tab._script.steps):
             tab._finish(TICK)
@@ -1196,9 +1252,12 @@ def main() -> int:
     dead = False
     for _ in range(int(2.0 / TICK)):
         dead = tab._check_death(TICK) or dead
-    ck("★★ HP 0 連續兩次（在副本裡）→ 不停機、不警報，進「復活」段、算一趟",
-       dead and tab.run_cb.isChecked() and fake.fired == [] and tab._cycle == "revive"
-       and tab._rounds == 1, f"{tab._cycle} rounds={tab._rounds} fired={fake.fired}")
+    ck("★★ HP 0 連續兩次（在副本裡）→ 不停機，進「復活」段、算一趟、**有通知**"
+       "（使用者 2026-09-06：死亡還是要通知）",
+       dead and tab.run_cb.isChecked() and len(fake.fired) == 1 and "死了" in fake.fired[0][1]
+       and tab._cycle == "revive" and tab._rounds == 1,
+       f"{tab._cycle} rounds={tab._rounds} fired={fake.fired}")
+    fake.fired.clear()
     revived = []
     dt.revive.to_mark = lambda mv: (revived.append(1), True)[1]
     closed = []
@@ -1222,7 +1281,7 @@ def main() -> int:
     ck("　　關窗只叫一次", closed == [1], str(closed))
     dt.scene.current_id = lambda sc, **k: 26                 # 傳回標記點（城）了
     run(tab, dt.DEATH_POLL + dt.REVIVE_SETTLE + 0.6)
-    ck("★ 換到標記點那張圖、穩 1 秒 → 沒循環 → 停（✔ 不警報）",
+    ck("★ 換到標記點那張圖、穩 1 秒 → 沒循環 → 停（✔，停機那句不再重複通知）",
        not tab.run_cb.isChecked() and "✔" in tab.status.text()
        and "死亡當成刷完" in tab.status.text() and fake.fired == [],
        f"{tab.status.text()} fired={fake.fired}")
@@ -1247,6 +1306,7 @@ def main() -> int:
     dt.player.read = lambda _sc, _base: St(0)
     for _ in range(int(2.0 / TICK)):
         tab._check_death(TICK)
+    fake.fired.clear()                      # 死亡那一則通知（2026-09-06 起會送）不算在這題裡
     run(tab, dt.REVIVE_MAX + 1.0)
     ck("★ 復活超過上限沒成功 → 停機＋通知", not tab.run_cb.isChecked()
        and len(fake.fired) == 1 and "復活" in fake.fired[0][1], str(fake.fired))
@@ -2225,9 +2285,10 @@ def main() -> int:
     tab = sched_tab(2, 120, True)
     tab._map_key = 98
     die(tab)
-    ck("★ 第 1 場死了 → 進復活段、算一場、不警報", tab._cycle == "revive"
-       and tab._batch_done == 1 and tab._rounds == 1 and tab._notifier.fired == [],
-       f"{tab._cycle} done={tab._batch_done}")
+    ck("★ 第 1 場死了 → 進復活段、算一場、有通知", tab._cycle == "revive"
+       and tab._batch_done == 1 and tab._rounds == 1 and len(tab._notifier.fired) == 1,
+       f"{tab._cycle} done={tab._batch_done} fired={tab._notifier.fired}")
+    tab._notifier.fired.clear()
     revive_flow(tab)
     ck("　復活到城 → 回程補給（批次沒滿 → 回程＝入口）", tab._cycle == "supply"
        and not tab._batch_end and revived, f"{tab._cycle} end={tab._batch_end}")
@@ -2320,6 +2381,319 @@ def main() -> int:
        f"{tab._sched_rounds} {tab._sched_rest_min} {tab._sched_farm}")
     ck("　按鈕提示跟著變", "3 場" in tab.sched_btn.toolTip() and "1 小時 30 分" in tab.sched_btn.toolTip(),
        tab.sched_btn.toolTip())
+
+    # =====================================================================
+    # ★★★ 斷線＝當成一場（使用者 2026-09-06）：「不管是連線斷了還是閃退都算完成一場，
+    #   直接回程當完成」→ 等同帳號回線 → 站穩（吃掉 5 秒倒數傳回城）→ 回程補給。
+    # =====================================================================
+    print("\n斷線＝當成一場 → 等回線 → 站穩 → 回程補給")
+
+    def off_tab(rounds=3, loop=True):
+        """人在副本裡跑第 1 步（還沒走到點位）的分頁；rounds=None＝沒勾副本設定。"""
+        if rounds is None:
+            tab = loop_tab("none")
+            tab._farm = FakeFarm()
+            tab._runlog_open = lambda: None
+            tab._maps = FakeMaps(FakeGrid({(10, 10)}))
+            supplies.clear()
+            supply_gate.clear()
+        else:
+            tab = sched_tab(rounds, 60, True)
+        tab._loop = loop
+        tab._sc = FakeAliveSc()
+        tab._scanners = {1: tab._sc}
+        tab.who.blockSignals(True)
+        tab.who.clear()
+        tab.who.addItem("小天使（acct）", 1)
+        tab.who.blockSignals(False)
+        tab._keys, tab._atk = FakeWorker(), FakeWorker()
+        tab._pos = [30.0, 30.0]
+        world["here"] = 98
+        net_reset()
+        return tab
+
+    def kinds(tab):
+        return [k for _t, _a, k, _x in tab._events]
+
+    # ① TCP 連線消失：要滿 30 秒才算（換頻瞬斷）；整張表空＝API 出錯當還連著
+    tab = off_tab()
+    NET["est"] = set()
+    run(tab, 40.0, watch=True)
+    ck("TCP 表整張空＝API 出錯 → 當還連著（不誤判）", tab._cycle == "go", tab._cycle)
+    NET["est"] = {99}                       # 別台有連線、這台沒有
+    run(tab, dt.OFFLINE_TCP_GRACE - 4.0, watch=True)
+    ck("連線消失還沒滿 30 秒 → 不算斷線", tab._cycle == "go", tab._cycle)
+    run(tab, 6.0, watch=True)
+    ck("★★★ 連線消失滿 30 秒 → 斷線＝當成一場、進「等回線」",
+       tab._cycle == "offline" and tab._rounds == 1 and tab._batch_done == 1,
+       f"{tab._cycle} rounds={tab._rounds} batch={tab._batch_done}")
+    ck("　跳板／執行緒還掉了", tab._mover is None and tab._keys is None)
+    ck("　重要事件記了「斷線當成完成」", "offline" in kinds(tab), str(kinds(tab)))
+    ck("　有通知（使用者 2026-09-06：死亡／進不去／斷線那些還是要通知）",
+       len(tab._notifier.fired) == 1 and "斷線" in tab._notifier.fired[0][1],
+       str(tab._notifier.fired))
+    run(tab, 20.0, watch=True)
+    ck("　沒回線就一直等（不停機、不設上限）", tab._cycle == "offline"
+       and tab.run_cb.isChecked() and "等" in tab.status.text(), tab.status.text())
+    # 同一個行程登回來（手動重登）：先讀不到場景 → 再出現在副本裡 → 5 秒後被傳回城
+    NET["est"] = {1}
+    world["here"] = None
+    run(tab, 4.0, watch=True)
+    ck("　回線但讀不到場景 → 還不動", tab._cycle == "offline", tab._cycle)
+    world["here"] = 98
+    run(tab, 4.0, watch=True)
+    ck("　讀到場景 → 等站穩，還不動", tab._cycle == "offline", tab._cycle)
+    world["here"] = 26                      # 倒數 5 秒把人傳回城
+    run(tab, 4.0, watch=True)
+    ck("　地圖變了 → 重新等地圖 3 秒沒變", tab._cycle == "offline", tab._cycle)
+    run(tab, 4.0, watch=True)
+    ck("★★★ 站穩 → 重新裝跳板 → 回程補給（不判人在哪，補給自己用翼）",
+       tab._cycle == "supply" and tab._mover is not None and tab._keys is not None,
+       f"{tab._cycle} {tab.status.text()}")
+    ck("　補給回程＝入口那張圖（這一批還沒滿）", bool(supplies) and supplies[-1][2] == 90,
+       str(supplies[-1:]))
+    ck("　趟數／批次沒被重置", tab._rounds == 1 and tab._batch_done == 1,
+       f"{tab._rounds}/{tab._batch_done}")
+    ck("　重要事件記了回線", any("回到線上" in x for _t, _a, _k, x in tab._events))
+    supply_gate.set()
+
+    # ② 閃退（視窗消失）→ 立刻算；自動回連登回來是**新的 pid** → 接新視窗、換掉下拉的 pid
+    tab = off_tab()
+    old_sc = tab._sc
+    old_sc.alive_ = False
+    run(tab, 3.0, watch=True)
+    ck("★★ 遊戲視窗消失（閃退）→ 立刻當成一場", tab._cycle == "offline" and tab._rounds == 1
+       and "閃退" in tab._offline_why, f"{tab._cycle} {tab._offline_why}")
+    dt.MemoryScanner = FakeAliveSc
+    NET["est"], NET["wins"] = {5}, [FakeWin(5)]
+    world["here"] = 26
+    run(tab, 14.0, watch=True)
+    ck("★★★ 同帳號換了 pid 回來 → 接上新視窗 → 補給", tab._cycle == "supply"
+       and tab._pid == 5 and tab._sc.opened == 5, f"{tab._cycle} pid={tab._pid}")
+    ck("　下拉那一項的 pid 換成新的（沒重建、沒觸發「換了分身」）",
+       tab.who.itemData(0) == 5 and tab.run_cb.isChecked(), str(tab.who.itemData(0)))
+    ck("　舊的 scanner 關掉、清單裡換成新的", old_sc.closed and 1 not in tab._scanners
+       and tab._scanners.get(5) is tab._sc)
+    supply_gate.set()
+
+    # ③ 崩潰對話框：連兩拍才算
+    tab = off_tab()
+    NET["dialogs"] = [types.SimpleNamespace(pid=1, title="Angels Online Error")]
+    run(tab, 2.5, watch=True)
+    ck("崩潰視窗只看到一拍 → 還不算", tab._cycle == "go", tab._cycle)
+    run(tab, 2.5, watch=True)
+    ck("★★ 崩潰視窗連兩拍 → 當成一場", tab._cycle == "offline"
+       and "崩潰" in tab._offline_why, f"{tab._cycle} {tab._offline_why}")
+
+    # ④ 斷線那一場正好是這一批最後一場 → 回線後補給回程指到掛機記錄點
+    tab = off_tab(rounds=1)
+    NET["est"] = {99}
+    run(tab, 34.0, watch=True)
+    ck("斷線那場就是這一批最後一場", tab._cycle == "offline" and tab._batch_done == 1,
+       f"{tab._cycle} {tab._batch_done}")
+    NET["est"] = {1}
+    world["here"] = 26
+    run(tab, 14.0, watch=True)
+    ck("★★ 回線 → 這一批滿了 → 補給回程指到掛機記錄點、補完交給掛機",
+       tab._cycle == "supply" and tab._batch_end and supplies[-1] == (100.0, 200.0, 26),
+       f"{tab._cycle} end={tab._batch_end} {supplies[-1:]}")
+    supply_gate.set()
+
+    # ⑤ 沒勾循環：斷線當成刷完 → 直接停（✔，不是警報）
+    tab = off_tab(rounds=None, loop=False)
+    tab._sc.alive_ = False
+    run(tab, 3.0, watch=True)
+    ck("★ 沒勾循環：斷線當成刷完 → 直接停（✔）", not tab.run_cb.isChecked()
+       and tab.status.text().startswith("✔"), tab.status.text())
+    ck("　斷線那一則通知有送（停機那句是 ✔ 不再重複通知）",
+       len(tab._notifier.fired) == 1 and "斷線" in tab._notifier.fired[0][1],
+       str(tab._notifier.fired))
+
+    # ⑥ 不在副本裡（補給途中）斷線 → 照樣算一場（使用者：不管哪裡都算）
+    tab = off_tab()
+    finish_round(tab)
+    ck("（前置）跑完進補給", tab._cycle == "supply" and tab._rounds == 1, tab._cycle)
+    NET["est"] = {99}
+    run(tab, 34.0, watch=True)
+    ck("★ 補給途中斷線 → 照樣算一場", tab._cycle == "offline" and tab._rounds == 2
+       and tab._batch_done == 2, f"{tab._cycle} {tab._rounds}/{tab._batch_done}")
+    supply_gate.set()
+
+    # ⑦ 休息期間閃退還沒登回來 → 休息結束不拿舊 pid 開跑，等回線再「先補給再刷」
+    tab = sched_tab(1, 1, True)
+    tab._sc = FakeAliveSc()
+    tab._scanners = {1: tab._sc}
+    finish_round(tab)
+    wait_supply(tab)
+    ck("（前置）進休息", tab._cycle == "rest", tab._cycle)
+    NET["wins"] = []                        # 閃退了、還沒登回來
+    run(tab, 61.0)
+    ck("★★ 休息結束但分身不在線上 → 等回線（不拿舊 pid 開跑）",
+       tab._cycle == "offline" and tab._offline_next == "presupply" and tab.run_cb.isChecked(),
+       f"{tab._cycle} {tab._offline_next} {tab.status.text()}")
+    ck("　掛機頁有被叫停", tab._farm.calls[-1] == (1, False), str(tab._farm.calls))
+    NET["wins"], NET["est"] = [FakeWin(7)], {7}
+    world["here"] = 26
+    supplies.clear()
+    run(tab, 14.0)
+    ck("★★ 回線（新 pid）→ 接上 → 先補給一趟再刷", tab._cycle == "supply" and tab._pid == 7
+       and bool(supplies) and supplies[-1][2] == 90, f"{tab._cycle} pid={tab._pid} {supplies[-1:]}")
+    supply_gate.set()
+
+    # =====================================================================
+    # ★★★ 進不去副本＝當這一批刷完（使用者 2026-09-06）
+    # =====================================================================
+    print("\n進不去副本 → 當這一批 N 場刷完 → 回掛機點")
+    tab = sched_tab(3, 60, True, here=90)
+    tab._sched_give_up_min = 1
+    tab._sched_reset()
+    tab._sched_begin()
+    tab._sc = FakeAliveSc()
+    tab._keys, tab._atk = FakeWorker(), FakeWorker()
+    tab._phase = "enter"
+    tab._enter_t = tab._poke_total = 0.0
+    tab.trigs = [FakeTrig(294.2, 14.7, 60001)]
+    tab._pos = [294.2, 14.7]                # 站在入口上
+    wire(tab, FakeTalk([]))                 # 沒有對話跳出來
+    run(tab, 30.0, watch=True)
+    ck("（前置）站在入口上一直撞", tab._cycle == "go" and tab._phase == "enter"
+       and len(tab.portal_sent) >= 5, f"{tab._cycle}/{tab._phase} sent={len(tab.portal_sent)}")
+    run(tab, 32.0, watch=True)
+    ck("★★★ 撞滿 1 分鐘進不去 → 當這一批 3 場刷完 → 補給回程指到掛機記錄點",
+       tab._batch_done == 3 and tab._cycle == "supply" and tab._batch_end
+       and supplies[-1] == (100.0, 200.0, 26),
+       f"batch={tab._batch_done} {tab._cycle} end={tab._batch_end} {supplies[-1:]}")
+    ck("　重要事件記了「進不去當成完成」", "noentry" in kinds(tab), str(kinds(tab)))
+    ck("　有通知（使用者 2026-09-06：無法進入副本要通知）、狀態列也有講",
+       len(tab._notifier.fired) == 1 and "進不去" in tab._notifier.fired[0][1]
+       and "進不去" in tab._notice, f"{tab._notifier.fired} {tab._notice}")
+    supply_gate.set()
+    # 沒勾副本設定 → 照舊無限撞（9/2「無限嘗試不需要通知」）
+    tab = loop_tab("none")
+    tab._sched = None
+    tab._sc = FakeAliveSc()
+    tab._keys, tab._atk = FakeWorker(), FakeWorker()
+    tab._phase = "enter"
+    tab.trigs = [FakeTrig(294.2, 14.7, 60001)]
+    tab._pos = [294.2, 14.7]
+    wire(tab, FakeTalk([]))
+    world["here"] = 90
+    run(tab, 200.0, watch=True)
+    ck("沒勾副本設定 → 照舊一直撞、不放棄、不通知", tab._cycle == "go"
+       and tab._phase == "enter" and len(tab.portal_sent) > 30 and not tab._notifier.fired,
+       f"{tab._cycle}/{tab._phase} sent={len(tab.portal_sent)}")
+    # 走過去的路不算「撞」
+    tab = sched_tab(3, 60, True, here=90)
+    tab._sched_give_up_min = 1
+    tab._sched_reset()
+    tab._sched_begin()
+    tab._sc = FakeAliveSc()
+    tab._keys, tab._atk = FakeWorker(), FakeWorker()
+    tab._phase = "enter"
+    tab._pos = [50.0, 50.0]                 # 離入口很遠、一直在走
+    run(tab, 90.0, watch=True)
+    ck("　走去入口的路不算撞（只算站在入口上的時間）", tab._phase == "enter"
+       and tab._cycle == "go" and tab._poke_total == 0.0,
+       f"{tab._cycle}/{tab._phase} poke={tab._poke_total}")
+    # 設定視窗有這一欄、按確定回存
+    dlg = tab._sched_dialog()
+    ck("副本設定視窗有「在入口撞超過 N 分鐘」", dlg._give_up.value() == 1, str(dlg._give_up.value()))
+    dlg._give_up.setValue(7)
+    tab._apply_sched_dialog(dlg)
+    ck("　按確定 → 回存＋提示跟著變", tab._sched_give_up_min == 7
+       and "7 分鐘" in tab.sched_btn.toolTip(), tab.sched_btn.toolTip())
+    tab._load_settings()
+    ck("　存進 config、讀得回來", tab._sched_give_up_min == 7, str(tab._sched_give_up_min))
+
+    # =====================================================================
+    # ★★ 副本收益：只在人在副本裡跑腳本時對帳（補給買的不混進來）
+    # =====================================================================
+    print("\n副本收益：只在副本裡對帳")
+
+    class FakeBag:
+        def __init__(self):
+            self.bag = {}
+
+        def scan(self, _sc, *a, **k):
+            return ([types.SimpleNamespace(type_id=t, count=n, icon_id=0)
+                     for t, n in self.bag.items() if n], True)
+
+    FB = FakeBag()
+    dt.loot.bag = FB
+    tab = off_tab()
+    FB.bag = {100: 5}
+    run(tab, 0.5, watch=True)
+    lt = tab._loot_for()
+    ck("進副本第一拍只建基準（整袋不算獲得）", lt.rows() == [], str(lt.rows()))
+    FB.bag = {100: 8}
+    run(tab, dt.LOOT_GAP + 0.3, watch=True)
+    ck("★ 副本裡多了 3 個 → 記 3", [r[:2] for r in lt.rows()] == [(100, 3)], str(lt.rows()))
+    tab._cycle = "supply"                   # 出去補給（買了兩百瓶）
+    FB.bag = {100: 208, 200: 50}
+    run(tab, dt.LOOT_GAP * 2, watch=True)
+    ck("★★ 不在副本裡不對帳（補給買的沒被記）", [r[:2] for r in lt.rows()] == [(100, 3)],
+       str(lt.rows()))
+    tab._cycle, tab._phase = "go", "run"    # 回到副本
+    run(tab, 0.5, watch=True)
+    FB.bag = {100: 210, 200: 50}
+    run(tab, dt.LOOT_GAP + 0.3, watch=True)
+    ck("★★ 回副本後只算新增的 2（舊基準丟掉，兩百瓶沒混進來）",
+       sorted(r[:2] for r in lt.rows()) == [(100, 5)], str(lt.rows()))
+    tab._show_loot()
+    ck("「副本收益」視窗：表跟掛機頁同一支、1 列", tab._loot_dlg._panel._tbl.rowCount() == 1
+       and "只算人在副本裡" in tab._loot_dlg._panel._head.text(), tab._loot_dlg._panel._head.text())
+    tab._loot_dlg._panel._reset_btn.click()
+    ck("　重新計算 → 歸零、當場重建基準", lt.rows() == [] and tab._loot_dlg._panel._tbl.rowCount() == 0)
+    FB.bag = {100: 211, 200: 50}
+    run(tab, dt.LOOT_GAP + 0.3, watch=True)
+    ck("　歸零後只算之後多的 1", [r[:2] for r in lt.rows()] == [(100, 1)], str(lt.rows()))
+    tab._loot_dlg.close()
+
+    # =====================================================================
+    # ★★ 重要事件：統計＋視窗插列＋卡住偵測（純紀錄）
+    # =====================================================================
+    print("\n重要事件")
+    tab = off_tab()
+    tab._events.clear()
+    tab._event("full", "第 1 趟：完整完成")
+    tab._event("death", "第 2 趟：死亡當成完成")
+    tab._event("offline", "第 3 趟：斷線當成完成")
+    tab._event("stop", "停止：⛔ 地圖對不上")
+    s = tab._events_summary()
+    ck("統計：完整 1／死亡 1／斷線 1／進不去 0、停機 1", "完整完成 1 場" in s
+       and "死亡當成完成 1 場" in s and "斷線當成完成 1 場" in s
+       and "進不去當成完成 0 場" in s and "停機 1 次" in s, s)
+    tab._show_events()
+    ck("視窗：4 列、最新在最上面", tab._events_tbl.rowCount() == 4
+       and tab._events_tbl.item(0, 2).text().startswith("停止"),
+       tab._events_tbl.item(0, 2).text())
+    tab._event("stuck", "卡住：第 3 步…")
+    ck("開著時插一列（不整張重畫）", tab._events_tbl.rowCount() == 5
+       and tab._events_tbl.item(0, 2).text().startswith("卡住"))
+    ck("　統計跟著更新", "卡住 1 次" in tab._events_head.text(), tab._events_head.text())
+    tab._events_dlg.close()
+    # 卡住偵測：同一步超過 5 分鐘沒前進 → 記一筆（帶狀態列）、一段只記一次、不停機
+    tab = off_tab()
+    tab._events.clear()
+    run(tab, dt.STUCK_EVENT_SECS + 1.0, watch=True)
+    stuck = [x for _t, _a, k, x in tab._events if k == "stuck"]
+    ck("★ 同一步超過 5 分鐘 → 記一筆卡住（講在哪一步、當時在幹嘛）",
+       len(stuck) == 1 and "第 1 步" in stuck[0], str(stuck))
+    run(tab, 60.0, watch=True)
+    ck("　一段只記一次", sum(1 for k in kinds(tab) if k == "stuck") == 1)
+    ck("　純紀錄，沒因此停機", tab.run_cb.isChecked() and tab._cycle == "go")
+    tab._i = 1                              # 前進了 → 新的一段重新計
+    tab._script.steps.append({"do": "walk", "to": [60, 60]})
+    run(tab, 10.0, watch=True)
+    ck("　前進到下一步 → 計時歸零", tab._stuck_t < 11.0 and not tab._stuck_noted,
+       f"{tab._stuck_t} {tab._stuck_noted}")
+    # 停機原因進重要事件（開跑之後）
+    tab = off_tab()
+    tab._events.clear()
+    tab._started = True
+    tab._stop("⛔ 地圖變了")
+    ck("★ 出問題停機 → 記「停機」", kinds(tab) == ["stop"] and "地圖變了" in tab._events[0][3],
+       str(tab._events))
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
