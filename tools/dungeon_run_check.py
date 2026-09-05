@@ -1649,6 +1649,26 @@ def main() -> int:
 
     print("\n製作頁：入口的選項自動記進去")
     from app.tabs.dungeon_make_tab import DungeonMakeTab
+    # ★ 製作頁的傳點出口監看（2026-09-05 稽核）：跟執行端同一條規矩 ——
+    #   跳之前不在傳點上（伺服器拉回）→ 不記出口、繼續盯；從傳點上跳走才記。
+    from app.tabs import dungeon_make_tab as dmt
+    mk2 = DungeonMakeTab()
+    mk2._script = dungeon.Script(name="t", steps=[{"do": "portal",
+                                                    "to": [141.3, 277.6]}])
+    mk2._cur = lambda: (1, object())
+    pos2 = [128.0, 270.0]
+    mk2._me = lambda _sc: tuple(pos2)
+    dmt.scene.current_id = lambda _sc, **_k: 110
+    mk2._pw = (0, time.monotonic() + 60.0, (134.0, 270.0), time.monotonic())
+    mk2._portal_watch()
+    ck("★ 製作頁：跳之前離傳點 10 格（拉回）→ 不記出口、繼續盯",
+       "land" not in mk2._script.steps[0] and mk2._pw is not None,
+       str(mk2._script.steps[0]))
+    pos2[:] = [47.5, 278.5]
+    mk2._pw = (0, time.monotonic() + 60.0, (141.0, 277.0), time.monotonic())
+    mk2._portal_watch()
+    ck("★ 製作頁：從傳點上跳走 → 記出口",
+       mk2._script.steps[0].get("land") == [47.5, 278.5], str(mk2._script.steps[0]))
     mk = DungeonMakeTab()
     mk._script = dungeon.Script(name="t")
     mk._script.entrance = {"scene": 71, "to": [10.0, 20.0], "model": 60001}

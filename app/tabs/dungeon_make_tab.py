@@ -86,6 +86,11 @@ PORTAL_WATCH_SECS = 90.0
 JUMP_TILES = 3.0
 # 兩次取樣隔太久就分不出是走的還是傳的 → 不判，只重設基準。
 JUMP_MAX_GAP = 0.4
+# ★ 跳之前要站在傳點附近才算是傳點搬的（跟 dungeon_tab.PORTAL_FROM 同一條規矩，
+#   2026-09-05 稽核補）：伺服器拉回位置（丟移動包後的修正）一拍也跳好幾格，
+#   人還在半路就被記成「出口」＝腳本存到一個錯的 land，跑的時候會停在
+#   「傳點把人送到別的地方」。不在傳點上的跳動一律不算、繼續盯。
+PORTAL_FROM = 6.0
 
 
 def _fmt(v: float) -> str:
@@ -1093,6 +1098,14 @@ class DungeonMakeTab(BaseTab):
         if prev is None or now - prev_t > JUMP_MAX_GAP:
             return                               # 隔太久 → 只重設基準，不判
         if math.hypot(me[0] - prev[0], me[1] - prev[1]) < JUMP_TILES:
+            return
+        to = steps[i].get("to") or [None, None]
+        if (to[0] is not None
+                and math.hypot(prev[0] - to[0], prev[1] - to[1]) > PORTAL_FROM):
+            # 人不在傳點上就跳了 ＝ 伺服器拉回／被擊退，不是傳點 → 不記，繼續盯
+            self._say_map(f"位置一拍跳了 {math.hypot(me[0] - prev[0], me[1] - prev[1]):.0f} 格，"
+                          f"但跳之前離傳點 {math.hypot(prev[0] - to[0], prev[1] - to[1]):.0f} 格"
+                          "（不在傳點上）→ 不算出口，繼續盯")
             return
         steps[i]["land"] = [round(me[0], 1), round(me[1], 1)]
         steps[i]["scene"] = scene.map_key(scene.current_id(sc))
