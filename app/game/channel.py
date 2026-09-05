@@ -110,7 +110,7 @@ from app.game.login import (SRV_ID as OFF_ID,               # noqa: E402
 # ⚠ ip 欄只有這裡在用（login.py 靠索引取記錄、用不到它，所以 SRV_* 沒這格）。
 #   出處：上面那張版面表的 +0x40（跟名稱／port 同一輪實機對出來的）。
 OFF_IP = 0x40
-REC_SPAN = 0x60           # 讀到 +0x5C 就夠了
+REC_SPAN = 0x60           # ⚠ 讀取長度（讀到 +0x5C 就夠了），不是遊戲記錄大小
 MAX_SUBSET = 32           # 合理性上限：分流數不可能比這大
 
 

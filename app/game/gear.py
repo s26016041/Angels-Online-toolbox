@@ -54,7 +54,7 @@ JEWEL_TABLE_PTR = 0x009973CC    # [這裡] + 效果編號*4 → 寶石效果表�
 # --- 物品結構（裝備專屬的那半）-------------------------------------------
 OFF_ADV = 0x0C              # 5 個 dword：高 6 位屬性編號、低 26 位數值
 ADV_SLOTS = 5
-ADV_ID_SHIFT = 26
+ADV_ID_SHIFT = 26           # 出處：OFF_ADV 那句（高 6 位編號 → 值佔低 26 位）
 ADV_VALUE_MASK = 0x3FFFFFF
 OFF_GEM = 0x3D              # 5 個 dword：鑲進去的寶石**種類 ID**（0 ＝ 空孔）
 GEM_SLOTS = 5
@@ -136,7 +136,7 @@ ATTR_OFFSET: dict[int, tuple[int, ...]] = {
 #    106×10 = **1060**，跟遊戲提示框的「+1060 點攻擊力」一模一樣。
 ENHANCE_WEAPON_KINDS = frozenset({9, 10, 11, 12, 13, 14, 15, 16, 63, 75})
 ENHANCE_ARMOR_KINDS = frozenset({2, 3, 4, 5, 6, 7, 8, 17, 76})
-ENHANCE_MOUNT_KIND = 25
+ENHANCE_MOUNT_KIND = 25     # 座騎分類 25（出處見上面強化公式那段）
 RATE_ARMOR = 0.03           # [0x7D8B48]
 RATE_WEAPON = 0.06          # [0x7D8B4C]
 RATE_MOUNT = 0.08           # [0x7D8B50]
@@ -460,7 +460,7 @@ def speed_display(raw: int) -> int:
     return q + 5
 
 
-# 攻擊速度那行的閘門（照抄 `0x5F04FC` 與 `0x5EFE26` 兩支互補的判斷）：
+# ⚠ 出處：攻擊速度那行的閘門（照抄 `0x5F04FC` 與 `0x5EFE26` 兩支互補的判斷）：
 #   範本+0x14 的 bit 0xC 有立 → 印**換算後**的值（分類 46 紙娃娃除外）
 #   沒立                     → 分類 24 印換算後的值，其餘印範本原值
 SPEED_FLAG = 0x0C

@@ -84,7 +84,7 @@ USE_TARGETED = 1
 # ★ 新版的算式：ecx = (頁*12 + 格)*9，再 `movzx eax, byte [ecx+esi+TABLE_OFF]`
 #   （舊版是把 0xE5*12*9 折進常數，結果一樣）。
 TABLE_OFF = 0x603C
-ENTRY_SIZE = 9
+ENTRY_SIZE = 9                # 出處：上面那條算式 (頁*12+格)*9
 PAGES = 4
 SLOTS = 12                    # F1~F12
 

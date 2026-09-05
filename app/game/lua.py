@@ -104,7 +104,7 @@ CALL_TIMEOUT = 0.5           # Lua 可能跑一小段，比送封包寬鬆一點
 #   supply/exchange 0x180、team 0x1C0、produce 0x200；這裡佔 0x300~0x4A0（P）
 #   與 0x500~0x7F8（字串池），別人要加新區段請避開。
 _SEQ_P_OFF = 0x300
-_SEQ_STR_OFF = 0x500
+_SEQ_STR_OFF = 0x500         # ⚠ 我們自己 scratch 區的配置（見上），跟遊戲無關
 _SEQ_POOL_MAX = 0x2F0
 _SEQ_STR_MAX = 0xB8          # 結果字串最多抄這麼多（錯誤訊息夠用了）
 _RC_NOT_FUNCTION = 0xFFFFFFFE

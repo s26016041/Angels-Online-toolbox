@@ -51,11 +51,11 @@ from app.game import bag, skills
 #   ★ 全專案只有這裡認識這棵樹的版面，別在第二個地方再抄一份。
 OFF_TREE = 0x420          # 實體 + 這裡 ＝ 哨兵（紅黑樹的環錨）
 NODE_LEFT = 0x00
-NODE_PARENT = 0x04
-NODE_RIGHT = 0x08
-NODE_KEY = 0x10           # 技能 ID
-NODE_EXPIRE = 0x18        # 到期時間（Unix 秒）
-NODE_SPAN = 0x1C          # 一次讀到 +0x18 就夠
+NODE_PARENT = 0x04        # 出處見上
+NODE_RIGHT = 0x08         # 出處見上
+NODE_KEY = 0x10           # 技能 ID（出處見上）
+NODE_EXPIRE = 0x18        # 到期時間（Unix 秒）（出處見上）
+NODE_SPAN = 0x1C          # ⚠ 讀取長度（一次讀到 +0x18 就夠），不是節點大小
 
 MAX_NODES = 64            # 走訪上限（樹被改到時不會無限繞）
 MAX_DEPTH = 32            # find 的下探上限（64 個節點的紅黑樹最深 ~12 層）

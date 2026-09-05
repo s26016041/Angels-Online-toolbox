@@ -77,7 +77,7 @@ KIND_GEM = 29               # item.xml「寶石」
 # 寶石效果表一列（gear.JEWEL_ROW_* 那三組 0x24 bytes 之後）
 JEWEL_MIN_LEVEL = 0x6C      # 最低等級 ＝ 說明文字「裝備等限」
 JEWEL_MAX_LEVEL = 0x70      # 等級上限
-LEVEL_SANE = 1000           # 等級超過這個就是讀到垃圾
+LEVEL_SANE = 1000           # ⚠ 合理性上界（我們自己定的）：等級超過這個就是讀到垃圾
 
 MAX_HOLES = 5               # 遊戲上限（使用者 2026-09-03 說明）
 STAR_SPAN = 10              # 一星涵蓋 10 級：13星 → 130~139 級以下都能打

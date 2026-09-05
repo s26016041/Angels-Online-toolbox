@@ -75,12 +75,12 @@ STAGE_SEMI = 3
 R_PRODUCT, R_IS_SKILL, R_CLASS = 0x00, 0x04, 0x0C
 R_NEED_LEVEL, R_RATE = 0x18, 0x28
 R_MAT_ID, R_MAT_NUM, R_MAT_KINDS, R_STAGE = 0x2C, 0x40, 0x54, 0x58
-R_SIZE = 0x5C
+R_SIZE = 0x5C              # ⚠ 一筆讀到這裡（涵蓋 R_STAGE +0x58）；欄位出處見檔頭
 MAT_SLOTS = 5
 
 # 貢獻品記錄的欄位
 G_ID, G_ITEM, G_GROUP, G_POINTS = 0x00, 0x04, 0x08, 0x0C
-G_SIZE = 0x10
+G_SIZE = 0x10              # ⚠ 一筆讀到這裡（涵蓋 G_POINTS +0x0C）；欄位出處見檔頭
 
 # ⚠ 出處＝反組譯 initmakeclasswnd：分半成品時讀「物品範本 +0x18」當分類欄（見檔頭）。
 OFF_ITEM_CLASS = 0x18      # 物品範本的分類欄

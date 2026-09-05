@@ -127,7 +127,7 @@ TMPL_COMPOSE1 = 0x110
 # ★ 出處：反組譯提示框上色 0x5F358A（讀範本+0x130 挑名字顏色）；
 #   對帳 item*.xml 的顏色欄 32476 筆 100% 吻合（詳見下面 GRADE_* 那段）
 TMPL_GRADE = 0x130          # ★ 品質（白／藍／橘），見 GRADE_NAMES
-TMPL_SPAN = 0x134
+TMPL_SPAN = 0x134          # ⚠ 讀取長度（涵蓋到上面最大的 TMPL_GRADE 0x130），不是遊戲範本大小
 
 # ★ 分類代號 46 ＝ 紙娃娃（造型／裝扮）。來源有兩份互相印證：遊戲自己的
 #   Lua 常數 `ITEMOBJ_TYPE_DOLL = 46`，以及 2026-08-08 五台實測
@@ -205,17 +205,17 @@ DOLL_WORN_LAST = 249
 #     +0x108 = 30），東西全落在 70~99、60~69 與 100 以上一件都沒有 —— 吻合。
 #   ★ 讀不到一律往「少算」退（少幾格＝下一輪重試；多算＝送錯格）。
 CHAR_OPEN_LAST = 0x3B        # 20~59：不用通行證就能放
-CHAR_PASS_FIRST = 0x3C       # 60~69：要擴充通行證
-CHAR_PASS_LAST = 0x45
-EXT_FIRST = 0x46             # 70 起：穿著的背包給的格子
-BAG_WORN_SLOT = 7            # 穿著的背包在第 7 格（0x5AABD3 `push 7`）
-PASS_SLOT = 0x2E6            # 擴充通行證在第 742 格（0x5AEFF6 `push 0x2e6`）
+CHAR_PASS_FIRST = 0x3C       # 60~69：要擴充通行證（出處見上面那段反組譯）
+CHAR_PASS_LAST = 0x45        # 出處見上面那段反組譯
+EXT_FIRST = 0x46             # 70 起：穿著的背包給的格子（出處見上面那段反組譯）
+BAG_WORN_SLOT = 7            # 穿著的背包在第 7 格（出處：0x5AABD3 `push 7`）
+PASS_SLOT = 0x2E6            # 擴充通行證在第 742 格（出處：0x5AEFF6 `push 0x2e6`）
 BAG_CAP_ATTR = 0x30          # 「背包格數」的屬性編號（兩處都比 0x30）
-ITEM_ADV = 0x0C              # 進階屬性 5 個 u32（同 gear.OFF_ADV）
-ITEM_ADV_N = 5
-ITEM_EXTRA_ID = 0xB0         # 5 個 byte 編號…（0x532E9E）
+ITEM_ADV = 0x0C              # 進階屬性 5 個 u32（同 gear.OFF_ADV）；出處：0x532E67（見上）
+ITEM_ADV_N = 5               # 出處同上（0x532E67 讀 5 個）
+ITEM_EXTRA_ID = 0xB0         # 5 個 byte 編號…（出處：0x532E9E）
 ITEM_EXTRA_VAL = 0xB8        # …對應的 5 個 u32 值
-ITEM_EXTRA_N = 5
+ITEM_EXTRA_N = 5             # 出處同上（0x532E9E 讀 5 個）
 ITEM_CAP_SPAN = ITEM_EXTRA_VAL + ITEM_EXTRA_N * 4   # 算容量要讀到這裡
 
 GOLD_SLOT = 0              # 第 0 格就是金幣（見 gold()）

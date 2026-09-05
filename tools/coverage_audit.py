@@ -104,7 +104,7 @@ HARDCODED_DATA = (
     ("assets/skill_range.tsv.gz", "技能射程／對象", "Magic",
      "已有 recheck_tables 對帳（19312 筆）"),
     ("assets/skills.tsv.gz", "buff 持續時間", "Magic",
-     "⚠ 還沒對帳 —— 持續時間在 Magic 範本裡，可以補"),
+     "已有 recheck_tables 對帳（範本 +0x100，10519 筆）"),
     ("assets/jumpmap.tsv", "趴趴GO 傳送點", "JumpMap",
      "已有 recheck_tables 對帳（120 筆）"),
     ("assets/jumpmap_class.tsv", "傳送點分類名", "JumpMapClass",

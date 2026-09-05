@@ -64,19 +64,19 @@ SEND_FN = 0x005D94A4
 
 # ── 結構偏移（出處＝檔頭那段反組譯）───────────────────────────────
 OFF_FLAGS = 0x1FE          # u16 伺服器發的物件旗標，決定送不送、送哪個碼
-OFF_FLAGS2 = 0x200         # u16 旁邊那個（進場封包同時填的，用途未確認）
-OFF_THROTTLE = 0x204       # i32 節流倒數：>0 的期間一律不送
+OFF_FLAGS2 = 0x200         # u16 旁邊那個（進場封包同時填的，用途未確認）；出處：檔頭反組譯
+OFF_THROTTLE = 0x204       # i32 節流倒數：>0 的期間一律不送；出處：檔頭反組譯
 OFF_LAST = 0x208           # u32 ★去重欄：上一個踩上來的玩家（＝玩家 +0xBC）
-OFF_SELECT_ID = 0x1D0      # u32 封包裡代表這個物件的 id（跟 scenery 同一格）
-OFF_MODEL = 0xB4           # u32 外觀編號（查 mapobj 拿名字）
-# vtable 第 3 槽 ＝ 那支每拍檢查的跳板。
+OFF_SELECT_ID = 0x1D0      # u32 封包裡代表這個物件的 id（跟 scenery 同一格）；出處：檔頭反組譯
+OFF_MODEL = 0xB4           # u32 外觀編號（查 mapobj 拿名字）；出處：檔頭（同一個物件的版面）
+# ⚠ 出處：檔頭 RTTI／反組譯 —— vtable 第 3 槽（+0x0C）＝ 那支每拍檢查的跳板。
 VT_SLOT = 0x0C
-# 跳板的長度與尾巴 jmp 的位置：`56 8B F1 E8 rel32 8B CE 5E E9 rel32`
+# ⚠ 出處：實機讀出的跳板位元組 `56 8B F1 E8 rel32 8B CE 5E E9 rel32` —— 長度與尾巴 jmp 的位置
 THUNK_LEN = 16
-THUNK_JMP_AT = 11
-# 旗標要中這幾個位元才會送（0x546A3B `test eax, 0x185`）。
+THUNK_JMP_AT = 11              # E9 在第 12 個 byte（索引 11），出處同上
+# ⚠ 出處：0x546A3B `test eax, 0x185`（檔頭反組譯）—— 旗標要中這幾個位元才會送。
 TRIGGER_MASK = 0x185
-# 物件起點 → entity 偏移的基準差（跟 scenery.py / gather.py 同一個常數）。
+# ⚠ 出處：scenery.py / gather.py 同一個常數 —— 物件起點 → entity 偏移的基準差。
 E = 8
 # 一次要讀到哪裡（最遠的欄位是 +0x208）。
 _SPAN = OFF_LAST + 4

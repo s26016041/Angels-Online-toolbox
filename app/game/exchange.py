@@ -94,7 +94,7 @@ REC_MATERIAL = 0x2C
 REC_MATERIAL_N = 0x3C
 # ⚠ 出處同上。排序欄，比對用的最後一欄。
 REC_SORT = 0x4C
-REC_SPAN = 0x50              # 讀到排序就夠了
+REC_SPAN = 0x50              # ⚠ 讀取長度（讀到 REC_SORT 就夠了），不是遊戲記錄大小
 SLOTS = 4
 
 

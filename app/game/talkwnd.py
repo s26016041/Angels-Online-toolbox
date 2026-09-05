@@ -141,9 +141,9 @@ def find_spot(scanner) -> Spot | None:
 #   GetWindowById = `[管理器 + (代號 & 0x1FFF)*4 + 0x20]`，再驗 `[物件+0x10] == 代號`。
 #   ⚠ 這幾個是結構偏移（允許寫死，出處如上），改版靠 patch-doctor 重驗。
 MSG_END_OFF = 0x148
-WND_SLOT_MASK = 0x1FFF
-WND_TABLE_OFF = 0x20
-WND_ID_OFF = 0x10
+WND_SLOT_MASK = 0x1FFF      # 出處：上面 GetWindowById 那行反組譯（代號 & 0x1FFF）
+WND_TABLE_OFF = 0x20        # 出處：上面 GetWindowById 那行反組譯
+WND_ID_OFF = 0x10           # 出處：上面 GetWindowById 那行反組譯（驗 [物件+0x10] == 代號）
 
 
 def _wnd_object(scanner) -> int | None:

@@ -81,13 +81,13 @@ TABLE_PTR = 0x00997394
 MAX_ID = 0x9C40
 # 記錄欄位（見檔頭）
 G_ITEM, G_ORDER, G_CAT, G_NUM, G_PRICE = 0x00, 0x08, 0x0C, 0x10, 0x14
-G_SPAN = 0x18
+G_SPAN = 0x18                # ⚠ 一筆讀到這裡（涵蓋 G_PRICE +0x14）；欄位出處見檔頭
 # ⚠ 這段編號送出前會被客戶端重新對應（0x5D660F），我們不碰。
 REMAP_LO, REMAP_HI = 0xF3D, 0xF4C
 
 # 商城倉庫（管理器 + 這裡）。★ 管理器指標借 gather.WORLD_PTR，不再寫一份。
 STORAGE_OFF = 0xCEC4
-STORAGE_STRIDE = 0x37
+STORAGE_STRIDE = 0x37            # 出處：memset 0x226 ＝ 10 格 × 0x37（見下一行）
 STORAGE_SLOTS = 10               # 0x5D38B1 `cmp eax,9`／memset 0x226 兩處印證
 ST_SERIAL, ST_ITEM, ST_COUNT = 0x00, 0x04, 0x08
 
