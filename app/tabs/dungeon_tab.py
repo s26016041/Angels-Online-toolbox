@@ -906,6 +906,7 @@ class DungeonTab(BaseTab):
         self._walked_ok = True
         self._walk_t = 0.0
         self._why = ""               # 為什麼沒在打（狀態列）
+        self._exact_sent = 0.0       # 上次直走（walk_exact／walk_near）送出的時刻
 
     def _on_run_toggled(self, on: bool) -> None:
         if not on:
@@ -2729,7 +2730,16 @@ class DungeonTab(BaseTab):
                 + (f"；{why}" if why and n < live else "") + "）")
 
     def _busy_walking(self) -> bool:
-        """正在走路嗎（正在走就別再送，重下指令會把上一段打斷）。"""
+        """正在走路嗎（正在走就別再送，重下指令會把上一段打斷）。
+
+        ⚠⚠ 剛送出走路指令的 `navigate.SEND_GRACE`(0.3 秒) 內也算「正在走」：
+          送出到角色真的開始動實測 107~154ms，這段期間 `is_walking` 還是 False，
+          10 Hz 的心跳每 100ms 再送一次就會**把上一個指令重置掉**（navigate.py
+          檔頭實測「0.12 秒重送 → 一路互相打斷」）。尋路器自己有這道閘，
+          直走這兩支（`_walk_onto`／`_walk_beside`）以前沒有 —— 2026-09-05 稽核補上。
+        """
+        if time.monotonic() - self._exact_sent < navigate.SEND_GRACE:
+            return True
         try:
             return bool(entity.is_walking(self._sc, self._player))
         except Exception:                                # noqa: BLE001
@@ -2767,9 +2777,11 @@ class DungeonTab(BaseTab):
         if self._busy_walking():
             return "走最後一段…"
         try:
-            self._mover.walk_exact(self._sc, self._player, gx, gy)
+            sent = self._mover.walk_exact(self._sc, self._player, gx, gy)
         except Exception:                                # noqa: BLE001
             return "走最後一段（送不出去）"
+        if sent:
+            self._exact_sent = time.monotonic()
         return "直接走到那一格（尋路器 3 格內不動作）"
 
     def _walk_beside(self, gx: float, gy: float, keep: float) -> str:
@@ -2780,9 +2792,11 @@ class DungeonTab(BaseTab):
         if self._busy_walking():
             return "走最後一段…"
         try:
-            self._mover.walk_near(self._sc, self._player, gx, gy, keep)
+            sent = self._mover.walk_near(self._sc, self._player, gx, gy, keep)
         except Exception:                                # noqa: BLE001
             return "走最後一段（送不出去）"
+        if sent:
+            self._exact_sent = time.monotonic()
         return f"走到旁邊（留 {keep:g} 格）"
 
     def _blocked(self, dt: float, what: str, goal=None) -> None:
