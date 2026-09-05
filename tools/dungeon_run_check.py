@@ -1634,6 +1634,20 @@ def main() -> int:
        _cfg.get("dungeon.測試帳號.start") == 4,
        str(_cfg.get("dungeon.測試帳號.start")))
     ck("　技能鍵有存", isinstance(_cfg.get("dungeon.測試帳號.vks"), list))
+    # ★ exe 的腳本下拉標籤帶「（內建）」、py 不帶 → 存的一律是檔名、載入用檔名比
+    #   （2026-09-05 [[exe-vs-py-differences]]）。
+    tab.files.blockSignals(True)
+    tab.files.clear()
+    tab.files.addItem("吞噬之間（內建）", r"X:\assets\副本\吞噬之間.json")
+    tab.files.addItem("無限塔（內建）", r"X:\assets\副本\無限塔.json")
+    tab.files.setCurrentIndex(1)
+    tab.files.blockSignals(False)
+    tab._save_settings()
+    ck("★ 腳本存的是檔名不是標籤（exe 標籤帶（內建））",
+       _cfg.get("dungeon.測試帳號.script") == "無限塔",
+       str(_cfg.get("dungeon.測試帳號.script")))
+    ck("　舊 config 存了標籤字也找得到", tab._script_index("無限塔（內建）") == 1)
+    ck("　py 那種不帶標的名字也找得到", tab._script_index("吞噬之間") == 0)
     ck("　記得上次是哪一台分身",
        _cfg.get("dungeon.last_account") == "測試帳號")
     # ⚠ `_load_settings` 會先照「目前選的腳本檔」重建下拉；測試裡沒有真的檔，

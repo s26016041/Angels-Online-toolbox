@@ -666,7 +666,10 @@ class DungeonTab(BaseTab):
         （[[config-set-needs-save]]，已經復發兩次）。"""
         if self._loading:
             return
-        config.set(self._key("script"), self.files.currentText())
+        # ★ 存**檔名**不存下拉的標籤字：exe 的標籤帶「（內建）／（自己做的）」、py 不帶，
+        #   存標籤的話在 exe 選的腳本換到 py 就找不到（退回第一個）—— 2026-09-05 查
+        #   exe/py 差異時抓到（[[exe-vs-py-differences]]）。
+        config.set(self._key("script"), self._script_stem())
         config.set(self._key("vks"), self._picked_keys())
         # ⛔ 「從第幾步開始」的開關與步驟**不存**（使用者 2026-09-05：不需要紀錄）。
         config.set(self._key("loop"), bool(self.loop_cb.isChecked()))
@@ -683,7 +686,7 @@ class DungeonTab(BaseTab):
         self._loading = True
         try:
             name = str(config.get(self._key("script"), "") or "")
-            i = self.files.findText(name)
+            i = self._script_index(name)
             if i >= 0:
                 self.files.setCurrentIndex(i)
             self._refresh_start_box()
@@ -707,6 +710,25 @@ class DungeonTab(BaseTab):
                 self._sync_key_btn()
         finally:
             self._loading = False
+
+    def _script_stem(self) -> str:
+        """目前選的腳本的**檔名**（不含 .json、不含 exe 標的來源字樣）。"""
+        from pathlib import Path
+        data = self.files.currentData()
+        return Path(str(data)).stem if data else ""
+
+    def _script_index(self, name: str) -> int:
+        """config 記的腳本名 → 下拉索引；找不到回 -1。
+        舊 config 可能存的是標籤字（exe 帶「（內建）」），把那截去掉再比檔名。"""
+        from pathlib import Path
+        want = (name or "").split("（")[0].strip()
+        if not want:
+            return -1
+        for i in range(self.files.count()):
+            data = self.files.itemData(i)
+            if data and Path(str(data)).stem == want:
+                return i
+        return self.files.findText(name)
 
     def _refresh_start_box(self) -> None:
         """把「從第幾步開始」的下拉重建成目前這份腳本的步驟。
