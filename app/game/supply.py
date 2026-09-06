@@ -1464,7 +1464,11 @@ JUMP_TRIES = 3         # 回程趴趴GO 最多重送幾次（★ 送出去≠到
 JUMP_WAIT = 10.0       # 每次送出後等落地的上限（秒）
 WALK_TIMEOUT = 90.0    # 走到 NPC 的上限（秒）——銀行常在城另一頭（永夜城實測離落點 176 格），
                        #   放寬保險；正常走到就提早返回，只有真的走不到才等滿
-ARRIVE_TILES = 2       # 離商人這麼近就算真的到了
+ARRIVE_TILES = 2       # 離商人這麼近（曼哈頓格數）就算真的到了
+# ⚠⚠ 只看這個門檻會**站著磨滿逾時**（2026-09-06 黑狐實錄，見 _walk_to_npc）：
+#   Navigator 直線 ≤ navigate.ARRIVE(3.0) 就當「到了」不再動，而 2.9 格斜角的
+#   曼哈頓距離是 3 > 2 → 兩邊誰也不讓，人站在 NPC 旁邊等 30 秒才回。
+#   所以 _walk_to_npc 也認 Navigator 那個直線門檻（兩個條件任一成立就算到）。
 # ★ 主城人多，navigate 常被玩家擋在最後幾格。但 0x54A520 點 NPC 會自己走完
 #   最後那段再互動，所以走到「夠近」就交給它收尾（不必硬擠到 2 格）。
 NEAR_ENOUGH = 8
@@ -1576,6 +1580,19 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
     ⚠ 為什麼要這樣：實測**和風林銀行** .MPC 表座標 (322,148) 離真實 NPC (326,140) 差 12 格
       （表座標不準），而真實 NPC 那格**不可走**——直接走任一個都不對。改成「走到 NPC 旁
       最近的可走格」才穩（買/修也共用這支，本來就更可靠）。每 ~2 秒重規劃一次。
+
+    ★★★ 到達判定要跟 Navigator **同一把尺**（2026-09-06 使用者：「銀行／維修前面卡很久，
+      等很久後他沒動就能講到話；藥水商人卻秒說到話」，黑狐永夜城實測定案）：
+      · 銀行／維修商離出發點 >90 格還沒串流 → `_engage_npc` 走這支；目標格＝NPC 本格。
+      · `navigate.Navigator.step` 直線 ≤ ARRIVE(3.0) 就回「到了」**什麼都不做**；
+        舊寫法這裡只認曼哈頓 ≤ ARRIVE_TILES(2) → 人 1.9 秒走到 (138.5,163.5)、離 NPC
+        直線 2.89／曼哈頓 3 → **站著磨滿 30 秒逾時**才靠 best≤NEAR_ENOUGH 回 True，
+        回去 `_engage_npc` 下一輪 TryAct 0.13 秒就開對話 —— 就是「沒動就能講到話」。
+      · 藥水商人離維修商 27 格已串流，`_engage_npc` 走 `_approach_npc`（遊戲尋路、
+        卡 3 秒就回）→ 秒開。這支現在也照那把尺：**直線 ≤ navigate.ARRIVE 就回**，
+        剩下交 TryAct／`_approach_npc` 收尾。
+      · 同類坑一起補：Navigator 舉 `exhausted`（路線走完、終點格地形圖跟實際站得住的
+        格不一致）之後 step() 也是什麼都不做 → 人停了就回，不空轉到逾時。
     """
     g, _ = terrain.load(scanner)              # 地形圖載一次（同一張圖不變）
     nav = None
@@ -1613,13 +1630,20 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
                 nav.reset((float(target[0]), float(target[1])))
         d = abs(round(here[0]) - target[0]) + abs(round(here[1]) - target[1])
         best = min(best, d)
-        if d <= ARRIVE_TILES:
+        # ★ 兩把尺任一到了就算到：曼哈頓 ≤ ARRIVE_TILES，或 Navigator 自己那把
+        #   直線 ≤ navigate.ARRIVE（它到了就不再動，我們再等也只是空等）。
+        if d <= ARRIVE_TILES or math.hypot(here[0] - target[0],
+                                           here[1] - target[1]) <= navigate.ARRIVE:
             return True
         nav.step(scanner, mover, pf + 8, float(target[0]), float(target[1]))
         if nav.stuck:
             nav = navigate.Navigator()
             nav.reset((float(target[0]), float(target[1])))
             time.sleep(0.3)
+        elif nav.exhausted and not entity.is_walking(scanner, pf + 8):
+            # 路線走完、人也停了、但還沒進到達圈 → Navigator 不會再動（不重算），
+            # 留在這裡只會磨到逾時。夠近就交給呼叫端收尾，不夠近才算沒走到。
+            return best <= NEAR_ENOUGH
         time.sleep(0.2)
     return best <= NEAR_ENOUGH
 

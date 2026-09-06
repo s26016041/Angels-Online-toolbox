@@ -222,6 +222,7 @@ class FakeNav:
 
     def __init__(self):
         self.stuck = False
+        self.exhausted = False          # 真的 Navigator 有這個旗（_walk_to_npc 會看）
 
     def reset(self, goal):
         FakeNav.goals.append(goal)
