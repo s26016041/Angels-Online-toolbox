@@ -29,7 +29,6 @@ class FarmSettingsDialog(QDialog):
         row = QHBoxLayout()
         self.fill_spin = QSpinBox()
         self.fill_spin.setRange(farmsettings.FILL_MIN, farmsettings.FILL_MAX)
-        self.fill_spin.setSuffix(" %")
         self.fill_spin.setValue(farmsettings.fill_pct())
         self.fill_spin.setToolTip(
             "回城補給時，精靈頁放的藥水買到負重的這個比例。\n"
@@ -37,6 +36,7 @@ class FarmSettingsDialog(QDialog):
         fit_spin(self.fill_spin)
         self.fill_spin.valueChanged.connect(self._on_fill_changed)
         row.addWidget(self.fill_spin)
+        row.addWidget(QLabel("%"))         # 單位放框外（使用者 2026-09-06：% 不該在輸入框）
         row.addStretch(1)
         form.addRow("補給時藥水買到負重", row)
         v.addLayout(form)
