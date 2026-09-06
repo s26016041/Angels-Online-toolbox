@@ -6,12 +6,13 @@
     上午：Navigator 直線 ≤ ARRIVE(3.0) 就當「到了」，_walk_to_npc 只認曼哈頓 ≤2 → 站著磨 30 秒。
     晚上：改「站上目標格」又太緊 —— 商人本人站在可走格時目標＝他本格、伺服器不給站 → 磨 30 秒；
           而棕櫚基地銀行唯一能講話的格被玩家「倉用4」站著 → 磨 4 輪 51~72 秒才放棄。
-規則（現行，實測 TryAct kind 2：講得到話＝tile 方框 |Δx|≤TALK_BOX_X(5) 且 |Δy|≤TALK_BOX_Y(3)）：
-    ① 人已在互動方框內 → **馬上**回 True，一步都不走
-    ② 框外 → 目標＝框內可走、沒人站、離 NPC 最近的格；走進框就回（不必站上目標格）
+規則（現行，使用者 2026-09-06 定「直接走到離 NPC 最近可到的格」）：
+    ① 人已站在離 NPC 最近可到的格 → **馬上**回 True，一步都不走
+    ② 還沒 → 目標＝離 NPC 最近、可走、我這區走得到的格，**站上去**才回（不用講話方框當停止線）
     ③ Navigator 舉 exhausted 且人停了 → 夠近回 True、太遠回 False，兩種都馬上回
-    ④ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回「離 NPC 最近的可走格」照走
-    ⚠ 人牆偵測（框內的格被別人站著就放棄）使用者 2026-09-06 定刪掉，沒有這條規格。
+    ④ NPC 周圍沒有可到格 → 退回「離 NPC 最近的可走格」照走
+    ⑤ 最後一步走不進去（目標格被人站著、Navigator 說 stuck）→ 離目標 ≤2 格就算到，不磨 30 秒
+    ⚠ 人牆偵測（被別人站著就放棄）使用者定刪掉，沒有這條規格。
 ⚠ 純離線：假時鐘／假地形圖／假 Navigator／假實體，**只換 I/O，判斷邏輯跑真的**。
 """
 from __future__ import annotations
@@ -128,30 +129,28 @@ def in_box():
 
 BOX_TILES = {(139, 161), (138, 163), (135, 159)}     # 框內可走的格
 
-print("① 人已在互動方框內（tile (138,163) vs NPC (137,161)）：馬上回 True，一步不走")
-POS[:] = [138.5, 163.46875]
+print("① 人已站在離 NPC 最近可到的格 (139,161)：馬上回 True，一步不走")
+POS[:] = [139.5, 161.46875]
 REACH.clear(); REACH.update(BOX_TILES)
 FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
-check("這個站位真的在方框內", in_box())
 ok, dt = run()
 check("回 True", ok is True)
 check("★ 一步都沒走（step 沒被叫到）", FakeNav.steps == 0, f"steps={FakeNav.steps}")
 check("⛔ 不磨逾時：<1 秒就回", dt < 1.0, f"花了 {dt:.1f} 秒")
 
 print()
-print("② 8 格外：目標＝框內離 NPC 最近的空格 (139,161)，走進框就回")
+print("② 8 格外：目標＝離 NPC 最近可到的格 (139,161)，站上去才回")
 POS[:] = [145.0, 161.0]
 FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
-check("出發點在框外", not in_box())
 ok, dt = run()
 check("回 True", ok is True)
-check("★ 目標是框內最近的空格中心 (139.5,161.5)", FakeNav.last_goal == (139.5, 161.5),
+check("★ 目標是離 NPC 最近可到格的中心 (139.5,161.5)", FakeNav.last_goal == (139.5, 161.5),
       f"實得 {FakeNav.last_goal}")
 check("★ Navigator 收到 arrive=NPC_ARRIVE", FakeNav.last_arrive == supply.NPC_ARRIVE,
       f"實得 {FakeNav.last_arrive}")
 check("有真的在走（step 被叫到）", FakeNav.steps >= 3, f"steps={FakeNav.steps}")
-check("★ 進框就回（不必站上目標格）", in_box(), f"停在 {POS}")
-check("不磨逾時", dt < 5.0, f"花了 {dt:.1f} 秒")
+check("★ 站上那格才回（不是進方框就停）", (int(POS[0]), int(POS[1])) == (139, 161), f"停在 {POS}")
+check("不磨逾時", dt < 8.0, f"花了 {dt:.1f} 秒")
 
 print()
 print("③ Navigator 舉 exhausted（路線走完卻沒進框）且人停了：馬上回，不空轉")
@@ -174,6 +173,22 @@ ok, dt = run()
 check("回 True（站上最近可走格）", ok is True)
 check("目標是 (143,161) 的中心", FakeNav.last_goal == (143.5, 161.5), f"實得 {FakeNav.last_goal}")
 check("停在目標格上", (int(POS[0]), int(POS[1])) == (143, 161), f"停在 {POS}")
+
+print()
+print("⑤ ★ 最後一步走不進去（目標格被人站著）：Navigator 說 stuck、離目標 ≤2 格 → 算到，不磨 30 秒")
+POS[:] = [140.5, 161.46875]                   # 目標 (139,161) 的隔壁格
+REACH.clear(); REACH.update(BOX_TILES)
+FakeNav.MOVE, FakeNav.EXHAUST = 0.0, False
+_orig_step = FakeNav.step
+def _stuck_step(self, *a, **k):
+    r = _orig_step(self, *a, **k)
+    self.stuck = True                          # 走不動 → 導航器舉 stuck
+    return r
+FakeNav.step = _stuck_step
+ok, dt = run()
+FakeNav.step = _orig_step
+check("回 True（旁邊這格就是實際最近可到的格）", ok is True)
+check("⛔ 馬上回（<3 秒，舊寫法磨 30 秒）", dt < 3.0, f"花了 {dt:.1f} 秒")
 
 print()
 if FAILS:
