@@ -89,8 +89,18 @@ class Grid:
         return (0 <= x < self.w and 0 <= y < self.h
                 and bool(self.open[y][x]))
 
-    def clear_line(self, a, b) -> bool:
+    def _walk_fn(self, avoid):
+        """可走判定；`avoid`（格子集合）給了就把那些格當成暫時不可走。
+        ★ 給導航器「被擋住 → 換一條路」用（navigate.AVOID_AHEAD）：地形圖本身
+          不改，只在這一次算路時把腳前被擋的幾格扣掉。"""
+        if not avoid:
+            return self.walkable
+        base = self.walkable
+        return lambda x, y: base(x, y) and (x, y) not in avoid
+
+    def clear_line(self, a, b, avoid=None) -> bool:
         """兩格之間直線是不是全程可走（含不許鑽對角縫）。"""
+        walk = self._walk_fn(avoid)
         x0, y0 = a
         x1, y1 = b
         dx, dy = abs(x1 - x0), abs(y1 - y0)
@@ -99,7 +109,7 @@ class Grid:
         err = dx - dy
         x, y = x0, y0
         while (x, y) != (x1, y1):
-            if not self.walkable(x, y):
+            if not walk(x, y):
                 return False
             e2 = err * 2
             stepped_x = stepped_y = False
@@ -113,9 +123,9 @@ class Grid:
                 stepped_y = True
             # 斜著跨過去時，兩個「肩膀」都要能走，不然是鑽牆縫
             if stepped_x and stepped_y:
-                if not (self.walkable(x - sx, y) and self.walkable(x, y - sy)):
+                if not (walk(x - sx, y) and walk(x, y - sy)):
                     return False
-        return self.walkable(x1, y1)
+        return walk(x1, y1)
 
     def reachable(self, tx: int, ty: int) -> set | None:
         """所有「走得到 (tx,ty)」的格子（同一個連通區）。那一格不能走回 None。
@@ -166,7 +176,7 @@ class Grid:
 
     # -- 最短路 -------------------------------------------------------
     def route(self, start, goal, relax: int = GOAL_RELAX,
-              max_cost: float | None = None):
+              max_cost: float | None = None, avoid=None):
         """A* 最短路，回傳每一格的座標；走不到回 None。
 
         ⚠ 起點也可能落在牆上（角色站在只有一格寬的縫裡、或剛傳送完），
@@ -177,6 +187,9 @@ class Grid:
             （整張圖最壞約 20ms）。打怪時每 0.2 秒問一次、五台一起跑，
             這個上限就是把最壞情況壓下來的閘門，順便也符合語意：
             繞了直線距離好幾倍還到不了的怪，本來就不該追。
+        avoid: 這一次算路要**繞開**的格子集合（被人牆／怪擋住的那幾格，見
+          navigate.AVOID_AHEAD）。只影響這次的路，地形圖本身不動；
+          起點／終點的放寬不看它（起點就是人站的格、終點本來就不會被標）。
         """
         s = self.nearest_open(int(start[0]), int(start[1]), relax)
         g = self.nearest_open(int(goal[0]), int(goal[1]), relax)
@@ -194,7 +207,7 @@ class Grid:
         openq = [(hf(sx, sy), 0.0, sx, sy)]
         came: dict = {}
         best = {(sx, sy): 0.0}
-        walk = self.walkable
+        walk = self._walk_fn(avoid)
         push, pop = heapq.heappush, heapq.heappop
         while openq:
             _f, g0, x, y = pop(openq)
@@ -226,13 +239,14 @@ class Grid:
         return None
 
     def waypoints(self, start, goal, relax: int = GOAL_RELAX,
-                  max_cost: float | None = None):
+                  max_cost: float | None = None, avoid=None):
         """最短路 → **轉折點**（每段之間直線可通、且不超過 MAX_SEG 格）。
 
         直接把 A* 的每一格都當路徑點沒有意義（一段 180 格就是 180 個點）；
         拉直之後通常只剩幾個點，每一段交給遊戲的走路常式一次走完。
+        avoid 同 `route()`；拉直時也要繞開那些格（不然直線一拉又穿回人牆）。
         """
-        path = self.route(start, goal, relax, max_cost)
+        path = self.route(start, goal, relax, max_cost, avoid)
         if not path:
             return None
         out = []
@@ -240,7 +254,8 @@ class Grid:
         i = 1
         while i < len(path):
             seg = math.dist(path[anchor], path[i])
-            if seg > MAX_SEG or not self.clear_line(path[anchor], path[i]):
+            if seg > MAX_SEG or not self.clear_line(path[anchor], path[i],
+                                                    avoid):
                 out.append(path[i - 1])
                 anchor = i - 1
             i += 1

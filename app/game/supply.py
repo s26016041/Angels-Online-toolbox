@@ -1494,6 +1494,8 @@ ARRIVE_TILES = 2       # 離商人這麼近（曼哈頓格數）就算真的到�
 # ★ 主城人多，navigate 常被玩家擋在最後幾格。但 0x54A520 點 NPC 會自己走完
 #   最後那段再互動，所以走到「夠近」就交給它收尾（不必硬擠到 2 格）。
 NEAR_ENOUGH = 8
+# 導航器連換路都走不動（被堵死）→ 停這麼久再從頭規劃（人牆會走開；原樣立刻重走沒意義）
+BLOCKED_PAUSE = 1.5
 
 
 def _player_tile(scanner):
@@ -1659,9 +1661,12 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
             return True
         nav.step(scanner, mover, pf + 8, float(target[0]), float(target[1]))
         if nav.stuck:
-            nav = navigate.Navigator()
+            # ★ 導航器被擋住時**自己會換路**（navigate.AVOID_AHEAD：把腳前那幾格扣掉
+            #   再算）；走到這裡＝換了幾條都沒往前、或根本沒別條路（單格寬走道被堵）。
+            #   同一條原樣再走沒意義（使用者 2026-09-06「沒靠近就直接換」）→ 停一拍
+            #   讓擋路的人／怪走開，再從頭規劃；磨到 timeout 才放棄這一段。
+            time.sleep(BLOCKED_PAUSE)
             nav.reset((float(target[0]), float(target[1])))
-            time.sleep(0.3)
         elif nav.exhausted and not entity.is_walking(scanner, pf + 8):
             # 路線走完、人也停了、但還沒進到達圈 → Navigator 不會再動（不重算），
             # 留在這裡只會磨到逾時。夠近就交給呼叫端收尾，不夠近才算沒走到。

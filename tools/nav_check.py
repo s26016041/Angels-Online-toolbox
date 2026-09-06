@@ -62,12 +62,20 @@ class FakeGrid:
     def __init__(self, wp):
         self.wp = wp
         self.asked = 0
+        self.last_avoid = None   # 最近一次算路被要求繞開的格
+        self.corridor = False    # True＝單格寬走道：要繞開任何格就沒有路
 
-    def waypoints(self, start, goal):
+    def waypoints(self, start, goal, avoid=None):
         self.asked += 1
+        self.last_avoid = set(avoid) if avoid else None
         if self.wp is None:
             return None
+        if avoid and self.corridor:
+            return None
         ahead = [p for p in self.wp if p[0] > start[0] + 0.5]
+        if avoid and ahead:
+            # 繞路：第一個轉折點偏到旁邊一列（跟真的 A* 一樣「換一條路」）
+            ahead = [(ahead[0][0], ahead[0][1] + 2)] + ahead[1:]
         return ahead or None
 
 
@@ -243,6 +251,83 @@ step(nav)
 check("★ 路算出來了 → stuck 清掉、真的送走路",
       nav.stuck is False and nav.stuck_reason == "" and SENT == [(10.5, 0.5)],
       f"stuck={nav.stuck} reason={nav.stuck_reason!r} sent={SENT}")
+
+print("⑧ ★ 被擋住 → 換一條路，不是原樣重算（2026-09-06「同樣東西重試沒意義」）")
+nav, maps = build(GOAL_WP)
+SENT.clear()
+POS[0], POS[1] = 0.0, 0.0
+WALKING[0] = False
+for _ in range(60):                     # 站著不動，推到第一次「被擋」為止
+    step(nav)
+    if nav._replans:
+        break
+check("腳前往轉折點方向的 3 格記成暫時不可走",
+      nav._avoid == {(1, 0), (2, 0), (3, 0)}, f"實得 {sorted(nav._avoid)}")
+check("　訊息講的是「換一條路」", "換一條路" in nav.note, f"實得「{nav.note}」")
+n0 = len(SENT)
+step(nav)                               # 重算那一拍
+check("★ 重算時把那幾格交給地形圖繞開",
+      maps.grid.last_avoid == {(1, 0), (2, 0), (3, 0)},
+      f"實得 {maps.grid.last_avoid}")
+check("★ 走的是**另一條路**（第一個轉折點變了）",
+      len(SENT) == n0 + 1 and SENT[-1] == (10.5, 2.5),
+      f"實得 {SENT[n0:]}")
+check("　沒有被判 stuck", nav.stuck is False)
+pt = nav._route[nav._ri]
+step(nav, pt[0], pt[1])                 # 真的繞到那個轉折點
+check("走到轉折點＝繞過去了 → 清掉暫時不可走的格", nav._avoid == set(),
+      f"實得 {sorted(nav._avoid)}")
+
+print("⑨ ★ 單格寬走道被堵（扣掉腳前的格就沒有路）→ 馬上判 blocked，不是 grid")
+nav, maps = build(GOAL_WP)
+maps.grid.corridor = True
+SENT.clear()
+POS[0], POS[1] = 0.0, 0.0
+for _ in range(60):
+    step(nav)
+    if nav._replans:
+        break
+step(nav)                               # 帶 avoid 重算 → 沒有路
+check("判 stuck", nav.stuck is True)
+check("理由是 blocked（暫時被擋，不是地形沒路）", nav.stuck_reason == "blocked",
+      f"實得 {nav.stuck_reason!r}")
+check("訊息講得出「繞不開」", "繞不開" in nav.note, f"實得「{nav.note}」")
+check("暫時不可走的格已清掉（人牆會走開，下次原圖重算）", nav._avoid == set())
+n0 = len(SENT)
+step(nav)                               # 呼叫端沒 reset 也要自癒：原圖重算照走
+check("下一拍原圖算得出路 → stuck 清掉、照走",
+      nav.stuck is False and len(SENT) == n0 + 1, f"stuck={nav.stuck} sent={SENT[n0:]}")
+
+print("⑩ 轉折點就是目標、就在 3.5 格外 → 目標格不准被標成不可走")
+nav, maps = build([(3, 0)])
+SENT.clear()
+POS[0], POS[1] = 0.0, 0.0
+for _ in range(60):
+    CLOCK.t += 0.31
+    nav.step(None, MOVER, object(), 3.5, 0.0)
+    if nav._replans:
+        break
+check("只標中間兩格，目標格 (3,0) 不標", nav._avoid == {(1, 0), (2, 0)},
+      f"實得 {sorted(nav._avoid)}")
+
+print("⑪ 真的地形圖：帶 avoid 算路要繞開那些格；走道被堵要回 None")
+from app.game import terrain                                  # noqa: E402
+open_rows = [bytearray([1] * 10) for _ in range(5)]
+grid = terrain.Grid(10, 5, 0, open_rows)
+bad = {(1, 2), (2, 2), (3, 2)}
+path = grid.route((0, 2), (9, 2), avoid=bad)
+check("算得出路", bool(path))
+check("路不經過被擋的格", path is not None and not (set(path) & bad),
+      f"實得 {path}")
+wp = grid.waypoints((0, 2), (9, 2), avoid=bad)
+check("轉折點拉直後直線也不穿過被擋的格",
+      wp is not None and all(grid.clear_line(wp[i], wp[i + 1], bad)
+                             for i in range(len(wp) - 1)), f"實得 {wp}")
+check("不帶 avoid 行為不變（直線一段到底）",
+      grid.waypoints((0, 2), (9, 2)) == [(9, 2)], f"實得 {grid.waypoints((0, 2), (9, 2))}")
+corridor = terrain.Grid(10, 1, 0, [bytearray([1] * 10)])
+check("單格寬走道扣掉一格 → 沒有路（None）",
+      corridor.waypoints((0, 0), (9, 0), avoid={(4, 0)}) is None)
 
 print()
 if FAILS:
