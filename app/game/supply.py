@@ -133,8 +133,6 @@ TALK_RANGE = 4.0           # 送對話選項前，人必須停著且離 NPC 這�
 #   ⚠ 若哪天實機看到 Chebyshev 3 也開了，要改的是這個數字（或那隻 NPC 的 +0x1A4 不是 1）。
 TALK_BOX = 2
 OFF_ACT_SIZE = 0x1A4       # 實體互動框邊長（TryAct 距離檢查用；NPC 實測 1）
-# 走不到／不能講話的原因（npc_id → 說明），給 run_bank/run_repair/run_buy 的失敗訊息用。
-_WALK_WHY: dict[int, str] = {}
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
 #   開倉庫序列（跟買/修同一套點 NPC → talkaction，只差選項碼）：
@@ -473,41 +471,18 @@ def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int,
             and y0 <= ty0 + npc_size - 1 and y0 + side - 1 >= ty0)
 
 
-def _occupied_tiles(scanner, me_ent: int) -> dict:
-    """別的實體（玩家／NPC 的身體）站著的格 → 名字。
-
-    ★ 人牆是**動態障礙**，地形圖看不到（2026-09-06 棕櫚基地銀行：唯一能講話的格
-      (185,137) 被玩家「倉用4」站著，遊戲 path_to 說走得到、真走就被推開）。
-    沒名字又不是 NPC 編號的（特效／光點）不算身體。
-    """
-    out: dict = {}
-    for e in _scene_entities(scanner):
-        if e == me_ent:
-            continue
-        t = _ent_tile_f(scanner, e)
-        if t is None:
-            continue
-        num = _u32(scanner, e + OFF_NPC_NUM)
-        name = _npc_name(scanner, e)
-        if not (0 < num < 0x10000) and not (name.strip() and name.isprintable()):
-            continue
-        out.setdefault((int(t[0]), int(t[1])), name or f"#{num}")
-    return out
-
-
 def _talk_spots(scanner, g, here, npc_ent: int, npc_tile):
-    """互動方框（TALK_BOX）內、可走且從我這區走得到的格。
-
-    回 (空著的格依離 NPC 距離排序, 被別人站著的 {格: 名字})。NPC 本格不算（伺服器不給站）。
+    """互動方框（TALK_BOX）內、可走且從我這區走得到的格，依離 NPC 距離排序。
+    NPC 本格不算（伺服器不給站）。
+    ⚠ 不看別的玩家站不站在那（使用者 2026-09-06 定：人牆偵測刪掉）——站著就走不上去，
+      由走路逾時／點不開的重試自己磨，不提前放棄。
     """
     reach = _reach_around(g, here) or set()
     pf = move.pathfinder_this(scanner)
-    me_ent = pf + 8 if pf else 0
-    me_size = _act_size(scanner, me_ent)
+    me_size = _act_size(scanner, pf + 8 if pf else 0)
     npc_size = _act_size(scanner, npc_ent)
-    occ = _occupied_tiles(scanner, me_ent)
     r = TALK_BOX + max(me_size, npc_size)
-    free, taken = [], {}
+    out = []
     for dx in range(-r, r + 1):
         for dy in range(-r, r + 1):
             c = (npc_tile[0] + dx, npc_tile[1] + dy)
@@ -515,19 +490,15 @@ def _talk_spots(scanner, g, here, npc_ent: int, npc_tile):
                 continue
             if not _in_talk_box(c, me_size, npc_tile, npc_size):
                 continue
-            if c in occ:
-                taken[c] = occ[c]
-                continue
-            free.append((math.hypot(dx, dy), c))
-    free.sort()
-    return [c for _, c in free], taken
+            out.append((math.hypot(dx, dy), c))
+    out.sort()
+    return [c for _, c in out]
 
 
 def _box_status(scanner, npc_id: int, npc_ent: int):
     """我現在講不講得到這隻 NPC、框內還有哪些格能站。地形圖／座標讀不到回 None。
 
-    回 {"in_box": 我已在互動方框內, "free": [可走且沒人站的格…], "taken": {格: 誰站著},
-        "npc_tile": NPC 的 tile}。
+    回 {"in_box": 我已在互動方框內, "free": [框內可走的格，近的在前…], "npc_tile": NPC 的 tile}。
     """
     g, _why = terrain.load(scanner)
     pf, here = _player_tile(scanner)
@@ -538,20 +509,8 @@ def _box_status(scanner, npc_id: int, npc_ent: int):
     me_tile = (int(here[0]), int(here[1]))
     in_box = _in_talk_box(me_tile, _act_size(scanner, pf + 8),
                           npc_tile, _act_size(scanner, npc_ent))
-    free, taken = _talk_spots(scanner, g, here, npc_ent, npc_tile)
-    return {"in_box": in_box, "free": free, "taken": taken, "npc_tile": npc_tile}
-
-
-def _note_taken(npc_id: int, taken: dict) -> None:
-    c, who = next(iter(taken.items()))
-    _WALK_WHY[npc_id] = (f"能講到話的格 {c} 被玩家「{who}」站著"
-                         + (f"（框內 {len(taken)} 格全被佔）" if len(taken) > 1 else ""))
-
-
-def engage_why(npc_id: int) -> str:
-    """上一次 _engage_npc／_walk_to_npc 放棄這隻 NPC 的原因（取一次就清）；沒有回空字串。"""
-    why = _WALK_WHY.pop(npc_id, "")
-    return f"；{why}" if why else ""
+    free = _talk_spots(scanner, g, here, npc_ent, npc_tile)
+    return {"in_box": in_box, "free": free, "npc_tile": npc_tile}
 
 
 def _dist_to_npc(scanner, npc_id: int):
@@ -780,10 +739,9 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             # ★★★ 先問「講得到話的方框」（TALK_BOX，反組譯 0x508DF6）：
             #   · 已在框內 → 直接點（TryAct 當拍就開）。
             #   · 框內有可走又沒人站的格 → 用地形圖走過去站上（_walk_to_npc 認得方框）。
-            #   · 框內能站的格**全被別的玩家站著** → 官方尋路也走不進去、TryAct 永遠開不了
-            #     （2026-09-06 棕櫚基地銀行：唯一那格被「倉用4」站著，舊寫法磨 4 輪 51~72 秒）
-            #     → 馬上放棄、把原因講出來（engage_why），別再點。
             #   · 框內根本沒有可走格（地形圖跟遊戲對不上）→ 照舊靠近再點，讓 TryAct 自己試。
+            #   ⚠ 框內的格被別的玩家站著（棕櫚基地銀行唯一那格被「倉用4」站著）不特別處理
+            #     （使用者 2026-09-06 定：人牆偵測刪掉）——走不上去就照走路逾時／重點的節奏磨。
             box = _box_status(scanner, npc_id, found[0])
             if box is not None and box["in_box"]:
                 pass
@@ -791,9 +749,6 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                 _walk_to_npc(mover, scanner, npc_id, fallback, 12.0)
                 walked = True
                 found = find_npc(scanner, npc_id) or found
-            elif box is not None and box["taken"]:
-                _note_taken(npc_id, box["taken"])
-                return False
             else:
                 gap = _npc_gap(scanner, npc_id)
                 if gap is not None and gap > CLICK_RANGE:
@@ -1033,7 +988,7 @@ def run_repair(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
         return False, "跳板沒裝好"
     if not _engage_npc(mover, scanner, npc_id, fallback,
                        [TALK_REPAIR], WND_REPAIR):
-        return False, f"開維修視窗失敗（靠不夠近或對話碼不對{engage_why(npc_id)}）"
+        return False, "開維修視窗失敗（靠不夠近或對話碼不對）"
     time.sleep(0.3)
     if not _repair_all(mover, scanner):
         _repair_close(mover, scanner)          # 開了窗就算失敗也把它關掉，別卡住
@@ -1191,7 +1146,7 @@ def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
                        [TALK_BANK_USE, TALK_BANK_SELF], BANK_WND):
         _bank_close(mover, scanner)
         return False, (f"倉庫開不起來（停在離銀行約 {_dist_to_npc(scanner, npc_id)} 格；"
-                       f"靠不夠近或對話碼不對{engage_why(npc_id)}）")
+                       "靠不夠近或對話碼不對）")
 
     deposited = 0
     capped = False
@@ -1382,7 +1337,7 @@ def _run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, 
 
         if not _engage_npc(mover, scanner, npc_id, fallback,
                            [TALK_BUY], WND_SALE):
-            return False, f"開交易失敗（靠不夠近或對話碼不對{engage_why(npc_id)}）"
+            return False, "開交易失敗（靠不夠近或對話碼不對）"
         time.sleep(0.2)
 
         ok, msg = buy(mover, scanner, need)
@@ -1555,7 +1510,7 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
 
         if not _engage_npc(mover, scanner, npc_id, fallback,
                            [TALK_BUY], WND_SALE):
-            return False, f"開交易失敗（靠不夠近或對話碼不對{engage_why(npc_id)}）"
+            return False, "開交易失敗（靠不夠近或對話碼不對）"
         time.sleep(0.2)
         moved = False
         for what, bid, qty in need:
@@ -1823,8 +1778,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
             anchor = _npc_tile(scanner, npc_id) or tuple(fallback)
             newt = None
             if g is not None and found:
-                # NPC 看得到 → 目標＝方框內離他最近、可走、沒人站的格；全被站著就別走了
-                #   （原因記進 _WALK_WHY，呼叫端講出來）；框內沒可走格才退回「最近可走格」。
+                # NPC 看得到 → 目標＝方框內離他最近、可走的格；框內沒可走格才退回「最近可走格」。
                 st = _box_status(scanner, npc_id, found[0])
                 if st is not None:
                     box_npc = (st["npc_tile"], _act_size(scanner, pf + 8),
@@ -1833,9 +1787,6 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
                         return True
                     if st["free"]:
                         newt = st["free"][0]
-                    elif st["taken"]:
-                        _note_taken(npc_id, st["taken"])
-                        return False
             if newt is None and g is not None:
                 reach = _reach_around(g, here)
                 newt = _nearest_reachable(reach, anchor) if reach else None

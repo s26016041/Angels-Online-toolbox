@@ -10,8 +10,8 @@
     ① 人已在互動方框內 → **馬上**回 True，一步都不走
     ② 框外 → 目標＝框內可走、沒人站、離 NPC 最近的格；走進框就回（不必站上目標格）
     ③ Navigator 舉 exhausted 且人停了 → 夠近回 True、太遠回 False，兩種都馬上回
-    ④ 框內能站的格全被別的玩家站著 → **馬上**回 False，原因（誰站著）由 engage_why 講出來
-    ⑤ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回「離 NPC 最近的可走格」照走
+    ④ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回「離 NPC 最近的可走格」照走
+    ⚠ 人牆偵測（框內的格被別人站著就放棄）使用者 2026-09-06 定刪掉，沒有這條規格。
 ⚠ 純離線：假時鐘／假地形圖／假 Navigator／假實體，**只換 I/O，判斷邏輯跑真的**。
 """
 from __future__ import annotations
@@ -57,7 +57,6 @@ NPC_ID = 1890
 POS = [138.5, 163.46875]              # 人站的地方（可變）
 PF = 0x30DD11D0
 REACH = set()                         # 假地形圖「我這區走得到」的格（各測試自己設）
-OCCUPIED: dict = {}                   # 假的人牆：{格: 名字}
 
 
 class FakeGrid:
@@ -113,7 +112,6 @@ supply._npc_tile = lambda sc, nid: NPC
 supply.find_npc = lambda sc, nid: (0x1000, None)                 # NPC 一直看得到
 supply._ent_tile_f = lambda sc, e: (NPC[0] + 0.5, NPC[1] + 0.5)
 supply._act_size = lambda sc, e: 1
-supply._occupied_tiles = lambda sc, me: dict(OCCUPIED)
 
 
 def run(timeout=30.0):
@@ -133,7 +131,6 @@ BOX_TILES = {(139, 161), (138, 163), (135, 159)}     # 框內可走的格（Cheb
 print("① 人已在互動方框內（tile (138,163) vs NPC (137,161)）：馬上回 True，一步不走")
 POS[:] = [138.5, 163.46875]
 REACH.clear(); REACH.update(BOX_TILES)
-OCCUPIED.clear()
 FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
 check("這個站位真的在方框內", in_box())
 ok, dt = run()
@@ -169,21 +166,7 @@ check("太遠 → False（不能假裝到了）", ok is False)
 check("一樣馬上回", dt < 2.0, f"花了 {dt:.1f} 秒")
 
 print()
-print("④ ★ 框內能站的格全被玩家站著（棕櫚基地「倉用4」）：馬上回 False，原因講得出誰")
-POS[:] = [145.0, 161.0]
-OCCUPIED.clear(); OCCUPIED.update({t: "倉用4" for t in BOX_TILES})
-FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
-ok, dt = run()
-check("回 False", ok is False)
-check("⛔ 馬上回（舊寫法磨 30 秒逾時再點 3 輪）", dt < 1.0, f"花了 {dt:.1f} 秒")
-check("一步都沒走", FakeNav.steps == 0, f"steps={FakeNav.steps}")
-why = supply.engage_why(NPC_ID)
-check("原因寫著是「倉用4」站著", "倉用4" in why and "全被佔" in why, f"實得 {why!r}")
-check("原因取一次就清", supply.engage_why(NPC_ID) == "")
-OCCUPIED.clear()
-
-print()
-print("⑤ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回離 NPC 最近的可走格照走")
+print("④ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回離 NPC 最近的可走格照走")
 POS[:] = [145.0, 161.0]
 REACH.clear(); REACH.update({(141, 161), (150, 161)})
 FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
