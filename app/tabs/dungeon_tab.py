@@ -203,6 +203,13 @@ WND_TTL = 0.3
 #     所以一秒一次（4%）就好，晚一秒關掉沒差；⛔ 別改成每拍。
 STRAY_WND_POLL = 1.0
 STRAY_WND_GAP = 2.0
+# ★★ 順移／換圖之後這麼久內**不收**對話框（2026-09-06 黑狐 11:49 遊戲崩潰實錄）：第 35 步
+#   踩傳點的同一秒跳出對話框 → 我們送 OnMessageClose（＝messageclose）→ 傳點順移把視窗物件
+#   收掉了、`WND_MESSAGE` 還是舊代號 → 遊戲那支查不到物件沒防呆 → 讀 NULL 崩潰
+#   （error.log EIP=0x5D498A ESI=0，見 talkwnd 檔頭）。talkwnd.close_page 送前已改成當場
+#   驗物件，這裡再避開最危險的那一段：一拍有順移、或順移／換圖後 STRAY_HOLD 秒內，
+#   遊戲正在拆視窗，晚幾秒再收沒差。
+STRAY_HOLD = 2.0
 # ★★ 點下去之後這麼久都沒有任何對話反應 → **再點一次**（使用者 2026-09-02
 #   回報「最後一個石頭雕像點不到」）。點一次就不管是不對的：遊戲是「自己走
 #   過去才開對話」，路上被怪打斷、被人擋住、剛好在走都會讓那一下落空 ——
@@ -1194,6 +1201,7 @@ class DungeonTab(BaseTab):
         self._stray_t = 0.0          # 多久之後再看一次有沒有不該出現的對話框
         self._stray_closed = 0.0     # 上次關掉的時刻（節流）
         self._stray_n = 0            # 這一趟關掉幾次（狀態列／紀錄）
+        self._stray_hold = 0.0       # 這個時刻之前不收對話框（順移／換圖後，見 STRAY_HOLD）
         self._grid_t = 0.0           # 還有多久重讀地形圖
         # ---- 全自動循環（見 PARTY_MODES 的說明）----
         self._loop = False           # 要不要循環（＝「循環打副本」勾選框，見 _round_plan）
@@ -1911,6 +1919,7 @@ class DungeonTab(BaseTab):
           拿它在新圖上算可達區與路徑全是垃圾（見 MAP_SETTLE 的說明）。
         """
         self._map_settle = time.monotonic() + MAP_SETTLE
+        self._stray_hold = time.monotonic() + STRAY_HOLD   # 遊戲正在拆舊圖的視窗
         self._state, self._player = None, None      # 等下一次（強制全）掃描重抓
         self._pos_prev, self._pos_t = None, 0.0     # 新圖第一拍不准判成順移
         self._me = None
@@ -2643,6 +2652,7 @@ class DungeonTab(BaseTab):
         self._drop_target()
         self._scan.force_full(self._pid)       # 順移到新的一區＝新的怪
         self._hopeless.clear()
+        self._stray_hold = time.monotonic() + STRAY_HOLD   # 遊戲正在拆舊區的視窗，別碰
         self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f})")
         self._next()
         return True
@@ -2701,6 +2711,9 @@ class DungeonTab(BaseTab):
         if self._stray_t > 0:
             return False
         self._stray_t = STRAY_WND_POLL
+        # ★ 這一拍有順移、或順移／換圖後 STRAY_HOLD 秒內 → 不收（遊戲正在拆視窗，見 STRAY_HOLD）
+        if self._jumped or time.monotonic() < self._stray_hold:
+            return False
         try:
             present = talkwnd.window_present(self._sc)
         except Exception:                                # noqa: BLE001

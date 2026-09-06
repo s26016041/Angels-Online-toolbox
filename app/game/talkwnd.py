@@ -28,8 +28,19 @@ r"""對話視窗：把「無異議對話」那一頁**按確定過掉**。
 參數是**視窗代號**：UI 腳本呼叫的是 `messageclose(WND_MESSAGE)`，那個值
 就是 Lua 全域 `WND_MESSAGE`（`lua.globals_of` 讀得到）。
 ⚠⚠ `WND_MESSAGE` 非 0 **不代表對話開著**（[[lua-readonly-inspect]] 實測 5 台
-  有 3 台沒在對話也非 0）——所以這支**不判斷開沒開**，由呼叫端決定何時叫；
-  沒開著時叫下去，遊戲那支自己會因為查不到東西而不送（`test edi,edi; je`）。
+  有 3 台沒在對話也非 0）——所以這支**不判斷開沒開**，由呼叫端決定何時叫。
+
+⛔⛔ **代號查不到視窗物件時叫下去遊戲會當**（2026-09-06 黑狐 11:49 實錄，error.log
+  EIP=0x5D498A、ESI=0）。送包本體 `0x5D494D`（反組譯）：
+      edi = 查自己的實體([[世界+8]+0x2A90])  → `test edi,edi; je`   ← 只有這個有防呆
+      esi = GetWindowById([世界+0xC], 代號)  → **沒驗 NULL**
+      mov eax,[esi+0xB0]                      ← 代號殘留、物件已被銷毀 → 讀 NULL → 崩潰
+  以前這裡寫「查不到東西自己會不送」是看錯暫存器（那個 je 守的是玩家物件）。
+  什麼時候會踩到：`WND_MESSAGE` 還留著舊代號、視窗物件卻已經被遊戲收掉 —— 傳點順移／
+  換區那一瞬間遊戲自己 destroy 所有視窗就是實錄那次（跳出對話框的同一秒人被傳走）。
+  → `close_page` 送之前**當場**用 `_wnd_object` 重驗（照 GetWindowById 走一遍，物件在
+  而且 [物件+0x10] 對得上代號）才叫；查不到就不送（回 False 說原因）。
+  Lua `OnMessageClose` 最後也是叫同一支，所以 Lua 那條路一樣先驗。
 """
 from __future__ import annotations
 
@@ -351,6 +362,10 @@ def close_page(mover, scanner) -> tuple[bool, str]:
     if not wnd:
         # 讀不到就別亂送 —— 參數錯的話遊戲會拿去查別的視窗。
         return False, f"⚠ 讀不到 {WND_NAME}（對話視窗代號）"
+    # ⛔ 代號查不到物件 → 不送（送了遊戲會當，見檔頭）。純讀、當場驗（CLAUDE.md：
+    #   交給遊戲的位址送出前當場重讀重驗）。
+    if _wnd_object(scanner) is None:
+        return False, "對話視窗物件已不在（代號殘留）→ 不送確定（送了遊戲會當）"
     try:
         ok, _val = lua.call(mover, scanner, CLOSE_BTN_FN, int(wnd))
         if ok:
@@ -364,6 +379,8 @@ def close_page(mover, scanner) -> tuple[bool, str]:
     world = _u32(scanner, spot.world_ptr)
     if not world or not 0x10000 < world < 0x7FFF0000:
         return False, "⚠ 讀不到世界物件"
+    if _wnd_object(scanner) is None:                       # 退化路一樣要驗（同一支函式）
+        return False, "對話視窗物件已不在（代號殘留）→ 不送確定（送了遊戲會當）"
     with mover.lock:
         ok = mover.call_sync(spot.close_fn, int(wnd), ecx=world,
                              timeout=CALL_TIMEOUT) is not None

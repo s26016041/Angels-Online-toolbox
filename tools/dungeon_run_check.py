@@ -945,6 +945,30 @@ def main() -> int:
        not tab._ensure_mover(0.1) and tab.status.text() == "")
     tab._mover = object()
     ck("　跳板活著 → 什麼都不做", tab._ensure_mover(0.1))
+
+    # ★★ 2026-09-06 黑狐 11:49 遊戲崩潰實錄：踩傳點同一秒跳出對話框 → 我們送確定 →
+    #   順移把視窗物件收掉、代號殘留 → 遊戲 messageclose 讀 NULL 崩潰。
+    #   → 一拍有順移、或順移／換圖後 STRAY_HOLD 秒內不收對話框。
+    print("\n順移那一瞬間不收對話框")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    fake = FakeTalk([(1, 2, 3)])
+    wire(tab, fake)
+    fake.opened()                                   # 對話框跳出來了（沒在等對話）
+    tab._stray_t, tab._jumped = 0.0, (10.0, 10.0)   # 這一拍剛順移
+    ck("★★ 這一拍有順移 → 不收對話框", not tab._stray_dialog(0.1) and fake.closes == 0)
+    tab._stray_t, tab._jumped = 0.0, None
+    tab._stray_hold = time.monotonic() + 2.0        # 剛順移／換圖完
+    ck("　順移／換圖後 STRAY_HOLD 秒內 → 不收", not tab._stray_dialog(0.1) and fake.closes == 0)
+    tab._stray_t, tab._stray_hold = 0.0, 0.0
+    ck("　過了保留期 → 照收（確定鈕＋離開互動）",
+       tab._stray_dialog(0.1) and fake.closes == 1 and tab.left == [1],
+       f"closes={fake.closes} left={tab.left}")
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]},
+                    {"do": "clear"}], pos=(201.0, 41.0))
+    tab._jumped = (50.0, 50.5)
+    run(tab, 0.1)
+    ck("　傳點過了 → 之後 STRAY_HOLD 秒不收對話框",
+       tab._i == 1 and tab._stray_hold > time.monotonic() + 1.0, f"hold={tab._stray_hold:.1f}")
     tab._pos_prev = None
     ck("★ 第一拍沒有基準 → 不判", not tab._check_jump((50.0, 10.0)))
 
