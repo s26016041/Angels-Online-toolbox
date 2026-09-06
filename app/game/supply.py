@@ -124,6 +124,17 @@ NUDGE_STEPS = (0.0, 1.5, 3.0)
 #   的「人真的到了」閘門才送選項。
 CLICK_RANGE = 2.5          # 發互動包前，先自己走到離 NPC 這麼近
 TALK_RANGE = 4.0           # 送對話選項前，人必須停著且離 NPC 這麼近（櫃檯後 NPC 留裕度）
+# ★★★ 真正的「講得到話」判定（2026-09-06 反組譯 TryAct 0x506784 → 距離檢查 0x508DF6）：
+#   不是直線距離，是 **tile 方框相交**：我的框邊長＝我[+0x1A4]＋2·range、目標框邊長＝
+#   目標[+0x1A4]，tile＝世界座標/32 取整；size 都是 1 時就是 |Δx|≤range 且 |Δy|≤range。
+#   range 從一張小表查（0x506913 附近 0x80020202），沒讀出數值；實測 6 個點全對得上 2：
+#     開：買東西 Chebyshev 2（2.0 格）、永夜城銀行 (138,163)vs(137,161)＝2（2.92 格）
+#     不開：棕櫚基地銀行 (184,136)/(185,136)/(186,136) vs (183,139)＝3（3.19／3.63／4.26 格）
+#   ⚠ 若哪天實機看到 Chebyshev 3 也開了，要改的是這個數字（或那隻 NPC 的 +0x1A4 不是 1）。
+TALK_BOX = 2
+OFF_ACT_SIZE = 0x1A4       # 實體互動框邊長（TryAct 距離檢查用；NPC 實測 1）
+# 走不到／不能講話的原因（npc_id → 說明），給 run_bank/run_repair/run_buy 的失敗訊息用。
+_WALK_WHY: dict[int, str] = {}
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
 #   開倉庫序列（跟買/修同一套點 NPC → talkaction，只差選項碼）：
@@ -443,6 +454,106 @@ def _npc_gap(scanner, npc_id: int):
     return math.hypot(here[0] - nt[0], here[1] - nt[1])
 
 
+def _act_size(scanner, ent: int) -> int:
+    """實體的互動框邊長（[+0x1A4]）；讀不到／不合理當 1（NPC 與玩家實測都是 1）。"""
+    v = _u32(scanner, ent + OFF_ACT_SIZE) if ent else 0
+    return v if 0 < v < 16 else 1
+
+
+def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int,
+                 rng: int = TALK_BOX) -> bool:
+    """0x508DF6 原樣移植：兩個 tile 方框有沒有相交（見 TALK_BOX 的說明）。"""
+    if rng <= 0:
+        return True
+    side = me_size + 2 * rng
+    half = side // 2
+    x0, y0 = me_tile[0] - half, me_tile[1] - half
+    tx0, ty0 = npc_tile[0] - npc_size // 2, npc_tile[1] - npc_size // 2
+    return (x0 <= tx0 + npc_size - 1 and x0 + side - 1 >= tx0
+            and y0 <= ty0 + npc_size - 1 and y0 + side - 1 >= ty0)
+
+
+def _occupied_tiles(scanner, me_ent: int) -> dict:
+    """別的實體（玩家／NPC 的身體）站著的格 → 名字。
+
+    ★ 人牆是**動態障礙**，地形圖看不到（2026-09-06 棕櫚基地銀行：唯一能講話的格
+      (185,137) 被玩家「倉用4」站著，遊戲 path_to 說走得到、真走就被推開）。
+    沒名字又不是 NPC 編號的（特效／光點）不算身體。
+    """
+    out: dict = {}
+    for e in _scene_entities(scanner):
+        if e == me_ent:
+            continue
+        t = _ent_tile_f(scanner, e)
+        if t is None:
+            continue
+        num = _u32(scanner, e + OFF_NPC_NUM)
+        name = _npc_name(scanner, e)
+        if not (0 < num < 0x10000) and not (name.strip() and name.isprintable()):
+            continue
+        out.setdefault((int(t[0]), int(t[1])), name or f"#{num}")
+    return out
+
+
+def _talk_spots(scanner, g, here, npc_ent: int, npc_tile):
+    """互動方框（TALK_BOX）內、可走且從我這區走得到的格。
+
+    回 (空著的格依離 NPC 距離排序, 被別人站著的 {格: 名字})。NPC 本格不算（伺服器不給站）。
+    """
+    reach = _reach_around(g, here) or set()
+    pf = move.pathfinder_this(scanner)
+    me_ent = pf + 8 if pf else 0
+    me_size = _act_size(scanner, me_ent)
+    npc_size = _act_size(scanner, npc_ent)
+    occ = _occupied_tiles(scanner, me_ent)
+    r = TALK_BOX + max(me_size, npc_size)
+    free, taken = [], {}
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            c = (npc_tile[0] + dx, npc_tile[1] + dy)
+            if c == npc_tile or c not in reach:
+                continue
+            if not _in_talk_box(c, me_size, npc_tile, npc_size):
+                continue
+            if c in occ:
+                taken[c] = occ[c]
+                continue
+            free.append((math.hypot(dx, dy), c))
+    free.sort()
+    return [c for _, c in free], taken
+
+
+def _box_status(scanner, npc_id: int, npc_ent: int):
+    """我現在講不講得到這隻 NPC、框內還有哪些格能站。地形圖／座標讀不到回 None。
+
+    回 {"in_box": 我已在互動方框內, "free": [可走且沒人站的格…], "taken": {格: 誰站著},
+        "npc_tile": NPC 的 tile}。
+    """
+    g, _why = terrain.load(scanner)
+    pf, here = _player_tile(scanner)
+    nt = _ent_tile_f(scanner, npc_ent)
+    if g is None or pf is None or here is None or nt is None:
+        return None
+    npc_tile = (int(nt[0]), int(nt[1]))
+    me_tile = (int(here[0]), int(here[1]))
+    in_box = _in_talk_box(me_tile, _act_size(scanner, pf + 8),
+                          npc_tile, _act_size(scanner, npc_ent))
+    free, taken = _talk_spots(scanner, g, here, npc_ent, npc_tile)
+    return {"in_box": in_box, "free": free, "taken": taken, "npc_tile": npc_tile}
+
+
+def _note_taken(npc_id: int, taken: dict) -> None:
+    c, who = next(iter(taken.items()))
+    _WALK_WHY[npc_id] = (f"能講到話的格 {c} 被玩家「{who}」站著"
+                         + (f"（框內 {len(taken)} 格全被佔）" if len(taken) > 1 else ""))
+
+
+def engage_why(npc_id: int) -> str:
+    """上一次 _engage_npc／_walk_to_npc 放棄這隻 NPC 的原因（取一次就清）；沒有回空字串。"""
+    why = _WALK_WHY.pop(npc_id, "")
+    return f"；{why}" if why else ""
+
+
 def _dist_to_npc(scanner, npc_id: int):
     """角色現在離某 NPC 幾格（給失敗訊息用，方便對距離）；算不出回 '?'。"""
     gap = _npc_gap(scanner, npc_id)
@@ -466,7 +577,7 @@ def _dialog_token(scanner):
 
 
 def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
-                 again=None) -> bool:
+                 again=None, give_up_still: float | None = None) -> bool:
     """點 NPC 後等對話框**真的開了**：DIALOG_WND 變成「非 0 且 ≠ baseline」才算。
 
     ★ 用「值變了」不用「非 0」（見 _dialog_token 的坑）；視窗代號是遞增配號
@@ -492,6 +603,7 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
     t0 = time.time()
     last_walk = t0
     last_click = t0                      # 進來之前呼叫端剛點過一次
+    still_at, still_t = None, t0
     while time.time() - t0 < timeout:
         now = _dialog_token(scanner)
         if now is not None and now != baseline and now != 0:
@@ -500,6 +612,16 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
             if time.time() - last_click >= CLICK_REPEAT:
                 last_click = time.time()
                 again()
+            # ★ give_up_still（2026-09-06 棕櫚基地銀行實錄）：人在互動方框外時 TryAct 唯一的
+            #   作用是「用官方尋路走一步」——位置一直沒動就是官方尋路也走不過去（人牆／櫃檯），
+            #   再點 12 秒也只是白等（實測三輪 12 秒 30 發全空）。位置這麼久沒變就回去換站位。
+            if give_up_still and pf:
+                p = entity.read_pos(scanner, pf + 8)
+                if p is not None and (still_at is None or math.hypot(
+                        p[0] - still_at[0], p[1] - still_at[1]) > 0.3):
+                    still_at, still_t = p, time.time()
+                elif p is not None and time.time() - still_t > give_up_still:
+                    return False
         elif pf and entity.is_walking(scanner, pf + 8):
             last_walk = time.time()
         elif time.time() - last_walk > DIALOG_STILL_GRACE:
@@ -655,14 +777,32 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             walked = True
             found = find_npc(scanner, npc_id) or found
         else:
-            gap = _npc_gap(scanner, npc_id)
-            if gap is not None and gap > CLICK_RANGE:
-                # ★★ 人還沒到位，**不准發互動包**（使用者 8/19 晚實機回報：太遠發包
-                #   「人沒到對話先開」→ 對話開著不能移動、我要買東西也沒人理）
-                #   → 先自己走進 CLICK_RANGE 內。
-                _approach_npc(mover, scanner, npc_id)
+            # ★★★ 先問「講得到話的方框」（TALK_BOX，反組譯 0x508DF6）：
+            #   · 已在框內 → 直接點（TryAct 當拍就開）。
+            #   · 框內有可走又沒人站的格 → 用地形圖走過去站上（_walk_to_npc 認得方框）。
+            #   · 框內能站的格**全被別的玩家站著** → 官方尋路也走不進去、TryAct 永遠開不了
+            #     （2026-09-06 棕櫚基地銀行：唯一那格被「倉用4」站著，舊寫法磨 4 輪 51~72 秒）
+            #     → 馬上放棄、把原因講出來（engage_why），別再點。
+            #   · 框內根本沒有可走格（地形圖跟遊戲對不上）→ 照舊靠近再點，讓 TryAct 自己試。
+            box = _box_status(scanner, npc_id, found[0])
+            if box is not None and box["in_box"]:
+                pass
+            elif box is not None and box["free"]:
+                _walk_to_npc(mover, scanner, npc_id, fallback, 12.0)
                 walked = True
                 found = find_npc(scanner, npc_id) or found
+            elif box is not None and box["taken"]:
+                _note_taken(npc_id, box["taken"])
+                return False
+            else:
+                gap = _npc_gap(scanner, npc_id)
+                if gap is not None and gap > CLICK_RANGE:
+                    # ★★ 人還沒到位，**不准發互動包**（使用者 8/19 晚實機回報：太遠發包
+                    #   「人沒到對話先開」→ 對話開著不能移動、我要買東西也沒人理）
+                    #   → 先自己走進 CLICK_RANGE 內。
+                    _approach_npc(mover, scanner, npc_id)
+                    walked = True
+                    found = find_npc(scanner, npc_id) or found
             # ⚠ 2026-09-03 拿掉「已在距離內但站著沒動過腳 → 先穿過 NPC 再點」：
             #   那是 8/14 為了**舊的**點擊（自動走路狀態機）50% 白站才加的暖身動作。
             #   改叫 TryAct 之後，站著不動點下去實測 0.13 秒對話框就開（黑狐 永夜城
@@ -674,8 +814,10 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         #   貼著點＝3 秒沒開就換站位重點，不要傻等 12 秒（使用者 8/27 回報）。
         #   從遠處點＝客戶端要自己走過去，那才需要 12 秒。
         gap_now = _npc_gap(scanner, npc_id)
+        box_now = _box_status(scanner, npc_id, npc_ent)
+        in_box = bool(box_now and box_now["in_box"])
         wait_dlg = (DIALOG_NEAR_TIMEOUT
-                    if gap_now is not None and gap_now <= CLICK_RANGE + 1.0
+                    if in_box or (gap_now is not None and gap_now <= CLICK_RANGE + 1.0)
                     else DIALOG_TIMEOUT)
         if not _click_npc(mover, scanner, npc_ent):  # TryAct：到位就開對話，沒到就走一步
             time.sleep(0.5)
@@ -690,7 +832,8 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         if base is None:                             # 安全退化：全域讀不到才走盲等照送
             _wait_still(scanner, timeout=12.0)
             time.sleep(TALK_GAP)
-        elif _wait_dialog(scanner, base, wait_dlg, again=_again):
+        elif _wait_dialog(scanner, base, wait_dlg, again=_again,
+                          give_up_still=None if in_box else 2.5):
             if not _wait_arrival(scanner, npc_id):
                 fails += 1                           # 對話開了但人沒到位（被擋/太遠）
                 continue                             # → 絕不送購買選項，調位置重來
@@ -890,7 +1033,7 @@ def run_repair(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
         return False, "跳板沒裝好"
     if not _engage_npc(mover, scanner, npc_id, fallback,
                        [TALK_REPAIR], WND_REPAIR):
-        return False, "開維修視窗失敗（靠不夠近或對話碼不對）"
+        return False, f"開維修視窗失敗（靠不夠近或對話碼不對{engage_why(npc_id)}）"
     time.sleep(0.3)
     if not _repair_all(mover, scanner):
         _repair_close(mover, scanner)          # 開了窗就算失敗也把它關掉，別卡住
@@ -1048,7 +1191,7 @@ def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
                        [TALK_BANK_USE, TALK_BANK_SELF], BANK_WND):
         _bank_close(mover, scanner)
         return False, (f"倉庫開不起來（停在離銀行約 {_dist_to_npc(scanner, npc_id)} 格；"
-                       "靠不夠近或對話碼不對）")
+                       f"靠不夠近或對話碼不對{engage_why(npc_id)}）")
 
     deposited = 0
     capped = False
@@ -1239,7 +1382,7 @@ def _run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, 
 
         if not _engage_npc(mover, scanner, npc_id, fallback,
                            [TALK_BUY], WND_SALE):
-            return False, "開交易失敗（靠不夠近或對話碼不對）"
+            return False, f"開交易失敗（靠不夠近或對話碼不對{engage_why(npc_id)}）"
         time.sleep(0.2)
 
         ok, msg = buy(mover, scanner, need)
@@ -1412,7 +1555,7 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
 
         if not _engage_npc(mover, scanner, npc_id, fallback,
                            [TALK_BUY], WND_SALE):
-            return False, "開交易失敗（靠不夠近或對話碼不對）"
+            return False, f"開交易失敗（靠不夠近或對話碼不對{engage_why(npc_id)}）"
         time.sleep(0.2)
         moved = False
         for what, bid, qty in need:
@@ -1486,13 +1629,17 @@ JUMP_TRIES = 3         # 回程趴趴GO 最多重送幾次（★ 送出去≠到
 JUMP_WAIT = 10.0       # 每次送出後等落地的上限（秒）
 WALK_TIMEOUT = 90.0    # 走到 NPC 的上限（秒）——銀行常在城另一頭（永夜城實測離落點 176 格），
                        #   放寬保險；正常走到就提早返回，只有真的走不到才等滿
-ARRIVE_TILES = 2       # 離商人這麼近（曼哈頓格數）就算真的到了
-# ⚠⚠ 只看這個門檻會**站著磨滿逾時**（2026-09-06 黑狐實錄，見 _walk_to_npc）：
-#   Navigator 直線 ≤ navigate.ARRIVE(3.0) 就當「到了」不再動，而 2.9 格斜角的
-#   曼哈頓距離是 3 > 2 → 兩邊誰也不讓，人站在 NPC 旁邊等 30 秒才回。
-#   所以 _walk_to_npc 也認 Navigator 那個直線門檻（兩個條件任一成立就算到）。
-# ★ 主城人多，navigate 常被玩家擋在最後幾格。但 0x54A520 點 NPC 會自己走完
-#   最後那段再互動，所以走到「夠近」就交給它收尾（不必硬擠到 2 格）。
+# ★★★ 要**真的站上**「離 NPC 最近的可走格」才算到（2026-09-06 黑狐 棕櫚基地 銀行實跑三趟）：
+#   銀行小姐站在櫃檯裡的孤島格，外面最近的可走格離她 2.83 格（正面）；對話距離
+#   差一格就是開跟不開的差別。舊寫法兩把尺（曼哈頓 ≤2、或 Navigator 直線 ≤3.0）
+#   任一到了就算到 → 人停在目標格的斜角鄰格（離目標 1.58）＝離 NPC **4.26** 格 →
+#   TryAct 30 發開不了、官方尋路走不進櫃檯、`_nudge_toward` 候選全在櫃檯裡
+#   → 4 輪 51 秒「倉庫開不起來」。同一把尺（1.0）同時交給 Navigator（arrive=）
+#   跟這裡的判定，才不會重演 9/6 上午那個「Navigator 停了我們還在等」的 30 秒坑。
+NPC_ARRIVE = 0.75      # Navigator 的到達圈：離目標格**中心**這麼近才停（鄰格中心是 1.0 起跳，
+                       #   站定的座標一律在格中心 ±0.05，所以 0.75 分得出「站上了」跟「隔壁格」）
+# ★ 主城人多，navigate 常被玩家擋在最後幾格。但 TryAct 點 NPC 會自己走完
+#   最後那段再互動，所以路線走完（exhausted）而人在這麼近之內就交給它收尾。
 NEAR_ENOUGH = 8
 # 導航器連換路都走不動（被堵死）→ 停這麼久再從頭規劃（人牆會走開；原樣立刻重走沒意義）
 BLOCKED_PAUSE = 1.5
@@ -1524,6 +1671,27 @@ def _wing_count(scanner):
         return int(inventory.count_by_type(scanner, h[0], recall.RECALL_ITEM))
     except Exception:                                      # noqa: BLE001
         return None
+
+
+LAND_READY_WAIT = 15.0     # 落地後等「玩家物件＋整袋背包」讀得到的上限（秒）
+
+
+def _wait_ready(scanner, timeout: float = LAND_READY_WAIT) -> bool:
+    """換圖落地後等到「玩家物件讀得到座標、背包整袋讀得完」才回 True；逾時回 False。
+
+    ⚠ 場景編號換了 ≠ 人站穩了：實測（黑狐 2026-09-06）翼用掉 0.5 秒場景就變、
+      但玩家物件 NULL／背包半袋還要再一陣子。任何「落地就讀背包做決定」的地方
+      都要先過這裡，不然就是 bag-false-empty-guards 復發（讀不到被當成沒有／整趟放棄）。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        pf, here = _player_tile(scanner)
+        if pf and here is not None:
+            _items, complete = bag.scan(scanner)
+            if complete:
+                return True
+        time.sleep(0.3)
+    return False
 
 
 def _wait_map_change(scanner, from_map: int, timeout: float):
@@ -1561,16 +1729,24 @@ def _nearest_reachable(reach, target, max_r: int = 50):
     tx, ty = target
     if (tx, ty) in reach:
         return (tx, ty)
-    for r in range(1, max_r + 1):
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                if max(abs(dx), abs(dy)) != r:      # 只掃這一圈的外框
-                    continue
-                c = (tx + dx, ty + dy)
-                if c in reach:
-                    return c
+    # ★★ 一定要挑**直線距離**最近的（2026-09-06 黑狐 棕櫚基地 銀行實跑）：舊寫法
+    #   「一圈圈往外掃、同一圈碰到第一個就回」是照 Chebyshev 圈掃，第 3 圈的
+    #   **斜角 (3,3)** 直線 4.24 格排在**正面 (3,0)** 3.0 格前面被先碰到 → 人停在
+    #   離銀行 4.26 格的櫃檯斜角，TryAct 30 發開不了、官方尋路也走不進去、
+    #   `_nudge_toward` 五個候選格全在櫃檯裡 → 磨滿 4 輪 51 秒「倉庫開不起來」。
+    #   對話距離差 1 格就是開跟不開的差別，這裡不能省。
+    #   reach 一區最多兩三萬格，一次線性掃 ~10ms；`_walk_to_npc` 每 2 秒才問一次。
+    best, bd = None, None
+    for (x, y) in reach:
+        if abs(x - tx) > max_r or abs(y - ty) > max_r:
+            continue
+        d = (x - tx) * (x - tx) + (y - ty) * (y - ty)
+        if bd is None or d < bd or (d == bd and (y, x) < (best[1], best[0])):
+            bd, best = d, (x, y)
+    if best is not None:
+        return best
     # 錨點離所有可走格都 > max_r（罕見）→ 全掃找最近的，保證有解（reach 非空）
-    best, bd = None, 1 << 30
+    bd = 1 << 30
     for (x, y) in reach:
         d = abs(x - tx) + abs(y - ty)
         if d < bd:
@@ -1613,8 +1789,10 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
         直線 2.89／曼哈頓 3 → **站著磨滿 30 秒逾時**才靠 best≤NEAR_ENOUGH 回 True，
         回去 `_engage_npc` 下一輪 TryAct 0.13 秒就開對話 —— 就是「沒動就能講到話」。
       · 藥水商人離維修商 27 格已串流，`_engage_npc` 走 `_approach_npc`（遊戲尋路、
-        卡 3 秒就回）→ 秒開。這支現在也照那把尺：**直線 ≤ navigate.ARRIVE 就回**，
-        剩下交 TryAct／`_approach_npc` 收尾。
+        卡 3 秒就回）→ 秒開。
+      · ⚠ 9/6 晚再改：「直線 ≤ navigate.ARRIVE(3.0) 就回」太鬆 —— 目標格本身已經是
+        離 NPC 最近的可走格，再差 3 格就講不到話（棕櫚基地銀行：停在 4.26 格失敗三趟）。
+        現在 Navigator 跟這裡都用 NPC_ARRIVE(1.0) 同一把尺，人要真的站上目標格。
       · 同類坑一起補：Navigator 舉 `exhausted`（路線走完、終點格地形圖跟實際站得住的
         格不一致）之後 step() 也是什麼都不做 → 人停了就回，不空轉到逾時。
     """
@@ -1624,19 +1802,41 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
     best = 999
     t0 = last_plan = 0.0
     t0 = time.time()
+    box_npc = None                            # NPC 串流後：(npc_tile, my size, npc size)
     while time.time() - t0 < timeout:
         pf, here = _player_tile(scanner)
         if pf is None or here is None:
             time.sleep(0.3)
             continue
+        # ★★★ 已經站進「講得到話的方框」就算到（TALK_BOX）：目標格本來就只是框裡
+        #   離 NPC 最近的一格，硬要站上去反而會磨（商人本人站在可走格 → 目標＝他本格 →
+        #   伺服器不給站 → 30 秒逾時，2026-09-06 run4 買東西實錄）。
+        if box_npc is not None and _in_talk_box((int(here[0]), int(here[1])), box_npc[1],
+                                                box_npc[0], box_npc[2]):
+            return True
         now = time.time()
         if target is None or now - last_plan > 2.0:      # 每 ~2s 重規劃目標
             last_plan = now
             # 錨點：NPC 串流進來就用它的真座標（準），否則用 .MPC 表座標把人帶近。
             # 兩者那格都常不可走 → 一律走「離錨點最近的可走格」。
+            found = find_npc(scanner, npc_id)
             anchor = _npc_tile(scanner, npc_id) or tuple(fallback)
             newt = None
-            if g is not None:
+            if g is not None and found:
+                # NPC 看得到 → 目標＝方框內離他最近、可走、沒人站的格；全被站著就別走了
+                #   （原因記進 _WALK_WHY，呼叫端講出來）；框內沒可走格才退回「最近可走格」。
+                st = _box_status(scanner, npc_id, found[0])
+                if st is not None:
+                    box_npc = (st["npc_tile"], _act_size(scanner, pf + 8),
+                               _act_size(scanner, found[0]))
+                    if st["in_box"]:
+                        return True
+                    if st["free"]:
+                        newt = st["free"][0]
+                    elif st["taken"]:
+                        _note_taken(npc_id, st["taken"])
+                        return False
+            if newt is None and g is not None:
                 reach = _reach_around(g, here)
                 newt = _nearest_reachable(reach, anchor) if reach else None
             if newt is None:
@@ -1649,24 +1849,27 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
                 newt = target if target is not None else tuple(fallback)
             if newt != target:
                 target = newt
+                # 目標＝那一格的**中心**（角色座標也是格中心：186.5 是第 186 格）
+                goal = (target[0] + 0.5, target[1] + 0.5)
                 best = 999
                 nav = navigate.Navigator()
-                nav.reset((float(target[0]), float(target[1])))
-        d = abs(round(here[0]) - target[0]) + abs(round(here[1]) - target[1])
+                nav.reset(goal)
+        d = math.hypot(here[0] - goal[0], here[1] - goal[1])
         best = min(best, d)
-        # ★ 兩把尺任一到了就算到：曼哈頓 ≤ ARRIVE_TILES，或 Navigator 自己那把
-        #   直線 ≤ navigate.ARRIVE（它到了就不再動，我們再等也只是空等）。
-        if d <= ARRIVE_TILES or math.hypot(here[0] - target[0],
-                                           here[1] - target[1]) <= navigate.ARRIVE:
+        # ★ 到了＝**站上目標格**（tile 相等；講不講得到話是看 tile 的，見 TALK_BOX）。
+        #   NPC 沒串流（目標只是表座標附近的可走格）才用 Navigator 那把 NPC_ARRIVE 尺；
+        #   Navigator 也用同一把（arrive=），它停下來的時候我們一定已經回去了，不會互相等。
+        if (int(here[0]), int(here[1])) == tuple(target) or (
+                box_npc is None and d <= NPC_ARRIVE):
             return True
-        nav.step(scanner, mover, pf + 8, float(target[0]), float(target[1]))
+        nav.step(scanner, mover, pf + 8, goal[0], goal[1], arrive=NPC_ARRIVE)
         if nav.stuck:
             # ★ 導航器被擋住時**自己會換路**（navigate.AVOID_AHEAD：把腳前那幾格扣掉
             #   再算）；走到這裡＝換了幾條都沒往前、或根本沒別條路（單格寬走道被堵）。
             #   同一條原樣再走沒意義（使用者 2026-09-06「沒靠近就直接換」）→ 停一拍
             #   讓擋路的人／怪走開，再從頭規劃；磨到 timeout 才放棄這一段。
             time.sleep(BLOCKED_PAUSE)
-            nav.reset((float(target[0]), float(target[1])))
+            nav.reset(goal)
         elif nav.exhausted and not entity.is_walking(scanner, pf + 8):
             # 路線走完、人也停了、但還沒進到達圈 → Navigator 不會再動（不重算），
             # 留在這裡只會磨到逾時。夠近就交給呼叫端收尾，不夠近才算沒走到。
@@ -1771,7 +1974,14 @@ def run_full_supply(mover, scanner, say=None,
                 return False, (f"翼用掉了但等了 {WING_WAIT + WING_WAIT_LATE:.0f} 秒"
                                "地圖還沒變（回程可能失敗）")
         note(f"回到 {scene.scene_name(home)}")
-        time.sleep(1.0)                   # 落地穩定一下
+        # ★★ 落地要等「人跟背包都讀得到」才准動（2026-09-06 黑狐實跑探針）：
+        #   翼用掉 0.5 秒場景編號就換了，但那一瞬間玩家物件還是 NULL、背包半袋
+        #   → 舊寫法固定睡 1 秒就往下走 → 「背包讀不到，跳過銀行」＋「背包讀不到，
+        #   先不動」→ 整趟什麼都沒做、翼白燒一張、趴趴GO 第一發也送在人還沒站穩
+        #   的時候（10 秒沒落地才重送第二發）。這是 bag-false-empty-guards 那一族：
+        #   讀取端擋住了沒做錯事，但呼叫端要等到讀得到再問，不是問一次就放棄整趟。
+        if not _wait_ready(scanner):
+            note(f"⚠ 落地 {LAND_READY_WAIT:.0f} 秒人／背包還讀不到，照舊往下（各步驟自己會擋）")
 
     # ── 回程收尾（★★ 不准射後不理）────────────────────────────
     # 「送出去≠到得了」是這個專案抓過的真根因（memory jump-back-channel-fix，

@@ -124,7 +124,7 @@ seen: list[float] = []
 AGAIN_SEEN: list = []
 
 
-def fake_wait_dialog(sc, base, timeout=supply.DIALOG_TIMEOUT, again=None):
+def fake_wait_dialog(sc, base, timeout=supply.DIALOG_TIMEOUT, again=None, **_kw):
     seen.append(timeout)
     AGAIN_SEEN.append(again)
     return False                                 # 一律「沒開」，逼它換站位
@@ -238,14 +238,14 @@ supply._npc_tile = lambda sc, nid: None                  # 銀行 NPC 還沒串�
 supply._player_tile = lambda sc: (0x3000, (213.5, 53.5))  # round → (214,54)：不可走
 REAL_WALK(MOVER, SC, 1890, (129, 168), timeout=0.5)
 check("站的格不可走 → 問旁邊一圈取最大區，目標＝離銀行最近的可走格 (129,166)",
-      bool(FakeNav.goals) and FakeNav.goals[0] == (129.0, 166.0), f"實得 {FakeNav.goals[:2]}")
+      bool(FakeNav.goals) and FakeNav.goals[0] == (129.5, 166.5), f"實得 {FakeNav.goals[:2]}")
 check("全程沒把孤島的表座標 (129,168) 當目標",
-      all(g != (129.0, 168.0) for g in FakeNav.goals), str(FakeNav.goals[:3]))
+      all(g != (129.5, 168.5) for g in FakeNav.goals), str(FakeNav.goals[:3]))
 FakeNav.goals.clear()
 supply._player_tile = lambda sc: (0x3000, (300.0, 300.0))  # 旁邊一圈也全不可走
 REAL_WALK(MOVER, SC, 1890, (129, 168), timeout=0.5)
 check("整圈都問不到（地形圖跟人對不上）→ 才硬走表座標（沒有上一個目標可沿用）",
-      bool(FakeNav.goals) and FakeNav.goals[0] == (129.0, 168.0), f"實得 {FakeNav.goals[:2]}")
+      bool(FakeNav.goals) and FakeNav.goals[0] == (129.5, 168.5), f"實得 {FakeNav.goals[:2]}")
 
 print()
 if FAILS:

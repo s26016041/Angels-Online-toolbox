@@ -2,16 +2,17 @@
 
     py tools\\walknpc_check.py     （全 PASS 印 OK，有 FAIL 結束碼 1）
 
-驗的是 2026-09-06 黑狐實錄的那個坑（memory supply-walk-to-npc-30s-hang）：
-    使用者：「銀行／維修前面卡很久，等很久後他沒動就能講到話；藥水商人卻秒說到話」
-    根因＝ Navigator 直線 ≤ ARRIVE(3.0) 就當「到了」不再動，而 _walk_to_npc 只認
-    曼哈頓 ≤ ARRIVE_TILES(2) → 人停在 2.9 格斜角（曼哈頓 3）站著磨滿 30 秒逾時。
-規則：
-    ① 直線進到 navigate.ARRIVE 內就要**馬上**回 True（不准等逾時）
-    ② 還沒到就一直 step，Navigator 把人帶進圈子就回
-    ③ Navigator 舉 exhausted（路線走完卻沒進圈）且人停了 → 夠近回 True、太遠回 False，
-       兩種都**馬上**回，不空轉
-⚠ 純離線：假時鐘／假地形圖／假 Navigator，**只換 I/O，判斷邏輯跑真的**。
+驗的是 2026-09-06 黑狐三段實錄的坑（memory supply-walk-to-npc-30s-hang、nav-blocked-detour）：
+    上午：Navigator 直線 ≤ ARRIVE(3.0) 就當「到了」，_walk_to_npc 只認曼哈頓 ≤2 → 站著磨 30 秒。
+    晚上：改「站上目標格」又太緊 —— 商人本人站在可走格時目標＝他本格、伺服器不給站 → 磨 30 秒；
+          而棕櫚基地銀行唯一能講話的格被玩家「倉用4」站著 → 磨 4 輪 51~72 秒才放棄。
+規則（現行，反組譯 0x508DF6：講得到話＝tile 方框相交，size 1 時 Chebyshev ≤ TALK_BOX(2)）：
+    ① 人已在互動方框內 → **馬上**回 True，一步都不走
+    ② 框外 → 目標＝框內可走、沒人站、離 NPC 最近的格；走進框就回（不必站上目標格）
+    ③ Navigator 舉 exhausted 且人停了 → 夠近回 True、太遠回 False，兩種都馬上回
+    ④ 框內能站的格全被別的玩家站著 → **馬上**回 False，原因（誰站著）由 engage_why 講出來
+    ⑤ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回「離 NPC 最近的可走格」照走
+⚠ 純離線：假時鐘／假地形圖／假 Navigator／假實體，**只換 I/O，判斷邏輯跑真的**。
 """
 from __future__ import annotations
 
@@ -21,16 +22,19 @@ import sys
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.stdout.reconfigure(encoding="utf-8")
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 from app.game import navigate, supply                     # noqa: E402
 
-FAILS: list[str] = []
+FAILS = []
 
 
-def check(name: str, cond: bool, why: str = "") -> None:
-    print(("  ✔ " if cond else "  ✘ ") + name + ("" if cond else f"　{why}"))
-    if not cond:
+def check(name, ok, extra=""):
+    print(("  ✔ " if ok else "  ✘ ") + name + ("" if ok else f"　{extra}"))
+    if not ok:
         FAILS.append(name)
 
 
@@ -41,9 +45,6 @@ class Clock:
     def time(self):
         return self.t
 
-    def monotonic(self):
-        return self.t
-
     def sleep(self, s):
         self.t += s
 
@@ -51,21 +52,27 @@ class Clock:
 CLOCK = Clock()
 supply.time = CLOCK
 
-NPC = (137, 161)                      # 永夜城銀行小姐艾寶的真實格（實測）
+NPC = (137, 161)                      # 永夜城銀行小姐（地形圖說她那格可走）
+NPC_ID = 1890
 POS = [138.5, 163.46875]              # 人站的地方（可變）
 PF = 0x30DD11D0
+REACH = set()                         # 假地形圖「我這區走得到」的格（各測試自己設）
+OCCUPIED: dict = {}                   # 假的人牆：{格: 名字}
 
 
 class FakeGrid:
     def reachable(self, cx, cy):
-        return {NPC, (cx, cy), (138, 163), (141, 161), (145, 161), (160, 161)}
+        return set(REACH) | {(cx, cy)}
 
 
 class FakeNav:
-    """假 Navigator：step 時照 MOVE 把人往目標推（0 ＝ 不動）；EXHAUST 時舉旗不動。"""
+    """假 Navigator：step 時照 MOVE 把人往目標推（0 ＝ 不動），進 `arrive` 內就不動；
+    EXHAUST 時舉旗不動。記下最近一次收到的 arrive 跟目標。"""
     MOVE = 0.0
     EXHAUST = False
     steps = 0
+    last_arrive = None
+    last_goal = None
 
     def __init__(self):
         self.stuck = False
@@ -77,54 +84,80 @@ class FakeNav:
 
     def step(self, scanner, mover, player_obj, gx, gy, arrive=navigate.ARRIVE):
         FakeNav.steps += 1
+        FakeNav.last_arrive = arrive
+        FakeNav.last_goal = (gx, gy)
         if FakeNav.EXHAUST:
             self.exhausted = True
             return "最短路只能到這裡"
+        dx, dy = gx - POS[0], gy - POS[1]
+        dd = math.hypot(dx, dy)
+        if dd <= arrive:
+            return "到了"
         if FakeNav.MOVE > 0:
-            dx, dy = gx - POS[0], gy - POS[1]
-            dd = math.hypot(dx, dy) or 1.0
-            POS[0] += dx / dd * FakeNav.MOVE
-            POS[1] += dy / dd * FakeNav.MOVE
+            # 跟真的一樣：送出去的走路指令是走到目標點**本身**（遊戲會把人走到格中心停），
+            # 所以最後一段直接落在目標上，不會停在半格外。
+            if dd <= FakeNav.MOVE + arrive:
+                POS[0], POS[1] = gx, gy
+            else:
+                POS[0] += dx / dd * FakeNav.MOVE
+                POS[1] += dy / dd * FakeNav.MOVE
         return "走"
 
 
 supply.terrain = types.SimpleNamespace(load=lambda sc: (FakeGrid(), None))
 supply.navigate = types.SimpleNamespace(Navigator=FakeNav, ARRIVE=navigate.ARRIVE)
 supply.entity = types.SimpleNamespace(is_walking=lambda sc, obj: False)
+supply.move = types.SimpleNamespace(pathfinder_this=lambda sc: PF)
 supply._player_tile = lambda sc: (PF, (POS[0], POS[1]))
 supply._npc_tile = lambda sc, nid: NPC
+supply.find_npc = lambda sc, nid: (0x1000, None)                 # NPC 一直看得到
+supply._ent_tile_f = lambda sc, e: (NPC[0] + 0.5, NPC[1] + 0.5)
+supply._act_size = lambda sc, e: 1
+supply._occupied_tiles = lambda sc, me: dict(OCCUPIED)
 
 
 def run(timeout=30.0):
     t0 = CLOCK.t
     FakeNav.steps = 0
-    ok = supply._walk_to_npc(object(), object(), 1890, (129, 168), timeout)
+    FakeNav.last_arrive = FakeNav.last_goal = None
+    ok = supply._walk_to_npc(object(), object(), NPC_ID, (129, 168), timeout)
     return ok, CLOCK.t - t0
 
 
-print("① 站在 2.9 格斜角（曼哈頓 3）：Navigator 說到了，我們也要馬上回")
+def in_box():
+    return supply._in_talk_box((int(POS[0]), int(POS[1])), 1, NPC, 1)
+
+
+BOX_TILES = {(139, 161), (138, 163), (135, 159)}     # 框內可走的格（Chebyshev ≤2）
+
+print("① 人已在互動方框內（tile (138,163) vs NPC (137,161)）：馬上回 True，一步不走")
 POS[:] = [138.5, 163.46875]
-FakeNav.MOVE, FakeNav.EXHAUST = 0.0, False
+REACH.clear(); REACH.update(BOX_TILES)
+OCCUPIED.clear()
+FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
+check("這個站位真的在方框內", in_box())
 ok, dt = run()
-d_eu = math.hypot(POS[0] - NPC[0], POS[1] - NPC[1])
-check("這個站位真的是「直線 ≤3、曼哈頓 >2」的案例", d_eu <= navigate.ARRIVE and
-      abs(round(POS[0]) - NPC[0]) + abs(round(POS[1]) - NPC[1]) > supply.ARRIVE_TILES,
-      f"直線 {d_eu:.2f}")
 check("回 True", ok is True)
-check("⛔ 不磨逾時：<1 秒就回（舊寫法要 30 秒）", dt < 1.0, f"花了 {dt:.1f} 秒")
+check("★ 一步都沒走（step 沒被叫到）", FakeNav.steps == 0, f"steps={FakeNav.steps}")
+check("⛔ 不磨逾時：<1 秒就回", dt < 1.0, f"花了 {dt:.1f} 秒")
 
 print()
-print("② 8 格外：一路 step 到進圈就回")
+print("② 8 格外：目標＝框內離 NPC 最近的空格 (139,161)，走進框就回")
 POS[:] = [145.0, 161.0]
 FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
+check("出發點在框外", not in_box())
 ok, dt = run()
 check("回 True", ok is True)
-check("有真的在走（step 被叫到）", FakeNav.steps >= 5, f"steps={FakeNav.steps}")
-check("進圈就回（不磨逾時）", dt < 5.0, f"花了 {dt:.1f} 秒")
-check("停在 Navigator 的到達圈內", math.hypot(POS[0] - NPC[0], POS[1] - NPC[1]) <= navigate.ARRIVE)
+check("★ 目標是框內最近的空格中心 (139.5,161.5)", FakeNav.last_goal == (139.5, 161.5),
+      f"實得 {FakeNav.last_goal}")
+check("★ Navigator 收到 arrive=NPC_ARRIVE", FakeNav.last_arrive == supply.NPC_ARRIVE,
+      f"實得 {FakeNav.last_arrive}")
+check("有真的在走（step 被叫到）", FakeNav.steps >= 3, f"steps={FakeNav.steps}")
+check("★ 進框就回（不必站上目標格）", in_box(), f"停在 {POS}")
+check("不磨逾時", dt < 5.0, f"花了 {dt:.1f} 秒")
 
 print()
-print("③ Navigator 舉 exhausted（路線走完卻沒進圈）且人停了：馬上回，不空轉")
+print("③ Navigator 舉 exhausted（路線走完卻沒進框）且人停了：馬上回，不空轉")
 POS[:] = [141.0, 161.0]                       # 4 格：夠近（≤ NEAR_ENOUGH）
 FakeNav.MOVE, FakeNav.EXHAUST = 0.0, True
 ok, dt = run()
@@ -134,6 +167,31 @@ POS[:] = [160.0, 161.0]                       # 23 格：太遠
 ok, dt = run()
 check("太遠 → False（不能假裝到了）", ok is False)
 check("一樣馬上回", dt < 2.0, f"花了 {dt:.1f} 秒")
+
+print()
+print("④ ★ 框內能站的格全被玩家站著（棕櫚基地「倉用4」）：馬上回 False，原因講得出誰")
+POS[:] = [145.0, 161.0]
+OCCUPIED.clear(); OCCUPIED.update({t: "倉用4" for t in BOX_TILES})
+FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
+ok, dt = run()
+check("回 False", ok is False)
+check("⛔ 馬上回（舊寫法磨 30 秒逾時再點 3 輪）", dt < 1.0, f"花了 {dt:.1f} 秒")
+check("一步都沒走", FakeNav.steps == 0, f"steps={FakeNav.steps}")
+why = supply.engage_why(NPC_ID)
+check("原因寫著是「倉用4」站著", "倉用4" in why and "全被佔" in why, f"實得 {why!r}")
+check("原因取一次就清", supply.engage_why(NPC_ID) == "")
+OCCUPIED.clear()
+
+print()
+print("⑤ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回離 NPC 最近的可走格照走")
+POS[:] = [145.0, 161.0]
+REACH.clear(); REACH.update({(141, 161), (150, 161)})
+FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
+ok, dt = run()
+check("回 True（站上最近可走格）", ok is True)
+check("目標是 (141,161) 的中心", FakeNav.last_goal == (141.5, 161.5), f"實得 {FakeNav.last_goal}")
+check("停在目標格 1.0 內", math.hypot(POS[0] - 141.5, POS[1] - 161.5) <= supply.NPC_ARRIVE,
+      f"停在 {POS}")
 
 print()
 if FAILS:
