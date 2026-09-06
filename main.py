@@ -8,6 +8,17 @@
 from __future__ import annotations
 
 import os
+
+# ★★★ 一定要在任何會 import numpy 的東西之前（2026-09-06 使用者整台當機兩次 → Windows
+#   事件檔＝虛擬記憶體耗盡，主嫌是別的遊戲，但工具箱排第三、常駐 1.1GB commit）：
+#   numpy 內建的 OpenBLAS 一 import 就照 CPU 核心數預留執行緒緩衝，32 核實測
+#   **私有記憶體 7MB → 792MB**（承諾量、幾乎沒真的碰過，所以工作集只有 180MB）。
+#   本專案只用 numpy 做逐元素比對（不做矩陣運算），1 條執行緒零損失 → 同樣的 import
+#   只剩 17MB。setdefault：使用者自己設了環境變數就尊重。
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import sys
 import traceback
 from datetime import datetime

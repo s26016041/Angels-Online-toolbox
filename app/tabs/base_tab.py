@@ -221,7 +221,13 @@ class ClientWatchMixin:
             self._maybe_resume(page)
 
         # 2. 視窗對帳：關掉的收走、新開的補上、**換了人的整頁重建**
-        wins = {w.pid: w for w in preload.windows()}
+        # ★ 列舉失敗（2026-09-06 04:54 實錄：系統記憶體被別的程式吃光，EnumWindows 回
+        #   「記憶體資源不足」，例外一路炸到 crash.log 跳崩潰視窗）→ **這一拍跳過**。
+        #   ⛔ 不能把「問不到」當成「全部分身都關了」收掉所有分頁（安靜地做錯事）。
+        try:
+            wins = {w.pid: w for w in preload.windows()}
+        except Exception:                                  # noqa: BLE001
+            return
         for pid in [p for p in list(self._pages) if p not in wins]:
             self._relog.discard(pid)
             self._client_gone(pid)

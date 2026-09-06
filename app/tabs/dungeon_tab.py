@@ -342,6 +342,14 @@ GONE_SCANS = 2                  # 目標連續這麼多拍不在掃描裡（物�
 JUMP_TILES = 3.0
 # 兩次取樣隔太久就分不出是走的還是傳的（畫面卡一下就會誤判）→ 這一拍不判。
 JUMP_MAX_GAP = 0.35
+# ★★ 隔太久但**跑步再快也到不了那麼遠**的還是要認（2026-09-06 黑狐實錄，無限塔第 41 步
+#   卡了 193 分鐘）：踩上傳點那一拍遊戲載新區域會頓一下、我們叫進遊戲的呼叫（call_sync
+#   最長 0.5 秒）跟著卡，兩拍隔超過 0.35 秒 → 210 格的順移被「不判」丟掉 → 落地後先打怪、
+#   被怪帶到出口 8 格外 → _run_step 的保險也吃不到 → 對著另一區的傳點「走不到」到天亮。
+#   跑步 6 格/秒（一拍 0.6 格），取 RUN_SPEED 8 格/秒當上限：隔 g 秒還跳了超過
+#   JUMP_TILES + 8g 格，只可能是被搬的；隔超過 JUMP_GAP_LIMIT 秒才真的不判、只重設基準。
+RUN_SPEED = 8.0
+JUMP_GAP_LIMIT = 3.0
 # 傳到的位置跟腳本記的出口差這麼多格就當「傳到別的地方」，大聲停下。
 LAND_TOL = 8.0
 # ★★ 換圖之後要等座標跟上（2026-09-05 黑狐實錄）：場景編號已經變了，玩家座標卻還是
@@ -1867,17 +1875,24 @@ class DungeonTab(BaseTab):
         ★ 傳點的完成訊號就是它（使用者 2026-09-02：「人被傳走不會換地圖，
           有順移就算吧，有時候傳點之間也很短」）—— 用距離門檻會漏掉短傳點，
           用速度就分得出來：跑步一拍最多 0.6 格，順移一拍好幾十格。
-        ⚠ 兩次取樣隔太久（畫面卡住、剛開始跑）一律**不判**，只重設基準 ——
-          寧可漏一次（下一拍還會再看），不要誤判成傳送了就跳下一步。
+        ⚠ 兩次取樣隔太久（畫面卡住、剛開始跑）：跑得到的距離不算，門檻隨間隔放大
+          （JUMP_TILES + RUN_SPEED × 間隔）；隔超過 JUMP_GAP_LIMIT 秒才**不判**、只重設
+          基準 —— 寧可漏一次（下一拍還會再看），不要誤判成傳送了就跳下一步。
         ★ 回跳之前的位置是給傳點那一步驗「是不是**從傳點上**跳走的」（`PORTAL_FROM`）
           —— 伺服器拉回位置也是一拍跳好幾格，人不在傳點上就不算。
         """
         now = time.monotonic()
         prev, prev_t = self._pos_prev, self._pos_t
         self._pos_prev, self._pos_t = me, now
-        if prev is None or now - prev_t > JUMP_MAX_GAP:
+        if prev is None:
             return None
-        return prev if _d(prev, me) >= JUMP_TILES else None
+        gap = now - prev_t
+        if gap <= JUMP_MAX_GAP:
+            return prev if _d(prev, me) >= JUMP_TILES else None
+        if gap > JUMP_GAP_LIMIT:
+            return None
+        # 隔太久（見 RUN_SPEED 的說明）：這段時間跑得到的距離不算，跑不到的才是順移
+        return prev if _d(prev, me) >= JUMP_TILES + RUN_SPEED * gap else None
 
     def _after_map_change(self) -> None:
         """換圖了：舊圖的座標／玩家物件／順移基準全部作廢，等 MAP_SETTLE 秒再算。
@@ -2509,8 +2524,11 @@ class DungeonTab(BaseTab):
             #   事蓋掉）。⚠ 一定要「傳點走不到」才算：出口跟傳點在同一區的短傳點
             #   （「有時候傳點之間也很短」）不能只憑離出口近就當過了。
             land = step.get("land")
-            if (land and _d(land, me) <= LAND_TOL and self._reach is not None
-                    and not self._can_reach((gx, gy))):
+            # ★ 2026-09-06：「離出口 8 格內」放寬成「出口走得到」—— 順移那一拍漏掉之後人會
+            #   先去打怪（落點旁邊常有怪），打完早就被帶到 8 格外（黑狐實錄 26 格）；
+            #   「傳點走不到、出口走得到」才是本質（人在出口那一側）。
+            if (land and self._reach is not None and not self._can_reach((gx, gy))
+                    and (_d(land, me) <= LAND_TOL or self._can_reach(land))):
                 self._notify(f"第 {self._i + 1} 步　人已經在出口這一側、傳點在另一區"
                              f" → 當作傳過了")
                 self._drop_target()
@@ -2572,6 +2590,15 @@ class DungeonTab(BaseTab):
                          f"→ 不算傳送，繼續走")
             return False
         if land and not near_land:
+            if _d((gx, gy), me) <= PORTAL_FROM:
+                # ★★ 跳完人還站在傳點旁邊（2026-09-06 黑狐實錄，無限塔第 6 步：走向傳點的
+                #   最後幾格被伺服器拉了一下，落點離傳點 2.6 格、離出口 80 格 → 舊版當成
+                #   「傳點把人送到別的地方」停機）。傳點搬人一定是搬**到出口**、不會把人
+                #   留在傳點旁 → 這是位置修正，不算傳送，照樣走過去踩。
+                self._notify(f"第 {self._i + 1} 步　位置一拍跳了 {_d(frm, me):.0f} 格，"
+                             f"但人還在傳點旁（{_d((gx, gy), me):.1f} 格）"
+                             f"→ 伺服器拉回，不算傳送，繼續走")
+                return False
             self._stop(
                 f"⛔ 第 {self._i + 1} 步：傳點把人送到 "
                 f"({me[0]:.0f}, {me[1]:.0f})，"

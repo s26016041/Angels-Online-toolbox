@@ -809,6 +809,17 @@ def main() -> int:
     run(tab, 0.1)
     ck("★ 沒記出口的舊腳本：不在傳點上跳了一樣不算",
        tab._i == 0 and tab.run_cb.isChecked(), tab.status.text())
+    # ★★ 2026-09-06 黑狐實錄（無限塔第 6 步）：走向傳點最後幾格被伺服器拉一下 —— 跳之前
+    #   離傳點 4 格、跳完離傳點 5 格、離出口 80 格 → 舊版停機「傳點把人送到別的地方」。
+    #   傳點搬人一定是搬到出口，人還在傳點旁＝位置修正，不算。
+    tab = make_tab([{"do": "portal", "to": [181.9, 74.5], "land": [200.5, 149.5]}],
+                   pos=(178.0, 71.0))
+    tab._jumped = (183.5, 71.0)
+    run(tab, 0.1)
+    ck("★★ 跳完人還在傳點旁（伺服器拉回）→ 不停、不算完成",
+       tab.run_cb.isChecked() and tab._i == 0, tab.status.text())
+    ck("　照樣往傳點走", tab._nav.goal == (181.9, 74.5), str(tab._nav.goal))
+    ck("　狀態列講得出「不算傳送」", "不算傳送" in tab.status.text(), tab.status.text())
     tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}],
                    pos=(201.0, 41.0))
     tab._jumped = (43.0, 50.0)                # 離傳點 7 格（比 PORTAL_FROM 遠）
@@ -852,6 +863,22 @@ def main() -> int:
     run(tab, 0.1)
     ck("　傳點走得到（同一區）→ 不能只憑離出口近就當過了，照樣往傳點走",
        tab._i == 0 and tab._nav.goal == (50, 50), f"i={tab._i} goal={tab._nav.goal}")
+    # ★★ 2026-09-06 黑狐實錄（無限塔第 41 步，卡 193 分鐘）：順移漏掉 → 落地先打怪 →
+    #   被帶到出口 26 格外 → 「離出口 8 格內」的保險吃不到。改看「出口走得到、傳點走不到」。
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]},
+                    {"do": "clear"}], pos=(226.0, 60.0))
+    tab._grid = FakeGrid({(226, 60), (200, 40)}, others={(50, 50)})
+    tab._reach = {(226, 60), (200, 40)}
+    run(tab, 0.1)
+    ck("★★ 打怪被帶到出口 26 格外：出口走得到、傳點在另一區 → 當作傳過了",
+       tab._i == 1, f"i={tab._i} {tab.status.text()}")
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]},
+                    {"do": "clear"}], pos=(226.0, 60.0))
+    tab._grid = FakeGrid({(226, 60)}, others={(50, 50), (200, 40)})
+    tab._reach = {(226, 60)}
+    run(tab, 0.1)
+    ck("　出口也走不到（人根本不在出口那一側）→ 不能當過了",
+       tab._i == 0, f"i={tab._i} {tab.status.text()}")
 
     # ★★ 2026-09-05 無限塔第 54 步「剩 3.5 格　走完這條路線 → 重算收尾」原地不動：
     #   目標那格地形圖說不可走、最短路的終點被放寬到 3 格外、人站在那裡
@@ -881,6 +908,16 @@ def main() -> int:
     tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic() - 5.0
     ck("★ 兩次取樣隔 5 秒 → 不判（可能是走過去的），只重設基準",
        not tab._check_jump((50.0, 10.0)))
+    # ★★ 2026-09-06 黑狐實錄（無限塔第 41 步）：踩傳點那拍 UI 卡了 >0.35 秒（遊戲載新區、
+    #   call_sync 跟著等）→ 210 格的順移被「隔太久不判」丟掉 → 卡 193 分鐘。
+    tab._pos_prev, tab._pos_t = (305.0, 56.9), time.monotonic() - 0.6
+    ck("★★ 隔 0.6 秒但跳了 210 格（跑不到那麼遠）→ 還是順移",
+       tab._check_jump((243.5, 263.5)) == (305.0, 56.9))
+    tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic() - 0.6
+    ck("　隔 0.6 秒動 4 格（跑得到）→ 不是順移", not tab._check_jump((14.0, 10.0)))
+    tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic() - 2.0
+    ck("　隔 2 秒跳 40 格（8 格/秒也只跑 16 格）→ 順移",
+       tab._check_jump((50.0, 10.0)) == (10.0, 10.0))
     tab._pos_prev = None
     ck("★ 第一拍沒有基準 → 不判", not tab._check_jump((50.0, 10.0)))
 
