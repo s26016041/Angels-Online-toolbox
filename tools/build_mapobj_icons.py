@@ -16,7 +16,7 @@
   那才是會出現在清單裡的東西。
 * 每張縮到最長邊 `--max`（預設 64）像素，PNG（RGBA）。
 
-.SHP 的格式與解碼共用 `tools/build_item_icons.py` 的 `decode_shp()`
+.SHP 的格式與解碼共用 `app/game/itemicon.py` 的 `decode_shp()`＋`compose()`
 （同一套自家格式，2026-08-28 解的，含「一列可以有好幾段」那個坑）。
 
 ⚠ 官方改版新增物件要重跑；查不到圖就退化成不顯示（不會顯示錯的圖）。
@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.build_item_icons import decode_shp                # noqa: E402
+from app.game.itemicon import compose, decode_shp           # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = ROOT / "assets" / "mapobj_names.tsv.gz"
@@ -84,8 +84,9 @@ def main() -> int:
         key = f"{stem}.png"
         if key not in blobs:
             try:
-                w, h, rgba = decode_shp(path.read_bytes())
-                img = Image.frombytes("RGBA", (w, h), rgba)
+                # ★ 2026-09-06 圖示重構後解碼器搬到 app/game/itemicon.py：
+                #   decode_shp 回 Shp 物件，compose 才轉成 RGBA [h, w, 4]。
+                img = Image.fromarray(compose(decode_shp(path.read_bytes())), "RGBA")
                 img.thumbnail((size, size), Image.LANCZOS)
                 buf = io.BytesIO()
                 img.save(buf, "PNG", optimize=True)
