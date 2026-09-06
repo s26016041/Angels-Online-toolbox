@@ -476,7 +476,8 @@ def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int) -> bool:
 
 
 NEAR_SPOT_R = 8            # 找「離 NPC 最近可到的格」時掃 NPC 周圍這麼多格
-NEAR_GIVE_UP = 2.5         # 在目標格 2 格內待了這麼久還站不上去 → 就地算到（最後一格被人占著）
+NEAR_GIVE_UP = 1.2         # 在目標格 2 格內待了這麼久還站不上去 → 就地算到（最後一格被人占著）
+                           #   ★ 9/6 使用者「到點後卡一下」：走路指令 0.5 秒內就會動，1.2 秒沒動就是被擋，2.5 太久
 
 
 def _near_spots(scanner, g, here, npc_ent: int, npc_tile, avoid=None):
@@ -803,7 +804,6 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             if not _wait_arrival(scanner, npc_id):
                 fails += 1                           # 對話開了但人沒到位（被擋/太遠）
                 continue                             # → 絕不送購買選項，調位置重來
-            time.sleep(0.2)                          # 人到位了，緩一小拍再送選項
         elif _dialog_token(scanner) and _wait_arrival(scanner, npc_id,
                                                       timeout=2.0):
             # ★★ 沒看到邊沿 **≠** 對話框沒開：**本來就開著**的時候代號一動也不動
@@ -813,7 +813,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             #   ⚠ 這正是本專案復發七次的「讀不到≠沒有」（bag-false-empty-guards）。
             #   → 人到位（停穩且 ≤ TALK_RANGE）且代號非 0 就照送選項，
             #     成沒成一律交給最後那道視窗檢查判。
-            time.sleep(0.2)
+            pass
         else:
             fails += 1
             continue                                 # 確認沒開對話 → 馬上調位置重點
@@ -942,7 +942,7 @@ def _wait_arrival(scanner, npc_id: int, timeout: float = 8.0) -> bool:
             still_since = None
         else:
             still_since = still_since or time.time()
-            if time.time() - still_since > 0.5:          # 停穩了（不是走路中的頓拍）
+            if time.time() - still_since > 0.3:          # 停穩了（不是走路中的頓拍；9/6 0.5→0.3）
                 # ★ 到位＝在講話方框內（TALK_BOX_X/Y；伺服器實測從框內任何一格都吃選項，
                 #   最遠 (5,3)＝5.81 格）。tile 讀不到才退回舊的直線 TALK_RANGE。
                 box = _npc_in_box(scanner, npc_id)
