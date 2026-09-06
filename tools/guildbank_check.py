@@ -10,7 +10,7 @@
     ④ 送了沒進去：單件＝跳過換下一件；連續 FAIL_STREAK 件＝倉庫滿 → 關窗、訊息寫明、
        回 True（安靜，不當失敗）
     ⑤ 小視窗兩張表：左＝背包裡能存的、右＝清單；子字串過濾兩邊一起、加入／移除改 config、
-       清單上但不在這台背包的右邊灰字、列高留夠圖示
+       右邊只有名字＋圖示（圖示查表，這台沒有的也有）、列高留夠圖示
 ⚠ 純離線：假 config／假背包／假 supply 那幾支，**只換 I/O，判斷邏輯跑真的**。
 """
 from __future__ import annotations
@@ -74,7 +74,8 @@ CFG = FakeConfig()
 guildbank.config = CFG
 guildbank.time = Clock()
 # 假旗標表：1905 天使之翼可存、66 可存、137 不可交易+不可存倉庫、500 裝備綁定、999 不在表裡
-itemflags._flags = {1905: 0, 66: 0, 137: 3, 500: 4}
+itemflags._table = {1905: (0, 11), 66: (0, 12), 137: (3, 0), 500: (4, 0), 4837: (0, 13)}
+check("icon_of 查表（4837 → 13）、不在表裡回 0", itemflags.icon_of(4837) == 13 and itemflags.icon_of(999) == 0)
 
 print("① 清單存 config，勾一下就 save")
 guildbank.set_wanted([66, "1905", 66])
@@ -192,8 +193,8 @@ def texts(lst):
 
 check("左邊＝背包裡能存、還沒在清單上的（不可交易那件不列）", texts(dlg.bag_list) == ["天使之翼 ×3"],
       str(texts(dlg.bag_list)))
-check("右邊＝清單：同種類併成一列數量相加＋不在這台背包的灰字",
-      texts(dlg.want_list) == ["低效紅藥水 ×13", "高效藍藥水（不在這台背包）"], str(texts(dlg.want_list)))
+check("右邊＝清單：只有名字（含這台沒有的），照名字排",
+      texts(dlg.want_list) == ["低效紅藥水", "高效藍藥水"], str(texts(dlg.want_list)))
 check("右邊的種類＝config", dlg.wanted_ids() == {66, 4837}, str(dlg.wanted_ids()))
 check("列高留夠（圖示 32 不被裁）", dlg.want_list.item(0).sizeHint().height() >= 32 + 8,
       str(dlg.want_list.item(0).sizeHint()))
@@ -207,13 +208,13 @@ dlg.bag_list.item(0).setSelected(True)
 dlg._add()                                                # 加入天使之翼
 check("加入 → 寫 config＋save、左邊消失右邊出現",
       CFG.d[guildbank.CFG_KEY] == [66, 1905, 4837] and CFG.saves == 1
-      and texts(dlg.bag_list) == [] and "天使之翼 ×3" in texts(dlg.want_list),
+      and texts(dlg.bag_list) == [] and "天使之翼" in texts(dlg.want_list),
       f"{CFG.d.get(guildbank.CFG_KEY)} saves={CFG.saves} {texts(dlg.bag_list)} {texts(dlg.want_list)}")
 row = next(dlg.want_list.item(i) for i in range(dlg.want_list.count())
-           if "不在這台背包" in dlg.want_list.item(i).text())
+           if dlg.want_list.item(i).text() == "高效藍藥水")
 row.setSelected(True)
-dlg._remove()                                             # 拿掉不在背包的那個
-check("移除「不在這台背包」的也存得掉", CFG.d[guildbank.CFG_KEY] == [66, 1905],
+dlg._remove()                                             # 拿掉這台背包沒有的那個
+check("移除這台背包沒有的也存得掉", CFG.d[guildbank.CFG_KEY] == [66, 1905],
       str(CFG.d.get(guildbank.CFG_KEY)))
 dlg.close()
 

@@ -7,8 +7,9 @@
     不可存倉庫="是"  → NO_BANK  (1)
     不可交易="是"    → NO_TRADE (2)
     裝備綁定="是"    → BIND     (4)
-輸出每行 `種類ID<TAB>旗標位元`，**全部道具都寫**（旗標 0 也寫）——這樣讀取端才分得出
+輸出每行 `種類ID<TAB>旗標位元<TAB>原型介面`，**全部道具都寫**（旗標 0 也寫）——這樣讀取端才分得出
 「查得到而且沒限制」跟「表裡沒這筆（新道具，還沒重跑）」；後者一律當不能存（安全退化）。
+第三欄「原型介面」＝圖示編號（給不在這台背包的清單項目畫圖用；沒有那個屬性寫 0）。
 
 用途：公會（社團）倉庫的存放清單過濾（`app/game/itemflags.py`／`guildbank.py`）。
 使用者 2026-09-06 定：綁定／不可交易的東西也不能存公會倉庫。
@@ -36,8 +37,9 @@ NO_BANK, NO_TRADE, BIND = 1, 2, 4
 ATTR_BITS = (("不可存倉庫", NO_BANK), ("不可交易", NO_TRADE), ("裝備綁定", BIND))
 
 
-def extract() -> dict[int, int]:
-    out: dict[int, int] = {}
+def extract() -> dict[int, tuple[int, int]]:
+    """{種類ID: (旗標位元, 原型介面)}"""
+    out: dict[int, tuple[int, int]] = {}
     for fn in ITEM_FILES:
         p = SETTING / "base" / fn
         if not p.exists():
@@ -55,19 +57,20 @@ def extract() -> dict[int, int]:
             for key, bit in ATTR_BITS:
                 if re.search(r'%s="是"' % key, a):
                     bits |= bit
-            out[tid] = bits
+            im = re.search(r'原型介面="(\d+)"', a)
+            out[tid] = (bits, int(im.group(1)) if im else 0)
     return out
 
 
-def load_existing() -> dict[int, int]:
+def load_existing() -> dict[int, tuple[int, int]]:
     if not OUT.exists():
         return {}
-    got: dict[int, int] = {}
+    got: dict[int, tuple[int, int]] = {}
     with gzip.open(OUT, "rt", encoding="utf-8") as f:
         for line in f:
-            tid, _, bits = line.rstrip("\n").partition("\t")
-            if tid and bits:
-                got[int(tid)] = int(bits)
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                got[int(parts[0])] = (int(parts[1]), int(parts[2]) if len(parts) >= 3 else 0)
     return got
 
 
@@ -80,12 +83,13 @@ def main() -> int:
     if not table:
         print("⛔ item*.xml 一筆道具都沒抽到（格式變了？）—— 不出表")
         return 1
-    n_bank = sum(1 for v in table.values() if v & NO_BANK)
-    n_trade = sum(1 for v in table.values() if v & NO_TRADE)
-    n_bind = sum(1 for v in table.values() if v & BIND)
-    n_ok = sum(1 for v in table.values() if v == 0)
+    n_bank = sum(1 for v, _ in table.values() if v & NO_BANK)
+    n_trade = sum(1 for v, _ in table.values() if v & NO_TRADE)
+    n_bind = sum(1 for v, _ in table.values() if v & BIND)
+    n_ok = sum(1 for v, _ in table.values() if v == 0)
+    n_icon = sum(1 for _, ic in table.values() if ic)
     print(f"item*.xml 共 {len(table)} 筆：不可存倉庫 {n_bank}、不可交易 {n_trade}、"
-          f"裝備綁定 {n_bind}；三項都沒有（公會倉庫可存）{n_ok}")
+          f"裝備綁定 {n_bind}；三項都沒有（公會倉庫可存）{n_ok}；有原型介面（圖示編號）{n_icon}")
     old = load_existing()
     if old:
         added = sorted(set(table) - set(old))
@@ -99,7 +103,8 @@ def main() -> int:
         return 1
     with gzip.open(OUT, "wt", encoding="utf-8", newline="\n") as f:
         for tid in sorted(table):
-            f.write(f"{tid}\t{table[tid]}\n")
+            bits, icon = table[tid]
+            f.write(f"{tid}\t{bits}\t{icon}\n")
     print(f"✔ 寫出 {OUT}（{OUT.stat().st_size / 1024:.0f} KB）")
     return 0
 

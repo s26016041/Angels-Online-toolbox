@@ -300,7 +300,7 @@ py tools\recheck_tables.py        # 要進遊戲，最後會直接給結論
 |---|---|---|
 | `py tools\build_item_names.py` | `assets/item_names.tsv.gz` | 物品名稱；過期＝新道具顯示成編號 |
 | `py tools\build_item_desc.py` | `assets/item_desc.tsv.gz` | 物品說明原文（寶石提示框）；過期＝新寶石只印記憶體算的加成 |
-| `py tools\build_item_flags.py` | `assets/item_flags.tsv.gz` | 物品限制旗標（不可存倉庫／不可交易／裝備綁定）→ 公會倉庫存放清單的過濾；過期＝新道具不在表裡一律當「不能存」（清單不列、不送），`--check` 只比對 |
+| `py tools\build_item_flags.py` | `assets/item_flags.tsv.gz` | 物品限制旗標（不可存倉庫／不可交易／裝備綁定）＋原型介面（圖示編號）→ 公會倉庫存放清單的過濾與清單圖示；過期＝新道具不在表裡一律當「不能存」（清單不列、不送）、清單上沒圖，`--check` 只比對 |
 | `py tools\build_item_icons.py` | `assets/item_icons.zip` | 道具圖示（原始 .SHP＋換色索引 base／mask 兩組，執行時 `iconbias` 照遊戲換色）；過期＝新道具沒圖；換色算法改版後用 `py tools\icon_mask_probe.py` 餵遊戲函式逐位元對 |
 | `py tools\build_jumpmap.py` | `assets/jumpmap.tsv`、`jumpmap_class.tsv` | 趴趴GO 傳送點；⛔ 過期＝傳錯地方 |
 | `py tools\build_skills.py` | `assets/skills.tsv.gz` | buff 持續時間／MP；⛔ 過期＝補 buff 時間點錯 |

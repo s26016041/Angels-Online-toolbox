@@ -7,8 +7,9 @@
 
 規則：
   · 不能存的（綁定／不可交易／不可存倉庫，表在 itemflags）**不列**，只在底下報個數。
-  · 清單上有、但這台背包沒有的，右邊照列（灰字「不在這台背包」）—— 不然在別台加的
-    東西在這台就看不到、也拿不掉。
+  · 右邊只顯示**名字＋圖示**（使用者 2026-09-06：「大家共用存倉庫表，不需要說不在這台背包，
+    以後他拿到這東西一樣會存」）；圖示查資料表（itemflags.icon_of，item.xml 原型介面），
+    所以別台加的、這台沒有的東西也畫得出來。
   · 搬一下就存檔（config.set 接 save），不用按確定。
   · 列高＝圖示 32 + 上下各 6（使用者：「每個物品上下要距離大點，現在圖片會被擋到」）。
   · 「🧪 現在就存」＝就地測試（走去這城的銀行開社團倉庫存清單上的東西），
@@ -17,12 +18,12 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QPushButton, QVBoxLayout)
 
 from app import theme
-from app.game import guildbank, itemicon, itemname
+from app.game import guildbank, itemflags, itemicon, itemname
 
 ROLE_TID = Qt.UserRole
 ROLE_TEXT = Qt.UserRole + 1          # 過濾用的小寫字串（名字＋編號）
@@ -161,28 +162,23 @@ class GuildBankDialog(QDialog):
         self.want_list.clear()
         for tid, (count, icon_id) in self._agg.items():
             if tid not in wanted:
-                self._add_row(self.bag_list, tid, count, icon_id, in_bag=True)
-        for tid, (count, icon_id) in self._agg.items():
-            if tid in wanted:
-                self._add_row(self.want_list, tid, count, icon_id, in_bag=True)
-        for tid in sorted(wanted - set(self._agg)):
-            self._add_row(self.want_list, tid, 0, 0, in_bag=False)
+                self._add_row(self.bag_list, tid, f"{itemname.label(tid)} ×{count}", icon_id)
+        # 右邊＝清單本身：名字＋圖示（圖示查表，這台沒有的也畫得出來），照名字排
+        for tid in sorted(wanted, key=lambda t: (itemname.label(t), t)):
+            icon_id = itemflags.icon_of(tid) or self._agg.get(tid, (0, 0))[1]
+            self._add_row(self.want_list, tid, itemname.label(tid), icon_id)
         self._apply_filter(self.search.text())
 
-    def _add_row(self, lst: QListWidget, tid: int, count: int, icon_id: int,
-                 in_bag: bool) -> None:
+    def _add_row(self, lst: QListWidget, tid: int, text: str, icon_id: int) -> None:
         name = itemname.label(tid)
-        text = f"{name} ×{count}" if in_bag else f"{name}（不在這台背包）"
         row = QListWidgetItem(text)
         row.setData(ROLE_TID, int(tid))
         row.setData(ROLE_TEXT, f"{name} {tid}".lower())
         row.setSizeHint(QSize(0, ROW_H))
-        if in_bag and icon_id:
+        if icon_id:
             pm = itemicon.pixmap(icon_id)
             if pm is not None and not pm.isNull():
                 row.setIcon(QIcon(pm))
-        if not in_bag:
-            row.setForeground(QColor(theme.TEXT_DIS))
         lst.addItem(row)
 
     # ------------------------------------------------------------------
