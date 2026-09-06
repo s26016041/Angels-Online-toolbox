@@ -315,6 +315,10 @@ py tools\recheck_tables.py        # 要進遊戲，最後會直接給結論
 跑完 → `py tools
 echeck_tables.py` 全對 → `py tools\stamp_tables.py` 蓋章。
 （`build_signature.py` 不是表，是做 AOB 特徵的工具，不在此列。）
+⚠ 重跑完先**比內容再 commit**：`.tsv.gz`／`.zip` 每次重生位元組都不同（gzip 時間戳、
+zip 檔案時間），`git status` 全部亮 M 不代表表變了。解壓後逐列／逐檔 CRC 比對，
+內容相同的 `git checkout --` 還原，只 commit 真的有差的（9/6 實跑：9 個亮 M、只有
+mapobj_icons.zip 真的變）。
 
 ### ⚠ 官方改版**新增道具**時要重跑 `build_item_icons.py` 與 `build_item_desc.py`
 

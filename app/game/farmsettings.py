@@ -14,7 +14,7 @@ from __future__ import annotations
 from app.config import config
 
 CFG_FILL = "farm.fill_pct"       # 補給時藥水買到負重的百分比（整數；全部分身共用）
-FILL_DEFAULT = 95                # 2026-08-19 使用者指定的原值
+FILL_DEFAULT = 95                # 百分比不是偏移；2026-08-19 使用者指定的原值
 FILL_MIN = 10                    # 低於這個等於沒買，防呆
 FILL_MAX = 100
 

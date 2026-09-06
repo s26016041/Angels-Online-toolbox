@@ -52,7 +52,7 @@ ADDR_LO, ADDR_HI = 0x400000, 0xA00000
 #   （問不到 SizeOfImage 時墊底用的掃描長度）都中槍過。這些字尾／字首一律當
 #   數值不當位址 —— 位址不會取名叫 `_SPAN`／`_SIZE`。
 NOT_ADDR = ("MAX_", "MIN_", "LIMIT_", "CAP_", "THRESHOLD_")
-NOT_ADDR_SUFFIX = ("_SPAN", "_SIZE", "_LEN", "_BYTES")
+NOT_ADDR_SUFFIX = ("_SPAN", "_SIZE", "_LEN", "_BYTES", "_MAX")   # _MAX：dungeon_tab.RUNLOG_MAX 是檔案大小上限（9/6 誤報）
 ADDR_ALLOW = {("injector", "CODE_LO"), ("injector", "CODE_HI")}
 
 # ⚠⚠ 偏移**不一定叫 OFF_***：`SRV_BEGIN`、`M_ID`、`OBJ_UI_MGR`、`PENDING_OFF`
@@ -399,13 +399,14 @@ def main() -> int:
     def _is_offset(name: str, v: int) -> bool:
         # 名字比數值可靠：`OFF_`/`TMPL_`/`SRV_`/`M_`/`OBJ_` 開頭、或 `_OFF`
         # 結尾、含 STRIDE 的一律當偏移（`entity.OFF_ID` 是偏移不是編號）；
-        # 含 CODE/SLOT/GRADE/_TYPE/_ITEM/_ID 的當代碼或編號
+        # 含 CODE/SLOT/GRADE/_TYPE/_ITEM/_ID 的當代碼或編號，_DEFAULT/_PCT 結尾
+        # 是設定預設值／百分比（farmsettings.FILL_DEFAULT = 95，9/6 誤報成偏移）
         # （`channel.SWITCH_CODE = 0x47` 是封包代碼，跟版面無關）；
         # 都不像就退回看值大小。
         if re.match(r"^(OFF_|TMPL_|SRV_|M_|OBJ_|VT_OFF|MEMBERS_|PENDING_)", name) \
                 or name.endswith("_OFF") or "STRIDE" in name:
             return True
-        if re.search(r"(CODE|SLOT|GRADE|_TYPE$|_ITEM|_ID$|_LAST$|_FIRST$)", name):
+        if re.search(r"(CODE|SLOT|GRADE|_TYPE$|_ITEM|_ID$|_LAST$|_FIRST$|_DEFAULT$|_PCT$)", name):
             return False
         return abs(v) >= 0x20
 

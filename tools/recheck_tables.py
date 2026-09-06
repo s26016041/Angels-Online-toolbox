@@ -328,10 +328,18 @@ def check_item_desc(sc, tabs, lines):
     if not its:
         return "背包讀不到東西", False
     missing = sorted({i.type_id for i in its if not itemdesc.of(i.type_id)})
+    # ★ 「查不到說明」分兩種：名稱表也沒有＝真的是新道具（要重跑 build）；名稱表有
+    #   ＝GAMEDATA 那筆本來就沒寫文字3（2026-09-06 實例：31700 一級紅藥水），不是過期。
+    new_ids = [t for t in missing if itemname.of(t).strip().isdigit()]
     if missing:
         lines.append(f"    這些種類查不到說明（提示框只印記憶體算的）：{missing[:20]}")
+    hint = ""
+    if new_ids:
+        hint = "　← 新道具，重跑 build_item_desc.py"
+    elif missing:
+        hint = "　← 名稱表有、GAMEDATA 本來就沒寫說明，不是過期"
     return (f"說明表 {itemdesc.count()} 筆；背包 {len(its)} 件，查不到說明 {len(missing)} 種"
-            + ("　← 新道具，重跑 build_item_desc.py" if missing else ""), True)
+            + hint, True)
 
 
 def check_item_flags(sc, tabs, lines):
