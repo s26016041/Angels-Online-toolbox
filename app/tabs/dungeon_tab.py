@@ -122,7 +122,8 @@ from app.core import charname, injector, netstat, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (dungeon, entity, guildbank, itemname, jumpmap, locate, loot, mapobj,
+from app.game import (dungeon, entity, farmsettings, guildbank, itemname, jumpmap, locate,
+                      loot, mapobj,
                       move, navigate, player, portal, produce, quickbar, revive,
                       robot, scene, scenery, sell, skills, supply, talkwnd,
                       team, terrain)
@@ -3193,13 +3194,15 @@ class DungeonTab(BaseTab):
         self._done = False
         self._empty_since = 0.0
         gitems = guildbank.wanted()    # 公會倉庫清單（全部分身共用；主執行緒讀 config）
+        fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
 
         def _worker():
             try:
                 res = supply.run_full_supply(
                     mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
                     back_to=back, potions=plan,
-                    guild_items=gitems)             # 順手存公會倉庫（2026-09-06）
+                    guild_items=gitems,             # 順手存公會倉庫（2026-09-06）
+                    fill_pct=fill)                  # 藥水買到負重 N%（掛機設定）
             except Exception as exc:                      # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:

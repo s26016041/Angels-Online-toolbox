@@ -76,11 +76,12 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
-                      channel, entity, eventmap, guildbank, itemicon, loot,
+                      channel, entity, eventmap, farmsettings, guildbank, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
+from app.tabs.farm_settings_dialog import FarmSettingsDialog
 from app.tabs.guildbank_dialog import GuildBankDialog
 from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list, fit_spin,
                                mall_buys_dialog, mall_buys_widget, no_elide,
@@ -1986,6 +1987,16 @@ class CharFarmPage(QWidget):
             lambda: self.notify("這是一則測試通知。"))
         nbar.addWidget(self.test_btn)
         nbar.addStretch(1)
+        # ★ 「掛機設定」放頁面**右上角**（2026-09-06 使用者要求）：小視窗，
+        #   目前只有「負重設定」＝補給時藥水買到負重幾 %；全部分身共用
+        #   （config farm.fill_pct，見 app/game/farmsettings.py）。
+        self.settings_btn = QPushButton("掛機設定")
+        self.settings_btn.setToolTip(
+            "掛機設定小視窗：補給時藥水買到負重幾 %（預設 95%）。\n"
+            "全部分身共用，改一台全部跟著改。")
+        fit_btn(self.settings_btn)
+        self.settings_btn.clicked.connect(self._open_settings)
+        nbar.addWidget(self.settings_btn)
         root.addLayout(nbar)
 
         # ★ 主開關一列放在所有分類方框**上面** —— 它管的是整個頁面，
@@ -2278,7 +2289,7 @@ class CharFarmPage(QWidget):
         pot_lbl = QLabel(f"藥水剩 ≤{robot.POTION_LOW} 顆自動補給")
         pot_lbl.setToolTip(
             f"精靈頁放的藥水剩 {robot.POTION_LOW} 顆以下就自動回城補給。\n"
-            "買到負重 95%，HP/MP 數量差不多。\n"
+            "買到負重的比例在右上角「掛機設定」（預設 95%），HP/MP 數量差不多。\n"
             "商店沒賣的藥水（如活動藥水）：通知＋天使之翼回城＋停止掛機。")
         c.addWidget(pot_lbl)
         c.addSpacing(10)
@@ -3041,15 +3052,17 @@ class CharFarmPage(QWidget):
         # ★ 背景執行緒跑整趟補給。say 回報進度存進 _supply_progress，_supply_tick 顯示＋等完成。
         mv, sc, gen = self._mover, self.sc, self._supply_gen
         gitems = guildbank.wanted()    # 公會倉庫清單（全部分身共用；主執行緒讀 config）
+        fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
 
         def _worker():
             try:
                 res = supply.run_full_supply(
                     mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
                     back_to=home,      # 回程跳回記錄點（None＝出發當下，原行為）
-                    potions=plan,      # 藥水買到負重 95%（生產分頁不帶＝不買）
+                    potions=plan,      # 藥水買到負重 N%（生產分頁不帶＝不買）
                     ledger=self._record_purchase,   # 購買紀錄（純資料 append）
-                    guild_items=gitems)             # 順手存公會倉庫（2026-09-06）
+                    guild_items=gitems,             # 順手存公會倉庫（2026-09-06）
+                    fill_pct=fill)
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
@@ -3060,6 +3073,10 @@ class CharFarmPage(QWidget):
         t.start()
         self.status.setText(f"🔧 {why} → 開始跑補給（存倉庫→修裝→買水→趴趴GO回來）…")
         return True
+
+    def _open_settings(self) -> None:
+        """「掛機設定」小視窗（全部分身共用，見 app/tabs/farm_settings_dialog.py）。"""
+        FarmSettingsDialog(self).exec()
 
     def _open_guildbank(self) -> None:
         """「存公會倉庫」小視窗（清單全部分身共用，見 app/tabs/guildbank_dialog.py）。"""
@@ -3362,6 +3379,7 @@ class CharFarmPage(QWidget):
         self._train_gen += 1
         mv, sc, gen = self._mover, self.sc, self._train_gen
         home = self._train_home
+        fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
 
         def _worker():
             try:
@@ -3369,9 +3387,10 @@ class CharFarmPage(QWidget):
                     mv, sc,
                     say=lambda m: setattr(self, "_train_progress", m),
                     back_to=home,          # 回練技的原地圖（不是巡邏點）
-                    potions=plan,          # 藥水買到負重 95%
+                    potions=plan,          # 藥水買到負重 N%（掛機設定）
                     potion_only=True,      # 只跑補給商：不存倉、不修裝
-                    ledger=self._record_purchase)   # 購買紀錄（純資料 append）
+                    ledger=self._record_purchase,   # 購買紀錄（純資料 append）
+                    fill_pct=fill)
             except Exception as exc:                      # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._train_gen:     # 這一趟還沒被作廢才收結果

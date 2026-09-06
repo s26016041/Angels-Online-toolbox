@@ -1305,19 +1305,40 @@ def _fill_target(budget: int, gold, groups: list[tuple[int, int, int]]) -> int:
     return lo
 
 
+def _fill_frac(fill_pct) -> float:
+    """把「掛機設定」給的百分比整數換成比例；None／壞值 → 模組預設 FILL_PCT（95%）。
+
+    2026-09-06 使用者要求：買到多少負重改成掛機頁右上角「掛機設定」可調、全部分身
+    共用（app/game/farmsettings.py）。這裡再夾一次是讀取端的合理性驗證 —— 傳錯
+    型別或範圍不拿垃圾值去算購買量。
+    """
+    try:
+        v = int(fill_pct)
+    except (TypeError, ValueError):
+        return FILL_PCT
+    if v < 10 or v > 100:
+        return FILL_PCT
+    return v / 100.0
+
+
 def run_potion_fill(mover, scanner, npc_id: int, fallback,
-                    plan: dict, say=None, ledger=None) -> tuple[bool, str]:
-    """補藥水 —— **收尾一定把販售視窗關掉**（同 run_buy，見 `close_sale`）。"""
+                    plan: dict, say=None, ledger=None,
+                    fill_pct=None) -> tuple[bool, str]:
+    """補藥水 —— **收尾一定把販售視窗關掉**（同 run_buy，見 `close_sale`）。
+
+    fill_pct 可選：買到負重的百分比整數（掛機設定；None＝預設 95%）。
+    """
     try:
         return _run_potion_fill(mover, scanner, npc_id, fallback, plan,
-                                say, ledger)
+                                say, ledger, fill_pct)
     finally:
         if mover is not None and getattr(mover, "active", False):
             close_sale(mover, scanner)
 
 
 def _run_potion_fill(mover, scanner, npc_id: int, fallback,
-                     plan: dict, say=None, ledger=None) -> tuple[bool, str]:
+                     plan: dict, say=None, ledger=None,
+                     fill_pct=None) -> tuple[bool, str]:
     """把精靈頁放的藥水**買到負重 95%**。假設角色已在補給商附近（跟 run_buy 同一站）。
 
     plan = {"HP": [種類id…], "MP": […]}（robot.potion_buy_ids 給的，只含「真藥水」）。
@@ -1357,6 +1378,7 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
         return False, "找不到玩家物件（負重讀不到），先不買"
 
     ids_of = {what: ids for what, _, ids in groups}
+    frac = _fill_frac(fill_pct)      # 買到負重的比例（掛機設定；預設 95%）
     w_est: dict[int, float] = {}     # 買哪種 → 實測單顆重量（Δ負重÷Δ數量）
     bought = {what: 0 for what, _, _ in groups}
     left_note = ""
@@ -1365,7 +1387,7 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
         if wgt is None:
             return False, "負重讀不到，先不買（避免超載）"
         cur, cap = wgt
-        budget = int(cap * FILL_PCT) - cur
+        budget = int(cap * frac) - cur
         have = bag_counts(scanner)
         if have is None:
             return False, "背包讀不到，先不買"
@@ -1427,7 +1449,7 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
         have = bag_counts(scanner)
         left_note = ""
         if wgt is not None and have is not None:
-            budget = int(wgt[1] * FILL_PCT) - wgt[0]
+            budget = int(wgt[1] * frac) - wgt[0]
             counts = {what: sum(have.get(t, 0) for t in ids)
                       for what, _, ids in groups}
             trip = [(counts[what],
@@ -1651,8 +1673,12 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
 def run_full_supply(mover, scanner, say=None,
                     back_to=None, potions=None,
                     potion_only: bool = False,
-                    ledger=None, guild_items=None) -> tuple[bool, str]:
+                    ledger=None, guild_items=None,
+                    fill_pct=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
+
+    fill_pct 可選：藥水買到負重的百分比整數（掛機頁「掛機設定」，全部分身共用；
+    None＝預設 95%）。呼叫端在主執行緒用 farmsettings.fill_pct() 讀了帶進來。
 
     記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
     照清單買 → 趴趴GO 跳回原練功點。順序＝**銀行 → 修裝 → 買**（使用者要求）。
@@ -1850,9 +1876,10 @@ def run_full_supply(mover, scanner, say=None,
         # ★ 藥水買到負重 95%（2026-08-19 使用者要求）：排在清單購買**之後**，
         #   翼那 50 張先佔掉的重量會自動算進去（每輪都重讀實際負重）。
         if potions and any(potions.get(w) for w in ("HP", "MP")):
-            note("補藥水到負重 95%…")
+            note(f"補藥水到負重 {int(round(_fill_frac(fill_pct) * 100))}%…")
             pok, pmsg = run_potion_fill(mover, scanner, bid, (bx, by),
-                                        potions, say=note, ledger=lg)
+                                        potions, say=note, ledger=lg,
+                                        fill_pct=fill_pct)
             note("藥水：" + pmsg)
             results.append("藥水:" + pmsg)
             bought_ok = bought_ok and pok
