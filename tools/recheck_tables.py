@@ -32,8 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
-from app.game import (bag, dailygift, energy, entity, itemdesc, itemicon,  # noqa: E402
-                      itemname, locate, monsters, skillcost, skills)
+from app.game import (bag, dailygift, energy, entity, itemdesc, itemflags,  # noqa: E402
+                      itemicon, itemname, locate, monsters, skillcost, skills)
 from app.paths import resource                        # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -334,6 +334,22 @@ def check_item_desc(sc, tabs, lines):
             + ("　← 新道具，重跑 build_item_desc.py" if missing else ""), True)
 
 
+def check_item_flags(sc, tabs, lines):
+    """物品限制旗標表（只驗**涵蓋率**：旗標在 item.xml，記憶體裡沒抓到對應欄位可比）。
+    ⛔ 過期後果：新道具不在表裡 → 公會倉庫清單不列、不送（安全退化，不會存錯）。"""
+    if not itemflags.count():
+        lines.append("    旗標表沒載到 —— 跑 py tools\\build_item_flags.py 產生")
+        return "assets/item_flags.tsv.gz 讀不到", False
+    its = bag.items(sc)
+    if not its:
+        return "背包讀不到東西", False
+    missing = sorted({i.type_id for i in its if itemflags.flags(i.type_id) is None})
+    if missing:
+        lines.append(f"    這些種類不在旗標表（公會倉庫清單不會列它們）：{missing[:20]}")
+    return (f"旗標表 {itemflags.count()} 筆；背包 {len(its)} 件，不在表裡 {len(missing)} 種"
+            + ("　← 新道具，重跑 build_item_flags.py" if missing else ""), True)
+
+
 def check_item_icons(sc, tabs, lines):
     """道具圖示包（只驗**涵蓋率**：圖在資源包，記憶體裡沒有圖可比）。
 
@@ -375,6 +391,8 @@ CHECKS = (
      "只影響顯示：查不到就沒有圖示，不會做錯事", False),
     ("item_desc（物品說明原文）", check_item_desc,
      "只影響顯示：查不到就只印記憶體算的素質，不會做錯事", False),
+    ("item_flags（物品限制旗標）", check_item_flags,
+     "公會倉庫清單的過濾：查不到一律當不能存（少存不會存錯）", False),
 )
 
 
