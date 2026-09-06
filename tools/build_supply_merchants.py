@@ -11,7 +11,8 @@
 為什麼這樣做
 ------------
 * NPC 擺放座標**不在** setting 的 xml，而在 `GAMEDATA/map/MAP<場景>.MPC`（二進位地圖檔）。
-* 補給商各城名字統一「藥水雜貨商人」；維修商名字**不統一**（維修奴隸/維修專家/維修技師…都含「維修」）。
+* 補給商各城名字統一「藥水雜貨商人」；維修商名字**不統一**（維修奴隸/維修專家/維修技師…含「維修」，
+  棕櫚基地的「修理機器人」含「修理」）。
   → **build 時用名字發掘、把「編號」抽出來；執行時用編號精準比對**（比讀名字字串穩、也符合
     使用者「用 ID 不用名字」的要求）。編號在實體 +0x1D8。
 
@@ -31,7 +32,10 @@ import sys
 from pathlib import Path
 
 BUY_NAME = "藥水雜貨商人"      # 賣天使之翼（商店 35）
-REPAIR_KEY = "維修"           # 修裝 NPC 名字都含這兩個字（維修奴隸/專家/技師…）
+# ★ 2026-09-06 使用者「補給沒找維修商人」：棕櫚基地的修裝 NPC 叫「修理機器人」(2238)，
+#   名字裡沒有「維修」→ 表上整城沒 repair。修裝 NPC 名字有兩種寫法：「維修*」（維修奴隸/專家/
+#   技師/工人/員…）跟「修理*」（修理機器人/修理屋長慶/裝備修理天使）。兩個關鍵字都認。
+REPAIR_KEYS = ("維修", "修理")   # 修裝 NPC 名字含其一
 BANK_KEY = "銀行"             # 銀行 NPC 名字都含「銀行」（銀行員工/專員/小姐/老闆…）
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "assets" / "supply_merchants.json"
@@ -79,9 +83,9 @@ def main() -> None:
     names = _npc_names(setting)
     shapes = _npc_shapes(setting)
     buy_ids = {nid for nid, nm in names.items() if nm == BUY_NAME}
-    rep_ids = {nid for nid, nm in names.items() if REPAIR_KEY in nm}
+    rep_ids = {nid for nid, nm in names.items() if any(k in nm for k in REPAIR_KEYS)}
     bank_ids = {nid for nid, nm in names.items() if BANK_KEY in nm}
-    print(f"買（{BUY_NAME}）編號 {len(buy_ids)}；修（含「{REPAIR_KEY}」）編號 "
+    print(f"買（{BUY_NAME}）編號 {len(buy_ids)}；修（含{'/'.join(REPAIR_KEYS)}）編號 "
           f"{len(rep_ids)}；銀行（含「{BANK_KEY}」）編號 {len(bank_ids)}")
 
     table: dict[str, dict[str, list[int]]] = {}
