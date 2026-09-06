@@ -6,7 +6,7 @@
     上午：Navigator 直線 ≤ ARRIVE(3.0) 就當「到了」，_walk_to_npc 只認曼哈頓 ≤2 → 站著磨 30 秒。
     晚上：改「站上目標格」又太緊 —— 商人本人站在可走格時目標＝他本格、伺服器不給站 → 磨 30 秒；
           而棕櫚基地銀行唯一能講話的格被玩家「倉用4」站著 → 磨 4 輪 51~72 秒才放棄。
-規則（現行，反組譯 0x508DF6：講得到話＝tile 方框相交，size 1 時 Chebyshev ≤ TALK_BOX(2)）：
+規則（現行，實測 TryAct kind 2：講得到話＝tile 方框 |Δx|≤TALK_BOX_X(5) 且 |Δy|≤TALK_BOX_Y(3)）：
     ① 人已在互動方框內 → **馬上**回 True，一步都不走
     ② 框外 → 目標＝框內可走、沒人站、離 NPC 最近的格；走進框就回（不必站上目標格）
     ③ Navigator 舉 exhausted 且人停了 → 夠近回 True、太遠回 False，兩種都馬上回
@@ -126,7 +126,7 @@ def in_box():
     return supply._in_talk_box((int(POS[0]), int(POS[1])), 1, NPC, 1)
 
 
-BOX_TILES = {(139, 161), (138, 163), (135, 159)}     # 框內可走的格（Chebyshev ≤2）
+BOX_TILES = {(139, 161), (138, 163), (135, 159)}     # 框內可走的格
 
 print("① 人已在互動方框內（tile (138,163) vs NPC (137,161)）：馬上回 True，一步不走")
 POS[:] = [138.5, 163.46875]
@@ -167,14 +167,13 @@ check("一樣馬上回", dt < 2.0, f"花了 {dt:.1f} 秒")
 
 print()
 print("④ 框內沒有任何可走格（地形圖跟遊戲對不上）→ 退回離 NPC 最近的可走格照走")
-POS[:] = [145.0, 161.0]
-REACH.clear(); REACH.update({(141, 161), (150, 161)})
+POS[:] = [150.0, 161.0]
+REACH.clear(); REACH.update({(143, 161), (160, 161)})     # 框外才有可走格（(143,161) Δx=6）
 FakeNav.MOVE, FakeNav.EXHAUST = 1.0, False
 ok, dt = run()
 check("回 True（站上最近可走格）", ok is True)
-check("目標是 (141,161) 的中心", FakeNav.last_goal == (141.5, 161.5), f"實得 {FakeNav.last_goal}")
-check("停在目標格 1.0 內", math.hypot(POS[0] - 141.5, POS[1] - 161.5) <= supply.NPC_ARRIVE,
-      f"停在 {POS}")
+check("目標是 (143,161) 的中心", FakeNav.last_goal == (143.5, 161.5), f"實得 {FakeNav.last_goal}")
+check("停在目標格上", (int(POS[0]), int(POS[1])) == (143, 161), f"停在 {POS}")
 
 print()
 if FAILS:

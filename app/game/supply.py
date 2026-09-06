@@ -57,6 +57,14 @@ TRY_ACT_FN = 0x00506784    # ★ AOB 定位（locate.py supply.TRY_ACT_FN）：t
 # ★ 出處：自動走路狀態機 mode 1 的每拍動作就是 TryAct(eid, 3)（0x5493D9），
 #   而點擊處理式對 NPC 也是先叫 TryAct(eid, 3) 再視情況設 mode 1（0x5AC8E0）。
 KIND_TALK = 3
+# ★★★ 跟 **NPC** 講話的 kind 是 **2**，不是 3（2026-09-06 黑狐 棕櫚基地 實測＋封包鏈）：
+#   使用者滑鼠點銀行員的封包鏈是 0x5AC95C 點擊處理式 → 狀態機 mode 4 → tick 0x5494A5
+#   `push 2; push eid; call TryAct` → 0x5069BC 送包。我們一直用 kind 3（那是雕像／公佈欄／
+#   製作檯這類場景物件的 kind，produce.click 用它沒錯），對 NPC 的範圍小很多：
+#     kind 3：站 (186,137) Δ(3,-2) 30 發全開不了；kind 2：同一格 0.53 秒開。
+#   kind 2 實測範圍（tile 差，9 個點）：|Δx|≤5 且 |Δy|≤3 全開，Δx=6/7、Δy=4 不開，
+#   隔著櫃檯也開（沒有視線檢查）。見 TALK_BOX_X/Y。
+KIND_NPC = 2
 # 等對話框的期間每隔多久補叫一次 TryAct（＝官方狀態機那個 20 拍重試，我們做得比它勤）。
 # 它同時也是「還沒走到就繼續往前走」的動力來源，所以不能只叫一次就乾等。
 CLICK_REPEAT = 0.35
@@ -123,15 +131,15 @@ NUDGE_STEPS = (0.0, 1.5, 3.0)
 #   → 規則：**先自己走進 CLICK_RANGE 內才發互動包**；對話開了還要過 TALK_RANGE
 #   的「人真的到了」閘門才送選項。
 CLICK_RANGE = 2.5          # 發互動包前，先自己走到離 NPC 這麼近
-TALK_RANGE = 4.0           # 送對話選項前，人必須停著且離 NPC 這麼近（櫃檯後 NPC 留裕度）
-# ★★★ 真正的「講得到話」判定（2026-09-06 反組譯 TryAct 0x506784 → 距離檢查 0x508DF6）：
-#   不是直線距離，是 **tile 方框相交**：我的框邊長＝我[+0x1A4]＋2·range、目標框邊長＝
-#   目標[+0x1A4]，tile＝世界座標/32 取整；size 都是 1 時就是 |Δx|≤range 且 |Δy|≤range。
-#   range 從一張小表查（0x506913 附近 0x80020202），沒讀出數值；實測 6 個點全對得上 2：
-#     開：買東西 Chebyshev 2（2.0 格）、永夜城銀行 (138,163)vs(137,161)＝2（2.92 格）
-#     不開：棕櫚基地銀行 (184,136)/(185,136)/(186,136) vs (183,139)＝3（3.19／3.63／4.26 格）
-#   ⚠ 若哪天實機看到 Chebyshev 3 也開了，要改的是這個數字（或那隻 NPC 的 +0x1A4 不是 1）。
-TALK_BOX = 2
+TALK_RANGE = 4.0           # 送對話選項前的直線門檻 —— ⚠ 只剩 tile 讀不到時的備援，
+                           #   正常路徑看 TALK_BOX_X/Y（_npc_in_box）
+# ★★★ 真正的「講得到話」判定＝**tile 方框**（2026-09-06 黑狐 棕櫚基地 銀行實測，TryAct kind 2）：
+#   tile＝世界座標/32 取整，|Δx|≤TALK_BOX_X 且 |Δy|≤TALK_BOX_Y 就開（0.1 秒），隔著櫃檯也開。
+#   實測點（我的 tile − NPC tile）：開 (3,-2)(4,0)(5,0)(4,-2)(3,-3)(5,1)(5,3)；不開 (6,0)(7,0)(3,-4)。
+#   ⚠ 反組譯 0x508DF6 是 AABB 相交（我框邊長＝[+0x1A4]+2·range），但 range 那張表沒讀出來，
+#     兩軸為什麼不一樣也沒追；先用實測數字。舊的 kind 3 是 Chebyshev ≤2（另一組數字）。
+TALK_BOX_X = 5
+TALK_BOX_Y = 3
 OFF_ACT_SIZE = 0x1A4       # 實體互動框邊長（TryAct 距離檢查用；NPC 實測 1）
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）
@@ -390,7 +398,7 @@ def _click_npc(mover, scanner, npc_ent: int) -> bool:
       20 拍、動作鎖著時還會整包被延後，但總比整個功能停掉好。
     """
     if TRY_ACT_FN:
-        return click_object(mover, scanner, npc_ent)
+        return click_object(mover, scanner, npc_ent, kind=KIND_NPC)
     pf = move.pathfinder_this(scanner)
     if not pf:
         return False
@@ -458,21 +466,17 @@ def _act_size(scanner, ent: int) -> int:
     return v if 0 < v < 16 else 1
 
 
-def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int,
-                 rng: int = TALK_BOX) -> bool:
-    """0x508DF6 原樣移植：兩個 tile 方框有沒有相交（見 TALK_BOX 的說明）。"""
-    if rng <= 0:
-        return True
-    side = me_size + 2 * rng
-    half = side // 2
-    x0, y0 = me_tile[0] - half, me_tile[1] - half
-    tx0, ty0 = npc_tile[0] - npc_size // 2, npc_tile[1] - npc_size // 2
-    return (x0 <= tx0 + npc_size - 1 and x0 + side - 1 >= tx0
-            and y0 <= ty0 + npc_size - 1 and y0 + side - 1 >= ty0)
+def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int) -> bool:
+    """站在 me_tile 講不講得到 npc_tile（見 TALK_BOX_X/Y 的實測）。
+
+    size 參數保留（NPC 與玩家實測都是 1，大一點的 NPC 沒遇過）；量到不一樣再接進來。
+    """
+    return (abs(me_tile[0] - npc_tile[0]) <= TALK_BOX_X
+            and abs(me_tile[1] - npc_tile[1]) <= TALK_BOX_Y)
 
 
 def _talk_spots(scanner, g, here, npc_ent: int, npc_tile):
-    """互動方框（TALK_BOX）內、可走且從我這區走得到的格，依離 NPC 距離排序。
+    """互動方框（TALK_BOX_X/Y）內、可走且從我這區走得到的格，依離 NPC 距離排序。
     NPC 本格不算（伺服器不給站）。
     ⚠ 不看別的玩家站不站在那（使用者 2026-09-06 定：人牆偵測刪掉）——站著就走不上去，
       由走路逾時／點不開的重試自己磨，不提前放棄。
@@ -481,7 +485,7 @@ def _talk_spots(scanner, g, here, npc_ent: int, npc_tile):
     pf = move.pathfinder_this(scanner)
     me_size = _act_size(scanner, pf + 8 if pf else 0)
     npc_size = _act_size(scanner, npc_ent)
-    r = TALK_BOX + max(me_size, npc_size)
+    r = max(TALK_BOX_X, TALK_BOX_Y) + max(me_size, npc_size)
     out = []
     for dx in range(-r, r + 1):
         for dy in range(-r, r + 1):
@@ -738,7 +742,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             walked = True
             found = find_npc(scanner, npc_id) or found
         else:
-            # ★★★ 先問「講得到話的方框」（TALK_BOX，反組譯 0x508DF6）：
+            # ★★★ 先問「講得到話的方框」（TALK_BOX_X/Y，kind 2 實測）：
             #   · 已在框內 → 直接點（TryAct 當拍就開）。
             #   · 框內有可走又沒人站的格 → 用地形圖走過去站上（_walk_to_npc 認得方框）。
             #   · 框內根本沒有可走格（地形圖跟遊戲對不上）→ 照舊靠近再點，讓 TryAct 自己試。
@@ -934,10 +938,24 @@ def _wait_arrival(scanner, npc_id: int, timeout: float = 8.0) -> bool:
         else:
             still_since = still_since or time.time()
             if time.time() - still_since > 0.5:          # 停穩了（不是走路中的頓拍）
+                # ★ 到位＝在講話方框內（TALK_BOX_X/Y；伺服器實測從框內任何一格都吃選項，
+                #   最遠 (5,3)＝5.81 格）。tile 讀不到才退回舊的直線 TALK_RANGE。
+                box = _npc_in_box(scanner, npc_id)
+                if box is not None:
+                    return box
                 gap = _npc_gap(scanner, npc_id)
                 return gap is None or gap <= TALK_RANGE
         time.sleep(0.1)
     return False
+
+
+def _npc_in_box(scanner, npc_id: int):
+    """我現在站的 tile 講不講得到這隻 NPC（TALK_BOX_X/Y）；座標讀不到回 None。"""
+    pf, here = _player_tile(scanner)
+    nt = _npc_tile(scanner, npc_id)
+    if pf is None or here is None or nt is None:
+        return None
+    return _in_talk_box((int(here[0]), int(here[1])), 1, nt, 1)
 
 
 def _repair_all(mover, scanner) -> bool:
@@ -1765,7 +1783,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
         if pf is None or here is None:
             time.sleep(0.3)
             continue
-        # ★★★ 已經站進「講得到話的方框」就算到（TALK_BOX）：目標格本來就只是框裡
+        # ★★★ 已經站進「講得到話的方框」就算到（TALK_BOX_X/Y）：目標格本來就只是框裡
         #   離 NPC 最近的一格，硬要站上去反而會磨（商人本人站在可走格 → 目標＝他本格 →
         #   伺服器不給站 → 30 秒逾時，2026-09-06 run4 買東西實錄）。
         if box_npc is not None and _in_talk_box((int(here[0]), int(here[1])), box_npc[1],
@@ -1809,7 +1827,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
                 nav.reset(goal)
         d = math.hypot(here[0] - goal[0], here[1] - goal[1])
         best = min(best, d)
-        # ★ 到了＝**站上目標格**（tile 相等；講不講得到話是看 tile 的，見 TALK_BOX）。
+        # ★ 到了＝**站上目標格**（tile 相等；講不講得到話是看 tile 的，見 TALK_BOX_X/Y）。
         #   NPC 沒串流（目標只是表座標附近的可走格）才用 Navigator 那把 NPC_ARRIVE 尺；
         #   Navigator 也用同一把（arrive=），它停下來的時候我們一定已經回去了，不會互相等。
         if (int(here[0]), int(here[1])) == tuple(target) or (
