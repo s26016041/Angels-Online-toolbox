@@ -88,6 +88,7 @@ supply.time = CLOCK                 # ⚠ 假時鐘要 patch 進 supply 的命�
 MOVER, SC = FakeMover(), FakeSC()
 
 REAL_WAIT = supply._wait_dialog     # ④ 要用它本人（②會換成替身）
+REAL_WALK = supply._walk_to_npc     # ⑤ 要用它本人（①會換成替身）
 
 print("① 人被傳走之後不會在新地圖亂走（每一輪先問 confirm）")
 walked = []
@@ -196,6 +197,54 @@ opened = REAL_WAIT(SC, 7, supply.DIALOG_TIMEOUT)  # 沒給 again ＝ 舊行為
 check("沒給補點回呼時，站著不動 0.8 秒就早退（舊行為不變）",
       opened is False and CLOCK.t - t0 < supply.DIALOG_TIMEOUT,
       f"花了 {CLOCK.t - t0:.1f} 秒")
+
+print()
+print("⑤ 走去 NPC：人站在地形圖標成不可走的格上（復活剛落地）")
+# ★★ 2026-09-06 黑狐實錄：死在副本 → 復活回永夜城 → 補給，人站的格地形圖說不可走 →
+#   reachable 回 None → 舊寫法退回 .MPC 表座標 (129,168)，那格是櫃檯後 2 格孤島 →
+#   尋路永遠算不出 → 4 輪 × 30 秒原地不動 → 「倉庫開不起來（停在離銀行約 ? 格）」。
+
+
+class FakeGrid:
+    def __init__(self, region, island):
+        self.region, self.island = set(region), set(island)
+
+    def reachable(self, x, y):
+        if (x, y) in self.region:
+            return set(self.region)
+        if (x, y) in self.island:
+            return set(self.island)
+        return None
+
+
+class FakeNav:
+    goals: list = []
+
+    def __init__(self):
+        self.stuck = False
+
+    def reset(self, goal):
+        FakeNav.goals.append(goal)
+
+    def step(self, *a, **k):
+        pass
+
+
+grid = FakeGrid({(213, 54), (213, 53), (212, 52), (129, 166)}, {(129, 168), (128, 168)})
+supply.terrain.load = lambda sc: (grid, None)
+supply.navigate.Navigator = FakeNav
+supply._npc_tile = lambda sc, nid: None                  # 銀行 NPC 還沒串流進來
+supply._player_tile = lambda sc: (0x3000, (213.5, 53.5))  # round → (214,54)：不可走
+REAL_WALK(MOVER, SC, 1890, (129, 168), timeout=0.5)
+check("站的格不可走 → 問旁邊一圈取最大區，目標＝離銀行最近的可走格 (129,166)",
+      bool(FakeNav.goals) and FakeNav.goals[0] == (129.0, 166.0), f"實得 {FakeNav.goals[:2]}")
+check("全程沒把孤島的表座標 (129,168) 當目標",
+      all(g != (129.0, 168.0) for g in FakeNav.goals), str(FakeNav.goals[:3]))
+FakeNav.goals.clear()
+supply._player_tile = lambda sc: (0x3000, (300.0, 300.0))  # 旁邊一圈也全不可走
+REAL_WALK(MOVER, SC, 1890, (129, 168), timeout=0.5)
+check("整圈都問不到（地形圖跟人對不上）→ 才硬走表座標（沒有上一個目標可沿用）",
+      bool(FakeNav.goals) and FakeNav.goals[0] == (129.0, 168.0), f"實得 {FakeNav.goals[:2]}")
 
 print()
 if FAILS:

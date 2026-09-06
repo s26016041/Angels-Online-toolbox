@@ -1550,6 +1550,23 @@ def _nearest_reachable(reach, target, max_r: int = 50):
     return best
 
 
+def _reach_around(g, here):
+    """我這一區走得到的格。站的那格地形圖標成不可走（剛落地、貼牆、櫃檯邊）就問旁邊
+    一圈、取**最大**的那一區（跟副本頁 _refresh_grid 同一招：取第一個問得到的會拿到碎片區）。
+    全部問不到回 None。"""
+    cx, cy = round(here[0]), round(here[1])
+    got = g.reachable(cx, cy)
+    if got:
+        return got
+    best = None
+    for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                   (1, 1), (1, -1), (-1, 1), (-1, -1)):
+        cand = g.reachable(cx + dx, cy + dy)
+        if cand and (best is None or len(cand) > len(best)):
+            best = cand
+    return best
+
+
 def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
     """走到某個 NPC 旁。到了/夠近回 True。
 
@@ -1579,10 +1596,16 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
             anchor = _npc_tile(scanner, npc_id) or tuple(fallback)
             newt = None
             if g is not None:
-                reach = g.reachable(round(here[0]), round(here[1]))
+                reach = _reach_around(g, here)
                 newt = _nearest_reachable(reach, anchor) if reach else None
             if newt is None:
-                newt = tuple(fallback)                    # 地形讀不到才硬走表座標
+                # ★★ 2026-09-06 黑狐實錄（死在副本 → 復活回永夜城 → 補給）：人站在地形圖標成
+                #   不可走的格上 → reachable 回 None → 舊寫法退回 .MPC 表座標 (129,168)，而那格
+                #   是櫃檯後的 2 格孤島（見 _nearest_reachable 的說明）→ 尋路永遠算不出 →
+                #   4 輪 × 30 秒原地不動 → 「倉庫開不起來（停在離銀行約 ? 格）」。
+                #   → 站的格不可走先問旁邊一圈（_reach_around）；還是算不出就**沿用上一個目標**，
+                #     沒有上一個（地形整張讀不到）才硬走表座標。
+                newt = target if target is not None else tuple(fallback)
             if newt != target:
                 target = newt
                 best = 999

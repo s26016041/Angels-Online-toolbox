@@ -414,6 +414,12 @@ MIN_REGION = 20
 #   實測表裡 `地底廣場(LV70~80)副本進入點` 就是一個合法目的地。
 #   ⚠ 送出到人真的過去約 1 秒；這麼久還沒到就再送一次（跟撞入口一樣無限重試）。
 FLY_RESEND = 8.0
+# ★★ 跳板死了（IAT 被換掉／區塊讀不到 → Mover._sink）隔多久重裝一次（2026-09-06 黑狐實錄：
+#   11:01 補給走到銀行旁跳板忽然作廢，之後整趟每一步「跳板沒裝好」、趴趴GO 空送 23 分鐘
+#   沒有出口 —— 跟 9/3「黑狐 IAT 指回真正的 PeekMessageA」同一型）。跳板掉了是暫時性失敗：
+#   move.acquire 本來就會把「IAT 被換掉」那份丟掉重裝 → 每拍先看、死了就重裝接著跑；
+#   裝不回來大聲講但不停（[[transient-failure-auto-retry]]，出口是取消勾選）。
+MOVER_RETRY = 5.0
 PORTAL_NEAR = 2.5          # 站到這麼近就算「已經在傳點上」，開始補送
 # ★★ 比 PORTAL_NEAR 更近的「真的踩在那格上」門檻（2026-09-05 黑狐實錄，無限塔第 35 步）：
 #   路線最後一段被傳點物件擋住，人停在 2.3 格外；隔空送 0x0D 一分多鐘伺服器都不理
@@ -1234,6 +1240,7 @@ class DungeonTab(BaseTab):
         self._stuck_noted = False    # 這一段記過「卡住」了
         self._fly_t = 0.0            # 還有多久重送一次趴趴GO
         self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
+        self._mover_t = 0.0          # 跳板掉了之後隔多久再重裝一次（見 MOVER_RETRY）
         self._enter_acted = None     # 入口對話「已經動過」的那一頁（防重複送）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
@@ -1638,6 +1645,9 @@ class DungeonTab(BaseTab):
         #   打怪／走路永遠「沒進展」。
         if self._check_offline(dt):
             return
+        # ⓪-000 跳板還活著嗎（IAT 被換掉／讀不到 → 作廢）→ 死了就重裝（見 MOVER_RETRY）
+        if not self._ensure_mover(dt):
+            return
         # 純紀錄：同一段停太久記一筆「卡住」；副本收益只在副本裡對帳
         self._stuck_watch(dt)
         self._loot_tick(dt)
@@ -2002,6 +2012,31 @@ class DungeonTab(BaseTab):
     # ------------------------------------------------------------------
     def _mover_ok(self) -> bool:
         return self._mover is not None and bool(getattr(self._mover, "active", False))
+
+    def _ensure_mover(self, dt: float) -> bool:
+        """跳板還活著就回 True；死了（遊戲還在）就重裝，裝回來也回 True。
+        回 False＝這一拍別動（重裝失敗、或還沒到重試時間）。見 MOVER_RETRY 的說明。
+        ⚠ 背景補給執行緒抓的是它自己那份 mover：死了它會很快用「跳板沒裝好」收尾，
+          後面飛回入口／組隊／跑腳本用的都是這裡換上的新一份。"""
+        mv = self._mover
+        if (mv is not None and getattr(mv, "active", True)
+                and getattr(mv, "installed", True)):
+            return True
+        self._mover_t -= dt
+        if self._mover_t > 0:
+            return False
+        self._mover_t = MOVER_RETRY
+        try:
+            self._mover = move.acquire(self._pid, injector.process_path(self._pid), self)
+        except Exception as exc:                         # noqa: BLE001
+            self._notify(f"⚠ 跳板掉了（IAT 被換掉／讀不到），重裝失敗：{exc}"
+                         f"（{MOVER_RETRY:.0f} 秒後再試）")
+            return False
+        if self._keys is not None:
+            self._keys.mover = self._mover
+        self._event("warn", "⚠ 跳板掉了（IAT 被換掉／讀不到）→ 已重裝，接著跑")
+        self._notify("⚠ 跳板掉了（IAT 被換掉／讀不到）→ 已重裝，接著跑")
+        return True
 
     def _candidates(self) -> list:
         """照規則挑出「現在打得了」的怪，**照直線距離排序**（近→遠）。

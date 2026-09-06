@@ -918,6 +918,33 @@ def main() -> int:
     tab._pos_prev, tab._pos_t = (10.0, 10.0), time.monotonic() - 2.0
     ck("　隔 2 秒跳 40 格（8 格/秒也只跑 16 格）→ 順移",
        tab._check_jump((50.0, 10.0)) == (10.0, 10.0))
+
+    # ★★ 2026-09-06 黑狐實錄：11:01 跳板忽然作廢（call() 看到 IAT 不是我們的 → _sink）→ 之後
+    #   每一步「跳板沒裝好」、趴趴GO 空送 23 分鐘沒出口。→ 每拍先看跳板，死了就重裝。
+    print("\n跳板死了就重裝")
+    tab = make_tab([{"do": "clear"}])
+    dead = type("Dead", (), {"active": False, "installed": False})()
+    tab._mover = dead
+    got = []
+    dt.move.acquire = lambda pid, path, owner: got.append(pid) or FakeMover()
+    dt.injector.process_path = lambda pid: "x"
+    ck("★★ 跳板死了（active=False）→ 當拍重裝、換成新的一份",
+       tab._ensure_mover(0.1) and got == [1] and tab._mover is not dead, f"got={got}")
+    ck("　狀態列講得出「跳板掉了 → 已重裝」", "已重裝" in tab.status.text(), tab.status.text())
+    tab._mover = dead
+    tab._mover_t = 0.0                        # 重試倒數歸零（上一次成功重裝把它設成 MOVER_RETRY）
+
+    def _boom(pid, path, owner):
+        raise RuntimeError("裝不上")
+    dt.move.acquire = _boom
+    ck("　重裝失敗 → 這一拍不動、不停機（出口是取消勾選）",
+       not tab._ensure_mover(0.1) and tab.run_cb.isChecked() and "裝不上" in tab.status.text(),
+       tab.status.text())
+    tab.status.setText("")
+    ck("　失敗後 MOVER_RETRY 秒內不再狂試",
+       not tab._ensure_mover(0.1) and tab.status.text() == "")
+    tab._mover = object()
+    ck("　跳板活著 → 什麼都不做", tab._ensure_mover(0.1))
     tab._pos_prev = None
     ck("★ 第一拍沒有基準 → 不判", not tab._check_jump((50.0, 10.0)))
 
