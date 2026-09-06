@@ -9,7 +9,8 @@
     ③ 開到的不是公會倉（CUR_BANK_TYPE≠1）→ 一件都不送、關窗
     ④ 送了沒進去：單件＝跳過換下一件；連續 FAIL_STREAK 件＝倉庫滿 → 關窗、訊息寫明、
        回 True（安靜，不當失敗）
-    ⑤ 小視窗：子字串過濾、勾選改 config、清單上但不在這台背包的另列灰字
+    ⑤ 小視窗兩張表：左＝背包裡能存的、右＝清單；子字串過濾兩邊一起、加入／移除改 config、
+       清單上但不在這台背包的右邊灰字、列高留夠圖示
 ⚠ 純離線：假 config／假背包／假 supply 那幾支，**只換 I/O，判斷邏輯跑真的**。
 """
 from __future__ import annotations
@@ -170,8 +171,8 @@ ok, msg = guildbank.run(MOVER, None, 1890, (129, 168), {1905})
 check("窗開著先關一次再講話（關窗共 2 次）", closes == [1, 1] and ok, f"{closes} {msg}")
 
 print()
-print("⑤ 小視窗")
-from PySide6.QtCore import Qt                                     # noqa: E402
+print("⑤ 小視窗（兩張表）")
+from PySide6.QtCore import QSize                                  # noqa: E402
 from PySide6.QtWidgets import QApplication                        # noqa: E402
 from app.tabs import guildbank_dialog                             # noqa: E402
 
@@ -183,21 +184,36 @@ guildbank_dialog.guildbank = guildbank
 guildbank_dialog.itemname = types.SimpleNamespace(
     label=lambda tid, c=None: {1905: "天使之翼", 66: "低效紅藥水", 4837: "高效藍藥水"}.get(tid, f"種類 {tid}"))
 dlg = guildbank_dialog.GuildBankDialog(None, object(), "測試")
-texts = [dlg.list.item(i).text() for i in range(dlg.list.count())]
-check("列：兩種能存的＋一種不在背包的（不可交易那件不列）", len(texts) == 3, str(texts))
-check("同種類併成一列、數量相加", "低效紅藥水 ×13" in texts, str(texts))
-check("不在這台背包的另列", any("不在這台背包" in t for t in texts), str(texts))
-check("勾選照 config", dlg.checked_ids() == {66, 4837}, str(dlg.checked_ids()))
+
+
+def texts(lst):
+    return [lst.item(i).text() for i in range(lst.count())]
+
+
+check("左邊＝背包裡能存、還沒在清單上的（不可交易那件不列）", texts(dlg.bag_list) == ["天使之翼 ×3"],
+      str(texts(dlg.bag_list)))
+check("右邊＝清單：同種類併成一列數量相加＋不在這台背包的灰字",
+      texts(dlg.want_list) == ["低效紅藥水 ×13", "高效藍藥水（不在這台背包）"], str(texts(dlg.want_list)))
+check("右邊的種類＝config", dlg.wanted_ids() == {66, 4837}, str(dlg.wanted_ids()))
+check("列高留夠（圖示 32 不被裁）", dlg.want_list.item(0).sizeHint().height() >= 32 + 8,
+      str(dlg.want_list.item(0).sizeHint()))
 dlg.search.setText("藥")
-hidden = [dlg.list.item(i).isHidden() for i in range(dlg.list.count())]
-check("打「藥」：只剩兩種藥水", hidden == [True, False, False], str(hidden))
+hidden = ([dlg.bag_list.item(i).isHidden() for i in range(dlg.bag_list.count())],
+          [dlg.want_list.item(i).isHidden() for i in range(dlg.want_list.count())])
+check("打「藥」：兩邊一起過濾", hidden == ([True], [False, False]), str(hidden))
 dlg.search.setText("")
 CFG.saves = 0
-dlg.list.item(0).setCheckState(Qt.Checked)              # 勾天使之翼
-check("勾一下就寫 config＋save", CFG.d[guildbank.CFG_KEY] == [66, 1905, 4837] and CFG.saves == 1,
-      f"{CFG.d.get(guildbank.CFG_KEY)} saves={CFG.saves}")
-dlg.list.item(2).setCheckState(Qt.Unchecked)            # 取消不在背包的那個
-check("取消「不在這台背包」的也存得掉", CFG.d[guildbank.CFG_KEY] == [66, 1905],
+dlg.bag_list.item(0).setSelected(True)
+dlg._add()                                                # 加入天使之翼
+check("加入 → 寫 config＋save、左邊消失右邊出現",
+      CFG.d[guildbank.CFG_KEY] == [66, 1905, 4837] and CFG.saves == 1
+      and texts(dlg.bag_list) == [] and "天使之翼 ×3" in texts(dlg.want_list),
+      f"{CFG.d.get(guildbank.CFG_KEY)} saves={CFG.saves} {texts(dlg.bag_list)} {texts(dlg.want_list)}")
+row = next(dlg.want_list.item(i) for i in range(dlg.want_list.count())
+           if "不在這台背包" in dlg.want_list.item(i).text())
+row.setSelected(True)
+dlg._remove()                                             # 拿掉不在背包的那個
+check("移除「不在這台背包」的也存得掉", CFG.d[guildbank.CFG_KEY] == [66, 1905],
       str(CFG.d.get(guildbank.CFG_KEY)))
 dlg.close()
 

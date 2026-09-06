@@ -1,14 +1,16 @@
 """「存公會倉庫」小視窗（掛機頁那顆鈕開的）。
 
-列**這台**背包裡能存公會倉庫的東西（圖示＋名字＋數量）、打字就過濾（子字串，
-打一個字有那個字的都出現）、勾選＝清單。清單存 config（`guildbank.items`），
-**全部分身共用** —— 在哪一台勾都一樣，補給時每台照這張存自己背包裡有的。
+兩張表（使用者 2026-09-06 定）：左邊＝**這台背包**裡能存公會倉庫的東西、右邊＝**要存的清單**。
+選了按「加入 →」／「← 移除」（或雙擊）在兩邊搬；搜尋框同時過濾兩邊（子字串，打一個字
+有那個字的都出現）。清單存 config（`guildbank.items`），**全部分身共用** —— 在哪一台勾都
+一樣，補給時每台照這張存自己背包裡有的。
 
 規則：
   · 不能存的（綁定／不可交易／不可存倉庫，表在 itemflags）**不列**，只在底下報個數。
-  · 清單上有、但這台背包沒有的，另外列在最後（灰字「不在這台背包」）—— 不然在別台勾的
-    東西在這台就看不到、也取消不了。
-  · 勾一下就存檔（config.set 接 save），不用按確定。
+  · 清單上有、但這台背包沒有的，右邊照列（灰字「不在這台背包」）—— 不然在別台加的
+    東西在這台就看不到、也拿不掉。
+  · 搬一下就存檔（config.set 接 save），不用按確定。
+  · 列高＝圖示 32 + 上下各 6（使用者：「每個物品上下要距離大點，現在圖片會被擋到」）。
   · 「🧪 現在就存」＝就地測試（走去這城的銀行開社團倉庫存清單上的東西），
     由掛機頁提供 `test_run(say)`；背景執行緒的進度用 QTimer 撈回來顯示。
 """
@@ -16,8 +18,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon
-from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QPushButton, QVBoxLayout)
 
 from app import theme
 from app.game import guildbank, itemicon, itemname
@@ -25,6 +27,7 @@ from app.game import guildbank, itemicon, itemname
 ROLE_TID = Qt.UserRole
 ROLE_TEXT = Qt.UserRole + 1          # 過濾用的小寫字串（名字＋編號）
 ICON = 32
+ROW_H = ICON + 12                    # 圖示上下各留 6px，不然 32px 的圖會被列高裁掉
 
 
 def aggregate(items):
@@ -50,12 +53,13 @@ class GuildBankDialog(QDialog):
         self._sc = scanner
         self._test_run = test_run
         self._progress = ""
+        self._agg: dict[int, tuple[int, int]] = {}
         self.setWindowTitle(f"存公會倉庫 — {who}")
         v = QVBoxLayout(self)
 
         top = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("搜尋：打一個字，有那個字的都會出現")
+        self.search.setPlaceholderText("搜尋：打一個字，有那個字的都會出現（兩邊一起過濾）")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._apply_filter)
         top.addWidget(self.search, 1)
@@ -64,11 +68,34 @@ class GuildBankDialog(QDialog):
         top.addWidget(self.reload_btn)
         v.addLayout(top)
 
-        self.list = QListWidget()
-        self.list.setIconSize(QSize(ICON, ICON))
-        self.list.setUniformItemSizes(True)
-        self.list.itemChanged.connect(self._on_item_changed)
-        v.addWidget(self.list, 1)
+        mid = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(QLabel("這台背包裡能存的"))
+        self.bag_list = self._make_list()
+        self.bag_list.itemDoubleClicked.connect(lambda _i: self._add())
+        left.addWidget(self.bag_list, 1)
+        mid.addLayout(left, 1)
+
+        arrows = QVBoxLayout()
+        arrows.addStretch(1)
+        self.add_btn = QPushButton("加入 →")
+        self.add_btn.setToolTip("把左邊選的加進要存的清單（可多選、可雙擊）")
+        self.add_btn.clicked.connect(self._add)
+        arrows.addWidget(self.add_btn)
+        self.remove_btn = QPushButton("← 移除")
+        self.remove_btn.setToolTip("把右邊選的從清單拿掉（可多選、可雙擊）")
+        self.remove_btn.clicked.connect(self._remove)
+        arrows.addWidget(self.remove_btn)
+        arrows.addStretch(1)
+        mid.addLayout(arrows)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("要存公會倉庫的清單（全部分身共用）"))
+        self.want_list = self._make_list()
+        self.want_list.itemDoubleClicked.connect(lambda _i: self._remove())
+        right.addWidget(self.want_list, 1)
+        mid.addLayout(right, 1)
+        v.addLayout(mid, 1)
 
         self.summary = QLabel()
         self.summary.setWordWrap(True)
@@ -98,80 +125,100 @@ class GuildBankDialog(QDialog):
         self._timer = QTimer(self)
         self._timer.setInterval(300)
         self._timer.timeout.connect(self._poll_progress)
-        self.resize(520, 560)
-        self._populating = False
+        self.resize(860, 600)
         self.reload()
+
+    @staticmethod
+    def _make_list() -> QListWidget:
+        lst = QListWidget()
+        lst.setIconSize(QSize(ICON, ICON))
+        lst.setUniformItemSizes(True)
+        lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        return lst
 
     # ------------------------------------------------------------------
     def reload(self) -> None:
-        """重讀背包、重畫清單（勾選狀態照 config）。"""
-        wanted = guildbank.wanted()
+        """重讀背包、重畫兩張表（清單照 config）。"""
         ok, no, complete = ([], [], False)
         if self._sc is not None:
             try:
                 ok, no, complete = guildbank.candidates(self._sc)
             except Exception:                                  # noqa: BLE001
                 ok, no, complete = [], [], False
-        agg = aggregate(ok)
-        self._populating = True
-        self.list.blockSignals(True)
-        self.list.clear()
-        for tid, (count, icon_id) in agg.items():
-            self._add_row(tid, itemname.label(tid), count, icon_id, tid in wanted, in_bag=True)
-        for tid in sorted(wanted - set(agg)):
-            self._add_row(tid, itemname.label(tid), 0, 0, True, in_bag=False)
-        self.list.blockSignals(False)
-        self._populating = False
-        n_no = sum(it.count for it in no)
-        parts = [f"已勾 {len(wanted)} 種（全部分身共用）",
-                 f"這台背包可存 {len(agg)} 種"]
-        if n_no:
+        self._agg = aggregate(ok)
+        self._rebuild(guildbank.wanted())
+        parts = [f"這台背包可存 {len(self._agg)} 種"]
+        if no:
             parts.append(f"不能存 {len(no)} 格（綁定／不可交易／不可存倉庫，不列）")
         if not complete:
             parts.append("⚠ 背包沒讀完整（換圖中？）—— 按「重新讀背包」再試")
-        self.summary.setText("　·　".join(parts))
+        self._summary_tail = "　·　".join(parts)
+        self._update_summary()
+
+    def _rebuild(self, wanted: set[int]) -> None:
+        """照 wanted 重畫兩張表：左邊＝背包裡有、還沒在清單上的；右邊＝清單（含不在背包的）。"""
+        self.bag_list.clear()
+        self.want_list.clear()
+        for tid, (count, icon_id) in self._agg.items():
+            if tid not in wanted:
+                self._add_row(self.bag_list, tid, count, icon_id, in_bag=True)
+        for tid, (count, icon_id) in self._agg.items():
+            if tid in wanted:
+                self._add_row(self.want_list, tid, count, icon_id, in_bag=True)
+        for tid in sorted(wanted - set(self._agg)):
+            self._add_row(self.want_list, tid, 0, 0, in_bag=False)
         self._apply_filter(self.search.text())
 
-    def _add_row(self, tid: int, name: str, count: int, icon_id: int,
-                 checked: bool, in_bag: bool) -> None:
+    def _add_row(self, lst: QListWidget, tid: int, count: int, icon_id: int,
+                 in_bag: bool) -> None:
+        name = itemname.label(tid)
         text = f"{name} ×{count}" if in_bag else f"{name}（不在這台背包）"
         row = QListWidgetItem(text)
-        row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
-        row.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         row.setData(ROLE_TID, int(tid))
         row.setData(ROLE_TEXT, f"{name} {tid}".lower())
+        row.setSizeHint(QSize(0, ROW_H))
         if in_bag and icon_id:
             pm = itemicon.pixmap(icon_id)
             if pm is not None and not pm.isNull():
                 row.setIcon(QIcon(pm))
         if not in_bag:
             row.setForeground(QColor(theme.TEXT_DIS))
-        self.list.addItem(row)
+        lst.addItem(row)
 
     # ------------------------------------------------------------------
     def _apply_filter(self, text: str) -> None:
-        for i in range(self.list.count()):
-            row = self.list.item(i)
-            row.setHidden(not matches(text, row.data(ROLE_TEXT) or ""))
+        for lst in (self.bag_list, self.want_list):
+            for i in range(lst.count()):
+                row = lst.item(i)
+                row.setHidden(not matches(text, row.data(ROLE_TEXT) or ""))
 
-    def checked_ids(self) -> set[int]:
-        out: set[int] = set()
-        for i in range(self.list.count()):
-            row = self.list.item(i)
-            if row.checkState() == Qt.Checked:
-                out.add(int(row.data(ROLE_TID)))
-        return out
+    def wanted_ids(self) -> set[int]:
+        """右邊那張表現在有的種類 ID。"""
+        return {int(self.want_list.item(i).data(ROLE_TID))
+                for i in range(self.want_list.count())}
 
-    def _on_item_changed(self, _row) -> None:
-        if self._populating:
-            return
-        ids = self.checked_ids()
-        guildbank.set_wanted(ids)               # 勾一下就存檔（含 save）
-        # 只更新第一段字，不重讀背包（重畫會把捲動位置弄掉）
-        parts = self.summary.text().split("　·　")
-        if parts:
-            parts[0] = f"已勾 {len(ids)} 種（全部分身共用）"
-            self.summary.setText("　·　".join(parts))
+    def _selected(self, lst: QListWidget) -> set[int]:
+        return {int(r.data(ROLE_TID)) for r in lst.selectedItems()}
+
+    def _add(self) -> None:
+        picked = self._selected(self.bag_list)
+        if picked:
+            self._commit(self.wanted_ids() | picked)
+
+    def _remove(self) -> None:
+        picked = self._selected(self.want_list)
+        if picked:
+            self._commit(self.wanted_ids() - picked)
+
+    def _commit(self, ids: set[int]) -> None:
+        guildbank.set_wanted(ids)               # 搬一下就存檔（含 save）
+        self._rebuild(ids)
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        n = len(self.wanted_ids())
+        self.summary.setText(f"清單 {n} 種（全部分身共用）　·　"
+                             + getattr(self, "_summary_tail", ""))
 
     # ------------------------------------------------------------------
     def _say(self, msg: str) -> None:
