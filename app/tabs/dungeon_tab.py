@@ -250,8 +250,9 @@ CLEAR_SETTLE = 3.0
 #   名單出現人」）。
 PARTY_MODES = (("none", "不組隊"), ("bind", "綁定分身"), ("auto", "遊戲自動組隊"))
 LEAVE_GAP = 1.0            # 退組沒清空就每隔這麼久再送一次
-INVITE_GAP = 2.0           # 邀請沒進隊就每隔這麼久再邀一次
+DENY_SETTLE = 0.5          # 兩隻都送完「拒絕」後緩這麼久才邀請（拒絕包先到）
 JOIN_GAP = 0.5             # 分身每隔這麼久按一次「同意」
+TEAM_ROUND = 4.0           # 一輪（邀請＋同意）等這麼久沒成隊 → 整套從「退組」再走一次
 TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 # ★★★ 副本設定（使用者 2026-09-05：「這遊戲有鎖副本並且未來會改所以需要一個設定」）：
 #   一次連續刷幾場、全部刷完後休息多久再刷、全部場次結束後要不要回自動掛機的點位開掛機。
@@ -688,7 +689,8 @@ class DungeonTab(BaseTab):
         for data, label in PARTY_MODES:
             self.party_box.addItem(label, data)
         self.party_box.setToolTip(
-            "綁定分身：開跑先把你跟綁定的分身都退組，再由你邀請它（均分）；\n"
+            "綁定分身：兩隻都「有隊伍就退組 → 拒絕掛著的邀請」，再由你邀請它（均分）、\n"
+            "　它按同意；幾秒沒成隊就整套重走一次，直到它出現在你的隊伍名單；\n"
             "遊戲自動組隊：先退組，等遊戲自己配到隊伍才開跑（要先在遊戲裡打開）。\n"
             "每一趟刷完 → 回程補給 → 趴趴GO回入口 → 退組再組隊 → 循環。")
         self.party_box.currentIndexChanged.connect(self._on_party_changed)
@@ -1213,8 +1215,11 @@ class DungeonTab(BaseTab):
         self._loop = False           # 要不要循環（＝「循環打副本」勾選框，見 _round_plan）
         self._cycle = "go"           # go（飛／撞入口／跑）／supply／back／team
         self._party = "none"         # 組隊模式
-        self._team_sub = ""          # leave／invite／wait
+        self._team_sub = ""          # leave／deny／invite／wait
         self._team_t = 0.0           # 下一次送退組／邀請的倒數
+        self._team_round_t = 0.0     # 這一輪（邀請＋同意）還能等多久
+        self._team_rounds = 0        # 這次組隊走了幾輪（記錄用）
+        self._team_invited = False   # 這一輪邀請送出去了沒（一輪只邀一次）
         self._join_t = 0.0           # 分身下一次按同意的倒數
         self._team_note_t = 0.0
         self._ppid = None            # 綁定分身 pid
@@ -3369,7 +3374,16 @@ class DungeonTab(BaseTab):
         self._team_begin()
 
     def _team_begin(self) -> None:
-        """進入組隊段：先退組（兩隻都退），再邀請／等遊戲配隊。"""
+        """進入組隊段。綁定分身模式是**一個循環**（使用者 2026-09-06 定）：
+
+            有隊伍就退組（兩隻都退，等名單真的清空）
+            → 兩隻都拒絕一次邀請（可能掛著別人的／上一輪沒回的；沒有就是空包）
+            → 隊長邀請 → 分身同意
+            → TEAM_ROUND 秒內分身沒出現在隊長名單 → **整套從退組再走一次**
+
+        ⛔ 不准「開頭退一次組、後面只顧一直邀請」：分身接了別人的邀請、或掛著舊邀請
+          把新的擋掉，那樣會永遠邀不進來又不會發現。
+        遊戲自動組隊模式照舊：退組 → 等遊戲自己配到隊伍。"""
         if self._party == "none":
             self._cycle = "go"
             return
@@ -3377,19 +3391,34 @@ class DungeonTab(BaseTab):
         self._team_sub = "leave"
         self._team_t = 0.0
         self._join_t = 0.0
+        self._team_round_t = 0.0
+        self._team_rounds = 0
+        self._team_invited = False
         self._team_note_t = 0.0
+
+    def _team_restart(self, why: str) -> None:
+        """這一輪沒組成 → 從「退組」整套再走一次（見 _team_begin）。"""
+        self._event("warn", f"組隊：第 {self._team_rounds} 輪沒組成（{why}）→ "
+                            "重走 退組→拒絕→邀請→同意")
+        self._team_sub = "leave"
+        self._team_t = 0.0
+        self._team_invited = False
 
     def _team_tick(self, dt: float) -> None:
         mine = team.members(self._sc)
         self._team_t -= dt
         self._join_t -= dt
+        self._team_round_t -= dt
         if self._team_sub == "leave":
             his = team.members(self._psc) if self._psc is not None else []
             if mine is None or his is None:
                 self._say("組隊：讀不到隊伍狀態，等下一拍…")
                 return
             if not mine and not his:
-                self._team_sub = "invite" if self._party == "bind" else "wait"
+                if self._party == "bind":
+                    self._team_sub = "deny"
+                else:
+                    self._team_sub = "wait"
                 self._team_t = 0.0
                 return
             if self._team_t <= 0:
@@ -3399,6 +3428,21 @@ class DungeonTab(BaseTab):
                 if his and self._pmover is not None:
                     team.leave(self._pmover)
             self._say("組隊：先退組…（等隊伍名單清空）")
+            return
+        if self._team_sub == "deny":
+            # ★ 兩隻都拒絕一次：有人正在邀請（別人的、或上一輪沒回的）會擋住新邀請。
+            #   「有沒有人在邀請我」讀不到（team.PENDING_OFF 不可信），所以無條件送，
+            #   沒掛著就是空包。
+            team.deny(self._mover)
+            if self._pmover is not None:
+                team.deny(self._pmover)
+            self._team_rounds += 1
+            self._team_sub = "invite"
+            self._team_invited = False
+            self._team_t = DENY_SETTLE                  # 拒絕包先到，再邀請
+            self._join_t = DENY_SETTLE + JOIN_GAP       # 邀請送出後才開始按同意
+            self._team_round_t = TEAM_ROUND
+            self._say(f"組隊：第 {self._team_rounds} 輪 —— 兩隻都先拒絕掛著的邀請…")
             return
         if self._team_sub == "wait":
             # 遊戲自動組隊（遊戲裡設定）：只等隊伍名單出現人
@@ -3411,19 +3455,32 @@ class DungeonTab(BaseTab):
         if self._team_sub == "invite":
             names = {m.name for m in (mine or [])}
             if self._partner_name in names:
-                self._notify(f"已跟「{self._partner_name}」組隊（均分）→ 開跑")
+                self._notify(f"已跟「{self._partner_name}」組隊（均分）"
+                             f"（第 {self._team_rounds} 輪）→ 開跑")
                 self._cycle = "go"
                 return
-            if self._team_t <= 0:
-                self._team_t = INVITE_GAP
+            if mine and self._partner_name not in names:
+                # 隊長名單有別人（接到別人的邀請）→ 不能在這隊裡刷，整套重走
+                self._team_restart("隊長名單裡是別人：" + "、".join(sorted(names)))
+                return
+            if self._team_round_t <= 0:
+                # ⚠ 分身在別人的隊伍裡／邀請被舊的擋掉／伺服器沒理 —— 這裡分不出來，
+                #   一律回頭：退組（兩隻都查）→ 拒絕 → 再邀一次。
+                self._team_restart(f"{TEAM_ROUND:g} 秒內分身沒進隊")
+                return
+            if not self._team_invited:
+                if self._team_t > 0:
+                    return
                 ok, why = team.invite(self._mover, self._partner_name, team.SHARE_EVEN)
                 if not ok:
                     self._say(f"組隊：邀請送不出去（{why}），重試中…")
                     return
+                self._team_invited = True                # 一輪只邀一次
             if self._join_t <= 0 and self._pmover is not None:
                 self._join_t = JOIN_GAP
                 team.join(self._pmover, self._psc)
-            self._say(f"組隊：邀請「{self._partner_name}」入隊中（均分）…")
+            self._say(f"組隊：第 {self._team_rounds} 輪 —— 邀請「{self._partner_name}」"
+                      f"入隊中（均分），分身按同意…")
             return
 
     # -- 副本設定：刷 N 場 → 回去掛機 → 休息 → 再刷（見 SCHED_DEFAULTS）-----------

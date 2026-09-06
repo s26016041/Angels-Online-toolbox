@@ -6,6 +6,7 @@
     team.invite(mover, "黑狐", team.SHARE_EVEN)
     team.join(mover, sc)        # 同意（邀請者 id 當場重讀）
     team.leave(mover)           # 退組（隊長、隊員都是這一支）
+    team.deny(mover)            # 拒絕邀請（沒邀請掛著就是空包）
 
 ## 這些東西怎麼來的（2026-08-09，反組譯，不是猜的）
 
@@ -176,6 +177,18 @@ def _act(mover, action: int, param: int) -> bool:
 def leave(mover) -> bool:
     """退組。**隊長與隊員都是這一支**（使用者的兩份擷取都走 groupleave）。"""
     return _act(mover, LEAVE, 0)
+
+
+def deny(mover) -> bool:
+    """拒絕組隊邀請。跟遊戲自己的 `groupdeny`（push 0 / push 7）同一包。
+
+    使用者 2026-09-06 的擷取對上：22 bytes、呼叫鏈 `0x59393D 參數 (7, 0)` →
+    動作函式，就是 (DENY, 0)。
+    ⚠ 「有沒有人正在邀請我」讀不到（PENDING_OFF 不可信，見檔頭），所以呼叫端是
+      **無條件送**：沒有邀請掛著時這一包只是空包，有掛著（別人的／上一輪沒回的）
+      就被清掉 —— 這樣下一發邀請才不會被舊的擋住。
+    """
+    return _act(mover, DENY, 0)
 
 
 def join(mover, scanner) -> tuple[bool, str]:
