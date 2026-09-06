@@ -20,7 +20,8 @@ Qt 讀不了。執行時 `app/game/itemicon.py` 自己解（numpy），這支只
 照遊戲換調色盤；這裡只把三個參數抄進索引。
 
 ## 包裡有什麼
-    index.tsv     編號 <TAB> 圖檔名 <TAB> basebias <TAB> basecolor <TAB> baserange（十進位）
+    index.tsv     編號 <TAB> 圖檔名 <TAB> basebias <TAB> basecolor <TAB> baserange
+                  <TAB> maskbias <TAB> maskcolor <TAB> maskrange（都十進位；mask 那組見 iconbias 檔頭）
     i####.shp     原始 TLHS 圖檔（deflate 壓過）
 ⚠ 同一個編號在不同 itemicon 檔裡說法矛盾（圖檔名或換色參數不同）→ **整個丟掉不收**，
   寧可沒圖也不要顯示錯的圖（照 CLAUDE.md 的安全退化原則）。
@@ -79,9 +80,10 @@ def _int(s: str | None, default: int = 0) -> int:
         return default
 
 
-def read_index(setting: Path) -> tuple[dict[int, tuple[str, int, int, int]], list[int]]:
-    """itemicon*.xml → {編號: (圖檔名, bias, color, range)}，以及「說法互相矛盾」的編號清單。"""
-    merged: dict[int, tuple[str, int, int, int]] = {}
+def read_index(setting: Path) -> tuple[dict[int, tuple[str, int, int, int, int, int, int]], list[int]]:
+    """itemicon*.xml → {編號: (圖檔名, basebias, basecolor, baserange, maskbias, maskcolor, maskrange)}，
+    以及「說法互相矛盾」的編號清單。⚠ mask 那組（2026-09-06）：調色盤前 `+0x44` 格用它換色。"""
+    merged: dict[int, tuple[str, int, int, int, int, int, int]] = {}
     bad: set[int] = set()
     files = sorted(setting.glob("itemicon*.xml"))
     if not files:
@@ -95,7 +97,9 @@ def read_index(setting: Path) -> tuple[dict[int, tuple[str, int, int, int]], lis
                 continue           # 目前資源包裡全是 \item\，別的先不收
             a = dict(ATTR.findall(rest))
             entry = (name.lower(), _int(a.get("basebias")) & 0xFFFFFFFF,
-                     _int(a.get("basecolor")) & 0xFFFF, _int(a.get("baserange")) & 0xFF)
+                     _int(a.get("basecolor")) & 0xFFFF, _int(a.get("baserange")) & 0xFF,
+                     _int(a.get("maskbias")) & 0xFFFFFFFF,
+                     _int(a.get("maskcolor")) & 0xFFFF, _int(a.get("maskrange")) & 0xFF)
             n += 1
             if iid in merged and merged[iid] != entry:
                 bad.add(iid)
@@ -113,8 +117,9 @@ def main() -> int:
         raise SystemExit(f"找不到圖檔資料夾 {shape}")
 
     index, conflict = read_index(setting)
-    biased = sum(1 for e in index.values() if e[1])
-    print(f"編號 {len(index)} 個（{biased} 個帶換色參數）"
+    biased = sum(1 for e in index.values() if e[1] or e[4])
+    masked = sum(1 for e in index.values() if e[4])
+    print(f"編號 {len(index)} 個（{biased} 個帶換色參數，其中 {masked} 個有 mask 那組）"
           + (f"（丟掉 {len(conflict)} 個說法矛盾的：{conflict[:10]}）" if conflict else ""))
 
     on_disk = {p.name.lower(): p for p in shape.glob("*.SHP")}
@@ -124,7 +129,7 @@ def main() -> int:
     missing: list[int] = []
     failed: dict[str, str] = {}
     unverified: list[str] = []
-    for iid, (name, _b, _c, _r) in sorted(index.items()):
+    for iid, (name, *_params) in sorted(index.items()):
         key = f"{name}.shp"
         path = on_disk.get(key)
         if path is None:
@@ -147,7 +152,7 @@ def main() -> int:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         z.writestr("index.tsv",
-                   "".join(f"{i}\t{e[0]}\t{e[1]}\t{e[2]}\t{e[3]}\n"
+                   "".join(f"{i}\t{e[0]}\t{e[1]}\t{e[2]}\t{e[3]}\t{e[4]}\t{e[5]}\t{e[6]}\n"
                            for i, e in sorted(usable.items())))
         for key, raw in sorted(done.items()):
             z.writestr(key, raw)

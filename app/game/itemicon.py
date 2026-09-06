@@ -7,7 +7,13 @@
 --------
 `assets/item_icons.zip`（`tools/build_item_icons.py` 從遊戲資源包打包）：
     index.tsv     編號 <TAB> 圖檔名 <TAB> basebias <TAB> basecolor <TAB> baserange
+                  <TAB> maskbias <TAB> maskcolor <TAB> maskrange
     i####.shp     遊戲自己的 TLHS 圖檔**原封不動**（4575 個、8.9MB，zip 壓完約一半）
+★★ 2026-09-06 第二坑：`mask*` 那組**是第二個換色窗**（調色盤前「檔頭 +0x44」格用它、其餘用
+  base），22922 個編號有它；第一版只抄 base → 極效藍藥水、魔法驢子…全畫成原色
+  （使用者：「有些物品圖片和遊戲顏色不同」）。算法與出處見 `iconbias.py` 檔頭。
+★ **所有顯示道具圖的地方一律走這裡的 `pixmap()`／`rgba()`**（強化頁 IconGrid、掛機頁獲得物品表、
+  存公會倉庫小視窗都是）—— 換色只在這一處做對，別的地方不准自己解圖。
 ⚠ **官方改版新增道具要重跑那支**，不然新道具沒有圖示。
 ★ **圖示編號本身是從記憶體讀的**（範本 `+0x00`，見 `bag.TMPL_ICON`），所以改版換了某個
   道具的圖，編號會自動跟上；這支只負責「編號 → 圖」那一段。
@@ -47,7 +53,8 @@ KIND_INDEX_ALPHA = 4
 
 _lock = threading.Lock()
 _zip: zipfile.ZipFile | None = None
-_index: dict[int, tuple[str, int, int, int]] | None = None   # 編號 → (圖檔名, bias, color, range)
+# 編號 → (圖檔名, basebias, basecolor, baserange, maskbias, maskcolor, maskrange)
+_index: dict[int, tuple[str, int, int, int, int, int, int]] | None = None
 _shp_cache: dict[str, object] = {}                             # 圖檔名 → 解好的圖（或 None）
 _rgba_cache: dict[int, np.ndarray | None] = {}
 _pixmap_cache: dict[int, object] = {}
@@ -56,10 +63,12 @@ _pixmap_cache: dict[int, object] = {}
 class Shp:
     """解好的一張圖：`pix` 是索引（uint8）或直接色（uint16），`alpha` 0/255（型別 4 是真 alpha）。"""
 
-    __slots__ = ("w", "h", "pal", "pix", "alpha")
+    __slots__ = ("w", "h", "pal", "pix", "alpha", "split")
 
-    def __init__(self, w: int, h: int, pal, pix, alpha) -> None:
+    def __init__(self, w: int, h: int, pal, pix, alpha, split: int = 0) -> None:
         self.w, self.h, self.pal, self.pix, self.alpha = w, h, pal, pix, alpha
+        # 檔頭 +0x44：調色盤前幾格屬於「mask 區」（換色用第二組參數），0 ＝ 整張 base 區
+        self.split = split
 
 
 def decode_shp(data: bytes) -> Shp:
@@ -73,6 +82,7 @@ def decode_shp(data: bytes) -> Shp:
     pal_off = struct.unpack_from("<I", data, 0x40)[0]
     pal = (np.frombuffer(data, dtype="<u2", count=256, offset=pal_off).astype(np.uint16)
            if pal_off else None)
+    split = data[0x44] if pal_off else 0        # 見 Shp.split／iconbias.remap_palette
     if kind == KIND_INDEX and pal is not None:
         mode, step = "index", 1
     elif kind == KIND_INDEX and pal is None:
@@ -107,13 +117,18 @@ def decode_shp(data: bytes) -> Shp:
             else:
                 pix[y, x0:x0 + n] = np.frombuffer(data, dtype="<u2", count=n, offset=src)
                 alpha[y, x0:x0 + n] = 255
-    return Shp(w, h, pal, pix, alpha)
+    return Shp(w, h, pal, pix, alpha, split)
 
 
-def compose(shp: Shp, bias: int = 0, color: int = 0, rng: int = 0) -> np.ndarray:
-    """Shp（＋換色參數）→ RGBA uint8 [h, w, 4]。換色照遊戲：有調色盤換調色盤、直接色逐點換。"""
+def compose(shp: Shp, bias: int = 0, color: int = 0, rng: int = 0,
+            mbias: int = 0, mcolor: int = 0, mrng: int = 0) -> np.ndarray:
+    """Shp（＋兩組換色參數）→ RGBA uint8 [h, w, 4]。換色照遊戲：
+    調色盤圖 → 前 `split` 格用 mask 那組、其餘用 base 那組（`0x6825b0`）；
+    直接色圖 → 只有 base 那組逐點換（`0x682150`，遊戲不看 mask）。"""
     if shp.pal is not None:
-        pal = iconbias.remap(shp.pal, bias, color, rng) if bias else shp.pal
+        pal = (iconbias.remap_palette(shp.pal, shp.split, (bias, color, rng),
+                                      (mbias, mcolor, mrng))
+               if (bias or mbias) else shp.pal)
         c = pal[shp.pix]
     else:
         c = iconbias.remap(shp.pix.ravel(), bias, color, rng).reshape(shp.h, shp.w) if bias else shp.pix
@@ -122,11 +137,13 @@ def compose(shp: Shp, bias: int = 0, color: int = 0, rng: int = 0) -> np.ndarray
 
 
 # --- 圖包 ---------------------------------------------------------------------
-def _open() -> tuple[zipfile.ZipFile | None, dict[int, tuple[str, int, int, int]]]:
-    """開檔＋讀索引（只做一次）。檔案缺了就整個功能退化成「都沒有圖」。"""
+def _open() -> tuple[zipfile.ZipFile | None, dict[int, tuple[str, int, int, int, int, int, int]]]:
+    """開檔＋讀索引（只做一次）。檔案缺了就整個功能退化成「都沒有圖」。
+
+    索引一行 = 編號、圖檔名、base 三欄、mask 三欄（舊圖包只有 base 三欄 → mask 當 0）。"""
     global _zip, _index
     if _index is None:
-        idx: dict[int, tuple[str, int, int, int]] = {}
+        idx: dict[int, tuple[str, int, int, int, int, int, int]] = {}
         try:
             z = zipfile.ZipFile(resource(DATA_FILE))
             for line in z.read(INDEX_NAME).decode("utf-8").splitlines():
@@ -134,9 +151,9 @@ def _open() -> tuple[zipfile.ZipFile | None, dict[int, tuple[str, int, int, int]
                 if len(parts) < 2 or not parts[1]:
                     continue
                 try:
-                    bias, color, rng = (int(parts[2]), int(parts[3]), int(parts[4])) \
-                        if len(parts) >= 5 else (0, 0, 0)
-                    idx[int(parts[0])] = (parts[1].lower(), bias, color, rng)
+                    nums = [int(x) for x in parts[2:8]]
+                    nums += [0] * (6 - len(nums))
+                    idx[int(parts[0])] = (parts[1].lower(), *nums)
                 except ValueError:
                     continue
             _zip = z
@@ -173,7 +190,7 @@ def rgba(icon_id: int) -> np.ndarray | None:
             shp = _shp(entry[0])
             if shp is not None:
                 try:
-                    out = compose(shp, entry[1], entry[2], entry[3])
+                    out = compose(shp, *entry[1:7])
                 except Exception:                          # noqa: BLE001
                     out = None
         _rgba_cache[icon_id] = out
@@ -186,8 +203,9 @@ def has(icon_id: int) -> bool:
     return int(icon_id) in idx
 
 
-def entry(icon_id: int) -> tuple[str, int, int, int] | None:
-    """索引裡這個編號的 (圖檔名, basebias, basecolor, baserange)；沒有回 None。"""
+def entry(icon_id: int) -> tuple[str, int, int, int, int, int, int] | None:
+    """索引裡這個編號的 (圖檔名, basebias, basecolor, baserange, maskbias, maskcolor, maskrange)；
+    沒有回 None。"""
     _, idx = _open()
     return idx.get(int(icon_id))
 

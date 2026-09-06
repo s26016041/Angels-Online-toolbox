@@ -36,6 +36,21 @@ baserange="132">`：**33316 個道具圖示裡有 21564 個**是同一張 .SHP �
 * ✅ 驗證方法：`tools/icon_bias_probe.py` 在遊戲開著時把 `[0xa02e08]`／`[0xa02e0c]`
   兩張表整包讀出來跟這裡算的逐位元比對（兩張表一樣＝換色結果必然一樣）。
 
+## ★★ 第二組參數 `maskbias／maskcolor／maskrange`（2026-09-06 使用者：「有些物品圖片跟遊戲顏色不同」）
+
+`itemicon*.xml` 有 **22922 個編號**帶 `mask*`（4544 個只有 mask、18378 個 base+mask）——
+第一版只抄 `base*`，這些圖示（極效藍藥水 9744、魔法驢子 5281…）全畫成原色。反組譯：
+* 畫圖示 `0x64bbcc`／`0x64bbe0`：`SetBias(0, base…)`＋**`SetBias(1, mask…)`**（slot 1 ＝ 全域 +0x10）。
+* 調色盤圖的換色本體是 **`0x6825b0(dst, src, n, state)`**（不是 0x682230 那條，那條給直接色）：
+      n ＝ .SHP 檔頭 **+0x44 的 byte**（2811 檔＝64、1573 檔＝0）
+      調色盤 [0, n)   → 用 **slot 1（mask）** 的窗／bias；mask bias 0 就照抄
+      調色盤 [n, 256) → 用 **slot 0（base）** 的窗／bias；base bias 0 就照抄
+  → 有 mask 的圖，前 64 格是「mask 區」，base 只管後面 192 格（以前 base 整張套是錯的）。
+* 直接色圖（沒調色盤）只看 slot 0（`0x67c438`：slot0 bias≠0 才叫 `0x682150`），mask 不理。
+* 觸發條件 `0x67c3b0`：slot0 或 slot1 任一 bias≠0 才建換色調色盤。
+✅ 逐位元驗證：`tools/icon_mask_probe.py` 把調色盤＋我們算的 state 餵給遊戲那支 `0x6825b0`，
+  跟 `remap_palette()` 的結果比。
+
 ⚠ 這支只做純數學，不碰 Qt、不讀遊戲；圖檔解碼在 itemicon.py。
 """
 from __future__ import annotations
@@ -178,6 +193,20 @@ def remap(colors: np.ndarray, bias: int, color: int, rng: int) -> np.ndarray:
     v2 = np.clip(v + dv, 0, 31)
     out = B[(((v2 << 5) | s2) << 6) | h2]
     return np.where(inside, out, colors).astype(np.uint16)
+
+
+def remap_palette(pal: np.ndarray, split: int,
+                  base: tuple[int, int, int], mask: tuple[int, int, int]) -> np.ndarray:
+    """整張調色盤換色（照 `0x6825b0`）：前 `split` 格用 mask 那組、其餘用 base 那組。
+
+    pal：256 個 RGB565；split：.SHP 檔頭 +0x44（0 ＝ 整張都是 base 區）；
+    base／mask：各自的 (bias, color, range)。bias 0 的那組不動（跟遊戲一樣照抄）。
+    """
+    pal = np.asarray(pal, dtype=np.uint16)
+    n = max(0, min(int(split) & 0xFF, len(pal)))
+    head = remap(pal[:n], *mask) if n else pal[:n]
+    tail = remap(pal[n:], *base)
+    return np.concatenate([head, tail]).astype(np.uint16)
 
 
 def rgb565_to_rgb8(c: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -59,8 +59,14 @@ def main() -> int:
             bad.append(f"{name}:{exc}")
     ck("每一張都解得開", not bad, str(bad[:5]))
     e = itemicon.entry(5450)
-    ck("5450（完美的黃寶石）索引帶換色參數 i0254 / 0x50a08 / 0x4aed / 132",
-       e == ("i0254", 0x50A08, 0x4AED, 132), str(e))
+    ck("5450（完美的黃寶石）索引帶換色參數 i0254 / 0x50a08 / 0x4aed / 132（沒 mask）",
+       e == ("i0254", 0x50A08, 0x4AED, 132, 0, 0, 0), str(e))
+    e = itemicon.entry(9744)
+    ck("9744（極效藍藥水）索引帶 **mask** 那組 i0141 / 0x26 / 0 / 160（沒 base）",
+       e == ("i0141", 0, 0, 0, 0x26, 0, 160), str(e))
+    shp = itemicon._shp("i0141")
+    ck("i0141 檔頭 +0x44 ＝ 64（調色盤前 64 格是 mask 區）", shp is not None and shp.split == 64,
+       str(getattr(shp, "split", None)))
 
     print("\n換色算法（iconbias）")
     A, B = iconbias.tables()
@@ -111,6 +117,30 @@ def main() -> int:
     want = int(B[((max(bv - 2, 0) << 5) | min(bs + 8, 31)) << 6 | 5])
     ck("bias 高位元組是 int8（亮度 −2）", int(neg[0]) == want, f"{int(neg[0]):#x} vs {want:#x}")
 
+    print("\n第二組參數（mask）：調色盤前 split 格用 mask、其餘用 base（0x6825b0）")
+    pal = np.arange(256, dtype=np.uint16) * 0x100 + 0x4AED % 0x100    # 各種顏色都有
+    pal[:64] = 0x4AED                                                    # mask 區放窗內的顏色
+    pal[64:] = 0x4AED
+    both = iconbias.remap_palette(pal, 64, (0x0A, 0x4AED, 132), (0x50A08, 0x4AED, 132))
+    only_mask = iconbias.remap(pal[:64], 0x50A08, 0x4AED, 132)
+    only_base = iconbias.remap(pal[64:], 0x0A, 0x4AED, 132)
+    ck("前 64 格＝mask 那組的結果、後 192 格＝base 那組的結果",
+       bool((both[:64] == only_mask).all()) and bool((both[64:] == only_base).all()))
+    ck("split 0 → 整張都走 base、mask 不理",
+       bool((iconbias.remap_palette(pal, 0, (0x0A, 0x4AED, 132), (0x50A08, 0x4AED, 132))
+             == iconbias.remap(pal, 0x0A, 0x4AED, 132)).all()))
+    ck("mask bias 0 → 前 64 格照抄",
+       bool((iconbias.remap_palette(pal, 64, (0x0A, 0x4AED, 132), (0, 0, 0))[:64] == pal[:64]).all()))
+    ck("base bias 0 → 後 192 格照抄",
+       bool((iconbias.remap_palette(pal, 64, (0, 0, 0), (0x50A08, 0x4AED, 132))[64:] == pal[64:]).all()))
+    blue, red = itemicon.rgba(9744), itemicon.rgba(9743)
+    ck("極效藍藥水 9744（只有 mask）≠ 極效紅藥水 9743（同一張 i0141 沒參數）",
+       blue is not None and red is not None and bool((blue != red).any()))
+    if blue is not None and red is not None:
+        m = blue[..., 3] > 0
+        ck("藍藥水真的偏藍（b > r）", float(blue[..., 2][m].mean()) > float(blue[..., 0][m].mean()),
+           f"r={float(blue[..., 0][m].mean()):.0f} b={float(blue[..., 2][m].mean()):.0f}")
+
     print("\n寶石：同一個形狀不同顏色要畫出不同的圖")
     imgs = {i: itemicon.rgba(i) for i in (5445, 5450, 5455)}
     ck("三張都畫得出來", all(x is not None for x in imgs.values()))
@@ -127,7 +157,7 @@ def main() -> int:
            mean(imgs[5455], 1) > mean(imgs[5455], 0) and mean(imgs[5445], 0) > mean(imgs[5445], 1),
            f"綠 r={mean(imgs[5455], 0):.0f} g={mean(imgs[5455], 1):.0f}；"
            f"橙 r={mean(imgs[5445], 0):.0f} g={mean(imgs[5445], 1):.0f}")
-    plain = [i for i, e in itemicon._open()[1].items() if e[1] == 0][:3]
+    plain = [i for i, e in itemicon._open()[1].items() if e[1] == 0 and e[4] == 0][:3]
     ok = True
     for i in plain:
         e = itemicon.entry(i)
