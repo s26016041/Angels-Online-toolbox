@@ -601,6 +601,11 @@ ROT_SETTLE = 5.0
 #   REST_HP_DEFAULT／REST_MP_DEFAULT／SIT_GAP／SIT_CONFIRM／REST_SAMPLE）。
 #   整個功能 2026-08-09 依使用者要求移除，理由與替代路徑見建構式裡那段說明。
 PATH_GAP = 0.2                  # 重算「跟目標之間有沒有地形」的最短間隔
+# ★★★ 人牆（使用者 2026-09-06 定：這遊戲的人不會走開，有時穿得過、有時能疊、有時不行）：
+#   走路指令送了 BODY_TRY 秒還沒動（地形圖說腳前可走）＝腳前那格站著人的身體，硬走已經試過
+#   → 那格這一隻目標的追逐期間當牆（terrain.next_cell），重算路；繞不開就是「走不到」→ 換一隻。
+#   ⛔ 不等人走開、一個人只試一次（不會左右來回閃）。
+BODY_TRY = 1.5
 # ★ 規劃路徑最多只准佔這麼一小部分的時間（1/20 = 5%）：算完之後休息
 #   「這次花掉的時間 × PATH_BUDGET」再算下一次。近距離的 A* 是 0.1~0.8ms，
 #   乘 20 也還在 PATH_GAP 之內＝節奏完全不變；只有極遠的目標
@@ -1733,6 +1738,8 @@ class CharFarmPage(QWidget):
         self._handoff_t = 0.0      # 交棒之後多久沒真的接戰
         self._near_fail = 0        # 近距離直線走連續幾次沒位移（撞牆偵測）
         self._near_from = None     # 上一次直線走出發時的位置
+        self._body_avoid: set = set()   # 這一隻目標追逐期間撞到的人站的格（當牆，見 BODY_TRY）
+        self._walk_sent = None          # (送走路指令的時間, 當時位置, 目標點)：判「硬走沒過」用
         self._gone = 0             # 連續幾次掃描沒看到目標
         self._walked_ok = True     # 上次下移動指令有沒有成功
         self._moving = False       # 角色是不是正在走路（讀動畫狀態，見 tick）
@@ -4428,6 +4435,28 @@ class CharFarmPage(QWidget):
             self._castwatch = None
         self._keys.castwatch = None
 
+    def _body_ahead(self, me) -> bool:
+        """走路指令送了 BODY_TRY 秒還在原地 → 腳前那格站著人，這一隻的追逐期間當牆。
+
+        回 True＝這一拍剛標了一格（呼叫端接著就會帶 avoid 重算路）。
+        ⚠ 只在「送過指令」之後判：沒送指令站著本來就不會動，不能算人擋。
+        """
+        ws = self._walk_sent
+        if not ws or not me:
+            return False
+        t0, at, toward = ws
+        if time.monotonic() - t0 < BODY_TRY:
+            return False
+        self._walk_sent = None
+        if math.hypot(me[0] - at[0], me[1] - at[1]) >= 0.3:
+            return False                                   # 有動 → 不是被擋
+        cell = terrain.next_cell(me, toward)
+        if cell is None or cell in self._body_avoid:
+            return False
+        self._body_avoid.add(cell)
+        self._dbg(f"腳前 {cell} 走不進去（有人）→ 當牆繞開，這隻已標 {len(self._body_avoid)} 格")
+        return True
+
     def _walk_to_spot(self, gx: float, gy: float, me, keep: float,
                       reach: float | None):
         """走去「跟目標同行同列」的站位（見 _walk_toward 裡的說明）。
@@ -4442,24 +4471,27 @@ class CharFarmPage(QWidget):
         finder = getattr(grid, "ortho_spot", None)
         if finder is None or not me:
             return None
-        spot = finder(me, (gx, gy), keep, reach)
+        av = self._body_avoid or None
+        spot = finder(me, (gx, gy), keep, reach, av) if av else finder(me, (gx, gy), keep, reach)
         if spot is None:
             return None
         if math.hypot(spot[0] - me[0], spot[1] - me[1]) < 0.6:
             return 0                                   # 已經站在那格
         mtile = (int(me[0]), int(me[1]))
         stile = (int(spot[0]), int(spot[1]))
-        if grid.clear_line(mtile, stile):
+        if (grid.clear_line(mtile, stile, av) if av else grid.clear_line(mtile, stile)):
             ok = self._mover.walk_exact(self.sc, self.player, spot[0], spot[1])
             self._walk_t = 0.0
+            self._walk_sent = (time.monotonic(), me, spot)
             return 1 if ok else 0
-        wp = grid.waypoints(mtile, stile)
+        wp = grid.waypoints(mtile, stile, avoid=av) if av else grid.waypoints(mtile, stile)
         if not wp:
             return None                                # 到不了那格 → 照舊
         pts = [(x + 0.5, y + 0.5) for x, y in wp]
         n = self._mover.walk_route(self.sc, self.player, spot[0], spot[1],
                                    stop_short=0.0, points=pts)
         self._walk_t = 0.0
+        self._walk_sent = (time.monotonic(), me, pts[0])
         return n
 
     def _walk_toward(self, gx: float, gy: float, me, keep: float,
@@ -4523,6 +4555,7 @@ class CharFarmPage(QWidget):
             self._near_from = me
             ok = self._mover.walk_near(self.sc, self.player, gx, gy, keep)
             self._walk_t = 0.0
+            self._walk_sent = (time.monotonic(), me, (gx, gy))
             return 1 if ok else 0
         self._near_from = None
         # ★★ 路徑一律用**我們自己算的**交給遊戲走，不再請它尋一次路
@@ -4545,6 +4578,7 @@ class CharFarmPage(QWidget):
         n = self._mover.walk_route(self.sc, self.player, gx, gy,
                                    stop_short=keep, points=pts)
         self._walk_t = 0.0
+        self._walk_sent = (time.monotonic(), me, pts[0])
         return n
 
     def _my_id(self) -> int:
@@ -5148,6 +5182,8 @@ class CharFarmPage(QWidget):
         self._path_t = PATH_GAP                   # 下一拍就算
         self._path_gap = PATH_GAP                 # 換目標 → 節奏重來
         self._way = []
+        self._body_avoid = set()      # 換目標 → 這一趟的人牆重來
+        self._walk_sent = None
         self._unreach = 0
         self._hurt = False           # 換了新目標 → 又回到「還沒打傷，可以再換」
         self._push_in = False        # 貼身繞打是跟上一隻綁的，換目標歸零
@@ -5981,12 +6017,16 @@ class CharFarmPage(QWidget):
             #   一瞬間 —— 那一瞬間本來就不該走路。
             self._no_grid = "" if grid is not None else (
                 self._maps.why or "讀不到地形圖")
+            if grid is not None:
+                self._body_ahead(me)              # 硬走沒過 → 腳前那格當牆（見 BODY_TRY）
+            av = self._body_avoid or None
             if grid is None:
                 # ⚠ 這裡**不准動 _unreach**：那是「這隻怪走不到」的計數，
                 #   我們自己讀不到圖不能算在怪頭上（會把牠冷凍起來）。
                 self._path_pts, self._way = 0, []
                 self._line_clear = False
-            elif grid.clear_line(mtile, ttile):
+            elif (grid.clear_line(mtile, ttile, av) if av
+                  else grid.clear_line(mtile, ttile)):
                 self._path_pts, self._way, self._unreach = 1, [], 0
                 self._line_clear = True
             else:
@@ -6001,7 +6041,8 @@ class CharFarmPage(QWidget):
                 #     長度成正比（實測整張圖最壞 12~19ms，一般 0.2~0.8ms）。
                 #     A* 最貴的情況是「走不到」要把整片展開完 —— 那個情況
                 #     在這裡已經不存在。
-                wp = grid.waypoints(mtile, ttile)
+                wp = (grid.waypoints(mtile, ttile, avoid=av) if av
+                      else grid.waypoints(mtile, ttile))
                 if wp:
                     self._path_pts = max(2, len(wp))
                     self._way = [(x + 0.5, y + 0.5) for x, y in wp]

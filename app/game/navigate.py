@@ -65,15 +65,20 @@ STALL_TRIES = 4          # 同一個轉折點連續這麼多拍沒進展就重�
 #   「走不到」，然後那張圖只有一個巡邏點的話**直接停掉掛機**。
 #   使用者 2026-08-24 回報「巡邏點設得到就一定走得到，為什麼會走不到就停」
 #   —— 就是這個。
-REPLAN_MAX = 3
+# ⚠ 2026-09-06 晚改 6：現在每次重算只把**一個人**的格標掉（AVOID_AHEAD=1），一道三人寬的
+#   人牆要標三次才繞得出去，3 次額度會在找到路之前就判走不到。真正的硬停是「標掉之後
+#   沒有路」（_plan_from_grid），這個額度只防無限重算。
+REPLAN_MAX = 6
 # ★★★ 被擋住時要**換一條路**，不是把同一條再算一遍（使用者 2026-09-06：
 #   「沒靠近就直接換，同樣東西重試沒意義」）。A* 是確定性的：站在同一格重算
 #   一定得到同一條最短路 → 舊版「重算 3 次」＝把同一道人牆推 3 次。
-#   現在：連續 STALL_TRIES 拍沒靠近轉折點 → 把「腳前往轉折點方向的這幾格」
-#   記成暫時不可走（只影響這一次算路，地形圖本身不動）再算，算出來的必然是
-#   繞開那段的另一條路。扣掉那幾格就沒有路（單格寬走道）→ 這才判 blocked。
-#   走到下一個轉折點＝已經繞過去了，清掉重來。
-AVOID_AHEAD = 3
+# ★★★ 2026-09-06 晚使用者定：**這遊戲的人不會走開**（大家都掛著），而且有時穿得過、
+#   有時能疊、有時不行 → 規則＝「先硬走一次，沒過就把那個人當牆，一個人只試一次」：
+#   · 地形圖說可走、卻連續 STALL_TRIES 拍走不進去 ＝ 腳前那格站著人的身體（硬走已經試過了）
+#     → 把**腳前那一格**記成這一趟不可走，重算；有縫就繞，扣掉之後沒有路 → stuck "blocked"。
+#   · 標過的格這一趟**不清**（走到轉折點也不清、reset 才清）→ 同一個人不會再撞第二次，
+#     也就不會左右來回閃。⛔ 不准「等人走開再試」。
+AVOID_AHEAD = 1
 
 
 def _bresenham(a, b):
@@ -114,6 +119,21 @@ class Navigator:
         #   54000 格，打怪那邊也要查同一份，各存一份只是白佔記憶體又要各讀一次。
         self._maps = maps if maps is not None else terrain.Cache()
         self.reset()
+
+    def retarget(self, goal: tuple[float, float]) -> None:
+        """換目標但**保留這一趟標掉的人**（人不會走開；同一趟走去同一個 NPC 換站位用）。"""
+        keep = set(self._avoid)
+        self.reset(goal)
+        self._avoid = keep
+
+    def seed_avoid(self, cells) -> None:
+        """把呼叫端記的「這一趟已知被人站著的格」帶進來（跨 Navigator 物件沿用）。"""
+        self._avoid |= set(cells)
+
+    @property
+    def avoid(self) -> frozenset:
+        """這一趟標成不可走的格（人的身體）；呼叫端挑站位時要一起扣掉。"""
+        return frozenset(self._avoid)
 
     def reset(self, goal: tuple[float, float] | None = None) -> None:
         self.goal = goal
@@ -166,14 +186,14 @@ class Navigator:
         wp = (grid.waypoints(here, goal, avoid=self._avoid) if self._avoid
               else grid.waypoints(here, goal))
         if not wp and self._avoid:
-            # ★ 扣掉被擋的那幾格就沒有路 ＝ 單格寬走道被堵死。這不是地形沒路
-            #   （不帶 avoid 明明算得出來、人也走過），是暫時被擋 → blocked，
-            #   交呼叫端決定要等還是換目標；下次重算不再扣（人牆會走開）。
-            self._avoid.clear()
+            # ★ 扣掉被人站著的格就沒有路 ＝ 人牆封死、繞不開。這不是地形沒路
+            #   （不帶 avoid 明明算得出來），是人擋 → blocked，交呼叫端換目標／就地做事。
+            #   ⛔ 標掉的格**不清**（使用者 2026-09-06：人不會走開，不准等），呼叫端要
+            #     重來得自己 reset()。
             self._route = None
             self.stuck = True
             self.stuck_reason = "blocked"
-            self.note = "⛔ 路被擋住而且繞不開（沒有別條路）"
+            self.note = "⛔ 被人擋住而且繞不開（人不會走開）"
             return False
         if not wp:
             # 地形圖說「真的走不到」。
@@ -272,7 +292,7 @@ class Navigator:
             self._go_now = True     # 到點了 → 下一拍立刻送下一段
             self._best = None
             self._replans = 0       # ★ 走到一個轉折點＝真的有進展（見 REPLAN_MAX）
-            self._avoid.clear()     # 繞過去了 → 之前被擋的格不必再繞
+            # ⚠ 標掉的人**不清**（人不會走開；清了回頭又撞同一個人、左右來回）。
         if self._ri >= len(self._route):
             # 路線走完了還沒到 ＝ 終點被放寬到最近的可走格、人已經站在那裡。
             # ⛔ 不重算（算出來還是同一條，2026-09-05 無限塔第 54 步就是這樣原地轉）
@@ -298,8 +318,8 @@ class Navigator:
         else:
             self._stall += 1
             if self._stall >= STALL_TRIES:
-                # 走不動（多半是被怪／別的玩家擋住）→ **換一條路**：把腳前往轉折點
-                #   方向的幾格記成暫時不可走再從現在的位置重算（見 AVOID_AHEAD）。
+                # 硬走了 STALL_TRIES 拍還走不進腳前那格（地形圖說可走）＝那格站著人。
+                #   → 這個人當牆（這一趟不再試），從現在的位置重算（見 AVOID_AHEAD）。
                 #   ⛔ 不准原樣重算 —— A* 站在同一格算出來永遠是同一條，那只是把牆
                 #   再推一次（使用者 2026-09-06「同樣東西重試沒意義」）。
                 self._replans += 1
@@ -309,11 +329,11 @@ class Navigator:
                 if self._replans > REPLAN_MAX:
                     self.stuck = True
                     self.stuck_reason = "blocked"
-                    self.note = (f"⛔ 換了 {REPLAN_MAX} 條路都完全沒往前走"
-                                 "（路被擋住？）")
+                    self.note = (f"⛔ 繞了 {REPLAN_MAX} 個人都完全沒往前走"
+                                 "（被人牆圍住？）")
                     return self.note
-                self.note = (f"路上被擋住 → 繞開腳前那段換一條路"
-                             f"（第 {self._replans} 次）")
+                self.note = (f"腳前有人走不過 → 當牆繞開"
+                             f"（第 {self._replans} 個）")
                 return self.note
         # ★ 最短路的每一段本來就保證直線可通 → 直接把終點交給遊戲的走路常式，
         #   不必再請它尋一次路（省一次呼叫、不佔指令槽）。

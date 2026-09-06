@@ -479,7 +479,7 @@ NEAR_SPOT_R = 8            # 找「離 NPC 最近可到的格」時掃 NPC 周�
 NEAR_GIVE_UP = 2.5         # 在目標格 2 格內待了這麼久還站不上去 → 就地算到（最後一格被人占著）
 
 
-def _near_spots(scanner, g, here, npc_ent: int, npc_tile):
+def _near_spots(scanner, g, here, npc_ent: int, npc_tile, avoid=None):
     """離 NPC **最近、可走且從我這區走得到**的格，近的在前（同距離同行同列的排前面）。
 
     ★ 使用者 2026-09-06 定：走位目標就是「離 NPC 最近可到的格」，不用講話方框當停止線
@@ -488,7 +488,7 @@ def _near_spots(scanner, g, here, npc_ent: int, npc_tile):
     ⚠ 不看別的玩家站不站在那（使用者定：人牆偵測刪掉）——站不上去由 _walk_to_npc 的
       「最後一步走不進去就算到」收尾。
     """
-    reach = _reach_around(g, here) or set()
+    reach = _reach_around(g, here, avoid) or set()
     r = NEAR_SPOT_R
     out = []
     for dx in range(-r, r + 1):
@@ -501,7 +501,7 @@ def _near_spots(scanner, g, here, npc_ent: int, npc_tile):
     return [c for _d, _o, c in out]
 
 
-def _box_status(scanner, npc_id: int, npc_ent: int):
+def _box_status(scanner, npc_id: int, npc_ent: int, avoid=None):
     """我現在講不講得到這隻 NPC、框內還有哪些格能站。地形圖／座標讀不到回 None。
 
     回 {"in_box": 我已在互動方框內, "free": [離 NPC 最近可到的格，近的在前…], "npc_tile": NPC 的 tile}。
@@ -515,7 +515,7 @@ def _box_status(scanner, npc_id: int, npc_ent: int):
     me_tile = (int(here[0]), int(here[1]))
     in_box = _in_talk_box(me_tile, _act_size(scanner, pf + 8),
                           npc_tile, _act_size(scanner, npc_ent))
-    free = _near_spots(scanner, g, here, npc_ent, npc_tile)
+    free = _near_spots(scanner, g, here, npc_ent, npc_tile, avoid)
     return {"in_box": in_box, "free": free, "npc_tile": npc_tile}
 
 
@@ -722,6 +722,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早也無害——
     #   對話框晚一拍才到，下一輪 _wait_dialog 看到「值已經變了」立刻接上，不重等。
     base = _dialog_token(scanner)
+    trip: set = set()  # 這一趟撞到、當牆的人站的格（人不會走開，跨呼叫沿用；換 NPC 才重來）
     fails = 0        # 「點了確認沒開」的次數（決定 nudge 步伐階梯）
     walked = False   # 這一趟 engage 動過腳沒（點擊要跟在移動後面才穩，8/14 flaky 實測）
     for _ in range(tries):
@@ -733,7 +734,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             return True
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
-            _walk_to_npc(mover, scanner, npc_id, fallback, 30.0)
+            _walk_to_npc(mover, scanner, npc_id, fallback, 30.0, avoid=trip)
             walked = True
             continue
         if fails > 0:                                # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
@@ -746,7 +747,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             #   （_walk_to_npc：已在那格馬上回；最後一步被人／NPC 身體擋住也算到）。
             #   講話方框（TALK_BOX_X/Y）只拿來決定「點下去等多久」跟「送選項前到位沒」。
             #   地形圖讀不到（換圖瞬間）才退回舊的：離 NPC > CLICK_RANGE 就用遊戲尋路靠近再點。
-            box = _box_status(scanner, npc_id, found[0])
+            box = _box_status(scanner, npc_id, found[0], avoid=trip)
             if box is not None:
                 # ★ 使用者 2026-09-06 定：**直接走到離 NPC 最近可到的格**再點（已在那格就
                 #   馬上回；最後一步被身體擋住也算到）。不拿講話方框當「夠近了」的停止線。
@@ -756,7 +757,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                 near = bool(_here and spot and math.hypot(
                     _here[0] - spot[0] - 0.5, _here[1] - spot[1] - 0.5) <= 2.0)
                 if not near:
-                    _walk_to_npc(mover, scanner, npc_id, fallback, 12.0)
+                    _walk_to_npc(mover, scanner, npc_id, fallback, 12.0, avoid=trip)
                     walked = True
                     found = find_npc(scanner, npc_id) or found
             else:
@@ -1620,8 +1621,6 @@ NPC_ARRIVE = 0.75      # Navigator 的到達圈：離目標格**中心**這麼�
 # ★ 主城人多，navigate 常被玩家擋在最後幾格。但 TryAct 點 NPC 會自己走完
 #   最後那段再互動，所以路線走完（exhausted）而人在這麼近之內就交給它收尾。
 NEAR_ENOUGH = 8
-# 導航器連換路都走不動（被堵死）→ 停這麼久再從頭規劃（人牆會走開；原樣立刻重走沒意義）
-BLOCKED_PAUSE = 1.5
 
 
 def _player_tile(scanner):
@@ -1733,24 +1732,26 @@ def _nearest_reachable(reach, target, max_r: int = 50):
     return best
 
 
-def _reach_around(g, here):
+def _reach_around(g, here, avoid=None):
     """我這一區走得到的格。站的那格地形圖標成不可走（剛落地、貼牆、櫃檯邊）就問旁邊
     一圈、取**最大**的那一區（跟副本頁 _refresh_grid 同一招：取第一個問得到的會拿到碎片區）。
-    全部問不到回 None。"""
+    全部問不到回 None。avoid＝這一趟被人站著、當牆的格（nav.avoid）。"""
     cx, cy = round(here[0]), round(here[1])
-    got = g.reachable(cx, cy)
+    got = g.reachable(cx, cy, avoid) if avoid else g.reachable(cx, cy)
     if got:
         return got
     best = None
     for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
                    (1, 1), (1, -1), (-1, 1), (-1, -1)):
-        cand = g.reachable(cx + dx, cy + dy)
+        cand = (g.reachable(cx + dx, cy + dy, avoid) if avoid
+                else g.reachable(cx + dx, cy + dy))
         if cand and (best is None or len(cand) > len(best)):
             best = cand
     return best
 
 
-def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
+def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float,
+                 avoid=None) -> bool:
     """走到某個 NPC 旁。到了/夠近回 True。
 
     ★★★ 目標＝**離 NPC 真實座標最近的「可走」格**（NPC 本身常在櫃檯後不可走）。
@@ -1778,11 +1779,23 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
     g, _ = terrain.load(scanner)              # 地形圖載一次（同一張圖不變）
     nav = None
     target = None
+    goal = None
     best = 999
     t0 = last_plan = 0.0
     t0 = time.time()
     streamed = False                          # NPC 串流進來了（目標＝離他最近可到的格）
     near_since = None                         # 進到目標 2 格內是什麼時候（最後一格被占用）
+    # ★ 一趟只用**一個**導航器：它記著這趟撞到的人（navigate.AVOID_AHEAD，人不會走開），
+    #   換站位用 retarget() 保留；呼叫端跨呼叫沿用的 `avoid` 也先塞進去。
+    nav = navigate.Navigator()
+    if avoid:
+        nav.seed_avoid(avoid)
+
+    def done(v):
+        """回去之前把這趟撞到的人回寫給呼叫端（同一趟 _engage_npc 的下一次呼叫沿用）。"""
+        if avoid is not None:
+            avoid.update(nav.avoid)
+        return v
     while time.time() - t0 < timeout:
         pf, here = _player_tile(scanner)
         if pf is None or here is None:
@@ -1798,14 +1811,14 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
             newt = None
             if g is not None and found:
                 # ★ NPC 看得到 → 目標＝**離他最近、可到的格**（使用者 2026-09-06 定），
-                #   不用講話方框當停止線；周圍 NEAR_SPOT_R 內沒可到格才退回一般最近可走格。
-                st = _box_status(scanner, npc_id, found[0])
+                #   被人站著的格（nav.avoid）扣掉；周圍 NEAR_SPOT_R 內沒可到格才退回一般最近可走格。
+                st = _box_status(scanner, npc_id, found[0], avoid=nav.avoid)
                 if st is not None:
                     streamed = True
                     if st["free"]:
                         newt = st["free"][0]
             if newt is None and g is not None:
-                reach = _reach_around(g, here)
+                reach = _reach_around(g, here, nav.avoid)
                 newt = _nearest_reachable(reach, anchor) if reach else None
             if newt is None:
                 # ★★ 2026-09-06 黑狐實錄（死在副本 → 復活回永夜城 → 補給）：人站在地形圖標成
@@ -1820,47 +1833,47 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
                 # 目標＝那一格的**中心**（角色座標也是格中心：186.5 是第 186 格）
                 goal = (target[0] + 0.5, target[1] + 0.5)
                 best = 999
-                nav = navigate.Navigator()
-                nav.reset(goal)
+                near_since = None
+                nav.retarget(goal)
         d = math.hypot(here[0] - goal[0], here[1] - goal[1])
         best = min(best, d)
-        # ★ 到了＝**站上目標格**（tile 相等；講不講得到話是看 tile 的，見 TALK_BOX_X/Y）。
-        #   NPC 沒串流（目標只是表座標附近的可走格）才用 Navigator 那把 NPC_ARRIVE 尺；
-        #   Navigator 也用同一把（arrive=），它停下來的時候我們一定已經回去了，不會互相等。
+        # ★ 到了＝**站上目標格**（tile 相等）。NPC 沒串流（目標只是表座標附近的可走格）
+        #   才用 Navigator 那把 NPC_ARRIVE 尺；Navigator 也用同一把（arrive=）。
         if (int(here[0]), int(here[1])) == tuple(target) or (
                 not streamed and d <= NPC_ARRIVE):
-            return True
-        # ★ 最後一格走不進去（被別的玩家／NPC 身體站著：棕櫚基地銀行 (185,137) 的「倉用4」、
-        #   補給商旁圍一圈人）→ 在目標 ≤2 格內**待滿 NEAR_GIVE_UP 秒**還站不上去 ＝ 這裡就是
-        #   實際上最近可到的格，算到，交給 TryAct（kind 2 從這裡本來就開得了）。
-        #   ⚠ 用「在 2 格內待了多久」不用「位置沒動多久」：被擋時角色會在兩格之間彈
-        #     （實測 186.5,137.5 ↔ 186.5,136.5），看位置永遠在動，會磨滿 12 秒逾時。
+            return done(True)
+        # ★ 最後一格走不進去（被別的玩家／NPC 身體站著）→ 在目標 ≤2 格內**待滿 NEAR_GIVE_UP 秒**
+        #   還站不上去 ＝ 這裡就是實際上最近可到的格，算到，交給 TryAct（kind 2 從這裡開得了）。
+        #   ⚠ 用「在 2 格內待了多久」不用「位置沒動多久」：被擋時角色會在兩格之間彈。
+        #   （導航器自己的 stall 也會把那格標成人、換站位；這條是它數不到拍時的保險。）
         if streamed and d <= 2.0:
             if near_since is None:
                 near_since = now
             elif now - near_since >= NEAR_GIVE_UP:
-                return True
+                return done(True)
         else:
             near_since = None
         nav.step(scanner, mover, pf + 8, goal[0], goal[1], arrive=NPC_ARRIVE)
         if nav.stuck:
-            # ★ 最後一步走不進去（目標格被別的玩家／NPC 身體占著：棕櫚基地銀行 (185,137)
-            #   站著「倉用4」）→ 旁邊這格就是**實際上最近可到的格**，算到，交給 TryAct
-            #   （kind 2 從這裡本來就開得了）。不磨 30 秒。
-            if streamed and d <= 2.0:
-                return True
-            # ★ 導航器被擋住時**自己會換路**（navigate.AVOID_AHEAD：把腳前那幾格扣掉
-            #   再算）；走到這裡＝換了幾條都沒往前、或根本沒別條路（單格寬走道被堵）。
-            #   同一條原樣再走沒意義（使用者 2026-09-06「沒靠近就直接換」）→ 停一拍
-            #   讓擋路的人／怪走開，再從頭規劃；磨到 timeout 才放棄這一段。
-            time.sleep(BLOCKED_PAUSE)
-            nav.reset(goal)
+            # ★ 導航器把撞到的人都當牆之後說「沒有路」（人牆封死）。使用者 2026-09-06 定：
+            #   人不會走開、不准等 → 馬上換站位：目標改成扣掉那些人之後離 NPC 最近可到的格
+            #   （下一拍 last_plan=0 重挑）；挑不出新的（能到的最近格就是腳下）就算到，
+            #   在這裡直接點（kind 2 5 格內開得了）；NPC 沒串流就回「夠不夠近」。
+            if not streamed:
+                return done(best <= NEAR_ENOUGH)
+            found = find_npc(scanner, npc_id)
+            st = _box_status(scanner, npc_id, found[0], avoid=nav.avoid) if found else None
+            spots = st["free"] if st else []
+            me_tile = (int(here[0]), int(here[1]))
+            if not spots or spots[0] == me_tile or spots[0] == target:
+                return done(True)
+            last_plan = 0.0                  # 下一拍照 nav.avoid 重挑站位（retarget 保留標記）
         elif nav.exhausted and not entity.is_walking(scanner, pf + 8):
             # 路線走完、人也停了、但還沒進到達圈 → Navigator 不會再動（不重算），
             # 留在這裡只會磨到逾時。夠近就交給呼叫端收尾，不夠近才算沒走到。
-            return best <= NEAR_ENOUGH
+            return done(best <= NEAR_ENOUGH)
         time.sleep(0.2)
-    return best <= NEAR_ENOUGH
+    return done(best <= NEAR_ENOUGH)
 
 
 def run_full_supply(mover, scanner, say=None,

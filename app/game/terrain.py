@@ -127,8 +127,9 @@ class Grid:
                     return False
         return walk(x1, y1)
 
-    def reachable(self, tx: int, ty: int) -> set | None:
+    def reachable(self, tx: int, ty: int, avoid=None) -> set | None:
         """所有「走得到 (tx,ty)」的格子（同一個連通區）。那一格不能走回 None。
+        avoid：這一趟暫時當成不可走的格（別的玩家站的身體，見 navigate.AVOID_AHEAD）。
 
         ★ 為什麼要有它：**好幾台分身問同一個目標**時，答案只差在「我站哪一格」。
           一台一台叫 `route()` 是每台各展開一次 A*，而**走不到是最貴的**
@@ -138,9 +139,9 @@ class Grid:
           **對稱的** —— 「從目標走得到我」等於「我走得到目標」。
           規則要是分岔了，就會出現「說走得到卻算不出路」。
         """
-        if not self.walkable(tx, ty):
+        walk = self._walk_fn(avoid)
+        if not walk(tx, ty):
             return None
-        walk = self.walkable
         seen = {(tx, ty)}
         stack = [(tx, ty)]
         add, push, pop = seen.add, stack.append, stack.pop
@@ -174,7 +175,8 @@ class Grid:
                 return best[1], best[2]
         return None
 
-    def ortho_spot(self, me, target, keep: float, reach: float | None = None):
+    def ortho_spot(self, me, target, keep: float, reach: float | None = None,
+                   avoid=None):
         """打怪／講話的**站位**：跟目標**同一行或同一列**（不站對角）、離目標 ≥keep、
         可走、跟目標之間直線可通、離我最近的那一格 —— 回格中心；找不到回 None。
 
@@ -188,10 +190,11 @@ class Grid:
         tx, ty = int(target[0]), int(target[1])
         k_min = max(1, math.ceil(keep - 1e-9))
         k_max = k_min if reach is None else max(k_min, math.floor(reach - 1.0 + 1e-9))
+        walk = self._walk_fn(avoid)
         best, bd = None, None
         for k in range(k_min, k_max + 1):
             for x, y in ((tx + k, ty), (tx - k, ty), (tx, ty + k), (tx, ty - k)):
-                if not self.walkable(x, y) or not self.clear_line((x, y), (tx, ty)):
+                if not walk(x, y) or not self.clear_line((x, y), (tx, ty), avoid):
                     continue
                 cx, cy = x + 0.5, y + 0.5
                 d = math.hypot(cx - me[0], cy - me[1])
@@ -288,6 +291,29 @@ class Grid:
         # 去掉「原地」那種零長度段
         return [p for k, p in enumerate(out)
                 if k == 0 or math.dist(p, out[k - 1]) > 0.5]
+
+
+def next_cell(a, b):
+    """從 a 往 b 的直線上，**緊接著 a 的下一格**（整數格）；a、b 同格回 None。
+
+    ★ 「腳前那格」：走路指令送了卻走不進去，就是這一格被人的身體站著
+      （人不會走開，見 navigate.AVOID_AHEAD）。座標可給浮點（先取整）。
+    """
+    x0, y0 = int(a[0]), int(a[1])
+    x1, y1 = int(b[0]), int(b[1])
+    if (x0, y0) == (x1, y1):
+        return None
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    e2 = err * 2
+    x, y = x0, y0
+    if e2 > -dy:
+        x += sx
+    if e2 < dx:
+        y += sy
+    return (x, y)
 
 
 def _u32(scanner, addr: int):

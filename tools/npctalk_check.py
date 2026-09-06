@@ -226,6 +226,19 @@ class FakeNav:
 
     def reset(self, goal):
         FakeNav.goals.append(goal)
+        self._avoid = set()
+
+    def retarget(self, goal):
+        keep = set(getattr(self, "_avoid", ()))
+        self.reset(goal)
+        self._avoid = keep
+
+    def seed_avoid(self, cells):
+        self._avoid |= set(cells)
+
+    @property
+    def avoid(self):
+        return frozenset(getattr(self, "_avoid", ()))
 
     def step(self, *a, **k):
         pass

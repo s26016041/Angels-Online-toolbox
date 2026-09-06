@@ -253,7 +253,7 @@ check("★ 路算出來了 → stuck 清掉、真的送走路",
       nav.stuck is False and nav.stuck_reason == "" and SENT == [(10.5, 0.5)],
       f"stuck={nav.stuck} reason={nav.stuck_reason!r} sent={SENT}")
 
-print("⑧ ★ 被擋住 → 換一條路，不是原樣重算（2026-09-06「同樣東西重試沒意義」）")
+print("⑧ ★ 被擋住 → 腳前那個人當牆、換一條路，不是原樣重算（2026-09-06「同樣東西重試沒意義」）")
 nav, maps = build(GOAL_WP)
 SENT.clear()
 POS[0], POS[1] = 0.0, 0.0
@@ -262,13 +262,11 @@ for _ in range(60):                     # 站著不動，推到第一次「被�
     step(nav)
     if nav._replans:
         break
-check("腳前往轉折點方向的 3 格記成暫時不可走",
-      nav._avoid == {(1, 0), (2, 0), (3, 0)}, f"實得 {sorted(nav._avoid)}")
-check("　訊息講的是「換一條路」", "換一條路" in nav.note, f"實得「{nav.note}」")
+check("腳前那一格（人的身體）記成這趟不可走", nav._avoid == {(1, 0)}, f"實得 {sorted(nav._avoid)}")
+check("　訊息講的是「當牆繞開」", "當牆繞開" in nav.note, f"實得「{nav.note}」")
 n0 = len(SENT)
 step(nav)                               # 重算那一拍
-check("★ 重算時把那幾格交給地形圖繞開",
-      maps.grid.last_avoid == {(1, 0), (2, 0), (3, 0)},
+check("★ 重算時把那格交給地形圖繞開", maps.grid.last_avoid == {(1, 0)},
       f"實得 {maps.grid.last_avoid}")
 check("★ 走的是**另一條路**（第一個轉折點變了）",
       len(SENT) == n0 + 1 and SENT[-1] == (10.5, 2.5),
@@ -276,10 +274,10 @@ check("★ 走的是**另一條路**（第一個轉折點變了）",
 check("　沒有被判 stuck", nav.stuck is False)
 pt = nav._route[nav._ri]
 step(nav, pt[0], pt[1])                 # 真的繞到那個轉折點
-check("走到轉折點＝繞過去了 → 清掉暫時不可走的格", nav._avoid == set(),
+check("★ 走到轉折點也**不清**標掉的人（人不會走開，清了回頭又撞）", nav._avoid == {(1, 0)},
       f"實得 {sorted(nav._avoid)}")
 
-print("⑨ ★ 單格寬走道被堵（扣掉腳前的格就沒有路）→ 馬上判 blocked，不是 grid")
+print("⑨ ★ 單格寬走道被人堵（扣掉那格就沒有路）→ 馬上判 blocked，不是 grid；不清標記、不自己重試")
 nav, maps = build(GOAL_WP)
 maps.grid.corridor = True
 SENT.clear()
@@ -293,13 +291,17 @@ check("判 stuck", nav.stuck is True)
 check("理由是 blocked（暫時被擋，不是地形沒路）", nav.stuck_reason == "blocked",
       f"實得 {nav.stuck_reason!r}")
 check("訊息講得出「繞不開」", "繞不開" in nav.note, f"實得「{nav.note}」")
-check("暫時不可走的格已清掉（人牆會走開，下次原圖重算）", nav._avoid == set())
+check("標掉的人**不清**（人不會走開）", nav._avoid == {(1, 0)}, f"實得 {sorted(nav._avoid)}")
 n0 = len(SENT)
-step(nav)                               # 呼叫端沒 reset 也要自癒：原圖重算照走
-check("下一拍原圖算得出路 → stuck 清掉、照走",
-      nav.stuck is False and len(SENT) == n0 + 1, f"stuck={nav.stuck} sent={SENT[n0:]}")
+step(nav)                               # 呼叫端沒 reset → 還是 stuck，不准原樣再走
+check("⛔ 下一拍不會自己把人忘掉重走（還是 stuck、沒送走路）",
+      nav.stuck is True and len(SENT) == n0, f"stuck={nav.stuck} sent={SENT[n0:]}")
+nav.reset((100.0, 0.0))
+check("reset 才清掉標記", nav._avoid == set())
+step(nav)
+check("reset 之後照走", nav.stuck is False and len(SENT) == n0 + 1, f"stuck={nav.stuck} sent={SENT[n0:]}")
 
-print("⑩ 轉折點就是目標、就在 3.5 格外 → 目標格不准被標成不可走")
+print("⑩ 轉折點就是目標、就在 3.5 格外 → 只標腳前那格、目標格不准被標")
 nav, maps = build([(3, 0)])
 SENT.clear()
 POS[0], POS[1] = 0.0, 0.0
@@ -308,8 +310,7 @@ for _ in range(60):
     nav.step(None, MOVER, object(), 3.5, 0.0)
     if nav._replans:
         break
-check("只標中間兩格，目標格 (3,0) 不標", nav._avoid == {(1, 0), (2, 0)},
-      f"實得 {sorted(nav._avoid)}")
+check("只標腳前那格，目標格不標", nav._avoid == {(1, 0)}, f"實得 {sorted(nav._avoid)}")
 
 print("⑪ 真的地形圖：帶 avoid 算路要繞開那些格；走道被堵要回 None")
 from app.game import terrain                                  # noqa: E402

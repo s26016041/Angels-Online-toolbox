@@ -61,8 +61,8 @@ REACH = set()                         # 假地形圖「我這區走得到」的�
 
 
 class FakeGrid:
-    def reachable(self, cx, cy):
-        return set(REACH) | {(cx, cy)}
+    def reachable(self, cx, cy, avoid=None):
+        return (set(REACH) | {(cx, cy)}) - set(avoid or ())
 
 
 class FakeNav:
@@ -81,6 +81,19 @@ class FakeNav:
 
     def reset(self, goal=None):
         self.goal = goal
+        self._avoid = set()
+
+    def retarget(self, goal):
+        keep = set(getattr(self, "_avoid", ()))
+        self.reset(goal)
+        self._avoid = keep
+
+    def seed_avoid(self, cells):
+        self._avoid |= set(cells)
+
+    @property
+    def avoid(self):
+        return frozenset(getattr(self, "_avoid", ()))
 
     def step(self, scanner, mover, player_obj, gx, gy, arrive=navigate.ARRIVE):
         FakeNav.steps += 1

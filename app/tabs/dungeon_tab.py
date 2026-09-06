@@ -323,6 +323,11 @@ WALK_GAP_FAR = 0.30             # 趕路（離目標 > FAR_ENOUGH）時的冷卻
 FAR_ENOUGH = 6.0
 WALK_SLACK = 1.0                # 超過停留距離再多這麼多格才走（不然打一打又往前一格）
 PATH_GAP = 0.2                  # 重算「跟目標之間有沒有地形」的最短間隔
+# ★★★ 人牆（使用者 2026-09-06 定：這遊戲的人不會走開，有時穿得過、有時能疊、有時不行）：
+#   走路指令送了 BODY_TRY 秒還沒動（地形圖說腳前可走）＝腳前那格站著人的身體，硬走已經試過
+#   → 那格這一隻目標的追逐期間當牆（terrain.next_cell），重算路；繞不開就是「走不到」→ 換一隻。
+#   ⛔ 不等人走開、一個人只試一次（不會左右來回閃）。
+BODY_TRY = 1.5
 PATH_BUDGET = 20.0              # 規劃路徑最多佔 1/20 的時間
 PATH_GAP_MAX = 1.0
 UNREACH_HITS = 3                # 尋路連續這麼多次算不出 → 這隻走不到，換一隻
@@ -1272,6 +1277,8 @@ class DungeonTab(BaseTab):
         self._path_t = 0.0
         self._path_gap = PATH_GAP
         self._way = []               # 隔地形時的繞路點
+        self._body_avoid: set = set()   # 這一隻目標追逐期間撞到的人站的格（當牆，見 BODY_TRY）
+        self._walk_sent = None          # (送走路指令的時間, 當時位置, 目標點)：判「硬走沒過」用
         self._unreach = 0            # 尋路連續算不出幾次
         self._switch_t = 0.0
         self._handoff_fail = False
@@ -2174,6 +2181,8 @@ class DungeonTab(BaseTab):
         self._path_t = PATH_GAP                   # 下一拍就算
         self._path_gap = PATH_GAP
         self._way = []
+        self._body_avoid = set()      # 換目標 → 這一趟的人牆重來
+        self._walk_sent = None
         self._unreach = 0
         self._hurt = False
         self._push_in = False
@@ -2227,6 +2236,28 @@ class DungeonTab(BaseTab):
         self._engage(d2, m2)
         return True
 
+    def _body_ahead(self, me) -> bool:
+        """走路指令送了 BODY_TRY 秒還在原地 → 腳前那格站著人，這一隻的追逐期間當牆。
+
+        回 True＝這一拍剛標了一格（呼叫端接著就會帶 avoid 重算路）。
+        ⚠ 只在「送過指令」之後判：沒送指令站著本來就不會動，不能算人擋。
+        """
+        ws = self._walk_sent
+        if not ws or not me:
+            return False
+        t0, at, toward = ws
+        if time.monotonic() - t0 < BODY_TRY:
+            return False
+        self._walk_sent = None
+        if math.hypot(me[0] - at[0], me[1] - at[1]) >= 0.3:
+            return False                                   # 有動 → 不是被擋
+        cell = terrain.next_cell(me, toward)
+        if cell is None or cell in self._body_avoid:
+            return False
+        self._body_avoid.add(cell)
+        (lambda m: self._event("info", m))(f"腳前 {cell} 走不進去（有人）→ 當牆繞開，這隻已標 {len(self._body_avoid)} 格")
+        return True
+
     def _walk_to_spot(self, gx: float, gy: float, me, keep: float,
                       reach: float | None):
         """走去「跟目標同行同列」的站位（掛機頁 _walk_to_spot 的複本，見那邊的說明）。
@@ -2238,24 +2269,27 @@ class DungeonTab(BaseTab):
         finder = getattr(grid, "ortho_spot", None)
         if finder is None or not me:
             return None
-        spot = finder(me, (gx, gy), keep, reach)
+        av = self._body_avoid or None
+        spot = finder(me, (gx, gy), keep, reach, av) if av else finder(me, (gx, gy), keep, reach)
         if spot is None:
             return None
         if math.hypot(spot[0] - me[0], spot[1] - me[1]) < 0.6:
             return 0
         mtile = (int(me[0]), int(me[1]))
         stile = (int(spot[0]), int(spot[1]))
-        if grid.clear_line(mtile, stile):
+        if (grid.clear_line(mtile, stile, av) if av else grid.clear_line(mtile, stile)):
             ok = self._mover.walk_exact(self._sc, self._player, spot[0], spot[1])
             self._walk_t = 0.0
+            self._walk_sent = (time.monotonic(), me, spot)
             return 1 if ok else 0
-        wp = grid.waypoints(mtile, stile)
+        wp = grid.waypoints(mtile, stile, avoid=av) if av else grid.waypoints(mtile, stile)
         if not wp:
             return None
         pts = [(x + 0.5, y + 0.5) for x, y in wp]
         n = self._mover.walk_route(self._sc, self._player, spot[0], spot[1],
                                    stop_short=0.0, points=pts)
         self._walk_t = 0.0
+        self._walk_sent = (time.monotonic(), me, pts[0])
         return n
 
     def _walk_toward(self, gx: float, gy: float, me, keep: float,
@@ -2287,6 +2321,7 @@ class DungeonTab(BaseTab):
             self._near_from = me
             ok = self._mover.walk_near(self._sc, self._player, gx, gy, keep)
             self._walk_t = 0.0
+            self._walk_sent = (time.monotonic(), me, (gx, gy))
             return 1 if ok else 0
         self._near_from = None
         pts = self._way or ([(int(gx) + 0.5, int(gy) + 0.5)]
@@ -2296,6 +2331,7 @@ class DungeonTab(BaseTab):
         n = self._mover.walk_route(self._sc, self._player, gx, gy,
                                    stop_short=keep, points=pts)
         self._walk_t = 0.0
+        self._walk_sent = (time.monotonic(), me, pts[0])
         return n
 
     def _give_up(self, why: str) -> None:
@@ -2378,15 +2414,20 @@ class DungeonTab(BaseTab):
             ttile = (int(mp[0]), int(mp[1]))
             self._no_grid = "" if grid is not None else (
                 getattr(self._maps, "why", "") or "讀不到地形圖")
+            if grid is not None:
+                self._body_ahead(me)              # 硬走沒過 → 腳前那格當牆（見 BODY_TRY）
+            av = self._body_avoid or None
             if grid is None:
                 self._path_pts, self._way = 0, []
                 self._line_clear = False
-            elif grid.clear_line(mtile, ttile):
+            elif (grid.clear_line(mtile, ttile, av) if av
+                  else grid.clear_line(mtile, ttile)):
                 self._path_pts, self._way, self._unreach = 1, [], 0
                 self._line_clear = True
             else:
                 self._line_clear = False
-                wp = grid.waypoints(mtile, ttile)
+                wp = (grid.waypoints(mtile, ttile, avoid=av) if av
+                      else grid.waypoints(mtile, ttile))
                 if wp:
                     self._path_pts = max(2, len(wp))
                     self._way = [(x + 0.5, y + 0.5) for x, y in wp]
