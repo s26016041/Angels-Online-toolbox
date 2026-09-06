@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
@@ -91,6 +92,11 @@ JUMP_MAX_GAP = 0.4
 #   人還在半路就被記成「出口」＝腳本存到一個錯的 land，跑的時候會停在
 #   「傳點把人送到別的地方」。不在傳點上的跳動一律不算、繼續盯。
 PORTAL_FROM = 6.0
+# ★ 拉回的第二個樣子（跟 dungeon_tab.TRACK_SECS 同一條規矩，2026-09-06 黑狐無限塔第 71 步）：
+#   從傳點上跳走、卻**落回剛走過的軌跡上**（離傳點 9 格 > PORTAL_FROM）＝伺服器把人放回它
+#   最後認可的位置，不是傳點搬的 → 不記成出口（記了就是一份錯的 land）。
+TRACK_SECS = 30.0
+TRACK_TOL = 2.0
 
 
 def _fmt(v: float) -> str:
@@ -552,6 +558,7 @@ class DungeonMakeTab(BaseTab):
         self._poke_timer.timeout.connect(self._poke_check)
         # 傳點監看（加完「走進傳點」才跑，看到順移就停）
         self._pw = None
+        self._pw_track = deque()     # 盯傳點期間走過的軌跡 [(時刻, (x, y))]（判伺服器拉回）
         self._pw_timer = QTimer(self)
         self._pw_timer.timeout.connect(self._portal_watch)
         for sp in self.findChildren(QSpinBox):
@@ -974,6 +981,7 @@ class DungeonMakeTab(BaseTab):
                    "to": [int(self._pick[0]), int(self._pick[1])]})
         if len(self._script.steps) <= n:
             return                       # 被 _add 擋下來了（換圖了之類）
+        self._pw_track.clear()
         self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
         self._pw_timer.start(PORTAL_WATCH_MS)
         self._say_map("走進那個傳點吧 —— 我盯著看它把你送到哪，"
@@ -996,6 +1004,7 @@ class DungeonMakeTab(BaseTab):
                    "model": pr.model})
         if len(self._script.steps) <= n:
             return                       # 被 _add 擋下來了（換圖了之類）
+        self._pw_track.clear()
         self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
         self._pw_timer.start(PORTAL_WATCH_MS)
         self._say_map(f"記成傳送點：{mapobj.label(pr.model)} —— "
@@ -1095,17 +1104,31 @@ class DungeonMakeTab(BaseTab):
         if me is None:
             return                               # 讀不到就跳過這一次取樣
         self._pw = (i, deadline, me, now)
+        if prev is not None:
+            # 軌跡只收跳之前的點（這一拍的落點不放，不然拉回判定會對到自己）
+            self._pw_track.append((prev_t, prev))
+            cut = now - TRACK_SECS
+            while self._pw_track and self._pw_track[0][0] < cut:
+                self._pw_track.popleft()
         if prev is None or now - prev_t > JUMP_MAX_GAP:
             return                               # 隔太久 → 只重設基準，不判
-        if math.hypot(me[0] - prev[0], me[1] - prev[1]) < JUMP_TILES:
+        jump = math.hypot(me[0] - prev[0], me[1] - prev[1])
+        if jump < JUMP_TILES:
             return
         to = steps[i].get("to") or [None, None]
         if (to[0] is not None
                 and math.hypot(prev[0] - to[0], prev[1] - to[1]) > PORTAL_FROM):
             # 人不在傳點上就跳了 ＝ 伺服器拉回／被擊退，不是傳點 → 不記，繼續盯
-            self._say_map(f"位置一拍跳了 {math.hypot(me[0] - prev[0], me[1] - prev[1]):.0f} 格，"
+            self._say_map(f"位置一拍跳了 {jump:.0f} 格，"
                           f"但跳之前離傳點 {math.hypot(prev[0] - to[0], prev[1] - to[1]):.0f} 格"
                           "（不在傳點上）→ 不算出口，繼續盯")
+            return
+        back = [now - t for t, p in self._pw_track
+                if math.hypot(me[0] - p[0], me[1] - p[1]) <= TRACK_TOL]
+        if back:
+            # 落回剛走過的軌跡上 ＝ 伺服器拉回（傳點搬人是搬到出口，不會搬回你剛走過的路上）
+            self._say_map(f"位置一拍跳了 {jump:.0f} 格，但落回 {min(back):.0f} 秒前走過的位置"
+                          "（伺服器拉回）→ 不算出口，繼續盯")
             return
         steps[i]["land"] = [round(me[0], 1), round(me[1], 1)]
         steps[i]["scene"] = scene.map_key(scene.current_id(sc))

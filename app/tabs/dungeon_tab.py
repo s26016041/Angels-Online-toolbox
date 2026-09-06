@@ -92,6 +92,7 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -303,8 +304,16 @@ OFFLINE_MAP_STILL = 3.0
 #   壞掉」那條還在）。
 EVENTS_MAX = 500
 STUCK_EVENT_SECS = 300.0
+# ★★ 副本裡同一步卡到這麼久 → **當成完成一場**收掉這一趟（`_abort_trip`：回程補給 → 下一場）。
+#   使用者 2026-09-06：「副本卡住啥的預期之外的錯誤，就當完成一場，別關掉或卡在那」——
+#   9/6 之前黑狐第 41 步卡 193 分鐘、趴趴GO 空送 23 分鐘那種，之後都有這條兜底。
+#   ⚠ 10 分鐘是我定的：無限塔整趟 7 分鐘，同一步 10 分鐘沒前進不可能是正常在打。
+#   ⚠ 這不推翻「沒有幾秒沒到就放棄」（傳點補送、走不到就一直試照舊）：那是單一動作的
+#     重試不設限，這條是整趟的外圈保險。只管人在副本裡跑腳本的那段（cycle=go、phase=run）。
+STUCK_ABORT_SECS = 600.0
 EVENT_ROUND_KINDS = (("full", "完整完成"), ("death", "死亡當成完成"),
-                     ("offline", "斷線當成完成"), ("noentry", "進不去當成完成"))
+                     ("offline", "斷線當成完成"), ("noentry", "進不去當成完成"),
+                     ("abort", "出狀況當成完成"))
 # ---------------------------------------------------------------------------
 # 打怪流程的數字 —— **從掛機頁抄一份**（使用者 2026-09-04：「複製一份幾乎一樣的
 # 不要共用」）。⛔ 不要改成 import farm_tab 的：兩邊要能各自調。
@@ -379,6 +388,20 @@ MAP_SETTLE = 1.0
 #   ⚠ 這不是「離傳點多遠判完成」（那條 ⛔）：判完成仍看一拍跳了多少；這裡只擋
 #     「人根本不在傳點上」的跳動。落點對得上 `land` 的一律算（觸發範圍比記的寬也吃得到）。
 PORTAL_FROM = 6.0
+# ★★★ 伺服器拉回的第二個樣子（2026-09-06 黑狐實錄，無限塔第 71 步）：人已經走到傳點
+#   2.5 格內、0x0D 也送了，下一拍卻被拉回 9 格外 —— 落點 (16.5,52.5) 就是 1 秒前走過的
+#   (16.4,52.2)。離傳點 9 格 > PORTAL_FROM，舊版當成「傳點把人送到 (16, 52)…差 81 格」停機。
+#   傳點搬人是搬到出口、絕不會搬回你剛走過的路上；伺服器拉回則**一定**落在自己剛走過的
+#   軌跡上（它只是把你放回它最後認可的位置，[[whitefox-rollback]] 那種丟移動包的修正）。
+#   → 每拍記一點、留最近 TRACK_SECS 秒的軌跡；落點離軌跡上任一點 ≤ TRACK_TOL 格＝拉回，
+#     不算傳送、繼續走過去踩。⚠ TRACK_TOL 要比 JUMP_TILES 小，不然一拍剛好跳 3 格會對到
+#     跳之前那一點（軌跡收的是跳之前的點）。
+#   ⚠ 同一步「從傳點上跳走卻沒到出口」被當成拉回滿 ROLLBACK_MAX 次就不再信 —— 那是傳點
+#     真的把人送回剛走過的地方（送錯地方，例如送回房間入口），再信下去就是走過去→被送回→
+#     走過去…無限循環 → 當成「傳到別的地方」收掉這一趟（`_abort_trip`）。
+TRACK_SECS = 30.0
+TRACK_TOL = 2.0
+ROLLBACK_MAX = 3
 # ★★ 地形圖多久重讀一次（秒）。使用者 2026-09-02：
 #   「地圖之間有可能會用牆壁隔開，解謎之後會打開又會變成聯通，
 #     所以記憶體地圖要即時刷新」
@@ -1205,6 +1228,8 @@ class DungeonTab(BaseTab):
         self._pos_prev = None        # 上一拍的位置（順移偵測用）
         self._pos_t = 0.0
         self._jumped = None          # 這一拍有沒有順移：有＝跳之前站的位置 (x, y)
+        self._track = deque()        # 最近 TRACK_SECS 秒走過的軌跡 [(時刻, (x, y))]（判伺服器拉回）
+        self._rollbacks = 0          # 這一步從傳點上跳走卻被當成「拉回」幾次了（見 ROLLBACK_MAX）
         self._map_settle = 0.0       # 換圖後等座標跟上，這個時刻之前不算任何東西
         self._stray_t = 0.0          # 多久之後再看一次有沒有不該出現的對話框
         self._stray_closed = 0.0     # 上次關掉的時刻（節流）
@@ -1669,8 +1694,10 @@ class DungeonTab(BaseTab):
         # ⓪-000 跳板還活著嗎（IAT 被換掉／讀不到 → 作廢）→ 死了就重裝（見 MOVER_RETRY）
         if not self._ensure_mover(dt):
             return
-        # 純紀錄：同一段停太久記一筆「卡住」；副本收益只在副本裡對帳
-        self._stuck_watch(dt)
+        # 同一段停太久記一筆「卡住」；副本裡卡到 STUCK_ABORT_SECS 就當成完成一場收掉這一趟
+        #   （回 True＝已經收掉／停下，這一拍到此為止）；副本收益只在副本裡對帳
+        if self._stuck_watch(dt):
+            return
         self._loot_tick(dt)
         sc = self._sc
 
@@ -1911,12 +1938,18 @@ class DungeonTab(BaseTab):
           基準 —— 寧可漏一次（下一拍還會再看），不要誤判成傳送了就跳下一步。
         ★ 回跳之前的位置是給傳點那一步驗「是不是**從傳點上**跳走的」（`PORTAL_FROM`）
           —— 伺服器拉回位置也是一拍跳好幾格，人不在傳點上就不算。
+        ★ 順手把**跳之前**的點收進軌跡 `_track`（判「落回剛走過的地方」＝拉回，見 TRACK_SECS）。
+          這一拍的落點不放進去，不然拉回判定會對到自己。
         """
         now = time.monotonic()
         prev, prev_t = self._pos_prev, self._pos_t
         self._pos_prev, self._pos_t = me, now
         if prev is None:
             return None
+        self._track.append((prev_t, prev))
+        cut = now - TRACK_SECS
+        while self._track and self._track[0][0] < cut:
+            self._track.popleft()
         gap = now - prev_t
         if gap <= JUMP_MAX_GAP:
             return prev if _d(prev, me) >= JUMP_TILES else None
@@ -1935,6 +1968,7 @@ class DungeonTab(BaseTab):
         self._stray_hold = time.monotonic() + STRAY_HOLD   # 遊戲正在拆舊圖的視窗
         self._state, self._player = None, None      # 等下一次（強制全）掃描重抓
         self._pos_prev, self._pos_t = None, 0.0     # 新圖第一拍不准判成順移
+        self._track.clear()                         # 舊圖的軌跡在新圖上沒有意義
         self._me = None
         self._hopeless.clear()                      # 換圖＝全新的怪
 
@@ -2693,16 +2727,19 @@ class DungeonTab(BaseTab):
             self._do_interact(step, me, dt)
             return
 
-        self._stop(f"⛔ 第 {self._i + 1} 步是不認得的動作「{kind}」")
+        self._abort_trip(f"⛔ 第 {self._i + 1} 步是不認得的動作「{kind}」")
 
     def _portal_transit(self, step: dict, me) -> bool:
-        """這一拍的順移是不是「傳點把人搬走了」。回 True＝這一步處理完（過了或停機），
-        呼叫端這一拍不要再做別的；False＝不是傳點搬的，照常。
+        """這一拍的順移是不是「傳點把人搬走了」。回 True＝這一步處理完（過了、或這一趟
+        已經收掉），呼叫端這一拍不要再做別的；False＝不是傳點搬的，照常。
 
-        三分（見 PORTAL_FROM／LAND_TOL 的說明）：
+        四分（見 PORTAL_FROM／LAND_TOL／TRACK_SECS 的說明）：
           · 落點在記的出口 8 格內 → 過（觸發範圍比記的寬也吃得到）；
-          · 跳之前在傳點 6 格內、落點卻對不上出口 → 傳到別的地方，大聲停；
-          · 跳之前根本不在傳點上 → 伺服器拉回／被擊退，不算，繼續。
+          · 跳之前根本不在傳點上 → 伺服器拉回／被擊退，不算，繼續；
+          · 跳之前在傳點旁、落點卻還在傳點旁**或落回剛走過的軌跡上** → 伺服器拉回，
+            不算，繼續（同一步滿 ROLLBACK_MAX 次就不再信，走下一條）；
+          · 跳之前在傳點 6 格內、落點對不上出口也不像拉回 → 傳到別的地方 → **當成完成
+            一場**收掉這一趟（`_abort_trip`；使用者 2026-09-06：別關掉、別卡在那）。
         """
         gx, gy = step["to"]
         frm = self._jumped                     # 跳之前站的位置
@@ -2719,21 +2756,41 @@ class DungeonTab(BaseTab):
                          f"→ 不算傳送，繼續走")
             return False
         if land and not near_land:
-            if _d((gx, gy), me) <= PORTAL_FROM:
-                # ★★ 跳完人還站在傳點旁邊（2026-09-06 黑狐實錄，無限塔第 6 步：走向傳點的
-                #   最後幾格被伺服器拉了一下，落點離傳點 2.6 格、離出口 80 格 → 舊版當成
-                #   「傳點把人送到別的地方」停機）。傳點搬人一定是搬**到出口**、不會把人
-                #   留在傳點旁 → 這是位置修正，不算傳送，照樣走過去踩。
-                self._notify(f"第 {self._i + 1} 步　位置一拍跳了 {_d(frm, me):.0f} 格，"
-                             f"但人還在傳點旁（{_d((gx, gy), me):.1f} 格）"
-                             f"→ 伺服器拉回，不算傳送，繼續走")
-                return False
-            self._stop(
-                f"⛔ 第 {self._i + 1} 步：傳點把人送到 "
-                f"({me[0]:.0f}, {me[1]:.0f})，"
-                f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— "
-                f"差 {_d(land, me):.0f} 格，停下來")
+            jump = _d(frm, me)
+            back = self._rolled_back(me)
+            if _d((gx, gy), me) <= PORTAL_FROM or back is not None:
+                self._rollbacks += 1
+                if self._rollbacks < ROLLBACK_MAX:
+                    if back is not None:
+                        # ★★★ 落回剛走過的軌跡上（2026-09-06 黑狐實錄，無限塔第 71 步：走到
+                        #   傳點 2.5 格內、0x0D 也送了，下一拍被拉回 9 格外 —— 落點就是 1 秒前
+                        #   走過的地方）。傳點搬人是搬到出口、絕不會搬回你剛走過的路上
+                        #   → 伺服器拉回，不算傳送，照樣走過去踩（見 TRACK_SECS）。
+                        self._notify(f"第 {self._i + 1} 步　位置一拍跳了 {jump:.0f} 格，"
+                                     f"但落回 {back:.0f} 秒前走過的位置"
+                                     f"（離傳點 {_d((gx, gy), me):.1f} 格）"
+                                     f"→ 伺服器拉回，不算傳送，繼續走"
+                                     f"（{self._rollbacks}/{ROLLBACK_MAX}）")
+                        return False
+                    # ★★ 跳完人還站在傳點旁邊（2026-09-06 黑狐實錄，無限塔第 6 步：走向傳點的
+                    #   最後幾格被伺服器拉了一下，落點離傳點 2.6 格、離出口 80 格 → 舊版當成
+                    #   「傳點把人送到別的地方」停機）。傳點搬人一定是搬**到出口**、不會把人
+                    #   留在傳點旁 → 這是位置修正，不算傳送，照樣走過去踩。
+                    self._notify(f"第 {self._i + 1} 步　位置一拍跳了 {jump:.0f} 格，"
+                                 f"但人還在傳點旁（{_d((gx, gy), me):.1f} 格）"
+                                 f"→ 伺服器拉回，不算傳送，繼續走"
+                                 f"（{self._rollbacks}/{ROLLBACK_MAX}）")
+                    return False
+                # 同一步第 ROLLBACK_MAX 次 ＝ 不是拉回：傳點真的把人送回剛走過的地方（送錯
+                #   地方），再信下去就是走過去→被送回→走過去…無限循環 → 當成傳到別的地方。
+            why = (f"⛔ 第 {self._i + 1} 步：傳點把人送到 ({me[0]:.0f}, {me[1]:.0f})，"
+                   f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— 差 {_d(land, me):.0f} 格")
+            if self._rollbacks >= ROLLBACK_MAX:
+                why += f"（同一步已經被送回剛走過的地方 {self._rollbacks} 次）"
+            self._abort_trip(why)
             return True
+        self._track.clear()                    # 真的傳過去了：舊區的軌跡不留（下一個傳點別誤判成拉回）
+        self._rollbacks = 0
         self._drop_target()
         self._scan.force_full(self._pid)       # 順移到新的一區＝新的怪
         self._hopeless.clear()
@@ -2741,6 +2798,13 @@ class DungeonTab(BaseTab):
         self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f})")
         self._next()
         return True
+
+    def _rolled_back(self, me):
+        """落點是不是在剛走過的軌跡上（伺服器把人放回它最後認可的位置，見 TRACK_SECS）。
+        回「對到的那一點是幾秒前走過的」；不在軌跡上回 None。"""
+        now = time.monotonic()
+        ages = [now - t for t, p in self._track if _d(p, me) <= TRACK_TOL]
+        return min(ages) if ages else None
 
     def _send_portal(self, at, want, tag: str) -> str:
         """對那個傳點**主動送一次 0x0D**（＝踩上去那一包）。回一句說明。
@@ -2938,9 +3002,9 @@ class DungeonTab(BaseTab):
                 return
             hit = _pick(props)
             if not hit:
-                self._stop(
+                self._abort_trip(
                     f"⛔ {tag}：({ax}, {ay}) 附近 {PROP_TOL:.0f} "
-                    f"格內找不到可互動的物件 —— 停下來")
+                    f"格內找不到可互動的物件")
                 return
             # ★ 基準要在**點下去之前**讀：點完對話可能立刻就開了，
             #   那時再讀就跟第一頁一樣，永遠判不出「有沒有點到」。
@@ -3049,9 +3113,9 @@ class DungeonTab(BaseTab):
                           f"（{self._gone_t:.1f}/{CLOSE_GRACE:.1f} 秒）")
                 return
             if self._menu_i < len(menu):
-                self._stop(f"⛔ {tag}：對話已經關掉了，"
-                           f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
-                           f" —— 停下來（NPC 的對話跟腳本記的不一樣？）")
+                self._abort_trip(f"⛔ {tag}：對話已經關掉了，"
+                                 f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
+                                 f"（NPC 的對話跟腳本記的不一樣？）")
                 return
             supply.leave_npc(self._mover, self._sc)
             finish()
@@ -3088,14 +3152,14 @@ class DungeonTab(BaseTab):
             if pg.has_options:
                 if self._menu_i >= len(menu):
                     # ⛔ 跳出選項但腳本沒說要選哪一項 —— **絕不亂選**。
-                    self._stop(f"⛔ {tag}：對話跳出 "
-                               f"{len(pg.options)} 個選項，"
-                               f"但腳本沒有記要選第幾項 —— 停下來")
+                    self._abort_trip(f"⛔ {tag}：對話跳出 "
+                                     f"{len(pg.options)} 個選項，"
+                                     f"但腳本沒有記要選第幾項")
                     return
                 n = menu[self._menu_i]
                 if n not in pg.options:
-                    self._stop(f"⛔ {tag}：腳本要選第 {n} 項，"
-                               f"但這一頁只有 {list(pg.options)} —— 停下來")
+                    self._abort_trip(f"⛔ {tag}：腳本要選第 {n} 項，"
+                                     f"但這一頁只有 {list(pg.options)}")
                     return
                 if not sell.talk(self._mover, supply.talk_option(n)):
                     self._say(f"第 {n} 項送不出去（指令槽忙碌），重試中…")
@@ -3144,10 +3208,9 @@ class DungeonTab(BaseTab):
                     self._wnd, self._wnd_t = None, 0.0
                     self._close_n = 0
                     if self._menu_i < len(menu):
-                        self._stop(f"⛔ {tag}：確定按了 {CLOSE_GIVEUP} 次對話頁"
-                                   f"都沒變，腳本還有 "
-                                   f"{len(menu) - self._menu_i} 個選項沒送到"
-                                   f" —— 停下來")
+                        self._abort_trip(f"⛔ {tag}：確定按了 {CLOSE_GIVEUP} 次對話頁"
+                                         f"都沒變，腳本還有 "
+                                         f"{len(menu) - self._menu_i} 個選項沒送到")
                         return
                     self._say(f"{tag}　確定按不動＝殘留的對話框，收掉當結束")
                     finish()
@@ -3165,9 +3228,9 @@ class DungeonTab(BaseTab):
             return
         # 按了確定又沒有下一頁 ＝ 這段對話走完了
         if self._menu_i < len(menu):
-            self._stop(f"⛔ {tag}：對話結束了，"
-                       f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
-                       f" —— 停下來（NPC 的對話跟腳本記的不一樣？）")
+            self._abort_trip(f"⛔ {tag}：對話結束了，"
+                             f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
+                             f"（NPC 的對話跟腳本記的不一樣？）")
             return
         # ★ 收尾：**先把對話框從畫面上收掉**再送離開互動。
         #   使用者 2026-09-02：「現在都會帶著最後無異議對話離開到處跑，
@@ -3189,6 +3252,7 @@ class DungeonTab(BaseTab):
         self._wait_left = 0.0
         self._empty_since = 0.0
         self._poke_t = 0.0            # 下一步的傳點要馬上補送第一次
+        self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
         self._nudge = 0               # 靠近重試的次數歸零
         self._still_t = 0.0
         self._nav.reset()
@@ -3221,6 +3285,32 @@ class DungeonTab(BaseTab):
                     self._end_batch()
                     return
             self._start_supply_trip()
+
+    def _abort_trip(self, why: str) -> None:
+        """副本裡出了**預期之外**的狀況 → **當成完成一場**收掉這一趟（使用者 2026-09-06：
+        「副本卡住啥的預期之外的錯誤，就當完成一場，別關掉或卡在那」）。
+
+        跟死在副本裡（`_on_death`）同一個地位：記一場、通知（出問題還是要讓人知道，只是
+        不停機）、照正常收尾走 —— 回程補給 → 下一場；這一批滿了照 `_end_batch`。
+        用在：傳點把人送到別的地方、NPC 對話跟腳本對不上、找不到要點的物件、同一步卡超過
+        STUCK_ABORT_SECS。⛔ 只給人在副本裡跑腳本（cycle=go、phase=run）的狀況；趕路／
+        補給／復活的問題各有自己的收尾。沒勾循環＝本來就只跑這一趟 → 照舊停下（訊息＝原因）。
+        """
+        if not self._loop:
+            self._stop(why)
+            return
+        self._rounds += 1
+        if self._sched is not None:
+            self._batch_done += 1
+        at = (f"（第 {self._i + 1} 步）"
+              if self._script and self._i < len(self._script.steps) else "（腳本跑完等收尾）")
+        self._event("abort", f"第 {self._rounds} 趟：出狀況當成完成{at}—— {why}")
+        self.notify(f"{why}　→ 當成完成一場，回程補給後繼續")
+        if self._sched is not None and self._batch_done >= self._sched["rounds"]:
+            self._end_batch()
+            return
+        self._start_supply_trip(
+            note=f"⚠ 第 {self._rounds} 趟出狀況、當成完成 → 回程補給…（{why}）")
 
     # -- 全自動循環：補給 → 飛回入口 → 組隊 --------------------------------
     def _cycle_tick(self, dt: float) -> bool:
@@ -4146,10 +4236,13 @@ class DungeonTab(BaseTab):
         self.notify(f"⚠ {text}")          # 使用者 2026-09-06：無法進入副本要通知
         self._end_batch()
 
-    # -- 卡住偵測（純紀錄，不改行為）---------------------------------------------
-    def _stuck_watch(self, dt: float) -> None:
-        """同一段（同一步／撞入口／飛／等組隊）超過 STUCK_EVENT_SECS 沒前進 → 記一筆。
-        補給／飛回入口／復活／休息不算（各有自己的收尾）。"""
+    # -- 卡住偵測：記一筆；副本裡同一步卡到 STUCK_ABORT_SECS → 當成完成一場 ---------------
+    def _stuck_watch(self, dt: float) -> bool:
+        """同一段（同一步／撞入口／飛／等組隊）超過 STUCK_EVENT_SECS 沒前進 → 記一筆；
+        人在副本裡跑腳本的那種再撐到 STUCK_ABORT_SECS → `_abort_trip`（使用者 2026-09-06：
+        「副本卡住啥的預期之外的錯誤，就當完成一場，別關掉或卡在那」）。回 True＝這一拍已經
+        收掉這一趟（或停下），呼叫端到此為止。
+        補給／飛回入口／復活／休息不算（各有自己的收尾）；撞入口有副本設定的 N 分鐘那條。"""
         if self._cycle == "go":
             key = ("go", self._phase, self._i if self._phase == "run" else -1)
         elif self._cycle == "team":
@@ -4158,26 +4251,34 @@ class DungeonTab(BaseTab):
             key = None
         if key != self._stuck_key:
             self._stuck_key, self._stuck_t, self._stuck_noted = key, 0.0, False
-            return
-        if key is None or self._stuck_noted:
-            return
+            return False
+        if key is None:
+            return False
         self._stuck_t += dt
         if self._stuck_t < STUCK_EVENT_SECS:
-            return
-        self._stuck_noted = True
-        if key[0] == "team":
-            where = f"等組隊（{self._team_sub}）"
-        elif self._phase == "fly":
-            where = "趴趴GO去入口那張圖"
-        elif self._phase == "enter":
-            where = "撞入口"
-        else:
+            return False
+
+        def _where() -> str:
+            if key[0] == "team":
+                return f"等組隊（{self._team_sub}）"
+            if self._phase == "fly":
+                return "趴趴GO去入口那張圖"
+            if self._phase == "enter":
+                return "撞入口"
             step = (self._script.steps[self._i]
                     if self._script and self._i < len(self._script.steps) else None)
-            where = (f"第 {self._i + 1} 步 {dungeon.describe(step)}" if step
-                     else "腳本跑完等周圍沒怪")
-        self._event("stuck", f"卡住：{where} 超過 {STUCK_EVENT_SECS / 60:.0f} 分鐘沒前進"
-                             f" —— {self.status.text()[:140]}")
+            return (f"第 {self._i + 1} 步 {dungeon.describe(step)}" if step
+                    else "腳本跑完等周圍沒怪")
+
+        if not self._stuck_noted:
+            self._stuck_noted = True
+            self._event("stuck", f"卡住：{_where()} 超過 {STUCK_EVENT_SECS / 60:.0f} 分鐘沒前進"
+                                 f" —— {self.status.text()[:140]}")
+        if key[0] == "go" and self._phase == "run" and self._stuck_t >= STUCK_ABORT_SECS:
+            self._abort_trip(f"⚠ 卡住：{_where()} 超過 {STUCK_ABORT_SECS / 60:.0f} 分鐘沒前進"
+                             f"（{self.status.text()[:100]}）")
+            return True
+        return False
 
     # -- 副本收益（只在人在副本裡跑腳本時對帳；表跟掛機頁同一支）-------------------
     def _loot_for(self, acct: str | None = None) -> loot.Loot:

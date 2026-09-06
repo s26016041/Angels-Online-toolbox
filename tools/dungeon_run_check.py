@@ -831,6 +831,117 @@ def main() -> int:
     run(tab, 0.1)
     ck("★ 從傳點上跳走、腳本沒記出口 → 算過", tab._i == 1, tab.status.text())
 
+    # ★★★ 2026-09-06 黑狐實錄（無限塔第 71 步）：走到傳點 2.5 格內、0x0D 也送了，下一拍被
+    #   拉回 9 格外 —— 落點 (16.5,52.5) 就是 1 秒前走過的 (16.4,52.2)。離傳點 9 格 > PORTAL_FROM
+    #   → 舊版停機「傳點把人送到 (16, 52)…差 81 格」。落回剛走過的軌跡上＝伺服器拉回。
+    def _walk_track(tab, pts):
+        """照順序餵位置給 _check_jump（建軌跡），回最後一拍的 _jumped。"""
+        j = None
+        for q in pts:
+            tab._pos = list(q)
+            j = tab._check_jump(tuple(q))
+        return j
+
+    ROLL = [(17.5, 51.5), (16.4, 52.2), (14.5, 53.4), (12.6, 54.6), (10.8, 55.7), (16.5, 52.5)]
+    tab = make_tab([{"do": "portal", "to": [8.7, 57.0], "land": [71.5, 111.5]}],
+                   pos=(17.5, 51.5))
+    tab._jumped = _walk_track(tab, ROLL)
+    ck("　前置：一拍跳 6.5 格認成順移、跳之前在傳點 2.5 格內",
+       tab._jumped == (10.8, 55.7), str(tab._jumped))
+    run(tab, 0.1)
+    ck("★★★ 落回 1 秒前走過的位置（拉回 9 格、離傳點 9 格）→ 不停、不算完成",
+       tab.run_cb.isChecked() and tab._i == 0 and tab._cycle == "go", tab.status.text())
+    ck("　照樣往傳點走", tab._nav.goal == (8.7, 57.0), str(tab._nav.goal))
+    ck("　狀態列講得出「拉回／不算傳送」",
+       "拉回" in tab.status.text() and "不算傳送" in tab.status.text(), tab.status.text())
+    ck("　軌跡不會無限長（只留 TRACK_SECS 秒）", len(tab._track) <= len(ROLL), str(len(tab._track)))
+    # 真的傳過去（落在出口）→ 軌跡清掉、拉回次數歸零（下一個傳點別誤判）
+    tab._pos = [72.0, 112.0]
+    tab._jumped = (9.0, 56.5)
+    run(tab, 0.1)
+    ck("　接著真的傳到出口 → 過，軌跡清空、拉回次數歸零",
+       tab._i == 1 and not tab._track and tab._rollbacks == 0, tab.status.text())
+
+    # ★★ 同一步被「送回剛走過的地方」滿 ROLLBACK_MAX 次 → 不再當拉回：是傳點真的送錯地方 →
+    #   勾了循環就**當成完成一場**收掉這一趟（回程補給），不是無限走過去→被送回。
+    _orig_supply = dt.supply.run_full_supply
+    _gate = threading.Event()
+    dt.supply.run_full_supply = lambda *a, **k: (_gate.wait(2.0), (True, "都夠了"))[1]
+    tab = make_tab([{"do": "portal", "to": [8.7, 57.0], "land": [71.5, 111.5]}],
+                   pos=(17.5, 51.5))
+    tab._loop = True
+    for n in range(dt.ROLLBACK_MAX):
+        tab._jumped = _walk_track(tab, ROLL)
+        run(tab, 0.1)
+        if n < dt.ROLLBACK_MAX - 1:
+            ck(f"　第 {n + 1} 次拉回 → 還在走（{n + 1}/{dt.ROLLBACK_MAX}）",
+               tab._cycle == "go" and tab._i == 0 and f"{n + 1}/{dt.ROLLBACK_MAX}" in tab.status.text(),
+               tab.status.text())
+    ck(f"★★ 第 {dt.ROLLBACK_MAX} 次 → 當成傳到別的地方，收掉這一趟（不停機、進回程補給）",
+       tab.run_cb.isChecked() and tab._cycle == "supply" and tab._rounds == 1, tab.status.text())
+    ck("　有通知、寫明「當成完成一場」",
+       any("當成完成一場" in m and "送回剛走過的地方" in m for _w, m in tab._notifier.fired),
+       str(tab._notifier.fired[-1:]))
+    ck("　重要事件記「出狀況當成完成」", any(r[2] == "abort" for r in tab._events),
+       str(tab._events[:1]))
+
+    # ★★ 使用者 2026-09-06：「副本卡住啥的預期之外的錯誤，就當完成一場，別關掉或卡在那」
+    #   → 傳到別的地方（勾了循環）：不停機、當成一場、回程補給後下一場
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}], pos=(12.0, 300.0))
+    tab._loop = True
+    tab._jumped = (50.0, 50.5)
+    run(tab, 0.1)
+    ck("★★ 勾了循環：傳到別的地方 → 不停機，當成完成一場、進回程補給",
+       tab.run_cb.isChecked() and tab._cycle == "supply" and tab._rounds == 1, tab.status.text())
+    ck("　狀態列講得出原因", "傳點把人送到" in tab.status.text() and "當成完成" in tab.status.text(),
+       tab.status.text())
+    # 副本設定：這一批最後一場出狀況 → 照 _end_batch 走（回程改飛掛機記錄點／進休息）
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}], pos=(12.0, 300.0))
+    tab._loop = True
+    tab._sched = {"rounds": 2, "rest": 0.0, "farm": False}
+    tab._batch_done = 1
+    tab._jumped = (50.0, 50.5)
+    run(tab, 0.1)
+    ck("　這一批最後一場出狀況 → 算滿一批（_end_batch：補完進休息）",
+       tab._cycle == "supply" and tab._batch_end and tab._batch_done == 2, tab.status.text())
+    # 沒勾循環：本來就只跑這一趟 → 照舊停下（訊息＝原因）
+    tab = make_tab([{"do": "portal", "to": [50, 50], "land": [200, 40]}], pos=(12.0, 300.0))
+    tab._loop = False
+    tab._jumped = (50.0, 50.5)
+    run(tab, 0.1)
+    ck("　沒勾循環 → 照舊停下", not tab.run_cb.isChecked() and "傳點把人送到" in tab.status.text(),
+       tab.status.text())
+
+    # ★★ 卡住 → 當成完成一場：副本裡同一步 STUCK_ABORT_SECS 沒前進（5 分鐘先記一筆、10 分鐘收掉）
+    tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
+    tab._loop = True
+    tab._phase, tab._cycle = "run", "go"
+    tab._stuck_watch(TICK)                                  # 建基準
+    tab._stuck_watch(dt.STUCK_EVENT_SECS)
+    ck("　卡 5 分鐘：記「卡住」、還在跑",
+       tab._cycle == "go" and any(r[2] == "stuck" for r in tab._events), str(tab._events[:1]))
+    handled = tab._stuck_watch(dt.STUCK_ABORT_SECS - dt.STUCK_EVENT_SECS)
+    ck("★★ 卡 10 分鐘：當成完成一場 → 回程補給（不停機）",
+       handled and tab.run_cb.isChecked() and tab._cycle == "supply" and tab._rounds == 1,
+       tab.status.text())
+    ck("　通知寫明卡在哪一步",
+       any("卡住" in m and "第 1 步" in m for _w, m in tab._notifier.fired), str(tab._notifier.fired[-1:]))
+    tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
+    tab._loop = True
+    tab._phase, tab._cycle = "enter", "go"
+    tab._stuck_watch(TICK)
+    tab._stuck_watch(dt.STUCK_ABORT_SECS + 1.0)
+    ck("　撞入口卡住不走這條（那段有副本設定的 N 分鐘）", tab._cycle == "go" and tab.run_cb.isChecked(),
+       tab.status.text())
+    tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
+    tab._loop = False
+    tab._phase, tab._cycle = "run", "go"
+    tab._stuck_watch(TICK)
+    tab._stuck_watch(dt.STUCK_ABORT_SECS + 1.0)
+    ck("　沒勾循環卡 10 分鐘 → 停下（只跑一趟沒有下一場）", not tab.run_cb.isChecked(),
+       tab.status.text())
+    dt.supply.run_full_supply = _orig_supply
+
     # ★★★ 2026-09-05 黑狐實錄（無限塔第 24 步）：踩上傳點的同一拍落點旁邊有怪 →
     #   _fight 先回 True → _run_step 沒跑到 → 順移被下一拍蓋掉 → 步驟停在 24，
     #   打完怪還走回另一區的傳點 → 「走不到傳點…屬於另一區」卡死。
