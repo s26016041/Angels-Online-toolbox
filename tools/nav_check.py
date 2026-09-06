@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import types
@@ -328,6 +329,30 @@ check("不帶 avoid 行為不變（直線一段到底）",
 corridor = terrain.Grid(10, 1, 0, [bytearray([1] * 10)])
 check("單格寬走道扣掉一格 → 沒有路（None）",
       corridor.waypoints((0, 0), (9, 0), avoid={(4, 0)}) is None)
+
+print("⑫ ★ 站位不挑斜角（使用者 2026-09-06 定「B」）：ortho_spot 只挑跟目標同行同列的格")
+g12 = terrain.Grid(21, 21, 0, [bytearray([1] * 21) for _ in range(21)])
+mon = (10.5, 10.5)                                  # 怪在 (10,10)
+sp = g12.ortho_spot((13.5, 13.5), mon, keep=1.4, reach=2.0)   # 我在對角 3 格外，近戰
+check("近戰 keep 1.4 → 站 2 格、同行或同列", sp in ((12.5, 10.5), (10.5, 12.5)), f"實得 {sp}")
+sp = g12.ortho_spot((16.5, 10.5), mon, keep=1.4, reach=2.0)
+check("挑離我最近的那一側", sp == (12.5, 10.5), f"實得 {sp}")
+sp = g12.ortho_spot((2.5, 18.5), mon, keep=10.0, reach=12.0)  # 法師：停 10、射程 12
+check("法師 keep 10／reach 12 → 站 10~11 格的同行同列格", sp is not None and
+      (sp[0] == 10.5 or sp[1] == 10.5) and 10.0 <= math.dist(sp, mon) <= 11.0, f"實得 {sp}")
+g12.open[10][12] = 0                                # 怪右邊 2 格是小石頭
+sp = g12.ortho_spot((16.5, 10.5), mon, keep=1.4, reach=2.0)
+check("同列那格不可走 → 換另一側，不挑對角", sp in ((10.5, 12.5), (10.5, 8.5), (8.5, 10.5)),
+      f"實得 {sp}")
+g12.open[10][11] = 0                                # 怪右邊 1 格有石頭：右邊 2 格雖可走但直線被擋
+g12.open[10][12] = 1
+sp = g12.ortho_spot((16.5, 10.5), mon, keep=1.4, reach=2.0)
+check("同列那格跟怪之間有障礙 → 不選它", sp != (12.5, 10.5), f"實得 {sp}")
+for x, y in ((12, 10), (8, 10), (10, 12), (10, 8)):
+    g12.open[y][x] = 0
+g12.open[10][11] = 1
+sp = g12.ortho_spot((13.5, 13.5), mon, keep=1.4, reach=2.0)
+check("四個方向都沒得站 → None（呼叫端照舊）", sp is None, f"實得 {sp}")
 
 print()
 if FAILS:

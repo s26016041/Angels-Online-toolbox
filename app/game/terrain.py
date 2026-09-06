@@ -174,6 +174,31 @@ class Grid:
                 return best[1], best[2]
         return None
 
+    def ortho_spot(self, me, target, keep: float, reach: float | None = None):
+        """打怪／講話的**站位**：跟目標**同一行或同一列**（不站對角）、離目標 ≥keep、
+        可走、跟目標之間直線可通、離我最近的那一格 —— 回格中心；找不到回 None。
+
+        ★ 使用者 2026-09-06 定「站位不挑斜角」（B）：小障礙物擋線多半是站在對角、
+          直線正好切到障礙物的角；同行同列的直線只穿過整格，地形圖說可通就真的可通。
+        · 距離用格數 k：k_min = ceil(keep)（近戰 keep 1.4 → 2 格、法師 10 → 10 格），
+          k_max = floor(reach − 1)（射程邊緣留一格，見 ranged-dead-band），最少等於 k_min。
+        · 候選 = (tx±k, ty)、(tx, ty±k)；每格要 walkable 且 clear_line(格, 目標格)。
+        · 找不到（目標被圍住只剩對角）回 None，呼叫端照舊沿直線靠近。
+        """
+        tx, ty = int(target[0]), int(target[1])
+        k_min = max(1, math.ceil(keep - 1e-9))
+        k_max = k_min if reach is None else max(k_min, math.floor(reach - 1.0 + 1e-9))
+        best, bd = None, None
+        for k in range(k_min, k_max + 1):
+            for x, y in ((tx + k, ty), (tx - k, ty), (tx, ty + k), (tx, ty - k)):
+                if not self.walkable(x, y) or not self.clear_line((x, y), (tx, ty)):
+                    continue
+                cx, cy = x + 0.5, y + 0.5
+                d = math.hypot(cx - me[0], cy - me[1])
+                if bd is None or d < bd:
+                    bd, best = d, (cx, cy)
+        return best
+
     # -- 最短路 -------------------------------------------------------
     def route(self, start, goal, relax: int = GOAL_RELAX,
               max_cost: float | None = None, avoid=None):

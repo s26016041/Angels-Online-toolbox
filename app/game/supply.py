@@ -490,9 +490,11 @@ def _talk_spots(scanner, g, here, npc_ent: int, npc_tile):
                 continue
             if not _in_talk_box(c, me_size, npc_tile, npc_size):
                 continue
-            out.append((math.hypot(dx, dy), c))
+            # ★ 站位不挑斜角（使用者 2026-09-06 定「B」）：跟 NPC 同行或同列的格排前面，
+            #   對角的只在沒有正面格時才輪到（棕櫚基地銀行只剩對角那格）。
+            out.append((0 if (dx == 0 or dy == 0) else 1, math.hypot(dx, dy), c))
     out.sort()
-    return [c for _, c in out]
+    return [c for _, _d, c in out]
 
 
 def _box_status(scanner, npc_id: int, npc_ent: int):

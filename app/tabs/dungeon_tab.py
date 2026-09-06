@@ -2227,9 +2227,43 @@ class DungeonTab(BaseTab):
         self._engage(d2, m2)
         return True
 
-    def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
+    def _walk_to_spot(self, gx: float, gy: float, me, keep: float,
+                      reach: float | None):
+        """走去「跟目標同行同列」的站位（掛機頁 _walk_to_spot 的複本，見那邊的說明）。
+        回 None＝沒有這種站位（照舊走）；否則回路徑點數（0＝送不出去）。"""
+        try:
+            grid = self._maps.get(self._sc)
+        except Exception:                                # noqa: BLE001
+            grid = None                                  # 讀不到地形圖 → 照舊走法
+        finder = getattr(grid, "ortho_spot", None)
+        if finder is None or not me:
+            return None
+        spot = finder(me, (gx, gy), keep, reach)
+        if spot is None:
+            return None
+        if math.hypot(spot[0] - me[0], spot[1] - me[1]) < 0.6:
+            return 0
+        mtile = (int(me[0]), int(me[1]))
+        stile = (int(spot[0]), int(spot[1]))
+        if grid.clear_line(mtile, stile):
+            ok = self._mover.walk_exact(self._sc, self._player, spot[0], spot[1])
+            self._walk_t = 0.0
+            return 1 if ok else 0
+        wp = grid.waypoints(mtile, stile)
+        if not wp:
+            return None
+        pts = [(x + 0.5, y + 0.5) for x, y in wp]
+        n = self._mover.walk_route(self._sc, self._player, spot[0], spot[1],
+                                   stop_short=0.0, points=pts)
+        self._walk_t = 0.0
+        return n
+
+    def _walk_toward(self, gx: float, gy: float, me, keep: float,
+                     reach: float | None = None) -> int:
         """往 (gx,gy) 走，在距離 keep 格處停。回路徑點數（0 = 走不了）。
 
+        ★ 站位不挑斜角（使用者 2026-09-06 定「B」）：先找跟目標同行同列的站位
+          （_walk_to_spot），沒有才照下面原本的走法。
         近距離（< NEAR_WALK）且直線可通 → walk_near 直走不尋路（連兩次沒動就改尋路）；
         其他 → walk_route 交**我們自己算的**點（隔地形＝繞路點 _way、直線可通＝目標那格）。
         ⛔ 沒有路徑點就不走（不再退回遊戲的尋路撞牆）。
@@ -2239,6 +2273,9 @@ class DungeonTab(BaseTab):
         gd = math.hypot(gx - me[0], gy - me[1])
         if gd <= keep:
             return 0
+        n = self._walk_to_spot(gx, gy, me, keep, reach)
+        if n is not None:
+            return n
         if (gd < NEAR_WALK and self._path_pts <= 1 and self._near_fail < 2
                 and self._line_clear):
             if self._near_from is not None and me:
@@ -2395,7 +2432,8 @@ class DungeonTab(BaseTab):
         self._walk_t += dt
         if (me and mp and not self._busy_walking()
                 and self._walk_t >= walk_gap and need_walk):
-            self._walked_ok = self._walk_toward(mp[0], mp[1], me, keep) > 0
+            self._walked_ok = self._walk_toward(mp[0], mp[1], me, keep,
+                                                reach=reach_keep) > 0
 
         self._atk.packets = bool(self._keys.mode == MODE_PACKET
                                  and self._keys.packets and self._keys.skill

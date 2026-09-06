@@ -4428,7 +4428,42 @@ class CharFarmPage(QWidget):
             self._castwatch = None
         self._keys.castwatch = None
 
-    def _walk_toward(self, gx: float, gy: float, me, keep: float) -> int:
+    def _walk_to_spot(self, gx: float, gy: float, me, keep: float,
+                      reach: float | None):
+        """走去「跟目標同行同列」的站位（見 _walk_toward 裡的說明）。
+
+        回 None＝沒有這種站位（呼叫端照舊走）；否則回路徑點數（0＝送不出去）。
+        直線可通就 walk_exact 直走到那格；不通就用地形圖算到那格的路交給 walk_route。
+        """
+        try:
+            grid = self._maps.get(self.sc)
+        except Exception:                                # noqa: BLE001
+            grid = None                                  # 讀不到地形圖 → 照舊走法
+        finder = getattr(grid, "ortho_spot", None)
+        if finder is None or not me:
+            return None
+        spot = finder(me, (gx, gy), keep, reach)
+        if spot is None:
+            return None
+        if math.hypot(spot[0] - me[0], spot[1] - me[1]) < 0.6:
+            return 0                                   # 已經站在那格
+        mtile = (int(me[0]), int(me[1]))
+        stile = (int(spot[0]), int(spot[1]))
+        if grid.clear_line(mtile, stile):
+            ok = self._mover.walk_exact(self.sc, self.player, spot[0], spot[1])
+            self._walk_t = 0.0
+            return 1 if ok else 0
+        wp = grid.waypoints(mtile, stile)
+        if not wp:
+            return None                                # 到不了那格 → 照舊
+        pts = [(x + 0.5, y + 0.5) for x, y in wp]
+        n = self._mover.walk_route(self.sc, self.player, spot[0], spot[1],
+                                   stop_short=0.0, points=pts)
+        self._walk_t = 0.0
+        return n
+
+    def _walk_toward(self, gx: float, gy: float, me, keep: float,
+                     reach: float | None = None) -> int:
         """往 (gx,gy) 走，但在距離 keep 格處停下。有冷卻，不會狂送。
 
         ★★ 走的是 move.Mover.walk_route()：**對目標本身尋路**，走遊戲算出來
@@ -4451,6 +4486,14 @@ class CharFarmPage(QWidget):
         #   （「退開一步」這類動作使用者本來就否決過）。太近一律不動。
         if gd <= keep:
             return 0
+        # ★★★ 站位不挑斜角（使用者 2026-09-06 定「B」）：要走的時候，目標不是「怪的
+        #   直線上留 keep 格」那個點，而是**跟怪同一行或同一列**、離怪 keep~reach 格、
+        #   可走且直線可通的格（terrain.Grid.ortho_spot）。小障礙物擋線多半是站在對角、
+        #   直線切到障礙物的角。找不到這種格才退回下面原本的走法。
+        #   ⚠ 只改「走去哪」；要不要走（need_walk／slack）跟打不打得到完全沒動。
+        n = self._walk_to_spot(gx, gy, me, keep, reach)
+        if n is not None:
+            return n
         # ★★★ **近距離一律不尋路**，直接朝目標微調位置。
         #   2026-08-06 實拍：雪狐站 2.2 格、怪滿血、沒在走，**卡 8.2 秒**。
         #   近戰打得到 2.0，只差 0.2 格卻走不過去 —— 因為 walk_route() 要先
@@ -6138,7 +6181,8 @@ class CharFarmPage(QWidget):
                 and self._walk_t >= walk_gap and need_walk):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
-            self._walked_ok = self._walk_toward(gx, gy, me, gkeep) > 0
+            self._walked_ok = self._walk_toward(gx, gy, me, gkeep,
+                                                reach=reach_keep) > 0
 
         # 兩條執行緒對「現在是不是用封包打」要有共識：
         # 寫目標那條要據此決定「寫不寫血量」——
