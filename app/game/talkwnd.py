@@ -41,6 +41,18 @@ r"""對話視窗：把「無異議對話」那一頁**按確定過掉**。
   → `close_page` 送之前**當場**用 `_wnd_object` 重驗（照 GetWindowById 走一遍，物件在
   而且 [物件+0x10] 對得上代號）才叫；查不到就不送（回 False 說原因）。
   Lua `OnMessageClose` 最後也是叫同一支，所以 Lua 那條路一樣先驗。
+
+★★★ 根治（使用者 2026-09-06 要求把「驗完到執行之間那一幀的空窗」也補掉）：
+  我們在自己的執行緒驗完、遊戲主執行緒真的執行 stub 之間，遊戲仍可能把視窗拆掉。
+  所以把「查視窗」搬進遊戲主執行緒：跳板頁第三段程式碼區（`move.aux_code2`）放一支
+  包裝 `guard(世界, 代號)`（見 `_guard_asm`）：
+      esi = 世界；eax = GetWindowById([世界+0xC], 代號)   ← 跟送包本體同一支（從它身上抄位址）
+      eax == 0 → 回 0（什麼都不送）
+      否則     → 呼叫送包本體(世界, 代號)，回 1
+  查與送在同一次呼叫、同一個執行緒裡，中間沒有任何遊戲程式碼能插進來。
+  GetWindowById 的位址**從送包本體的骨架抄**（`push [ebp+8]; mov ecx,[esi+0xC]; call rel32`），
+  ⛔ 不寫死；骨架對不上／keystone 不在／寫不進去 → 退回 Lua 確定鈕（有 `_wnd_object` 預檢）。
+  離線用 unicorn 模擬兩條路（tools/talkwnd_check.py），實機借閒置分身用假代號叫一次驗回 0。
 """
 from __future__ import annotations
 
@@ -325,6 +337,89 @@ CLOSE_BTN_FN = "OnMessageClose"
 CLOSE_WND_FN = "DestroyMessageWnd"
 
 
+# ★ 防呆包裝（見檔頭「根治」）。骨架＝送包本體裡「push [ebp+8]; mov ecx,[esi+0xC]; call rel32」
+#   那一句：rel32 的目標就是 GetWindowById（0x5037F3，2026-09-06 反組譯；⛔ 不寫死，從骨架抄）。
+_GUARD_SKEL = b"\xff\x75\x08\x8b\x4e\x0c\xe8"
+_GUARD_BODY = 0x40           # 只在本體開頭這一段找骨架（實測在 +0x1E；讀更長會撈到鄰居函式的）
+
+
+def _find_lookup_fn(scanner, spot: Spot) -> int | None:
+    """從 messageclose 送包本體抄出 GetWindowById 的位址；骨架對不上回 None（＝包裝停用）。"""
+    raw = scanner._read_bytes(spot.close_fn, _GUARD_BODY)
+    if not raw:
+        return None
+    b = bytes(raw)
+    k = b.find(_GUARD_SKEL)
+    if k < 0:
+        return None
+    at = k + len(_GUARD_SKEL)
+    rel = struct.unpack_from("<i", b, at)[0]
+    fn = (spot.close_fn + at + 4 + rel) & 0xFFFFFFFF
+    base = scanner.module_base(GAME_MODULE)
+    span = roulette._module_span(scanner, base) if base else 0
+    return fn if base and base <= fn < base + span else None
+
+
+def _guard_asm(lookup_fn: int, close_fn: int) -> str:
+    """包裝的組譯原文：`thiscall guard(世界 in ecx, 代號 on stack)` → eax 1＝送了、0＝視窗不在。
+    兩個被呼叫的都是 __thiscall、各自 `ret 4`；esi 是 callee-saved，跨 call 保得住。
+    ⚠ keystone 把無前綴數字當十六進位，所以一律寫 0x。"""
+    return f"""
+        push ebp
+        mov ebp, esp
+        push esi
+        mov esi, ecx
+        push dword ptr [ebp + 0x8]
+        mov ecx, dword ptr [esi + 0xC]
+        call {lookup_fn:#x}
+        test eax, eax
+        jz skip
+        push dword ptr [ebp + 0x8]
+        mov ecx, esi
+        call {close_fn:#x}
+        mov eax, 0x1
+        jmp done
+    skip:
+        xor eax, eax
+    done:
+        pop esi
+        pop ebp
+        ret 0x4
+    """
+
+
+def _ensure_guard(mover, scanner, spot: Spot) -> int:
+    """把包裝裝進這份跳板的第三段程式碼區；回位址，裝不了回 0（呼叫端退回 Lua 確定鈕）。
+    快取跟著 (區塊位址, 送包本體位址) 走：跳板換了、或改版位址變了就重寫。"""
+    aux2 = getattr(mover, "aux_code2", None)
+    if aux2 is None:
+        return 0
+    base, size = aux2()
+    if not base:
+        return 0
+    if getattr(mover, "_wnd_guard", None) == (base, spot.close_fn):
+        return base
+    lookup = _find_lookup_fn(scanner, spot)
+    if not lookup:
+        return 0
+    with mover.lock:
+        if getattr(mover, "_wnd_guard", None) == (base, spot.close_fn):
+            return base
+        try:
+            import keystone
+            ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+            ks.syntax = keystone.KS_OPT_SYNTAX_INTEL
+            shell, _n = ks.asm(_guard_asm(lookup, spot.close_fn), addr=base)
+        except Exception:                                  # noqa: BLE001
+            return 0
+        if not shell or len(shell) > size:
+            return 0
+        if not mover.write(base, bytes(shell)):
+            return 0
+        mover._wnd_guard = (base, spot.close_fn)
+    return base
+
+
 def close_window(mover, scanner) -> bool:
     """把對話視窗**從畫面上收掉**。已經關著的話這支是空操作。
 
@@ -366,6 +461,21 @@ def close_page(mover, scanner) -> tuple[bool, str]:
     #   交給遊戲的位址送出前當場重讀重驗）。
     if _wnd_object(scanner) is None:
         return False, "對話視窗物件已不在（代號殘留）→ 不送確定（送了遊戲會當）"
+    # ★★★ 正路：防呆包裝（查視窗＋送包在遊戲主執行緒同一次呼叫裡做完，見檔頭「根治」）
+    #   ＋ destroy —— 跟確定鈕做的兩件事一樣。包裝裝不起來才退回 Lua 確定鈕。
+    spot = locate(scanner)
+    world = _u32(scanner, spot.world_ptr) if spot else None
+    guard = (_ensure_guard(mover, scanner, spot)
+             if spot and world and 0x10000 < world < 0x7FFF0000 else 0)
+    if guard:
+        with mover.lock:
+            got = mover.call_sync(guard, int(wnd), ecx=world, timeout=CALL_TIMEOUT)
+        if got is None:
+            return False, "指令槽忙，等下一輪"
+        if not got:
+            return False, "對話視窗物件已不在（遊戲那邊當場查不到）→ 沒送確定"
+        close_window(mover, scanner)
+        return True, "已按「確定」（messageclose 防呆包裝＋destroy）"
     try:
         ok, _val = lua.call(mover, scanner, CLOSE_BTN_FN, int(wnd))
         if ok:

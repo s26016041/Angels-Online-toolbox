@@ -254,7 +254,11 @@ _SCRATCH = 0x800            # 配置的是 0x1000，程式碼用不到 0x100，�
 # 第二段程式碼區（lua.py 的「原子序列」stub 放這裡）：主 stub 在 _CODE(0x40)
 # 起、實測不到 0x100，所以 0x200 起到 _SCRATCH 之間整段是空的。
 _AUX_CODE = 0x200
-_AUX_CODE_MAX = _SCRATCH - _AUX_CODE
+# ⚠ lua.py 的 stub 實測 308 bytes（0x200~0x334）；給它留到 0x400，之後是第三段。
+_AUX_CODE_MAX = 0x400 - _AUX_CODE
+# 第三段程式碼區：talkwnd.py 的 messageclose 防呆包裝（幾十 bytes）放這裡。
+_AUX2_CODE = 0x400
+_AUX2_CODE_MAX = _SCRATCH - _AUX2_CODE
 
 
 def _stub_asm(block: int) -> str:
@@ -530,6 +534,13 @@ class Mover:
         if not self._active:
             return 0, 0
         return self._block + _AUX_CODE, _AUX_CODE_MAX
+
+    def aux_code2(self) -> tuple[int, int]:
+        """第三段程式碼區 (位址, 大小)；沒裝好回 (0, 0)。
+        talkwnd.py 的「先查視窗物件、NULL 就不叫」包裝放這裡（_AUX2_CODE=0x400 起）。"""
+        if not self._active:
+            return 0, 0
+        return self._block + _AUX2_CODE, _AUX2_CODE_MAX
 
     def write(self, addr: int, data: bytes) -> bool:
         """往遊戲行程寫一段位元組（給 scratch 區與 Lua 堆疊用）。"""
