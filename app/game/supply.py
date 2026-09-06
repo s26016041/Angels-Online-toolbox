@@ -1651,7 +1651,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float) -> bool:
 def run_full_supply(mover, scanner, say=None,
                     back_to=None, potions=None,
                     potion_only: bool = False,
-                    ledger=None) -> tuple[bool, str]:
+                    ledger=None, guild_items=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
@@ -1675,6 +1675,11 @@ def run_full_supply(mover, scanner, say=None,
     ledger(商人標籤, 種類id, 實收數量) 可選：購買記帳（掛機頁「購買紀錄」，
     2026-08-20 使用者要求）。標籤這裡組好（「某某城補給商」），數量由
     run_buy／run_potion_fill 的背包對帳回報 —— 記的是真的進來幾個。
+
+    guild_items（2026-09-06 使用者要求）：要存**公會倉庫**的物品種類 ID 集合
+    （`guildbank.wanted()`，全部分身共用一張清單）。背包有清單上的東西才多講一次話
+    開社團倉庫存進去（跟個人倉庫同一個銀行 NPC）；None／空＝不存。
+    potion_only 那趟一樣不去銀行。
     """
     def note(m):
         if say:
@@ -1796,6 +1801,20 @@ def run_full_supply(mover, scanner, say=None,
             _, kmsg = run_bank(mover, scanner, bkid, (bkx, bky))
             note("銀行：" + kmsg)
             results.append("銀行:" + kmsg)
+        # ★ 公會（社團）倉庫（2026-09-06 使用者要求）：清單全部分身共用，背包有清單上的
+        #   東西才走這段；跟個人倉庫同一個 NPC，再講一次話開社團倉庫（見 guildbank 檔頭）。
+        #   滿了安靜關窗（使用者定：不通知），結果只寫進訊息。
+        if guild_items:
+            from app.game import guildbank       # 避免模組載入期循環相依
+            _gpend = guildbank.pending(scanner, guild_items)
+            if _gpend is None:
+                results.append("⚠ 背包讀不到，跳過公會倉庫")
+            elif _gpend:
+                bkid, bkx, bky = bank_npc
+                note(f"背包有 {len(_gpend)} 件要存公會倉庫，走去銀行 ({bkx},{bky})…")
+                _, gmsg = guildbank.run(mover, scanner, bkid, (bkx, bky), guild_items)
+                note("公會倉庫：" + gmsg)
+                results.append("公會倉庫:" + gmsg)
 
     # 5. 修裝：有維修商就走去全修（★無腦修，不看裝備——使用者指定）
     # ★ 修裝的成敗要進整趟的結果：壞裝觸發的那趟若修裝失敗，回去馬上又會

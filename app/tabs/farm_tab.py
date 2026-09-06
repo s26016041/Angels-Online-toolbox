@@ -76,11 +76,12 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
-                      channel, entity, eventmap, itemicon, loot,
+                      channel, entity, eventmap, guildbank, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply,
                       tablestamp, terrain)
+from app.tabs.guildbank_dialog import GuildBankDialog
 from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list, fit_spin,
                                mall_buys_dialog, mall_buys_widget, no_elide,
                                record_mall_buy)
@@ -2321,6 +2322,15 @@ class CharFarmPage(QWidget):
             "⚠ 會真的用掉一張天使之翼、真的花錢買東西。")
         self.test_supply_btn.clicked.connect(self._test_supply)
         t.addWidget(self.test_supply_btn)
+        # ★ 存公會倉庫（2026-09-06 使用者要求）：小視窗勾清單、全部分身共用；
+        #   回程補給到銀行時順手存（supply.run_full_supply 的 guild_items）。
+        self.guildbank_btn = QPushButton("存公會倉庫")
+        self.guildbank_btn.setToolTip(
+            "打開小視窗：列這台背包裡能存公會倉庫的東西，打字過濾、勾選＝要存的清單。\n"
+            "清單全部分身共用；回程補給到銀行時，每台把清單上、自己背包有的存進社團倉庫。\n"
+            "綁定／不可交易／不可存倉庫的東西不會列出來；公會倉庫滿了就安靜關窗。")
+        self.guildbank_btn.clicked.connect(self._open_guildbank)
+        t.addWidget(self.guildbank_btn)
         t.addStretch(1)
         sup_v.addLayout(t)
         sup_v.addWidget(self.jump_lbl)
@@ -3030,6 +3040,7 @@ class CharFarmPage(QWidget):
         plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
         # ★ 背景執行緒跑整趟補給。say 回報進度存進 _supply_progress，_supply_tick 顯示＋等完成。
         mv, sc, gen = self._mover, self.sc, self._supply_gen
+        gitems = guildbank.wanted()    # 公會倉庫清單（全部分身共用；主執行緒讀 config）
 
         def _worker():
             try:
@@ -3037,7 +3048,8 @@ class CharFarmPage(QWidget):
                     mv, sc, say=lambda m: setattr(self, "_supply_progress", m),
                     back_to=home,      # 回程跳回記錄點（None＝出發當下，原行為）
                     potions=plan,      # 藥水買到負重 95%（生產分頁不帶＝不買）
-                    ledger=self._record_purchase)   # 購買紀錄（純資料 append）
+                    ledger=self._record_purchase,   # 購買紀錄（純資料 append）
+                    guild_items=gitems)             # 順手存公會倉庫（2026-09-06）
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
@@ -3047,6 +3059,42 @@ class CharFarmPage(QWidget):
         self._supply_thread = t
         t.start()
         self.status.setText(f"🔧 {why} → 開始跑補給（存倉庫→修裝→買水→趴趴GO回來）…")
+        return True
+
+    def _open_guildbank(self) -> None:
+        """「存公會倉庫」小視窗（清單全部分身共用，見 app/tabs/guildbank_dialog.py）。"""
+        who = self.char_name or self.account or self.pid
+        GuildBankDialog(self, self.sc, str(who), test_run=self._guildbank_test).exec()
+
+    def _guildbank_test(self, say) -> bool:
+        """小視窗的「🧪 現在就存」：就地走去這城的銀行、開社團倉庫、存清單上的東西。
+
+        背景執行緒跑 `guildbank.run_here`；進度／結果用 say(訊息) 回小視窗。
+        接得起來回 True。⚠ 掛機在跑就不准（兩邊會搶走位），上一趟補給沒收工也不准。
+        """
+        if self.run_cb.isChecked():
+            say("先把「開始掛機」關掉再測（避免跟掛機搶走位）")
+            return False
+        t = self._supply_thread
+        if t is not None and t.is_alive():
+            say("上一趟補給的背景執行緒還沒收工，先等它")
+            return False
+        if self.sc is None:
+            say("這台沒連上遊戲")
+            return False
+        if not self._ensure_mover():
+            say("跳板沒裝好（移動功能啟不了）")
+            return False
+        mv, sc = self._mover, self.sc
+
+        def _worker():
+            try:
+                ok, msg = guildbank.run_here(mv, sc, say=say)
+            except Exception as exc:                          # noqa: BLE001
+                ok, msg = False, f"出錯：{exc}"
+            say(("✔ " if ok else "✘ ") + msg)
+
+        threading.Thread(target=_worker, daemon=True).start()
         return True
 
     def _test_supply(self) -> None:
