@@ -222,6 +222,14 @@ STRAY_HOLD = 2.0
 #   ⚠ 安全性不變：底下那條「**沒有更靠近才累加**」還在，所以遊戲正在自己
 #     走過去的期間**一次都不會插手**，收快的只有「真的停住不動」那種。
 CLICK_RETRY = 1.0
+# ★★★★ 使用者 2026-09-08：「對話傳送你就改成**跟我狂按點點看一樣**，然後不行
+#   再喬位置」。實測（黑狐 莉維坦的寢室「神燈巨人雕像」60408）：站 1.5 格點下去
+#   完全沒反應、站 0.5 格一發就傳走 —— 遊戲收到點選會自己再往前走一點，所以
+#   **連點**本身就會把人一步一步帶進互動範圍。
+#   → 先狂點 SPAM_SHOTS 發（每 CLICK_SPAM 秒一發，⛔ 這段完全不動我們自己的腳），
+#     還是沒反應才進到舊的「往它靠上去再點」（NUDGE_KEEP）。
+CLICK_SPAM = 0.4           # 狂點的間隔
+SPAM_SHOTS = 6             # 先狂點幾發才開始喬位置
 # ⚠⚠ 「站穩了才點」最多等這麼久，超過就照點（**不是逾時停機，是照樣做**）。
 #   出處 [[self-supply-buy]] 的老坑：人擠人／被推的時候 `is_walking` 會**恆為
 #   True**，「等停穩」那道閘就永遠不會過 —— 看起來就是「站在它旁邊卻不點」。
@@ -1451,6 +1459,7 @@ class DungeonTab(BaseTab):
         self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
         self._mover_t = 0.0          # 跳板掉了之後隔多久再重裝一次（見 MOVER_RETRY）
         self._enter_acted = None     # 入口對話「已經動過」的那一頁（防重複送）
+        self._spam = 0               # 「點了沒反應」先狂點幾發（見 SPAM_SHOTS）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -3716,6 +3725,7 @@ class DungeonTab(BaseTab):
             # ⚠ 那些全域關著也會留舊值（見 talkwnd）→ 簽章一直沒變＝沒點到。
             self._talk_sig = self._talk_base = (pg0.sig if pg0 else None)
             self._talk_same, self._click_t, self._nudge = 0, 0.0, 0
+            self._spam = 0
             self._click_best = None
             self._talk_did = ""
             self._talk_seen, self._close_t, self._close_n = False, 0.0, 0
@@ -3765,6 +3775,26 @@ class DungeonTab(BaseTab):
                 self._click_best, self._click_t = d_now, 0.0
                 self._say(f"{tag}　遊戲正在走過去…"
                           f"剩 {d_now:.1f} 格")
+                return
+            # ★★★★ 先狂點（見 SPAM_SHOTS）：⛔ 這段不動腳，只是一直點 ——
+            #   點選本身就會讓遊戲再往前走一點，多半點著點著就進範圍了。
+            if self._spam < SPAM_SHOTS:
+                self._click_t += gap
+                if self._click_t >= CLICK_SPAM:
+                    self._click_t = 0.0
+                    self._spam += 1
+                    props = scenery.nearby(self._sc, (ax, ay), PROP_TOL) or []
+                    hit = _pick(props, want_model)
+                    if not hit:
+                        self._say(f"{tag}　點了沒反應，"
+                                  f"而且那一格現在掃不到東西 —— 等下一輪")
+                        return
+                    ok, msg = produce.click(self._mover, self._sc, hit[0])
+                    self._say(f"{tag}　狂點第 {self._spam}/{SPAM_SHOTS} 發"
+                              f"（離它 {_d((ax, ay), me):.1f} 格，"
+                              f"{'送出' if ok else msg}）")
+                    return
+                self._say(f"{tag}　等對話出現…（狂點 {self._spam}/{SPAM_SHOTS} 發）")
                 return
             self._click_t += gap
             if self._click_t >= CLICK_RETRY:
@@ -3963,6 +3993,7 @@ class DungeonTab(BaseTab):
         self._gate_last = None
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
         self._nudge = 0               # 靠近重試的次數歸零
+        self._spam = 0                # 狂點的發數歸零
         self._still_t = 0.0
         self._nav.reset()
         self._refresh_steps()

@@ -1826,12 +1826,20 @@ def main() -> int:
         "walk_exact": lambda _s, _sc, _p, x, y: moved3.append(("exact", 0.0)),
     })()
     dt.entity.is_walking = lambda _sc, _p: False
-    run(tab, (dt.CLICK_RETRY + dt.MENU_GAP * 2) * 5 + 1.0)
-    ck(f"★★ 點了 {dt.CLICK_RETRY:.0f} 秒沒反應 → **再點一次**（不是點一次就不管）",
+    # ★★★★ 使用者 2026-09-08：「改成跟我狂按點點看一樣，然後不行再喬位置」
+    #    → 先狂點（⛔ 這段不動腳），狂點完才開始往物件靠上去。
+    run(tab, dt.CLICK_SPAM * 3 + dt.MENU_GAP * 3)
+    ck("★★★★ 點不到時**先狂點**（每 %.1f 秒一發）" % dt.CLICK_SPAM,
        len(clicks) >= 2, str(len(clicks)))
+    ck("　⛔ 狂點這段完全不動腳（點選本身就會讓遊戲往前走）",
+       not moved3, str(moved3))
+    run(tab, (dt.CLICK_RETRY + dt.MENU_GAP * 2) * 5 + 1.0)
+    ck(f"★★ 狂點 {dt.SPAM_SHOTS} 發還是沒反應 → 才開始喬位置（往它靠上去）",
+       len(clicks) > dt.SPAM_SHOTS and bool(moved3),
+       f"{len(clicks)} 發　{moved3}")
     ck("　而且還在跑（上限交給 STEP_TIMEOUT 大聲停）", tab.run_cb.isChecked())
     # ★★ 使用者 2026-09-02：「如果點了沒反應要調整位置往對話物件靠上去」
-    ck("★★ 重點之前會**往物件靠上去**（站著硬點沒用）", bool(moved3),
+    ck("★★ 喬位置＝**往物件靠上去**（站著硬點沒用）", bool(moved3),
        str(moved3))
     keeps = [k for _w, k in moved3]
     ck("　一次比一次近", keeps == sorted(keeps, reverse=True), str(keeps))
@@ -2305,13 +2313,12 @@ def main() -> int:
     shots5 = []
     dmt.produce.click = lambda _mv, _sc, _p: (shots5.append(1), (True, "點了"))[1]
     mk5._poke_check()
-    ck("★★★★ 製作頁：點了沒反應 → 自動再點一次（幫使用者按第二下）",
+    ck("★★★★ 製作頁：點了沒反應 → **自動連點**（跟使用者狂按點點看一樣）",
        len(shots5) == 1, str(len(shots5)))
-    mk5._poke_next = time.time() - 0.1
-    mk5._poke_check()
-    mk5._poke_next = time.time() - 0.1
-    mk5._poke_check()
-    ck(f"　⛔ 最多補 {dmt.POKE_AGAIN_MAX} 發就停（再多就是真的點不到）",
+    for _ in range(dmt.POKE_AGAIN_MAX + 5):      # 一直催也不會超過上限
+        mk5._poke_next = time.time() - 0.1
+        mk5._poke_check()
+    ck(f"　⛔ 最多連點 {dmt.POKE_AGAIN_MAX} 發就停（再多就是真的點不到）",
        len(shots5) == dmt.POKE_AGAIN_MAX, str(len(shots5)))
     mk5.on_close()
 

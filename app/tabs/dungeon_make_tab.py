@@ -78,13 +78,11 @@ WALL_COLOR = (26, 28, 32)
 PROP_RADIUS = 25.0
 # 點下去之後等對話框開的上限。⚠ 遊戲會自己走過去才開，所以要放寬一點。
 DIALOG_WAIT = 12.0
-# ★★★★ 點了這麼久還沒反應 → **自動再送一發**（使用者 2026-09-08：「我發現他要
-#   按兩次點點看才會傳送」）。原因是 `TryAct` 的互動範圍很小：第一發只是讓遊戲把
-#   人走過去（實測停在 1.5 格還不夠近），第二發貼到 0.5 格才真的點到。
-#   ⛔ 不是換別種點法 —— 就是「再按一次」而已，這裡幫使用者按。
-POKE_AGAIN_AFTER = 2.5
-# 最多自動補幾發（再多就是真的點不到，讓使用者看畫面自己判斷）。
-POKE_AGAIN_MAX = 2
+# ★★★★ 使用者 2026-09-08：「改成**跟我狂按點點看一樣**」——按一下「點點看」＝
+#   幫你連點。原因是 `TryAct` 的互動範圍很小：第一發只是讓遊戲把人走過去
+#   （實測停在 1.5 格還不夠近），連點著點著貼到 0.5 格才真的點到。
+POKE_AGAIN_AFTER = 0.4     # 狂點的間隔
+POKE_AGAIN_MAX = 12        # 最多連點幾發（約 5 秒；再多就是真的點不到）
 # ★ 傳點的出口是「盯著看到的」不是算的（使用者 2026-09-02：「人被傳走不會
 #   換地圖，有順移就算吧」）：加完傳點那一步就開始每 0.12 秒看一次位置，
 #   一跳超過 JUMP_TILES 格就把落點記進那一步。
@@ -1609,9 +1607,8 @@ class DungeonMakeTab(BaseTab):
             self.status.setText(
                 "對話框開了 —— 看遊戲畫面，按下面對應的「第 N 項」")
             return
-        # ★★★★ 過了 POKE_AGAIN_AFTER 秒還沒反應 → **幫使用者再按一次**
-        #   （使用者 2026-09-08：「要按兩次點點看才會傳送」——第一發只是讓遊戲
-        #   把人走過去，還不夠近；再一發貼到 0.5 格才真的點到）。
+        # ★★★★ 還沒反應 → **一直幫你點**（使用者 2026-09-08：「跟我狂按點點看
+        #   一樣」）：第一發只是讓遊戲把人走過去，連點著就會一步一步進互動範圍。
         if (self._poked is not None and self._poke_again < POKE_AGAIN_MAX
                 and time.time() >= self._poke_next):
             self._poke_again += 1
@@ -1621,8 +1618,9 @@ class DungeonMakeTab(BaseTab):
             if mv is not None:
                 ok, msg = produce.click(mv, sc, self._poked)
                 self.status.setText(
-                    f"還沒反應（多半是還不夠近）→ 自動再點一次"
-                    f"（第 {self._poke_again + 1} 發，{'送出' if ok else msg}）")
+                    f"還沒反應（多半是還不夠近）→ 連點中"
+                    f"（第 {self._poke_again + 1}/{POKE_AGAIN_MAX + 1} 發，"
+                    f"{'送出' if ok else msg}）")
         if time.time() >= self._poke_until:
             self._poke_timer.stop()
             # ⚠ 「沒看到變化」≠「沒點到」：有些機關是純動作（開門、放火），
