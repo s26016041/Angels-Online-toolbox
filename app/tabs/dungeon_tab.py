@@ -168,6 +168,12 @@ TALK_NEAR = 1.8
 TALK_KEEP = 1.2
 # 腳本裡的座標跟現場物件對得起來的最大誤差（格）。
 PROP_TOL = 3.0
+# ★★★ 「機關擋路」回頭再撞一次的間隔（秒）。2026-09-07 黑狐 莉薇坦的寢室：
+#   一個「蠍子雕像不可走」物件蓋 23 格把整張圖切成兩半，使用者原話
+#   「這種東西就是多撞幾次就會開」——反覆觸摸之後那個物件外觀從 60414 換成
+#   60301、阻擋整片解除。⛔ **不設次數上限**（跟 `_blocked` 一樣，副本的門本來
+#   就是解謎才開），只用這個間隔避免一直空點。
+GATE_RETRY = 6.0
 # 送完一個對話動作之後等多久再看下一頁。
 # ★ 對話動作之間的節奏（點→選項→確定）。使用者 2026-09-03：「把間隔直接刪掉，
 #   不給輸入；預設 0.5；不會跟使用者說」→ 製作頁的欄位拿掉、腳本裡舊的 gap
@@ -1391,6 +1397,9 @@ class DungeonTab(BaseTab):
         #      的狀態，換目標一律走 _engage() 整組重設 ----
         self._last_gave_up = None    # 剛換掉的那一隻（有別隻時先挑別隻；⛔ 不是黑名單）
         self._me = None              # 這一拍我的位置（挑目標／算路徑用）
+        self._gate_t = 0.0           # 距離上次「回頭撞機關」過了多久
+        self._gate_n = 0             # 這一步為了機關回頭撞了幾次（只拿來回報）
+        self._gate_on = False        # 上次算出來的「擋我的是機關嗎」（⛔ 泛洪很貴，要快取）
         self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
@@ -3412,7 +3421,15 @@ class DungeonTab(BaseTab):
         finish()
 
     def _next(self) -> None:
-        self._i += 1
+        self._goto(self._i + 1)
+
+    def _goto(self, i: int) -> None:
+        """跳到第 i 步（0 起算）並把「跟這一步綁在一起」的狀態全部歸零。
+
+        ★ 往前走是 `_next()`；**往回跳**只有一個用途 —— 走不到而且中間隔的是
+          機關（見 `_gate_retry`），要回上一個互動步驟再撞一次。
+        """
+        self._i = i
         self._step_t = 0.0
         self._unreach_t = 0.0
         self._blocked_last = False
@@ -3426,6 +3443,9 @@ class DungeonTab(BaseTab):
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
         self._nudge = 0               # 靠近重試的次數歸零
         self._still_t = 0.0
+        self._gate_t = 0.0
+        self._gate_n = 0
+        self._gate_on = False
         self._nav.reset()
         self._refresh_steps()
 
@@ -4799,9 +4819,66 @@ class DungeonTab(BaseTab):
         self._unreach_t += dt
         self._blocked_last = True
         self._grid_t = 0.0                    # 下一拍就重讀地形（門可能剛開）
+        if self._gate_retry(dt, goal, what):
+            return
         self._say(f"第 {self._i + 1} 步：{what} —— 現在沒有路，"
                   f"重讀地形繼續試（已 {self._unreach_t / 60.0:.1f} 分鐘）"
                   f"{self._why_unreachable(goal)}")
+
+    def _prev_interact(self) -> int | None:
+        """往回找最近的一個「點物件」步驟（機關就是那一步點的）。找不到回 None。"""
+        steps = (self._script.steps if self._script else None) or []
+        for k in range(min(self._i, len(steps)) - 1, -1, -1):
+            if (steps[k] or {}).get("do") == dungeon.INTERACT:
+                return k
+        return None
+
+    def _gate_retry(self, dt: float, goal, what: str) -> bool:
+        """走不到，但**把場景物件的阻擋拿掉就走得到** ＝ 中間隔的是機關不是地形
+        → 回上一個「點物件」的步驟，再撞一次。回 True 表示這一拍已經處理掉了。
+
+        ★★★ 2026-09-07 黑狐 莉薇坦的寢室實錄（使用者當場撞開、我當場抓狀態）：
+          擋路的是**單一物件**「蠍子雕像不可走」60414，它照外觀的形狀表蓋了 23 格，
+          其中 15 格正好把整張圖切成兩半（我這區 17587 ／ 對面 19009；把那些格
+          拿掉就合成一整片 59903）。使用者原話「這種東西就是多撞幾次就會開」，
+          撞開後**物件沒有消失**，是**外觀從 60414 換成 60301「門開關火不給點」**、
+          阻擋整片解除，我這區變成 36619 格、目標點就走得到了。
+        ⚠⚠ 所以判「開了沒」一律看**地形格**（`Grid.gate_between`）——
+          ⛔ 不准看物件在不在、也不准比外觀（外觀本來就會換，見 `_pick`）。
+        ⚠⚠ **每一發之間一定要把對話收乾淨才算真的再點一次**：我用探針連點 6 發，
+          但第 1 發之後對話框就開著沒收，第 2~6 發的對話簽章完全一樣 ＝ 等於沒送。
+          回到互動那一步走完整流程（點 → 走完對話 → 收掉）才是「撞第二次」。
+        ⛔ 不設次數上限 —— 副本的門本來就是解謎才開，`_blocked` 也是無限重試。
+        """
+        if goal is None or self._grid is None or self._me is None:
+            return False
+        self._gate_t += dt
+        if self._gate_t < GATE_RETRY:
+            # ⚠⚠ 冷卻中就**沿用上次算出來的答案**，⛔ 不准每拍重算：
+            #   `gate_between` 要泛洪兩次，440x280 的圖實機量到 **41.6ms**，
+            #   而 `_blocked` 是走不到時**每一拍**都會進來的 —— 每拍多花 40ms
+            #   會讓整個工具箱變頓（memory `no-crash-no-lag`：UI 執行緒不放慢）。
+            return self._gate_on
+        self._gate_t = 0.0
+        try:
+            self._gate_on = bool(self._grid.gate_between(self._me, goal))
+        except Exception:                                # noqa: BLE001
+            self._gate_on = False                        # 答不出來＝安全退化
+        if not self._gate_on:
+            return False
+        k = self._prev_interact()
+        if k is None:
+            self._say(f"第 {self._i + 1} 步：{what} —— **是機關擋著，不是地形**"
+                      f"（把場景物件的阻擋拿掉就走得到）。"
+                      f"腳本裡前面沒有「點物件」的步驟，只能等它自己開"
+                      f"（已 {self._unreach_t / 60.0:.1f} 分鐘）")
+            return True
+        n = self._gate_n + 1
+        self._notify(f"第 {self._i + 1} 步：{what} —— 是**機關**擋著（不是地形）"
+                     f"　→ 回第 {k + 1} 步再撞一次（第 {n} 次）")
+        self._goto(k)                         # ⚠ 這一支會把 _gate_n／_gate_on 歸零
+        self._gate_n = n
+        return True
 
     def _why_unreachable(self, goal) -> str:
         """停下來時**把證據講出來**：那一格到底是牆，還是在別的區。
@@ -4817,8 +4894,13 @@ class DungeonTab(BaseTab):
                     f"腳本的點位放在不能站的地方？）")
         comp = self._grid.reachable(gx, gy)
         mine = self._reach_n if self._reach is not None else "?"
+        # ★ 分得出「機關擋的」跟「地形本來就不通」：格子旗標 bit0 是場景物件蓋上去
+        #   的、bit1 才是地圖本身的牆（見 terrain.OBJ_MASK）。
+        # ⚠ 直接用 `_gate_retry` 剛才算好的那個答案，⛔ 不要自己再泛洪一次
+        #   （那是 40ms，而這裡每一拍都會被叫到）。
+        gate = "，而且**隔開的是場景物件（機關）不是地形**" if self._gate_on else ""
         return (f"（那一格可以站，但屬於另一區：它那區 "
-                f"{len(comp) if comp else '?'} 格、我這區 {mine} 格 —— "
+                f"{len(comp) if comp else '?'} 格、我這區 {mine} 格{gate} —— "
                 f"中間的門沒開，或是要先走傳點）")
 
     # ------------------------------------------------------------------

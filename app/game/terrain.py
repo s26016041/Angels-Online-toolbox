@@ -59,6 +59,17 @@ CELL = 7                   # 每格幾 bytes
 FLAG_OFF = 2               # 格子裡的阻擋旗標在第幾個 byte
 # ⚠ 出處＝同上那道 test 的立即值 3（bit0|bit1 ＝ 不能走）。
 BLOCK_MASK = 3             # 那個 byte 的哪幾個 bit 代表不能走
+# ★★★ 那兩個 bit **意義不一樣**（2026-09-07 反組譯定案，見 memory
+#   `dungeon-object-blocking-gate`）：
+#     bit0 = 場景物件執行時蓋上去的阻擋（機關、擺設、雕像）
+#            —— 遊戲自己那支 StampObjectBlocking(0x546d7f) 查外觀的形狀表，
+#               逐格 SetCell(or=開關, clear=開關^1)；機關一開就整片清掉。
+#     bit1 = 地圖檔本身的牆（載圖時填好，這一局不會變）
+#   雷達繪製（0x5858ea）也把兩者畫成不同顏色，是兩種東西沒錯。
+#   ⛔ 走路判定**照舊看 BLOCK_MASK**（遊戲的 walkable 就是 test …,3）——
+#      下面這兩個遮罩只拿來**解釋「為什麼走不到」**，不准拿去放寬走路。
+OBJ_MASK = 1               # bit0：場景物件放的阻擋（機關開了就消失）
+MAP_MASK = 2               # bit1：地圖本身的牆
 MAX_DIM = 4096             # 合理性上限（讀到亂數就當失敗）
 # 讀不到時當場重試幾次（一次 6~8ms）。換圖那一瞬間會短暫讀不到，
 # 而沒有地形圖我們就不走路 —— 多花十幾毫秒把圖拿到手划算得多。
@@ -78,16 +89,81 @@ _NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
 
 
 class Grid:
-    """一張地圖的可走格。`rows[y]` 是一列的 bytes，用 bit 判斷。"""
+    """一張地圖的可走格。`rows[y]` 是一列的 bytes，用 bit 判斷。
 
-    __slots__ = ("w", "h", "obj", "open")
+    `soft`（可有可無）＝**只看地圖本身的牆**（bit1）那一份，用來回答
+    「我走不到那裡，是地形，還是有機關沒開？」。⛔ 走路一律用 `open`。
+    """
 
-    def __init__(self, w: int, h: int, obj: int, open_rows: list[bytearray]):
+    __slots__ = ("w", "h", "obj", "open", "soft")
+
+    def __init__(self, w: int, h: int, obj: int, open_rows: list[bytearray],
+                 soft_rows: "list[bytearray] | None" = None):
         self.w, self.h, self.obj, self.open = w, h, obj, open_rows
+        self.soft = soft_rows
 
     def walkable(self, x: int, y: int) -> bool:
         return (0 <= x < self.w and 0 <= y < self.h
                 and bool(self.open[y][x]))
+
+    def map_walkable(self, x: int, y: int) -> bool:
+        """**只看地圖本身的牆**（忽略場景物件放的阻擋）。沒有 soft 就退回一般判定。"""
+        if self.soft is None:
+            return self.walkable(x, y)
+        return (0 <= x < self.w and 0 <= y < self.h
+                and bool(self.soft[y][x]))
+
+    def object_blocked(self, x: int, y: int) -> bool:
+        """這一格**只被場景物件擋住**（地圖本身可以走）—— 機關開了就會通。"""
+        return (0 <= x < self.w and 0 <= y < self.h
+                and not self.walkable(x, y) and self.map_walkable(x, y))
+
+    def gate_between(self, here, goal) -> bool:
+        """`here` 現在走不到 `goal`，但**把場景物件的阻擋拿掉就走得到**
+        ＝ 中間隔的是**機關**，不是地形。
+
+        ★ 副本的「石像擋路」就是這一種（2026-09-07 黑狐 莉薇坦的寢室：
+          一個「蠍子雕像不可走」物件蓋 23 格，把整張圖切成兩半；反覆觸摸它
+          之後外觀換掉、那些格全部解封）。呼叫端可以據此**回頭再撞一次機關**，
+          而不是對著一道永遠不會開的牆重算路。
+        ⚠ 這裡不改任何走路規則，只是多算一次泛洪（~6ms），只在要停的那拍算。
+        """
+        if self.soft is None:
+            return False
+        gx, gy = int(goal[0]), int(goal[1])
+        hx, hy = int(here[0]), int(here[1])
+        if not (self.map_walkable(gx, gy) and self.map_walkable(hx, hy)):
+            return False
+        # ⚠ 目標那一格自己被物件蓋住時**不算**「機關擋路」——那多半是腳本的點位
+        #   壓到擺設身上（永遠不會開），跟「另一區被機關隔開」是兩回事。
+        #   那一種由 `_why_unreachable` 的「那一格是牆」分支去講。
+        if not self.walkable(gx, gy):
+            return False
+        # ⚠ 先確認**現在真的走不到** —— 少了這一段，已經開了的路也會回 True。
+        hard = self._flood(self.walkable, hx, hy)
+        if hard is not None and (gx, gy) in hard:
+            return False
+        soft = self._flood(self.map_walkable, hx, hy)
+        return soft is not None and (gx, gy) in soft
+
+    def _flood(self, walk, tx: int, ty: int) -> "set | None":
+        """照 `walk` 這個可走判定，從 (tx,ty) 泛洪出整個連通區。"""
+        if not walk(tx, ty):
+            return None
+        seen = {(tx, ty)}
+        stack = [(tx, ty)]
+        add, push, pop = seen.add, stack.append, stack.pop
+        while stack:
+            x, y = pop()
+            for dx, dy, diag in _NEIGHBOURS:
+                nx, ny = x + dx, y + dy
+                if (nx, ny) in seen or not walk(nx, ny):
+                    continue
+                if diag and not (walk(nx, y) and walk(x, ny)):
+                    continue
+                add((nx, ny))
+                push((nx, ny))
+        return seen
 
     def _walk_fn(self, avoid):
         """可走判定；`avoid`（格子集合）給了就把那些格當成暫時不可走。
@@ -139,23 +215,7 @@ class Grid:
           **對稱的** —— 「從目標走得到我」等於「我走得到目標」。
           規則要是分岔了，就會出現「說走得到卻算不出路」。
         """
-        walk = self._walk_fn(avoid)
-        if not walk(tx, ty):
-            return None
-        seen = {(tx, ty)}
-        stack = [(tx, ty)]
-        add, push, pop = seen.add, stack.append, stack.pop
-        while stack:
-            x, y = pop()
-            for dx, dy, diag in _NEIGHBOURS:
-                nx, ny = x + dx, y + dy
-                if (nx, ny) in seen or not walk(nx, ny):
-                    continue
-                if diag and not (walk(nx, y) and walk(x, ny)):
-                    continue
-                add((nx, ny))
-                push((nx, ny))
-        return seen
+        return self._flood(self._walk_fn(avoid), tx, ty)
 
     def nearest_open(self, gx: int, gy: int, radius: int = GOAL_RELAX):
         """終點落在牆上時找最近的可走格；找不到回 None。"""
@@ -350,18 +410,21 @@ def load(scanner) -> tuple["Grid | None", str]:
         return None, "讀不到列指標陣列"
     ptrs = struct.unpack(f"<{h}I", bytes(raw))
     open_rows: list[bytearray] = []
+    soft_rows: list[bytearray] = []
     for y in range(h):
         line = scanner._read_bytes(ptrs[y], w * CELL) if ptrs[y] else None
         if not line or len(line) < w * CELL:
             return None, f"第 {y} 列讀不到（共 {h} 列）"
         b = bytes(line)
-        open_rows.append(bytearray(
-            0 if (b[x * CELL + FLAG_OFF] & BLOCK_MASK) else 1
-            for x in range(w)))
+        flags = [b[x * CELL + FLAG_OFF] for x in range(w)]
+        open_rows.append(bytearray(0 if (f & BLOCK_MASK) else 1 for f in flags))
+        # ★ 同一趟順手把「只看地圖本身的牆」那一份也做出來（見 Grid.soft）——
+        #   多這一行不必再讀一次記憶體。
+        soft_rows.append(bytearray(0 if (f & MAP_MASK) else 1 for f in flags))
     # 一格都不能走 = 這份資料還沒填好（換圖那一瞬間），不是一張全是牆的地圖。
     if not any(any(r) for r in open_rows):
         return None, "整張圖沒有一格可走（還在載入）"
-    return Grid(w, h, obj, open_rows), ""
+    return Grid(w, h, obj, open_rows, soft_rows), ""
 
 
 class Cache:
