@@ -3277,6 +3277,58 @@ def main() -> int:
        not _terr.Grid(W, H, 0,
                       [bytearray([1] * W) for _ in range(H)]).gate_between((0, 0), (4, 0)))
 
+    # =====================================================================
+    # ★ 「查擋路」體檢鈕（純讀）：三種答案都要講得出來
+    # =====================================================================
+    print("")
+    print("查擋路（純讀體檢鈕）")
+    from PySide6.QtWidgets import QLabel as _QLabel
+    _W = _H = 12
+    # x=5：上半是場景物件蓋的（機關）、下半是地圖的牆；x=9 整行是地圖的牆
+    _flags = [[0] * _W for _ in range(_H)]
+    for _y in range(_H):
+        _flags[_y][5] = _terr.OBJ_MASK if _y < 8 else _terr.MAP_MASK
+        _flags[_y][9] = _terr.MAP_MASK
+    _grid = _terr.Grid(
+        _W, _H, 0,
+        [bytearray(0 if (f & _terr.BLOCK_MASK) else 1 for f in row) for row in _flags],
+        [bytearray(0 if (f & _terr.MAP_MASK) else 1 for f in row) for row in _flags])
+    _steps = [
+        {"do": dungeon.WALK, "to": [2, 2]},
+        {"do": dungeon.INTERACT, "at": [4.0, 2.0], "model": 60413, "menu": [],
+         "stand": [4, 2]},
+        {"do": dungeon.WALK, "to": [7, 2]},
+        {"do": dungeon.WALK, "to": [11, 2]},
+        {"do": dungeon.WALK, "to": [5, 2]},
+    ]
+    tab = make_tab(_steps, pos=(2.5, 2.5))
+    tab._scanners[1] = object()
+    # ⚠ 動 who 下拉會觸發 _on_who_changed → 把 _script 換成上次用的那一份，
+    #   所以腳本要**在這之後**才塞回去（不然驗到的是別人的 74 步）。
+    tab.who.blockSignals(True)
+    tab.who.addItem("測試", 1)
+    tab.who.setCurrentIndex(tab.who.count() - 1)
+    tab.who.blockSignals(False)
+    tab._script = dungeon.Script(name="t", steps=list(_steps))
+    _old_load, _old_pos = dt.terrain.load, dt.entity.read_pos
+    dt.terrain.load = lambda _sc: (_grid, "")
+    dt.entity.read_pos = lambda _sc, _a: (2.5, 2.5)
+    dt.scene.current_id = lambda _sc: 127
+    dt.scene.scene_name = lambda _i: "測試圖"
+    tab._check_blocking()
+    _dlg = tab._block_dlg
+    _body = "".join(w.text() for w in _dlg.findChildren(_QLabel)) if _dlg else ""
+    ck("★ 視窗有開，而且是**非模態**（模態會把副本 tick 凍住）",
+       _dlg is not None and _dlg.isVisible() and not _dlg.isModal())
+    ck("　同一區的點 → 走得到", "走得到" in _body, _body)
+    ck("★ 被場景物件隔開 → 講「機關」（＝回頭再撞會啟動）", "【機關】" in _body, _body)
+    ck("★ 地圖本身的牆 → 講「地形本來就不通」", "地形本來就不通" in _body, _body)
+    ck("　目標格自己被物件蓋住 → 分開講", "被場景物件蓋住" in _body, _body)
+    ck("　有指出要回第幾步（點物件）", "回第 2 步" in _body, _body)
+    if _dlg:
+        _dlg.close()
+    dt.terrain.load, dt.entity.read_pos = _old_load, _old_pos
+
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
 

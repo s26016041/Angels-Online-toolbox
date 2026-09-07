@@ -94,7 +94,7 @@ import threading
 import time
 from collections import deque
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -647,6 +647,16 @@ class DungeonTab(BaseTab):
         b = QPushButton("重新整理")
         b.setToolTip("重新讀取腳本資料夾。")
         b.clicked.connect(self._reload_files)
+        sbar.addWidget(b)
+        # ★ 純讀的體檢鈕（2026-09-07）：使用者問「我要怎樣才會觸發回頭再撞」——
+        #   與其等下一趟自然遇到，不如給他一顆隨時按得到的按鈕，當場看每一步
+        #   走不走得到、擋住的是地形還是機關（＝「回頭再撞」的觸發條件）。
+        b = QPushButton("查擋路")
+        b.setToolTip(
+            "純讀，隨時可按（開著跑也沒差）：把腳本每一步的目標點拿去問地形圖 ——\n"
+            "走得到／被地形擋住／**被機關擋住**（拿掉場景物件的阻擋就走得到）。\n"
+            "看到「機關」那一行，就是「走不到 → 回頭再撞」會啟動的情形。")
+        b.clicked.connect(self._check_blocking)
         sbar.addWidget(b)
         sbar.addStretch(1)
         root.addLayout(sbar)
@@ -1400,6 +1410,7 @@ class DungeonTab(BaseTab):
         self._gate_t = 0.0           # 距離上次「回頭撞機關」過了多久
         self._gate_n = 0             # 這一步為了機關回頭撞了幾次（只拿來回報）
         self._gate_on = False        # 上次算出來的「擋我的是機關嗎」（⛔ 泛洪很貴，要快取）
+        self._block_dlg = None       # 「查擋路」那個視窗（非模態，要留參考才不會被回收）
         self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
@@ -4827,11 +4838,7 @@ class DungeonTab(BaseTab):
 
     def _prev_interact(self) -> int | None:
         """往回找最近的一個「點物件」步驟（機關就是那一步點的）。找不到回 None。"""
-        steps = (self._script.steps if self._script else None) or []
-        for k in range(min(self._i, len(steps)) - 1, -1, -1):
-            if (steps[k] or {}).get("do") == dungeon.INTERACT:
-                return k
-        return None
+        return self._prev_interact_from(self._i)
 
     def _gate_retry(self, dt: float, goal, what: str) -> bool:
         """走不到，但**把場景物件的阻擋拿掉就走得到** ＝ 中間隔的是機關不是地形
@@ -4902,6 +4909,101 @@ class DungeonTab(BaseTab):
         return (f"（那一格可以站，但屬於另一區：它那區 "
                 f"{len(comp) if comp else '?'} 格、我這區 {mine} 格{gate} —— "
                 f"中間的門沒開，或是要先走傳點）")
+
+    def _check_blocking(self) -> None:
+        """純讀體檢：腳本每一步的目標點，現在走不走得到？擋的是地形還是機關？
+
+        ★ 使用者 2026-09-07 問「我要怎樣才會觸發回頭再撞」—— 觸發條件就是
+          「某一步走不到，而且把場景物件的阻擋拿掉就走得到」。這一支把那個
+          判斷直接列出來給他看，不必等下一趟自然遇到。
+        ⛔ 全程唯讀：只讀地形圖跟自己的座標，不呼叫遊戲、不動任何東西。
+        """
+        pid = self.who.currentData()
+        sc = self._scanners.get(pid) if pid else None
+        script = self._script
+        if sc is None:
+            self._say("先選一台分身")
+            return
+        if script is None or not script.steps:
+            self._say("先選一個腳本")
+            return
+        try:
+            grid, why = terrain.load(sc)
+        except Exception as ex:                          # noqa: BLE001
+            self._say(f"讀不到地形圖：{ex}")
+            return
+        if grid is None:
+            self._say(f"讀不到地形圖：{why}")
+            return
+        pf = move.pathfinder_this(sc)
+        me = entity.read_pos(sc, pf + 8) if pf else None
+        if me is None:
+            self._say("讀不到自己的位置（載圖中？）")
+            return
+        here = (int(me[0]), int(me[1]))
+        sid = scene.current_id(sc)
+        lines = [f"{scene.scene_name(sid)}（場景 {sid}）　我在 ({me[0]:.1f}, {me[1]:.1f})",
+                 f"腳本「{script.name}」共 {len(script.steps)} 步", ""]
+        gates = 0
+        for i, st in enumerate(script.steps):
+            st = st or {}
+            kind = st.get("do")
+            goal = (st.get("to") if kind in (dungeon.WALK, dungeon.PORTAL)
+                    else (st.get("stand") or st.get("at")))
+            if not goal:
+                lines.append(f"  第 {i + 1:2d} 步　{dungeon.describe(st)}")
+                continue
+            gx, gy = int(goal[0]), int(goal[1])
+            if not grid.walkable(gx, gy):
+                tag = ("那一格被場景物件蓋住（擺設／機關）"
+                       if grid.object_blocked(gx, gy) else "那一格在地形圖上是牆")
+            else:
+                reach = grid.reachable(*here) if grid.walkable(*here) else None
+                if reach is not None and (gx, gy) in reach:
+                    tag = "走得到"
+                elif grid.gate_between(here, goal):
+                    tag = "★ 走不到 —— 是【機關】擋著（回頭再撞會啟動）"
+                    gates += 1
+                else:
+                    tag = "走不到 —— 地形本來就不通（要先過傳點？）"
+            lines.append(f"  第 {i + 1:2d} 步　({gx}, {gy})　{tag}")
+        lines.append("")
+        if gates:
+            k = self._prev_interact_from(len(script.steps))
+            lines.append(f"有 {gates} 步被機關擋著。跑到那一步時會每 "
+                         f"{GATE_RETRY:.0f} 秒回第 "
+                         f"{(k + 1) if k is not None else '?'} 步（點物件）再撞一次。"
+                         if k is not None else
+                         f"有 {gates} 步被機關擋著，但腳本裡**沒有「點物件」的步驟** "
+                         f"—— 只能等它自己開，撞不了。")
+        else:
+            lines.append("目前沒有任何一步被機關擋著。"
+                         "（機關是進副本才關上的：要在新的一趟、還沒撞開之前按才看得到）")
+        # ⚠ **非模態**（`show()` 不是 `exec()`）：這一頁的 tick 是 QTimer 跑在 UI
+        #   執行緒上，`exec()` 會把整個副本流程凍在原地 —— 開著跑的時候按下去
+        #   就等於停機（Qt 坑那一條：不要在跑著的時候開模態視窗）。
+        #   ⚠ 要留參考，不然一出這個函式就被回收、視窗一閃就沒了。
+        dlg = QDialog(self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, False)
+        dlg.setWindowTitle("查擋路（純讀）")
+        v = QVBoxLayout(dlg)
+        lab = QLabel("\n".join(lines))
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(lab)
+        b = QPushButton("關閉")
+        b.clicked.connect(dlg.close)
+        v.addWidget(b)
+        self._block_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+
+    def _prev_interact_from(self, upto: int) -> int | None:
+        """`upto` 之前最近的一個「點物件」步驟（`_prev_interact` 的離線版）。"""
+        steps = (self._script.steps if self._script else None) or []
+        for k in range(min(upto, len(steps)) - 1, -1, -1):
+            if (steps[k] or {}).get("do") == dungeon.INTERACT:
+                return k
+        return None
 
     # ------------------------------------------------------------------
     def on_close(self) -> None:
