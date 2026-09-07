@@ -1834,16 +1834,31 @@ def main() -> int:
     ck("　⛔ 狂點這段完全不動腳（點選本身就會讓遊戲往前走）",
        not moved3, str(moved3))
     run(tab, (dt.CLICK_RETRY + dt.MENU_GAP * 2) * 5 + 1.0)
-    ck(f"★★ 狂點 {dt.SPAM_SHOTS} 發還是沒反應 → 才開始喬位置（往它靠上去）",
-       len(clicks) > dt.SPAM_SHOTS and bool(moved3),
+    # ⛔⛔ 使用者 2026-09-08：「是**狂點**，點點看不是點了**退回來**」——
+    #    人已經貼在 0.2 格時，往「留 1.2 格」走等於**把自己拉出互動範圍**。
+    ck("★★★★ 貼著它（%.1f 格內）→ **只狂點、⛔ 完全不動腳**" % dt.CLICK_CLOSE,
+       len(clicks) > dt.SPAM_SHOTS and not moved3,
        f"{len(clicks)} 發　{moved3}")
-    ck("　而且還在跑（上限交給 STEP_TIMEOUT 大聲停）", tab.run_cb.isChecked())
-    # ★★ 使用者 2026-09-02：「如果點了沒反應要調整位置往對話物件靠上去」
-    ck("★★ 喬位置＝**往物件靠上去**（站著硬點沒用）", bool(moved3),
-       str(moved3))
-    keeps = [k for _w, k in moved3]
+
+    # 還沒貼到（CLICK_CLOSE 之外、但已在 TALK_NEAR 內）才會喬位置，而且**只准更近**
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(21.8, 20.2),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, never)
+    dt.produce.click = lambda *_a, **_k: (True, "點了")
+    moved4 = []
+    tab._mover = type("M", (), {
+        "walk_near": lambda _s, _sc, _p, x, y, k: moved4.append(("near", k)),
+        "walk_exact": lambda _s, _sc, _p, x, y: moved4.append(("exact", 0.0)),
+    })()
+    dt.entity.is_walking = lambda _sc, _p: False
+    run(tab, (dt.CLICK_RETRY + dt.MENU_GAP * 2) * 5 + 1.0)
+    ck("★★ 還沒貼到（1.7 格）點不到 → 才往它靠上去（站著硬點沒用）",
+       bool(moved4), str(moved4))
+    keeps = [k for _w, k in moved4]
+    ck("　⛔ 只准更近，不准退開（留的格數一定小於現在的距離）",
+       all(k < 1.7 for k in keeps), str(keeps))
     ck("　一次比一次近", keeps == sorted(keeps, reverse=True), str(keeps))
-    ck("　最後直接穿過去（留 0 格）", 0.0 in keeps, str(keeps))
     # ⚠ 點不到多半只是**還不夠近**（TryAct 的互動範圍很小，2026-09-08 實測：
     #   站 1.5 格沒反應、0.5 格一發就中）→ 重試時一律用同一種點法，靠「靠近
     #   一點再點」解決。⛔ 不換 kind（那是 9/7 的誤判，已經拿掉）。

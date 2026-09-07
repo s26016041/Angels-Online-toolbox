@@ -230,6 +230,11 @@ CLICK_RETRY = 1.0
 #     還是沒反應才進到舊的「往它靠上去再點」（NUDGE_KEEP）。
 CLICK_SPAM = 0.4           # 狂點的間隔
 SPAM_SHOTS = 6             # 先狂點幾發才開始喬位置
+# ⛔⛔ 使用者 2026-09-08：「是**狂點**，點點看不是點了**退回來**」——
+#   `NUDGE_KEEP` 是「走到離它 N 格」，人已經貼在 0.5 格時那一步會把人**往後拉**
+#   到 1.2 格（＝自己把自己弄出互動範圍）。→ 已經這麼近就**只狂點、不動腳**；
+#   要動也只准往它更近，⛔ 永遠不准退開。
+CLICK_CLOSE = 1.5          # 離它這麼近就只狂點，不喬位置
 # ⚠⚠ 「站穩了才點」最多等這麼久，超過就照點（**不是逾時停機，是照樣做**）。
 #   出處 [[self-supply-buy]] 的老坑：人擠人／被推的時候 `is_walking` 會**恆為
 #   True**，「等停穩」那道閘就永遠不會過 —— 看起來就是「站在它旁邊卻不點」。
@@ -3813,13 +3818,22 @@ class DungeonTab(BaseTab):
                 #   物件位置用**現場重讀的**那一個，不是腳本裡的舊座標。
                 tx, ty = hit[0].x, hit[0].y
                 self._click_best = None      # 重新給遊戲一次自己走過去的機會
+                d_now = _d((tx, ty), me)
+                if d_now <= CLICK_CLOSE:
+                    # ⛔ 已經貼著它了 → **只狂點，不動腳**（見 CLICK_CLOSE：
+                    #   往「留 N 格」走會把人往後拉出互動範圍）。
+                    ok, msg = produce.click(self._mover, self._sc, hit[0])
+                    self._say(f"{tag}　貼著它狂點（{d_now:.1f} 格，⛔ 不動腳）"
+                              f"（{'送出' if ok else msg}）")
+                    return
                 keep = NUDGE_KEEP[min(self._nudge, len(NUDGE_KEEP) - 1)]
+                keep = min(keep, max(0.0, d_now - 0.5))   # ⛔ 只准更近，不准退開
                 self._nudge += 1
                 how = (self._walk_onto(tx, ty) if keep <= 0
                        else self._walk_beside(tx, ty, keep))
                 ok, msg = produce.click(self._mover, self._sc, hit[0])
                 self._say(f"{tag}　點了沒反應 → 靠近一點"
-                          f"（留 {keep:g} 格，{how}）再點"
+                          f"（{d_now:.1f} → 留 {keep:g} 格，{how}）再點"
                           f"（{'送出' if ok else msg}）")
                 return
             self._say(f"{tag}　等對話出現…"
