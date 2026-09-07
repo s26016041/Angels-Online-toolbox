@@ -3396,6 +3396,7 @@ def main() -> int:
     _cells = [(23, 10), (20, 12)]                 # 阻擋最遠鋪到 3 格 → 半徑 4
     _room = {(x, y) for x in range(8, 30) for y in range(4, 18)}
     tab = bump_tab([15], cells=_cells)            # 一直有 15 格阻擋 ＝ 撞不開
+    tab.trigs = [FakeTrig(20.0, 10.0, 60414)]     # 那個石像是「踩上去送 0x0D」的
     tab._grid = FakeGrid(_room)
     tab._reach, tab._reach_n = set(_room), len(_room)
     run(tab, 0.5)
@@ -3404,6 +3405,17 @@ def main() -> int:
        and "阻擋 15 格" in tab.status.text(), tab.status.text())
     ck("★★★ 半徑＝機關到它蓋的阻擋最遠那一格 ＋ 1 格",
        abs(tab._gate["r"] - 4.0) < 1e-6, str(tab._gate.get("r")))
+    # ★★★★ 2026-09-07 封包擷取：石像是「踩上去會送 0x0D」的觸發物件，
+    #    而我們之前四條路都沒送過這一包 → 亂走的同時要主動送。
+    ck("★★★★ 一邊亂走一邊**主動送 0x0D**（＝人踩上去時客戶端自己送的那一包）",
+       tab.portal_sent == [60414], str(tab.portal_sent))
+    ck("　狀態列講得出送出去了沒", "0x0D" in tab.status.text(), tab.status.text())
+    run(tab, dt.BUMP_POKE - 1.0)      # 這一台已經跑了 0.5 秒
+    ck(f"　{dt.BUMP_POKE:g} 秒還沒到不重送（⛔ 不是每拍狂送）",
+       len(tab.portal_sent) == 1, str(tab.portal_sent))
+    run(tab, 0.8)
+    ck(f"★ 過了 {dt.BUMP_POKE:g} 秒才送第二發", len(tab.portal_sent) == 2,
+       str(tab.portal_sent))
     run(tab, dt.BUMP_IN)
     _wander = [w for w in tab.walked if w != (10.0, 10.0)]   # 排掉「回退開點」
     ck("★★★ 撞法＝在機關周圍**亂走**（每個目標都在半徑內、⛔ 不是只走它身上）",
@@ -3481,6 +3493,14 @@ def main() -> int:
     tab = bump_tab([7], props=[FakeProp(20.0, 10.0, 60414)])
     run(tab, 0.3)
     ck("　外觀還是腳本記的那個 → 繼續撞", tab._i == 0, f"第 {tab._i + 1} 步")
+
+    tab = bump_tab([15], cells=_cells)            # 附近沒有觸發物件
+    tab._grid = FakeGrid(_room)
+    tab._reach = set(_room)
+    run(tab, 1.0)
+    ck("　⛔ 附近掃不到觸發物件 → 不亂送 0x0D，但照樣繼續亂走撞",
+       tab.portal_sent == [] and tab.walked and tab._i == 0,
+       f"{tab.portal_sent} {tab.walked[:2]}")
 
     tab = bump_tab([7], stand=None, cells=_cells)   # 舊腳本沒記退開點
     tab._grid = FakeGrid(_room)

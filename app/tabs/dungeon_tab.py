@@ -530,6 +530,15 @@ BUMP_PAD = 1.0             # 半徑＝阻擋鋪到多遠 ＋ 這麼多格（使�
 # ⚠ 上限：方框裡可能還有**別的物件**的阻擋，不夾住的話半徑會被別人撐大。
 BUMP_RAD_MAX = 8.0
 BUMP_TRIES = 10            # 一個目標最多挑幾次（挑不到就往機關身上撞）
+# ★★★★ 2026-09-07 晚：使用者手動撞開那一趟的**封包擷取**（封包/寢室石像開關.txt）
+#   解出來 —— 石像是「踩上去會送 0x0D」的**觸發物件**（跟副本傳點同一族）：
+#     0x546B38（＝portal.TRIGGER_FN 那支的送包點）→ 0x0D(玩家+0x1D0, 物件+0x1D0, 碼 3)
+#   他走過去時客戶端自己送了兩發；而我們之前試的四條路**從來沒送過 0x0D**
+#   （只送過點物件的 0x05/0x07）。→ 亂走的同時**主動送 0x0D**（`portal.enter`，
+#   碼是從物件旗標算的，不是猜的），而且主動送**不受去重欄 +0x208 限制**
+#   （客戶端站著不動永遠不會送第二次，那正是「要退開再撞」的由來）。
+#   ⚠ 隔太遠送伺服器不理（無限塔第 35 步實錄）—— 所以是「一邊在它旁邊亂走一邊送」。
+BUMP_POKE = 1.5            # 每幾秒對機關送一發 0x0D
 BUMP_CLEAR = 4             # bit0 格數比一開始少這麼多（或歸零）就算「開了」
 # ⛔ 沒有次數上限（同傳點的撞法：副本的門本來就是解謎才開，出口是取消勾選）。
 # ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
@@ -1442,6 +1451,7 @@ class DungeonTab(BaseTab):
         self._gate = None            # 「來回撞機關」正在跑的那一輪（相位／退開點）
         self._gate_t = 0.0           # 距離下次重讀地形還有多久
         self._gate_send = 0.0        # 距離下次補送目的地還有多久
+        self._gate_poke = 0.0        # 距離下次對機關送 0x0D 還有多久
         self._gate_base = None       # 剛到時那個機關周圍有幾格 bit0（⚠ None＝還沒讀到）
         self._gate_last = None       # 最近一次讀到的格數（只拿來回報）
         self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
@@ -3343,10 +3353,12 @@ class DungeonTab(BaseTab):
     def _do_bump(self, step: dict, me, dt: float) -> None:
         """來回撞一個機關，撞到它蓋的阻擋消失為止（使用者 2026-09-07）。
 
-        「撞」＝**人真的走過去那一下**：在機關周圍「阻擋鋪到多遠 ＋ 1 格」的
-        範圍內**亂走**（`walk_exact` 直送，⛔ 不算路徑、不問尋路 —— 算得出來
-        就不必撞了），走 BUMP_IN 秒回退開點（製作時使用者站的那一格），
-        再回去亂走，一直來回。
+        「撞」有兩層，一起做：
+        · **亂走**：在機關周圍「阻擋鋪到多遠 ＋ 1 格」的範圍內隨機挑落腳點
+          （`walk_exact` 直送，⛔ 不算路徑、不問尋路 —— 算得出來就不必撞了），
+          走 BUMP_IN 秒回退開點（製作時使用者站的那一格），再回去亂走。
+        · **每 BUMP_POKE 秒主動送一發 0x0D**（＝人踩上去時客戶端自己送的那一包，
+          2026-09-07 封包擷取解出來的；見 BUMP_POKE 那段註解）。
         ⛔ 沒有次數上限；卡太久由既有的「同一段超過 2 分鐘」記重要事件。
         ⚠ 撞出來的對話框由 `_stray_dialog` 收（BUMP 不是 INTERACT，本來就在它
           管的範圍）—— 不收乾淨的話後面每一發都等於沒送到。
@@ -3409,11 +3421,18 @@ class DungeonTab(BaseTab):
                 self._gate_send = BUMP_STEP
                 gate["to"] = self._gate_wander(step, rad)
                 self._walk_onto(*gate["to"])
+            # ★★★★ 一邊亂走一邊**主動送 0x0D**（＝踩上去那一包，見 BUMP_POKE）。
+            #   ⛔ 找不到觸發物件就只回報，絕不就近送一個（`_send_portal` 的規矩）。
+            self._gate_poke -= dt
+            if self._gate_poke <= 0:
+                self._gate_poke = BUMP_POKE
+                gate["poke"] = self._send_portal((ax, ay), step.get("model"),
+                                                 "機關")
             tx, ty = gate.get("to") or (float(ax), float(ay))
             note = "" if gate["spot"] is not None else "　（沒記退開點 → 不回頭）"
             self._say(f"{tag}　在機關 ({ax}, {ay}) 周圍 {rad:.1f} 格內亂走"
                       f"（第 {gate['n']} 輪）　目標 ({tx:g}, {ty:g})"
-                      f"{blk}{note}　{self._mon_note()}")
+                      f"　{gate.get('poke', '')}{blk}{note}　{self._mon_note()}")
             return
         sx, sy = gate["spot"]
         if _d((sx, sy), me) <= BUMP_ARRIVE or gate["t"] >= BUMP_OUT:
@@ -3768,6 +3787,7 @@ class DungeonTab(BaseTab):
         self._gate = None             # 「來回撞機關」也整組歸零（含阻擋的基準）
         self._gate_t = 0.0
         self._gate_send = 0.0
+        self._gate_poke = 0.0
         self._gate_base = None
         self._gate_last = None
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
