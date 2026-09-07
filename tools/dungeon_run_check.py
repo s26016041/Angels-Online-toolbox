@@ -3256,25 +3256,10 @@ def main() -> int:
     ck("　有座標的步驟照舊驗地圖章（人在別張圖就不存）",
        len(mtab._script.steps) == _n, f"{_n} → {len(mtab._script.steps)}")
     _n = len(mtab._script.steps)
-    mtab.who.clear()                              # 沒選分身
-    mtab._force_walk()
-    ck("　「強制走到」沒選分身 → 只回報、不當掉、不亂加步驟",
-       len(mtab._script.steps) == _n, mtab.status.text())
     mtab.who.addItem("測試", 1)
     mtab.who.setCurrentIndex(0)
     mtab._scanners[1] = FakeAliveSc()             # ⚠ on_close 會叫 sc.close()
-    mtab._me = lambda _sc: None                   # 讀不到角色位置
-    mtab._force_walk()
-    ck("　讀不到角色位置 → ⛔ 不存 (0,0)", len(mtab._script.steps) == _n,
-       mtab.status.text())
     mtab._here_key = lambda: (127, None)          # 回到腳本那張圖
-    mtab._me = lambda _sc: (11.5, 12.5)           # 角色站在 (11.5, 12.5)
-    mtab._pick = (99, 99)                         # ⚠ 地圖上點的格**不該**被用到
-    mtab._force_walk()
-    ck("★ 「強制走到」記的是**角色站的位置**（不是地圖上點的格）",
-       len(mtab._script.steps) == _n + 1
-       and mtab._script.steps[-1] == {"do": dungeon.FORCE, "to": [12, 12]},
-       str(mtab._script.steps[-1:]))
     # ★★ 「來回撞這個機關」：記的是**選到的物件**＋**我現在站的位置當退開點**
     _n = len(mtab._script.steps)
     mtab.props.clear()
@@ -3301,10 +3286,10 @@ def main() -> int:
        not hasattr(_big, "add_portal"))
     ck("★ 「加入點到的位置」已經拿掉（使用者 2026-09-07：「根本沒用」）",
        not hasattr(_big, "add_pick") and not hasattr(mtab, "_add_picked"))
-    ck("★ 地圖視窗多了「強制走到我站的位置」",
-       hasattr(_big, "force_btn")
-       and _big.force_btn.text() == "強制走到我站的位置",
-       getattr(getattr(_big, "force_btn", None), "text", lambda: "沒有")())
+    ck("★ 「強制走到我站的位置」已經拿掉（使用者 2026-09-07：「無用」）",
+       not hasattr(_big, "force_btn") and not hasattr(mtab, "_force_walk"))
+    ck("　⚠ 但舊腳本的 force 步驟照樣收（格式沒拿掉）",
+       dungeon.validate({"do": dungeon.FORCE, "to": [9, 9]})[0])
     ck("　還沒畫地圖時 fit_window 安全（回 True、不當掉）",
        _big.fit_window() is True)
     _big.close()
