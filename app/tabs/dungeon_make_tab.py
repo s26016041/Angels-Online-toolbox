@@ -78,10 +78,13 @@ WALL_COLOR = (26, 28, 32)
 PROP_RADIUS = 25.0
 # 點下去之後等對話框開的上限。⚠ 遊戲會自己走過去才開，所以要放寬一點。
 DIALOG_WAIT = 12.0
-# ★★★★ 點了這麼久還沒反應 → **換另一種 kind 再點一發**（2026-09-07 黑狐實機：
-#   「對話傳送」的雕像只吃 `TryAct` kind 2（NPC 那種），kind 3 貼著點完全沒反應；
-#   製作檯那種則只吃 kind 3。⛔ 不是「多點幾發同一種」就會開。
-POKE_KIND2_AFTER = 2.5
+# ★★★★ 點了這麼久還沒反應 → **自動再送一發**（使用者 2026-09-08：「我發現他要
+#   按兩次點點看才會傳送」）。原因是 `TryAct` 的互動範圍很小：第一發只是讓遊戲把
+#   人走過去（實測停在 1.5 格還不夠近），第二發貼到 0.5 格才真的點到。
+#   ⛔ 不是換別種點法 —— 就是「再按一次」而已，這裡幫使用者按。
+POKE_AGAIN_AFTER = 2.5
+# 最多自動補幾發（再多就是真的點不到，讓使用者看畫面自己判斷）。
+POKE_AGAIN_MAX = 2
 # ★ 傳點的出口是「盯著看到的」不是算的（使用者 2026-09-02：「人被傳走不會
 #   換地圖，有順移就算吧」）：加完傳點那一步就開始每 0.12 秒看一次位置，
 #   一跳超過 JUMP_TILES 格就把落點記進那一步。
@@ -338,8 +341,8 @@ class DungeonMakeTab(BaseTab):
         self._base = None                 # 底圖快取（QImage，只跟地形／房間有關）
         self._poke_base = None            # 點下去之前的對話框代號
         self._poke_until = 0.0
-        self._poke_kind = supply.KIND_TALK   # 這一發用哪一種 TryAct（沒反應會換）
-        self._poke_switch = 0.0              # 什麼時候換另一種 kind
+        self._poke_again = 0                 # 這一輪已經自動補送幾發
+        self._poke_next = 0.0                # 什麼時候補下一發
 
         # ★ 整頁放進可捲動區（跟自動掛機／記憶體掃描一樣）。主視窗固定 1040x700，
         #   這一頁「步驟至少 5 列」＋對話方框加起來塞不下時，Qt 會把清單壓到比最小
@@ -1570,7 +1573,7 @@ class DungeonMakeTab(BaseTab):
             return
         prop = self._props[i]
         before = self._dialog_token(sc)
-        ok, msg = produce.click(mv, sc, prop, kind=supply.KIND_TALK)
+        ok, msg = produce.click(mv, sc, prop)
         if not ok:
             self.status.setText(f"⚠ 點不下去：{msg}")
             return
@@ -1587,8 +1590,8 @@ class DungeonMakeTab(BaseTab):
         #   回報「點點看無效，只會讓我程式當機好幾秒」）—— 那是最多 12 秒的
         #   卡死，畫面不重畫、按鈕按不動，看起來就像當掉。改用計時器輪詢。
         self._poke_base = before
-        self._poke_kind = supply.KIND_TALK       # 先用場景物件那種
-        self._poke_switch = time.time() + POKE_KIND2_AFTER
+        self._poke_again = 0
+        self._poke_next = time.time() + POKE_AGAIN_AFTER
         self._poke_until = time.time() + DIALOG_WAIT
         self.status.setText(f"已點 {mapobj.label(prop.model)}"
                             f" ({_fmt(prop.x)},{_fmt(prop.y)})　等對話框…")
@@ -1606,28 +1609,29 @@ class DungeonMakeTab(BaseTab):
             self.status.setText(
                 "對話框開了 —— 看遊戲畫面，按下面對應的「第 N 項」")
             return
-        # ★★★★ 過了 POKE_KIND2_AFTER 秒還沒反應 → **換另一種 kind 再點一發**
-        #   （2026-09-07 黑狐實機：「對話傳送」那種雕像只吃 kind 2）。只換一次。
-        if (self._poked is not None
-                and self._poke_kind == supply.KIND_TALK
-                and time.time() >= self._poke_switch):
-            self._poke_kind = supply.KIND_NPC
+        # ★★★★ 過了 POKE_AGAIN_AFTER 秒還沒反應 → **幫使用者再按一次**
+        #   （使用者 2026-09-08：「要按兩次點點看才會傳送」——第一發只是讓遊戲
+        #   把人走過去，還不夠近；再一發貼到 0.5 格才真的點到）。
+        if (self._poked is not None and self._poke_again < POKE_AGAIN_MAX
+                and time.time() >= self._poke_next):
+            self._poke_again += 1
+            self._poke_next = time.time() + POKE_AGAIN_AFTER
             pid, _sc2 = self._cur()
             mv = self._mover(pid) if pid is not None else None
             if mv is not None:
-                ok, msg = produce.click(mv, sc, self._poked,
-                                        kind=supply.KIND_NPC)
+                ok, msg = produce.click(mv, sc, self._poked)
                 self.status.setText(
-                    f"kind 3 沒反應 → 改用 kind 2（NPC 那種）再點一發"
-                    f"（{'送出' if ok else msg}）")
+                    f"還沒反應（多半是還不夠近）→ 自動再點一次"
+                    f"（第 {self._poke_again + 1} 發，{'送出' if ok else msg}）")
         if time.time() >= self._poke_until:
             self._poke_timer.stop()
             # ⚠ 「沒看到變化」≠「沒點到」：有些機關是純動作（開門、放火），
             #   根本不會開對話框。所以這裡只陳述事實，不下結論。
             self.status.setText(
-                "⚠ 沒看到對話框變化（kind 3 與 kind 2 都試過了）—— 可能是純動作"
-                "的機關（開門那種），也可能沒點到。看一下遊戲畫面：真的開了就"
-                "直接按「第 N 項」；什麼都沒發生就把這一步存成沒有選項的對話。")
+                f"⚠ 沒看到對話框變化（自動點了 {self._poke_again + 1} 發）—— "
+                "可能是純動作的機關（開門那種），也可能還是不夠近。看一下遊戲"
+                "畫面：真的開了就直接按「第 N 項」；什麼都沒發生就再按一次"
+                "「點點看」，或把這一步存成沒有選項的對話。")
 
     def _pass_page(self) -> None:
         """把「無異議對話」那一頁按掉。⚠ **不記進腳本**。

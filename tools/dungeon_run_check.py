@@ -1836,14 +1836,11 @@ def main() -> int:
     keeps = [k for _w, k in moved3]
     ck("　一次比一次近", keeps == sorted(keeps, reverse=True), str(keeps))
     ck("　最後直接穿過去（留 0 格）", 0.0 in keeps, str(keeps))
-    # ★★★★ 2026-09-07 黑狐實機：「對話傳送」的雕像**只吃 TryAct kind 2**
-    #    （kind 3 貼著點完全沒反應）→ 點不到就要**換另一種 kind**，
-    #    ⛔ 不是一直加送同一種（那正是「點了六發等於沒點」）。
-    from app.game import supply as _sup5
-    ck("★★★★ 點不到 → **換另一種 kind 再點**（3 ↔ 2 交替）",
-       _sup5.KIND_NPC in kinds and _sup5.KIND_TALK in kinds, str(kinds))
-    ck("　第一發用場景物件那種（kind 3）", kinds and kinds[0] == _sup5.KIND_TALK,
-       str(kinds[:2]))
+    # ⚠ 點不到多半只是**還不夠近**（TryAct 的互動範圍很小，2026-09-08 實測：
+    #   站 1.5 格沒反應、0.5 格一發就中）→ 重試時一律用同一種點法，靠「靠近
+    #   一點再點」解決。⛔ 不換 kind（那是 9/7 的誤判，已經拿掉）。
+    ck("　⛔ 重試不換點法（沒有 kind 參數這種東西）",
+       all(k is None for k in kinds), str(kinds))
 
     # 收尾要把對話框從畫面上收掉（不然人會帶著框到處跑）
     closed = []
@@ -2291,7 +2288,8 @@ def main() -> int:
        dmt.TALK_JUMP_GAP > dmt.JUMP_MAX_GAP)
     mk3.on_close()
     mk4.on_close()
-    # ★★★★ 製作頁「點點看」：kind 3 沒反應 → 自動補一發 kind 2（同上）
+    # ★★★★ 製作頁「點點看」：沒反應 → **自動再按一次**（使用者 2026-09-08：
+    #    「要按兩次點點看才會傳送」—— 第一發只是讓遊戲把人走過去，還不夠近）
     mk5 = DungeonMakeTab()
     mk5._script = dungeon.Script(name="t")
     mk5._cur = lambda: (1, object())
@@ -2302,16 +2300,19 @@ def main() -> int:
     mk5._dialog_token = lambda _sc: 7            # 一直沒變＝點不到
     mk5._poke_base = 7
     mk5._poke_until = time.time() + 60.0
-    mk5._poke_kind = dmt.supply.KIND_TALK
-    mk5._poke_switch = time.time() - 0.1         # 已經過了換 kind 的時間
-    kinds5 = []
-    dmt.produce.click = lambda _mv, _sc, _p, kind=None: (
-        kinds5.append(kind), (True, "點了"))[1]
+    mk5._poke_again = 0
+    mk5._poke_next = time.time() - 0.1           # 已經到了補送時間
+    shots5 = []
+    dmt.produce.click = lambda _mv, _sc, _p: (shots5.append(1), (True, "點了"))[1]
     mk5._poke_check()
-    ck("★★★★ 製作頁：kind 3 點不到 → 自動改用 kind 2 再點一發",
-       kinds5 == [dmt.supply.KIND_NPC], str(kinds5))
+    ck("★★★★ 製作頁：點了沒反應 → 自動再點一次（幫使用者按第二下）",
+       len(shots5) == 1, str(len(shots5)))
+    mk5._poke_next = time.time() - 0.1
     mk5._poke_check()
-    ck("　⛔ 只換一次，不會一直重送", kinds5 == [dmt.supply.KIND_NPC], str(kinds5))
+    mk5._poke_next = time.time() - 0.1
+    mk5._poke_check()
+    ck(f"　⛔ 最多補 {dmt.POKE_AGAIN_MAX} 發就停（再多就是真的點不到）",
+       len(shots5) == dmt.POKE_AGAIN_MAX, str(len(shots5)))
     mk5.on_close()
 
     mk = DungeonMakeTab()
