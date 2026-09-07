@@ -3281,23 +3281,41 @@ def main() -> int:
        and mtab._script.steps[-1] == {"do": dungeon.BUMP, "at": [20.0, 10.0],
                                       "model": 60414, "stand": [12, 12]},
        str(mtab._script.steps[-1:]))
-    # ★★ 對話傳送（使用者 2026-09-07：「除了傳送還有對話傳送」）
+    # ★★ 對話傳送（使用者 2026-09-07：「除了傳送還有對話傳送」；當場又更正
+    #    「應該要跟這是傳送點一樣，為何還要我按點點看」→ 清單選一個就能存）
     _n = len(mtab._script.steps)
+    mtab.props.clear()
+    mtab._props = []
     mtab._poked = None
     mtab._add_talk_portal()
-    ck("　沒先「點點看」→ 只回報、不亂加步驟",
+    ck("　沒選物件 → 只回報、不亂加步驟",
        len(mtab._script.steps) == _n, mtab.status.text())
-    mtab._poked = FakeProp(30.0, 40.0, 60123)
-    mtab._poked_at = (11.5, 12.5)
-    mtab._menu = [1]
+    mtab._props = [FakeProp(30.0, 40.0, 60123)]
+    mtab.props.addItem("傳送物件")
+    mtab.props.setCurrentRow(0)
+    mtab._menu = []
+    mtab._me = lambda _sc: None                   # 讀不到角色位置
     mtab._add_talk_portal()
-    ck("★★ 「這個是對話傳送」＝portal 步驟 ＋ 站位 ＋ 選項路徑",
+    ck("　讀不到角色位置 → ⛔ 不存 (0,0) 當站位",
+       len(mtab._script.steps) == _n, mtab.status.text())
+    mtab._me = lambda _sc: (11.5, 12.5)
+    mtab._add_talk_portal()
+    ck("★★ 「這個是對話傳送」**跟「這個是傳送點」一樣**：清單選一個就存"
+       "（沒按選項 ＝ 點一下就傳）",
        len(mtab._script.steps) == _n + 1
        and mtab._script.steps[-1] == {"do": dungeon.PORTAL,
                                       "to": [30.0, 40.0], "model": 60123,
-                                      "menu": [1], "stand": [11.5, 12.5]},
+                                      "menu": [], "stand": [12, 12]},
        str(mtab._script.steps[-1:]))
     ck("　存完開始盯順移（出口自動記進這一步）", mtab._pw is not None)
+    mtab._pw = None
+    mtab._pw_timer.stop()
+    _n = len(mtab._script.steps)
+    mtab._menu = [1]                              # 有按過「第 1 項」就一起記
+    mtab._add_talk_portal()
+    ck("★ 按過「第 N 項」的話，那條選項路徑會一起記進去",
+       mtab._script.steps[-1].get("menu") == [1],
+       str(mtab._script.steps[-1:]))
     mtab._pw = None
     mtab._pw_timer.stop()
     _big = dm.MapWindow(mtab)

@@ -512,9 +512,11 @@ class DungeonMakeTab(BaseTab):
         #   對話視窗，所以要多一個按鈕是這是對話傳送」。
         b = QPushButton("這個是對話傳送")
         b.setToolTip(
-            "點了、選完選項**才會把人傳走**的那種傳點（跟站上去就傳的不一樣）。\n"
-            "★ 用法：先按「點點看」，再按你要的「第 N 項」，然後按這顆。\n"
-            "跑的時候：走到你剛剛講話的位置 → 點它 → 照順序送那些選項 →\n"
+            "點了才會把人傳走的那種傳點（跟站上去就傳的不一樣）。\n"
+            "★ 用法**跟「這個是傳送點」一樣**：在清單裡選一個，按這顆就好。\n"
+            "　 要選第幾項才傳的，就先按「點點看」再按「第 N 項」，然後按這顆\n"
+            "　 —— 已經按過的選項路徑會一起記進去。\n"
+            "跑的時候：走到你**現在站的這一格** → 點它 → 送那些選項 →\n"
             "**等人被傳走**才算完成（對話走完人還在原地就隔幾秒整段重來）。\n"
             "按完之後你自己走完對話，出口在哪會自動記進這一步。")
         b.clicked.connect(self._add_talk_portal)
@@ -1076,24 +1078,35 @@ class DungeonMakeTab(BaseTab):
                    "stand": [round(me[0]), round(me[1])]})
 
     def _add_talk_portal(self) -> None:
-        """把剛剛「點點看＋選項」試出來的那個物件記成**對話傳送**（使用者 2026-09-07）。
+        """把清單裡選到的物件記成**對話傳送**（使用者 2026-09-07）。
 
-        跟「這個是傳送點」的差別：那一種是站上去就被搬走；這一種要**點它、
-        選第 N 項**才傳。存的東西跟對話步驟一樣（位置／外觀／站位／選項路徑），
-        只是 `do` 是 `portal` —— 完成訊號因此是「人被搬走」，不是「對話走完」。
-        ⚠ 存完一樣開始盯順移，把出口記進這一步（跟踩的傳點同一套）。
+        ⚠ 用法**跟「這個是傳送點」一模一樣**（使用者當場更正：「為何還要我按
+          點點看」）：在清單裡選一個、按這顆就好。差別只在怎麼觸發：那一種是
+          站上去被搬走，這一種要**點它**；要選第幾項才傳的，先按「點點看」再按
+          「第 N 項」，已經按過的路徑會一起記進來。
+        站位＝**你現在站的那一格**（跟「來回撞這個機關」同一條規矩：你人就在
+        上面，一定站得住、也一定講得到話）。
+        ⚠ 存完一樣開始盯順移，把出口記進這一步。
         """
-        if self._poked is None:
-            self.status.setText("先按「點點看」試那個傳送物件，再按這顆")
+        i = self.props.currentRow()
+        pr = self._props[i] if 0 <= i < len(self._props) else self._poked
+        if pr is None:
+            self.status.setText("先在清單裡選一個物件（那個傳送物件）")
             return
-        pr = self._poked
+        _pid, sc = self._cur()
+        if sc is None:
+            self._say_map("先選一台分身")
+            return
+        me = self._me(sc)
+        if me is None:
+            # 讀不到就什麼都不做 —— 存一個 (0,0) 當站位比不存危險得多。
+            self._say_map("⚠ 讀不到角色位置，這一步沒有存")
+            return
         step = {"do": dungeon.PORTAL,
                 "to": [round(pr.x, 1), round(pr.y, 1)],
                 "model": pr.model,
-                "menu": list(self._menu)}
-        at = getattr(self, "_poked_at", None)
-        if at:
-            step["stand"] = [round(at[0], 1), round(at[1], 1)]
+                "menu": list(self._menu),
+                "stand": [round(me[0]), round(me[1])]}
         n = len(self._script.steps)
         self._add(step)
         if len(self._script.steps) <= n:
@@ -1106,7 +1119,9 @@ class DungeonMakeTab(BaseTab):
         self._pw_track.clear()
         self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
         self._pw_timer.start(PORTAL_WATCH_MS)
-        self._say_map(f"記成對話傳送：{mapobj.label(pr.model)} —— "
+        how = ("　對話 " + " → ".join(f"第{k}項" for k in step["menu"] if k)
+               if step["menu"] else "（點一下就傳）")
+        self._say_map(f"記成對話傳送：{mapobj.label(pr.model)}{how} —— "
                       "把對話走完吧，我盯著看它把你送到哪。")
 
     def _entrance_here(self) -> bool:
