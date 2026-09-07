@@ -3364,8 +3364,9 @@ def main() -> int:
        "來回撞機關" in dungeon.describe({"do": dungeon.BUMP, "at": [9, 9]}),
        dungeon.describe({"do": dungeon.BUMP, "at": [9, 9]}))
 
-    def bump_tab(seq, model=60414, props=(), stand=[10, 10]):
-        """`seq` ＝ terrain.object_blocked 每次回什麼（用完停在最後一個）。"""
+    def bump_tab(seq, model=60414, props=(), stand=[10, 10], cells=None):
+        """`seq` ＝ terrain.object_blocked 每次回什麼（用完停在最後一個）；
+        `cells` ＝ terrain.object_block_cells 回什麼（亂走的半徑照它算）。"""
         step = {"do": dungeon.BUMP, "at": [20, 10], "model": model}
         if stand:
             step["stand"] = list(stand)
@@ -3385,28 +3386,61 @@ def main() -> int:
         left = list(seq)
         dt.terrain.object_blocked = lambda _sc, x, y, r: (
             left.pop(0) if len(left) > 1 else left[0])
+        # 亂走的半徑是問「阻擋鋪到哪幾格」算的 —— 預設讀不到（→ 退回預設半徑），
+        # 要驗半徑的測試自己再 wire 一次。
+        dt.terrain.object_block_cells = lambda _sc, x, y, r: cells
         return t
 
-    tab = bump_tab([15])                     # 一直有 15 格阻擋 ＝ 撞不開
+    # ★★★ 使用者 2026-09-07 定案的撞法：以「機關到它的阻擋」為半徑再多一格，
+    #    在它**周圍亂走**，走一陣子回退開點，再去亂走。
+    _cells = [(23, 10), (20, 12)]                 # 阻擋最遠鋪到 3 格 → 半徑 4
+    _room = {(x, y) for x in range(8, 30) for y in range(4, 18)}
+    tab = bump_tab([15], cells=_cells)            # 一直有 15 格阻擋 ＝ 撞不開
+    tab._grid = FakeGrid(_room)
+    tab._reach, tab._reach_n = set(_room), len(_room)
     run(tab, 0.5)
-    ck("　狀態列講得出撞第幾次、與還剩幾格阻擋",
-       "撞第" in tab.status.text() and "阻擋 15 格" in tab.status.text(),
-       tab.status.text())
-    ck("　⚠ 沒有地形圖 → 退回撞機關那一格（安全退化）",
-       tab.walked and tab.walked[0] == (20, 10), str(tab.walked[:2]))
+    ck("　狀態列講得出在亂走、半徑多少、還剩幾格阻擋",
+       "亂走" in tab.status.text() and "4.0 格" in tab.status.text()
+       and "阻擋 15 格" in tab.status.text(), tab.status.text())
+    ck("★★★ 半徑＝機關到它蓋的阻擋最遠那一格 ＋ 1 格",
+       abs(tab._gate["r"] - 4.0) < 1e-6, str(tab._gate.get("r")))
     run(tab, dt.BUMP_IN)
-    ck("★ 撞上去＝把機關那一格直接丟給遊戲（walk_exact，⛔ 不算路徑）",
-       tab.walked and tab.walked[0] == (20, 10), str(tab.walked[:3]))
+    _wander = [w for w in tab.walked if w != (10.0, 10.0)]   # 排掉「回退開點」
+    ck("★★★ 撞法＝在機關周圍**亂走**（每個目標都在半徑內、⛔ 不是只走它身上）",
+       len(_wander) >= 2
+       and all(((x - 20) ** 2 + (y - 10) ** 2) ** 0.5 <= 4.0 + 1.0
+               for x, y in _wander)          # +1：格中心取整的誤差
+       and len(set(_wander)) >= 2, str(tab.walked))
+    ck("　亂走的落腳點一定站得住、而且在我這一區",
+       all((int(x), int(y)) in _room for x, y in _wander), str(tab.walked))
     ck("　⛔ 完全沒有問過尋路器", tab._nav.calls == 0,
        f"尋路器被呼叫了 {tab._nav.calls} 次")
     run(tab, 1.0)
-    ck("★★ 撞了幾秒沒開 → **退開**到腳本記的退開點（來回撞）",
+    ck("★★ 亂走幾秒沒開 → 回**退開點**（來回）",
        (10.0, 10.0) in tab.walked, str(tab.walked))
+    _n_before = len(tab.walked)
     run(tab, dt.BUMP_OUT + dt.BUMP_IN + 1.0)
-    ck("★ 退完又撞回去（一直來回）", tab.walked.count((20, 10)) >= 2,
-       str(tab.walked))
+    ck("★ 回到退開點又出去亂走（一直來回）",
+       any(w != (10.0, 10.0) for w in tab.walked[_n_before:]),
+       str(tab.walked[_n_before:]))
     ck("　⛔ 撞不開不停機、不往下一步（沒有次數上限）",
        tab._i == 0 and tab.run_cb.isChecked(), f"第 {tab._i + 1} 步")
+
+    # 半徑：讀不到就**不走**（⛔ 沒有預設半徑）；別的物件的阻擋撐不爆它
+    tab = bump_tab([15])                          # cells=None ＝ 讀不到
+    tab._grid = FakeGrid(_room)
+    tab._reach = set(_room)
+    run(tab, 0.5)
+    ck("★★ 還沒讀到阻擋範圍 → **不走**，⛔ 不准自己編一個預設半徑",
+       not tab.walked and tab._gate.get("r") is None
+       and "重試" in tab.status.text(), f"{tab.walked} {tab.status.text()}")
+    ck("　⛔ 程式裡沒有「預設半徑」這個常數", not hasattr(dt, "BUMP_RAD_FALLBACK"))
+    tab = bump_tab([15], cells=[(20 + dt.BUMP_R, 10)])   # 遠處別的物件的阻擋
+    tab._grid = FakeGrid(_room)
+    tab._reach = set(_room)
+    run(tab, 0.2)
+    ck("　半徑有上限（方框裡別的物件的阻擋撐不爆它）",
+       abs(tab._gate["r"] - dt.BUMP_RAD_MAX) < 1e-6, str(tab._gate.get("r")))
 
     tab = bump_tab([15, 15, 0])              # 第三次讀到：阻擋整片不見了
     tab._reach, tab._reach_n = {(19, 10)}, 1
@@ -3422,10 +3456,21 @@ def main() -> int:
     ck("★★ 地形讀不到 ⛔ 不可以當成「開了」（讀不到 ≠ 沒有阻擋）",
        tab._i == 0, f"第 {tab._i + 1} 步")
 
-    tab = bump_tab([0])                      # 上一趟就撞開了
+    # ★★★ 一到就讀到 0 格阻擋要分兩種（使用者 2026-09-07 明令：
+    #    「不要沒阻擋代表我設定錯誤要通知我然後來修改，不是預設」）
+    tab = bump_tab([0], props=[FakeProp(20.0, 10.0, 60301)])   # 外觀已經是啟動後的
     run(tab, 0.3)
-    ck("★ 到的時候本來就是開的（一格阻擋都沒有）→ 直接算完成", tab._i == 1,
-       f"第 {tab._i + 1} 步")
+    ck("★ 沒阻擋＋外觀已經是啟動後的樣子 → 真的開了，往下一步", tab._i == 1,
+       f"第 {tab._i + 1} 步　{tab.status.text()}")
+    tab = bump_tab([0], props=[FakeProp(20.0, 10.0, 60414)])   # 外觀還是腳本記的
+    run(tab, 0.3)
+    ck("★★★ 沒阻擋＋外觀沒變 ＝ **腳本選錯物件** → ⛔ 通知＋停機讓使用者去改，"
+       "⛔ 不是自己編個半徑繼續繞",
+       not tab.run_cb.isChecked() and tab._i == 0
+       and "選錯" in tab.status.text(),
+       f"{tab.run_cb.isChecked()} {tab.status.text()}")
+    # ⚠ 這裡不驗「有沒有跳通知」：測試沒走「開跑」那條路（`_started` 是 False），
+    #   真的跑起來時 `_stop` 看到 ⛔ 開頭就會通知（見 PROBLEM_MARKS）。
 
     # 外觀換了（60414「蠍子雕像不可走」→ 60301「門開關火不給點」）＝也是開了。
     # ⚠ 這一條接住「基準本來就低、光看格數不會動」的那種（上一趟撞開的）。
@@ -3437,31 +3482,14 @@ def main() -> int:
     run(tab, 0.3)
     ck("　外觀還是腳本記的那個 → 繼續撞", tab._i == 0, f"第 {tab._i + 1} 步")
 
-    # ★★ 使用者 2026-09-07 補的規格：「來回撞不是要剛好走到我選的東西位置上，
-    #    而是**盡力往他身後走**」——目的地是「退開點 → 機關」再往前 BUMP_PAST 格
-    #    那條線上，我這一側**還走得到的最遠一格**。
-    tab = bump_tab([9])
-    _line = {(x, 10) for x in range(10, 27)}      # 機關身後（x>20）也走得到
-    tab._grid = FakeGrid(_line)
-    tab._reach, tab._reach_n = set(_line), len(_line)
-    run(tab, 0.3)
-    ck("★★★ 撞的目的地是**機關的身後**，不是機關那一格",
-       tab.walked and tab.walked[0] == (26.0, 10.0), str(tab.walked[:2]))
-    ck("　狀態列講得出是往身後撞", "往身後" in tab.status.text(),
-       tab.status.text())
-    tab = bump_tab([9])
-    _mine = {(x, 10) for x in range(10, 20)}      # 身後那一段是**別區**（走不到）
-    tab._grid = FakeGrid(_mine, others={(x, 10) for x in range(21, 27)})
-    tab._reach, tab._reach_n = set(_mine), len(_mine)
-    run(tab, 0.3)
-    ck("★★ 身後走不到（在別區）→ 退回撞機關那一格，⛔ 不送走不到的目標"
-       "（送了遊戲會直接拒絕，人一步都不動）",
-       tab.walked and tab.walked[0] == (20.0, 10.0), str(tab.walked[:2]))
-
-    tab = bump_tab([7], stand=None)          # 舊腳本沒記退開點
+    tab = bump_tab([7], stand=None, cells=_cells)   # 舊腳本沒記退開點
+    tab._grid = FakeGrid(_room)
+    tab._reach = set(_room)
     run(tab, dt.BUMP_IN + 1.0)
-    ck("　沒記退開點 → 只往前撞，不會拿 (0,0) 當退開點",
-       tab.walked and set(tab.walked) == {(20, 10)}, str(tab.walked))
+    ck("　沒記退開點 → 一直在它周圍亂走，不會拿 (0,0) 當退開點",
+       tab.walked and (0.0, 0.0) not in tab.walked
+       and all(((x - 20) ** 2 + (y - 10) ** 2) ** 0.5 <= 4.0 + 1.0
+               for x, y in tab.walked), str(tab.walked))
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0

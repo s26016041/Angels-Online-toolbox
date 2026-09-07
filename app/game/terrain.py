@@ -375,18 +375,13 @@ def load(scanner) -> tuple["Grid | None", str]:
     return Grid(w, h, obj, open_rows), ""
 
 
-def object_blocked(scanner, cx: float, cy: float, r: int) -> int | None:
-    """以 (cx, cy) 為中心、邊長 2r+1 的方框裡，有幾格是**場景物件蓋上去的**
-    阻擋（bit0，見 OBJ_MASK）。
+def object_block_cells(scanner, cx: float, cy: float,
+                       r: int) -> list[tuple[int, int]] | None:
+    """以 (cx, cy) 為中心、邊長 2r+1 的方框裡，**哪些格**是場景物件蓋上去的
+    阻擋（bit0，見 OBJ_MASK）。讀不到回 None（⚠ 讀不到 ≠ 沒有阻擋）。
 
-    給「機關開了沒」用：副本那種石像擋路的機關**撞開之後物件不會消失**，是換
-    外觀（實測 60414「蠍子雕像不可走」→ 60301「門開關火不給點」），它蓋的那一片
-    bit0 整片被清掉 —— 所以判開了沒要看**地形格**，⛔ 不能看物件在不在。
-
-    ⚠⚠ **讀不到回 None —— 讀不到 ≠ 沒有阻擋**。呼叫端不可以把 None 當 0
-      （那會變成還沒撞就說「開了」，正是本專案不准的「安靜地做錯事」）。
-    ⚠ 只讀方框那幾列的那一段（25x25 格約 4KB），不必重讀整張圖，
-      所以可以每隔一兩秒問一次。
+    `object_blocked` 只要格數；要知道「那一片阻擋鋪到多遠」才用這一支
+    （副本「來回撞機關」拿它算亂走的半徑）。
     """
     obj = _u32(scanner, MAP_PTR)
     if not obj or not 0x10000 < obj < 0x7FFF0000:
@@ -401,7 +396,7 @@ def object_blocked(scanner, cx: float, cy: float, r: int) -> int | None:
     x0, x1 = max(0, int(cx) - r), min(w - 1, int(cx) + r)
     y0, y1 = max(0, int(cy) - r), min(h - 1, int(cy) + r)
     if x0 > x1 or y0 > y1:
-        return None                    # 中心不在圖上 ＝ 問錯了，⛔ 不可以回 0
+        return None                    # 中心不在圖上 ＝ 問錯了，⛔ 不可以回空的
     ny = y1 - y0 + 1
     raw = scanner._read_bytes(rows + y0 * 4, ny * 4)
     if not raw or len(raw) < ny * 4:
@@ -409,16 +404,35 @@ def object_blocked(scanner, cx: float, cy: float, r: int) -> int | None:
     ptrs = struct.unpack(f"<{ny}I", bytes(raw))
     nx = x1 - x0 + 1
     span = nx * CELL
-    n = 0
-    for ptr in ptrs:
+    out: list[tuple[int, int]] = []
+    for i, ptr in enumerate(ptrs):
         if not ptr:
             return None                # 一列讀不到就整個作廢（同 load 的規矩）
         line = scanner._read_bytes(ptr + x0 * CELL, span)
         if not line or len(line) < span:
             return None
         b = bytes(line)
-        n += sum(1 for x in range(nx) if b[x * CELL + FLAG_OFF] & OBJ_MASK)
-    return n
+        for x in range(nx):
+            if b[x * CELL + FLAG_OFF] & OBJ_MASK:
+                out.append((x0 + x, y0 + i))
+    return out
+
+
+def object_blocked(scanner, cx: float, cy: float, r: int) -> int | None:
+    """以 (cx, cy) 為中心、邊長 2r+1 的方框裡，有幾格是**場景物件蓋上去的**
+    阻擋（bit0，見 OBJ_MASK）。
+
+    給「機關開了沒」用：副本那種石像擋路的機關**撞開之後物件不會消失**，是換
+    外觀（實測 60414「蠍子雕像不可走」→ 60301「門開關火不給點」），它蓋的那一片
+    bit0 整片被清掉 —— 所以判開了沒要看**地形格**，⛔ 不能看物件在不在。
+
+    ⚠⚠ **讀不到回 None —— 讀不到 ≠ 沒有阻擋**。呼叫端不可以把 None 當 0
+      （那會變成還沒撞就說「開了」，正是本專案不准的「安靜地做錯事」）。
+    ⚠ 只讀方框那幾列的那一段（25x25 格約 4KB），不必重讀整張圖，
+      所以可以每隔一兩秒問一次。
+    """
+    cells = object_block_cells(scanner, cx, cy, r)
+    return None if cells is None else len(cells)
 
 
 class Cache:
