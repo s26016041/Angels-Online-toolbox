@@ -499,6 +499,23 @@ PORTAL_BUMP = 2.0          # 站在傳點上幾秒還沒被搬走 → 退開再�
 #     等於每撞一輪送一發 —— 這是想要的（機關型的傳點吃的是走進去那一下）。
 PORTAL_BACK = 3.0          # 退開幾格（要退到踩得出「走進去」那一下）
 PORTAL_BUMP_ARRIVE = 1.2   # 退到／回到定點算幾格內
+# ★★★ 「來回撞機關」（dungeon.BUMP，使用者 2026-09-07：「一直往我選的那物件
+#   一直不停頓的撞他，直到偵測到附近的那種阻擋消失」＋「不停頓的撞是要**來回**
+#   撞，就是走出來再去撞他」）。副本石像那種擋路的機關：送移動永遠過不去
+#   （我們的 A*、遊戲自己的尋路都拒絕），只有人真的一次一次撞上去才會開。
+#   ⚠ 撞開之後物件**不會消失**，是換外觀、它蓋的那一片阻擋（地形格 bit0）整片
+#     被清掉 —— 所以完成訊號看 `terrain.object_blocked`，⛔ 不是看物件在不在。
+#   ⚠ 撞的時候常會跳出對話框（「似乎觸碰到什麼機關了…」）——那個由既有的
+#     `_stray_dialog` 照遊戲的關法收掉（BUMP 不是 INTERACT，本來就在它管的範圍）。
+#     ⛔ 不收乾淨的話後面每一發都等於沒送到（2026-09-07 探針連點 6 發只算 1 發）。
+BUMP_IN = 3.0              # 往機關撞幾秒就退開
+BUMP_OUT = 2.5             # 退開走幾秒就再撞（提早走到退開點也直接再撞）
+BUMP_SEND = 0.8            # 每幾秒補送一次目的地（walk_exact 一次只走一段）
+BUMP_ARRIVE = 1.2          # 走到退開點算幾格內
+BUMP_POLL = 2.0            # 每幾秒重讀一次地形，看那一片阻擋還在不在
+BUMP_R = 12                # 看機關周圍幾格（那個石像自己就蓋 23 格，跨 7 格遠）
+BUMP_CLEAR = 4             # bit0 格數比一開始少這麼多（或歸零）就算「開了」
+# ⛔ 沒有次數上限（同傳點的撞法：副本的門本來就是解謎才開，出口是取消勾選）。
 # ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
 #   壞掉，那個拔掉」）—— 傳點過不去就一直打，出口是取消勾選。
 
@@ -1406,6 +1423,11 @@ class DungeonTab(BaseTab):
         self._bump = None            # 傳點「退開再走回來撞」正在跑的那一輪
         self._bump_t = 0.0           # 站在傳點上多久沒被搬走
         self._bump_n = 0             # 這一步撞了幾次（只拿來回報）
+        self._gate = None            # 「來回撞機關」正在跑的那一輪（相位／退開點）
+        self._gate_t = 0.0           # 距離下次重讀地形還有多久
+        self._gate_send = 0.0        # 距離下次補送目的地還有多久
+        self._gate_base = None       # 剛到時那個機關周圍有幾格 bit0（⚠ None＝還沒讀到）
+        self._gate_last = None       # 最近一次讀到的格數（只拿來回報）
         self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
@@ -2911,6 +2933,10 @@ class DungeonTab(BaseTab):
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}")
             return
 
+        if kind == dungeon.BUMP:
+            self._do_bump(step, me, dt)
+            return
+
         if kind == dungeon.INTERACT:
             self._do_interact(step, me, dt)
             return
@@ -3209,6 +3235,107 @@ class DungeonTab(BaseTab):
         self._wnd_t = WND_TTL
         self._wnd = talkwnd.window_open(self._mover, self._sc)
         return self._wnd
+
+    def _gate_open(self, step: dict) -> str:
+        """那個機關開了沒。回一句「開了」的原因（空字串＝還沒開）。
+
+        ★★★ 兩個訊號（2026-09-07 黑狐「莉薇坦的寢室」實錄，見 memory
+          `dungeon-object-blocking-gate`）：
+          ① **地形格**：它蓋的那一片 bit0 阻擋整片被清掉（15 格的牆 → 0）。
+             ⚠ 讀不到 ＝ 不知道（`object_blocked` 回 None），⛔ 不可以當成開了。
+          ② **外觀換了**：撞開之後物件不會消失，是 60414「蠍子雕像不可走」→
+             60301「門開關火不給點」。這一條也接住「上一趟就撞開了、這一趟到
+             的時候本來就是開的」——那種情況 bit0 的基準本來就低，光看①不會動。
+        ⛔ 不看「物件還在不在」（它永遠都在）。
+        """
+        ax, ay = step["at"]
+        n = terrain.object_blocked(self._sc, ax, ay, BUMP_R)
+        self._gate_last = n
+        if n is not None:
+            if self._gate_base is None:
+                self._gate_base = n
+                if n == 0:
+                    return "它周圍一格物件阻擋都沒有（本來就是開的？）"
+            elif n == 0 or n <= self._gate_base - BUMP_CLEAR:
+                return (f"它蓋的阻擋從 {self._gate_base} 格變成 {n} 格")
+        want = step.get("model")
+        if want is not None:
+            props = scenery.nearby(self._sc, (ax, ay), PROP_TOL)
+            # ⚠ None（讀不到）與空清單都不算數 —— 讀不到 ≠ 機關不見了。
+            hit = _pick(props, want) if props else None
+            if hit and hit[0].model != want:
+                return f"外觀從 {want} 換成 {hit[0].model}（機關啟動後的樣子）"
+        return ""
+
+    def _do_bump(self, step: dict, me, dt: float) -> None:
+        """來回撞一個機關，撞到它蓋的阻擋消失為止（使用者 2026-09-07）。
+
+        「撞」＝**人真的走上去那一下**：`walk_exact` 直接往機關那一格送
+        （⛔ 不算路徑、不問尋路 —— 算得出來就不必撞了），撞 BUMP_IN 秒退開到
+        腳本記的退開點（製作時使用者站的那一格），再撞回去，一直來回。
+        ⛔ 沒有次數上限；卡太久由既有的「同一段超過 2 分鐘」記重要事件。
+        ⚠ 撞出來的對話框由 `_stray_dialog` 收（BUMP 不是 INTERACT，本來就在它
+          管的範圍）—— 不收乾淨的話後面每一發都等於沒送到。
+        """
+        ax, ay = step["at"]
+        tag = f"第 {self._i + 1} 步"
+        # ── ① 開了沒（每 BUMP_POLL 秒問一次，⛔ 不是每拍讀地形）─────
+        self._gate_t -= dt
+        if self._gate_t <= 0:
+            self._gate_t = BUMP_POLL
+            why = self._gate_open(step)
+            if why:
+                # 牆變路了 → 地形快取一定要丟掉重讀，不然後面每一步都拿舊的牆
+                #   算路（「解完謎卻說走不到」，見 _refresh_grid）。
+                self._maps.drop()
+                self._grid_t = 0.0
+                self._reach, self._reach_n = None, 0
+                self._hopeless.clear()       # 門開了 → 放棄過的怪重新問一輪
+                self._notify(f"{tag}　機關開了：{why} → 下一步")
+                self._nav.reset()
+                self._gate = None
+                self._next()
+                return
+        # ── ② 撞 ↔ 退開 ───────────────────────────────────────────
+        gate = self._gate
+        if gate is None:
+            spot = step.get("stand")
+            spot = (float(spot[0]), float(spot[1])) if spot else None
+            self._gate = gate = {"phase": "in", "spot": spot, "n": 1, "t": 0.0}
+            self._gate_send = 0.0
+        gate["t"] += dt
+        self._gate_send -= dt
+        blk = ("" if self._gate_last is None
+               else f"　阻擋 {self._gate_last} 格"
+               + (f"（一開始 {self._gate_base}）"
+                  if self._gate_base is not None
+                  and self._gate_base != self._gate_last else ""))
+        if gate["phase"] == "in":
+            if gate["t"] >= BUMP_IN and gate["spot"] is not None:
+                gate["phase"], gate["t"] = "out", 0.0
+                self._gate_send = 0.0
+                self._say(f"{tag}　撞第 {gate['n']} 次沒開 → 退開再來{blk}")
+                return
+            if self._gate_send <= 0:
+                self._gate_send = BUMP_SEND
+                self._walk_onto(ax, ay)
+            note = "" if gate["spot"] is not None else "　（沒記退開點 → 只往前撞）"
+            self._say(f"{tag}　來回撞機關 ({ax}, {ay})　撞第 {gate['n']} 次"
+                      f"　剩 {_d((ax, ay), me):.1f} 格{blk}{note}"
+                      f"　{self._mon_note()}")
+            return
+        sx, sy = gate["spot"]
+        if _d((sx, sy), me) <= BUMP_ARRIVE or gate["t"] >= BUMP_OUT:
+            gate["phase"], gate["t"] = "in", 0.0
+            gate["n"] += 1
+            self._gate_send = 0.0
+            self._say(f"{tag}　退開了 → 撞第 {gate['n']} 次{blk}")
+            return
+        if self._gate_send <= 0:
+            self._gate_send = BUMP_SEND
+            self._walk_onto(sx, sy)
+        self._say(f"{tag}　退開到 ({sx:g}, {sy:g})　剩 "
+                  f"{_d((sx, sy), me):.1f} 格{blk}")
 
     def _do_interact(self, step: dict, me, dt: float,
                      tag: str = "", finish=None) -> None:
@@ -3547,6 +3674,11 @@ class DungeonTab(BaseTab):
         self._bump = None             # 換一步 → 撞的狀態整組歸零
         self._bump_t = 0.0
         self._bump_n = 0
+        self._gate = None             # 「來回撞機關」也整組歸零（含阻擋的基準）
+        self._gate_t = 0.0
+        self._gate_send = 0.0
+        self._gate_base = None
+        self._gate_last = None
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
         self._nudge = 0               # 靠近重試的次數歸零
         self._still_t = 0.0

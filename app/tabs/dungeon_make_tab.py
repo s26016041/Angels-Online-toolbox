@@ -214,11 +214,10 @@ class MapWindow(QDialog):
         self.pick_lbl = QLabel("點一下地圖選位置")
         ph.addWidget(self.pick_lbl)
         ph.addStretch(1)
-        self.add_pick = QPushButton("加入點到的位置")
-        self.add_pick.setToolTip("把地圖上點到的那一格，加成一個「走到」步驟。")
-        self.add_pick.setEnabled(False)
-        self.add_pick.clicked.connect(tab._add_picked)
-        ph.addWidget(self.add_pick)
+        # ⛔ 這裡**不再有**「加入點到的位置」（使用者 2026-09-07：「根本沒用」）
+        #   —— 點位一律用「加入我現在站的位置」加：人站得上去的格子才走得到，
+        #   在地圖上點一格常常是站不住的（貼牆、物件蓋住），加了只會卡在那一步。
+        #   地圖上點一下**照舊**會告訴你那一格能不能走、屬於哪個房間。
         b = QPushButton("加入我現在站的位置")
         b.setToolTip("把角色**現在**站的那一格，加成一個「走到」步驟。")
         b.clicked.connect(tab._add_here)
@@ -503,6 +502,18 @@ class DungeonMakeTab(BaseTab):
             "站上去沒反應就每 5 秒對它送一次互動，撐 3 分鐘沒過就停下來通知。\n"
             "按完之後你自己走進去，出口在哪會自動記進這一步。")
         b.clicked.connect(self._add_portal_prop)
+        th.addWidget(b)
+        # ★★★ 使用者 2026-09-07：「一直往我選的那物件一直不停頓的撞他，直到偵測到
+        #   附近的那種阻擋消失」＋「不停頓的撞是要來回撞，就是走出來再去撞他」。
+        b = QPushButton("一直來回撞這個機關")
+        b.setToolTip(
+            "把清單裡選到的那個物件記成「來回撞機關」的一步（存進腳本）。\n"
+            "跑的時候：撞上去 → 退開 → 再撞上去，一直來回，\n"
+            "**直到它蓋在地上的那一片阻擋不見了**（＝路通了）才算完成。\n"
+            "★ 石像擋路那種：送移動永遠過不去，只能人真的一次一次撞。\n"
+            "⚠ 用法：先站到你要從哪裡撞它的位置（那裡也是退開點），再按這顆。\n"
+            "⛔ 沒有次數上限 —— 撞不開就一直撞。")
+        b.clicked.connect(self._add_bump_prop)
         th.addWidget(b)
         # ★ 使用者 2026-09-02：「新增一個『加入進入副本傳送點』，一樣寫在
         #   同一個 json，他會紀錄那個入口傳送點目前在哪個地圖哪個地方」
@@ -1007,12 +1018,6 @@ class DungeonMakeTab(BaseTab):
             return
         self._add({"do": dungeon.WALK, "to": [round(me[0]), round(me[1])]})
 
-    def _add_picked(self) -> None:
-        if self._pick is None:
-            return
-        self._add({"do": dungeon.WALK,
-                   "to": [int(self._pick[0]), int(self._pick[1])]})
-
     def _force_walk(self) -> None:
         """把**角色現在站的位置**加成「強制走到」步驟。
 
@@ -1061,6 +1066,34 @@ class DungeonMakeTab(BaseTab):
         self._pw_timer.start(PORTAL_WATCH_MS)
         self._say_map(f"記成傳送點：{mapobj.label(pr.model)} —— "
                       "走進去吧，我盯著看它把你送到哪。")
+
+    def _add_bump_prop(self) -> None:
+        """把清單裡選到的物件記成「來回撞機關」（使用者 2026-09-07）。
+
+        記三樣：機關的位置、外觀編號、**你按這顆時站的那一格**（＝退開點）。
+        退開點用站的位置不用算的：你人就在上面，一定站得住、也一定撞得到
+        （跟「強制走到」同一條規矩）。
+        真正的撞法在執行端（`dungeon_tab` 的 `dungeon.BUMP` 分支：撞上去 →
+        退開 → 再撞，完成訊號是那個物件蓋的阻擋整片消失）。
+        """
+        i = self.props.currentRow()
+        if not 0 <= i < len(self._props):
+            self.status.setText("先在清單裡選一個物件（那個擋路的機關／石像）")
+            return
+        _pid, sc = self._cur()
+        if sc is None:
+            self._say_map("先選一台分身")
+            return
+        me = self._me(sc)
+        if me is None:
+            # 讀不到就什麼都不做 —— 存一個 (0,0) 當退開點比不存危險得多。
+            self._say_map("⚠ 讀不到角色位置，這一步沒有存")
+            return
+        pr = self._props[i]
+        self._add({"do": dungeon.BUMP,
+                   "at": [round(pr.x, 1), round(pr.y, 1)],
+                   "model": pr.model,
+                   "stand": [round(me[0]), round(me[1])]})
 
     def _entrance_here(self) -> bool:
         """現在正在跟**已經記好的那個入口**互動嗎？
@@ -1323,8 +1356,12 @@ class DungeonMakeTab(BaseTab):
             kind = self._script.steps[i].get("do")
             if kind == dungeon.WALK:
                 col = QColor(90, 170, 255)          # 走到：藍
+            elif kind == dungeon.FORCE:
+                col = QColor(90, 170, 255)          # 強制走到：也是走，同色
             elif kind == dungeon.PORTAL:
                 col = QColor(120, 235, 140)         # 傳點：綠（會換圖，特別標）
+            elif kind == dungeon.BUMP:
+                col = QColor(255, 160, 60)          # 撞機關：橘
             else:
                 col = QColor(210, 140, 255)         # 對話：紫
             p.setPen(QPen(col, 2))
@@ -1358,8 +1395,7 @@ class DungeonMakeTab(BaseTab):
         room = self._rooms.get((gx, gy))
         self._pick = (gx, gy)
         if self._big is not None:
-            # ⚠ 不可走的格子不給加：走不到的終點會讓執行端一直重試到逾時。
-            self._big.add_pick.setEnabled(walk)
+            # ⚠ 點一下只是「看這一格是什麼」——加點位一律用站的位置（見地圖視窗）
             self._big.pick_lbl.setText(
                 f"點到 ({gx}, {gy})　"
                 + (f"房間 {room}" if room is not None else

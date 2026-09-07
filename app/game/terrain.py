@@ -59,6 +59,17 @@ CELL = 7                   # 每格幾 bytes
 FLAG_OFF = 2               # 格子裡的阻擋旗標在第幾個 byte
 # ⚠ 出處＝同上那道 test 的立即值 3（bit0|bit1 ＝ 不能走）。
 BLOCK_MASK = 3             # 那個 byte 的哪幾個 bit 代表不能走
+# ★★★ 那兩個 bit 是**兩種不同的阻擋**（2026-09-07 反組譯定案，黑狐「莉薇坦的
+#   寢室」石像擋路那一案）：
+#     bit0 ＝ **場景物件執行時蓋上去的**（`StampObjectBlocking` 0x546d7f 查形狀表
+#             0x9F2990、逐格 `SetCell` 0x546d38）—— 物件停用／換外觀就被清掉，
+#             ＝ 機關開了、路通了。
+#     bit1 ＝ **地圖本身的牆**（.mpc 載圖時填的，不會變）。
+#   旁證：雷達繪製 0x5858ea 把兩者畫成不同顏色（bit0→0x1f、bit1→0x7e0）。
+#   ⚠ 「能不能走」照舊看 BLOCK_MASK（任一個 bit 都不能走）——
+#     這兩個常數只給「機關開了沒」用（見 object_blocked）。
+OBJ_MASK = 1
+MAP_MASK = 2
 MAX_DIM = 4096             # 合理性上限（讀到亂數就當失敗）
 # 讀不到時當場重試幾次（一次 6~8ms）。換圖那一瞬間會短暫讀不到，
 # 而沒有地形圖我們就不走路 —— 多花十幾毫秒把圖拿到手划算得多。
@@ -362,6 +373,52 @@ def load(scanner) -> tuple["Grid | None", str]:
     if not any(any(r) for r in open_rows):
         return None, "整張圖沒有一格可走（還在載入）"
     return Grid(w, h, obj, open_rows), ""
+
+
+def object_blocked(scanner, cx: float, cy: float, r: int) -> int | None:
+    """以 (cx, cy) 為中心、邊長 2r+1 的方框裡，有幾格是**場景物件蓋上去的**
+    阻擋（bit0，見 OBJ_MASK）。
+
+    給「機關開了沒」用：副本那種石像擋路的機關**撞開之後物件不會消失**，是換
+    外觀（實測 60414「蠍子雕像不可走」→ 60301「門開關火不給點」），它蓋的那一片
+    bit0 整片被清掉 —— 所以判開了沒要看**地形格**，⛔ 不能看物件在不在。
+
+    ⚠⚠ **讀不到回 None —— 讀不到 ≠ 沒有阻擋**。呼叫端不可以把 None 當 0
+      （那會變成還沒撞就說「開了」，正是本專案不准的「安靜地做錯事」）。
+    ⚠ 只讀方框那幾列的那一段（25x25 格約 4KB），不必重讀整張圖，
+      所以可以每隔一兩秒問一次。
+    """
+    obj = _u32(scanner, MAP_PTR)
+    if not obj or not 0x10000 < obj < 0x7FFF0000:
+        return None
+    w = _u32(scanner, obj + OFF_W)
+    h = _u32(scanner, obj + OFF_H)
+    rows = _u32(scanner, obj + OFF_ROWS)
+    if not w or not h or not rows or w > MAX_DIM or h > MAX_DIM:
+        return None
+    if not 0x10000 < rows < 0x7FFF0000:
+        return None
+    x0, x1 = max(0, int(cx) - r), min(w - 1, int(cx) + r)
+    y0, y1 = max(0, int(cy) - r), min(h - 1, int(cy) + r)
+    if x0 > x1 or y0 > y1:
+        return None                    # 中心不在圖上 ＝ 問錯了，⛔ 不可以回 0
+    ny = y1 - y0 + 1
+    raw = scanner._read_bytes(rows + y0 * 4, ny * 4)
+    if not raw or len(raw) < ny * 4:
+        return None
+    ptrs = struct.unpack(f"<{ny}I", bytes(raw))
+    nx = x1 - x0 + 1
+    span = nx * CELL
+    n = 0
+    for ptr in ptrs:
+        if not ptr:
+            return None                # 一列讀不到就整個作廢（同 load 的規矩）
+        line = scanner._read_bytes(ptr + x0 * CELL, span)
+        if not line or len(line) < span:
+            return None
+        b = bytes(line)
+        n += sum(1 for x in range(nx) if b[x * CELL + FLAG_OFF] & OBJ_MASK)
+    return n
 
 
 class Cache:

@@ -36,6 +36,9 @@ r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
     {"do": "wait",     "secs": 3}                    單純等幾秒
     {"do": "portal",   "to": [x, y], "model": 60xxx, 走進傳點（人被移走才算完成）
                        "land": [x, y], "scene": 76}
+    {"do": "force",    "to": [x, y]}                 強制走到（不算路徑、不管障礙）
+    {"do": "bump",     "at": [x, y], "model": 60414, 來回撞機關（撞→退開→再撞），
+                       "stand": [x, y]}              **它蓋的阻擋不見了**才算完成
 
 ## 傳點為什麼要獨立一種步驟（使用者 2026-09-02 問對了）
 
@@ -97,7 +100,14 @@ PORTAL = "portal"
 #   `force` 完全不算路 —— 直接把目的地丟給遊戲那支「走到這一格」，撞得過去
 #   就過得去。副本裡被機關（雕像那種）擋住的路尋路一定拒絕，就是留給這一種。
 FORCE = "force"
-KINDS = (WALK, INTERACT, CLEAR, WAIT, PORTAL, FORCE)
+# ★★★ 使用者 2026-09-07：「一直往我選的那物件一直不停頓的撞他，直到偵測到
+#   附近的那種阻擋消失」、「不停頓的撞是要來回撞，就是走出來再去撞他」。
+#   副本那種**石像擋路的機關**：送移動永遠過不去（我們的 A* 與遊戲自己的尋路
+#   都會拒絕，2026-09-07 黑狐實測四條路全滅），要人**一次一次真的撞上去**。
+#   撞開之後物件不會消失，是換外觀、它蓋的那一片阻擋（地形格 bit0）整片被清掉
+#   —— 那才是「開了」的訊號（見 terrain.object_blocked）。
+BUMP = "bump"
+KINDS = (WALK, INTERACT, CLEAR, WAIT, PORTAL, FORCE, BUMP)
 
 # 對話選單最多幾項（talkaction 碼只到第 10 項，見 supply.talk_option）
 MENU_MAX = 10
@@ -345,6 +355,16 @@ def validate(step: dict) -> tuple[bool, str]:
         xy = step.get("to")
         if not (isinstance(xy, list) and len(xy) == 2):
             return False, "force 少了 to:[x,y]"
+    elif kind == BUMP:
+        xy = step.get("at")
+        if not (isinstance(xy, list) and len(xy) == 2):
+            return False, "bump 少了 at:[x,y]"
+        mdl = step.get("model")
+        if mdl is not None and not isinstance(mdl, int):
+            return False, "bump 的 model 要是外觀編號"
+        st = step.get("stand")
+        if st is not None and not (isinstance(st, list) and len(st) == 2):
+            return False, "bump 的 stand 要是 [x,y]"
     elif kind == INTERACT:
         xy = step.get("at")
         if not (isinstance(xy, list) and len(xy) == 2):
@@ -451,6 +471,13 @@ def describe(step: dict) -> str:
     if kind == FORCE:
         x, y = step.get("to", ["?", "?"])
         return f"強制走到 ({x}, {y})　（不算路徑、不管障礙物）"
+    if kind == BUMP:
+        x, y = step.get("at", ["?", "?"])
+        m = step.get("model")
+        who = mapobj.label(m) if isinstance(m, int) else f"外觀 {m}"
+        st = step.get("stand")
+        where = f"　退開點 ({st[0]:g}, {st[1]:g})" if st else ""
+        return f"來回撞機關 ({x}, {y})　{who}{where}　（撞到路通為止）"
     if kind == INTERACT:
         x, y = step.get("at", ["?", "?"])
         menu = step.get("menu") or []

@@ -3275,9 +3275,32 @@ def main() -> int:
        len(mtab._script.steps) == _n + 1
        and mtab._script.steps[-1] == {"do": dungeon.FORCE, "to": [12, 12]},
        str(mtab._script.steps[-1:]))
+    # ★★ 「來回撞這個機關」：記的是**選到的物件**＋**我現在站的位置當退開點**
+    _n = len(mtab._script.steps)
+    mtab.props.clear()
+    mtab._props = []
+    mtab._add_bump_prop()
+    ck("　沒選物件 → 只回報、不亂加步驟", len(mtab._script.steps) == _n,
+       mtab.status.text())
+    mtab._props = [FakeProp(20.0, 10.0, 60414)]
+    mtab.props.addItem("蠍子雕像不可走")
+    mtab.props.setCurrentRow(0)
+    mtab._me = lambda _sc: None                   # 讀不到角色位置
+    mtab._add_bump_prop()
+    ck("　讀不到角色位置 → ⛔ 不存 (0,0) 當退開點",
+       len(mtab._script.steps) == _n, mtab.status.text())
+    mtab._me = lambda _sc: (11.5, 12.5)
+    mtab._add_bump_prop()
+    ck("★★ 「一直來回撞這個機關」＝機關的位置／外觀 ＋ 我站的位置當退開點",
+       len(mtab._script.steps) == _n + 1
+       and mtab._script.steps[-1] == {"do": dungeon.BUMP, "at": [20.0, 10.0],
+                                      "model": 60414, "stand": [12, 12]},
+       str(mtab._script.steps[-1:]))
     _big = dm.MapWindow(mtab)
     ck("★ 「加入『走進傳點』」已經拿掉（傳點一律用「這個是傳送點」）",
        not hasattr(_big, "add_portal"))
+    ck("★ 「加入點到的位置」已經拿掉（使用者 2026-09-07：「根本沒用」）",
+       not hasattr(_big, "add_pick") and not hasattr(mtab, "_add_picked"))
     ck("★ 地圖視窗多了「強制走到我站的位置」",
        hasattr(_big, "force_btn")
        and _big.force_btn.text() == "強制走到我站的位置",
@@ -3323,6 +3346,99 @@ def main() -> int:
     run(tab, 0.4)
     ck("　站上點位但周圍還有怪 → 不算到（跟「走到」同一條規矩）",
        tab._i == 0, f"第 {tab._i + 1} 步")
+
+    # =====================================================================
+    # ★★★ 「來回撞機關」步驟（bump，使用者 2026-09-07）：撞上去 → 退開 →
+    #      再撞，一直來回，**直到它蓋在地上的阻擋（地形格 bit0）消失**。
+    # =====================================================================
+    print("")
+    print("來回撞機關（bump）")
+    ck("　dungeon.validate 認得 bump",
+       dungeon.validate({"do": dungeon.BUMP, "at": [9, 9],
+                         "model": 60414, "stand": [8, 8]})[0])
+    ck("　少了 at 會被擋下來", not dungeon.validate({"do": dungeon.BUMP})[0])
+    ck("　model 不是編號會被擋下來",
+       not dungeon.validate({"do": dungeon.BUMP, "at": [9, 9],
+                             "model": "石像"})[0])
+    ck("　describe 講得出來",
+       "來回撞機關" in dungeon.describe({"do": dungeon.BUMP, "at": [9, 9]}),
+       dungeon.describe({"do": dungeon.BUMP, "at": [9, 9]}))
+
+    def bump_tab(seq, model=60414, props=(), stand=[10, 10]):
+        """`seq` ＝ terrain.object_blocked 每次回什麼（用完停在最後一個）。"""
+        step = {"do": dungeon.BUMP, "at": [20, 10], "model": model}
+        if stand:
+            step["stand"] = list(stand)
+        t = make_tab([step, {"do": dungeon.WAIT, "secs": 5}],
+                     pos=(19.0, 10.0), props=props)
+        t.walked = []
+        t._mover = type("M", (), {
+            "walk_exact":
+                lambda _s, _sc, _p, x, y: t.walked.append((x, y)) or True,
+        })()
+        dt.entity.is_walking = lambda _sc, _p: False
+        t._exact_sent = 0.0
+        # ⚠ 測試裡的時間不會真的過（dt 是喂的），而 `_busy_walking` 看的是
+        #   **真的** monotonic：不拉掉的話第一發之後 navigate.SEND_GRACE 內每一發
+        #   都會被當成「正在走」—— 那道閘本身別處已經驗過。
+        t._busy_walking = lambda: False
+        left = list(seq)
+        dt.terrain.object_blocked = lambda _sc, x, y, r: (
+            left.pop(0) if len(left) > 1 else left[0])
+        return t
+
+    tab = bump_tab([15])                     # 一直有 15 格阻擋 ＝ 撞不開
+    run(tab, 0.5)
+    ck("　狀態列講得出撞第幾次、與還剩幾格阻擋",
+       "撞第" in tab.status.text() and "阻擋 15 格" in tab.status.text(),
+       tab.status.text())
+    run(tab, dt.BUMP_IN)
+    ck("★ 撞上去＝把機關那一格直接丟給遊戲（walk_exact，⛔ 不算路徑）",
+       tab.walked and tab.walked[0] == (20, 10), str(tab.walked[:3]))
+    ck("　⛔ 完全沒有問過尋路器", tab._nav.calls == 0,
+       f"尋路器被呼叫了 {tab._nav.calls} 次")
+    run(tab, 1.0)
+    ck("★★ 撞了幾秒沒開 → **退開**到腳本記的退開點（來回撞）",
+       (10.0, 10.0) in tab.walked, str(tab.walked))
+    run(tab, dt.BUMP_OUT + dt.BUMP_IN + 1.0)
+    ck("★ 退完又撞回去（一直來回）", tab.walked.count((20, 10)) >= 2,
+       str(tab.walked))
+    ck("　⛔ 撞不開不停機、不往下一步（沒有次數上限）",
+       tab._i == 0 and tab.run_cb.isChecked(), f"第 {tab._i + 1} 步")
+
+    tab = bump_tab([15, 15, 0])              # 第三次讀到：阻擋整片不見了
+    tab._reach, tab._reach_n = {(19, 10)}, 1
+    run(tab, 2 * dt.BUMP_POLL + 0.4)
+    ck("★★★ 它蓋的阻擋不見了 ＝ 機關開了 → 這一步完成", tab._i == 1,
+       f"第 {tab._i + 1} 步　{tab.status.text()}")
+    ck("★★ 開了要把地形快取丟掉重讀（不然後面每一步都拿舊的牆算路）",
+       tab._reach is None and tab._grid_t == 0.0,
+       f"reach={tab._reach} grid_t={tab._grid_t}")
+
+    tab = bump_tab([None])                   # 地形讀不到
+    run(tab, 3 * dt.BUMP_POLL)
+    ck("★★ 地形讀不到 ⛔ 不可以當成「開了」（讀不到 ≠ 沒有阻擋）",
+       tab._i == 0, f"第 {tab._i + 1} 步")
+
+    tab = bump_tab([0])                      # 上一趟就撞開了
+    run(tab, 0.3)
+    ck("★ 到的時候本來就是開的（一格阻擋都沒有）→ 直接算完成", tab._i == 1,
+       f"第 {tab._i + 1} 步")
+
+    # 外觀換了（60414「蠍子雕像不可走」→ 60301「門開關火不給點」）＝也是開了。
+    # ⚠ 這一條接住「基準本來就低、光看格數不會動」的那種（上一趟撞開的）。
+    tab = bump_tab([7], props=[FakeProp(20.0, 10.0, 60301)])
+    run(tab, 0.3)
+    ck("★★ 外觀換成啟動後的樣子 → 也算開了（⛔ 不是看物件在不在）",
+       tab._i == 1, f"第 {tab._i + 1} 步　{tab.status.text()}")
+    tab = bump_tab([7], props=[FakeProp(20.0, 10.0, 60414)])
+    run(tab, 0.3)
+    ck("　外觀還是腳本記的那個 → 繼續撞", tab._i == 0, f"第 {tab._i + 1} 步")
+
+    tab = bump_tab([7], stand=None)          # 舊腳本沒記退開點
+    run(tab, dt.BUMP_IN + 1.0)
+    ck("　沒記退開點 → 只往前撞，不會拿 (0,0) 當退開點",
+       tab.walked and set(tab.walked) == {(20, 10)}, str(tab.walked))
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
