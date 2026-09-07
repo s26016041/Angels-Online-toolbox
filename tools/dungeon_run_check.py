@@ -999,6 +999,95 @@ def main() -> int:
     ck("　出口也走不到（人根本不在出口那一側）→ 不能當過了",
        tab._i == 0, f"i={tab._i} {tab.status.text()}")
 
+    # ★★★ 2026-09-07 邪靈古船執行紀錄（第 41 步）：從傳點上跳走、落在 (113.5,168.5)，腳本記的
+    #   出口 (107.5,161.5) 差 9.2 格 > LAND_TOL → 舊版「傳點把人送到…差 9 格」收掉這一趟。
+    #   同一個傳點每次落點都不一樣（同一趟第 7／14／26 步都差 4~5 格）。
+    #   → 使用者定：「預計地點和實際地點是可以走過去的，就是合理的正常傳送」；走不到才是傳到別的地方。
+    _orig_supply = dt.supply.run_full_supply
+    _gate = threading.Event()
+    dt.supply.run_full_supply = lambda *a, **k: (_gate.wait(2.0), (True, "都夠了"))[1]
+    LAND41 = [{"do": "portal", "to": [43.2, 89.1], "land": [107.5, 161.5]},
+              {"do": "walk", "to": [96, 166]}]
+    tab = make_tab(LAND41, pos=(113.5, 168.5))
+    tab._loop = True
+    tab._grid = FakeGrid({(113, 168), (107, 161), (96, 166)}, others={(43, 89)})
+    tab._reach = {(113, 168), (107, 161), (96, 166)}
+    tab._jumped = (43.5, 83.5)                # 跳之前離傳點 5.6 格（在傳點上）
+    run(tab, 0.1)
+    ck("★★★ 落點離記的出口 9 格、但出口走得到（同一區）→ 算過、不收這一趟",
+       tab._i == 1 and tab._cycle == "go" and tab.run_cb.isChecked(),
+       f"i={tab._i} cycle={tab._cycle} {tab.status.text()}")
+    ck("　狀態列講得出「傳點過了」＋離出口幾格",
+       "傳點過了" in tab.status.text() and "9 格" in tab.status.text(), tab.status.text())
+    ck("　軌跡清空、拉回次數歸零", not tab._track and tab._rollbacks == 0, "")
+    tab = make_tab(LAND41, pos=(113.5, 168.5))
+    tab._loop = True
+    tab._grid = FakeGrid({(113, 168)}, others={(43, 89), (107, 161), (96, 166)})
+    tab._reach = {(113, 168)}
+    tab._jumped = (43.5, 83.5)
+    run(tab, 0.1)
+    ck("　落點 9 格外、出口走不到（不同區）→ 照舊當成傳到別的地方、收掉這一趟",
+       tab._i == 0 and tab._cycle == "supply" and tab._rounds == 1
+       and "走不到" in tab.status.text(), f"i={tab._i} cycle={tab._cycle} {tab.status.text()}")
+    tab = make_tab(LAND41, pos=(113.5, 168.5))
+    tab._loop = True
+    tab._reach, tab._grid = None, None
+    tab._jumped = (43.5, 83.5)
+    run(tab, 0.1)
+    ck("　讀不到地形圖 → 不放行（不猜），照舊收掉", tab._cycle == "supply",
+       f"i={tab._i} cycle={tab._cycle} {tab.status.text()}")
+    tab = make_tab(LAND41, pos=(113.5, 168.5))
+    tab._loop = True
+    tab._grid = FakeGrid({(43, 89), (43, 83)}, others={(113, 168), (107, 161)})
+    tab._reach = {(43, 89), (43, 83)}                # 可達區還是跳之前那一區的
+    tab._jumped = (43.5, 83.5)
+    run(tab, 0.1)
+    ck("　可達區還是舊區的（沒為落點重算）→ 不放行", tab._cycle == "supply",
+       f"i={tab._i} cycle={tab._cycle} {tab.status.text()}")
+    tab = make_tab(LAND41, pos=(113.5, 168.5))
+    tab._loop = True
+    tab._grid = FakeGrid({(113, 168), (43, 89)}, others={(107, 161)})   # 出口在別區
+    tab._reach = {(113, 168), (43, 89)}
+    tab._jumped = (60.0, 70.0)                # 跳之前離傳點 25 格（不在傳點上）
+    run(tab, 0.1)
+    ck("　跳之前不在傳點上、出口也走不到 → 還是「不算傳送」（伺服器拉回）",
+       tab._i == 0 and tab._cycle == "go" and "不算傳送" in tab.status.text(), tab.status.text())
+    tab = make_tab(LAND41, pos=(109.5, 163.5))    # 離記的出口只有 2.8 格
+    tab._loop = True
+    tab._grid = FakeGrid({(109, 163)}, others={(43, 89), (107, 161), (96, 166)})   # 但隔牆
+    tab._reach = {(109, 163)}
+    tab._jumped = (43.5, 83.5)
+    run(tab, 0.1)
+    ck("　離出口 3 格但隔牆（出口走不到）→ 不是正常傳送，收掉",
+       tab._cycle == "supply" and "走不到" in tab.status.text(), f"cycle={tab._cycle} {tab.status.text()}")
+    tab = make_tab(LAND41, pos=(109.5, 163.5))
+    tab._loop = True
+    tab._reach, tab._grid = None, None
+    tab._jumped = (43.5, 83.5)
+    run(tab, 0.1)
+    ck("　讀不到地形圖、離出口 3 格 → 退回比距離，算過",
+       tab._i == 1 and tab._cycle == "go", f"i={tab._i} cycle={tab._cycle} {tab.status.text()}")
+    dt.supply.run_full_supply = _orig_supply
+
+    # ★★ 2026-09-07 執行紀錄：同一次拉回「不算傳送」通知印兩遍（⓪-3 判一次、_run_step 的保險
+    #   又判一次）→ `_rollbacks` 一次加 2、ROLLBACK_MAX 3 實際上兩次就收掉。→ ⓪-3 判過這一拍不再判。
+    tab = make_tab([{"do": "portal", "to": [181.9, 74.5], "land": [200.5, 149.5]}],
+                   pos=(178.0, 71.0))
+    tab._map_key = 110
+    dt.scene.current_id = lambda _sc, **_k: 110
+    dt.scene.map_key = lambda v: v
+    tab._maps = FakeMaps()
+    tab._fight = lambda _me, _dt: False           # 沒怪 → 這一拍會跑到 _run_step
+    tab._state, tab._player = 0x1000, 0x2000
+    tab._pos_prev, tab._pos_t = (183.5, 71.0), time.monotonic()   # 上一拍在傳點旁
+    _said, _orig_notify = [], tab._notify
+    tab._notify = lambda t: (_said.append(t), _orig_notify(t))[1]
+    tab._tick()
+    n_roll = sum(1 for m in _said if "拉回" in m)
+    ck("★★ 同一拍的拉回只判一次（通知一則、拉回次數加 1）",
+       n_roll == 1 and tab._rollbacks == 1 and tab._i == 0,
+       f"n={n_roll} rollbacks={tab._rollbacks} i={tab._i} {tab.status.text()}")
+
     # ★★ 2026-09-05 無限塔第 54 步「剩 3.5 格　走完這條路線 → 重算收尾」原地不動：
     #   目標那格地形圖說不可走、最短路的終點被放寬到 3 格外、人站在那裡
     #   → 尋路器舉 exhausted → 剩下那段要**直走**（walk_exact），不是站著等重算。

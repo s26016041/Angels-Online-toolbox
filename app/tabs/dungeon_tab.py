@@ -387,7 +387,12 @@ JUMP_MAX_GAP = 0.35
 #   JUMP_TILES + 8g 格，只可能是被搬的；隔超過 JUMP_GAP_LIMIT 秒才真的不判、只重設基準。
 RUN_SPEED = 8.0
 JUMP_GAP_LIMIT = 3.0
-# 傳到的位置跟腳本記的出口差這麼多格就當「傳到別的地方」，大聲停下。
+# ★★★ 落點算不算「落在腳本記的出口」——使用者 2026-09-07 定：**「預計地點和實際地點是可以
+#   走過去的，就是合理的正常傳送」**。同一個傳點每次落點都會散（邪靈古船執行紀錄：同一趟第
+#   7／14／26 步差 4~5 格、第 41 步差 9.2 格 → 舊版「差 9 格」當成傳到別的地方收掉這一趟），
+#   差幾格不算數，看的是**出口從落點走不走得到**（同一區＝正常傳送；不同區才是傳到別的地方）。
+#   這個距離只在**讀不到地形圖**（`_reach` 是 None／可達區不是為落點算的）時當退路用
+#   （見 `_at_land`）。
 LAND_TOL = 8.0
 # ★★ 換圖之後要等座標跟上（2026-09-05 黑狐實錄）：場景編號已經變了，玩家座標卻還是
 #   舊圖的值約 1 秒（(286.8,164.9) → 一秒後才變 (122.5,50.5)）。拿舊座標在新圖上算
@@ -1309,6 +1314,7 @@ class DungeonTab(BaseTab):
         self._pos_prev = None        # 上一拍的位置（順移偵測用）
         self._pos_t = 0.0
         self._jumped = None          # 這一拍有沒有順移：有＝跳之前站的位置 (x, y)
+        self._jump_judged = False    # 這一拍的順移 ⓪-3 已經判過了（`_run_step` 那份保險別再判一次）
         self._track = deque()        # 最近 TRACK_SECS 秒走過的軌跡 [(時刻, (x, y))]（判伺服器拉回）
         self._rollbacks = 0          # 這一步從傳點上跳走卻被當成「拉回」幾次了（見 ROLLBACK_MAX）
         self._map_settle = 0.0       # 換圖後等座標跟上，這個時刻之前不算任何東西
@@ -1856,6 +1862,7 @@ class DungeonTab(BaseTab):
 
         # ⓪ 人被搬走了嗎？順移要**每一拍**都採樣，不然錯過那一下就看不到了。
         self._jumped = self._check_jump(me)
+        self._jump_judged = False
         # 換圖了嗎？—— 座標是**跟著地圖**的，圖一換舊座標全部沒有意義。
         #   只有 `portal` 那一步准許換圖（有些傳點確實會換圖）；其他時候換圖
         #   ＝被傳走／死亡回城，繼續跑就是拿別張圖的座標亂走。
@@ -1871,9 +1878,13 @@ class DungeonTab(BaseTab):
         #   還要走回 149 格外、另一區的傳點 → 「走不到傳點…屬於另一區」卡死。
         if (self._phase == "run" and self._jumped
                 and self._i < len(self._script.steps)
-                and self._script.steps[self._i].get("do") == dungeon.PORTAL
-                and self._portal_transit(self._script.steps[self._i], me)):
-            return
+                and self._script.steps[self._i].get("do") == dungeon.PORTAL):
+            if self._portal_transit(self._script.steps[self._i], me):
+                return
+            # ★ 判過了（不是傳點搬的）→ `_run_step` 那份保險這一拍**別再判一次**
+            #   （2026-09-07 執行紀錄：同一次拉回「不算傳送」通知印兩遍、`_rollbacks`
+            #   一次加 2 → ROLLBACK_MAX 3 實際上第 2 次拉回就把這一趟收掉了）。
+            self._jump_judged = True
 
         # ⓪-4 沒在等對話卻跳出對話框 → 關掉（使用者 2026-09-05，見 STRAY_WND_POLL）
         if self._phase == "run":
@@ -2797,7 +2808,7 @@ class DungeonTab(BaseTab):
             #   換圖那種由 `_check_map_change` 接手；同一張圖裡的順移看這裡
             #   （正常情況 `_tick` ⓪-3 已經先認過了，這裡是保險）。
             gx, gy = step["to"]
-            if self._jumped and self._portal_transit(step, me):
+            if self._jumped and not self._jump_judged and self._portal_transit(step, me):
                 return
             # ★★ 保險（2026-09-05 黑狐實錄的殘局）：人已經站在腳本記的出口這一側、
             #   而傳點本身在**另一區**走不到 —— 就是已經傳過來了（順移那一拍被別的
@@ -2851,17 +2862,19 @@ class DungeonTab(BaseTab):
         已經收掉），呼叫端這一拍不要再做別的；False＝不是傳點搬的，照常。
 
         四分（見 PORTAL_FROM／LAND_TOL／TRACK_SECS 的說明）：
-          · 落點在記的出口 8 格內 → 過（觸發範圍比記的寬也吃得到）；
+          · 落點「落在記的出口」→ 過（跳之前在不在傳點上都算：觸發範圍比記的寬也吃得到）。
+            「落在出口」＝**出口從落點走得到（同一區）**，不是差幾格（使用者 2026-09-07：
+            傳點每次落點都會散；見 `_at_land`，讀不到地形圖才退回比 LAND_TOL）；
           · 跳之前根本不在傳點上 → 伺服器拉回／被擊退，不算，繼續；
           · 跳之前在傳點旁、落點卻還在傳點旁**或落回剛走過的軌跡上** → 伺服器拉回，
             不算，繼續（同一步滿 ROLLBACK_MAX 次就不再信，走下一條）；
-          · 跳之前在傳點 6 格內、落點對不上出口也不像拉回 → 傳到別的地方 → **當成完成
-            一場**收掉這一趟（`_abort_trip`；使用者 2026-09-06：別關掉、別卡在那）。
+          · 跳之前在傳點 6 格內、出口從落點走不到、也不像拉回 → 傳到別的地方
+            → **當成完成一場**收掉這一趟（`_abort_trip`；使用者 2026-09-06：別關掉、別卡在那）。
         """
         gx, gy = step["to"]
         frm = self._jumped                     # 跳之前站的位置
         land = step.get("land")
-        near_land = bool(land) and _d(land, me) <= LAND_TOL
+        near_land = bool(land) and self._at_land(land, me)
         from_portal = _d((gx, gy), frm) <= PORTAL_FROM
         if not near_land and not from_portal:
             # ★ 人不在傳點上就跳了 ＝ 不是傳點搬的（伺服器拉回／被擊退）
@@ -2900,8 +2913,13 @@ class DungeonTab(BaseTab):
                     return False
                 # 同一步第 ROLLBACK_MAX 次 ＝ 不是拉回：傳點真的把人送回剛走過的地方（送錯
                 #   地方），再信下去就是走過去→被送回→走過去…無限循環 → 當成傳到別的地方。
+            # 落點跟出口不同區（出口走不到）＝真的傳到別的地方（送回房間入口／別的房間，後面的
+            #   步驟走不到）；讀不到地形圖時才是「差幾格」在講話（見 `_at_land`）。
             why = (f"⛔ 第 {self._i + 1} 步：傳點把人送到 ({me[0]:.0f}, {me[1]:.0f})，"
-                   f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— 差 {_d(land, me):.0f} 格")
+                   f"腳本記的出口是 ({land[0]:g}, {land[1]:g}) —— "
+                   + (f"出口從那裡走不到（不同區；差 {_d(land, me):.0f} 格）"
+                      if self._reach_covers(me) else
+                      f"差 {_d(land, me):.0f} 格（讀不到地形圖，只能比距離）"))
             if self._rollbacks >= ROLLBACK_MAX:
                 why += f"（同一步已經被送回剛走過的地方 {self._rollbacks} 次）"
             self._abort_trip(why)
@@ -2912,9 +2930,35 @@ class DungeonTab(BaseTab):
         self._scan.force_full(self._pid)       # 順移到新的一區＝新的怪
         self._hopeless.clear()
         self._stray_hold = time.monotonic() + STRAY_HOLD   # 遊戲正在拆舊區的視窗，別碰
-        self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f})")
+        off = f"（離腳本記的出口 {_d(land, me):.0f} 格）" if land else ""
+        self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f}){off}")
         self._next()
         return True
+
+    def _reach_covers(self, me) -> bool:
+        """現在這份可達區是不是**為這個位置算的**（⓪-2 站到區外就重算；人落在不可走格上時
+        錨點是旁邊那一圈，所以看 3×3）。舊區的可達區拿來問出口永遠是「走不到」——不能拿來判。"""
+        if self._reach is None:
+            return False
+        cx, cy = int(me[0]), int(me[1])
+        return any((cx + dx, cy + dy) in self._reach
+                   for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+
+    def _at_land(self, land, me) -> bool:
+        """落點算不算「落在腳本記的出口」。
+
+        ★★★ 使用者 2026-09-07 定：「每次傳送，預計地點和實際地點是可以走過去的，就是合理的
+          正常傳送」—— 傳點每次落點都會散一點（邪靈古船同一趟差 4~9 格），差幾格不算數，
+          看的是**出口從落點走不走得到**（同一區）。
+        ⚠ 讀不到地形圖／碎片區（`_reach` 是 None）或可達區不是為落點算的 → 沒東西可問，
+          退回只看距離（LAND_TOL）。⛔ 這裡不能學 `_can_reach` 的「不知道就回 True」：那支
+          是過濾怪（安全退化＝多打幾隻），這支是放行傳點那一步，不知道就照舊比距離。
+        """
+        if not land:
+            return False
+        if self._reach_covers(me):
+            return self._can_reach(land)
+        return _d(land, me) <= LAND_TOL
 
     def _rolled_back(self, me):
         """落點是不是在剛走過的軌跡上（伺服器把人放回它最後認可的位置，見 TRACK_SECS）。
