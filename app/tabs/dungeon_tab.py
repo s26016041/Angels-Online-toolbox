@@ -538,7 +538,23 @@ BUMP_TRIES = 10            # 一個目標最多挑幾次（挑不到就往機關
 #   碼是從物件旗標算的，不是猜的），而且主動送**不受去重欄 +0x208 限制**
 #   （客戶端站著不動永遠不會送第二次，那正是「要退開再撞」的由來）。
 #   ⚠ 隔太遠送伺服器不理（無限塔第 35 步實錄）—— 所以是「一邊在它旁邊亂走一邊送」。
-BUMP_POKE = 1.5            # 每幾秒對機關送一發 0x0D
+BUMP_POKE = 1.5            # 每幾秒對機關送一發 0x0D（亂走那條退路用）
+# ★★★★★ 2026-09-07 晚**實機解開**（黑狐 莉維坦的寢室，使用者授權當場做的實驗）：
+#   擋路的是雕像，但**開關是它旁邊那 4 個「大型地板點」**（60305，旗標
+#   `+0x1FE=0x8104`、碼 3 —— 跟副本傳點同一族的觸發物件）。流程是：
+#     人**踩上去** → 客戶端送 0x0D → 伺服器回一頁**沒有選項**的對話
+#     → **要按「確定」才生效** → 雕像那 23 格阻擋整片消失、外觀 60414→60301。
+#   而官方的確定鈕送的是 **`talkaction(1)`**（反組譯 0x5B0923：`MESSAGE_OPTION1`
+#   與 `MESSAGE_SELECT_REWARD` 都空的那一頁走這條），⛔ **不是** `close_page`
+#   的 messageclose —— 這就是先前怎麼撞都沒用的原因。
+#   實測三段對照：隔空送 0x0D → 沒反應；走上去踩但不按確定 → 沒反應；
+#   踩了再送 talkaction(1) → bit0 163→140（正好雕像那 23 格）、這一區 17587→36619。
+GATE_ACK = 1               # 「確定」的對話動作碼（＝官方那一包 0x0B）
+GATE_ON = 1.0              # 站到這麼近算「踩上去了」
+GATE_ACK_WAIT = 1.0        # 踩上去之後等對話冒出來幾秒才按確定
+GATE_GO_SECS = 20.0        # 走去一個開關最多花幾秒（走不到就跳過換下一個）
+# ⛔ 離腳本自己記的傳點這麼近的觸發物件**不踩**（那是真傳點，踩了會被搬走）。
+GATE_PORTAL_TOL = 2.0
 BUMP_CLEAR = 4             # bit0 格數比一開始少這麼多（或歸零）就算「開了」
 # ⛔ 沒有次數上限（同傳點的撞法：副本的門本來就是解謎才開，出口是取消勾選）。
 # ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
@@ -3196,7 +3212,10 @@ class DungeonTab(BaseTab):
         """
         steps = self._script.steps if self._script else []
         step = steps[self._i] if self._i < len(steps) else None
-        if step is not None and step.get("do") == dungeon.INTERACT:
+        # ⚠⚠ 撞機關那一步也**不准插手**（2026-09-07）：機關的對話要按官方的
+        #   「確定」（talkaction 1）才會生效，這支跑去 destroy 掉就等於白撞。
+        if step is not None and step.get("do") in (dungeon.INTERACT,
+                                                   dungeon.BUMP):
             return False
         self._stray_t -= dt
         if self._stray_t > 0:
@@ -3327,6 +3346,44 @@ class DungeonTab(BaseTab):
         far = max(_d((ax, ay), c) for c in cells)
         return max(1.0, min(far + BUMP_PAD, BUMP_RAD_MAX))
 
+    def _gate_triggers(self, step: dict, rad: float):
+        """機關周圍的**開關**（踩上去會送 0x0D 的觸發物件），由近到遠。
+
+        讀不到回 None（⚠ 讀不到 ≠ 沒有）；⛔ 排掉腳本自己記成 `portal` 步驟的
+        那些 —— 那是真傳點，踩上去人會被搬走。
+        """
+        at = (float(step["at"][0]), float(step["at"][1]))
+        trigs = portal.nearby(self._sc, at, rad)
+        if trigs is None:
+            return None
+        skip = [tuple(st["to"]) for st in self._script.steps
+                if st.get("do") == dungeon.PORTAL and st.get("to")]
+        out = [t for t in trigs
+               if all(_d(p, (t.x, t.y)) > GATE_PORTAL_TOL for p in skip)]
+        out.sort(key=lambda t: _d((t.x, t.y), at))
+        return out
+
+    def _poke_gate(self, at, want) -> str:
+        """對開關**主動送一發 0x0D**（＝人踩上去時客戶端自己送的那一包）。回說明。
+
+        ⚠⚠ ⛔ 不可以走 `_send_portal`：那支用 `_pick`，而 `_pick` 會把「資料表
+          標成看不見」的物件濾掉 —— **開關那種「大型地板點」60305 正好就是**
+          （2026-09-07 實測 `mapobj.hidden(60305)` 是 True），濾掉就永遠送不到。
+        ⚠ 送出前的重讀重驗在 `portal.enter` 裡（+0x1D0 每次載圖重配）。
+        """
+        trigs = portal.nearby(self._sc, at, PROP_TOL)
+        if trigs is None:
+            return "物件清單讀不到"
+        if not trigs:
+            return "那一格附近沒有開關"
+        same = [t for t in trigs if want is not None and t.model == want]
+        hit = (same or trigs)[0]
+        pf = move.pathfinder_this(self._sc)
+        if not pf:
+            return "讀不到自己的實體（載圖中？）"
+        ok, msg = portal.enter(self._mover, self._sc, hit, pf)
+        return "已送 0x0D" if ok else msg
+
     def _gate_wander(self, step: dict, rad: float) -> tuple[float, float]:
         """在機關周圍 `rad` 格內隨便挑一格**站得住、而且我走得到**的落腳點。
 
@@ -3353,15 +3410,20 @@ class DungeonTab(BaseTab):
     def _do_bump(self, step: dict, me, dt: float) -> None:
         """來回撞一個機關，撞到它蓋的阻擋消失為止（使用者 2026-09-07）。
 
-        「撞」有兩層，一起做：
-        · **亂走**：在機關周圍「阻擋鋪到多遠 ＋ 1 格」的範圍內隨機挑落腳點
-          （`walk_exact` 直送，⛔ 不算路徑、不問尋路 —— 算得出來就不必撞了），
-          走 BUMP_IN 秒回退開點（製作時使用者站的那一格），再回去亂走。
-        · **每 BUMP_POKE 秒主動送一發 0x0D**（＝人踩上去時客戶端自己送的那一包，
-          2026-09-07 封包擷取解出來的；見 BUMP_POKE 那段註解）。
-        ⛔ 沒有次數上限；卡太久由既有的「同一段超過 2 分鐘」記重要事件。
-        ⚠ 撞出來的對話框由 `_stray_dialog` 收（BUMP 不是 INTERACT，本來就在它
-          管的範圍）—— 不收乾淨的話後面每一發都等於沒送到。
+        ★★★★ 正解（2026-09-07 實機解開，見 GATE_ACK 那段）：擋路的是雕像，
+        但**開關是它旁邊的觸發物件**（大型地板點那種，踩上去會送 0x0D）。一輪＝
+
+            掃出周圍的開關 → 一個一個**走上去踩** → 站上去補一發 0x0D
+            → **按官方的「確定」（talkaction 1）** → 換下一個
+            → 整輪踩完回退開點 → 再來一輪
+
+        直到它蓋的阻擋整片消失（見 `_gate_open`）。⛔ 沒有次數上限；卡太久由
+        既有的「同一段超過 2 分鐘」記重要事件。走不到某個開關就跳過換下一個。
+        ⚠⚠ 對話**不可以**用 `close_page`（messageclose）收 —— 伺服器要的是
+          `talkaction(1)`；所以 `_stray_dialog` 在這一步也停手（那支會 destroy
+          掉對話框，等於白踩）。
+        退路：附近**沒有**開關時才回到舊行為（在它周圍亂走＋每 BUMP_POKE 秒
+        對機關本身送一發 0x0D）。
         """
         ax, ay = step["at"]
         tag = f"第 {self._i + 1} 步"
@@ -3389,13 +3451,14 @@ class DungeonTab(BaseTab):
                 self._gate = None
                 self._next()
                 return
-        # ── ② 撞 ↔ 退開 ───────────────────────────────────────────
+        # ── ② 踩開關 → 按確定（找不到開關才退回亂走）────────────────
         gate = self._gate
         if gate is None:
             spot = step.get("stand")
             spot = (float(spot[0]), float(spot[1])) if spot else None
-            self._gate = gate = {"phase": "in", "spot": spot, "n": 1, "t": 0.0}
-            self._gate_send = 0.0
+            self._gate = gate = {"phase": "scan", "spot": spot, "n": 1,
+                                 "t": 0.0, "i": 0, "trigs": []}
+            self._gate_send = self._gate_poke = 0.0
         gate["t"] += dt
         self._gate_send -= dt
         blk = ("" if self._gate_last is None
@@ -3403,49 +3466,123 @@ class DungeonTab(BaseTab):
                + (f"（一開始 {self._gate_base}）"
                   if self._gate_base is not None
                   and self._gate_base != self._gate_last else ""))
-        if gate["phase"] == "in":
-            if gate["t"] >= BUMP_IN and gate["spot"] is not None:
-                gate["phase"], gate["t"] = "out", 0.0
-                self._gate_send = 0.0
-                self._say(f"{tag}　第 {gate['n']} 輪沒撞開 → 回退開點{blk}")
+        rad = gate.get("r")
+        if rad is None:
+            rad = gate["r"] = self._gate_radius(step)
+        if rad is None:
+            # ⚠ 還沒讀到它的阻擋鋪到哪 → **不要走**（⛔ 沒有預設半徑）。
+            #   讀不到是暫時的，重試；真的沒阻擋上面那一關會判成選錯物件。
+            self._say(f"{tag}　還沒讀到機關 ({ax}, {ay}) 的阻擋範圍，重試中…")
+            return
+
+        if gate["phase"] == "scan":
+            # ★★★★ 開關＝機關周圍的**觸發物件**（見 GATE_ACK 那段）。每一輪重掃：
+            #   撞開之後外觀會換，位置與清單都可能不一樣。
+            trigs = self._gate_triggers(step, rad)
+            if trigs is None:
+                self._say(f"{tag}　物件清單讀不到，重試中…")
                 return
-            rad = gate.get("r")
-            if rad is None:
-                rad = gate["r"] = self._gate_radius(step)
-            if rad is None:
-                # ⚠ 還沒讀到它的阻擋鋪到哪 → **不要走**（沒有預設半徑）。
-                #   讀不到是暫時的，重試；真的沒阻擋上面那一關會判成選錯物件。
-                self._say(f"{tag}　還沒讀到機關 ({ax}, {ay}) 的阻擋範圍，重試中…")
+            gate["trigs"] = [(t.x, t.y, t.model) for t in trigs]
+            gate["i"], gate["t"] = 0, 0.0
+            gate["phase"] = "go" if trigs else "wander"
+            self._gate_send = self._gate_poke = 0.0
+            if trigs:
+                self._notify(f"{tag}　機關周圍 {rad:.1f} 格內有 "
+                             f"{len(trigs)} 個開關（踩上去會送 0x0D 的）"
+                             f" → 一個一個去踩（第 {gate['n']} 輪）")
+            else:
+                self._notify(f"{tag}　機關周圍 {rad:.1f} 格內**沒有**開關"
+                             f" → 退回亂走撞它")
+            return
+
+        if gate["phase"] == "go":
+            tx, ty, model = gate["trigs"][gate["i"]]
+            if _d((tx, ty), me) <= GATE_ON:
+                gate["phase"], gate["t"] = "ack", 0.0
+                # 站上去先補一發 0x0D：客戶端自己那支有去重欄，同一個位置不會
+                # 送第二次（見 portal.py 檔頭）；我們主動送沒有這個限制。
+                gate["poke"] = self._poke_gate((tx, ty), model)
+                self._say(f"{tag}　踩上開關 ({tx:g}, {ty:g})"
+                          f"　{gate['poke']}{blk}")
+                return
+            if gate["t"] >= GATE_GO_SECS:
+                # 走不到就跳過換下一個（⛔ 不停機：門是解謎才開的）
+                self._say(f"{tag}　走不到開關 ({tx:g}, {ty:g})"
+                          f"（撐了 {GATE_GO_SECS:.0f} 秒）→ 換下一個")
+                self._gate_next(gate)
                 return
             if self._gate_send <= 0:
-                self._gate_send = BUMP_STEP
-                gate["to"] = self._gate_wander(step, rad)
-                self._walk_onto(*gate["to"])
-            # ★★★★ 一邊亂走一邊**主動送 0x0D**（＝踩上去那一包，見 BUMP_POKE）。
-            #   ⛔ 找不到觸發物件就只回報，絕不就近送一個（`_send_portal` 的規矩）。
-            self._gate_poke -= dt
-            if self._gate_poke <= 0:
-                self._gate_poke = BUMP_POKE
-                gate["poke"] = self._send_portal((ax, ay), step.get("model"),
-                                                 "機關")
-            tx, ty = gate.get("to") or (float(ax), float(ay))
-            note = "" if gate["spot"] is not None else "　（沒記退開點 → 不回頭）"
-            self._say(f"{tag}　在機關 ({ax}, {ay}) 周圍 {rad:.1f} 格內亂走"
-                      f"（第 {gate['n']} 輪）　目標 ({tx:g}, {ty:g})"
-                      f"　{gate.get('poke', '')}{blk}{note}　{self._mon_note()}")
+                self._gate_send = BUMP_SEND
+                self._walk_onto(tx, ty)
+            self._say(f"{tag}　去踩第 {gate['i'] + 1}/{len(gate['trigs'])} 個開關"
+                      f" ({tx:g}, {ty:g})　剩 {_d((tx, ty), me):.1f} 格"
+                      f"（第 {gate['n']} 輪）{blk}　{self._mon_note()}")
             return
-        sx, sy = gate["spot"]
-        if _d((sx, sy), me) <= BUMP_ARRIVE or gate["t"] >= BUMP_OUT:
-            gate["phase"], gate["t"] = "in", 0.0
-            gate["n"] += 1
+
+        if gate["phase"] == "ack":
+            # ★★★★ **按官方的「確定」**（talkaction 1）——伺服器要收到這一包，
+            #   機關才生效（2026-09-07 實測，見 GATE_ACK）。⛔ 不是 close_page。
+            if gate["t"] < GATE_ACK_WAIT:
+                self._say(f"{tag}　等機關的對話冒出來…"
+                          f"（{gate['t']:.1f}/{GATE_ACK_WAIT:.1f} 秒）{blk}")
+                return
+            try:
+                ok = sell.talk(self._mover, GATE_ACK)
+            except Exception as exc:                     # noqa: BLE001
+                ok, exc_s = False, str(exc)
+            else:
+                exc_s = ""
+            self._say(f"{tag}　按「確定」（talkaction {GATE_ACK}）"
+                      f"{'送出' if ok else '沒送出（指令槽忙碌）' + exc_s}"
+                      f"{blk}")
+            self._gate_next(gate)
+            return
+
+        if gate["phase"] == "back":
+            spot = gate["spot"]
+            if spot is None:
+                gate["phase"], gate["t"] = "scan", 0.0
+                gate["n"] += 1
+                return
+            sx, sy = spot
+            if _d((sx, sy), me) <= BUMP_ARRIVE or gate["t"] >= BUMP_OUT:
+                gate["phase"], gate["t"] = "scan", 0.0
+                gate["n"] += 1
+                self._say(f"{tag}　回到退開點 → 再踩一輪（第 {gate['n']} 輪）{blk}")
+                return
+            if self._gate_send <= 0:
+                self._gate_send = BUMP_SEND
+                self._walk_onto(sx, sy)
+            self._say(f"{tag}　回退開點 ({sx:g}, {sy:g})　剩 "
+                      f"{_d((sx, sy), me):.1f} 格{blk}")
+            return
+
+        # ── 退路：附近沒有開關 → 照舊在它周圍亂走＋送 0x0D ──────────
+        if gate["t"] >= BUMP_IN and gate["spot"] is not None:
+            gate["phase"], gate["t"] = "back", 0.0
             self._gate_send = 0.0
-            self._say(f"{tag}　回到退開點 → 再去亂走（第 {gate['n']} 輪）{blk}")
+            self._say(f"{tag}　第 {gate['n']} 輪沒撞開 → 回退開點{blk}")
             return
         if self._gate_send <= 0:
-            self._gate_send = BUMP_SEND
-            self._walk_onto(sx, sy)
-        self._say(f"{tag}　退開到 ({sx:g}, {sy:g})　剩 "
-                  f"{_d((sx, sy), me):.1f} 格{blk}")
+            self._gate_send = BUMP_STEP
+            gate["to"] = self._gate_wander(step, rad)
+            self._walk_onto(*gate["to"])
+        self._gate_poke -= dt
+        if self._gate_poke <= 0:
+            self._gate_poke = BUMP_POKE
+            gate["poke"] = self._poke_gate((ax, ay), step.get("model"))
+        tx, ty = gate.get("to") or (float(ax), float(ay))
+        note = "" if gate["spot"] is not None else "　（沒記退開點 → 不回頭）"
+        self._say(f"{tag}　在機關 ({ax}, {ay}) 周圍 {rad:.1f} 格內亂走"
+                  f"（第 {gate['n']} 輪）　目標 ({tx:g}, {ty:g})"
+                  f"　{gate.get('poke', '')}{blk}{note}　{self._mon_note()}")
+
+    def _gate_next(self, gate: dict) -> None:
+        """踩完一個開關 → 換下一個；整輪踩完就回退開點再來一輪。"""
+        gate["i"] += 1
+        gate["t"] = 0.0
+        self._gate_send = 0.0
+        gate["phase"] = "go" if gate["i"] < len(gate["trigs"]) else "back"
 
     def _do_interact(self, step: dict, me, dt: float,
                      tag: str = "", finish=None) -> None:

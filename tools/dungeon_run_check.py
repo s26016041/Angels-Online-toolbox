@@ -3376,71 +3376,95 @@ def main() -> int:
         dt.terrain.object_block_cells = lambda _sc, x, y, r: cells
         return t
 
-    # ★★★ 使用者 2026-09-07 定案的撞法：以「機關到它的阻擋」為半徑再多一格，
-    #    在它**周圍亂走**，走一陣子回退開點，再去亂走。
+    # ★★★★ 2026-09-07 實機解開：擋路的是雕像，**開關是它旁邊的觸發物件**
+    #    （踩上去會送 0x0D）。一輪＝掃開關 → 一個一個走上去踩 → 補一發 0x0D →
+    #    **按官方的「確定」talkaction(1)** → 換下一個 → 踩完回退開點 → 再一輪。
     _cells = [(23, 10), (20, 12)]                 # 阻擋最遠鋪到 3 格 → 半徑 4
     _room = {(x, y) for x in range(8, 30) for y in range(4, 18)}
-    tab = bump_tab([15], cells=_cells)            # 一直有 15 格阻擋 ＝ 撞不開
-    tab.trigs = [FakeTrig(20.0, 10.0, 60414)]     # 那個石像是「踩上去送 0x0D」的
-    tab._grid = FakeGrid(_room)
-    tab._reach, tab._reach_n = set(_room), len(_room)
+
+    def wire_room(t, trigs=()):
+        t._grid = FakeGrid(_room)
+        t._reach, t._reach_n = set(_room), len(_room)
+        t.trigs = list(trigs)
+        return t
+
+    tab = wire_room(bump_tab([15], cells=_cells),
+                    [FakeTrig(23.0, 10.0, 60305)])      # 開關在 4 格外
     run(tab, 0.5)
-    ck("　狀態列講得出在亂走、半徑多少、還剩幾格阻擋",
-       "亂走" in tab.status.text() and "4.0 格" in tab.status.text()
-       and "阻擋 15 格" in tab.status.text(), tab.status.text())
     ck("★★★ 半徑＝機關到它蓋的阻擋最遠那一格 ＋ 1 格",
        abs(tab._gate["r"] - 4.0) < 1e-6, str(tab._gate.get("r")))
-    # ★★★★ 2026-09-07 封包擷取：石像是「踩上去會送 0x0D」的觸發物件，
-    #    而我們之前四條路都沒送過這一包 → 亂走的同時要主動送。
-    ck("★★★★ 一邊亂走一邊**主動送 0x0D**（＝人踩上去時客戶端自己送的那一包）",
-       tab.portal_sent == [60414], str(tab.portal_sent))
-    ck("　狀態列講得出送出去了沒", "0x0D" in tab.status.text(), tab.status.text())
-    run(tab, dt.BUMP_POKE - 1.0)      # 這一台已經跑了 0.5 秒
-    ck(f"　{dt.BUMP_POKE:g} 秒還沒到不重送（⛔ 不是每拍狂送）",
-       len(tab.portal_sent) == 1, str(tab.portal_sent))
-    run(tab, 0.8)
-    ck(f"★ 過了 {dt.BUMP_POKE:g} 秒才送第二發", len(tab.portal_sent) == 2,
-       str(tab.portal_sent))
-    run(tab, dt.BUMP_IN)
-    _wander = [w for w in tab.walked if w != (10.0, 10.0)]   # 排掉「回退開點」
-    ck("★★★ 撞法＝在機關周圍**亂走**（每個目標都在半徑內、⛔ 不是只走它身上）",
-       len(_wander) >= 2
-       and all(((x - 20) ** 2 + (y - 10) ** 2) ** 0.5 <= 4.0 + 1.0
-               for x, y in _wander)          # +1：格中心取整的誤差
-       and len(set(_wander)) >= 2, str(tab.walked))
-    ck("　亂走的落腳點一定站得住、而且在我這一區",
-       all((int(x), int(y)) in _room for x, y in _wander), str(tab.walked))
+    ck("★★★★ 掃得到「開關」（機關周圍的觸發物件）就去踩，不再亂走",
+       tab._gate["phase"] == "go" and len(tab._gate["trigs"]) == 1
+       and "開關" in tab.status.text(), f"{tab._gate} {tab.status.text()}")
+    ck("　走的是**開關那一格**（walk_exact 直送，⛔ 不算路徑）",
+       tab.walked and tab.walked[0] == (23.0, 10.0), str(tab.walked[:2]))
     ck("　⛔ 完全沒有問過尋路器", tab._nav.calls == 0,
        f"尋路器被呼叫了 {tab._nav.calls} 次")
-    run(tab, 1.0)
-    ck("★★ 亂走幾秒沒開 → 回**退開點**（來回）",
-       (10.0, 10.0) in tab.walked, str(tab.walked))
-    _n_before = len(tab.walked)
-    run(tab, dt.BUMP_OUT + dt.BUMP_IN + 1.0)
-    ck("★ 回到退開點又出去亂走（一直來回）",
-       any(w != (10.0, 10.0) for w in tab.walked[_n_before:]),
-       str(tab.walked[_n_before:]))
-    ck("　⛔ 撞不開不停機、不往下一步（沒有次數上限）",
+    tab._pos = [23.0, 10.0]                            # 踩上去了
+    run(tab, 0.2)
+    ck("★★ 踩上去 → 補送一發 0x0D（客戶端自己那支有去重欄，我們沒有）",
+       tab.portal_sent == [60305], str(tab.portal_sent))
+    ck("　按確定之前先等對話冒出來", tab._gate["phase"] == "ack"
+       and not tab.sent, f"{tab._gate['phase']} {tab.sent}")
+    run(tab, dt.GATE_ACK_WAIT + 0.2)
+    ck("★★★★ 踩完**按官方的「確定」**（talkaction 1）—— 伺服器要收到這一包"
+       "機關才生效（⛔ 不是 close_page 的 messageclose）",
+       tab.sent == [dt.GATE_ACK], str(tab.sent))
+    ck("　這一輪的開關踩完了 → 回退開點", tab._gate["phase"] == "back",
+       tab._gate["phase"])
+    tab._pos = [10.0, 10.0]
+    run(tab, 0.3)
+    ck("★ 回到退開點 → 重掃開關、再踩一輪（⛔ 沒有次數上限）",
+       tab._gate["n"] == 2 and tab._i == 0 and tab.run_cb.isChecked(),
+       f"第 {tab._gate['n']} 輪　第 {tab._i + 1} 步")
+
+    # ⛔ 腳本自己記的傳點不准踩（踩了會被搬走）
+    tab = bump_tab([15], cells=_cells)
+    tab._script.steps.insert(0, {"do": dungeon.PORTAL, "to": [23, 10]})
+    tab._i = 1                                          # 現在跑的是 bump 那一步
+    wire_room(tab, [FakeTrig(23.0, 10.0, 60305)])
+    run(tab, 0.4)
+    ck("★★ 腳本自己的傳點**不踩**（那是真傳點，踩了人會被搬走）→ 退回亂走",
+       tab._gate["phase"] == "wander" and not tab._gate["trigs"],
+       f"{tab._gate['phase']} {tab._gate['trigs']}")
+
+    # 走不到某個開關 → 跳過換下一個（⛔ 不停機）
+    tab = wire_room(bump_tab([15], cells=_cells),
+                    [FakeTrig(23.0, 10.0, 60305), FakeTrig(24.0, 12.0, 60305)])
+    run(tab, dt.GATE_GO_SECS + 0.5)
+    ck("★ 走不到就跳過換下一個（⛔ 不停機）",
+       tab._gate["i"] == 1 and tab._i == 0 and tab.run_cb.isChecked(),
+       f"i={tab._gate['i']} 第 {tab._i + 1} 步")
+
+    # 沒有開關 → 退回舊行為：在它周圍亂走＋對機關送 0x0D
+    tab = wire_room(bump_tab([15], cells=_cells), [])
+    run(tab, 0.5)
+    ck("★★ 附近**沒有**開關 → 退回在它周圍亂走（半徑內、站得住、在我這一區）",
+       tab._gate["phase"] == "wander" and tab.walked
+       and all(((x - 20) ** 2 + (y - 10) ** 2) ** 0.5 <= 4.0 + 1.0
+               for x, y in tab.walked)
+       and all((int(x), int(y)) in _room for x, y in tab.walked),
+       f"{tab._gate['phase']} {tab.walked}")
+    ck("　亂走時照舊每隔幾秒對機關送一發 0x0D", tab.portal_sent == [],
+       str(tab.portal_sent))          # 這一台附近沒有觸發物件 → 不亂送
+    run(tab, dt.BUMP_IN + dt.BUMP_OUT + 1.0)
+    ck("　亂走幾輪也不停機、不往下一步",
        tab._i == 0 and tab.run_cb.isChecked(), f"第 {tab._i + 1} 步")
 
     # 半徑：讀不到就**不走**（⛔ 沒有預設半徑）；別的物件的阻擋撐不爆它
-    tab = bump_tab([15])                          # cells=None ＝ 讀不到
-    tab._grid = FakeGrid(_room)
-    tab._reach = set(_room)
+    tab = wire_room(bump_tab([15]), [])            # cells=None ＝ 讀不到
     run(tab, 0.5)
     ck("★★ 還沒讀到阻擋範圍 → **不走**，⛔ 不准自己編一個預設半徑",
        not tab.walked and tab._gate.get("r") is None
        and "重試" in tab.status.text(), f"{tab.walked} {tab.status.text()}")
     ck("　⛔ 程式裡沒有「預設半徑」這個常數", not hasattr(dt, "BUMP_RAD_FALLBACK"))
-    tab = bump_tab([15], cells=[(20 + dt.BUMP_R, 10)])   # 遠處別的物件的阻擋
-    tab._grid = FakeGrid(_room)
-    tab._reach = set(_room)
+    tab = wire_room(bump_tab([15], cells=[(20 + dt.BUMP_R, 10)]), [])
     run(tab, 0.2)
     ck("　半徑有上限（方框裡別的物件的阻擋撐不爆它）",
        abs(tab._gate["r"] - dt.BUMP_RAD_MAX) < 1e-6, str(tab._gate.get("r")))
 
-    tab = bump_tab([15, 15, 0])              # 第三次讀到：阻擋整片不見了
-    tab._reach, tab._reach_n = {(19, 10)}, 1
+    tab = bump_tab([15, 15, 0], cells=_cells)     # 第三次讀到：阻擋整片不見了
+    wire_room(tab, [FakeTrig(23.0, 10.0, 60305)])
     run(tab, 2 * dt.BUMP_POLL + 0.4)
     ck("★★★ 它蓋的阻擋不見了 ＝ 機關開了 → 這一步完成", tab._i == 1,
        f"第 {tab._i + 1} 步　{tab.status.text()}")
@@ -3448,7 +3472,7 @@ def main() -> int:
        tab._reach is None and tab._grid_t == 0.0,
        f"reach={tab._reach} grid_t={tab._grid_t}")
 
-    tab = bump_tab([None])                   # 地形讀不到
+    tab = wire_room(bump_tab([None], cells=_cells), [])   # 地形讀不到
     run(tab, 3 * dt.BUMP_POLL)
     ck("★★ 地形讀不到 ⛔ 不可以當成「開了」（讀不到 ≠ 沒有阻擋）",
        tab._i == 0, f"第 {tab._i + 1} 步")
@@ -3470,7 +3494,6 @@ def main() -> int:
     #   真的跑起來時 `_stop` 看到 ⛔ 開頭就會通知（見 PROBLEM_MARKS）。
 
     # 外觀換了（60414「蠍子雕像不可走」→ 60301「門開關火不給點」）＝也是開了。
-    # ⚠ 這一條接住「基準本來就低、光看格數不會動」的那種（上一趟撞開的）。
     tab = bump_tab([7], props=[FakeProp(20.0, 10.0, 60301)])
     run(tab, 0.3)
     ck("★★ 外觀換成啟動後的樣子 → 也算開了（⛔ 不是看物件在不在）",
@@ -3479,17 +3502,13 @@ def main() -> int:
     run(tab, 0.3)
     ck("　外觀還是腳本記的那個 → 繼續撞", tab._i == 0, f"第 {tab._i + 1} 步")
 
-    tab = bump_tab([15], cells=_cells)            # 附近沒有觸發物件
-    tab._grid = FakeGrid(_room)
-    tab._reach = set(_room)
-    run(tab, 1.0)
-    ck("　⛔ 附近掃不到觸發物件 → 不亂送 0x0D，但照樣繼續亂走撞",
-       tab.portal_sent == [] and tab.walked and tab._i == 0,
-       f"{tab.portal_sent} {tab.walked[:2]}")
+    # ⚠⚠ 撞機關這一步**不准**讓「自動收殘留對話」那支插手（它會 destroy 掉
+    #    對話框，等於白踩 —— 伺服器要的是 talkaction(1)）
+    tab = wire_room(bump_tab([15], cells=_cells), [FakeTrig(23.0, 10.0, 60305)])
+    ck("★★★★ `_stray_dialog` 在撞機關這一步停手（⛔ 不准收掉機關的對話）",
+       tab._stray_dialog(1.0) is False)
 
-    tab = bump_tab([7], stand=None, cells=_cells)   # 舊腳本沒記退開點
-    tab._grid = FakeGrid(_room)
-    tab._reach = set(_room)
+    tab = wire_room(bump_tab([7], stand=None, cells=_cells), [])
     run(tab, dt.BUMP_IN + 1.0)
     ck("　沒記退開點 → 一直在它周圍亂走，不會拿 (0,0) 當退開點",
        tab.walked and (0.0, 0.0) not in tab.walked
