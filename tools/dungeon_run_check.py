@@ -2234,16 +2234,52 @@ def main() -> int:
     pos2 = [128.0, 270.0]
     mk2._me = lambda _sc: tuple(pos2)
     dmt.scene.current_id = lambda _sc, **_k: 110
-    mk2._pw = (0, time.monotonic() + 60.0, (134.0, 270.0), time.monotonic())
+    mk2._close_dialog_quiet = lambda: None       # 收對話那支要真的分身，測試裡拔掉
+    mk2._pw = (0, time.monotonic() + 60.0, (134.0, 270.0), time.monotonic(), 110)
     mk2._portal_watch()
     ck("★ 製作頁：跳之前離傳點 10 格（拉回）→ 不記出口、繼續盯",
        "land" not in mk2._script.steps[0] and mk2._pw is not None,
        str(mk2._script.steps[0]))
     pos2[:] = [47.5, 278.5]
-    mk2._pw = (0, time.monotonic() + 60.0, (141.0, 277.0), time.monotonic())
+    mk2._pw = (0, time.monotonic() + 60.0, (141.0, 277.0), time.monotonic(), 110)
     mk2._portal_watch()
     ck("★ 製作頁：從傳點上跳走 → 記出口",
        mk2._script.steps[0].get("land") == [47.5, 278.5], str(mk2._script.steps[0]))
+    # ★★ 使用者 2026-09-07：「他傳送怎不紀錄出口，他一對話就會立即傳送」——
+    #    換圖型的傳送座標不見得會跳，舊版永遠記不到 → 換圖也要算傳送。
+    mk3 = DungeonMakeTab()
+    mk3._script = dungeon.Script(name="t", steps=[{"do": "portal",
+                                                   "to": [141.3, 277.6],
+                                                   "menu": [1]}])
+    mk3._cur = lambda: (1, object())
+    mk3._me = lambda _sc: (12.0, 34.0)
+    mk3._close_dialog_quiet = lambda: None
+    dmt.scene.current_id = lambda _sc, **_k: 126          # 已經換到別張圖
+    mk3._pw = (0, time.monotonic() + 60.0, None, 0.0, 110)
+    mk3._portal_watch()
+    ck("★★★ 換圖也算傳送 → 出口＋新的場景一起記進去",
+       mk3._script.steps[0].get("land") == [12.0, 34.0]
+       and mk3._script.steps[0].get("scene") == dmt.scene.map_key(126)
+       and mk3._pw is None, str(mk3._script.steps[0]))
+    # 對話傳送取樣容易隔久一點 → 放寬（同圖那條）
+    mk4 = DungeonMakeTab()
+    mk4._script = dungeon.Script(name="t", steps=[{"do": "portal",
+                                                   "to": [141.3, 277.6],
+                                                   "menu": [1]}])
+    mk4._cur = lambda: (1, object())
+    mk4._me = lambda _sc: (47.5, 278.5)
+    mk4._close_dialog_quiet = lambda: None
+    dmt.scene.current_id = lambda _sc, **_k: 110
+    mk4._pw = (0, time.monotonic() + 60.0, (141.0, 277.0),
+               time.monotonic() - (dmt.JUMP_MAX_GAP + 0.3), 110)
+    mk4._portal_watch()
+    ck("★★ 對話傳送：取樣隔了 0.7 秒照樣記得到出口（對話框開起來會拖慢取樣）",
+       mk4._script.steps[0].get("land") == [47.5, 278.5],
+       str(mk4._script.steps[0]))
+    ck("　⚠ 但隔太久（超過 TALK_JUMP_GAP）還是不判",
+       dmt.TALK_JUMP_GAP > dmt.JUMP_MAX_GAP)
+    mk3.on_close()
+    mk4.on_close()
     mk = DungeonMakeTab()
     mk._script = dungeon.Script(name="t")
     mk._script.entrance = {"scene": 71, "to": [10.0, 20.0], "model": 60001}

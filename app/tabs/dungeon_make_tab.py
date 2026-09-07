@@ -98,6 +98,15 @@ PORTAL_FROM = 6.0
 #   最後認可的位置，不是傳點搬的 → 不記成出口（記了就是一份錯的 land）。
 TRACK_SECS = 30.0
 TRACK_TOL = 2.0
+# ★★ 對話傳送（點了就被傳走那種）取樣容易隔比較久 —— 對話框正在開、畫面在載，
+#   0.4 秒常常不夠（使用者 2026-09-07：「他傳送怎不紀錄出口，他一對話就會立即
+#   傳送」）。這種步驟人是**站著講話**、位置本來就在傳點旁，放寬不會誤判
+#   （「跳之前離傳點 ≤ PORTAL_FROM」與「落點不在剛走過的軌跡上」兩道閘還在）。
+TALK_JUMP_GAP = 2.5
+# ⚠⚠ 傳送**那一瞬間不准收對話框** —— 遊戲正在拆舊區的視窗，收下去會讀到 NULL
+#   直接當掉（[[game-crash-dump-analysis]] 9/6 家族④，順移後 2 秒不收）。
+#   所以記到出口之後隔這麼久才收。
+CLOSE_AFTER_JUMP = 2.0
 
 
 def _fmt(v: float) -> str:
@@ -1044,7 +1053,8 @@ class DungeonMakeTab(BaseTab):
         if len(self._script.steps) <= n:
             return                       # 被 _add 擋下來了（換圖了之類）
         self._pw_track.clear()
-        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
+        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS,
+                    None, 0.0, self._here_key()[0])
         self._pw_timer.start(PORTAL_WATCH_MS)
         self._say_map(f"記成傳送點：{mapobj.label(pr.model)} —— "
                       "走進去吧，我盯著看它把你送到哪。")
@@ -1117,7 +1127,8 @@ class DungeonMakeTab(BaseTab):
         self._refresh_menu()
         self.save_talk.setEnabled(False)
         self._pw_track.clear()
-        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
+        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS,
+                    None, 0.0, self._here_key()[0])
         self._pw_timer.start(PORTAL_WATCH_MS)
         how = ("　對話 " + " → ".join(f"第{k}項" for k in step["menu"] if k)
                if step["menu"] else "（點一下就傳）")
@@ -1206,11 +1217,18 @@ class DungeonMakeTab(BaseTab):
             "　—— 現在去撞它、按「第 N 項」，那些選項會自動記進入口")
 
     def _portal_watch(self) -> None:
-        """盯著「剛加的那個傳點」把人送到哪。看到順移才記，看不到就說看不到。"""
+        """盯著「剛加的那個傳點」把人送到哪。看到**順移或換圖**才記，看不到就說看不到。
+
+        ★ 使用者 2026-09-07：「他傳送怎不紀錄出口，他一對話就會立即傳送」——
+          舊版只認「同一張圖裡一拍跳 ≥3 格」，所以**換圖型**的傳送（對話傳送
+          常常是這種）永遠記不到出口。現在兩種都認：
+            · 場景（map_key）變了 → 落點就是新圖上現在站的位置
+            · 同一張圖裡一拍跳一大段 → 舊的那條規矩（含拉回的兩道閘）
+        """
         if self._pw is None:
             self._pw_timer.stop()
             return
-        i, deadline, prev, prev_t = self._pw
+        i, deadline, prev, prev_t, key0 = self._pw
         steps = self._script.steps
         if i >= len(steps) or steps[i].get("do") != dungeon.PORTAL:
             self._pw = None                      # 那一步被刪／搬走了
@@ -1228,14 +1246,24 @@ class DungeonMakeTab(BaseTab):
         me = self._me(sc) if sc is not None else None
         if me is None:
             return                               # 讀不到就跳過這一次取樣
-        self._pw = (i, deadline, me, now)
+        # ★★ 換圖 ＝ 傳送（換圖那一下座標不見得會跳，舊版就是在這裡漏掉的）
+        try:
+            key = scene.map_key(scene.current_id(sc))
+        except Exception:                                # noqa: BLE001
+            key = None
+        if key is not None and key0 is not None and key != key0:
+            self._land(i, me, sc, f"換到 {scene.scene_name(scene.current_id(sc))}")
+            return
+        self._pw = (i, deadline, me, now, key0)
         if prev is not None:
             # 軌跡只收跳之前的點（這一拍的落點不放，不然拉回判定會對到自己）
             self._pw_track.append((prev_t, prev))
             cut = now - TRACK_SECS
             while self._pw_track and self._pw_track[0][0] < cut:
                 self._pw_track.popleft()
-        if prev is None or now - prev_t > JUMP_MAX_GAP:
+        # ★ 對話傳送（有 menu）取樣容易隔久一點 —— 見 TALK_JUMP_GAP
+        gap = TALK_JUMP_GAP if steps[i].get("menu") else JUMP_MAX_GAP
+        if prev is None or now - prev_t > gap:
             return                               # 隔太久 → 只重設基準，不判
         jump = math.hypot(me[0] - prev[0], me[1] - prev[1])
         if jump < JUMP_TILES:
@@ -1255,13 +1283,44 @@ class DungeonMakeTab(BaseTab):
             self._say_map(f"位置一拍跳了 {jump:.0f} 格，但落回 {min(back):.0f} 秒前走過的位置"
                           "（伺服器拉回）→ 不算出口，繼續盯")
             return
+        self._land(i, me, sc, f"一拍跳了 {jump:.0f} 格")
+
+    def _land(self, i: int, me, sc, why: str) -> None:
+        """把出口記進第 i 步、收工，並（隔一下）把傳送後留著的對話框收乾淨。"""
+        steps = self._script.steps
         steps[i]["land"] = [round(me[0], 1), round(me[1], 1)]
         steps[i]["scene"] = scene.map_key(scene.current_id(sc))
         self._pw = None
         self._pw_timer.stop()
         self._refresh_steps()
         self._say_map(f"第 {i + 1} 步的傳點出口記起來了："
-                      f"({me[0]:.0f}, {me[1]:.0f}) —— 記得按儲存")
+                      f"({me[0]:.0f}, {me[1]:.0f})（{why}）—— 記得按儲存")
+        # ⚠⚠ 使用者 2026-09-07：「傳送後有對話要關掉」。⛔ 但**不可以馬上收** ——
+        #   順移那一瞬間遊戲正在拆視窗，收下去會讀到 NULL 直接當掉
+        #   （[[game-crash-dump-analysis]]）→ 隔 CLOSE_AFTER_JUMP 秒再收。
+        QTimer.singleShot(int(CLOSE_AFTER_JUMP * 1000), self._close_dialog_quiet)
+
+    def _close_dialog_quiet(self) -> None:
+        """把傳送後留著的對話框收乾淨（沒有就什麼都不做，⛔ 不吵）。"""
+        _pid, sc = self._cur()
+        if sc is None:
+            return
+        try:
+            if not talkwnd.window_present(sc):
+                return
+        except Exception:                                # noqa: BLE001
+            return
+        pid = self.who.currentData()
+        mv = self._mover(int(pid)) if pid is not None else None
+        if mv is None:
+            return
+        try:
+            talkwnd.close_page(mv, sc)
+            supply.leave_npc(mv, sc)
+        except Exception as exc:                         # noqa: BLE001
+            self._say_map(f"⚠ 傳送後的對話框收不掉：{exc}")
+            return
+        self._say_map("傳送後留下的對話框已經收掉了")
 
     def _move(self, delta: int) -> None:
         i = self.steps.currentRow()
