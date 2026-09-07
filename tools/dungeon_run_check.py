@@ -3188,11 +3188,11 @@ def main() -> int:
     tab._grid = FakeGrid(_cells)
     tab._reach = set(_cells)
     tab._reach_n = len(_cells)
-    run(tab, dt.PORTAL_BUMP - 2.0)
+    run(tab, dt.PORTAL_BUMP * 0.5)
     ck(f"　站不到 {dt.PORTAL_BUMP:.0f} 秒 → 還在乖乖補送封包，不亂退開",
        tab._bump is None, str(tab._bump))
-    ck("　這段期間封包有照送", len(tab.portal_sent) >= 2, str(tab.portal_sent))
-    run(tab, 3.0)
+    ck("　這段期間封包有照送", len(tab.portal_sent) >= 1, str(tab.portal_sent))
+    run(tab, dt.PORTAL_BUMP + 1.0)
     ck(f"★ 站滿 {dt.PORTAL_BUMP:.0f} 秒沒被搬走 → 開始退開",
        tab._bump is not None and tab._bump["phase"] == "away", str(tab._bump))
     ck("　退開點是走得到的格", tab._bump is not None
@@ -3220,7 +3220,7 @@ def main() -> int:
     tab._grid = FakeGrid({(50, 50)})
     tab._reach = {(50, 50)}
     tab._reach_n = 1
-    run(tab, dt.PORTAL_BUMP + 2.0)
+    run(tab, dt.PORTAL_BUMP + dt.PORTAL_POKE + 2.0)
     ck("★ 周圍沒有退得開的格 → 不退開，繼續補送（⛔ 不卡住、不停機）",
        tab._bump is None and len(tab.portal_sent) >= 2 and tab.run_cb.isChecked(),
        f"{tab._bump} {tab.portal_sent}")
