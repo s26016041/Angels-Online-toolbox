@@ -82,13 +82,7 @@ DIALOG_WAIT = 12.0
 #   換地圖，有順移就算吧」）：加完傳點那一步就開始每 0.12 秒看一次位置，
 #   一跳超過 JUMP_TILES 格就把落點記進那一步。
 PORTAL_WATCH_MS = 120
-# ★ 「強制走到這個點位」（使用者 2026-09-07：「看能不能走到，這樣就能過了」）。
-#   ⛔ 不問尋路 —— 被機關擋住的路尋路會直接拒絕，這顆就是要繞過那個拒絕、
-#      叫遊戲一路往那格走，撞給你看。
-FORCE_WALK_SECS = 20.0     # 最多撐幾秒
-FORCE_WALK_GAP = 1.0       # 每隔幾秒補送一次（＝撞一次）
-FORCE_WALK_ARRIVE = 1.2    # 離目標幾格算走到了
-FORCE_WALK_MS = 200        # 幾毫秒看一次位置
+
 PORTAL_WATCH_SECS = 90.0
 # 一次取樣之間跳這麼多格＝順移（走路一拍最多 0.6 格）。
 JUMP_TILES = 3.0
@@ -238,9 +232,10 @@ class MapWindow(QDialog):
         #   一路撞給你看到底過不過得去。
         self.force_btn = QPushButton("強制走到這個點位")
         self.force_btn.setToolTip(
-            "不管尋路說走不走得到，**直接叫遊戲往那一格走**，每秒補送一次。\n"
-            "被機關（雕像那種）擋住的路尋路會直接拒絕，這顆就是拿來撞撞看的。\n"
-            "走到、或撐滿時間沒進展，都會在下面講結果。再按一次可以中止。")
+            "把點到的那一格，加成一個「**強制走到**」步驟。\n"
+            "跟「加入點到的位置」的差別：那一種會算最短路，算不出路就回報走不到；\n"
+            "這一種**不算路徑、不管障礙物**，直接叫遊戲往那一格走，一秒撞一次。\n"
+            "被機關（雕像那種）擋住的路尋路一定拒絕，那些地方要用這一種。")
         self.force_btn.setEnabled(False)
         self.force_btn.clicked.connect(tab._force_walk)
         ph.addWidget(self.force_btn)
@@ -602,9 +597,6 @@ class DungeonMakeTab(BaseTab):
         self._pw_track = deque()     # 盯傳點期間走過的軌跡 [(時刻, (x, y))]（判伺服器拉回）
         self._pw_timer = QTimer(self)
         self._pw_timer.timeout.connect(self._portal_watch)
-        self._fw = None              # 「強制走到這個點位」正在跑的那一輪
-        self._fw_timer = QTimer(self)
-        self._fw_timer.timeout.connect(self._force_tick)
         for sp in self.findChildren(QSpinBox):
             fit_spin(sp)
         self._reload_files()
@@ -1022,92 +1014,18 @@ class DungeonMakeTab(BaseTab):
                    "to": [int(self._pick[0]), int(self._pick[1])]})
 
     def _force_walk(self) -> None:
-        """**不問尋路**，直接叫遊戲往地圖上點到的那一格走，每秒補送一次。
+        """把點到的那一格加成「**強制走到**」步驟。
 
-        ★ 使用者 2026-09-07：「多一個按鈕是強制走到這個點位，看能不能走到，
-          這樣就能過了」。被機關（雕像那種）擋住的路，尋路會直接回「沒有路」，
-          我們算的 A* 也一樣 —— 這顆繞過那個拒絕，用 `walk_exact`（＝遊戲自己
-          那支「走到這一格」）一路撞，過不過得去當場看得到。
-        ⚠ 只送移動，不點東西、不打怪。再按一次就中止。
+        ⚠⚠ 使用者 2026-09-07 當場更正：**不是**「按下去叫我的角色走過去」，
+          而是「腳本其中一個步驟，強制走這個點，不管障礙物、不算路徑」。
+          → 這裡只是加一步進腳本；真正的走法在執行端（dungeon_tab 的
+            `dungeon.FORCE` 分支：不問尋路，每秒把目的地丟給遊戲一次）。
         """
-        if self._fw is not None:
-            self._force_stop("你按了停止")
-            return
         if self._pick is None:
             self._say_map("先在地圖上點一個位置")
             return
-        pid, sc = self._cur()
-        if sc is None:
-            self._say_map("先選一台分身")
-            return
-        me = self._me(sc)
-        if me is None:
-            self._say_map("⚠ 讀不到角色位置")
-            return
-        mv = self._mover(pid)
-        if mv is None:
-            return
-        gx, gy = int(self._pick[0]), int(self._pick[1])
-        self._fw = {"pid": pid, "goal": (gx, gy), "n": 0, "send": 0.0,
-                    "end": time.monotonic() + FORCE_WALK_SECS,
-                    "best": self._dist(me, gx, gy)}
-        if self._big is not None:
-            self._big.force_btn.setText("停止強制走")
-        self._say_map(f"強制走到 ({gx}, {gy})…（尋路說走不走得到都照走）")
-        self._fw_timer.start(FORCE_WALK_MS)
-
-    @staticmethod
-    def _dist(me, gx: int, gy: int) -> float:
-        """人到那一格**中心**的距離（角色座標讀回來都是 x.5，所以要 +0.5）。"""
-        return ((me[0] - gx - 0.5) ** 2 + (me[1] - gy - 0.5) ** 2) ** 0.5
-
-    def _force_stop(self, why: str) -> None:
-        self._fw_timer.stop()
-        self._fw = None
-        if self._big is not None:
-            self._big.force_btn.setText("強制走到這個點位")
-        self._say_map(why)
-
-    def _force_tick(self) -> None:
-        fw = self._fw
-        if fw is None:
-            self._fw_timer.stop()
-            return
-        pid, sc = self._cur()
-        if sc is None or pid != fw["pid"]:
-            self._force_stop("⚠ 換了分身 —— 強制走停下")
-            return
-        me = self._me(sc)
-        if me is None:
-            return                       # 讀不到就跳過這一拍（換圖中）
-        gx, gy = fw["goal"]
-        d = self._dist(me, gx, gy)
-        fw["best"] = min(fw["best"], d)
-        now = time.monotonic()
-        if d <= FORCE_WALK_ARRIVE:
-            self._force_stop(f"✔ 走到了 ({gx}, {gy}) —— 現在離 {d:.1f} 格，"
-                             f"總共送了 {fw['n']} 次")
-            return
-        if now >= fw["end"]:
-            self._force_stop(
-                f"⚠ 撐了 {FORCE_WALK_SECS:.0f} 秒沒走到 ({gx}, {gy})："
-                f"最近只到 {fw['best']:.1f} 格、送了 {fw['n']} 次 —— 這條路過不去。")
-            return
-        if now - fw["send"] < FORCE_WALK_GAP:
-            return
-        fw["send"] = now
-        fw["n"] += 1
-        mv = self._movers.get(pid)
-        ent = bag.player_entity(sc)
-        sent = False
-        if mv is not None and mv.active and ent:
-            try:
-                # ⚠ 送**格子中心**：終點落在格線上伺服器可能不給站。
-                sent = mv.walk_exact(sc, ent + 8, gx + 0.5, gy + 0.5)
-            except Exception:                            # noqa: BLE001
-                sent = False
-        self._say_map(f"強制走到 ({gx}, {gy})…剩 {d:.1f} 格　第 {fw['n']} 次"
-                      + ("" if sent else "（這一次沒送出去，指令槽忙）"))
+        self._add({"do": dungeon.FORCE,
+                   "to": [int(self._pick[0]), int(self._pick[1])]})
 
     def _add_portal_prop(self) -> None:
         """把清單裡選到的物件記成「走進傳點」（使用者 2026-09-02 要的按鈕）。
@@ -1677,8 +1595,6 @@ class DungeonMakeTab(BaseTab):
         self._poke_timer.stop()
         self._pw_timer.stop()
         self._pw = None
-        self._fw_timer.stop()
-        self._fw = None
         if self._big is not None:
             self._big._timer.stop()      # 地圖視窗每半秒重畫，要停掉
             self._big.close()

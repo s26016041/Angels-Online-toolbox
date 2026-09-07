@@ -492,6 +492,7 @@ PORTAL_POKE = 5.0          # 每幾秒對傳點主動送一次 0x0D
 # ★★ 使用者 2026-09-07：「這是傳送點要多一個，如果撞了沒有被傳送要回頭再撞一次」。
 #   站著補送封包對「要點一下才走」的傳點有效，但**機關型**的（雕像那種）認的是
 #   人真的走進去那一下 —— 站著不動再怎麼送都沒有用，要退開再走回來重撞。
+FORCE_GAP = 1.0            # 「強制走到」每幾秒補送一次目的地（＝撞一次）
 PORTAL_BUMP = 2.0          # 站在傳點上幾秒還沒被搬走 → 退開再走回來撞一次
 #   ⚠ 2 秒是使用者 2026-09-07 定的（原本 12 秒「太久」）。這比 PORTAL_POKE(5) 短，
 #     所以站上去補送第一發封包之後就會去撞了；撞回來 _poke_t 歸零會再送一發，
@@ -1400,6 +1401,8 @@ class DungeonTab(BaseTab):
         #      的狀態，換目標一律走 _engage() 整組重設 ----
         self._last_gave_up = None    # 剛換掉的那一隻（有別隻時先挑別隻；⛔ 不是黑名單）
         self._me = None              # 這一拍我的位置（挑目標／算路徑用）
+        self._force_t = 0.0          # 「強制走到」距離下次補送還有多久
+        self._force_n = 0            # 這一步強制走送了幾次（只拿來回報）
         self._bump = None            # 傳點「退開再走回來撞」正在跑的那一輪
         self._bump_t = 0.0           # 站在傳點上多久沒被搬走
         self._bump_n = 0             # 這一步撞了幾次（只拿來回報）
@@ -2797,6 +2800,35 @@ class DungeonTab(BaseTab):
                 self._next()
             return
 
+        if kind == dungeon.FORCE:
+            # ★★ 使用者 2026-09-07：「強制走這個點，不管障礙物、不算路徑」。
+            #   ⛔ 不問尋路、不算 A*、不判「走不到」—— 直接把目的地交給遊戲
+            #   那支「走到這一格」，每 FORCE_GAP 秒補送一次（＝一次一次撞）。
+            #   副本裡被機關（雕像那種）擋住的路，我們的 A* 跟遊戲自己的尋路
+            #   都會拒絕，這一種就是留給那些地方的。
+            #   ⛔ 撐不過去也**不停機**（跟 `_blocked` 同一條規矩：副本的門是
+            #   解謎才開的）；卡太久由既有的「同一段超過 2 分鐘」記事件。
+            gx, gy = step["to"]
+            if _d((gx, gy), me) <= ARRIVE:
+                if self._targets():
+                    self._say(f"第 {self._i + 1} 步　已經站上點位，"
+                              f"但周圍還有 {len(self._targets())} 隻走得到的怪"
+                              f" —— 先清光才算到")
+                    return
+                self._nav.reset()
+                self._next()
+                return
+            self._force_t -= dt
+            if self._force_t <= 0:
+                self._force_t = FORCE_GAP
+                self._force_n += 1
+                self._walk_onto(gx, gy)
+            self._say(f"第 {self._i + 1} 步　強制走到 ({gx}, {gy})"
+                      f"　剩 {_d((gx, gy), me):.1f} 格"
+                      f"　（不算路徑，撞第 {self._force_n} 次）"
+                      f"　{self._mon_note()}")
+            return
+
         if kind == dungeon.WALK:
             gx, gy = step["to"]
             if _d((gx, gy), me) <= ARRIVE:
@@ -3510,6 +3542,8 @@ class DungeonTab(BaseTab):
         self._wait_left = 0.0
         self._empty_since = 0.0
         self._poke_t = 0.0            # 下一步的傳點要馬上補送第一次
+        self._force_t = 0.0           # 下一步若是「強制走到」要馬上送第一次
+        self._force_n = 0
         self._bump = None             # 換一步 → 撞的狀態整組歸零
         self._bump_t = 0.0
         self._bump_n = 0

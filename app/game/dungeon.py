@@ -92,7 +92,12 @@ FOLDER_NAME = "副本"
 # 步驟種類
 WALK, INTERACT, CLEAR, WAIT = "walk", "interact", "clear", "wait"
 PORTAL = "portal"
-KINDS = (WALK, INTERACT, CLEAR, WAIT, PORTAL)
+# ★★ 使用者 2026-09-07：「強制走這個點，不管障礙物、不算路徑」。
+#   `walk` 是「用地形圖算最短路走過去」，算不出路就回報走不到、原地重試；
+#   `force` 完全不算路 —— 直接把目的地丟給遊戲那支「走到這一格」，撞得過去
+#   就過得去。副本裡被機關（雕像那種）擋住的路尋路一定拒絕，就是留給這一種。
+FORCE = "force"
+KINDS = (WALK, INTERACT, CLEAR, WAIT, PORTAL, FORCE)
 
 # 對話選單最多幾項（talkaction 碼只到第 10 項，見 supply.talk_option）
 MENU_MAX = 10
@@ -336,6 +341,10 @@ def validate(step: dict) -> tuple[bool, str]:
         xy = step.get("to")
         if not (isinstance(xy, list) and len(xy) == 2):
             return False, "walk 少了 to:[x,y]"
+    elif kind == FORCE:
+        xy = step.get("to")
+        if not (isinstance(xy, list) and len(xy) == 2):
+            return False, "force 少了 to:[x,y]"
     elif kind == INTERACT:
         xy = step.get("at")
         if not (isinstance(xy, list) and len(xy) == 2):
@@ -439,6 +448,9 @@ def describe(step: dict) -> str:
     if kind == WALK:
         x, y = step.get("to", ["?", "?"])
         return f"走到 ({x}, {y})"
+    if kind == FORCE:
+        x, y = step.get("to", ["?", "?"])
+        return f"強制走到 ({x}, {y})　（不算路徑、不管障礙物）"
     if kind == INTERACT:
         x, y = step.get("at", ["?", "?"])
         menu = step.get("menu") or []

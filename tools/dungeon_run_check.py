@@ -3255,15 +3255,18 @@ def main() -> int:
     mtab._add({"do": dungeon.WALK, "to": [20, 20]})
     ck("　有座標的步驟照舊驗地圖章（人在別張圖就不存）",
        len(mtab._script.steps) == _n, f"{_n} → {len(mtab._script.steps)}")
+    _n = len(mtab._script.steps)
     mtab._pick = None
     mtab._force_walk()
-    ck("　「強制走到」沒點位置 → 只回報、不當掉", mtab._fw is None,
-       mtab.status.text())
-    mtab._pick = (10, 10)
-    mtab.who.clear()
+    ck("　「強制走到」沒點位置 → 只回報、不當掉、不亂加步驟",
+       len(mtab._script.steps) == _n, mtab.status.text())
+    mtab._here_key = lambda: (127, None)          # 回到腳本那張圖
+    mtab._pick = (11, 12)
     mtab._force_walk()
-    ck("　「強制走到」沒選分身 → 只回報、不當掉", mtab._fw is None,
-       mtab.status.text())
+    ck("★ 「強制走到」加的是**腳本步驟**（不是叫角色走過去）",
+       len(mtab._script.steps) == _n + 1
+       and mtab._script.steps[-1] == {"do": dungeon.FORCE, "to": [11, 12]},
+       str(mtab._script.steps[-1:]))
     _big = dm.MapWindow(mtab)
     ck("★ 「加入『走進傳點』」已經拿掉（傳點一律用「這個是傳送點」）",
        not hasattr(_big, "add_portal"))
@@ -3274,6 +3277,43 @@ def main() -> int:
        _big.fit_window() is True)
     _big.close()
     mtab.on_close()
+
+    # =====================================================================
+    # ★★ 「強制走到」步驟：不算路徑、不管障礙物，一秒撞一次
+    # =====================================================================
+    print("")
+    print("強制走到（force）")
+    ck("　dungeon.validate 認得 force", dungeon.validate(
+        {"do": dungeon.FORCE, "to": [9, 9]})[0])
+    ck("　少了 to 會被擋下來", not dungeon.validate({"do": dungeon.FORCE})[0])
+    ck("　describe 講得出來",
+       "強制走到" in dungeon.describe({"do": dungeon.FORCE, "to": [9, 9]}),
+       dungeon.describe({"do": dungeon.FORCE, "to": [9, 9]}))
+    # 走不到的另一區：walk 會回報「走不到」，force 照走不停機
+    _cells = {(10, 10)}
+    tab = make_tab([{"do": dungeon.FORCE, "to": [90, 90]}], pos=(10.0, 10.0))
+    tab._grid = FakeGrid(_cells, others=[(90, 90)])
+    tab._reach = set(_cells)
+    tab._reach_n = 1
+    run(tab, 3.0)
+    ck("★ 目標在走不到的另一區 → 照樣往那邊走，⛔ 不回報走不到、不停機",
+       tab._i == 0 and tab.run_cb.isChecked()
+       and "強制走到" in tab.status.text(), tab.status.text())
+    ck("　⛔ 完全沒有問過尋路器（不算路徑）", tab._nav.calls == 0,
+       f"尋路器被呼叫了 {tab._nav.calls} 次")
+    # 走到了就換下一步
+    tab = make_tab([{"do": dungeon.FORCE, "to": [10, 10]},
+                    {"do": dungeon.WAIT, "secs": 5}], pos=(10.0, 10.0))
+    run(tab, 0.4)
+    ck("★ 站上點位 → 換下一步", tab._i == 1, f"第 {tab._i + 1} 步")
+    # 站上點位但周圍有怪 → 先清光才算到（跟 walk 同一條規矩）
+    tab = make_tab([{"do": dungeon.FORCE, "to": [10, 10]},
+                    {"do": dungeon.WAIT, "secs": 5}], pos=(10.0, 10.0),
+                   mons=[FakeMon(10.5, 10.5, "怪")])
+    tab._targets = lambda: [1]
+    run(tab, 0.4)
+    ck("　站上點位但周圍還有怪 → 不算到（跟「走到」同一條規矩）",
+       tab._i == 0, f"第 {tab._i + 1} 步")
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
