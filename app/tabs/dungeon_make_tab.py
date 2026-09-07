@@ -230,13 +230,13 @@ class MapWindow(QDialog):
         # ★ 使用者 2026-09-07：「多一個按鈕是強制走到這個點位，看能不能走到」——
         #   機關擋路那種地方尋路會直接拒絕，這顆不問尋路、直接叫遊戲走過去，
         #   一路撞給你看到底過不過得去。
-        self.force_btn = QPushButton("強制走到這個點位")
+        self.force_btn = QPushButton("強制走到我站的位置")
         self.force_btn.setToolTip(
-            "把點到的那一格，加成一個「**強制走到**」步驟。\n"
-            "跟「加入點到的位置」的差別：那一種會算最短路，算不出路就回報走不到；\n"
-            "這一種**不算路徑、不管障礙物**，直接叫遊戲往那一格走，一秒撞一次。\n"
-            "被機關（雕像那種）擋住的路尋路一定拒絕，那些地方要用這一種。")
-        self.force_btn.setEnabled(False)
+            "把**角色現在站的那一格**，加成一個「強制走到」步驟。\n"
+            "跟「加入我現在站的位置」的差別：那一種會算最短路，算不出路就回報\n"
+            "走不到；這一種**不算路徑、不管障礙物**，直接叫遊戲往那一格走，\n"
+            "一秒撞一次。被機關（雕像那種）擋住的路尋路一定拒絕，要用這一種。\n"
+            "⚠ 用法：你自己走到障礙物的另一邊，站好再按。")
         self.force_btn.clicked.connect(tab._force_walk)
         ph.addWidget(self.force_btn)
         v.addLayout(ph)
@@ -1014,18 +1014,28 @@ class DungeonMakeTab(BaseTab):
                    "to": [int(self._pick[0]), int(self._pick[1])]})
 
     def _force_walk(self) -> None:
-        """把點到的那一格加成「**強制走到**」步驟。
+        """把**角色現在站的位置**加成「強制走到」步驟。
 
-        ⚠⚠ 使用者 2026-09-07 當場更正：**不是**「按下去叫我的角色走過去」，
-          而是「腳本其中一個步驟，強制走這個點，不管障礙物、不算路徑」。
-          → 這裡只是加一步進腳本；真正的走法在執行端（dungeon_tab 的
-            `dungeon.FORCE` 分支：不問尋路，每秒把目的地丟給遊戲一次）。
+        ⚠⚠ 使用者 2026-09-07 兩次更正，兩條都要記著：
+          ① **不是**「按下去叫我的角色走過去」，而是「腳本其中一個步驟，
+             強制走這個點，不管障礙物、不算路徑」。
+          ② 點位**看角色站在哪**，不是我在地圖上點的那一格。
+             → 你自己走到障礙物的另一邊，按這顆，那裡就是強制走的目標；
+               這樣也保證那一格站得住（你人就在上面）。
+        真正的走法在執行端（`dungeon_tab` 的 `dungeon.FORCE` 分支：
+        不問尋路、不算 A*，每秒把目的地丟給遊戲一次）。
         """
-        if self._pick is None:
-            self._say_map("先在地圖上點一個位置")
+        _pid, sc = self._cur()
+        if sc is None:
+            self._say_map("先選一台分身")
+            return
+        me = self._me(sc)
+        if me is None:
+            # 讀不到就什麼都不做 —— 存一個 (0,0) 進去比不存危險得多（同 _add_here）。
+            self._say_map("⚠ 讀不到角色位置，這一步沒有存")
             return
         self._add({"do": dungeon.FORCE,
-                   "to": [int(self._pick[0]), int(self._pick[1])]})
+                   "to": [round(me[0]), round(me[1])]})
 
     def _add_portal_prop(self) -> None:
         """把清單裡選到的物件記成「走進傳點」（使用者 2026-09-02 要的按鈕）。
@@ -1350,9 +1360,6 @@ class DungeonMakeTab(BaseTab):
         if self._big is not None:
             # ⚠ 不可走的格子不給加：走不到的終點會讓執行端一直重試到逾時。
             self._big.add_pick.setEnabled(walk)
-            # ⚠ 「強制走到」連不可走的格也給按 —— 機關擋住的格子在地形圖上
-            #   本來就是不可走，那正是要撞的目標。
-            self._big.force_btn.setEnabled(True)
             self._big.pick_lbl.setText(
                 f"點到 ({gx}, {gy})　"
                 + (f"房間 {room}" if room is not None else

@@ -3256,23 +3256,32 @@ def main() -> int:
     ck("　有座標的步驟照舊驗地圖章（人在別張圖就不存）",
        len(mtab._script.steps) == _n, f"{_n} → {len(mtab._script.steps)}")
     _n = len(mtab._script.steps)
-    mtab._pick = None
+    mtab.who.clear()                              # 沒選分身
     mtab._force_walk()
-    ck("　「強制走到」沒點位置 → 只回報、不當掉、不亂加步驟",
+    ck("　「強制走到」沒選分身 → 只回報、不當掉、不亂加步驟",
        len(mtab._script.steps) == _n, mtab.status.text())
-    mtab._here_key = lambda: (127, None)          # 回到腳本那張圖
-    mtab._pick = (11, 12)
+    mtab.who.addItem("測試", 1)
+    mtab.who.setCurrentIndex(0)
+    mtab._scanners[1] = FakeAliveSc()             # ⚠ on_close 會叫 sc.close()
+    mtab._me = lambda _sc: None                   # 讀不到角色位置
     mtab._force_walk()
-    ck("★ 「強制走到」加的是**腳本步驟**（不是叫角色走過去）",
+    ck("　讀不到角色位置 → ⛔ 不存 (0,0)", len(mtab._script.steps) == _n,
+       mtab.status.text())
+    mtab._here_key = lambda: (127, None)          # 回到腳本那張圖
+    mtab._me = lambda _sc: (11.5, 12.5)           # 角色站在 (11.5, 12.5)
+    mtab._pick = (99, 99)                         # ⚠ 地圖上點的格**不該**被用到
+    mtab._force_walk()
+    ck("★ 「強制走到」記的是**角色站的位置**（不是地圖上點的格）",
        len(mtab._script.steps) == _n + 1
-       and mtab._script.steps[-1] == {"do": dungeon.FORCE, "to": [11, 12]},
+       and mtab._script.steps[-1] == {"do": dungeon.FORCE, "to": [12, 12]},
        str(mtab._script.steps[-1:]))
     _big = dm.MapWindow(mtab)
     ck("★ 「加入『走進傳點』」已經拿掉（傳點一律用「這個是傳送點」）",
        not hasattr(_big, "add_portal"))
-    ck("★ 地圖視窗多了「強制走到這個點位」",
+    ck("★ 地圖視窗多了「強制走到我站的位置」",
        hasattr(_big, "force_btn")
-       and _big.force_btn.text() == "強制走到這個點位")
+       and _big.force_btn.text() == "強制走到我站的位置",
+       getattr(getattr(_big, "force_btn", None), "text", lambda: "沒有")())
     ck("　還沒畫地圖時 fit_window 安全（回 True、不當掉）",
        _big.fit_window() is True)
     _big.close()
