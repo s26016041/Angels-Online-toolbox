@@ -912,16 +912,24 @@ def main() -> int:
     ck("　沒勾循環 → 照舊停下", not tab.run_cb.isChecked() and "傳點把人送到" in tab.status.text(),
        tab.status.text())
 
-    # ★★ 卡住 → 當成完成一場：副本裡同一步 STUCK_ABORT_SECS 沒前進（5 分鐘先記一筆、10 分鐘收掉）
+    # ★★ 卡住 → 當成完成一場：副本裡同一步 STUCK_ABORT_SECS 沒前進（先記一筆事件、再收掉；
+    #   9/7 起兩個門檻都是 2 分鐘＝同一拍發生，測試寫成兩個門檻相同或不同都過）
+    ev_min, ab_min = dt.STUCK_EVENT_SECS / 60, dt.STUCK_ABORT_SECS / 60
     tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
     tab._loop = True
     tab._phase, tab._cycle = "run", "go"
     tab._stuck_watch(TICK)                                  # 建基準
-    tab._stuck_watch(dt.STUCK_EVENT_SECS)
-    ck("　卡 5 分鐘：記「卡住」、還在跑",
-       tab._cycle == "go" and any(r[2] == "stuck" for r in tab._events), str(tab._events[:1]))
-    handled = tab._stuck_watch(dt.STUCK_ABORT_SECS - dt.STUCK_EVENT_SECS)
-    ck("★★ 卡 10 分鐘：當成完成一場 → 回程補給（不停機）",
+    handled = tab._stuck_watch(dt.STUCK_EVENT_SECS - 1.0)
+    ck(f"　卡不到 {ev_min:.0f} 分鐘：沒記事件、照跑",
+       not handled and tab._cycle == "go" and not any(r[2] == "stuck" for r in tab._events),
+       str(tab._events[:1]))
+    handled = tab._stuck_watch(1.0)
+    ck(f"　卡 {ev_min:.0f} 分鐘：記「卡住」事件",
+       any(r[2] == "stuck" for r in tab._events), str(tab._events[:1]))
+    if dt.STUCK_ABORT_SECS > dt.STUCK_EVENT_SECS:
+        ck("　還沒到收掉門檻：還在跑", not handled and tab._cycle == "go", tab.status.text())
+        handled = tab._stuck_watch(dt.STUCK_ABORT_SECS - dt.STUCK_EVENT_SECS)
+    ck(f"★★ 卡 {ab_min:.0f} 分鐘：當成完成一場 → 回程補給（不停機）",
        handled and tab.run_cb.isChecked() and tab._cycle == "supply" and tab._rounds == 1,
        tab.status.text())
     ck("　通知寫明卡在哪一步",
@@ -938,7 +946,7 @@ def main() -> int:
     tab._phase, tab._cycle = "run", "go"
     tab._stuck_watch(TICK)
     tab._stuck_watch(dt.STUCK_ABORT_SECS + 1.0)
-    ck("　沒勾循環卡 10 分鐘 → 停下（只跑一趟沒有下一場）", not tab.run_cb.isChecked(),
+    ck(f"　沒勾循環卡 {ab_min:.0f} 分鐘 → 停下（只跑一趟沒有下一場）", not tab.run_cb.isChecked(),
        tab.status.text())
     dt.supply.run_full_supply = _orig_supply
 
@@ -2921,20 +2929,24 @@ def main() -> int:
        and tab._events_tbl.item(0, 2).text().startswith("卡住"))
     ck("　統計跟著更新", "卡住 1 次" in tab._events_head.text(), tab._events_head.text())
     tab._events_dlg.close()
-    # 卡住偵測：同一步超過 5 分鐘沒前進 → 記一筆（帶狀態列）、一段只記一次、不停機
-    tab = off_tab()
+    # 卡住偵測：同一段超過 STUCK_EVENT_SECS 沒前進 → 記一筆（帶狀態列）、一段只記一次、不停機
+    #   ⚠ 用「撞入口」那段驗純紀錄（沒勾副本設定＝沒有 N 分鐘放棄）：副本裡跑腳本那段
+    #     9/7 起記事件跟收掉同一拍（見上面 ★★ 卡住那組）。
+    tab = off_tab(rounds=None)
     tab._events.clear()
-    run(tab, dt.STUCK_EVENT_SECS + 1.0, watch=True)
+    tab._phase, tab._cycle = "enter", "go"
+    tab._enter_t = tab._poke_total = tab._poke_t = 0.0
+    tab._stuck_watch(TICK)
+    tab._stuck_watch(dt.STUCK_EVENT_SECS + 1.0)
     stuck = [x for _t, _a, k, x in tab._events if k == "stuck"]
-    ck("★ 同一步超過 5 分鐘 → 記一筆卡住（講在哪一步、當時在幹嘛）",
-       len(stuck) == 1 and "第 1 步" in stuck[0], str(stuck))
-    run(tab, 60.0, watch=True)
+    ck(f"★ 同一段超過 {dt.STUCK_EVENT_SECS / 60:.0f} 分鐘 → 記一筆卡住（講在哪、當時在幹嘛）",
+       len(stuck) == 1 and "撞入口" in stuck[0], str(stuck))
+    tab._stuck_watch(60.0)
     ck("　一段只記一次", sum(1 for k in kinds(tab) if k == "stuck") == 1)
     ck("　純紀錄，沒因此停機", tab.run_cb.isChecked() and tab._cycle == "go")
-    tab._i = 1                              # 前進了 → 新的一段重新計
-    tab._script.steps.append({"do": "walk", "to": [60, 60]})
-    run(tab, 10.0, watch=True)
-    ck("　前進到下一步 → 計時歸零", tab._stuck_t < 11.0 and not tab._stuck_noted,
+    tab._phase = "run"                      # 進副本了 → 新的一段重新計
+    tab._stuck_watch(10.0)
+    ck("　換一段 → 計時歸零", tab._stuck_t < 11.0 and not tab._stuck_noted,
        f"{tab._stuck_t} {tab._stuck_noted}")
     # 停機原因進重要事件（開跑之後）
     tab = off_tab()
