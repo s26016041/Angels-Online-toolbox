@@ -1057,11 +1057,22 @@ class DungeonMakeTab(BaseTab):
             self.status.setText("⚠ 讀不到目前場景，入口沒有記")
             return
         if self._script.scene is not None and key == self._script.scene:
-            QMessageBox.warning(
-                self, "入口傳送點",
-                f"你現在就站在腳本那張圖「{scene.scene_name(key)}」裡面。\n"
-                "入口是**外面**那張圖上的傳送點 —— 先出去再記一次。")
-            return
+            if not self._script.steps:
+                # ★ 沒半步卻有章（2026-09-07 黑狐「站在入口旁邊卻說我在副本裡
+                #   被擋」的根因）：步驟刪光／在外面按過「重新蓋章」留下的舊章。
+                #   章跟著步驟走，沒步驟＝章不算數 —— 清掉、照記入口，
+                #   第一步存進來時會在對的圖上重新蓋。
+                self._script.scene, self._script.map = None, {}
+                self._refresh_stamp()
+            else:
+                QMessageBox.warning(
+                    self, "入口傳送點",
+                    f"你現在就站在腳本那張圖「{scene.scene_name(key)}」（{key}）"
+                    f"裡面（已有 {len(self._script.steps)} 步記在這張圖上）。\n"
+                    "入口是**外面**那張圖上的傳送點 —— 先出去再記一次。\n"
+                    "如果這張圖其實是外面、步驟蓋錯圖了：把步驟刪掉再記入口，"
+                    "或進副本後按「重新蓋章」。")
+                return
         ent = {"scene": key,
                "to": [round(pr.x, 1), round(pr.y, 1)],
                "model": pr.model}
@@ -1151,6 +1162,11 @@ class DungeonMakeTab(BaseTab):
         if i < 0:
             return
         self._script.remove(i)
+        # ★ 章跟著步驟走：最後一步也刪掉了 → 章一起清（2026-09-07 黑狐：在外面
+        #   加了一步又刪掉，章停在外面那張圖，「這是進副本的入口」就說他在副本裡）。
+        #   下一次存第一步時會在當時那張圖重新蓋（_refresh_steps 會順手更新章的字）。
+        if not self._script.steps and self._script.scene is not None:
+            self._script.scene, self._script.map = None, {}
         self._refresh_steps()
 
     # ------------------------------------------------------------------
