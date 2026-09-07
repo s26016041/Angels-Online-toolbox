@@ -79,8 +79,7 @@ from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
                       channel, entity, eventmap, farmsettings, guildbank, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
-                      skillcost, skills, summon, supply,
-                      tablestamp, terrain)
+                      skillcost, skills, summon, supply, terrain)
 from app.tabs.farm_settings_dialog import FarmSettingsDialog
 from app.tabs.guildbank_dialog import GuildBankDialog
 from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list, fit_spin,
@@ -6792,10 +6791,9 @@ class FarmTab(ClientWatchMixin, BaseTab):
         self.found = QLabel("尚未偵測")
         self.found.setStyleSheet(f"color: {theme.TEXT_MUT};")
         bar.addWidget(self.found)
-        # ★ AOB 自動定位的結果。平常是空的；遊戲改版讓位址位移時會在這裡說出來，
-        #   不然使用者只會看到「怪怪的」卻不知道發生什麼事（上次改版就是這樣）。
-        self.locate_lbl = QLabel("")
-        bar.addWidget(self.locate_lbl)
+        # ⛔ 這裡原本還有一個「AOB 自動定位／資料表戳記」的警示標籤 ——
+        #   2026-09-07 使用者要求搬到主視窗最下面那條狀態列（見 app/status_ui.py），
+        #   每一頁各印一份沒有意義。這條只留「偵測到幾個分身」。
         bar.addStretch(1)
         root.addLayout(bar)
 
@@ -6810,31 +6808,6 @@ class FarmTab(ClientWatchMixin, BaseTab):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(TICK_MS)
-
-    def _show_locate(self) -> None:
-        """把 AOB 自動定位＋資料表戳記的結果顯示出來（沒事就不顯示）。"""
-        moved, failed = locate.moved(), locate.failed()
-        stale = tablestamp.check()   # 遊戲換版但寫死資料表還沒重新核對
-        parts, color = [], ""
-        if failed:
-            # ⚠ 函式位址驗不過會被清成 0＝該功能停用（不是沿用舊值），
-            #   資料位址才是沿用舊值。見 app/game/locate.py 檔頭。
-            parts.append(
-                f"⚠ 有 {len(failed)} 個遊戲位址定位失敗（相關功能已停用）："
-                + "、".join(failed[:3]))
-            color = theme.WARN
-        elif moved:
-            parts.append(f"偵測到遊戲改版，已自動重新定位 {len(moved)} 個位址")
-            color = theme.OK
-        if stale:
-            # 位址跟得上 ≠ 資料表跟得上：AOB 救位址，救不了抄來的內容
-            #（射程/地圖編號）。這條要一直亮到重新核對＋蓋章為止。
-            parts.append("⚠ " + stale)
-            color = theme.WARN
-        text = "　".join(parts)
-        self.locate_lbl.setText(text)
-        self.locate_lbl.setToolTip(text)   # 條太長被截掉時滑鼠移上去看全文
-        self.locate_lbl.setStyleSheet(f"color: {color};" if color else "")
 
     # ------------------------------------------------------------------
     def on_show(self) -> None:
@@ -6972,7 +6945,6 @@ class FarmTab(ClientWatchMixin, BaseTab):
             lambda _on, p=page: self._note_train_intent(p))
         self._pages[w.pid] = page
         self.tabs.addTab(page, nm or acct or str(w.pid))
-        self._show_locate()
         self._found_note()
         self._maybe_resume(page)
 

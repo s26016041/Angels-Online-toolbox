@@ -99,6 +99,13 @@ class MainWindow(QMainWindow):
         self._updater = UpdateManager(self)
         self._updater.start()
 
+        # ★ 狀態列右邊的常駐提示：遊戲改版（定位失敗／資料表沒核對）與
+        #   「GitHub 上有新版」。原本長在掛機分頁最上面，2026-09-07 使用者要求
+        #   搬到這條槓上（見 app/status_ui.py）。
+        from app.status_ui import StatusStrip
+
+        self._status = StatusStrip(self)
+
         # ★ 背景自我監察：遊戲改版讓讀取邏輯失效時，跳通知並關掉程式。
         #   壞掉時讀到的是垃圾數值而不是「沒有數值」，繼續開著會誤導使用者。
         #   判定很保守（要所有分身都失敗），沒開遊戲時完全不檢查。
@@ -183,10 +190,8 @@ class MainWindow(QMainWindow):
                 "若這是打包後的 .exe，通常是漏收了 app 底下的分頁模組；\n"
                 "請確認 spec 有 collect_submodules('app')，或改用 build_local.py 重新編譯。",
             )
-        else:
-            self.statusBar().showMessage(
-                f"已載入 {len(self._loaded_tabs)} 個分頁"
-            )
+        # ⛔ 這裡原本會在狀態列印「已載入 N 個分頁」——使用者 2026-09-07 要求拿掉
+        #   （開機看一次就沒用了，也會擋住真正要說的話）。空分頁那句警告留著。
 
     # ------------------------------------------------------------------
     # 給測試／其他模組用的查詢
@@ -273,6 +278,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名慣例)
         try:
             self._updater.stop()
+        except Exception:
+            traceback.print_exc()
+        try:
+            self._status.stop()
         except Exception:
             traceback.print_exc()
         # ⚠⚠ 自我監察那條執行緒**一定要等它結束**。它在掃五台分身的記憶體，
