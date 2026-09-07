@@ -134,12 +134,12 @@ def _send(mover, scanner, opcode: int, body_len: int,
 # 配方、同樣站在檯子旁，面板沒開送出去 20 秒毫無反應；面板開著 3 秒後材料
 # −1、產物 +1）。面板是伺服器開的，我們這邊唯一能做的就是**跟遊戲一樣點它**。
 #
-# 怎麼點：**叫遊戲自己那支**（`supply.click_object` → TryAct），見下面 `click()`。
-# ⚠ 舊做法是自己送封包 0x05(實體ID, 0)（`attack.THIRD_FN`，反組譯 0x559FE0 的
-#   `push 8 / push 5`）—— 2026-09-03 已**整條刪掉**改用官方那支（使用者：
-#   「都改新的、留下一種對話方式就好」）。差別是官方那支自己判距離＋視線、
-#   不夠近會用官方尋路走過去；盲送 0x05 太遠伺服器直接不理。
-#   （`attack.THIRD_FN` 本身還在，打怪第二包還在用它。）
+# 怎麼點：**製作檯**走 `click_bench()`＝自己送封包 0x05(站台+0x1D0 的互動 id, 0)
+#   （`attack.THIRD_FN`，反組譯 0x559FE0 的 `push 8 / push 5`）。
+# ⚠⚠ 2026-09-03 曾把它整條刪掉改走官方 TryAct（`click()`），當時註明「製作檯
+#   這個情境沒驗過」—— 2026-09-07 廚狐（有烹飪職業）棕櫚基地實機 A/B 證明
+#   **TryAct(eid,3) 對製作檯不開面板**（見 `click_bench` 的實錄），所以又加回來。
+#   對話物件（NPC／副本的機器人、雕像、公佈欄）仍然只有 `click()`（TryAct）一種。
 # 製作面板的 Lua 全域：開著是執行期代號、關著是 0（跟 WND_BANK 同一招）。
 WND_MAKE = "WND_MAKE"
 
@@ -184,10 +184,8 @@ def click(mover, scanner, prop) -> tuple[bool, str]:
       第1發走到 3.3 格、第2發走到 1.3 格、**第3發對話就開了**（約 1.2 秒）。
       舊的盲送 0x05 貼著點也開得起來，但它不會自己走 —— 使用者要的就是
       「跟滑鼠點一樣」：走過去＋開對話都交給遊戲。
-    ⚠ 製作檯（開製作面板）也走這一支了。⚠ 那個情境**還沒驗過**：當天線上
-      五隻都是戰鬥角色，站在永夜城製作檯前 1.1 格新舊兩種點法都不開面板
-      （面板是伺服器開的，八成是沒有那個生產職業）。真的開不了就把這支換回
-      `attack.THIRD_FN(prop.oid, 0)`（一行的事）。
+    ⛔ **製作檯不走這支**（2026-09-07 廚狐實機驗過：TryAct kind 3 會把人走到
+      檯子旁，但 WND_MAKE 永遠不開）→ 開製作面板用 `click_bench()`。
     """
     from app.game import scenery, supply
     if not (mover and mover.active):
@@ -198,6 +196,40 @@ def click(mover, scanner, prop) -> tuple[bool, str]:
         return False, "那個東西已經不在了（換地圖／走出視野？）"
     if not supply.click_object(mover, scanner, prop.addr):
         return False, "點選排不進去（指令槽忙碌／讀不到 eid）"
+    return True, f"已點 ({prop.x:.0f},{prop.y:.0f})"
+
+
+def click_bench(mover, scanner, prop) -> tuple[bool, str]:
+    """點**製作檯**（開製作面板）＝自己送封包 `0x05(oid, 0)`（`attack.THIRD_FN`）。
+    `prop.oid` 是站台物件 +0x1D0 的互動 id（scenery.py），不是 +0xBC 的 eid。
+
+    ⚠⚠ **不能改用 `click()`（TryAct kind 3）** —— 2026-09-07 廚狐 棕櫚基地
+      「烹飪-廚具組01」（外觀 60068，mapobj 表 HITTEST）實機 A/B：
+        · TryAct(eid,3) 在 4.7 格叫一發 → 官方尋路把人走到 1.9 格，WND_MAKE 不開；
+          站在 1.9 格再叫一發（回 1）→ 4 秒還是 0。
+        · 同一格 THIRD_FN(oid,0) → **0.20 秒 WND_MAKE 0→723476765**。
+      面板是伺服器開的，它認的是這一包；TryAct 對這種物件送的不是它。
+    ★ 伺服器對這一包有**距離檢查**（同日實測，跟站台座標的圓距離、單位格）：
+        開：1.9／2.59／2.69／2.92／3.08／3.37／3.42／3.61／3.68（九個點、四個方向）
+        不開：3.70／4.61／4.70
+      → 呼叫端要先走到 `produce_tab.BENCH_REACH` 內再點；太遠送了沒反應、
+        也不會有任何錯誤訊息（就是使用者 9/7「點不到製作台」的樣子：他站的
+        「檯子旁邊」離物件座標 4.7 格 —— 廚具組的圖很大，座標在它北邊）。
+    ⚠ 這不是第二種「對話方式」：對話（NPC／副本物件）只有 `click()` 一種；
+      這支是「開製作面板」那個動作，伺服器認的包本來就不一樣。
+    ⚠ 回 True 只代表送出去了，開沒開一律看 `panel_open()`（WND_MAKE）。
+    ⚠ 送出前當場重驗那個站台還在（`scenery.still_there`，CLAUDE.md 鐵則）。
+    """
+    from app.game import attack, scenery
+    if not (mover and mover.active):
+        return False, "跳板沒裝好"
+    if not attack.THIRD_FN:
+        return False, "點選函式定位失敗（遊戲改版？）—— 這個功能停用"
+    if not scenery.still_there(scanner, prop):
+        return False, "那個東西已經不在了（換地圖／走出視野？）"
+    if mover.call_sync(attack.THIRD_FN, prop.oid, 0,
+                       timeout=CALL_TIMEOUT) is None:
+        return False, "點選排不進去（指令槽忙碌）"
     return True, f"已點 ({prop.x:.0f},{prop.y:.0f})"
 
 

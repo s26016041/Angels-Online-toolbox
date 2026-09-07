@@ -60,7 +60,8 @@ KIND_TALK = 3
 # ★★★ 跟 **NPC** 講話的 kind 是 **2**，不是 3（2026-09-06 黑狐 棕櫚基地 實測＋封包鏈）：
 #   使用者滑鼠點銀行員的封包鏈是 0x5AC95C 點擊處理式 → 狀態機 mode 4 → tick 0x5494A5
 #   `push 2; push eid; call TryAct` → 0x5069BC 送包。我們一直用 kind 3（那是雕像／公佈欄／
-#   製作檯這類場景物件的 kind，produce.click 用它沒錯），對 NPC 的範圍小很多：
+#   副本物件這類場景物件的 kind，produce.click 用它沒錯；⚠ **製作檯不行**：2026-09-07 廚狐
+#   實測 kind 3 走到旁邊也不開面板，開面板走 produce.click_bench 自送 0x05），對 NPC 的範圍小很多：
 #     kind 3：站 (186,137) Δ(3,-2) 30 發全開不了；kind 2：同一格 0.53 秒開。
 #   kind 2 實測範圍（tile 差，9 個點）：|Δx|≤5 且 |Δy|≤3 全開，Δx=6/7、Δy=4 不開，
 #   隔著櫃檯也開（沒有視線檢查）。見 TALK_BOX_X/Y。

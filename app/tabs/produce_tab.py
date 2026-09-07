@@ -108,8 +108,13 @@
 檯子**（封包 `0x05`，就是打怪那組的第二包 `attack.THIRD_FN`，動作碼給 0）。
 所以製作那一段現在是：
 
-    走到（記住的）製作檯位置 → 點旁邊的東西 → 製作面板開起來
-      （Lua 全域 `WND_MAKE` 從 0 變非 0）→ 送 0x36 → **材料變少**＝真的做出來
+    走到（記住的）製作檯位置 → 離站台 > BENCH_REACH 就再走近 → 點它 →
+      製作面板開起來（Lua 全域 `WND_MAKE` 從 0 變非 0）→ 送 0x36 →
+      **材料變少**＝真的做出來
+
+⚠⚠ 點檯子**只能**是 `produce.click_bench`（自送 0x05），不能是官方 TryAct 的
+  `produce.click`（2026-09-07 廚狐實機：TryAct 把人走到檯子旁也不開面板）；
+  而且伺服器只認 ~3.7 格內（同日量的），太遠送了沒任何反應 —— 見 BENCH_REACH。
 
 ★ 檯子的實體 ID **每次載入地圖都會重配**（低 16 位是表格索引、高 16 位是
   伺服器的世代碼），所以只存位置、不存 ID；每一趟到了現場再從
@@ -241,6 +246,12 @@ TRIP_MAX_SECS = 1800.0
 #   點東西伺服器會判距離，站在檯子前面的話它一定在幾格內；範圍開太大只是
 #   讓「一個一個點」變慢（每 CRAFT_RETRY_SECS 才點一個）。
 BENCH_SCAN_R = 8.0
+# ★★★ 點檯子之前要離它多近（圓距離、格）。伺服器對「點製作檯」那一包有距離檢查
+#   （2026-09-07 廚狐 棕櫚基地 烹飪-廚具組01 實測：3.68 以內 9 個點全開、3.70 起
+#   全不開，而且太遠**沒有任何反應**）。使用者標的「檯子旁邊」常常離物件座標
+#   4 格以上（廚具組的圖很大、座標在它北邊，9/7 就是站 4.7 格點不到）→ 點之前
+#   先用地形圖走到這麼近。留 1 格餘裕：伺服器看的是它那邊的位置，客戶端會差一點。
+BENCH_REACH = 2.5
 # 記住的檯子長什麼樣（外觀編號）要在多近的範圍內才算「就是上次那個」。
 BENCH_SAME = 2.0
 
@@ -503,7 +514,8 @@ class CharProducePage(QWidget):
         self.mark_bench_btn = QPushButton("記下製作檯位置")
         self.mark_bench_btn.setToolTip(
             "站在製作檯旁邊一格按這顆，把這裡記成回程要走到的點。\n"
-            "⚠ 別站在檯子那一格上，走路踩不上去。")
+            "⚠ 別站在檯子那一格上，走路踩不上去。\n"
+            "⚠ 伺服器只認離檯子座標 3 格內的點擊；標得太遠工具箱會自己再走近。")
         self.mark_bench_btn.clicked.connect(self._mark_bench)
         row.addWidget(self.mark_bench_btn)
         self.bench_lbl = QLabel("")
@@ -1537,12 +1549,24 @@ class CharProducePage(QWidget):
                     c["pi"] = k
                     break
         p = props[min(c["pi"], len(props) - 1)]
-        ok, msg = produce.click(self._mover, self.sc, p)
+        # ★★★ 太遠先走近再點（2026-09-07）：伺服器只受理 ~3.7 格內的那一包，太遠
+        #   送了**完全沒反應**——舊流程站在使用者標的點直接點，標得離物件座標
+        #   4.7 格就永遠開不了、每 6 秒換下一個候選繞圈。走不到（地形圖說沒路／
+        #   最短路走完仍差一點）就照送不誤，讓伺服器判；等不到再換候選。
+        d = p.dist(me)
+        if d > BENCH_REACH and not (self._nav.stuck or self._nav.exhausted):
+            note = self._walk_to(p.x, p.y, arrive=BENCH_REACH)
+            if not (self._nav.stuck or self._nav.exhausted):
+                c["poked"] = None
+                return (f"走近第 {c['pi'] + 1}/{len(props)} 個站台"
+                        f"（還有 {d:.1f} 格，要 {BENCH_REACH:.0f} 格內才點得到）"
+                        f"　{note}")
+        ok, msg = produce.click_bench(self._mover, self.sc, p)
         c["poked"] = p if ok else None
         if not ok:
             return f"⚠ 點製作檯沒送出（{msg}）"
         return (f"點了第 {c['pi'] + 1}/{len(props)} 個候選"
-                f"（{p.dist(me):.1f} 格），等面板開…")
+                f"（{d:.1f} 格），等面板開…")
 
     def _craft_step(self, s: dict) -> None:
         """一拍推一格製作。**開一整批交給客戶端自己做完，工具箱只監看。**
@@ -2093,8 +2117,10 @@ class CharProducePage(QWidget):
 
     # ------------------------------------------------------------------
     # -- 定位點 ----------------------------------------------------------
-    def _walk_to(self, gx: float, gy: float) -> str:
+    def _walk_to(self, gx: float, gy: float,
+                 arrive: float = navigate.ARRIVE) -> str:
         """走去 (gx, gy)。回傳給狀態列看的說明；到不了時 `self._nav.stuck` 為 True。
+        arrive：離目標這麼近就算到了（點製作檯傳 BENCH_REACH）。
 
         ★ 走地形圖算出來的最短路（`navigate.Navigator`），一個轉折點一個
           轉折點推進，**純讀記憶體、不問遊戲的尋路**。
@@ -2104,7 +2130,7 @@ class CharProducePage(QWidget):
         pf = move.pathfinder_this(self.sc)
         if not pf:
             return "讀不到角色"
-        return self._nav.step(self.sc, self._mover, pf + 8, gx, gy)
+        return self._nav.step(self.sc, self._mover, pf + 8, gx, gy, arrive=arrive)
 
     # ⚠⚠ 採集狀態中**用不了天使之翼**（2026-08-12 使用者實測：要先按一下
     #   ESC 把採集狀態取消掉）。所以回程前一定要先送 ESC，而且**隔一拍**
