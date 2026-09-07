@@ -236,6 +236,15 @@ CRAFT_MAX_SECS = 3600.0
 # ⚠ 走位分兩段：遠距離 navigate（A* 最短路），最後一段 move.walk_exact
 #   （直送目的地、**不套打怪用的 MIN_GAP**，那個下限會讓人永遠差一格多）。
 BENCH_DONE = 0.8
+# ★★★ 最後一格走不上去（2026-09-07 廚狐實錄）：記的點就在腳邊 1 格，WALK_FN 每拍照送
+#   （跳板 DONE 計數一直在跳、參數 (110.5,53.5)→(110.5,52.5) 完全正確），但遊戲自己
+#   的尋路對**相鄰格回 0** → 一步不動，狀態列「走到製作檯上…還有 1.0 格」站到天亮
+#   （near-walk-and-lua-crash 那個坑的另一面：貼身尋路必回 0）。相鄰格本來就等於到了：
+#   站著不動 EXACT_STALL 秒而且差不到 EXACT_NEAR 格就當到；差更多但 EXACT_GIVEUP 秒
+#   都沒動也放行（大聲說）—— 站在那裡什麼都不做才是最糟的。製作那段會自己再走近站台。
+EXACT_NEAR = 1.6             # 相鄰格（含斜角 1.41）
+EXACT_STALL = 2.0
+EXACT_GIVEUP = 8.0
 # 整趟（回程→製作→捐→回標記點）的兜底：**沒有進展**超過這麼久才放棄。
 # ★ 製作有進展（清單變少／材料變少）都會把起算點往後推 ——
 #   見 CRAFT_MAX_SECS 的教訓：總時長上限會把大批製作砍在半路。
@@ -1335,24 +1344,28 @@ class CharProducePage(QWidget):
                 return
             bx, by = self._bench[0], self._bench[1]
             d = ((me[0] - bx) ** 2 + (me[1] - by) ** 2) ** 0.5
-            if d <= BENCH_DONE:
+            stalled = self._exact_stalled(s, "bench_stall", me, d)
+            if d <= BENCH_DONE or stalled:
                 self._nav.reset()
+                s.pop("bench_stall", None)
                 s["step"] = "craft"
                 s["craft"] = self.new_craft_state()
                 # ★ 把「記的」跟「實際站的」都講出來 —— 差多少一眼看得到，
                 #   不必猜（使用者回報過「走過去跟我定的位置不同」）。
                 self._note(f"到製作檯了（記的 {bx:.0f},{by:.0f}／"
-                           f"實際 {me[0]:.0f},{me[1]:.0f}／差 {d:.1f} 格），"
-                           "開始做半成品")
+                           f"實際 {me[0]:.0f},{me[1]:.0f}／差 {d:.1f} 格"
+                           f"{'；' + stalled if stalled else ''}），開始做半成品",
+                           warn=bool(stalled and stalled.startswith("⚠")))
                 return
             # ★ 最後 3 格 Navigator 會判定「到了」而不再走（ARRIVE=3.0），
-            #   所以近距離改用 walk_near 直接貼過去（不尋路 —— 近距離尋路
+            #   所以近距離改用 walk_exact 直接貼過去（不尋路 —— 近距離尋路
             #   必回 0，見 memory 的 near-walk-and-lua-crash）。
             if d <= navigate.ARRIVE:
                 # ★ Navigator 離目標 3 格就判定「到了」而不再走（ARRIVE），
                 #   最後這段自己送目的地 —— walk_exact 不留距離，直接站上去。
+                # ⚠ 正在走就別重送（重下指令會把上一段打斷，dungeon._busy_walking 同理）。
                 pf = move.pathfinder_this(self.sc)
-                if pf:
+                if pf and not entity.is_walking(self.sc, pf + 8):
                     self._mover.walk_exact(self.sc, pf + 8, bx, by)
                 self._note(f"走到製作檯上…還有 {d:.1f} 格")
                 return
@@ -1432,13 +1445,18 @@ class CharProducePage(QWidget):
             if me is None:
                 return
             d = ((me[0] - spot[0]) ** 2 + (me[1] - spot[1]) ** 2) ** 0.5
-            if d <= WALK_DONE:
+            stalled = self._exact_stalled(s, "spot_stall", me, d)
+            if d <= WALK_DONE or stalled:
                 self._nav.reset()
+                s.pop("spot_stall", None)
                 s["step"] = "resume"
+                if stalled:            # 同製作檯那段：相鄰格走不上去就站這裡開工
+                    self._note(f"到標記點了（{stalled}）",
+                               warn=stalled.startswith("⚠"))
                 return
             if d <= navigate.ARRIVE:            # 最後一段自己貼上去
                 pf = move.pathfinder_this(self.sc)
-                if pf:
+                if pf and not entity.is_walking(self.sc, pf + 8):
                     self._mover.walk_exact(self.sc, pf + 8, spot[0], spot[1])
                 self._note(f"走到標記點上…還有 {d:.1f} 格")
                 return
@@ -2117,6 +2135,29 @@ class CharProducePage(QWidget):
 
     # ------------------------------------------------------------------
     # -- 定位點 ----------------------------------------------------------
+    def _exact_stalled(self, s: dict, key: str, me, d: float) -> str | None:
+        """最後一段直走（walk_exact）的看門狗。回 None＝繼續走；回字串＝就當到了。
+
+        ★★★ 2026-09-07 廚狐實錄：記的製作檯位置在腳邊 **1 格**，每拍都送 WALK_FN
+          （跳板計數在跳、參數正確），遊戲自己的尋路對相鄰格回 0 → 一步不動，
+          「走到製作檯上…還有 1.0 格」站到天亮。相鄰格本來就到了。
+        判定只看「人有沒有動」：位置 EXACT_STALL 秒沒變而且差不到 EXACT_NEAR 格
+        → 當到（正常訊息）；差更多但 EXACT_GIVEUP 秒沒動 → 也放行（⚠ 大聲說）。
+        有動就重新起算；`s[key]` = (起算時間, 起算位置)，到了呼叫端要 pop 掉。
+        """
+        now = time.monotonic()
+        st = s.get(key)
+        if (st is None or abs(st[1][0] - me[0]) > 0.3
+                or abs(st[1][1] - me[1]) > 0.3):
+            s[key] = (now, me)
+            return None
+        still = now - st[0]
+        if d <= EXACT_NEAR and still >= EXACT_STALL:
+            return f"差 {d:.1f} 格走不上去（遊戲對相鄰格不走），就站這裡"
+        if still >= EXACT_GIVEUP:
+            return f"⚠ 差 {d:.1f} 格站了 {still:.0f} 秒沒動，不等了"
+        return None
+
     def _walk_to(self, gx: float, gy: float,
                  arrive: float = navigate.ARRIVE) -> str:
         """走去 (gx, gy)。回傳給狀態列看的說明；到不了時 `self._nav.stuck` 為 True。
