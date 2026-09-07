@@ -2948,6 +2948,21 @@ class DungeonTab(BaseTab):
             #   一退開人就離開了 PORTAL_NEAR，那一支根本不會再被叫到，狀態機
             #   會卡在 away；而下面「走進傳點」又會把人走回去 —— 兩邊互相拉扯，
             #   人就在傳點跟退開點之間來回。放在分支開頭它才管得到整段。
+            # ★★★ **對話傳送**（使用者 2026-09-07：「除了傳送還有對話傳送，
+            #   傳送後可能會有對話視窗」）：不是踩上去就走，是**點它、選第 N 項**
+            #   才被傳走。走 `_do_interact`（跟入口那種門口同一支），完成訊號
+            #   照舊是「人被搬走」（上面那幾關），⛔ 不是「對話走完了」。
+            #   對話走完人還在原地 → 隔 PORTAL_POKE 秒整段重來（無上限）。
+            if step.get("menu"):
+                if self._poke_t > 0:
+                    self._poke_t -= dt
+                    self._say(f"第 {self._i + 1} 步　對話傳送：對話走完了但人還在"
+                              f"　{self._poke_t:.1f} 秒後再點一次")
+                    return
+                self._do_interact({**step, "at": step["to"]}, me, dt,
+                                  tag=f"第 {self._i + 1} 步　對話傳送",
+                                  finish=self._talk_portal_again)
+                return
             if self._bump_portal(gx, gy, me):
                 return
             if _d((gx, gy), me) <= PORTAL_NEAR:
@@ -3154,6 +3169,22 @@ class DungeonTab(BaseTab):
         note = self._send_portal(tuple(step["to"]), step.get("model"), "傳點")
         self._say(f"第 {self._i + 1} 步　{note}…已 {mins:.1f} 分鐘")
 
+    def _talk_portal_again(self) -> None:
+        """對話傳送：對話整段走完了、但人**還沒被搬走** → 過一會整段重來。
+
+        ⛔ 這裡不可以 `_next()`（那是「對話走完就算過」，會把沒傳到的當成傳到）。
+        ⚠ 沒有次數上限（跟踩的傳點同一條規矩：過不去就一直試，出口是取消勾選）。
+        """
+        self._clicked = False
+        self._menu_i = 0
+        self._talk_seen = False
+        self._still_t = 0.0
+        self._nudge = 0
+        self._click_best = None
+        self._poke_t = PORTAL_POKE
+        self._say(f"第 {self._i + 1} 步　對話傳送：對話走完了但人還在原地"
+                  f" → {PORTAL_POKE:.0f} 秒後再點一次")
+
     def _bump_spot(self, gx: float, gy: float):
         """挑一格「退開 PORTAL_BACK 格」的落腳點：可走、而且**我現在走得到**。
 
@@ -3214,8 +3245,11 @@ class DungeonTab(BaseTab):
         step = steps[self._i] if self._i < len(steps) else None
         # ⚠⚠ 撞機關那一步也**不准插手**（2026-09-07）：機關的對話要按官方的
         #   「確定」（talkaction 1）才會生效，這支跑去 destroy 掉就等於白撞。
-        if step is not None and step.get("do") in (dungeon.INTERACT,
-                                                   dungeon.BUMP):
+        if step is not None and (step.get("do") in (dungeon.INTERACT,
+                                                    dungeon.BUMP)
+                                 or (step.get("do") == dungeon.PORTAL
+                                     and step.get("menu"))):
+            # ⚠ 對話傳送那一步也在等對話（點它、選第 N 項），這支收掉就白點了。
             return False
         self._stray_t -= dt
         if self._stray_t > 0:

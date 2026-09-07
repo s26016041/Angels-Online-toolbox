@@ -508,6 +508,17 @@ class DungeonMakeTab(BaseTab):
             "⛔ 沒有次數上限 —— 撞不開就一直撞。")
         b.clicked.connect(self._add_bump_prop)
         th.addWidget(b)
+        # ★★ 使用者 2026-09-07：「這遊戲除了傳送還有對話傳送，傳送後可能會有
+        #   對話視窗，所以要多一個按鈕是這是對話傳送」。
+        b = QPushButton("這個是對話傳送")
+        b.setToolTip(
+            "點了、選完選項**才會把人傳走**的那種傳點（跟站上去就傳的不一樣）。\n"
+            "★ 用法：先按「點點看」，再按你要的「第 N 項」，然後按這顆。\n"
+            "跑的時候：走到你剛剛講話的位置 → 點它 → 照順序送那些選項 →\n"
+            "**等人被傳走**才算完成（對話走完人還在原地就隔幾秒整段重來）。\n"
+            "按完之後你自己走完對話，出口在哪會自動記進這一步。")
+        b.clicked.connect(self._add_talk_portal)
+        th.addWidget(b)
         # ★ 使用者 2026-09-02：「新增一個『加入進入副本傳送點』，一樣寫在
         #   同一個 json，他會紀錄那個入口傳送點目前在哪個地圖哪個地方」
         b = QPushButton("這是進副本的入口")
@@ -1063,6 +1074,40 @@ class DungeonMakeTab(BaseTab):
                    "at": [round(pr.x, 1), round(pr.y, 1)],
                    "model": pr.model,
                    "stand": [round(me[0]), round(me[1])]})
+
+    def _add_talk_portal(self) -> None:
+        """把剛剛「點點看＋選項」試出來的那個物件記成**對話傳送**（使用者 2026-09-07）。
+
+        跟「這個是傳送點」的差別：那一種是站上去就被搬走；這一種要**點它、
+        選第 N 項**才傳。存的東西跟對話步驟一樣（位置／外觀／站位／選項路徑），
+        只是 `do` 是 `portal` —— 完成訊號因此是「人被搬走」，不是「對話走完」。
+        ⚠ 存完一樣開始盯順移，把出口記進這一步（跟踩的傳點同一套）。
+        """
+        if self._poked is None:
+            self.status.setText("先按「點點看」試那個傳送物件，再按這顆")
+            return
+        pr = self._poked
+        step = {"do": dungeon.PORTAL,
+                "to": [round(pr.x, 1), round(pr.y, 1)],
+                "model": pr.model,
+                "menu": list(self._menu)}
+        at = getattr(self, "_poked_at", None)
+        if at:
+            step["stand"] = [round(at[0], 1), round(at[1], 1)]
+        n = len(self._script.steps)
+        self._add(step)
+        if len(self._script.steps) <= n:
+            return                       # 被 _add 擋下來了（換圖了之類）
+        self._poked = None
+        self._poked_at = None
+        self._menu = []
+        self._refresh_menu()
+        self.save_talk.setEnabled(False)
+        self._pw_track.clear()
+        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
+        self._pw_timer.start(PORTAL_WATCH_MS)
+        self._say_map(f"記成對話傳送：{mapobj.label(pr.model)} —— "
+                      "把對話走完吧，我盯著看它把你送到哪。")
 
     def _entrance_here(self) -> bool:
         """現在正在跟**已經記好的那個入口**互動嗎？

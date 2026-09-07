@@ -3281,6 +3281,25 @@ def main() -> int:
        and mtab._script.steps[-1] == {"do": dungeon.BUMP, "at": [20.0, 10.0],
                                       "model": 60414, "stand": [12, 12]},
        str(mtab._script.steps[-1:]))
+    # ★★ 對話傳送（使用者 2026-09-07：「除了傳送還有對話傳送」）
+    _n = len(mtab._script.steps)
+    mtab._poked = None
+    mtab._add_talk_portal()
+    ck("　沒先「點點看」→ 只回報、不亂加步驟",
+       len(mtab._script.steps) == _n, mtab.status.text())
+    mtab._poked = FakeProp(30.0, 40.0, 60123)
+    mtab._poked_at = (11.5, 12.5)
+    mtab._menu = [1]
+    mtab._add_talk_portal()
+    ck("★★ 「這個是對話傳送」＝portal 步驟 ＋ 站位 ＋ 選項路徑",
+       len(mtab._script.steps) == _n + 1
+       and mtab._script.steps[-1] == {"do": dungeon.PORTAL,
+                                      "to": [30.0, 40.0], "model": 60123,
+                                      "menu": [1], "stand": [11.5, 12.5]},
+       str(mtab._script.steps[-1:]))
+    ck("　存完開始盯順移（出口自動記進這一步）", mtab._pw is not None)
+    mtab._pw = None
+    mtab._pw_timer.stop()
     _big = dm.MapWindow(mtab)
     ck("★ 「加入『走進傳點』」已經拿掉（傳點一律用「這個是傳送點」）",
        not hasattr(_big, "add_portal"))
@@ -3514,6 +3533,45 @@ def main() -> int:
        tab.walked and (0.0, 0.0) not in tab.walked
        and all(((x - 20) ** 2 + (y - 10) ** 2) ** 0.5 <= 4.0 + 1.0
                for x, y in tab.walked), str(tab.walked))
+
+    # =====================================================================
+    # ★★ 對話傳送（portal + menu，使用者 2026-09-07：「這遊戲除了傳送還有
+    #    對話傳送，傳送後可能會有對話視窗」）
+    # =====================================================================
+    print("")
+    print("對話傳送（portal + menu）")
+    _tp = {"do": dungeon.PORTAL, "to": [50, 50], "model": 60123,
+           "stand": [49, 50], "menu": [1]}
+    ck("　validate 收 portal 的 menu／stand", *dungeon.validate(_tp))
+    ck("　menu 值不合法 → 擋下",
+       not dungeon.validate({**_tp, "menu": [99]})[0])
+    ck("　stand 不是 [x,y] → 擋下",
+       not dungeon.validate({**_tp, "stand": 5})[0])
+    ck("★ describe 講「對話傳送」、還講得出選第幾項",
+       "對話傳送" in dungeon.describe(_tp) and "第1項" in dungeon.describe(_tp),
+       dungeon.describe(_tp))
+    ck("　沒 menu 的照舊寫「走進傳點」",
+       "走進傳點" in dungeon.describe({"do": dungeon.PORTAL, "to": [50, 50]}))
+
+    tab = make_tab([_tp, {"do": dungeon.WAIT, "secs": 5}], pos=(49.0, 50.0),
+                   props=[FakeProp(50.0, 50.0, 60123)])
+    tab.trigs = [FakeTrig(50.0, 50.0, 60123)]
+    dt.entity.is_walking = lambda _sc, _p: False
+    wire(tab, FakeTalk([(1, 2), ()]))
+    ck("★★★ 對話傳送這一步**不准**讓「自動收殘留對話」插手（收掉就白點了）",
+       tab._stray_dialog(1.0) is False)
+    run(tab, 4.0)
+    from app.game import supply as _sup4
+    ck("★★ 對話傳送＝走到站位、點它、送選項（⛔ 不是踩上去打 0x0D）",
+       tab.sent == [_sup4.talk_option(1)] and tab.portal_sent == [],
+       f"{tab.sent} {tab.portal_sent}")
+    ck("★★ 對話走完但人還在原地 → ⛔ 不算過（完成訊號是人被搬走）",
+       tab._i == 0, f"第 {tab._i + 1} 步")
+    ck("　等一下會整段重來（⛔ 沒有次數上限）", tab._poke_t > 0,
+       f"poke_t={tab._poke_t}")
+    tab._jumped = (49.0, 50.0)                  # 人被傳走了
+    run(tab, 0.2)
+    ck("★★★ 人被搬走了 → 這一步才完成", tab._i == 1, f"第 {tab._i + 1} 步")
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0

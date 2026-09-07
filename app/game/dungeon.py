@@ -35,7 +35,10 @@ r"""副本腳本：一趟副本要照順序做哪些事，存成 JSON。
                                                      （清怪本來就是每一步的前提）
     {"do": "wait",     "secs": 3}                    單純等幾秒
     {"do": "portal",   "to": [x, y], "model": 60xxx, 走進傳點（人被移走才算完成）
-                       "land": [x, y], "scene": 76}
+                       "land": [x, y], "scene": 76,
+                       "stand": [x, y],               ★ 有 menu ＝**對話傳送**：
+                       "menu": [1]}                     走到站位、點它、送選項，
+                                                        人被搬走才算完成
     {"do": "force",    "to": [x, y]}                 強制走到（不算路徑、不管障礙）
     {"do": "bump",     "at": [x, y], "model": 60414, 來回撞機關（撞→退開→再撞），
                        "stand": [x, y]}              **它蓋的阻擋不見了**才算完成
@@ -408,6 +411,18 @@ def validate(step: dict) -> tuple[bool, str]:
         mdl = step.get("model")
         if mdl is not None and not isinstance(mdl, int):
             return False, "portal 的 model 要是外觀編號"
+        # ★ 對話傳送（使用者 2026-09-07：「除了傳送還有對話傳送」）：點它、
+        #   選第 N 項才傳走。格式跟 interact 的 menu／stand 同一套。
+        menu = step.get("menu")
+        if menu is not None:
+            if not isinstance(menu, list):
+                return False, "portal 的 menu 要是陣列"
+            for n in menu:
+                if not isinstance(n, int) or not 0 <= n <= MENU_MAX:
+                    return False, f"portal 的對話動作要 0~{MENU_MAX}（收到 {n}）"
+        st = step.get("stand")
+        if st is not None and not (isinstance(st, list) and len(st) == 2):
+            return False, "portal 的 stand 要是 [x,y]"
     return True, ""
 
 
@@ -498,12 +513,16 @@ def describe(step: dict) -> str:
         return f"等 {step.get('secs')} 秒"
     if kind == PORTAL:
         x, y = step.get("to", ["?", "?"])
+        # ★ 對話傳送：跟「踩上去就傳」分開講，不然看不出這一步會開對話
+        talk = ("　對話 " + " → ".join(f"第{n}項" for n in step["menu"] if n)
+                if step.get("menu") else "")
+        head = "對話傳送" if step.get("menu") else "走進傳點"
         land = step.get("land")
         if not land:
             # ⚠ 還沒看到出口就要講出來 —— 沒看到 ≠ 沒有出口，但也不能裝作記到了。
             m = step.get("model")
             who = f"　{mapobj.label(m)}" if isinstance(m, int) else ""
-            return (f"走進傳點 ({x}, {y}){who}"
+            return (f"{head} ({x}, {y}){who}{talk}"
                     "　⚠ 還沒看到出口（走進去一次就會記起來）")
         tail = ""
         dst = step.get("scene")
@@ -512,7 +531,7 @@ def describe(step: dict) -> str:
             tail = f"　{_scene.scene_name(dst)}"
         m = step.get("model")
         who = f"　{mapobj.label(m)}" if isinstance(m, int) else ""
-        return (f"走進傳點 ({x}, {y}){who} → 出口 "
+        return (f"{head} ({x}, {y}){who}{talk} → 出口 "
                 f"({land[0]:g}, {land[1]:g}){tail}")
     return f"？{kind}"
 
