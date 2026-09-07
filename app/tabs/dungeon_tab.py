@@ -2962,7 +2962,11 @@ class DungeonTab(BaseTab):
             #   才被傳走。走 `_do_interact`（跟入口那種門口同一支），完成訊號
             #   照舊是「人被搬走」（上面那幾關），⛔ 不是「對話走完了」。
             #   對話走完人還在原地 → 隔 PORTAL_POKE 秒整段重來（無上限）。
-            if step.get("menu"):
+            # ⚠⚠ 判斷「是不是對話傳送」要看**有沒有 menu 這個欄位**，
+            #   ⛔ 不能看它有沒有內容：沒有選項的對話傳送存的是 `"menu": []`
+            #   （空的是假值）—— 2026-09-08 使用者實跑第 18 步就是這樣被當成
+            #   「踩上去的傳點」，站在那裡打了 8 輪 0x0D 從頭到尾沒點過它。
+            if "menu" in step:
                 if self._poke_t > 0:
                     self._poke_t -= dt
                     self._say(f"第 {self._i + 1} 步　對話傳送：對話走完了但人還在"
@@ -3257,7 +3261,7 @@ class DungeonTab(BaseTab):
         if step is not None and (step.get("do") in (dungeon.INTERACT,
                                                     dungeon.BUMP)
                                  or (step.get("do") == dungeon.PORTAL
-                                     and step.get("menu"))):
+                                     and "menu" in step)):
             # ⚠ 對話傳送那一步也在等對話（點它、選第 N 項），這支收掉就白點了。
             return False
         self._stray_t -= dt

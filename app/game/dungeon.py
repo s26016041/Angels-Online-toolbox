@@ -514,9 +514,10 @@ def describe(step: dict) -> str:
     if kind == PORTAL:
         x, y = step.get("to", ["?", "?"])
         # ★ 對話傳送：跟「踩上去就傳」分開講，不然看不出這一步會開對話
+        # ⚠ 有 menu 這個欄位就是對話傳送（沒有選項的存的是空陣列，見 dungeon_tab）
         talk = ("　對話 " + " → ".join(f"第{n}項" for n in step["menu"] if n)
                 if step.get("menu") else "")
-        head = "對話傳送" if step.get("menu") else "走進傳點"
+        head = "對話傳送" if "menu" in step else "走進傳點"
         land = step.get("land")
         if not land:
             # ⚠ 還沒看到出口就要講出來 —— 沒看到 ≠ 沒有出口，但也不能裝作記到了。

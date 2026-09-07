@@ -3669,6 +3669,28 @@ def main() -> int:
     run(tab, 0.2)
     ck("★★★ 人被搬走了 → 這一步才完成", tab._i == 1, f"第 {tab._i + 1} 步")
 
+    # ★★★★ 2026-09-08 實跑抓到的真 bug：**沒有選項**的對話傳送存的是
+    #    `"menu": []`（空的是假值）→ 舊判斷 `if step.get("menu")` 整個掉回
+    #    「踩上去的傳點」那條路，站在那裡打了 8 輪 0x0D，從頭到尾沒點過它。
+    #    → 判斷改成「有沒有 menu 這個欄位」。
+    _tp0 = {"do": dungeon.PORTAL, "to": [50, 50], "model": 60408,
+            "stand": [49, 50], "menu": []}
+    ck("★ describe：沒有選項的也要講「對話傳送」",
+       "對話傳送" in dungeon.describe(_tp0), dungeon.describe(_tp0))
+    tab = make_tab([_tp0, {"do": dungeon.WAIT, "secs": 5}], pos=(49.0, 50.0),
+                   props=[FakeProp(50.0, 50.0, 60408)])
+    tab.trigs = [FakeTrig(50.0, 50.0, 60408)]
+    dt.entity.is_walking = lambda _sc, _p: False
+    wire(tab, FakeTalk([(), ()]))
+    clicked0 = []
+    dt.produce.click = lambda *_a, **_k: (clicked0.append(1), (True, "點了"))[1]
+    run(tab, 3.0)
+    ck("★★★★ 沒有選項（menu 是空的）照樣走**對話傳送**：去點它，"
+       "⛔ 不是站上去打 0x0D",
+       clicked0 and tab.portal_sent == [], f"{len(clicked0)} 發 {tab.portal_sent}")
+    ck("　⛔ 也不會去撞（那是踩的傳點才有的動作）", tab._bump is None,
+       str(tab._bump))
+
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
 
