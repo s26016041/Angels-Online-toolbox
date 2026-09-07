@@ -3656,7 +3656,12 @@ class DungeonTab(BaseTab):
         #   真的講到話的位置，一定站得住、距離也一定夠。
         #   沒記的舊腳本才退回「靠近那個物件、留 TALK_KEEP 格」。
         stand = step.get("stand")
-        if stand:
+        # ⛔⛔ 使用者 2026-09-08：「他一直退回來，你就用我狂點點點看的樣子」——
+        #   **點過之後就不要再管站位**：點選會讓遊戲自己往物件走，下一拍我們又
+        #   把人走回站位，兩邊互相拉，人永遠靠不上去（他手動狂點會過就是因為
+        #   製作頁的「點點看」只做一件事：送 TryAct，其他什麼都不做）。
+        #   → 站位只在**第一發之前**用來就位。
+        if stand and not self._clicked:
             sx, sy = stand
             if _d((sx, sy), me) > ARRIVE:
                 if _d((sx, sy), me) <= NAV_DEAD:
@@ -3671,7 +3676,7 @@ class DungeonTab(BaseTab):
                           f"　剩 {_d((sx, sy), me):.1f} 格　{note}"
                           f"　{self._mon_note()}")
                 return
-        elif _d((ax, ay), me) > TALK_NEAR:
+        elif not self._clicked and _d((ax, ay), me) > TALK_NEAR:
             if _d((ax, ay), me) <= NAV_DEAD:
                 note = self._walk_beside(ax, ay, TALK_KEEP)
             else:

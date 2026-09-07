@@ -3684,6 +3684,31 @@ def main() -> int:
     run(tab, 0.2)
     ck("★★★ 人被搬走了 → 這一步才完成", tab._i == 1, f"第 {tab._i + 1} 步")
 
+    # ⛔⛔ 使用者 2026-09-08：「他一直退回來，你就用我狂點點點看的樣子」——
+    #    點過之後**不准再把人走回站位**：點選會讓遊戲自己往物件走，我們再把人
+    #    拉回站位就是兩邊互相拉，永遠靠不上去。
+    tab = make_tab([{"do": dungeon.PORTAL, "to": [50, 50], "model": 60408,
+                     "stand": [44, 50], "menu": []},
+                    {"do": dungeon.WAIT, "secs": 5}], pos=(44.0, 50.0),
+                   props=[FakeProp(50.0, 50.0, 60408)])
+    wire(tab, FakeTalk([(), ()]))
+    dt.produce.click = lambda *_a, **_k: (True, "點了")
+    dt.entity.is_walking = lambda _sc, _p: False
+    walked6 = []
+    tab._mover = type("M", (), {
+        "walk_exact": lambda _s, _sc, _p, x, y: walked6.append((x, y)) or True,
+        "walk_near": lambda _s, _sc, _p, x, y, k: walked6.append((x, y, k)),
+    })()
+    tab._busy_walking = lambda: False
+    run(tab, 0.5)                       # 站在站位上 → 直接點
+    ck("　站在站位上就點了", tab._clicked, str(tab._clicked))
+    tab._pos = [49.0, 50.0]             # 遊戲把人往雕像帶過去了
+    tab._nav.goal = None
+    run(tab, 2.0)
+    ck("★★★★ 點過之後**不會再把人走回站位**（⛔ 不准退回來）",
+       tab._nav.goal is None
+       and all(w[:2] != (44.0, 50.0) for w in walked6), str(walked6))
+
     # ★★★★ 2026-09-08 實跑抓到的真 bug：**沒有選項**的對話傳送存的是
     #    `"menu": []`（空的是假值）→ 舊判斷 `if step.get("menu")` 整個掉回
     #    「踩上去的傳點」那條路，站在那裡打了 8 輪 0x0D，從頭到尾沒點過它。
