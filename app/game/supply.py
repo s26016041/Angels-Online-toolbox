@@ -1607,6 +1607,9 @@ WING_WAIT = 12.0       # 回城後等地圖變的上限（秒）
 #   少了＝傳送在路上，再多等這麼久；沒少＝那一下真的沒生效，照舊算失敗（不盲等）。
 WING_WAIT_LATE = 20.0
 JUMP_TRIES = 3         # 回程趴趴GO 最多重送幾次（★ 送出去≠到得了，見 run_full_supply）
+# run_full_supply(back_to=STAY)：補完**不回程、留在城裡**（副本頁清單全部刷完、沒勾循環
+# 那條：使用者 2026-09-07「補給完就好」）。⚠ 不是 None：None＝跳回出發當下站的地方。
+STAY = "stay"
 JUMP_WAIT = 10.0       # 每次送出後等落地的上限（秒）
 WALK_TIMEOUT = 90.0    # 走到 NPC 的上限（秒）——銀行常在城另一頭（永夜城實測離落點 176 格），
                        #   放寬保險；正常走到就提早返回，只有真的走不到才等滿
@@ -1893,7 +1896,7 @@ def run_full_supply(mover, scanner, say=None,
 
     back_to=(x, y, 場景編號) 可選：回程改跳回這個指定點，而不是出發當下站的
     地方 —— 掛機分頁的「記錄點」（＝巡邏點，2026-08-18 使用者要求）用這個；
-    None ＝ 原行為（生產分頁照舊）。
+    None ＝ 原行為（生產分頁照舊）；`STAY` ＝ 補完留在城裡不回程（副本頁）。
 
     potions={"HP": [種類id…], "MP": […]} 可選（robot.potion_buy_ids 給的）：
     買完購買清單後，照精靈頁放的藥水**買到負重 95%**（run_potion_fill，
@@ -1930,20 +1933,24 @@ def run_full_supply(mover, scanner, say=None,
         return False, "讀不到目前地圖"
     start_map = here
     _, start_pos = _player_tile(scanner)
-    if back_to is not None:
+    stay = back_to is STAY or back_to == STAY
+    if stay:
+        back_to = None
+    elif back_to is not None:
         start_map = int(back_to[2])
         start_pos = (float(back_to[0]), float(back_to[1]))
     # ★ 活動地圖（暴走穗海農場那種）不在趴趴GO 傳送表裡 —— 回程要走活動 NPC
     #   的對話選單（app/game/eventmap.py）。活動結束把那邊的 ROUTES 清掉，
     #   這裡就自動退回原本的趴趴GO 行為。
     from app.game import eventmap            # 避免模組載入期循環相依
-    ev = eventmap.for_scene(start_map)
-    back = None if ev else jumpmap.nearest(
+    ev = None if stay else eventmap.for_scene(start_map)
+    back = None if (ev or stay) else jumpmap.nearest(
         start_map,
         start_pos[0] if start_pos else None,
         start_pos[1] if start_pos else None)
     note(f"記錄練功點：{scene.scene_name(start_map)}"
-         + (f"（回程：找{ev.npc_name}）" if ev else
+         + ("（補完留在城裡，不回程）" if stay else
+            f"（回程：找{ev.npc_name}）" if ev else
             f"（回程點：{back.name}）" if back else "（⚠ 沒有回程傳送點）"))
 
     # 2. 天使之翼回城
@@ -1990,6 +1997,8 @@ def run_full_supply(mover, scanner, say=None,
     # ⚠ 這裡是背景執行緒，重送設有限次（不回報比重試更糟）；還是沒到就大聲說，
     #   呼叫端看得到「人不在採集圖」自己接手。
     def _jump_back() -> tuple[bool, str]:
+        if stay:                                   # 呼叫端要的就是留在城裡
+            return True, "補完留在城裡（不回程）"
         # ★ 活動地圖：改走活動 NPC 的對話選單，而且回**原來那條分流**
         #   （start_map 帶著支流序號，eventmap.go_back 自己拆）。
         if ev is not None:

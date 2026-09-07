@@ -272,6 +272,19 @@ TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 #     ⚠ 只有勾了「副本設定」才有這條；沒勾（單純循環）照舊無限撞。
 #     ⚠ 預設 3 分鐘＝使用者 9/2 給副本裡傳點的那個數（「3 分鐘都這樣就結束」），
 #       可在「副本設定」視窗改。
+#   · ★★★ 2026-09-07 使用者：「可以刷多個副本，例如無限塔＋邪靈古船」——
+#     副本設定視窗裡多一張**腳本清單**（config `sched_scripts`，照分身）：
+#       清單第 1 個刷 N 場 → 最後一場的回程補給改飛**下一個副本的入口** → 刷 N 場 → …
+#       走完清單 → 看「循環打副本」：勾了＝巡邏點掛機 ↔ 副本來回（走原本 _end_batch：
+#       回程補給飛回掛機記錄點、交給掛機頁、休息、休息完先補給、從清單第 1 個再來）；
+#       沒勾＝最後一場補給完**留在城裡停下**（run_full_supply(back_to=STAY)）。
+#     · 場數／休息／放棄分鐘全清單共用，⛔ 不用每個副本各自設。
+#     · 清單空＝刷主畫面下拉選的那份（＝舊行為，舊 config 不變）。
+#     · 「一批」的單位＝目前這個副本的 N 場：死亡／斷線／預期外錯誤算目前副本一場；
+#       入口撞超過放棄分鐘＝這個副本額度用完 → **跳下一個副本**（不是整批結束）。
+#     · 開跑時人在哪照清單第 1 個副本判斷；人站在清單裡別的副本裡也從第 1 個開始
+#       （使用者 9/7 選的）。「從第幾步」只管第一個副本第一場。
+#     · 「循環打副本」不再因為勾了副本設定變灰：它現在管的是清單走完要不要回去。
 SCHED_DEFAULTS = {"rounds": 4, "rest_min": 120, "farm": True, "give_up_min": 3}
 REST_NOTE = 1.0            # 休息倒數狀態列多久刷一次
 REST_LOG = 60.0            # 休息倒數多久寫一行執行紀錄（每秒寫兩小時就是七千行）
@@ -518,6 +531,7 @@ class DungeonTab(BaseTab):
         # 「副本設定」視窗裡的三個值（存 config，照分身；預設見 SCHED_DEFAULTS）
         self._sched_rounds = SCHED_DEFAULTS["rounds"]
         self._sched_rest_min = SCHED_DEFAULTS["rest_min"]
+        self._sched_scripts: list[str] = []      # 副本清單（腳本檔名，照順序；空＝主畫面那份）
         self._sched_farm = SCHED_DEFAULTS["farm"]
         self._sched_give_up_min = SCHED_DEFAULTS["give_up_min"]
         self._acct = ""              # 開跑那台的帳號（斷線後靠它認「同一個帳號回來了」）
@@ -683,7 +697,10 @@ class DungeonTab(BaseTab):
             "勾著：每一趟刷完 → 回程補給 → 趴趴GO回入口 →（有選組隊就）退組再組隊 → "
             "從第 1 步再跑一趟，一直循環。\n"
             "沒勾：只打一場，跑完就停（不組隊、不補給）。\n"
-            "⚠「從第幾步開始」只影響你按下開跑的那一場；後面每一趟都從第 1 步。")
+            "⚠「從第幾步開始」只影響你按下開跑的那一場；後面每一趟都從第 1 步。\n"
+            "勾了「副本設定」時：清單裡每個副本各刷 N 場是一定會跑的；這裡管的是\n"
+            "清單全部刷完之後 —— 勾著＝回掛機記錄點掛機、休息完再從頭刷一輪；\n"
+            "沒勾＝最後一場補給完留在城裡停下。")
         self.loop_cb.toggled.connect(self._save_settings)
         rbar.addWidget(self.loop_cb)
         # ★★★ 副本設定（使用者 2026-09-05，見 SCHED_DEFAULTS）：勾了旁邊的按鈕才能按；
@@ -691,11 +708,12 @@ class DungeonTab(BaseTab):
         self.sched_cb = QCheckBox("副本設定")
         self.sched_cb.setToolTip(
             "遊戲有鎖副本（一段時間只能進幾次）→ 勾了就由「副本設定」接管循環：\n"
-            "連續刷幾場 → 回程補給、飛回掛機記錄點交給自動掛機 → 休息 → 停掛機、\n"
-            "先回程補給一趟（免得藥水不足）再去刷下一批。刷副本途中死掉＝當成一場，\n"
-            "自動復活回城補給接著跑。\n"
-            "勾了才能按旁邊的按鈕改設定；勾選跟裡面的設定都會記住（照分身）。\n"
-            "勾著時「循環打副本」不管用（由副本設定決定要刷幾場）。")
+            "清單裡每個副本各連續刷 N 場（清單空＝刷上面選的那份）→ 全部刷完 →\n"
+            "有勾「循環打副本」：回程補給、飛回掛機記錄點交給自動掛機 → 休息 → 停掛機、\n"
+            "先回程補給一趟（免得藥水不足）再從頭刷一輪；沒勾：補給完留在城裡停下。\n"
+            "刷副本途中死掉＝當成一場，自動復活回城補給接著跑；在入口撞太久進不去＝\n"
+            "這個副本額度用完，換清單下一個。\n"
+            "勾了才能按旁邊的按鈕改設定；勾選跟裡面的設定都會記住（照分身）。")
         self.sched_cb.toggled.connect(self._on_sched_toggled)
         rbar.addWidget(self.sched_cb)
         self.sched_btn = QPushButton("副本設定")
@@ -851,9 +869,10 @@ class DungeonTab(BaseTab):
 
     # -- 副本設定（勾選框＋設定視窗，見 SCHED_DEFAULTS）-------------------------
     def _on_sched_toggled(self, on: bool) -> None:
-        """勾了才能按旁邊的按鈕；勾了就由它接管循環 →「循環打副本」變灰。"""
+        """勾了才能按旁邊的按鈕；勾了就由它接管循環。
+        ★ 2026-09-07 起「循環打副本」**不再變灰**：它改管「清單走完要不要回去掛機再來一輪」。"""
         self.sched_btn.setEnabled(bool(on))
-        self.loop_cb.setEnabled(not on)
+        self.loop_cb.setEnabled(True)
         self._sched_tip()
         self._save_settings()
 
@@ -862,21 +881,75 @@ class DungeonTab(BaseTab):
         h, m = divmod(max(0, int(self._sched_rest_min)), 60)
         rest = ((f"{h} 小時" if h else "") + (f" {m} 分" if m else "")).strip() or "不休息"
         gu = max(0, int(self._sched_give_up_min))
+        names = [n for n in self._sched_scripts if n]
+        lst = ("清單：" + " → ".join(names) + f"（各 {self._sched_rounds} 場）"
+               if names else f"清單空＝刷上面選的那份，連續刷 {self._sched_rounds} 場")
         self.sched_btn.setToolTip(
-            f"目前：連續刷 {self._sched_rounds} 場 → 休息 {rest} 再刷一次"
+            f"目前：{lst} → 休息 {rest} 再刷一次"
             + ("；全部場次結束後回自動掛機的點位開掛機" if self._sched_farm
                else "；全部場次結束後留在原地休息")
+            + "（沒勾「循環打副本」＝全部刷完補給後留在城裡停下）"
             + (f"；在入口撞超過 {gu} 分鐘進不去＝當這一批刷完" if gu
                else "；進不去就一直撞")
             + "\n點開改設定（連續刷 0 場＝不刷、直接回去掛機，測試用）。")
 
     def _sched_dialog(self) -> QDialog:
         """「副本設定」小視窗（值先擺進控制項；按確定才回存，見 _apply_sched_dialog）。"""
+        from pathlib import Path
         dlg = QDialog(self)
         dlg.setWindowTitle("副本設定")
         v = QVBoxLayout(dlg)
+        # ★★★ 副本清單（使用者 2026-09-07「可以刷多個副本」）：照順序、每個各刷下面那個場數；
+        #   存**檔名**（同主畫面下拉，[[exe-vs-py-differences]]）。清單空＝刷主畫面選的那份。
+        v.addWidget(QLabel("副本清單（照順序刷，每個各刷下面的場數；空＝刷上面選的那份）"))
+        lrow = QHBoxLayout()
+        dlg._list = QListWidget()
+        dlg._list.setSelectionMode(QListWidget.SingleSelection)
+        dlg._list.setMinimumHeight(110)
+        for name in self._sched_scripts:
+            if name:
+                dlg._list.addItem(name)
+        lrow.addWidget(dlg._list, 1)
+        lcol = QVBoxLayout()
+        dlg._pick = QComboBox()
+        dlg._pick.setFixedWidth(200)
+        for i in range(self.files.count()):
+            data = self.files.itemData(i)
+            if data:
+                dlg._pick.addItem(self.files.itemText(i), Path(str(data)).stem)
+        dlg._pick.setToolTip("「副本腳本製作」那一頁做出來的腳本；同一份可以加好幾次。")
+        lcol.addWidget(dlg._pick)
+
+        def _add():
+            stem = dlg._pick.currentData()
+            if stem:
+                dlg._list.addItem(str(stem))
+                dlg._list.setCurrentRow(dlg._list.count() - 1)
+
+        def _remove():
+            row = dlg._list.currentRow()
+            if row >= 0:
+                dlg._list.takeItem(row)
+
+        def _move(delta: int):
+            row = dlg._list.currentRow()
+            to = row + delta
+            if row < 0 or not (0 <= to < dlg._list.count()):
+                return
+            it = dlg._list.takeItem(row)
+            dlg._list.insertItem(to, it)
+            dlg._list.setCurrentRow(to)
+
+        for label, fn in (("加入", _add), ("移除", _remove),
+                          ("上移", lambda: _move(-1)), ("下移", lambda: _move(1))):
+            b = QPushButton(label)
+            b.clicked.connect(fn)
+            lcol.addWidget(b)
+        lcol.addStretch(1)
+        lrow.addLayout(lcol)
+        v.addLayout(lrow)
         r1 = QHBoxLayout()
-        r1.addWidget(QLabel("一次連續刷"))
+        r1.addWidget(QLabel("每個副本連續刷"))
         dlg._rounds = QSpinBox()
         dlg._rounds.setRange(0, 99)
         dlg._rounds.setValue(max(0, int(self._sched_rounds)))
@@ -904,11 +977,12 @@ class DungeonTab(BaseTab):
         r2.addWidget(QLabel("分，再刷一次"))
         r2.addStretch(1)
         v.addLayout(r2)
-        dlg._farm = QCheckBox("全部場次結束後回自動掛機的點位，並開始掛機")
+        dlg._farm = QCheckBox("清單全部刷完後回自動掛機的點位，並開始掛機")
         dlg._farm.setToolTip(
             "休息期間交給自動掛機頁掛機：最後一趟的回程補給改飛回掛機頁的記錄點（巡邏點），\n"
             "落地就勾起那一台的「開始掛機」；休息時間到先停掛機再回來刷。\n"
-            "活動地圖（暴走穗海農場那種）走活動 NPC 的對話進場，不是無腦趴趴GO。")
+            "活動地圖（暴走穗海農場那種）走活動 NPC 的對話進場，不是無腦趴趴GO。\n"
+            "⚠ 要勾著主畫面的「循環打副本」才會走這條；沒勾＝全部刷完補給後留在城裡停下。")
         dlg._farm.setChecked(bool(self._sched_farm))
         v.addWidget(dlg._farm)
         # ★ 進不去副本（使用者 2026-09-06）：撞這麼久都沒進去＝這一批的額度用完了
@@ -923,7 +997,7 @@ class DungeonTab(BaseTab):
             "0 ＝ 一直撞、永遠不放棄。")
         fit_spin(dlg._give_up)
         r3.addWidget(dlg._give_up)
-        r3.addWidget(QLabel("分鐘還進不去 → 當這一批刷完（0＝一直撞）"))
+        r3.addWidget(QLabel("分鐘還進不去 → 當這個副本刷完、換清單下一個（0＝一直撞）"))
         r3.addStretch(1)
         v.addLayout(r3)
         btns = QHBoxLayout()
@@ -950,6 +1024,8 @@ class DungeonTab(BaseTab):
         self._sched_rest_min = int(dlg._hours.value()) * 60 + int(dlg._mins.value())
         self._sched_farm = bool(dlg._farm.isChecked())
         self._sched_give_up_min = int(dlg._give_up.value())
+        self._sched_scripts = [dlg._list.item(i).text()
+                               for i in range(dlg._list.count())]
         self._sched_tip()
         self._save_settings()
 
@@ -979,6 +1055,7 @@ class DungeonTab(BaseTab):
         config.set(self._key("sched_rest_min"), int(self._sched_rest_min))
         config.set(self._key("sched_farm"), bool(self._sched_farm))
         config.set(self._key("sched_give_up_min"), int(self._sched_give_up_min))
+        config.set(self._key("sched_scripts"), [str(n) for n in self._sched_scripts if n])
         config.set(self._key("party"), self.party_box.currentData() or "none")
         config.set(self._key("partner"),
                    self.partner_box.currentText().split("（")[-1].rstrip("）")
@@ -1008,6 +1085,9 @@ class DungeonTab(BaseTab):
                                                SCHED_DEFAULTS["farm"]))
             self._sched_give_up_min = self._cfg_int(self._key("sched_give_up_min"),
                                                     SCHED_DEFAULTS["give_up_min"])
+            lst = config.get(self._key("sched_scripts"), None)
+            self._sched_scripts = ([str(n) for n in lst if isinstance(n, str) and n]
+                                   if isinstance(lst, list) else [])
             self.sched_cb.setChecked(bool(config.get(self._key("sched_on"), False)))
             # 值沒變 toggled 不會發 → 按鈕灰不灰、提示文字要自己對一次
             self._on_sched_toggled(self.sched_cb.isChecked())
@@ -1346,6 +1426,16 @@ class DungeonTab(BaseTab):
         self._rounds = 0                 # 趟數從頭數（休息完再刷**不**歸零，見 _attach）
         self._sched_reset()
         self._sched_begin()
+        if self._sched is not None:
+            # ★ 副本清單（2026-09-07）：清單裡每一份都要現在就讀得進來，少一份就大聲停
+            #   （⛔ 不跳過、不猜：跑到一半才發現找不到更糟）。清單空＝主畫面那份。
+            queue, why = self._load_queue(script)
+            if queue is None:
+                self._stop(f"⛔ 副本設定清單：{why}")
+                return
+            self._queue = queue
+            self._qi = 0
+            script = queue[0]
         if self._sched is not None and self._sched["rounds"] == 0:
             # ★ 副本設定「連續刷 0 場」＝測試用：什麼都不刷，直接走「這一批刷完」那條路
             #   （回程補給 → 飛回掛機記錄點 → 交給掛機頁），做完就停（見 _enter_rest）。
@@ -1360,6 +1450,32 @@ class DungeonTab(BaseTab):
             self._end_batch()
             return
         self._launch(int(pid), sc, script)
+
+    def _load_queue(self, fallback):
+        """副本設定的清單 → 讀成 Script 陣列（照順序）。清單空＝只有主畫面那份。
+        回 (清單, "") 或 (None, 原因)。"""
+        names = [n for n in self._sched_scripts if n]
+        if not names:
+            return [fallback], ""
+        from pathlib import Path
+        paths = {p.stem: p for p in dungeon.list_scripts()}
+        out = []
+        for n in names:
+            p = paths.get(n)
+            if p is None:
+                return None, f"找不到腳本「{n}」（被改名或刪掉了？打開副本設定移掉它）"
+            sc, why = dungeon.load(Path(p))
+            if sc is None:
+                return None, f"腳本「{n}」讀不進來：{why}"
+            out.append(sc)
+        return out, ""
+
+    def _queue_desc(self) -> str:
+        """清單長怎樣（事件／狀態列用）：「無限塔 → 邪靈古船（各 4 場）」；單一份就只有名字。"""
+        q = self._queue or ([self._script] if self._script else [])
+        names = " → ".join(x.name for x in q)
+        n = self._sched["rounds"] if self._sched else 0
+        return f"{names}（各 {n} 場）" if len(q) > 1 else f"「{names}」{n} 場"
 
     def _launch(self, pid: int, sc, script, presupply: bool = False) -> bool:
         """開跑（也是副本設定「休息完再刷」的入口，見 _resume_batch）：照人現在在哪
@@ -1456,7 +1572,7 @@ class DungeonTab(BaseTab):
         self._runlog_open()
         self._event("info", f"開跑「{script.name}」（從第 {self._i + 1} 步"
                             f"，{'循環' if self._loop else '只打一場'}"
-                            + (f"，副本設定 {self._sched['rounds']} 場" if self._sched else "")
+                            + (f"，副本設定 {self._queue_desc()}" if self._sched else "")
                             + f"，{ {'fly': '先飛去入口那張圖', 'enter': '先撞入口'}.get(phase, '人已在副本裡') }）")
         if phase == "fly":
             self.status.setText(
@@ -3283,7 +3399,7 @@ class DungeonTab(BaseTab):
             if self._sched is not None:
                 self._batch_done += 1
                 if self._batch_done >= self._sched["rounds"]:
-                    self._end_batch()
+                    self._batch_full()
                     return
             self._start_supply_trip()
 
@@ -3308,7 +3424,7 @@ class DungeonTab(BaseTab):
         self._event("abort", f"第 {self._rounds} 趟：出狀況當成完成{at}—— {why}")
         self.notify(f"{why}　→ 當成完成一場，回程補給後繼續")
         if self._sched is not None and self._batch_done >= self._sched["rounds"]:
-            self._end_batch()
+            self._batch_full()
             return
         self._start_supply_trip(
             note=f"⚠ 第 {self._rounds} 趟出狀況、當成完成 → 回程補給…（{why}）")
@@ -3393,7 +3509,8 @@ class DungeonTab(BaseTab):
             self._say(f"✔ 第 {self._rounds} 趟結束（這一批刷完）→ 回程補給，"
                       f"補完飛回掛機記錄點「{scene.scene_name(self._batch_home[2])}」交給掛機頁…")
         elif self._batch_end:
-            self._say(f"✔ 第 {self._rounds} 趟結束（這一批刷完）→ 回程補給，補完進休息…")
+            self._say(f"✔ 第 {self._rounds} 趟結束（這一批刷完）→ 回程補給，"
+                      + ("補完停下…" if self._batch_stop else "補完進休息…"))
         else:
             self._say(f"✔ 第 {self._rounds} 趟結束 → 回程補給…")
 
@@ -3405,7 +3522,10 @@ class DungeonTab(BaseTab):
             if self._batch_end and self._batch_home is not None:
                 tail = f"（補完飛回掛機記錄點「{scene.scene_name(self._batch_home[2])}」，交給掛機頁）"
             elif self._batch_end:
-                tail = "（補完進休息）"
+                tail = "（補完留在城裡停下）" if self._batch_stop else "（補完進休息）"
+            elif len(self._queue) > 1:
+                tail = (f"（補完飛去「{self._script.name}」的入口，"
+                        f"清單 {self._qi + 1}/{len(self._queue)}）")
             self._say((f"第 {self._rounds} 趟結束 → " if self._rounds else "開刷前 → ")
                       + f"補給中：{self._supply_progress}{tail}")
             return
@@ -3414,6 +3534,11 @@ class DungeonTab(BaseTab):
         self._event("info" if ok else "warn",
                     ("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
         self._supply_result = None
+        if self._batch_end and self._batch_stop:
+            # ★ 清單全部刷完、沒勾循環（使用者 2026-09-07「補給完就好」）→ 留在城裡停下
+            self._stop(f"✔ 副本清單全部刷完（{self._queue_desc()}）、補給完成 —— "
+                       f"沒勾「循環打副本」，停下（{why}）")
+            return
         if self._batch_end:
             # ★ 副本設定：這一批刷完的那趟補給 → 進休息（不飛回入口）
             self._enter_rest()
@@ -3576,9 +3701,12 @@ class DungeonTab(BaseTab):
 
     # -- 副本設定：刷 N 場 → 回去掛機 → 休息 → 再刷（見 SCHED_DEFAULTS）-----------
     def _sched_reset(self) -> None:
-        self._sched = None           # 開跑時抓的副本設定 {"rounds","rest","farm"}；None＝沒用
-        self._batch_done = 0         # 這一批刷完幾場了
-        self._batch_end = False      # 正在跑的補給是「這一批的最後一趟」（補完進休息不回入口）
+        self._sched = None           # 開跑時抓的副本設定 {"rounds","rest","farm","give_up","loop"}；None＝沒用
+        self._queue = []             # 副本清單（Script，照順序；空＝只有 self._script 那份）
+        self._qi = 0                 # 現在刷到清單第幾個
+        self._batch_done = 0         # 目前這個副本刷完幾場了
+        self._batch_end = False      # 正在跑的補給是「這一輪的最後一趟」（補完進休息不回入口）
+        self._batch_stop = False     # 這一趟補給完就停（清單走完、沒勾循環；使用者 9/7）
         self._batch_home = None      # 這一批結束要飛回的掛機記錄點 (x, y, 場景編號)
         self._rest_left = 0.0        # 休息還剩幾秒
         self._rest_total = 0.0
@@ -3593,7 +3721,48 @@ class DungeonTab(BaseTab):
         self._sched = {"rounds": max(0, int(self._sched_rounds)),
                        "rest": max(0, int(self._sched_rest_min)) * 60.0,
                        "farm": bool(self._sched_farm),
-                       "give_up": max(0, int(self._sched_give_up_min)) * 60.0}
+                       "give_up": max(0, int(self._sched_give_up_min)) * 60.0,
+                       # 清單走完要不要回掛機記錄點再來一輪（＝主畫面「循環打副本」）
+                       "loop": bool(self.loop_cb.isChecked())}
+
+    def _batch_full(self) -> None:
+        """目前這個副本的 N 場刷滿了（刷完／死亡／斷線／預期外錯誤／入口撞不進去都算）：
+        清單還有下一個 → 換副本（回程補給改飛它的入口，跟每一趟的路一樣走
+        supply → back → team → go）；清單走完 → 勾了「循環打副本」走 `_end_batch`
+        （回掛機記錄點／休息／再來一輪），沒勾 → 補給完留在城裡停下（使用者 2026-09-07）。"""
+        sch = self._sched
+        q = self._queue
+        if q and self._qi + 1 < len(q):
+            prev = self._script.name
+            self._qi += 1
+            self._batch_done = 0
+            self._script = q[self._qi]
+            self._i = 0
+            self._refresh_steps()
+            text = (f"「{prev}」{sch['rounds']} 場刷完 → 換清單下一個副本"
+                    f"「{self._script.name}」（{self._qi + 1}/{len(q)}）")
+            self._event("info", text)
+            self._start_supply_trip(note=f"✔ {text} → 回程補給，補完飛去它的入口…")
+            return
+        if sch.get("loop", True):        # 舊的 _sched 沒這鍵＝照舊回去掛機／休息
+            self._end_batch()
+            return
+        self._batch_end = True
+        self._batch_stop = True
+        self._event("info", f"清單全部刷完（{self._queue_desc()}）→ 沒勾循環 → 回程補給後停下")
+        self._start_supply_trip(supply.STAY, note=f"✔ 清單全部刷完（{self._queue_desc()}）"
+                                                  "→ 回程補給，補完留在城裡停下…")
+
+    def _after_full_desc(self) -> str:
+        """「這個副本刷滿之後會怎樣」一句話（死亡／進不去的訊息用）。"""
+        sch = self._sched
+        q = self._queue
+        if q and self._qi + 1 < len(q):
+            return f"換清單下一個副本「{q[self._qi + 1].name}」"
+        if not sch.get("loop", True):
+            return "清單刷完、沒勾循環 → 補給完停下"
+        return (("回程補給、飛回掛機記錄點交給掛機" if sch["farm"] else "回程補給、進休息")
+                + f"、休息 {self._fmt_secs(sch['rest'])} 再刷")
 
     def _end_batch(self) -> None:
         """這一批刷夠場數了（或「0 場」的測試路）→ 最後一趟回程補給：勾了「回去掛機」
@@ -3643,7 +3812,7 @@ class DungeonTab(BaseTab):
         self._rest_note_t = 0.0
         self._rest_log_t = 0.0
         self._cycle = "rest"
-        text = (f"副本設定：這一批 {sch['rounds']} 場刷完 → 休息 "
+        text = (f"副本設定：這一輪刷完（{self._queue_desc()}）→ 休息 "
                 f"{self._fmt_secs(self._rest_left)} 再刷{note}")
         self.status.setText(text)
         self._runlog_write(f"★ {text}", force=True)
@@ -3659,7 +3828,7 @@ class DungeonTab(BaseTab):
             return
         self._rest_note_t = REST_NOTE
         text = (f"副本設定：休息中，{self._fmt_secs(self._rest_left)} 後再刷 "
-                f"{self._sched['rounds']} 場" + ("（掛機照跑）" if self._rest_farm else ""))
+                f"{self._queue_desc()}" + ("（掛機照跑）" if self._rest_farm else ""))
         self.status.setText(text)
         self._rest_log_t -= REST_NOTE
         if self._rest_log_t <= 0:
@@ -3680,6 +3849,10 @@ class DungeonTab(BaseTab):
             if not ok:
                 self._notify(f"⚠ 停掛機：{why}")
         self._notify("副本設定：休息結束 → 先回程補給一趟，再去刷下一批")
+        if self._queue:                  # 新一輪從清單第 1 個副本開始（2026-09-07）
+            self._qi = 0
+            self._script = self._queue[0]
+            self._i = 0
         w = self._find_client()
         sc = self._adopt_client(w) if w is not None else None
         if sc is None:
@@ -3738,7 +3911,9 @@ class DungeonTab(BaseTab):
         for i, s in enumerate(self._script.steps):
             mark = "▶" if i == self._i else ("✔" if i < self._i else "　")
             self.steps.addItem(f"{mark} {i + 1:>2}. {dungeon.describe(s)}")
-        self.prog.setText(f"{min(self._i, len(self._script.steps))}"
+        head = (f"「{self._script.name}」{self._qi + 1}/{len(self._queue)}　"
+                if len(self._queue) > 1 else "")
+        self.prog.setText(f"{head}{min(self._i, len(self._script.steps))}"
                           f" / {len(self._script.steps)} 步")
 
     def _say(self, text: str) -> None:
@@ -3885,9 +4060,8 @@ class DungeonTab(BaseTab):
         self._cycle = "revive"
         last = (self._sched is not None
                 and self._batch_done >= self._sched["rounds"])
-        nxt = ("這一批滿了，回去掛機" if last and self._sched["farm"] else
-               "這一批滿了，進休息" if last else
-               "下一場" if self._loop else "停止")
+        nxt = (f"「{self._script.name}」滿 {self._sched['rounds']} 場，{self._after_full_desc()}"
+               if last else "下一場" if self._loop else "停止")
         self._event("death", f"第 {self._rounds} 趟：死亡當成完成（第 {self._i + 1} 步）"
                              f"→ 復活回城 → 回程補給 → {nxt}")
         text = f"☠ 死了 —— 當成第 {self._rounds} 趟刷完 → 復活回城 → 回程補給 → {nxt}"
@@ -3957,7 +4131,7 @@ class DungeonTab(BaseTab):
                        "自動刷副本停止")
             return
         if self._sched is not None and self._batch_done >= self._sched["rounds"]:
-            self._end_batch()
+            self._batch_full()
             return
         self._start_supply_trip()
 
@@ -4177,7 +4351,7 @@ class DungeonTab(BaseTab):
                 note=f"「{self._script.name}」：回線了 → 先回程補給一趟再去副本")
             return
         if self._sched is not None and self._batch_done >= self._sched["rounds"]:
-            self._end_batch()
+            self._batch_full()
             return
         self._start_supply_trip()
 
@@ -4228,14 +4402,12 @@ class DungeonTab(BaseTab):
         sch = self._sched
         mins = self._poke_total / 60.0
         self._batch_done = sch["rounds"]
-        text = (f"在入口撞了 {mins:.0f} 分鐘都進不去（副本鎖住？）→ 當成這一批 "
-                f"{sch['rounds']} 場刷完 → 回程補給"
-                + ("、飛回掛機記錄點交給掛機" if sch["farm"] else "")
-                + f"、休息 {self._fmt_secs(sch['rest'])} 再試")
+        text = (f"在入口撞了 {mins:.0f} 分鐘都進不去（副本鎖住？）→ 當成「{self._script.name}」"
+                f"{sch['rounds']} 場刷完 → {self._after_full_desc()}")
         self._event("noentry", text)
         self._notify(f"⚠ {text}")
         self.notify(f"⚠ {text}")          # 使用者 2026-09-06：無法進入副本要通知
-        self._end_batch()
+        self._batch_full()
 
     # -- 卡住偵測：記一筆；副本裡同一步卡到 STUCK_ABORT_SECS → 當成完成一場 ---------------
     def _stuck_watch(self, dt: float) -> bool:

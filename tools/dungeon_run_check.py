@@ -17,7 +17,7 @@ import types
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtWidgets import QApplication                # noqa: E402
+from PySide6.QtWidgets import QApplication, QPushButton   # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
 
@@ -2435,6 +2435,7 @@ def main() -> int:
         tab._runlog_open = lambda: None            # 別真的寫 %APPDATA% 的紀錄檔
         tab._maps = FakeMaps(FakeGrid({(10, 10)}))
         tab.sched_cb.setChecked(True)
+        tab.loop_cb.setChecked(True)     # 9/7 起：勾著＝清單走完回掛機記錄點／休息再來一輪
         tab._sched_rounds, tab._sched_rest_min, tab._sched_farm = rounds, rest_min, farm
         tab._sched_reset()
         tab._sched_begin()
@@ -2467,10 +2468,11 @@ def main() -> int:
     tab.loop_cb.setChecked(False)
     _i, loop, _party = tab._round_plan(1)
     ck("★ 勾了副本設定就一定循環（循環打副本沒勾也一樣）", loop)
-    ck("　「循環打副本」變灰、按鈕可按", not tab.loop_cb.isEnabled()
+    # ★ 9/7 起「循環打副本」不變灰：它改管「清單走完要不要回掛機再來一輪」
+    ck("　「循環打副本」不變灰（改管清單走完要不要回去）、按鈕可按", tab.loop_cb.isEnabled()
        and tab.sched_btn.isEnabled())
     tab.sched_cb.setChecked(False)
-    ck("　取消副本設定 → 循環打副本恢復、按鈕變灰", tab.loop_cb.isEnabled()
+    ck("　取消副本設定 → 按鈕變灰", tab.loop_cb.isEnabled()
        and not tab.sched_btn.isEnabled())
     tab.sched_cb.setChecked(True)
 
@@ -2523,6 +2525,130 @@ def main() -> int:
        and supplies[-1][2] == 90, str(supplies[-1:]))
     ck("　補完 → 人在別張圖 → 飛回入口", tab._cycle == "back" and tab._phase == "fly",
        f"{tab._cycle}/{tab._phase}")
+
+    # ②c ★★★ 副本清單（使用者 2026-09-07「可以刷多個副本，例如無限塔＋邪靈古船」）：
+    #   清單第 1 個刷 N 場 → 補給回程飛**下一個副本的入口** → 刷 N 場 → 清單走完 →
+    #   勾了「循環打副本」走原本的回掛機／休息／再來一輪（從清單第 1 個）；
+    #   沒勾 → 最後一場補給完留在城裡停下（back_to=STAY）。
+    print("\n副本清單：多個副本照順序刷")
+
+    def two_tab(rounds=1, loop=True):
+        tab = sched_tab(rounds, 120, True)
+        tab.loop_cb.setChecked(loop)
+        tab._sched_begin()               # 重抓 loop
+        b = dungeon.Script(name="b", steps=[{"do": "walk", "to": [10, 10]}])
+        b.scene = 77
+        b.entrance = {"scene": 70, "to": [5.0, 6.0], "model": 60002, "menu": [1]}
+        tab._queue = [tab._script, b]
+        tab._qi = 0
+        tab._refresh_steps = lambda: dt.DungeonTab._refresh_steps(tab)   # 夾具停掉的，這組要真的
+        tab._refresh_steps()
+        return tab
+
+    tab = two_tab(1, True)
+    ck("　進度標籤講清單第幾個", "「t」1/2" in tab.prog.text(), tab.prog.text())
+    finish_round(tab)
+    ck("★★ 第 1 個副本刷滿 1 場 → 換清單下一個（不是進休息）", tab._cycle == "supply"
+       and not tab._batch_end and tab._qi == 1 and tab._script.name == "b"
+       and tab._batch_done == 0, f"{tab._cycle} qi={tab._qi} {tab._script.name}")
+    ck("　補給中的狀態列講補完要飛去哪個副本", "飛去「b」的入口" in tab.status.text()
+       and "清單 2/2" in tab.status.text(), tab.status.text())
+    ck("　進度標籤跟著換", "「b」2/2" in tab.prog.text(), tab.prog.text())
+    ck("　事件有記", any("換清單下一個副本「b」" in x for _t, _a, _k, x in tab._events))
+    wait_supply(tab)
+    ck("★★ 補給的回程＝**下一個副本的入口**", supplies[-1] == (5.0, 6.0, 70), str(supplies[-1]))
+    ck("　補完人在別張圖 → 飛去下一個副本的入口那張圖", tab._cycle == "back"
+       and tab._phase == "fly", f"{tab._cycle}/{tab._phase}")
+    world["here"] = 77                                   # 當作已經進到 b 裡
+    tab._cycle, tab._phase = "go", "run"
+    finish_round(tab)
+    ck("★★ 清單最後一個刷滿、勾了循環 → 這一輪滿了 → 補給回程指到掛機記錄點",
+       tab._cycle == "supply" and tab._batch_end and not tab._batch_stop
+       and tab._batch_home == (100.0, 200.0, 26), f"{tab._cycle} home={tab._batch_home}")
+    world["here"] = 26
+    wait_supply(tab)
+    ck("　補完 → 交給掛機頁 → 進休息", tab._cycle == "rest" and tab._farm.calls == [(1, True)],
+       f"{tab._cycle} calls={tab._farm.calls}")
+    ck("　休息訊息講整個清單", "t → b" in tab.status.text(), tab.status.text())
+    tab._rest_left = 0.05
+    run(tab, 0.3)
+    ck("★★ 休息完 → 從清單第 1 個副本重來（先補給）", tab._qi == 0 and tab._script.name == "t"
+       and tab._cycle == "supply" and tab._batch_done == 0,
+       f"qi={tab._qi} {tab._script.name} {tab._cycle}")
+    wait_supply(tab)
+    ck("　開刷前那趟補給的回程＝第 1 個副本的入口", supplies[-1][2] == 90, str(supplies[-1]))
+    world["here"] = 98
+
+    # 沒勾循環：清單走完 → 補給完留在城裡停下（back_to=STAY）、不交給掛機頁
+    tab = two_tab(1, False)
+    finish_round(tab)
+    ck("　沒勾循環：第 1 個刷滿照樣換下一個", tab._qi == 1 and tab._cycle == "supply"
+       and not tab._batch_end, f"qi={tab._qi} {tab._cycle}")
+    wait_supply(tab)
+    world["here"] = 77
+    tab._cycle, tab._phase = "go", "run"
+    finish_round(tab)
+    ck("★★ 清單最後一個刷滿、沒勾循環 → 補給、補完停下（不回入口不回掛機）",
+       tab._cycle == "supply" and tab._batch_end and tab._batch_stop
+       and supplies[-1] == dt.supply.STAY, f"{tab._cycle} back={supplies[-1]}")
+    ck("　狀態列講補完停下", "補完留在城裡停下" in tab.status.text(), tab.status.text())
+    wait_supply(tab)
+    ck("★★ 補完 → 停下、沒叫掛機頁", not tab.run_cb.isChecked() and tab._farm.calls == []
+       and "清單全部刷完" in tab.status.text(), tab.status.text())
+    world["here"] = 98
+
+    # 入口撞不進去＝這個副本額度用完 → 換清單下一個（不是整批結束）
+    tab = two_tab(2, True)
+    tab._phase = "enter"
+    tab._poke_total = 61.0
+    tab._on_no_entry()
+    ck("★★ 入口撞不進去 → 當這個副本刷完 → 換清單下一個副本", tab._qi == 1
+       and tab._script.name == "b" and tab._cycle == "supply" and not tab._batch_end,
+       f"qi={tab._qi} {tab._cycle}")
+    ck("　進不去的事件講得出換哪個", any("換清單下一個副本「b」" in x
+                                        for _t, _a, k, x in tab._events if k == "noentry"),
+       str([x for _t, _a, k, x in tab._events if k == "noentry"]))
+    wait_supply(tab)
+    world["here"] = 98
+
+    # 清單怎麼載：空＝主畫面那份；找不到的名字要大聲停、不跳過
+    tab = sched_tab(1, 120, True)
+    tab._sched_scripts = []
+    q, why = tab._load_queue(tab._script)
+    ck("　清單空＝只有主畫面選的那份", q is not None and len(q) == 1 and q[0] is tab._script)
+    tab._sched_scripts = ["無限塔", "沒有這份腳本"]
+    q, why = tab._load_queue(tab._script)
+    ck("★ 清單裡有找不到的腳本 → 不跳過、回原因", q is None and "沒有這份腳本" in why, why)
+    tab._sched_scripts = ["無限塔", "邪靈古船"]
+    q, why = tab._load_queue(tab._script)
+    ck("　清單兩份都讀得到 → 照順序兩份", q is not None and len(q) == 2
+       and [x.name for x in q] == ["無限塔", "邪靈古船"], str([x.name for x in q] if q else why))
+    # 設定存讀 ＋ 對話框
+    tab._save_settings()
+    tab._sched_scripts = []
+    tab._load_settings()
+    ck("★ 清單存進 config、讀得回來", tab._sched_scripts == ["無限塔", "邪靈古船"],
+       str(tab._sched_scripts))
+    ck("　按鈕提示講清單", "無限塔 → 邪靈古船" in tab.sched_btn.toolTip(), tab.sched_btn.toolTip())
+    dlg = tab._sched_dialog()
+    ck("　對話框清單列出兩份", dlg._list.count() == 2
+       and dlg._list.item(0).text() == "無限塔")
+    btn = {b.text(): b for b in dlg.findChildren(QPushButton)}
+    dlg._list.setCurrentRow(1)
+    btn["上移"].click()
+    ck("　上移", [dlg._list.item(i).text() for i in range(dlg._list.count())]
+       == ["邪靈古船", "無限塔"])
+    dlg._pick.setCurrentIndex(max(0, dlg._pick.findData("無限塔")))
+    btn["加入"].click()
+    ck("　加入（同一份可以加好幾次）", dlg._list.count() == 3
+       and dlg._list.item(2).text() == "無限塔")
+    dlg._list.setCurrentRow(0)
+    btn["移除"].click()
+    tab._apply_sched_dialog(dlg)
+    dlg.deleteLater()
+    ck("★ 確定 → 清單回存", tab._sched_scripts == ["無限塔", "無限塔"], str(tab._sched_scripts))
+    tab._sched_scripts = []
+    tab._save_settings()
 
     # ②b ★ 死在副本裡＝當成一場：第 1 場死 → 復活 → 補給回入口；第 2 場死 → 批次滿 →
     #   補給回程指到掛機記錄點（跟正常刷完一模一樣的路）
