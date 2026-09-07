@@ -158,9 +158,18 @@ def panel_open(scanner) -> bool | None:
     return bool(g.get(WND_MAKE))
 
 
-def click(mover, scanner, prop) -> tuple[bool, str]:
-    """點一個場景物件 —— **跟滑鼠點一模一樣**：官方的 `TryAct(eid, 3)`。
+def click(mover, scanner, prop, kind: int | None = None) -> tuple[bool, str]:
+    """點一個場景物件 —— **跟滑鼠點一模一樣**：官方的 `TryAct(eid, kind)`。
     `prop` 是 `scenery.Prop`（製作檯、副本的對話物件、雕像、公佈欄都是這個）。
+
+    ★★★★ `kind` 兩種都要會用（2026-09-07 黑狐 莉維坦的寢室實機 A/B）：
+      · `KIND_TALK`(3)＝場景物件那一種，**預設**；
+      · `KIND_NPC`(2)＝跟 NPC 講話那一種 —— **「對話傳送」的雕像只吃這個**：
+        同一個「靜態-( 4版 )神燈巨人雕像」60408 貼著點（1.5 格），
+        kind 3 送了完全沒反應、kind 2 一發就把人順移到 (302.5, 202.5)
+        並跳出訊息 85114「受到神祕魔法的傳送……」。
+        （跟 [[nav-blocked-detour]]「跟 NPC 講話要 kind 2，kind 3 範圍小」同一條坑。）
+      ⚠ 所以呼叫端「點了沒反應」時要**換另一種 kind 再點**，不是一直加送同一種。
 
     ★★ 2026-09-03 使用者定調「都改新的、留下一種對話方式就好」——
       舊做法（自己送封包 `0x05(oid, 0)`）已經**刪掉**，不再保留第二條路。
@@ -188,15 +197,17 @@ def click(mover, scanner, prop) -> tuple[bool, str]:
       檯子旁，但 WND_MAKE 永遠不開）→ 開製作面板用 `click_bench()`。
     """
     from app.game import scenery, supply
+    if kind is None:
+        kind = supply.KIND_TALK          # 預設＝場景物件那一種（3）
     if not (mover and mover.active):
         return False, "跳板沒裝好"
     if not supply.TRY_ACT_FN:
         return False, "點選函式定位失敗（遊戲改版？）—— 這個功能停用"
     if not scenery.still_there(scanner, prop):
         return False, "那個東西已經不在了（換地圖／走出視野？）"
-    if not supply.click_object(mover, scanner, prop.addr):
+    if not supply.click_object(mover, scanner, prop.addr, kind=kind):
         return False, "點選排不進去（指令槽忙碌／讀不到 eid）"
-    return True, f"已點 ({prop.x:.0f},{prop.y:.0f})"
+    return True, f"已點 ({prop.x:.0f},{prop.y:.0f}) kind={kind}"
 
 
 def click_bench(mover, scanner, prop) -> tuple[bool, str]:

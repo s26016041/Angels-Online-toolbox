@@ -1451,6 +1451,7 @@ class DungeonTab(BaseTab):
         self._fly_total = 0.0        # 飛了多久了（只拿來顯示）
         self._mover_t = 0.0          # 跳板掉了之後隔多久再重裝一次（見 MOVER_RETRY）
         self._enter_acted = None     # 入口對話「已經動過」的那一頁（防重複送）
+        self._click_kind = supply.KIND_TALK   # 這一步的點法（3＝場景物件／2＝NPC；點不到就換）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
@@ -3707,7 +3708,8 @@ class DungeonTab(BaseTab):
             # ★ 基準要在**點下去之前**讀：點完對話可能立刻就開了，
             #   那時再讀就跟第一頁一樣，永遠判不出「有沒有點到」。
             pg0 = talkwnd.page(self._sc)
-            ok, msg = produce.click(self._mover, self._sc, hit[0])
+            ok, msg = produce.click(self._mover, self._sc, hit[0],
+                                    kind=self._click_kind)
             if not ok:
                 self._say(f"點不下去（{msg}），重試中…")
                 return
@@ -3783,9 +3785,17 @@ class DungeonTab(BaseTab):
                 self._nudge += 1
                 how = (self._walk_onto(tx, ty) if keep <= 0
                        else self._walk_beside(tx, ty, keep))
-                ok, msg = produce.click(self._mover, self._sc, hit[0])
+                # ★★★★ **換另一種 kind 再點**（2026-09-07 實機：對話傳送的雕像
+                #   只吃 kind 2，kind 3 貼著點也完全沒反應；製作檯那種則相反）。
+                #   ⛔ 不要一直加送同一種 —— 那正是「點了六發等於沒點」。
+                self._click_kind = (supply.KIND_NPC
+                                    if self._click_kind == supply.KIND_TALK
+                                    else supply.KIND_TALK)
+                ok, msg = produce.click(self._mover, self._sc, hit[0],
+                                        kind=self._click_kind)
                 self._say(f"{tag}　點了沒反應 → 靠近一點"
-                          f"（留 {keep:g} 格，{how}）再點"
+                          f"（留 {keep:g} 格，{how}）換 kind="
+                          f"{self._click_kind} 再點"
                           f"（{'送出' if ok else msg}）")
                 return
             self._say(f"{tag}　等對話出現…"
@@ -3945,6 +3955,7 @@ class DungeonTab(BaseTab):
         self._blocked_last = False
         self._menu_i = 0
         self._clicked = False
+        self._click_kind = supply.KIND_TALK   # 下一步從 kind 3 開始試（見 _do_interact）
         self._talk_seen = False
         self._close_t = 0.0
         self._wait_left = 0.0

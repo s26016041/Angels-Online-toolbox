@@ -1816,7 +1816,10 @@ def main() -> int:
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, never)
     clicks = []
-    dt.produce.click = lambda *_a, **_k: (clicks.append(1), (True, "點了"))[1]
+    kinds = []
+    dt.produce.click = lambda *_a, **_k: (clicks.append(1),
+                                          kinds.append(_k.get("kind")),
+                                          (True, "點了"))[2]
     moved3 = []
     tab._mover = type("M", (), {
         "walk_near": lambda _s, _sc, _p, x, y, k: moved3.append(("near", k)),
@@ -1833,6 +1836,14 @@ def main() -> int:
     keeps = [k for _w, k in moved3]
     ck("　一次比一次近", keeps == sorted(keeps, reverse=True), str(keeps))
     ck("　最後直接穿過去（留 0 格）", 0.0 in keeps, str(keeps))
+    # ★★★★ 2026-09-07 黑狐實機：「對話傳送」的雕像**只吃 TryAct kind 2**
+    #    （kind 3 貼著點完全沒反應）→ 點不到就要**換另一種 kind**，
+    #    ⛔ 不是一直加送同一種（那正是「點了六發等於沒點」）。
+    from app.game import supply as _sup5
+    ck("★★★★ 點不到 → **換另一種 kind 再點**（3 ↔ 2 交替）",
+       _sup5.KIND_NPC in kinds and _sup5.KIND_TALK in kinds, str(kinds))
+    ck("　第一發用場景物件那種（kind 3）", kinds and kinds[0] == _sup5.KIND_TALK,
+       str(kinds[:2]))
 
     # 收尾要把對話框從畫面上收掉（不然人會帶著框到處跑）
     closed = []
@@ -2280,6 +2291,29 @@ def main() -> int:
        dmt.TALK_JUMP_GAP > dmt.JUMP_MAX_GAP)
     mk3.on_close()
     mk4.on_close()
+    # ★★★★ 製作頁「點點看」：kind 3 沒反應 → 自動補一發 kind 2（同上）
+    mk5 = DungeonMakeTab()
+    mk5._script = dungeon.Script(name="t")
+    mk5._cur = lambda: (1, object())
+    mk5._mover = lambda _pid: object()
+    mk5.who.addItem("測試", 1)
+    mk5.who.setCurrentIndex(0)
+    mk5._poked = FakeProp(20.0, 10.0, 60408)
+    mk5._dialog_token = lambda _sc: 7            # 一直沒變＝點不到
+    mk5._poke_base = 7
+    mk5._poke_until = time.time() + 60.0
+    mk5._poke_kind = dmt.supply.KIND_TALK
+    mk5._poke_switch = time.time() - 0.1         # 已經過了換 kind 的時間
+    kinds5 = []
+    dmt.produce.click = lambda _mv, _sc, _p, kind=None: (
+        kinds5.append(kind), (True, "點了"))[1]
+    mk5._poke_check()
+    ck("★★★★ 製作頁：kind 3 點不到 → 自動改用 kind 2 再點一發",
+       kinds5 == [dmt.supply.KIND_NPC], str(kinds5))
+    mk5._poke_check()
+    ck("　⛔ 只換一次，不會一直重送", kinds5 == [dmt.supply.KIND_NPC], str(kinds5))
+    mk5.on_close()
+
     mk = DungeonMakeTab()
     mk._script = dungeon.Script(name="t")
     mk._script.entrance = {"scene": 71, "to": [10.0, 20.0], "model": 60001}
