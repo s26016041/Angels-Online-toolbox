@@ -40,6 +40,10 @@ KEY_GROUP = "ui.last_group"     # 上次停在哪個分類（名稱）
 KEY_PAGE = "ui.last_page"       # 上次停在哪一頁（TAB_TITLE）
 
 
+# 載入失敗（import 就炸）的分頁模組名。主視窗只印 traceback 不中止，
+# 這份清單讓 tools/smoke_ui.py 能把它當成失敗（不然會假通過）。
+FAILED_TAB_MODULES: list[str] = []
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -116,6 +120,10 @@ class MainWindow(QMainWindow):
                 module = importlib.import_module(f"{tabs_pkg.__name__}.{name}")
             except Exception:  # 單一分頁載入失敗不應拖垮整個程式
                 traceback.print_exc()
+                # ★ 記下來給 tools/smoke_ui.py 查：這裡靜靜跳過，冒煙測試數到的
+                #   分頁就少一頁、卻照樣印「全部分頁都建得起來」（2026-09-07 一個
+                #   SyntaxError 就這樣溜過去了）。
+                FAILED_TAB_MODULES.append(name)
                 continue
             for _, obj in inspect.getmembers(module, inspect.isclass):
                 if (

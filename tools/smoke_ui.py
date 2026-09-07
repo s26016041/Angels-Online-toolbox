@@ -41,6 +41,16 @@ def main() -> int:
         traceback.print_exc()
         return 1
 
+    # ★★ 2026-09-07：分頁模組 import 就炸（SyntaxError／缺套件）時，主視窗只印
+    #   traceback 然後**跳過那一頁**，這裡數到的分頁少一頁卻照樣全 ✔ —— 要當失敗。
+    #   ⚠ 不能在這裡直接 return：分頁的 QThread 還沒 on_close() 就退出會
+    #     0xC0000409 當掉（見 memory packaging-and-release）→ 記進 bad，走完收尾再回 1。
+    from app import main_window as _mw
+    for name in getattr(_mw, "FAILED_TAB_MODULES", ()):
+        bad.append((f"模組 {name}", "分頁模組 import 就炸（主視窗靜靜跳過了它）"
+                    "—— traceback 在最上面"))
+        print(f"✘ 分頁模組載入失敗（主視窗靜靜跳過了它）：{name}")
+
     # ★ 2026-09-05 主視窗改成「左邊分類、右邊分頁」兩層：用 pages() 列全部、
     #   show_page() 切過去（分類與分頁一起切）。
     pages = win.pages() if hasattr(win, "pages") else None
