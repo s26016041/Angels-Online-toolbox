@@ -500,19 +500,29 @@ def _d(a, b) -> float:
 _SQRT2 = math.sqrt(2.0)
 
 
-def _pick(items):
-    """從掃到的東西裡挑「腳本說的那一個」＝**離記的位置最近的那一個**。
+def _pick(items, want=None):
+    """從掃到的東西裡挑「腳本說的那一個」。`want` ＝腳本記的外觀編號。
 
-    ★★ 使用者 2026-09-02 定案：**不比外觀**。
+    ★★ 使用者 2026-09-02 定案：**外觀不符不能當成「找不到」**。
       機關被啟動過之後外觀編號會換（實測遺落之地 60335「靜態-廢棄機器人2」
-      → 60301「門開關火不給點」，同一格、同一個東西），比外觀就會變成
+      → 60301「門開關火不給點」，同一格、同一個東西），硬比外觀就會變成
       「找不到」而整趟停掉。場景物件不會移動，**位置**才是它的身分。
-      腳本裡的 `model` 只留著給人看（清單上顯示名字用）。
-    ⚠ 但**看不見的場景標記點（TAG，SP_ATTRIB_HIDE）要排掉** —— 那些是
-      伺服器用的位置標記，一站就掃到一堆，點它們沒有意義。
+    ⚠⚠ 但「最近的那一個」在**同一格疊了兩個物件**時等於擲骰子
+      （2026-09-07 黑狐 莉薇坦的寢室：「蠍子雕像」60413 與「蠍子雕像不可走」
+        60414 座標**完全相同** 361.0/73.5625，執行端挑到 60414，每一趟都印
+        一次「外觀不符 —— 這個機關已經被啟動過了？」的假警示）。
+      → 規則改成兩段：**腳本記的外觀剛好在場就用它**，不在場才退回「最近的
+        那一個」。外觀變了照樣找得到（第二段），疊在一起也不會挑錯（第一段）。
+    ⚠ 看不見的場景標記點（TAG，SP_ATTRIB_HIDE）要排掉 —— 那些是伺服器用的
+      位置標記，一站就掃到一堆，點它們沒有意義。
     `scenery.nearby` / `portal.nearby` 給的已經是**由近到遠**，取第一個就好。
     """
-    return [x for x in items if not mapobj.hidden(x.model)][:1]
+    live = [x for x in items if not mapobj.hidden(x.model)]
+    if want is not None:
+        same = [x for x in live if x.model == want]
+        if same:
+            return same[:1]
+    return live[:1]
 
 
 class DungeonTab(BaseTab):
@@ -2978,7 +2988,7 @@ class DungeonTab(BaseTab):
         trigs = portal.nearby(self._sc, at, PROP_TOL)
         if trigs is None:
             return "物件清單讀不到，等下一次"
-        hit = _pick(trigs)
+        hit = _pick(trigs, want)
         if not hit:
             return "附近找不到傳點物件"
         pf = move.pathfinder_this(self._sc)
@@ -3161,7 +3171,7 @@ class DungeonTab(BaseTab):
                 # ⚠ 讀不到 ≠ 沒有。等下一拍再試，不要當成「這裡沒東西」。
                 self._say("物件清單讀不到，重試中…")
                 return
-            hit = _pick(props)
+            hit = _pick(props, want_model)
             if not hit:
                 self._abort_trip(
                     f"⛔ {tag}：({ax}, {ay}) 附近 {PROP_TOL:.0f} "
@@ -3233,7 +3243,7 @@ class DungeonTab(BaseTab):
             if self._click_t >= CLICK_RETRY:
                 self._click_t = 0.0
                 props = scenery.nearby(self._sc, (ax, ay), PROP_TOL) or []
-                hit = _pick(props)
+                hit = _pick(props, want_model)
                 if not hit:
                     self._say(f"{tag}　點了沒反應，"
                               f"而且那一格現在掃不到東西 —— 等下一輪")
