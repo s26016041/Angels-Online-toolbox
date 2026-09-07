@@ -3392,6 +3392,8 @@ def main() -> int:
     ck("　狀態列講得出撞第幾次、與還剩幾格阻擋",
        "撞第" in tab.status.text() and "阻擋 15 格" in tab.status.text(),
        tab.status.text())
+    ck("　⚠ 沒有地形圖 → 退回撞機關那一格（安全退化）",
+       tab.walked and tab.walked[0] == (20, 10), str(tab.walked[:2]))
     run(tab, dt.BUMP_IN)
     ck("★ 撞上去＝把機關那一格直接丟給遊戲（walk_exact，⛔ 不算路徑）",
        tab.walked and tab.walked[0] == (20, 10), str(tab.walked[:3]))
@@ -3434,6 +3436,27 @@ def main() -> int:
     tab = bump_tab([7], props=[FakeProp(20.0, 10.0, 60414)])
     run(tab, 0.3)
     ck("　外觀還是腳本記的那個 → 繼續撞", tab._i == 0, f"第 {tab._i + 1} 步")
+
+    # ★★ 使用者 2026-09-07 補的規格：「來回撞不是要剛好走到我選的東西位置上，
+    #    而是**盡力往他身後走**」——目的地是「退開點 → 機關」再往前 BUMP_PAST 格
+    #    那條線上，我這一側**還走得到的最遠一格**。
+    tab = bump_tab([9])
+    _line = {(x, 10) for x in range(10, 27)}      # 機關身後（x>20）也走得到
+    tab._grid = FakeGrid(_line)
+    tab._reach, tab._reach_n = set(_line), len(_line)
+    run(tab, 0.3)
+    ck("★★★ 撞的目的地是**機關的身後**，不是機關那一格",
+       tab.walked and tab.walked[0] == (26.0, 10.0), str(tab.walked[:2]))
+    ck("　狀態列講得出是往身後撞", "往身後" in tab.status.text(),
+       tab.status.text())
+    tab = bump_tab([9])
+    _mine = {(x, 10) for x in range(10, 20)}      # 身後那一段是**別區**（走不到）
+    tab._grid = FakeGrid(_mine, others={(x, 10) for x in range(21, 27)})
+    tab._reach, tab._reach_n = set(_mine), len(_mine)
+    run(tab, 0.3)
+    ck("★★ 身後走不到（在別區）→ 退回撞機關那一格，⛔ 不送走不到的目標"
+       "（送了遊戲會直接拒絕，人一步都不動）",
+       tab.walked and tab.walked[0] == (20.0, 10.0), str(tab.walked[:2]))
 
     tab = bump_tab([7], stand=None)          # 舊腳本沒記退開點
     run(tab, dt.BUMP_IN + 1.0)
