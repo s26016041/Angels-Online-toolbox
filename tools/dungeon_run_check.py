@@ -203,6 +203,10 @@ class FakeGrid:
     def route(self, start, goal, relax=4, max_cost=None):
         return [(int(start[0]), int(start[1])), (int(goal[0]), int(goal[1]))]
 
+    def nearest_open(self, x, y, radius=4):
+        # 真的那支會往外找最近的可走格；測試裡只要「可走就回它自己」就夠了
+        return (x, y) if self.walkable(x, y) else None
+
 
 class FakeAtk:
     """最小的假「寫目標」執行緒。"""
@@ -3170,6 +3174,106 @@ def main() -> int:
     tab._stop("⛔ 地圖變了")
     ck("★ 出問題停機 → 記「停機」", kinds(tab) == ["stop"] and "地圖變了" in tab._events[0][3],
        str(tab._events))
+
+    # =====================================================================
+    # ★★ 傳點：撞了沒被傳送 → 退開幾格再走回來撞一次
+    #     （使用者 2026-09-07：「如果撞了沒有被傳送要回頭再撞一次」）
+    # =====================================================================
+    print("")
+    print("傳點撞不過 → 退開再撞")
+    _cells = {(x, y) for x in range(44, 58) for y in range(44, 58)}
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(50.0, 50.0, 60123)]
+    tab._grid = FakeGrid(_cells)
+    tab._reach = set(_cells)
+    tab._reach_n = len(_cells)
+    run(tab, dt.PORTAL_BUMP - 2.0)
+    ck(f"　站不到 {dt.PORTAL_BUMP:.0f} 秒 → 還在乖乖補送封包，不亂退開",
+       tab._bump is None, str(tab._bump))
+    ck("　這段期間封包有照送", len(tab.portal_sent) >= 2, str(tab.portal_sent))
+    run(tab, 3.0)
+    ck(f"★ 站滿 {dt.PORTAL_BUMP:.0f} 秒沒被搬走 → 開始退開",
+       tab._bump is not None and tab._bump["phase"] == "away", str(tab._bump))
+    ck("　退開點是走得到的格", tab._bump is not None
+       and tab._can_reach(tab._bump["spot"]), str(tab._bump))
+    ck("　退開點離傳點有距離（不是原地）", tab._bump is not None
+       and abs(tab._bump["spot"][0] - 50) + abs(tab._bump["spot"][1] - 50) >= 3,
+       str(tab._bump))
+    _spot = tab._bump["spot"]
+    tab._pos = [float(_spot[0]), float(_spot[1])]     # 走到退開點了
+    run(tab, 0.4)
+    ck("★ 退到定點 → 換成走回傳點", tab._bump is not None
+       and tab._bump["phase"] == "back", str(tab._bump))
+    _n = len(tab.portal_sent)
+    tab._pos = [50.0, 50.0]                            # 撞回傳點上
+    run(tab, 0.4)
+    ck("★ 撞回傳點上 → 這一輪收掉，回去正常補送封包",
+       tab._bump is None and tab._bump_n == 1, f"{tab._bump} n={tab._bump_n}")
+    ck("　站回去**馬上**補送一發（不必再等 5 秒）", len(tab.portal_sent) > _n,
+       f"{_n} → {tab.portal_sent}")
+    ck("　全程不停機", tab.run_cb.isChecked())
+    # 退不開（周圍沒有走得到的格）→ 照舊只補送封包，⛔ 不能卡住
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab.trigs = [FakeTrig(50.0, 50.0, 60123)]
+    tab._grid = FakeGrid({(50, 50)})
+    tab._reach = {(50, 50)}
+    tab._reach_n = 1
+    run(tab, dt.PORTAL_BUMP + 2.0)
+    ck("★ 周圍沒有退得開的格 → 不退開，繼續補送（⛔ 不卡住、不停機）",
+       tab._bump is None and len(tab.portal_sent) >= 2 and tab.run_cb.isChecked(),
+       f"{tab._bump} {tab.portal_sent}")
+    # 換一步 → 撞的狀態整組歸零
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123},
+                    {"do": "wait", "secs": 1}], pos=(50.0, 50.0))
+    tab._bump = {"phase": "away", "spot": (47, 50), "n": 3}
+    tab._bump_t, tab._bump_n = 9.0, 3
+    tab._next()
+    ck("　換一步 → 撞的狀態整組歸零",
+       tab._bump is None and tab._bump_t == 0.0 and tab._bump_n == 0,
+       f"{tab._bump} {tab._bump_t} {tab._bump_n}")
+
+    # =====================================================================
+    # ★ 副本腳本製作頁（2026-09-07 使用者三項）
+    # =====================================================================
+    print("")
+    print("副本腳本製作頁")
+    import app.tabs.dungeon_make_tab as dm
+    mtab = dm.DungeonMakeTab()
+    mtab._script = dungeon.Script(name="t", steps=[])
+    mtab._script.scene = 127
+    mtab._script.add({"do": dungeon.WALK, "to": [10, 10]}, 0)
+    mtab._here_key = lambda: (999, None)          # 人在**別張圖**
+    _n = len(mtab._script.steps)
+    mtab._add({"do": dungeon.WAIT, "secs": 3.0})
+    ck("★ 「加入休息」不必待在副本裡（休息沒有座標，不看地圖章）",
+       len(mtab._script.steps) == _n + 1
+       and mtab._script.steps[-1].get("do") == dungeon.WAIT,
+       f"{_n} → {len(mtab._script.steps)}")
+    _n = len(mtab._script.steps)
+    mtab._add({"do": dungeon.WALK, "to": [20, 20]})
+    ck("　有座標的步驟照舊驗地圖章（人在別張圖就不存）",
+       len(mtab._script.steps) == _n, f"{_n} → {len(mtab._script.steps)}")
+    mtab._pick = None
+    mtab._force_walk()
+    ck("　「強制走到」沒點位置 → 只回報、不當掉", mtab._fw is None,
+       mtab.status.text())
+    mtab._pick = (10, 10)
+    mtab.who.clear()
+    mtab._force_walk()
+    ck("　「強制走到」沒選分身 → 只回報、不當掉", mtab._fw is None,
+       mtab.status.text())
+    _big = dm.MapWindow(mtab)
+    ck("★ 「加入『走進傳點』」已經拿掉（傳點一律用「這個是傳送點」）",
+       not hasattr(_big, "add_portal"))
+    ck("★ 地圖視窗多了「強制走到這個點位」",
+       hasattr(_big, "force_btn")
+       and _big.force_btn.text() == "強制走到這個點位")
+    ck("　還沒畫地圖時 fit_window 安全（回 True、不當掉）",
+       _big.fit_window() is True)
+    _big.close()
+    mtab.on_close()
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0

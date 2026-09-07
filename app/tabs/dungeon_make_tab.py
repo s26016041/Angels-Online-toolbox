@@ -82,6 +82,13 @@ DIALOG_WAIT = 12.0
 #   換地圖，有順移就算吧」）：加完傳點那一步就開始每 0.12 秒看一次位置，
 #   一跳超過 JUMP_TILES 格就把落點記進那一步。
 PORTAL_WATCH_MS = 120
+# ★ 「強制走到這個點位」（使用者 2026-09-07：「看能不能走到，這樣就能過了」）。
+#   ⛔ 不問尋路 —— 被機關擋住的路尋路會直接拒絕，這顆就是要繞過那個拒絕、
+#      叫遊戲一路往那格走，撞給你看。
+FORCE_WALK_SECS = 20.0     # 最多撐幾秒
+FORCE_WALK_GAP = 1.0       # 每隔幾秒補送一次（＝撞一次）
+FORCE_WALK_ARRIVE = 1.2    # 離目標幾格算走到了
+FORCE_WALK_MS = 200        # 幾毫秒看一次位置
 PORTAL_WATCH_SECS = 90.0
 # 一次取樣之間跳這麼多格＝順移（走路一拍最多 0.6 格）。
 JUMP_TILES = 3.0
@@ -178,7 +185,8 @@ class MapWindow(QDialog):
         self.zoom = QSpinBox()
         self.zoom.setRange(1, 12)
         self.zoom.setValue(3)
-        self.zoom.valueChanged.connect(lambda _v: self.redraw())
+        self.zoom.valueChanged.connect(
+            lambda _v: (self.redraw(), self.fit_window()))
         bar.addWidget(self.zoom)
         b = QPushButton("符合視窗")
         b.setToolTip("自動算一個剛好把整張圖塞進視窗的縮放。")
@@ -221,19 +229,21 @@ class MapWindow(QDialog):
         b.setToolTip("把角色**現在**站的那一格，加成一個「走到」步驟。")
         b.clicked.connect(tab._add_here)
         ph.addWidget(b)
-        # ★ 傳點要單獨一種步驟（使用者 2026-09-02 問：「點位放在傳點上會不會
-        #   永遠到不了？」——會）。「走到」的完成條件是站到那一格，但踩上去
-        #   人就被搬走了，那一格永遠不會到達。
-        #   ⚠ 完成訊號是**順移**不是換地圖（使用者當場更正：吞噬之間的傳點
-        #     是同一張圖裡搬位置，場景編號完全不變）。
-        self.add_portal = QPushButton("加入「走進傳點」")
-        self.add_portal.setToolTip(
-            "把點到的那一格當成**傳點**：走過去，看到人被**順移**走才算完成。\n"
-            "⚠ 用一般的「走到」放在傳點上會永遠到不了（人被搬走，那一格不會到達）。\n"
-            "按下去之後你自己走進傳點，工具盯著看，出口在哪會自動記進這一步。")
-        self.add_portal.setEnabled(False)
-        self.add_portal.clicked.connect(tab._add_portal)
-        ph.addWidget(self.add_portal)
+        # ⛔ 這裡**不再有**「加入『走進傳點』」（使用者 2026-09-07：「加入走進傳點
+        #   可以刪除」）—— 傳點一律用對話那一區的「這個是傳送點」加，那一顆連
+        #   **外觀編號**一起記，跑的時候站上去沒被搬走才有東西可以補送。
+        #   用地圖上點到的格子加，記不到外觀，補送就沒有對象。
+        # ★ 使用者 2026-09-07：「多一個按鈕是強制走到這個點位，看能不能走到」——
+        #   機關擋路那種地方尋路會直接拒絕，這顆不問尋路、直接叫遊戲走過去，
+        #   一路撞給你看到底過不過得去。
+        self.force_btn = QPushButton("強制走到這個點位")
+        self.force_btn.setToolTip(
+            "不管尋路說走不走得到，**直接叫遊戲往那一格走**，每秒補送一次。\n"
+            "被機關（雕像那種）擋住的路尋路會直接拒絕，這顆就是拿來撞撞看的。\n"
+            "走到、或撐滿時間沒進展，都會在下面講結果。再按一次可以中止。")
+        self.force_btn.setEnabled(False)
+        self.force_btn.clicked.connect(tab._force_walk)
+        ph.addWidget(self.force_btn)
         v.addLayout(ph)
 
         self.status = QLabel("　")
@@ -249,6 +259,32 @@ class MapWindow(QDialog):
     def _live(self) -> None:
         if self.isVisible() and self.live_cb.isChecked():
             self.redraw()
+
+    def fit_window(self) -> None:
+        """把視窗縮到**剛好包住畫出來的地圖**（使用者 2026-09-07）。
+
+        ⚠ 只在「繪製地圖」與改縮放時叫 —— ⛔ 不要放進 `redraw()`：那一支每半秒
+          跑一次（即時更新），每半秒把視窗尺寸搶回去，使用者就沒辦法自己拉大小了。
+        ⚠ 上限是螢幕的可用範圍（扣掉工作列），不然大地圖會把視窗撐到畫面外。
+        回 False ＝ 照目前縮放**塞不進螢幕**（已經撐到上限），呼叫端該去降縮放。
+        """
+        pix = self.canvas.pixmap()
+        if pix is None or pix.isNull():
+            return True
+        vp = self.area.viewport().size()
+        if vp.width() <= 0 or vp.height() <= 0:
+            return True                  # 還沒 show，量不到內距
+        extra_w = self.width() - vp.width()      # 邊框＋捲軸
+        extra_h = self.height() - vp.height()    # 上下兩排控制項
+        w, h = pix.width() + extra_w, pix.height() + extra_h
+        fits = True
+        scr = self.screen()
+        if scr is not None:
+            av = scr.availableGeometry()
+            fits = w <= av.width() and h <= av.height()
+            w, h = min(w, av.width()), min(h, av.height())
+        self.resize(max(w, 520), max(h, 360))
+        return fits
 
     def _fit(self) -> None:
         pix = self._tab._render(1)
@@ -566,6 +602,9 @@ class DungeonMakeTab(BaseTab):
         self._pw_track = deque()     # 盯傳點期間走過的軌跡 [(時刻, (x, y))]（判伺服器拉回）
         self._pw_timer = QTimer(self)
         self._pw_timer.timeout.connect(self._portal_watch)
+        self._fw = None              # 「強制走到這個點位」正在跑的那一輪
+        self._fw_timer = QTimer(self)
+        self._fw_timer.timeout.connect(self._force_tick)
         for sp in self.findChildren(QSpinBox):
             fit_spin(sp)
         self._reload_files()
@@ -870,11 +909,6 @@ class DungeonMakeTab(BaseTab):
         if not ok:
             self.status.setText(f"⚠ 這一步有問題：{why}")
             return
-        # ★★ 地圖章跟著**步驟**走（2026-09-02 使用者回報「明明是同一張地圖
-        #   卻說不是」的根因就在這）：第一步存進來時蓋章，之後每一步都確認
-        #   還在同一張圖 —— 走出去了還繼續加，等於把兩張圖的座標混在一份
-        #   腳本裡，跑起來一定亂走。
-        here, _grid = self._here_key()
         # ★ 插在**選到的那一步後面**，不是永遠塞到最後（使用者 2026-09-03：
         #   「點前面步驟加入新流程，要直接加在他下面」）。沒選或選的是最後
         #   一步 → 跟以前一樣接在最後。下面的「上一步」「該在哪張圖」全部
@@ -882,6 +916,21 @@ class DungeonMakeTab(BaseTab):
         row = self.steps.currentRow()
         n = len(self._script.steps)
         at = row + 1 if 0 <= row < n - 1 else n
+        # ★ 使用者 2026-09-07：「加入休息可以不用待在副本就能加入」——
+        #   「休息」只有秒數、**沒有座標**，跟人在哪張圖完全無關，不必過地圖章
+        #   那一關（在城裡補腳本、或事後想在某兩步中間塞個等待都該加得進去）。
+        #   ⛔ 其餘每一種步驟都有座標，照舊要驗，不然兩張圖的座標會混進同一份腳本。
+        if step.get("do") == dungeon.WAIT:
+            self._script.add(step, at)
+            self._refresh_steps()
+            self.steps.setCurrentRow(at)
+            self._say_map(f"已加入（第 {at + 1} 步）：{dungeon.describe(step)}")
+            return
+        # ★★ 地圖章跟著**步驟**走（2026-09-02 使用者回報「明明是同一張地圖
+        #   卻說不是」的根因就在這）：第一步存進來時蓋章，之後每一步都確認
+        #   還在同一張圖 —— 走出去了還繼續加，等於把兩張圖的座標混在一份
+        #   腳本裡，跑起來一定亂走。
+        here, _grid = self._here_key()
         if self._script.scene is None:
             if not self._stamp_map(quiet=True):
                 self._say_map("⚠ 讀不到目前場景，這一步沒有存")
@@ -972,30 +1021,100 @@ class DungeonMakeTab(BaseTab):
         self._add({"do": dungeon.WALK,
                    "to": [int(self._pick[0]), int(self._pick[1])]})
 
-    def _add_portal(self) -> None:
-        """把點到的那一格加成「走進傳點」，然後**盯著看**它會把人送到哪。
+    def _force_walk(self) -> None:
+        """**不問尋路**，直接叫遊戲往地圖上點到的那一格走，每秒補送一次。
 
-        出口（`land`）不在這裡填 —— 加完之後使用者自己走進傳點，工具每
-        0.12 秒看一次位置，看到順移就把**當場看到的**落點記進這一步。
-        ⛔ 不准用算的、也不准猜（傳點對面在哪只有走一次才知道）。
+        ★ 使用者 2026-09-07：「多一個按鈕是強制走到這個點位，看能不能走到，
+          這樣就能過了」。被機關（雕像那種）擋住的路，尋路會直接回「沒有路」，
+          我們算的 A* 也一樣 —— 這顆繞過那個拒絕，用 `walk_exact`（＝遊戲自己
+          那支「走到這一格」）一路撞，過不過得去當場看得到。
+        ⚠ 只送移動，不點東西、不打怪。再按一次就中止。
         """
-        if self._pick is None:
+        if self._fw is not None:
+            self._force_stop("你按了停止")
             return
-        n = len(self._script.steps)
-        self._add({"do": dungeon.PORTAL,
-                   "to": [int(self._pick[0]), int(self._pick[1])]})
-        if len(self._script.steps) <= n:
-            return                       # 被 _add 擋下來了（換圖了之類）
-        self._pw_track.clear()
-        self._pw = (n, time.monotonic() + PORTAL_WATCH_SECS, None, 0.0)
-        self._pw_timer.start(PORTAL_WATCH_MS)
-        self._say_map("走進那個傳點吧 —— 我盯著看它把你送到哪，"
-                      "看到就自動記進這一步。")
+        if self._pick is None:
+            self._say_map("先在地圖上點一個位置")
+            return
+        pid, sc = self._cur()
+        if sc is None:
+            self._say_map("先選一台分身")
+            return
+        me = self._me(sc)
+        if me is None:
+            self._say_map("⚠ 讀不到角色位置")
+            return
+        mv = self._mover(pid)
+        if mv is None:
+            return
+        gx, gy = int(self._pick[0]), int(self._pick[1])
+        self._fw = {"pid": pid, "goal": (gx, gy), "n": 0, "send": 0.0,
+                    "end": time.monotonic() + FORCE_WALK_SECS,
+                    "best": self._dist(me, gx, gy)}
+        if self._big is not None:
+            self._big.force_btn.setText("停止強制走")
+        self._say_map(f"強制走到 ({gx}, {gy})…（尋路說走不走得到都照走）")
+        self._fw_timer.start(FORCE_WALK_MS)
+
+    @staticmethod
+    def _dist(me, gx: int, gy: int) -> float:
+        """人到那一格**中心**的距離（角色座標讀回來都是 x.5，所以要 +0.5）。"""
+        return ((me[0] - gx - 0.5) ** 2 + (me[1] - gy - 0.5) ** 2) ** 0.5
+
+    def _force_stop(self, why: str) -> None:
+        self._fw_timer.stop()
+        self._fw = None
+        if self._big is not None:
+            self._big.force_btn.setText("強制走到這個點位")
+        self._say_map(why)
+
+    def _force_tick(self) -> None:
+        fw = self._fw
+        if fw is None:
+            self._fw_timer.stop()
+            return
+        pid, sc = self._cur()
+        if sc is None or pid != fw["pid"]:
+            self._force_stop("⚠ 換了分身 —— 強制走停下")
+            return
+        me = self._me(sc)
+        if me is None:
+            return                       # 讀不到就跳過這一拍（換圖中）
+        gx, gy = fw["goal"]
+        d = self._dist(me, gx, gy)
+        fw["best"] = min(fw["best"], d)
+        now = time.monotonic()
+        if d <= FORCE_WALK_ARRIVE:
+            self._force_stop(f"✔ 走到了 ({gx}, {gy}) —— 現在離 {d:.1f} 格，"
+                             f"總共送了 {fw['n']} 次")
+            return
+        if now >= fw["end"]:
+            self._force_stop(
+                f"⚠ 撐了 {FORCE_WALK_SECS:.0f} 秒沒走到 ({gx}, {gy})："
+                f"最近只到 {fw['best']:.1f} 格、送了 {fw['n']} 次 —— 這條路過不去。")
+            return
+        if now - fw["send"] < FORCE_WALK_GAP:
+            return
+        fw["send"] = now
+        fw["n"] += 1
+        mv = self._movers.get(pid)
+        ent = bag.player_entity(sc)
+        sent = False
+        if mv is not None and mv.active and ent:
+            try:
+                # ⚠ 送**格子中心**：終點落在格線上伺服器可能不給站。
+                sent = mv.walk_exact(sc, ent + 8, gx + 0.5, gy + 0.5)
+            except Exception:                            # noqa: BLE001
+                sent = False
+        self._say_map(f"強制走到 ({gx}, {gy})…剩 {d:.1f} 格　第 {fw['n']} 次"
+                      + ("" if sent else "（這一次沒送出去，指令槽忙）"))
 
     def _add_portal_prop(self) -> None:
         """把清單裡選到的物件記成「走進傳點」（使用者 2026-09-02 要的按鈕）。
 
-        跟 `_add_portal`（用地圖上點到的格）差別只在**位置從哪來**：
+        ⛔ 2026-09-07 起這是**唯一**一種加傳點的方法（地圖格版的「加入『走進傳點』」
+          使用者叫刪掉了）：這裡連**外觀編號**一起記，跑的時候站上去沒被搬走
+          才有東西可以補送；用地圖上點到的格子加記不到外觀，補送沒有對象。
         這裡連**外觀編號**一起記，跑的時候站上去沒被搬走才有東西可以補送。
         """
         i = self.props.currentRow()
@@ -1207,7 +1326,11 @@ class DungeonMakeTab(BaseTab):
             self._big = MapWindow(self)
         self._big.show()
         self._big.raise_()
-        self._big._fit()
+        # ★ 使用者 2026-09-07：「視窗大小要根據繪製出來的地圖大小變的剛好」——
+        #   先照目前縮放把視窗縮到剛好包住地圖；只有大到塞不進螢幕（視窗已經
+        #   撐到上限）才退回舊行為「符合視窗」＝自動把縮放降到看得見全圖。
+        if not self._big.fit_window():
+            self._big._fit()
         self._say_map(note)
 
     def _base_image(self) -> QImage:
@@ -1309,7 +1432,9 @@ class DungeonMakeTab(BaseTab):
         if self._big is not None:
             # ⚠ 不可走的格子不給加：走不到的終點會讓執行端一直重試到逾時。
             self._big.add_pick.setEnabled(walk)
-            self._big.add_portal.setEnabled(walk)
+            # ⚠ 「強制走到」連不可走的格也給按 —— 機關擋住的格子在地形圖上
+            #   本來就是不可走，那正是要撞的目標。
+            self._big.force_btn.setEnabled(True)
             self._big.pick_lbl.setText(
                 f"點到 ({gx}, {gy})　"
                 + (f"房間 {room}" if room is not None else
@@ -1552,6 +1677,8 @@ class DungeonMakeTab(BaseTab):
         self._poke_timer.stop()
         self._pw_timer.stop()
         self._pw = None
+        self._fw_timer.stop()
+        self._fw = None
         if self._big is not None:
             self._big._timer.stop()      # 地圖視窗每半秒重畫，要停掉
             self._big.close()

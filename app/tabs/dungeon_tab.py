@@ -489,6 +489,12 @@ PORTAL_ON = 0.8
 #     它自己**永遠不會送第二次**；我們主動送就沒有這個限制。
 # ⚠ 使用者 2026-09-02：「打太快了，5 秒打一次封包就好」——1 秒太密。
 PORTAL_POKE = 5.0          # 每幾秒對傳點主動送一次 0x0D
+# ★★ 使用者 2026-09-07：「這是傳送點要多一個，如果撞了沒有被傳送要回頭再撞一次」。
+#   站著補送封包對「要點一下才走」的傳點有效，但**機關型**的（雕像那種）認的是
+#   人真的走進去那一下 —— 站著不動再怎麼送都沒有用，要退開再走回來重撞。
+PORTAL_BUMP = 12.0         # 站在傳點上幾秒還沒被搬走 → 退開再走回來撞一次
+PORTAL_BACK = 3.0          # 退開幾格（要退到踩得出「走進去」那一下）
+PORTAL_BUMP_ARRIVE = 1.2   # 退到／回到定點算幾格內
 # ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
 #   壞掉，那個拔掉」）—— 傳點過不去就一直打，出口是取消勾選。
 
@@ -1391,6 +1397,9 @@ class DungeonTab(BaseTab):
         #      的狀態，換目標一律走 _engage() 整組重設 ----
         self._last_gave_up = None    # 剛換掉的那一隻（有別隻時先挑別隻；⛔ 不是黑名單）
         self._me = None              # 這一拍我的位置（挑目標／算路徑用）
+        self._bump = None            # 傳點「退開再走回來撞」正在跑的那一輪
+        self._bump_t = 0.0           # 站在傳點上多久沒被搬走
+        self._bump_n = 0             # 這一步撞了幾次（只拿來回報）
         self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
@@ -2836,6 +2845,12 @@ class DungeonTab(BaseTab):
                 self._scan.force_full(self._pid)
                 self._next()
                 return
+            # ★★ 「退開再走回來撞」要放在**這裡**，不能放在 _poke_portal 裡：
+            #   一退開人就離開了 PORTAL_NEAR，那一支根本不會再被叫到，狀態機
+            #   會卡在 away；而下面「走進傳點」又會把人走回去 —— 兩邊互相拉扯，
+            #   人就在傳點跟退開點之間來回。放在分支開頭它才管得到整段。
+            if self._bump_portal(gx, gy, me):
+                return
             if _d((gx, gy), me) <= PORTAL_NEAR:
                 # ★ 已經站在傳點上卻沒被搬走 → 每 PORTAL_POKE 秒對它送一次
                 #   互動（有些傳點要點一下才走）。⛔ 不是每一拍狂送：那是
@@ -3003,8 +3018,29 @@ class DungeonTab(BaseTab):
         使用者 2026-09-02：「進副本不是站在傳送口等傳送，而是要一直打進
         傳送點封包」。⛔ 沒有上限，過不去就一直打。
         ⚠ 遊戲自己那支有去重欄（站著不動永遠不會送第二次，見 portal.py
-          檔頭）—— 主動送就沒有這個限制，所以不必退開再走回來。
+          檔頭）—— 主動送就沒有這個限制。
+        ★★ 但**光補送封包不夠**（使用者 2026-09-07：「如果撞了沒有被傳送要
+          回頭再撞一次」）：機關型的那種（雕像）認的是人真的走進去那一下，
+          站著不動再怎麼送都不會過 → 站滿 PORTAL_BUMP 秒還在原地就**退開
+          再走回來**。
         """
+        gx, gy = step["to"]
+        me = self._me
+        if me is not None:
+            # ⚠ 這裡只負責「站久了 → 開始撞」；撞的過程由分支開頭的
+            #   `_bump_portal` 驅動（人退開之後就不會再進到這一支了）。
+            self._bump_t += dt
+            if self._bump_t >= PORTAL_BUMP:
+                self._bump_t = 0.0
+                spot = self._bump_spot(gx, gy)
+                if spot is not None:
+                    self._bump_n += 1
+                    self._bump = {"phase": "away", "spot": spot,
+                                  "n": self._bump_n}
+                    self._notify(f"第 {self._i + 1} 步　站在傳點上 "
+                                 f"{PORTAL_BUMP:.0f} 秒沒被搬走 → "
+                                 f"退開再撞一次（第 {self._bump_n} 次）")
+                    return
         self._poke_t -= dt
         mins = self._step_t / 60.0
         if self._poke_t > 0:
@@ -3014,6 +3050,54 @@ class DungeonTab(BaseTab):
         self._poke_t = PORTAL_POKE
         note = self._send_portal(tuple(step["to"]), step.get("model"), "傳點")
         self._say(f"第 {self._i + 1} 步　{note}…已 {mins:.1f} 分鐘")
+
+    def _bump_spot(self, gx: float, gy: float):
+        """挑一格「退開 PORTAL_BACK 格」的落腳點：可走、而且**我現在走得到**。
+
+        ⚠ 一定要在自己這一區裡挑（`_can_reach`）—— 退到隔壁區的格子就走不過去，
+          人會卡在原地磨到逾時。八個方向都挑不到就回 None（那就別退，繼續補送）。
+        """
+        if self._grid is None:
+            return None
+        r = PORTAL_BACK
+        for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            spot = self._grid.nearest_open(int(gx + dx * r), int(gy + dy * r))
+            if spot and self._can_reach(spot):
+                return spot
+        return None
+
+    def _bump_portal(self, gx: float, gy: float, me) -> bool:
+        """退開再走回來撞一次。回 True＝這一拍歸我管，呼叫端不要再補送封包。
+
+        ★ 使用者 2026-09-07 指定的行為。兩段：`away` 走到退開點 → `back` 走回傳點上。
+          回到傳點就交還給正常的補送流程；還是沒過的話 PORTAL_BUMP 秒後再撞一次。
+          ⛔ 沒有次數上限（跟補送封包一樣，副本的門本來就是解謎才開）。
+        """
+        bump = self._bump
+        if bump is None:
+            return False
+        if bump["phase"] == "away":
+            sx, sy = bump["spot"]
+            if _d((sx, sy), me) <= PORTAL_BUMP_ARRIVE:
+                bump["phase"] = "back"
+                self._say(f"第 {self._i + 1} 步　退開了 → 走回傳點再撞一次"
+                          f"（第 {bump['n']} 次）")
+                return True
+            self._walk_onto(sx, sy)
+            self._say(f"第 {self._i + 1} 步　傳點沒把我搬走 → 先退開到 "
+                      f"({sx}, {sy})　剩 {_d((sx, sy), me):.1f} 格")
+            return True
+        if _d((gx, gy), me) <= PORTAL_ON:        # back：已經站回傳點上
+            self._bump = None
+            self._bump_t = 0.0
+            self._poke_t = 0.0                   # 站回去就馬上補送一次
+            self._say(f"第 {self._i + 1} 步　撞回傳點上了（第 {bump['n']} 次）")
+            return True
+        self._walk_onto(gx, gy)
+        self._say(f"第 {self._i + 1} 步　走回傳點撞第 {bump['n']} 次"
+                  f"　剩 {_d((gx, gy), me):.1f} 格")
+        return True
 
     def _stray_dialog(self, dt: float) -> bool:
         """沒在等對話的時候跳出對話框 → 關掉。回 True＝這一拍關了一個。
@@ -3423,6 +3507,9 @@ class DungeonTab(BaseTab):
         self._wait_left = 0.0
         self._empty_since = 0.0
         self._poke_t = 0.0            # 下一步的傳點要馬上補送第一次
+        self._bump = None             # 換一步 → 撞的狀態整組歸零
+        self._bump_t = 0.0
+        self._bump_n = 0
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
         self._nudge = 0               # 靠近重試的次數歸零
         self._still_t = 0.0
