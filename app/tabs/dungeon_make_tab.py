@@ -424,7 +424,10 @@ class DungeonMakeTab(BaseTab):
         self.wait_secs.setSingleStep(0.5)
         self.wait_secs.setDecimals(1)
         self.wait_secs.setValue(3.0)
-        self.wait_secs.setSuffix(" 秒")
+        # ★ 使用者 2026-09-07：「休息旁邊的 x 秒太長，而且秒不要在輸入框裡面」
+        #   —— 寬度照最大值 600.0 量（fit_spin），單位「秒」改成旁邊的標籤，
+        #   後面補 stretch 讓框不再被拉滿整列。
+        fit_spin(self.wait_secs)
         b = QPushButton("加入「休息」")
         b.setToolTip("在這裡停幾秒再做下一步。\n"
                      "例如上一個機關剛講完話，馬上跟下一個講會被拒絕。\n"
@@ -434,6 +437,8 @@ class DungeonMakeTab(BaseTab):
                                "secs": round(self.wait_secs.value(), 1)}))
         sh2.addWidget(b)
         sh2.addWidget(self.wait_secs)
+        sh2.addWidget(QLabel("秒"))
+        sh2.addStretch(1)
         sv.addLayout(sh2)
         mid.addWidget(stepbox, 2)
         root.addLayout(mid, 1)
