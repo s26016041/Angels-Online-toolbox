@@ -2337,8 +2337,13 @@ def main() -> int:
     ck("★★ 勾循環、從第 3 步開始 → 這一場從第 3 步、要循環、組隊照選",
        tab._round_plan(5) == (2, True, "bind"), str(tab._round_plan(5)))
     tab.loop_cb.setChecked(False)
-    ck("★★ 沒勾循環 → 只打一場：不循環、不組隊（起始步驟照舊）",
+    # ★ 2026-09-09 使用者改規：組隊跟循環脫鉤 —— 只打一場也照下拉選的模式組隊
+    ck("★★ 沒勾循環 → 只打一場：不循環，但組隊照選（起始步驟照舊）",
+       tab._round_plan(5) == (2, False, "bind"), str(tab._round_plan(5)))
+    tab.party_box.setCurrentIndex(tab.party_box.findData("none"))
+    ck("　選「不組隊」才真的不組隊",
        tab._round_plan(5) == (2, False, "none"), str(tab._round_plan(5)))
+    tab.party_box.setCurrentIndex(tab.party_box.findData("bind"))
     tab.start_box.blockSignals(True)
     tab.start_box.setCurrentIndex(0)
     tab.start_box.blockSignals(False)
