@@ -5,7 +5,14 @@
 1. 上面選分身 → 中間的模擬背包只會列**背包裡可以強化的裝備**（身上穿的不列，
    所以不可能誤動你正在穿的東西）。
 2. 滑鼠移到圖示上會顯示跟遊戲一樣的說明（名稱／數值／已強化次數／孔與寶石）。
-3. 點一下選起來（黃色粗框），選好「強化到 +N」，按「強化錘強化」。
+3. 點一下選起來（黃色粗框），在「強化到 +」那排小方塊點要打到的數字，
+   按「強化錘強化」。
+
+「強化到 +N」「打孔到 N 孔」都是小方塊（使用者 2026-09-09 指定，不打字）：
+點哪一格就是它，**程式不會自己幫你改**（選到已經強化過的裝備也不動你的選擇），
+選的數字比裝備現況還低就按不出東西 —— 下面紀錄會寫「選擇強化等級過低／
+選擇孔數過低」。上次選的存在 config（`enhance.target`／`enhance.hole_target`），
+重開就是那一格。
 
 ⚠⚠ **一般強化錘失敗 → 裝備直接消失**（使用者 2026-08-28 確認）。
 所以按下去就是一路打到目標為止（使用者指定不要每發確認），中途只要
@@ -51,6 +58,7 @@ from PySide6.QtWidgets import (
 from dataclasses import dataclass
 from typing import Callable
 
+from app import theme
 from app.config import config
 from app.core import charname, injector, preload, window as win
 from app.core.memory import MemoryScanner
@@ -72,6 +80,7 @@ RUN_MS = 200                   # 強化狀態機多久跑一拍
 HIST_MAX = 300
 # 選裝備時「寶石等限 ≤」自動填成 裝備等級 − 這個數（使用者 2026-09-03 定 15 → 同日改 10），仍可手改
 GEM_CAP_BELOW = 10
+PICK_CELL = 28                 # 「強化到 +N」「打孔到 N 孔」小方塊的邊長
 
 COLOUR_OF = {
     enhance.SUCCESS: "#7CFC7C",
@@ -282,6 +291,46 @@ def _tooltip_html(g: gear.Gear, scanner=None) -> str:
             + "".join(parts) + "</div>")
 
 
+class NumberPicker(QWidget):
+    """1~N 的小方塊，點哪一格就是要打到哪個數字（取代原本的數字輸入框）。
+
+    使用者 2026-09-09 指定三件事，這個元件就是為了守住它們：
+      · 不打字，直接點方塊；
+      · **程式不准自己幫他改選的值**（選了強化過的裝備也不動）；
+      · 記住上次選的，下次開起來就是那一格（存 config，`changed` 由呼叫端接）。
+    """
+
+    changed = Signal(int)
+
+    def __init__(self, hi: int, value: int, parent=None) -> None:
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        self._btns: list[QPushButton] = []
+        for n in range(1, hi + 1):
+            b = QPushButton(str(n))
+            b.setCheckable(True)
+            b.setFixedSize(PICK_CELL, PICK_CELL)
+            b.setStyleSheet("padding: 0px;")     # ⛔ 只改內距，色碼一律走 theme
+            b.clicked.connect(lambda _c=False, k=n: self.setValue(k))
+            lay.addWidget(b)
+            self._btns.append(b)
+        self._value = 0
+        self.setValue(value)
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, n: int) -> None:
+        n = max(1, min(int(n), len(self._btns)))
+        self._value = n
+        for i, b in enumerate(self._btns, 1):
+            # 再點同一格會被 Qt 取消勾選 → 這裡一律重設，選中的那格永遠亮著
+            b.setChecked(i == n)
+        self.changed.emit(n)
+
+
 class EnhanceTab(BaseTab):
     TAB_TITLE = "強化裝備"
     GROUP = GROUP_CHORES
@@ -350,9 +399,12 @@ class EnhanceTab(BaseTab):
         act.addWidget(self.pick_lbl)
         act.addStretch(1)
         act.addWidget(QLabel("強化到 +"))
-        self.target = QSpinBox()
-        self.target.setRange(1, enhance.MAX_LEVEL)
-        self.target.setFixedWidth(64)
+        self.target = NumberPicker(
+            enhance.MAX_LEVEL, int(config.get("enhance.target", 1) or 1))
+        self.target.setToolTip(
+            "要打到 +幾。點一下就是它，程式不會自己幫你改；\n"
+            "下次開起來預設就是你上次選的那一格。")
+        self.target.changed.connect(self._on_target)
         act.addWidget(self.target)
         self.go_btn = QPushButton("強化錘強化")
         self.go_btn.setToolTip(
@@ -369,13 +421,13 @@ class EnhanceTab(BaseTab):
         act2 = QHBoxLayout()
         act2.addStretch(1)
         act2.addWidget(QLabel("打孔到"))
-        self.hole_target = QSpinBox()
-        self.hole_target.setRange(1, holes.MAX_HOLES)
-        self.hole_target.setValue(
+        self.hole_target = NumberPicker(
+            holes.MAX_HOLES,
             int(config.get("enhance.hole_target", holes.MAX_HOLES)))
-        self.hole_target.setFixedWidth(52)
         self.hole_target.setToolTip(
-            f"要打到幾個孔（遊戲上限 {holes.MAX_HOLES}）。到了就停，最後一孔留空。")
+            f"要打到幾個孔（遊戲上限 {holes.MAX_HOLES}）。到了就停，最後一孔留空。\n"
+            "點一下就是它，程式不會自己幫你改；下次開起來預設是上次選的。")
+        self.hole_target.changed.connect(self._on_hole_target)
         act2.addWidget(self.hole_target)
         act2.addWidget(QLabel("孔"))
         act2.addSpacing(12)
@@ -545,14 +597,9 @@ class EnhanceTab(BaseTab):
             self.pick_lbl.setText(
                 f"已選：{g.name}（目前 +{g.enhance}、{g.holes} 孔 "
                 f"已鑲 {len(g.gems_filled)}、{g.base.get('level', '?')} 級）")
-            low = min(g.enhance + 1, enhance.MAX_LEVEL)
-            self.target.setMinimum(low)
-            if self.target.value() < low:
-                self.target.setValue(low)
-            hlow = min(g.holes + 1, holes.MAX_HOLES)
-            self.hole_target.setMinimum(hlow)
-            if self.hole_target.value() < hlow:
-                self.hole_target.setValue(hlow)
+            # ⛔ 這裡以前會把「強化到 +N」「打孔到 N 孔」往上頂到裝備目前的次數＋1
+            #   —— 使用者 2026-09-09 明令**不准再偷改他選的數字**。選太低就在
+            #   按下去的時候用紀錄告訴他（見 `_on_go` / `_on_go_holes`）。
             # ★ 只在「換了一件」時自動填等限 —— 打孔中孔數變了也會走到這裡，
             #   每拍都填會把使用者手改的值洗掉
             lvl = g.base.get("level")
@@ -587,6 +634,14 @@ class EnhanceTab(BaseTab):
             config.save()
         self._update_buttons()
 
+    def _on_target(self, n: int) -> None:
+        config.set("enhance.target", int(n))
+        config.save()                      # ★ set() 不寫檔，要接 save()
+
+    def _on_hole_target(self, n: int) -> None:
+        config.set("enhance.hole_target", int(n))
+        config.save()
+
     def _on_gem_mode(self, _checked: bool) -> None:
         config.set("enhance.gem_mode",
                    "cap" if self.gem_cap_rb.isChecked() else "pick")
@@ -611,7 +666,9 @@ class EnhanceTab(BaseTab):
             return
         target = self.target.value()
         if target <= g.enhance:
-            self.status.setText("目標比目前的次數還低 —— 不用打")
+            msg = f"選擇強化等級過低（{g.name} 目前 +{g.enhance}，選的是 +{target}）"
+            self._log(msg, theme.WARN)
+            self.status.setText(msg)
             return
         self._run = enhance.Run(sc, mv, g.slot, g.serial, target, g.name)
         self._log(f"開始：{g.name} +{g.enhance} → +{target}", "#7CD8FF")
@@ -629,11 +686,12 @@ class EnhanceTab(BaseTab):
             return
         target = self.hole_target.value()
         cap = self.gem_cap.value()
-        config.set("enhance.hole_target", target)
-        config.save()                      # ★ set() 不寫檔，要接 save()
+        # 目標孔數在點方塊的當下就存了（`_on_hole_target`）
         # 寶石等限不存：每次選裝備都會自動填「裝備等級 − GEM_CAP_BELOW」
         if target <= g.holes:
-            self.status.setText("目標比目前的孔數還低 —— 不用打")
+            msg = f"選擇孔數過低（{g.name} 目前 {g.holes} 孔，選的是 {target} 孔）"
+            self._log(msg, theme.WARN)
+            self.status.setText(msg)
             return
         gem_type = None
         how = f"寶石等限 ≤ {cap} 級"
