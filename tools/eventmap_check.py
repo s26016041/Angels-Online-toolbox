@@ -225,9 +225,13 @@ class FakeSupply:
     def shop_sells(self, tid):
         return True
 
+    # ⚠ 簽章要跟 supply.run_full_supply 一致（漏一個關鍵字＝呼叫時 TypeError，
+    #   被 worker 的 try 吃掉，測試只會看到「一趟都沒開」——2026-09-06 加
+    #   guild_items／fill_pct 時就這樣紅了兩條沒人發現）。
     def run_full_supply(self, mv, sc, say=None, back_to=None, potions=None,
-                        potion_only=False, ledger=None):
-        self.trips.append({"back_to": back_to})
+                        potion_only=False, ledger=None, guild_items=None,
+                        fill_pct=None, should_stop=None):
+        self.trips.append({"back_to": back_to, "should_stop": should_stop})
         if say:
             say("測試補給中…")
         return True, "測試補給完成"
@@ -287,6 +291,26 @@ else:
           f"實得 {SUPPLY.trips[0]['back_to'] if SUPPLY.trips else None}")
     check("跑完自己收工（_supply_tick 收得到結果）",
           page._supply_tick(0.1) is True and page._supply is False)
+
+    # ★★ 2026-09-09 使用者定：回程補給要「開始掛機」勾著才有效；補給中把掛機
+    #    關掉就要停下來（不是跑完整趟）。
+    page = build_page()
+    page._spots = [EVENT_SPOT]
+    SUPPLY.trips.clear()
+    started = page._start_supply("裝備壞了")
+    check("★★ 沒勾「開始掛機」→ 不跑回程補給",
+          started is False and not SUPPLY.trips, f"實得 {started} {SUPPLY.trips}")
+    page.run_cb.setChecked(True)
+    SUPPLY.trips.clear()
+    started = page._start_supply("裝備壞了")
+    check("★★ 勾了「開始掛機」→ 照跑", started is True and len(SUPPLY.trips) == 1,
+          f"實得 {started} {SUPPLY.trips}")
+    stop = SUPPLY.trips[0]["should_stop"] if SUPPLY.trips else None
+    check("★★ 補給拿得到「要不要停」的回呼", callable(stop))
+    check("　掛機還開著＝不停", stop is not None and stop() is False)
+    page.run_cb.setChecked(False)          # 使用者把「開始掛機」關掉
+    check("★★★ 關掉「開始掛機」→ 那一趟補給當場叫停",
+          stop is not None and stop() is True)
 
     page = build_page()
     page._death_scene = EVENT_SPOT[2]

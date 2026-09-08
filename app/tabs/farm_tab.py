@@ -2995,7 +2995,7 @@ class CharFarmPage(QWidget):
         self._stop_with(msg)
         self.notify(msg)
 
-    def _start_supply(self, why: str) -> bool:
+    def _start_supply(self, why: str, manual: bool = False) -> bool:
         """觸發回程補給：跑**我們自己**的 `supply.run_full_supply`（存倉庫→修裝→買水→
         趴趴GO 回原地）。接得起來（開了背景執行緒）才回 True。
 
@@ -3004,7 +3004,17 @@ class CharFarmPage(QWidget):
           維修商全修→補給商照清單買→趴趴GO 跳回原練功點。整趟是阻塞式、~數十秒到幾分鐘，
           放**背景執行緒**跑、`_supply_tick` 每拍輪詢完成，不凍畫面。
         ⚠ 天使精靈的自動戰鬥**不需要再打開**（使用者要求）——我們自己走位/銀行/買賣，精靈全程讓開。
+
+        ★★★ 2026-09-09 使用者定：**回程補給要「開始掛機」勾著才有效**，而且
+          補給跑到一半把掛機關掉就要**停下來**（不是跑完整趟）。
+          · 開跑的閘在這裡（`manual=True` 只留給 🧪 測試鈕，那顆本來就是沒掛機時按的）。
+          · 中途停的實作在 `supply.run_full_supply(should_stop=…)`：關掉掛機
+            → `_on_toggle` 把 `_supply_gen` 加一 → 這趟的 `gen` 對不上 → 補給
+            自己中斷、收尾（關商店、離開 NPC 互動），人就停在那裡。
         """
+        if not manual and not self.run_cb.isChecked():
+            self.status.setText(f"🔧 {why} → 「開始掛機」沒勾，不跑回程補給")
+            return False
         if not self._ensure_mover():
             return False
         # ⚠ 上一趟的背景執行緒還活著就**絕不能**再開一條（逾時停機殺不掉它；
@@ -3068,7 +3078,10 @@ class CharFarmPage(QWidget):
                     potions=plan,      # 藥水買到負重 N%（生產分頁不帶＝不買）
                     ledger=self._record_purchase,   # 購買紀錄（純資料 append）
                     guild_items=gitems,             # 順手存公會倉庫（2026-09-06）
-                    fill_pct=fill)
+                    fill_pct=fill,
+                    # ★ 中途叫停：這一趟被作廢（關掉掛機／又開了新一趟）就當場停
+                    #   （2026-09-09 使用者要求，見 _start_supply 檔頭）
+                    should_stop=lambda: gen != self._supply_gen)
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._supply_gen:      # 這一趟還沒被作廢才收結果
@@ -3145,7 +3158,10 @@ class CharFarmPage(QWidget):
         self._pick_home()
         home = self._home
         where = scene.scene_name(home[2]) if home else "出發當下的位置"
-        if not self._start_supply(f"🧪 測試：假裝裝備壞掉（回程目標：{where}）"):
+        # ★ manual=True：這顆鈕本來就是「沒在掛機時按一下試跑一趟」，
+        #   不受「回程補給要開始掛機勾著才有效」那道閘限制（2026-09-09）。
+        if not self._start_supply(f"🧪 測試：假裝裝備壞掉（回程目標：{where}）",
+                                  manual=True):
             return          # 失敗原因 _start_supply 已經寫在狀態列上了
 
     def _end_supply(self, why: str, stop: bool = False) -> None:
@@ -5436,9 +5452,11 @@ class CharFarmPage(QWidget):
             self._death = False        # 死亡回程等到一半就作廢，別再傳送
             # ⚠ 停掛機時如果正在跑回程補給：作廢它（_supply_gen++ 讓背景執行緒回來的
             #   結果自己失效、_supply=False 讓掛機不再讓開）。
-            #   ⚠⚠ 補給是背景執行緒跑我們自己的整趟，**沒法中途硬殺** —— 那一趟會自己
-            #   跑完（run_full_supply 各段都有逾時），跑完角色就停著。停掛機當下不會再
-            #   接手打怪。這是「背景阻塞式補給」的取捨（要能中途停得再改 run_full_supply 支援）。
+            # ★★★ 2026-09-09 起 gen 對不上**也會讓那一趟自己停下來**（使用者要求：
+            #   「觸發回程補給，我把開始掛機關閉就要停止」）：`_start_supply` 給了
+            #   `should_stop=lambda: gen != self._supply_gen`，補給的每個等待／進度點
+            #   都會問一次，要停就收尾（關商店、離開 NPC 互動）後中止，人停在原地。
+            #   ⚠ 最慢就是一次等待的間隔（≤1 秒）；正在送出的那一包還是會送完。
             # ⛔ 不再 reset 分身／召喚（2026-08-13，獨立於掛機）。
             if self._supply:
                 self._supply = False

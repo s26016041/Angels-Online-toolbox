@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import struct
+import threading
 import time
 
 from app.game import (attack, bag, gather, quickbar, robot, itemname, scene,
@@ -26,6 +27,40 @@ from app.game import (attack, bag, gather, quickbar, robot, itemname, scene,
 #   建包 / 送出 / 連線 → jumpmap.BUILD_FN / SEND_FN / CONN_PTR（0x50E0AE / 0x711380 / 0x9B6660）
 #   talkaction        → sell.TALK_FN（0x5D9066，實測與買東西共用同一支）
 #   只有「點 NPC 互動」是新的 → supply.INTERACT_FN，已登進 locate.py 由 warm() 定位。
+
+# ★★★ 中途叫停（2026-09-09 使用者要求：「觸發回程補給，我把開始掛機關閉就要停止」）
+#   整趟補給是呼叫端開的**背景執行緒**在跑（阻塞式，幾十秒到幾分鐘）。以前只能等它
+#   跑完 —— 掛機都關掉了，角色還在城裡繼續修裝、買水、再飛回練功點。
+#   現在 `run_full_supply(should_stop=…)`：所有等待一律走 `_nap()`，它每次醒來都問
+#   一次呼叫端「還要不要跑」，要停就丟 `Aborted` 把整趟中斷，外層攔下來收尾
+#   （關商店、離開 NPC 互動 —— ⛔ 不送 0x22 會卡在互動狀態）再回 (False, 已中止)。
+#   ⚠ 回呼存在 **thread-local**：同一個工具箱可能好幾台分身各跑各的一趟，
+#   模組級單一變數會互相踩。
+class Aborted(Exception):
+    """呼叫端要求中止這一趟補給（例如掛機被關掉）。"""
+
+
+_ABORT = threading.local()
+
+
+def _abort_check() -> None:
+    """呼叫端說要停就丟 Aborted（沒設回呼＝永遠不停，舊行為）。"""
+    fn = getattr(_ABORT, "fn", None)
+    if fn is not None and fn():
+        raise Aborted()
+
+
+def _nap(secs: float) -> None:
+    """等一下下，順便看呼叫端有沒有叫停。
+
+    ⛔ 補給流程裡**一律用它**，不要直接 `time.sleep` —— 補給幾乎所有時間都花在
+    這些等待上（等換圖、等走到、等對話、等視窗），只在段落之間問「要不要停」
+    的話，最久要等好幾十秒才停得下來。
+    """
+    time.sleep(secs)
+    _abort_check()
+
+
 BUY_OPCODE = 0x27          # 跟 NPC 買
 
 # ★★★ 開交易的完整序列（2026-08-14 嵐狐實測跨圖冷交易 39→44 確認）：
@@ -593,7 +628,7 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
             last_walk = time.time()
         elif time.time() - last_walk > DIALOG_STILL_GRACE:
             return False
-        time.sleep(0.1)
+        _nap(0.1)
     return False
 
 
@@ -654,7 +689,7 @@ def _wait_for(ok, timeout: float) -> bool:
     while time.time() - t0 < timeout:
         if ok():
             return True
-        time.sleep(0.1)
+        _nap(0.1)
     return False
 
 
@@ -678,11 +713,11 @@ def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> 
     while time.time() - t0 < start_grace:            # 等開始走
         if entity.is_walking(scanner, pf + 8):
             break
-        time.sleep(0.05)
+        _nap(0.05)
     while time.time() - t0 < timeout:                # 等走完
         if not entity.is_walking(scanner, pf + 8):
             return
-        time.sleep(0.1)
+        _nap(0.1)
 
 
 def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str,
@@ -788,7 +823,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                     if in_box or (gap_now is not None and gap_now <= CLICK_RANGE + 1.0)
                     else DIALOG_TIMEOUT)
         if not _click_npc(mover, scanner, npc_ent):  # TryAct：到位就開對話，沒到就走一步
-            time.sleep(0.5)
+            _nap(0.5)
             continue
         # ★ 等對話框的期間每 CLICK_REPEAT 秒補點一次（＝官方那個重試迴圈）。
         #   ⚠ 每一發都**重新找那隻 NPC**：實體會被回收／換一格，上一拍的位址不能信
@@ -799,7 +834,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
 
         if base is None:                             # 安全退化：全域讀不到才走盲等照送
             _wait_still(scanner, timeout=12.0)
-            time.sleep(TALK_GAP)
+            _nap(TALK_GAP)
         elif _wait_dialog(scanner, base, wait_dlg, again=_again,
                           give_up_still=None if in_box else 2.5):
             if not _wait_arrival(scanner, npc_id):
@@ -820,7 +855,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             continue                                 # 確認沒開對話 → 馬上調位置重點
         for code in talk_codes[:-1]:
             _talkaction(mover, scanner, code)
-            time.sleep(TALK_GAP)                     # ★ 選項之間等夠（太快送會沒作用）
+            _nap(TALK_GAP)                     # ★ 選項之間等夠（太快送會沒作用）
         _talkaction(mover, scanner, talk_codes[-1])
         if wait_done():
             return True
@@ -951,7 +986,7 @@ def _wait_arrival(scanner, npc_id: int, timeout: float = 8.0) -> bool:
                     return box
                 gap = _npc_gap(scanner, npc_id)
                 return gap is None or gap <= TALK_RANGE
-        time.sleep(0.1)
+        _nap(0.1)
     return False
 
 
@@ -1015,13 +1050,13 @@ def run_repair(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
     if not _engage_npc(mover, scanner, npc_id, fallback,
                        [TALK_REPAIR], WND_REPAIR):
         return False, "開維修視窗失敗（靠不夠近或對話碼不對）"
-    time.sleep(0.3)
+    _nap(0.3)
     if not _repair_all(mover, scanner):
         _repair_close(mover, scanner)          # 開了窗就算失敗也把它關掉，別卡住
         return False, "全修送不出去（指令槽忙）"
-    time.sleep(0.8)
+    _nap(0.8)
     _repair_close(mover, scanner)              # ⚠ 一定要關維修畫面，不然角色卡住不能走
-    time.sleep(0.3)
+    _nap(0.3)
     return True, "已送出全修"
 
 
@@ -1192,7 +1227,7 @@ def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
         # poll 等它真的離開背包（避免網路延遲被誤判成「滿了」）
         left = False
         for _ in range(DEPOSIT_POLL):
-            time.sleep(DEPOSIT_WAIT)
+            _nap(DEPOSIT_WAIT)
             if _item_gone(scanner, it.serial):
                 left = True
                 break
@@ -1260,7 +1295,7 @@ def _wait_still(scanner, timeout: float = 3.0) -> None:
     while time.time() - t0 < timeout:
         if not entity.is_walking(scanner, pf + 8):
             return
-        time.sleep(0.15)
+        _nap(0.15)
 
 
 def buy(mover, scanner, entries: list[tuple[int, int]]) -> tuple[bool, str]:
@@ -1364,7 +1399,7 @@ def _run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, 
         if not _engage_npc(mover, scanner, npc_id, fallback,
                            [TALK_BUY], WND_SALE):
             return False, "開交易失敗（靠不夠近或對話碼不對）"
-        time.sleep(0.2)
+        _nap(0.2)
 
         ok, msg = buy(mover, scanner, need)
         if not ok:
@@ -1372,7 +1407,7 @@ def _run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, 
         lines.append("買 " + "、".join(
             f"{itemname.label(t)}×{q}" for t, q in need))
         last_need, last_have = need, have
-        time.sleep(SETTLE)
+        _nap(SETTLE)
 
     # 幾輪之後還沒補齊：回報現況（可能商人沒賣、或每次限量）
     have = bag_counts(scanner) or {}
@@ -1537,14 +1572,14 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
         if not _engage_npc(mover, scanner, npc_id, fallback,
                            [TALK_BUY], WND_SALE):
             return False, "開交易失敗（靠不夠近或對話碼不對）"
-        time.sleep(0.2)
+        _nap(0.2)
         moved = False
         for what, bid, qty in need:
             before_n = counts[what]
             ok, msg = buy(mover, scanner, [(bid, qty)])
             if not ok:
                 return False, "藥水購買送不出去：" + msg
-            time.sleep(SETTLE)
+            _nap(SETTLE)
             after = bag_counts(scanner)
             wgt2 = entity.weight(scanner, pf + 8)
             if after is None:
@@ -1672,7 +1707,7 @@ def _wait_ready(scanner, timeout: float = LAND_READY_WAIT) -> bool:
             _items, complete = bag.scan(scanner)
             if complete:
                 return True
-        time.sleep(0.3)
+        _nap(0.3)
     return False
 
 
@@ -1683,7 +1718,7 @@ def _wait_map_change(scanner, from_map: int, timeout: float):
         cur = scene.current_id(scanner)
         if cur is not None and cur != from_map:
             return cur
-        time.sleep(0.3)
+        _nap(0.3)
     return None
 
 
@@ -1803,7 +1838,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float,
     while time.time() - t0 < timeout:
         pf, here = _player_tile(scanner)
         if pf is None or here is None:
-            time.sleep(0.3)
+            _nap(0.3)
             continue
         now = time.time()
         if target is None or now - last_plan > 2.0:      # 每 ~2s 重規劃目標
@@ -1876,7 +1911,7 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float,
             # 路線走完、人也停了、但還沒進到達圈 → Navigator 不會再動（不重算），
             # 留在這裡只會磨到逾時。夠近就交給呼叫端收尾，不夠近才算沒走到。
             return done(best <= NEAR_ENOUGH)
-        time.sleep(0.2)
+        _nap(0.2)
     return done(best <= NEAR_ENOUGH)
 
 
@@ -1884,7 +1919,41 @@ def run_full_supply(mover, scanner, say=None,
                     back_to=None, potions=None,
                     potion_only: bool = False,
                     ledger=None, guild_items=None,
-                    fill_pct=None) -> tuple[bool, str]:
+                    fill_pct=None, should_stop=None) -> tuple[bool, str]:
+    """完整補給一趟（外殼：只管**中途叫停**，內容全在 `_full_supply`）。
+
+    should_stop() 可選（2026-09-09 使用者要求）：回 True 就**當場中止**這一趟。
+    掛機分頁傳的是「這趟還算不算數」——關掉「開始掛機」它就變 True，於是人不會
+    再繼續走完整趟補給。中止時會先收尾（關商店視窗、送 0x22 離開 NPC 互動，
+    ⛔ 不送會卡在互動狀態）再回 `(False, 中止原因)`；人停在中止的那個地方
+    （通常是城裡），呼叫端自己決定要不要做什麼。
+    ⚠ 沒傳 should_stop ＝ 完全是舊行為（生產／副本／練技那三條都還沒接）。
+    """
+    _ABORT.fn = should_stop
+    try:
+        return _full_supply(mover, scanner, say=say, back_to=back_to,
+                            potions=potions, potion_only=potion_only,
+                            ledger=ledger, guild_items=guild_items,
+                            fill_pct=fill_pct)
+    except Aborted:
+        _ABORT.fn = None            # ⛔ 收尾自己不能再被中斷
+        try:
+            close_sale(mover, scanner)
+            leave_npc(mover, scanner)
+        except Exception:                              # noqa: BLE001
+            pass                    # 對話早就關了／分身沒了：收尾失敗無所謂
+        if say:
+            say("補給已中止")
+        return False, "補給中止（呼叫端叫停）"
+    finally:
+        _ABORT.fn = None
+
+
+def _full_supply(mover, scanner, say=None,
+                 back_to=None, potions=None,
+                 potion_only: bool = False,
+                 ledger=None, guild_items=None,
+                 fill_pct=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     fill_pct 可選：藥水買到負重的百分比整數（掛機頁「掛機設定」，全部分身共用；
@@ -1918,6 +1987,9 @@ def run_full_supply(mover, scanner, say=None,
     potion_only 那趟一樣不去銀行。
     """
     def note(m):
+        # ★ 每個進度點都順便問一次「還要不要跑」（等待那邊是 _nap 在問）——
+        #   兩個加起來，中止最慢就是一次 _nap 的間隔。
+        _abort_check()
         if say:
             say(m)
 
@@ -2012,7 +2084,7 @@ def run_full_supply(mover, scanner, say=None,
             if landed is not None and scene.same_map(landed, start_map):
                 return True, "已回到練功點"
             if not jok:
-                time.sleep(1.0)          # 送不出去（槽忙）→ 喘口氣再重送
+                _nap(1.0)          # 送不出去（槽忙）→ 喘口氣再重送
         return False, (f"⚠ 趴趴GO 送了 {JUMP_TRIES} 次都沒回到練功點"
                        "（人可能還在城裡）")
 
