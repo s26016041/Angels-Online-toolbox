@@ -2569,11 +2569,19 @@ def main() -> int:
        f"{tab._cycle}/{tab._team_sub} left={len(world['left'])}")
     world["mine"], world["his"] = [], []
     run(tab, 0.3)
-    ck("★ 名單清空 → 兩隻都先拒絕一次掛著的邀請 → 換成邀請（使用者 9/6）",
+    ck("★★ 名單清空 → ⛔ 不是馬上拒絕，先隔 TEAM_GAP（使用者 2026-09-08）",
+       tab._team_sub == "deny" and not world["denied"],
+       f"{tab._team_sub} denied={len(world['denied'])}")
+    run(tab, dt.TEAM_GAP)
+    ck("★ 隔完 → 兩隻都先拒絕一次掛著的邀請 → 換成邀請（使用者 9/6）",
        tab._team_sub == "invite" and len(world["denied"]) == 2,
        f"{tab._team_sub} denied={len(world['denied'])}")
-    ck("　拒絕完先緩一下才邀請（拒絕包先到）", not world["invited"], str(world["invited"]))
-    run(tab, 1.2)
+    ck("　拒絕完先隔 TEAM_GAP 才邀請（拒絕包先到）", not world["invited"],
+       str(world["invited"]))
+    run(tab, dt.TEAM_GAP + 0.3)
+    ck("★★ 邀請送出後也先隔 TEAM_GAP 才按同意", world["invited"]
+       and world["joined"] == 0, f"{world['invited']} joined={world['joined']}")
+    run(tab, dt.TEAM_GAP)
     ck("★ 刷副本這隻當隊長邀請綁定分身、**均分**、分身按同意",
        world["invited"] and world["invited"][0] == ("小黑", dt.team.SHARE_EVEN)
        and world["joined"] >= 1, f"{world['invited']} joined={world['joined']}")
@@ -2589,7 +2597,7 @@ def main() -> int:
     tab._phase = "enter"
     world.update(mine=[], his=[], left=[], invited=[], joined=0, denied=[], here=90)
     tab._team_begin()
-    run(tab, 0.3 + dt.DENY_SETTLE + 0.3)
+    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
     ck("循環組隊：第 1 輪 邀請送出", tab._team_rounds == 1 and len(world["invited"]) == 1,
        f"rounds={tab._team_rounds} invited={len(world['invited'])}")
     # 分身這時接了**別人**的邀請 → 在別隊裡（隊長名單還是空的）
@@ -2600,7 +2608,7 @@ def main() -> int:
     ck("　沒成隊的這段期間沒有再狂邀（一輪一次）", len(world["invited"]) == 1,
        str(len(world["invited"])))
     world["his"] = []
-    run(tab, 0.3 + dt.DENY_SETTLE + 0.3)
+    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
     ck("★ 清空 → 又拒絕一次 → 第 2 輪再邀", tab._team_rounds == 2
        and len(world["denied"]) == 4 and len(world["invited"]) == 2,
        f"rounds={tab._team_rounds} denied={len(world['denied'])} invited={len(world['invited'])}")
@@ -2613,14 +2621,14 @@ def main() -> int:
     tab._phase = "enter"
     world.update(mine=[], his=[], left=[], invited=[], joined=0, denied=[], here=90)
     tab._team_begin()
-    run(tab, 0.3 + dt.DENY_SETTLE + 0.3)
+    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
     world["mine"] = [M("路人乙")]
     run(tab, 0.3)
     ck("★ 隊長名單裡是別人 → 立刻退組重走（不在別人的隊裡刷）",
        tab._team_sub == "leave" and world["left"] and tab._cycle == "team",
        f"{tab._team_sub} left={len(world['left'])}")
     world["mine"] = []
-    run(tab, 0.3 + dt.DENY_SETTLE + 0.3)
+    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
     world["mine"] = [M("小黑")]
     run(tab, 0.3)
     ck("　重走後成隊 → 開跑", tab._cycle == "go" and tab._team_rounds == 2,

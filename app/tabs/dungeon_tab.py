@@ -264,10 +264,19 @@ CLEAR_SETTLE = 3.0
 #   裡就好，人在哪不管）／遊戲自動組隊（遊戲裡自己設定，我們只做「退組 → 等隊伍
 #   名單出現人」）。
 PARTY_MODES = (("none", "不組隊"), ("bind", "綁定分身"), ("auto", "遊戲自動組隊"))
-LEAVE_GAP = 1.0            # 退組沒清空就每隔這麼久再送一次
-DENY_SETTLE = 0.5          # 兩隻都送完「拒絕」後緩這麼久才邀請（拒絕包先到）
-JOIN_GAP = 0.5             # 分身每隔這麼久按一次「同意」
-TEAM_ROUND = 4.0           # 一輪（邀請＋同意）等這麼久沒成隊 → 整套從「退組」再走一次
+# ★★★ 2026-09-08 使用者定：「組隊你只要執行好我說的流程，每次跑都是那個流程必定
+#   可以組隊，不過可以寫個間隔 3 秒」——**這一套的每一個動作之間一律隔 TEAM_GAP**
+#   （退組 → 拒絕 → 邀請 → 同意）。
+#   為什麼要隔：2026-09-08 的執行紀錄裡，刷邪靈古船時第 1 輪都組得起來，換成無限塔
+#   之後 16 次全部第 1 輪失敗、第 2 輪才成 —— 動作全擠在 1 秒內送出去，中間任何一段
+#   沒被伺服器收乾淨就整輪白走。⛔ 真正的原因我沒查到（不是動作節流：反組譯過
+#   team.ACTION_FN／INVITE_FN 都是直接 call 送包函式，中間沒有那道閘），所以這裡
+#   照使用者指定的做法辦：把流程走好、每步隔開，不自作聰明。
+TEAM_GAP = 3.0             # 這一套流程每一個動作之間隔多久（退組／拒絕／邀請／同意）
+# 一輪（拒絕→邀請→同意）等這麼久沒成隊 → 整套從「退組」再走一次。
+# ⚠ 一定要放得下「拒絕 +3 邀請 +3 第一次同意」再加幾次補按，⛔ 不能比 TEAM_GAP*2 短
+#   （那樣會在分身還沒按到同意之前就把整輪重走）。
+TEAM_ROUND = 12.0
 TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 # ★★★ 副本設定（使用者 2026-09-05：「這遊戲有鎖副本並且未來會改所以需要一個設定」）：
 #   一次連續刷幾場、全部刷完後休息多久再刷、全部場次結束後要不要回自動掛機的點位開掛機。
@@ -4312,6 +4321,9 @@ class DungeonTab(BaseTab):
             → 隊長邀請 → 分身同意
             → TEAM_ROUND 秒內分身沒出現在隊長名單 → **整套從退組再走一次**
 
+        ★ 2026-09-08 使用者定：**每一個動作之間隔 TEAM_GAP 秒**（「執行好我說的
+          流程、每次跑都是那個流程必定可以組隊，不過可以寫個間隔 3 秒」）。
+
         ⛔ 不准「開頭退一次組、後面只顧一直邀請」：分身接了別人的邀請、或掛著舊邀請
           把新的擋掉，那樣會永遠邀不進來又不會發現。
         遊戲自動組隊模式照舊：退組 → 等遊戲自己配到隊伍。"""
@@ -4350,10 +4362,10 @@ class DungeonTab(BaseTab):
                     self._team_sub = "deny"
                 else:
                     self._team_sub = "wait"
-                self._team_t = 0.0
+                self._team_t = TEAM_GAP     # ★ 退組之後隔 TEAM_GAP 才拒絕
                 return
             if self._team_t <= 0:
-                self._team_t = LEAVE_GAP
+                self._team_t = TEAM_GAP
                 if mine:
                     team.leave(self._mover)
                 if his and self._pmover is not None:
@@ -4364,14 +4376,17 @@ class DungeonTab(BaseTab):
             # ★ 兩隻都拒絕一次：有人正在邀請（別人的、或上一輪沒回的）會擋住新邀請。
             #   「有沒有人在邀請我」讀不到（team.PENDING_OFF 不可信），所以無條件送，
             #   沒掛著就是空包。
+            if self._team_t > 0:            # 退組跟拒絕之間也要隔開（見 TEAM_GAP）
+                self._say(f"組隊：退組了，等 {self._team_t:.0f} 秒讓伺服器收乾淨…")
+                return
             team.deny(self._mover)
             if self._pmover is not None:
                 team.deny(self._pmover)
             self._team_rounds += 1
             self._team_sub = "invite"
             self._team_invited = False
-            self._team_t = DENY_SETTLE                  # 拒絕包先到，再邀請
-            self._join_t = DENY_SETTLE + JOIN_GAP       # 邀請送出後才開始按同意
+            self._team_t = TEAM_GAP                     # 拒絕 → 隔 TEAM_GAP → 邀請
+            self._join_t = TEAM_GAP * 2                 # 邀請 → 隔 TEAM_GAP → 按同意
             self._team_round_t = TEAM_ROUND
             self._say(f"組隊：第 {self._team_rounds} 輪 —— 兩隻都先拒絕掛著的邀請…")
             return
@@ -4401,6 +4416,8 @@ class DungeonTab(BaseTab):
                 return
             if not self._team_invited:
                 if self._team_t > 0:
+                    self._say(f"組隊：第 {self._team_rounds} 輪 —— 拒絕送出了，"
+                              f"等 {self._team_t:.0f} 秒再邀請…")
                     return
                 ok, why = team.invite(self._mover, self._partner_name, team.SHARE_EVEN)
                 if not ok:
@@ -4408,7 +4425,7 @@ class DungeonTab(BaseTab):
                     return
                 self._team_invited = True                # 一輪只邀一次
             if self._join_t <= 0 and self._pmover is not None:
-                self._join_t = JOIN_GAP
+                self._join_t = TEAM_GAP
                 team.join(self._pmover, self._psc)
             self._say(f"組隊：第 {self._team_rounds} 輪 —— 邀請「{self._partner_name}」"
                       f"入隊中（均分），分身按同意…")
