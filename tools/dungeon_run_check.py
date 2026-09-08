@@ -1582,6 +1582,14 @@ def main() -> int:
        tab._cur is None and "血量歸零" in tab.status.text(), tab.status.text())
     tab._fight((10.0, 10.0), TICK)
     ck("★ 屍體不會再被挑到（血量 0 的候選直接跳過）", tab._cur is None)
+    # ★★★ 2026-09-09 使用者實機：血量是 0~100 的**整數百分比**，王剩不到 1%
+    #   就讀成 0 —— 還在打人的王不准當屍體丟掉。
+    for _st in ("Att", "Att2", "Cast", "Run"):
+        dt.entity.read_live_hp = lambda _sc, e, s=_st: (True, s, (e.x, e.y), 0)
+        tab._cur = None
+        tab._fight((10.0, 10.0), TICK)
+        ck(f"★★★ 血量 0 但狀態 {_st}（王剩不到 1%）→ 當活的照打", tab._cur is m,
+           f"實得 {tab._cur}")
     dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
     tab._fight((10.0, 10.0), TICK)
     ck("　血量 −1（沒交戰）→ 當活的、照挑", tab._cur is m)
@@ -1593,9 +1601,13 @@ def main() -> int:
         E(0x3000, 1, 5, "活的", 12.0, 10.0, kind=4, state="Wait", hp=-1),
         E(0x3100, 2, 5, "柱子屍體", 12.0, 10.0, kind=4, state="Wait", hp=0),
         E(0x3200, 3, 5, "一般屍體", 12.0, 10.0, kind=4, state="Dead", hp=0),
-        E(0x3300, 4, 5, "沒讀到血", 12.0, 10.0, kind=4, state="", hp=-1)]
+        E(0x3300, 4, 5, "沒讀到血", 12.0, 10.0, kind=4, state="", hp=-1),
+        # ★★★ 王打到剩不到 1%（整數百分比 → 0）但還在出手：不准當屍體
+        E(0x3400, 5, 5, "王 0% 還在打", 12.0, 10.0, kind=4, state="Att2", hp=0)]
     live = [x.eid for x in dt.DungeonTab._live_monsters(tab)]
-    ck("★ 掃描快照：血量 0 與 'Dead' 都當屍體濾掉、−1 留著", live == [1, 4], str(live))
+    ck("★ 掃描快照：血量 0 與 'Dead' 都當屍體濾掉、−1 留著",
+       live == [1, 4, 5], str(live))
+    ck("★★★ 血量 0 但在出手（王剩不到 1%）→ 留在清單裡", 5 in live, str(live))
 
     # ★★ 通知（使用者 2026-09-05：「死掉或出問題也要通知，跟自動掛機一樣」）
     print("通知")

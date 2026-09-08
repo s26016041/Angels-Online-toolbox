@@ -509,9 +509,14 @@ ATTACK_PACKET_RANGE = 12.0
 #    輸入框也一併拿掉了 —— 使用者填的值只會是地雷（雪狐把它留在遠程的
 #    預設 11，近戰射程只有 1，於是站 11 格外空打）。
 #    留 1 格餘裕的理由不變：怪會動，停在射程邊緣的話牠一走就出界要重走。
-# 血量要**連續**讀到 0 這麼久才算死亡。偶爾讀到一次 0 不算
-# —— 那會把還活著的怪丟掉。
-HP_SETTLE = 0.5
+# ⛔⛔ HP_SETTLE（血量連續 0 這麼久就算死）**已刪 —— 2026-09-09 使用者實機抓到**：
+#   那個欄位是**血量百分比、而且是整數 0~100**（entity.OFF_HP_PCT 的出處註解），
+#   王的血池大，剩 0.4% 就截斷成 0 → 我們判牠死了放手，王還一直打人；
+#   使用者的證據：召喚物打 50 下都不死（0% 其實還有幾萬點），他一個技能就死。
+#   一般怪血少、1% → 真死只要一兩下，所以以前看不出來。
+#   → 死亡改成只認**遊戲自己寫的**兩個即時訊號（都是 ≤20ms 就看得到，
+#     比舊的還快 0.5 秒）：目標欄被遊戲清 0、動畫狀態 'Dead'。
+#   ⛔ 不准再用血量百分比判死（不管等多久都一樣會在王身上誤判）。
 # 鎖定這麼久還**從來沒**看到血量 → 那是屍體（別人先打死的），換一隻。
 # ⚠ 門檻是量出來的：活著的目標鎖定後看到血量，中位 0.30 秒、最久 2.22 秒
 #   （34 隻樣本），所以 3 秒不會誤殺活的怪。
@@ -1335,14 +1340,14 @@ class TargetWorker(_Paced):
     def __init__(self, sc: MemoryScanner) -> None:
         super().__init__(WRITE_INTERVAL)
         self.sc = sc
-        self.hp = 0                 # 最近讀到的目標血量，給 UI 顯示
-        # 用封包攻擊時 True：只寫目標 ID、**不碰血量欄位**，
-        # 這樣血量才是遊戲寫的真值，0 就真的代表死了。見 entity.set_target_id。
+        self.hp = 0                 # 最近讀到的目標血量**百分比**，給 UI 顯示
+        # 用封包攻擊時 True：只寫目標 ID、**不碰血量欄位**，這樣血量才是遊戲
+        # 寫的真值。⛔ 但 0 **不代表死了** —— 它是 0~100 的整數，王剩不到 1%
+        # 就是 0（2026-09-09 使用者實機抓到）。見 entity.set_target_id。
         self.packets = False
         self._job: tuple[int, entity.Entity] | None = None
         self._wrote = False
         self._saw_hp = False        # 這隻有沒有讀到過 > 0 的血量
-        self._zero_at = 0.0         # 血量開始連續讀到 0 的時間
         self._since = 0.0           # **選定封包送出**之後過了多久（判斷屍體用）
         # 「選定」封包送出去了沒。⚠ 遊戲收到那一包才會填血量，
         #   所以沒送之前不能開始算屍體 —— 否則走過去的路上會把活怪全丟掉。
@@ -1351,7 +1356,6 @@ class TargetWorker(_Paced):
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
         self._saw_hp = False
-        self._zero_at = 0.0
         self._since = time.monotonic()
         self._job = (state, ent)
 
@@ -1401,21 +1405,11 @@ class TargetWorker(_Paced):
                 self.died.emit(ent.eid, self._saw_hp)
                 return
             if self.hp > 0:
-                self._saw_hp = True
-                self._zero_at = 0.0
-            elif not self._zero_at:
-                self._zero_at = now
-            # ★ 用封包攻擊時，血量歸零就是**遊戲告訴我們這隻死了**。
-            #   這才是可靠的死亡訊號 —— 屍體不會馬上從實體清單消失，
-            #   `is_alive()`（vtable + 實體 ID）也分不出死活。
-            # ⚠⚠ 兩個條件缺一不可，**都是實測踩出來的**：
-            #   ① 要先看過血量 > 0 —— 遊戲對「還沒交戰」的目標本來就回報 0，
-            #      少了這條會剛鎖定就判死（實測 150 秒誤判放棄 22 次、
-            #      真正擊殺只有 4 次）。
-            #   ② 0 要**連續**持續 HP_SETTLE 秒 —— 中途偶爾讀到一次 0
-            #      不算，免得把還活著的怪丟掉。
-            dead_by_hp = (packets and self._saw_hp and self.hp == 0
-                          and now - self._zero_at >= HP_SETTLE)
+                self._saw_hp = True    # 只拿來分辨「屍體 vs 交戰過」，⛔ 不判死
+            # ⛔ 血量歸零**不再當死亡訊號**（2026-09-09 使用者實機抓到，見 HP_SETTLE
+            #   那段的說明）：那是 0~100 的整數百分比，王剩不到 1% 就是 0。
+            #   死亡只認遊戲自己寫的：目標欄被清 0（下面 cur == 0）、動畫狀態 'Dead'
+            #   （上面那段，最快）。
             # ★ 屍體：鎖定這麼久了還**從來沒有**看到血量 —— 那是別人先打死的。
             #   搶怪嚴重的地方這種很多，實測 120 秒有 26 隻，白白鎖住 52 秒
             #   ＝ 44% 的時間在對屍體發呆。
@@ -1430,7 +1424,10 @@ class TargetWorker(_Paced):
                 self._since = now
             corpse = (packets and not self._saw_hp
                       and now - self._since >= CORPSE_SECS)
-            if self._wrote and (cur == 0 or dead_by_hp or corpse or not alive):
+            # ★ cur == 0 ＝ **遊戲自己把選定的目標清掉了**（怪死掉時它會清）。
+            #   我們每 20ms 才寫回去一次，所以讀得到那個 0；判死延遲 ≤20ms，
+            #   不必等任何秒數（2026-09-09 使用者定：「不能浪費時間判斷死亡」）。
+            if self._wrote and (cur == 0 or corpse or not alive):
                 if self._job is job:
                     self._job = None
                 self._wrote = False

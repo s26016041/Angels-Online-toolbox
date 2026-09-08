@@ -1858,13 +1858,20 @@ class DungeonTab(BaseTab):
 
         ★ 死活看兩個訊號，任一個成立就是屍體（使用者 2026-09-05）：
           · 動畫狀態 'Dead'（一般怪）
-          · **血量歸零**（`Entity.hp_zero`，實體 +0x288 恰好 0）—— 副本裡的
-            柱子死掉屍體會留一段時間、動畫狀態**不會**變 'Dead'，只看狀態
-            就會一直對著屍體出手。血量 −1（沒交戰）一律當活的。
+          · **血量歸零而且人不動了**（`Entity.hp_zero` ＝ 實體 +0x288 恰好 0）
+            —— 副本裡的柱子死掉屍體會留一段時間、動畫狀態**不會**變 'Dead'，
+            只看狀態就會一直對著屍體出手。血量 −1（沒交戰）一律當活的。
+
+        ⚠⚠ 2026-09-09 加的「而且人不動了」是**必要**的：那個欄位是 0~100 的
+          **整數百分比**，王的血池大，剩不到 1% 就讀成 0 —— 舊寫法會把還在
+          打人的王當屍體濾掉（使用者實機：召喚物打 50 下都不死，他一個技能就死）。
+          柱子本來就不會動，照樣判得出來；會動的（Att／Att2／Cast／Run）一律當活的。
         """
         if self._last is None:
             return []
-        return [m for m in self._last.mons if not m.dead and not m.hp_zero]
+        busy = entity.ATT_STATES + (entity.STATE_RUN,)
+        return [m for m in self._last.mons
+                if not m.dead and not (m.hp_zero and m.state not in busy)]
 
     # -- 這一區走得到哪裡 ---------------------------------------------
     def _refresh_grid(self, me, dt: float) -> None:
@@ -2389,9 +2396,13 @@ class DungeonTab(BaseTab):
         for m in self._live_monsters():
             if not m.eid:
                 continue                 # eid=0 挑到整條攻擊鏈都會空轉
-            # ★ 血量也當場重讀：0 ＝ 打死了（柱子屍體狀態不會變 'Dead'）
+            # ★ 血量也當場重讀：0 **而且沒在動作**才算打死了（柱子屍體狀態不會變
+            #   'Dead'）。⚠⚠ 血量是 0~100 的整數百分比 —— 王剩不到 1% 就是 0，
+            #   光看 0 會把還在打人的王當屍體跳過（2026-09-09 使用者實機抓到，
+            #   跟 _live_monsters 同一個修正）。
             alive, st, p, hp = entity.read_live_hp(self._sc, m)
-            if not alive or st == "Dead" or hp == 0 or p is None:
+            busy = st in entity.ATT_STATES or st == entity.STATE_RUN
+            if not alive or st == "Dead" or p is None or (hp == 0 and not busy):
                 continue
             # ★ 放棄過、而且還站在原地 → 不挑（HOPELESS_MOVE）；牠動了就重新問
             stuck_at = self._hopeless.get(m.eid)
@@ -2695,7 +2706,12 @@ class DungeonTab(BaseTab):
         # ★★ 血量歸零＝打死了，屍體還在也不管（使用者 2026-09-05：副本裡的
         #   柱子死掉屍體會留一段時間、狀態不變 'Dead'，不看血量會一直對屍體出手）。
         #   ⚠ 只認恰好 0：−1 是沒交戰／讀不到，照打。
-        if alive and hp_ent == 0:
+        #   ⚠⚠ 2026-09-09 加「而且沒在動作」：血量是 0~100 的**整數百分比**，
+        #     王剩不到 1% 就是 0 —— 還在出手（Att／Att2／Cast）或跑動（Run）的
+        #     一律當活的，不然王會被當屍體放掉（使用者實機抓到）。柱子不會動，
+        #     照樣判得出來。
+        if (alive and hp_ent == 0
+                and st not in entity.ATT_STATES and st != entity.STATE_RUN):
             self._say(f"「{m.name}」血量歸零＝打死了（屍體還在）→ 換下一隻")
             self._last_gave_up = None
             self._drop_target()
