@@ -208,6 +208,24 @@ class FakeGrid:
         return (x, y) if self.walkable(x, y) else None
 
 
+class FakeGridSnap(FakeGrid):
+    """`nearest_open` 照真的那支做：目標是牆就往外找最近的可走格。
+
+    ⚠ 這正是 2026-09-08 那個 bug 的舞台 —— 死巷裡「3 格外」全是牆，最近的可走格
+      就是**我腳下那一格**，退開點挑到它等於沒退開。
+    """
+
+    def nearest_open(self, x, y, radius=4):
+        if self.walkable(x, y):
+            return (x, y)
+        best = None
+        for (cx, cy) in self.cells:
+            d = (cx - x) ** 2 + (cy - y) ** 2
+            if d <= radius * radius and (best is None or d < best[0]):
+                best = (d, cx, cy)
+        return (best[1], best[2]) if best else None
+
+
 class FakeAtk:
     """最小的假「寫目標」執行緒。"""
 
@@ -3402,6 +3420,44 @@ def main() -> int:
     ck("★ 周圍沒有退得開的格 → 不退開，繼續補送（⛔ 不卡住、不停機）",
        tab._bump is None and len(tab.portal_sent) >= 2 and tab.run_cb.isChecked(),
        f"{tab._bump} {tab.portal_sent}")
+
+    # ★★★ 2026-09-08 實錄：整份紀錄撞了 296 次、`先退開到` 只出現 1 次，座標一路
+    #   釘死沒動過 —— 退開點被 `nearest_open` 吸回**腳下那一格**，away→back→清掉
+    #   當拍跑完，等於空轉。死巷（傳點在盡頭、只有一邊有路）就是它的舞台。
+    _dead = {(50, 50), (49, 50), (48, 50), (47, 50), (46, 50)}
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab._grid = FakeGridSnap(_dead)
+    tab._reach, tab._reach_n = set(_dead), len(_dead)
+    _spot = tab._bump_spot(50, 50)
+    ck("★★★ 死巷裡的退開點⛔ 不准挑到腳下那一格（那等於沒退開）",
+       _spot is not None and dt._d(_spot, (50.0, 50.0)) >= dt.BUMP_BACK_MIN,
+       str(_spot))
+    ck("　挑到的還是走得到的格", _spot is not None and tab._can_reach(_spot),
+       str(_spot))
+    tab._bump_from = (47.0, 50.0)
+    ck("★★ 有「我剛剛走過來的地方」→ 優先退回那裡"
+       "（⛔ 不再固定先試傳點正後方）", tab._bump_spot(50, 50) == (47, 50),
+       str(tab._bump_spot(50, 50)))
+    # 真的哪裡都退不開 → 回 None（照舊只補送封包），⛔ 不拿腳下那格假裝在撞
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(50.0, 50.0))
+    tab._grid = FakeGridSnap({(50, 50)})
+    tab._reach, tab._reach_n = {(50, 50)}, 1
+    ck("⛔ 真的沒地方退 → 回 None（⛔ 不拿腳下那格假裝退開）",
+       tab._bump_spot(50, 50) is None, str(tab._bump_spot(50, 50)))
+    # 走向傳點的路上要一直記著「我從哪裡來」
+    tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123}],
+                   pos=(56.0, 50.0))
+    tab.trigs = [FakeTrig(50.0, 50.0, 60123)]
+    tab._grid = FakeGrid(_cells)
+    tab._reach, tab._reach_n = set(_cells), len(_cells)
+    run(tab, 0.3)
+    ck("　還沒踩上傳點時會記著「我從哪裡來」（退開點首選）",
+       tab._bump_from is not None and tab._bump_from[0] >= 53.0,
+       str(tab._bump_from))
+    tab._next()
+    ck("　換一步 → 這份記憶也歸零", tab._bump_from is None, str(tab._bump_from))
     # 換一步 → 撞的狀態整組歸零
     tab = make_tab([{"do": "portal", "to": [50, 50], "model": 60123},
                     {"do": "wait", "secs": 1}], pos=(50.0, 50.0))

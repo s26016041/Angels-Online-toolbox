@@ -529,6 +529,18 @@ PORTAL_BUMP = 2.0          # 站在傳點上幾秒還沒被搬走 → 退開再�
 #     等於每撞一輪送一發 —— 這是想要的（機關型的傳點吃的是走進去那一下）。
 PORTAL_BACK = 3.0          # 退開幾格（要退到踩得出「走進去」那一下）
 PORTAL_BUMP_ARRIVE = 1.2   # 退到／回到定點算幾格內
+# ★★★ 2026-09-08 實錄：整份執行紀錄「退開再撞」撞了 296 次，`先退開到` 只出現
+#   **1 次**，座標整段釘在 (388.5,245.5) 沒動過 —— 等於這個功能形同沒有。
+#   根因兩個，都在 `_bump_spot`：
+#   ① 方向是寫死的順序、第一個試 (0,+1)＝**傳點正後方**，使用者實機看到的就是
+#      「都往傳點身後退，可是身後幾乎沒有空間」。
+#   ② `nearest_open()` 在死巷裡會把 3 格外那個目標**吸回我腳下那一格**，距離
+#      0.5 < PORTAL_BUMP_ARRIVE → 當拍就判「退開了」→ 下一拍「撞回傳點上了」→
+#      清掉重來，人一步都沒動。
+#   → 改成優先退回**我剛剛走過來的地方**（那一格真的站過，一定有空間、走得到），
+#     並且退開點一律要離我 BUMP_BACK_MIN 以上，找不到就把半徑往外擴。
+BUMP_BACK_MIN = 2.0        # 退開點至少要離我這麼遠（不然等於沒退開）
+PORTAL_BACK_MAX = 6.0      # 都挑不到就把半徑往外擴到這麼遠
 # ★★★ 「來回撞機關」（dungeon.BUMP，使用者 2026-09-07：「一直往我選的那物件
 #   一直不停頓的撞他，直到偵測到附近的那種阻擋消失」＋「不停頓的撞是要**來回**
 #   撞，就是走出來再去撞他」）。副本石像那種擋路的機關：送移動永遠過不去
@@ -1496,6 +1508,7 @@ class DungeonTab(BaseTab):
         self._bump = None            # 傳點「退開再走回來撞」正在跑的那一輪
         self._bump_t = 0.0           # 站在傳點上多久沒被搬走
         self._bump_n = 0             # 這一步撞了幾次（只拿來回報）
+        self._bump_from = None       # 走上傳點之前我站在哪（退開點首選，見 BUMP_BACK_MIN）
         self._gate = None            # 「來回撞機關」正在跑的那一輪（相位／退開點）
         self._gate_t = 0.0           # 距離下次重讀地形還有多久
         self._gate_send = 0.0        # 距離下次補送目的地還有多久
@@ -2964,6 +2977,10 @@ class DungeonTab(BaseTab):
             #   換圖那種由 `_check_map_change` 接手；同一張圖裡的順移看這裡
             #   （正常情況 `_tick` ⓪-3 已經先認過了，這裡是保險）。
             gx, gy = step["to"]
+            # ★ 一路記著「還沒踩上傳點之前我站在哪」——那是最好的退開點
+            #   （見 BUMP_BACK_MIN：那一格真的站過，有空間、也一定走得到）。
+            if me is not None and _d((gx, gy), me) > PORTAL_BACK:
+                self._bump_from = (me[0], me[1])
             if self._jumped and not self._jump_judged and self._portal_transit(step, me):
                 return
             # ★★ 保險（2026-09-05 黑狐實錄的殘局）：人已經站在腳本記的出口這一側、
@@ -3228,19 +3245,36 @@ class DungeonTab(BaseTab):
                   f" → {PORTAL_POKE:.0f} 秒後再點一次")
 
     def _bump_spot(self, gx: float, gy: float):
-        """挑一格「退開 PORTAL_BACK 格」的落腳點：可走、而且**我現在走得到**。
+        """挑一格「退開」的落腳點：可走、**我現在走得到**、而且**真的離我夠遠**。
 
-        ⚠ 一定要在自己這一區裡挑（`_can_reach`）—— 退到隔壁區的格子就走不過去，
-          人會卡在原地磨到逾時。八個方向都挑不到就回 None（那就別退，繼續補送）。
+        見 BUMP_BACK_MIN 那段（296 次撞、只退開過 1 次的實錄）。順序：
+        ① 我剛剛走過來的那一格（`_bump_from`）—— 真的站過，空間與可達性都不必賭；
+        ② 八個方向往外擴著找，方向**從「我來的那一邊」排起**，⛔ 不再固定先試
+           傳點正後方（使用者 2026-09-08：「傳點身後幾乎是沒有空間的」）。
+        ⚠ 一定要在自己這一區裡挑（`_can_reach`）—— 退到隔壁區就走不過去，人會卡在
+          原地磨到逾時。全部挑不到才回 None（那就別退，繼續補送封包）。
         """
-        if self._grid is None:
+        me = self._me
+        if self._grid is None or me is None:
             return None
-        r = PORTAL_BACK
-        for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
-                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            spot = self._grid.nearest_open(int(gx + dx * r), int(gy + dy * r))
-            if spot and self._can_reach(spot):
+        came = self._bump_from
+        if came:
+            spot = self._grid.nearest_open(int(came[0]), int(came[1]))
+            if spot and _d(spot, me) >= BUMP_BACK_MIN and self._can_reach(spot):
                 return spot
+        dirs = ((0, 1), (0, -1), (1, 0), (-1, 0),
+                (1, 1), (1, -1), (-1, 1), (-1, -1))
+        if came:                      # 往「我來的那一邊」優先
+            vx, vy = came[0] - gx, came[1] - gy
+            dirs = tuple(sorted(dirs, key=lambda d: -(d[0] * vx + d[1] * vy)))
+        r = PORTAL_BACK
+        while r <= PORTAL_BACK_MAX:
+            for dx, dy in dirs:
+                spot = self._grid.nearest_open(int(gx + dx * r), int(gy + dy * r))
+                if (spot and _d(spot, me) >= BUMP_BACK_MIN
+                        and self._can_reach(spot)):
+                    return spot
+            r += 1.0
         return None
 
     def _bump_portal(self, gx: float, gy: float, me) -> bool:
@@ -4041,6 +4075,7 @@ class DungeonTab(BaseTab):
         self._bump = None             # 換一步 → 撞的狀態整組歸零
         self._bump_t = 0.0
         self._bump_n = 0
+        self._bump_from = None
         self._gate = None             # 「來回撞機關」也整組歸零（含阻擋的基準）
         self._gate_t = 0.0
         self._gate_send = 0.0
