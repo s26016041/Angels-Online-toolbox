@@ -464,6 +464,91 @@ def main() -> int:
     ck("★ 門開了（尋路不再說沒路）→ 等待計時歸零", tab._unreach_t == 0.0,
        str(tab._unreach_t))
 
+    # ★★★ 「人跑到跟腳本對不上的地方 → 自己接回去」（使用者 2026-09-08）。
+    #   實錄：無限塔第 28 步走去 (23,206) 的路上提早踩到第 30 步的傳點，人被送到
+    #   下一層 (249.5,29.5)，腳本還停在第 28 步 → 對著上一層的座標磨滿 2 分鐘、
+    #   整趟報銷（12 趟裡 3 趟）。改成往前找第一個走得到的步驟接著跑。
+    print("\n跑錯地方自己接回腳本")
+    TOWER = [{"do": "walk", "to": [23, 206]},                      # 第 1 步（上一層）
+             {"do": "walk", "to": [26, 200]},                      # 第 2 步（上一層）
+             {"do": "portal", "to": [24, 207], "land": [249, 29]},  # 第 3 步（上一層）
+             {"do": "walk", "to": [258, 28]}]                      # 第 4 步（我這一層）
+
+    def _tower(pos=(249.0, 29.0)):
+        t = make_tab(TOWER, pos=pos)
+        mine = {(249, 29), (258, 28)}
+        t._grid = FakeGrid(mine, others={(23, 206), (26, 200), (24, 207)})
+        t._reach, t._reach_n = set(mine), len(mine)
+        t._nav.stuck, t._nav.stuck_reason = True, "grid"
+        return t
+
+    tab = _tower()
+    run(tab, 2.0)
+    ck("　確認期（3 秒）內先不動 —— 防剛換區地形圖還沒更新", tab._i == 0,
+       f"i={tab._i} away={tab._away_t:.1f}")
+    run(tab, 2.0)
+    ck("★★★ 目標在另一區 → 往前接到第一個走得到的步驟（第 4 步）", tab._i == 3,
+       f"i={tab._i} {tab.status.text()}")
+    ck("　記了一筆重要事件講清楚跳去哪",
+       any("接到第 4 步" in x for _t, _a, _k, x in tab._events),
+       str([x for *_r, x in tab._events]))
+    ck("　⛔ 沒有動用「往回」的次數", tab._back_jumps == 0, str(tab._back_jumps))
+
+    # ⛔ 不挑步驟類型（使用者 2026-09-08：「往前往後都可以不跳過任何步驟」）
+    tab = _tower()
+    tab._script.steps[3] = {"do": "interact", "at": [258, 28], "stand": [258, 28]}
+    run(tab, 4.0)
+    ck("★ 往前第一個走得到的是對話步驟 → 照樣接過去（⛔ 不跳過它）", tab._i == 3,
+       f"i={tab._i} {tab.status.text()}")
+
+    # 往前沒有 → 往回；限 REJOIN_BACK_MAX 次（防走回去又被送過來的鬼打牆）
+    def _back(jumps=0):
+        # ⚠ 人站在 (12,12)、第 1 步的點位是同一區的 (10,10)：接回去之後**留在那裡**
+        #   （同一區只是尋路器說沒路 → 照舊重讀地形試），測起來才不會來回彈。
+        t = make_tab([{"do": "walk", "to": [10, 10]},
+                      {"do": "walk", "to": [90, 90]},
+                      {"do": "walk", "to": [91, 91]}], pos=(12.0, 12.0))
+        t._grid = FakeGrid({(10, 10), (12, 12)}, others={(90, 90), (91, 91)})
+        t._reach, t._reach_n = {(10, 10), (12, 12)}, 2
+        t._nav.stuck, t._nav.stuck_reason = True, "grid"
+        t._i, t._back_jumps = 1, jumps
+        return t
+
+    tab = _back()
+    run(tab, 4.0)
+    ck("★★ 往前都走不到 → 往回接到第一個走得到的步驟（第 1 步）",
+       tab._i == 0 and tab._back_jumps == 1,
+       f"i={tab._i} back={tab._back_jumps} {tab.status.text()}")
+    tab = _back(jumps=dt.REJOIN_BACK_MAX)
+    run(tab, 4.0)
+    ck("★★ 往回的次數用完 → ⛔ 不再往回，照舊等 2 分鐘看門狗",
+       tab._i == 1 and "繼續試" in tab.status.text(),
+       f"i={tab._i} {tab.status.text()}")
+    ck("　把「人跟腳本完全對不上」講出來（只講一次）",
+       "對不上" in tab._notice, tab._notice)
+
+    # ⛔ 沒把握就不准跳：那一格是牆（腳本點錯地方）／讀不到地形圖
+    tab = _tower()
+    tab._grid = FakeGrid({(249, 29), (258, 28)})        # (23,206) 連可走都不是
+    run(tab, 4.0)
+    ck("⛔ 目標那一格是牆（不是另一區）→ 不接、照舊重讀地形試", tab._i == 0,
+       f"i={tab._i} {tab.status.text()}")
+    tab = _tower()
+    tab._reach, tab._grid = None, None
+    run(tab, 4.0)
+    ck("⛔ 讀不到地形圖 → 不下結論、不接（⛔ 不能拿沒把握的判斷跳步驟）",
+       tab._i == 0, f"i={tab._i} {tab.status.text()}")
+
+    # ⛔ 只有走路會接：撞機關／點物件「等」本來就是它的工作（門要撞才開）
+    tab = make_tab([{"do": "interact", "at": [90, 90], "stand": [90, 90]},
+                    {"do": "walk", "to": [10, 10]}], pos=(10.0, 10.0))
+    tab._grid = FakeGrid({(10, 10)}, others={(90, 90)})
+    tab._reach, tab._reach_n = {(10, 10)}, 1
+    tab._nav.stuck, tab._nav.stuck_reason = True, "grid"
+    run(tab, 6.0)
+    ck("⛔ 點物件的步驟走不到 → 不接回去（那種要一直等門開）", tab._i == 0,
+       f"i={tab._i} {tab.status.text()}")
+
     print("\n等待步驟")
     tab = make_tab([{"do": "wait", "secs": 1.0}, {"do": "clear"}])
     run(tab, 0.5)

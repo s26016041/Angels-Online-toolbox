@@ -342,6 +342,22 @@ STUCK_ABORT_SECS = 120.0
 EVENT_ROUND_KINDS = (("full", "完整完成"), ("death", "死亡當成完成"),
                      ("offline", "斷線當成完成"), ("noentry", "進不去當成完成"),
                      ("abort", "出狀況當成完成"))
+# ★★★ 「人跑到跟腳本對不上的地方 → 自己接回去」（使用者 2026-09-08 定）。
+#   實錄（無限塔，12 趟中 3 趟）：第 28 步走去 (23,206) 的路上**提早踩到第 30 步那個
+#   傳點**（兩者只差 2.0 格，角色一秒走 10~14 格），人被送到下一層的 (249.5,29.5)
+#   —— 跟第 30 步記的 land 一個位數都不差。但腳本還停在第 28 步，於是對著**上一層**
+#   的座標一直重試，磨滿 STUCK_ABORT_SECS 才當成完成一場，白賠一趟＋一次回程補給。
+#   修法：走路步驟確認「目標在另一區」→ 往前找第一個走得到的步驟接著跑；往前沒有
+#   就往回找（限 REJOIN_BACK_MAX 次，防走回去又被送過來的鬼打牆）。
+#   · ⛔ **不挑步驟類型**（使用者 2026-09-08：「往前往後都可以不跳過任何步驟，因為
+#     我們現在有對話傳送」）—— 落在對話步驟就真的去點它講話。
+#   · ⛔ 觸發只認 `walk`：撞機關／點物件那些步驟「等」本來就是它的工作（門要撞才開），
+#     那種一律照舊等到 2 分鐘看門狗。
+#   · 兩邊都找不到 → 照舊走 `_blocked` 等看門狗，並在事件裡寫清楚人在哪。
+#   ⚠ REJOIN_CONFIRM 不是在「等門開」（走路步驟站在那裡沒有人會去開門），純粹是
+#     防剛換區那一兩拍地形圖還沒更新讀到假答案。
+REJOIN_CONFIRM = 3.0        # 連續這麼久都讀到「目標在另一區」才認
+REJOIN_BACK_MAX = 2         # 一趟最多往回跳幾次
 # ---------------------------------------------------------------------------
 # 打怪流程的數字 —— **從掛機頁抄一份**（使用者 2026-09-04：「複製一份幾乎一樣的
 # 不要共用」）。⛔ 不要改成 import farm_tab 的：兩邊要能各自調。
@@ -1436,6 +1452,8 @@ class DungeonTab(BaseTab):
         self._supply_gen = 0
         self._unreach_t = 0.0        # 「沒有路」連續多久了（等門開）
         self._blocked_last = False   # 上一拍是不是卡在「沒有路」
+        self._away_t = 0.0           # 連續多久讀到「這一步的目標在另一區」（見 REJOIN_CONFIRM）
+        self._back_jumps = 0         # 這一趟往回接了幾次（見 REJOIN_BACK_MAX）
         self._notice = ""            # 要停留幾秒的提示
         self._poke_t = 0.0           # 還有多久對傳點補送一次互動
         # "fly"＝趴趴GO去入口那張圖、"enter"＝撞入口、"run"＝跑腳本
@@ -1678,6 +1696,7 @@ class DungeonTab(BaseTab):
             self._team_begin()
         self._refresh_steps()
         self._started = True
+        self._back_jumps = 0          # 「往回接回腳本」的次數是每一趟各算的
         self._runlog_open()
         self._event("info", f"開跑「{script.name}」（從第 {self._i + 1} 步"
                             f"，{'循環' if self._loop else '只打一場'}"
@@ -2927,8 +2946,13 @@ class DungeonTab(BaseTab):
             else:
                 note, no_path = self._go_to(gx, gy)
                 if no_path:
+                    # ★ 目標在另一區（人跑到別的地方了）→ 接回腳本，見 REJOIN_CONFIRM。
+                    #   ⛔ 只有走路這一種會接：撞機關／點物件「等」就是它的工作。
+                    if self._rejoin(dt, (gx, gy)):
+                        return
                     self._blocked(dt, f"走不到 ({gx}, {gy})", (gx, gy))
                     return
+            self._away_t = 0.0
             self._say(f"第 {self._i + 1} 步　走到 ({gx}, {gy})"
                       f"　剩 {_d((gx, gy), me):.1f} 格　{note}"
                       f"　{self._mon_note()}")
@@ -3992,9 +4016,18 @@ class DungeonTab(BaseTab):
         finish()
 
     def _next(self) -> None:
-        self._i += 1
+        self._goto(self._i + 1)
+
+    def _goto(self, idx: int) -> None:
+        """跳到第 `idx` 步（0 起算）並把「跟這一步綁在一起」的狀態整組歸零。
+
+        ⚠ `_next()` 只是 `_goto(i + 1)`；`_rejoin()` 接回腳本時也走這一支，
+          不可以只改 `self._i`（撞的輪次、對話送到第幾項那些會沿用上一步的）。
+        """
+        self._i = idx
         self._step_t = 0.0
         self._unreach_t = 0.0
+        self._away_t = 0.0
         self._blocked_last = False
         self._menu_i = 0
         self._clicked = False
@@ -4128,6 +4161,7 @@ class DungeonTab(BaseTab):
         self._supply_result = None
         self._supply_progress = "出發"
         self._i = 0                       # 下一趟從頭跑
+        self._back_jumps = 0              # 往回接回腳本的次數也跟著歸零（每趟各算）
         self._done = False
         self._empty_since = 0.0
         gitems = guildbank.wanted()    # 公會倉庫清單（全部分身共用；主執行緒讀 config）
@@ -5394,6 +5428,63 @@ class DungeonTab(BaseTab):
         self._say(f"第 {self._i + 1} 步：{what} —— 現在沒有路，"
                   f"重讀地形繼續試（已 {self._unreach_t / 60.0:.1f} 分鐘）"
                   f"{self._why_unreachable(goal)}")
+
+    @staticmethod
+    def _step_pos(step: dict):
+        """一個步驟「人要站到哪」——判斷這一步走不走得到就看它。
+
+        點物件那種看**站位**（`stand`）不看物件本身：物件可能只是那一拍沒掃到，
+        站位在不在我這一區才是硬的（使用者 2026-09-08）。清怪／休息沒有位置
+        （回 None）＝在哪都能跑，接回去時當成可以落腳。
+        """
+        for key in ("to", "stand", "at"):
+            pos = step.get(key)
+            if pos:
+                return pos
+        return None
+
+    def _rejoin(self, dt: float, goal) -> bool:
+        """人跑到跟腳本對不上的地方 → 接回腳本。回 True＝這一拍已經接好了。
+
+        見 REJOIN_CONFIRM 的說明（提早踩到後面那個傳點的實錄）。只在**目標
+        確定在另一區**時動：那一格是牆（腳本點錯地方）不算，讀不到地形圖也不算
+        —— 那兩種照舊等看門狗，⛔ 不能拿沒把握的判斷去跳步驟。
+        """
+        if self._reach is None or self._grid is None:
+            return False              # 沒有地形圖 → 不下結論（`_can_reach` 這時恆真）
+        gx, gy = int(goal[0]), int(goal[1])
+        if not self._grid.walkable(gx, gy) or self._can_reach(goal):
+            self._away_t = 0.0        # 是牆／其實走得到 → 不是「跑錯地方」
+            return False
+        self._away_t += dt
+        if self._away_t < REJOIN_CONFIRM:
+            return False              # 剛換區那一兩拍地形圖可能還沒更新
+        steps = self._script.steps if self._script else []
+        fwd = [i for i in range(self._i + 1, len(steps))]
+        back = [i for i in range(self._i - 1, -1, -1)]
+        for way, order in (("往前", fwd), ("往回", back)):
+            if way == "往回" and self._back_jumps >= REJOIN_BACK_MAX:
+                continue
+            for i in order:
+                pos = self._step_pos(steps[i])
+                if pos is not None and not self._can_reach(pos):
+                    continue
+                if way == "往回":
+                    self._back_jumps += 1
+                where = f"({pos[0]:.0f}, {pos[1]:.0f})" if pos else "原地"
+                self._event("warn",
+                            f"第 {self._i + 1} 步的 ({gx}, {gy}) 在另一區"
+                            f"（人跑到別的地方了）→ {way}接到第 {i + 1} 步 "
+                            f"{where}　{steps[i].get('do', '?')}")
+                self._drop_target()
+                self._goto(i)
+                return True
+        # 兩邊都沒有落腳點 —— 把人在哪講出來（只講一次），照舊等看門狗收掉這一趟。
+        if self._away_t - dt < REJOIN_CONFIRM:
+            me = self._me
+            self._notify(f"⚠ 人在 {f'({me[0]:.0f}, {me[1]:.0f})' if me else '?'}，"
+                         f"跟腳本完全對不上（前後都沒有走得到的步驟）")
+        return False
 
     def _why_unreachable(self, goal) -> str:
         """停下來時**把證據講出來**：那一格到底是牆，還是在別的區。
