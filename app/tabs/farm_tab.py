@@ -1412,11 +1412,11 @@ class TargetWorker(_Paced):
             # ★ 死活與動畫狀態一次讀回來（相鄰欄位）：以前狀態一次、
             #   下面的 is_alive 又兩次，這是 50Hz 的迴圈。
             # ★ 死活判斷跟副本頁**共用同一份**（entity.looks_dead，使用者
-            #   2026-09-09：「同樣東西盡量不要有 2 個」）：狀態 'Dead' 就是死；
-            #   血量恰好 0 而且沒在動作也是（那是不會變 'Dead' 的靜止物件）。
-            #   ⚠ 會出手／跑動的一律當活的 —— 王剩不到 1% 血量就讀成 0。
+            #   2026-09-09：「同樣東西盡量不要有 2 個」）：**只認動畫狀態
+            #   'Dead'**。⛔ 不准把血量歸零加回來（王剩不到 1% 就是 0、
+            #   怪站著不動更是常態）—— 理由見 entity.looks_dead。
             alive, st, _p = entity.read_live(self.sc, ent)
-            if entity.looks_dead(st, self.hp):
+            if entity.looks_dead(st):
                 if self._job is job:
                     self._job = None
                 self._wrote = False

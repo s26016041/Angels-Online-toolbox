@@ -1857,23 +1857,19 @@ class DungeonTab(BaseTab):
     def _live_monsters(self) -> list:
         """掃描結果裡還活著的怪。⚠ 屍體會在清單裡賴很久，一定要濾掉。
 
-        ★ 死活看兩個訊號，任一個成立就是屍體（使用者 2026-09-05）：
-          · 動畫狀態 'Dead'（一般怪）
-          · **血量歸零而且人不動了**（`Entity.hp_zero` ＝ 實體 +0x288 恰好 0）
-            —— 副本裡的柱子死掉屍體會留一段時間、動畫狀態**不會**變 'Dead'，
-            只看狀態就會一直對著屍體出手。血量 −1（沒交戰）一律當活的。
+        ★ 死活**只看動畫狀態 'Dead'** —— 判斷本身是 `entity.looks_dead()`，
+          跟掛機頁共用同一份（使用者 2026-09-09：「同樣東西盡量不要有 2 個」）。
 
-        ⚠⚠ 2026-09-09 加的「而且人不動了」是**必要**的：那個欄位是 0~100 的
-          **整數百分比**，王的血池大，剩不到 1% 就讀成 0 —— 舊寫法會把還在
-          打人的王當屍體濾掉（使用者實機：召喚物打 50 下都不死，他一個技能就死）。
-          柱子本來就不會動，照樣判得出來；會動的（Att／Att2／Cast／Run）一律當活的。
-        ★ 判斷本身是 `entity.looks_dead()` ——**跟掛機頁共用同一份**
-          （使用者 2026-09-09：「同樣東西盡量不要有 2 個」）。
+        ⛔⛔ 2026-09-05 那條「血量歸零也算屍體」**已經拿掉**（使用者 2026-09-09
+          連退兩次）：血量是 0~100 的整數百分比，王剩不到 1% 就讀成 0，
+          會把還在打人的王當屍體濾掉；改成「0 而且不動」也不行 ——
+          「怪物不動你都當死亡，怪物並不會一直動」。
+          副本裡那種死了也不變 'Dead' 的柱子，交給「打不動就放棄換下一隻」
+          （`_hopeless` / 沒進展換目標）兜過去：慢十幾秒，但不會誤殺活的。
         """
         if self._last is None:
             return []
-        return [m for m in self._last.mons
-                if not entity.looks_dead(m.state, m.hp)]
+        return [m for m in self._last.mons if not entity.looks_dead(m.state)]
 
     # -- 這一區走得到哪裡 ---------------------------------------------
     def _refresh_grid(self, me, dt: float) -> None:
@@ -2399,12 +2395,11 @@ class DungeonTab(BaseTab):
         for m in self._live_monsters():
             if not m.eid:
                 continue                 # eid=0 挑到整條攻擊鏈都會空轉
-            # ★ 血量也當場重讀：0 **而且沒在動作**才算打死了（柱子屍體狀態不會變
-            #   'Dead'）。⚠⚠ 血量是 0~100 的整數百分比 —— 王剩不到 1% 就是 0，
-            #   光看 0 會把還在打人的王當屍體跳過（2026-09-09 使用者實機抓到，
-            #   跟 _live_monsters 同一個修正）。
+            # ★ 死活當場重讀：**只看動畫狀態 'Dead'**。
+            #   ⛔ 血量歸零不算死（王剩不到 1% 就是 0、怪站著不動是常態）——
+            #   見 entity.looks_dead 的說明。
             alive, st, p, hp = entity.read_live_hp(self._sc, m)
-            if not alive or p is None or entity.looks_dead(st, hp):
+            if not alive or p is None or entity.looks_dead(st):
                 continue
             # ★ 放棄過、而且還站在原地 → 不挑（HOPELESS_MOVE）；牠動了就重新問
             stuck_at = self._hopeless.get(m.eid)
@@ -2708,18 +2703,11 @@ class DungeonTab(BaseTab):
         m = self._cur
         # ★ 正在打的這隻每拍當場重讀一次：物件還在嗎／動畫狀態／血量。
         alive, st, _lp, hp_ent = entity.read_live_hp(self._sc, m)
-        # ★★ 血量歸零＝打死了，屍體還在也不管（使用者 2026-09-05：副本裡的
-        #   柱子死掉屍體會留一段時間、狀態不變 'Dead'，不看血量會一直對屍體出手）。
-        #   ⚠ 只認恰好 0：−1 是沒交戰／讀不到，照打。
-        #   ⚠⚠ 2026-09-09 加「而且沒在動作」：血量是 0~100 的**整數百分比**，
-        #     王剩不到 1% 就是 0 —— 還在出手（Att／Att2／Cast）或跑動（Run）的
-        #     一律當活的，不然王會被當屍體放掉（使用者實機抓到）。柱子不會動，
-        #     照樣判得出來。
-        if alive and st != entity.STATE_DEAD and entity.looks_dead(st, hp_ent):
-            self._say(f"「{m.name}」血量歸零＝打死了（屍體還在）→ 換下一隻")
-            self._last_gave_up = None
-            self._drop_target()
-            return True
+        # ⛔⛔ 這裡以前有一段「血量歸零＝打死了 → 換下一隻」（2026-09-05 為了
+        #   副本柱子加的），2026-09-09 使用者連退兩次後**整段拿掉**：血量是
+        #   0~100 的整數百分比，王剩不到 1% 就是 0；改成「0 而且不動」也不行，
+        #   因為「怪物不動你都當死亡，怪物並不會一直動」。
+        #   柱子那種死了也不變 'Dead' 的，靠底下「沒進展就放棄換一隻」兜。
         # ★ 正在打的那隻不在掃描結果裡 → 用剛才那次讀取驗物件：還在而且不是屍體
         #   ＝掃描漏了（照打＋補一次全掃）；物件沒了才**連續兩拍**判沒了。
         if not any(x.eid == m.eid for x in self._live_monsters()):

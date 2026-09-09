@@ -1576,20 +1576,23 @@ def main() -> int:
     dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 35)
     tab._fight((10.0, 10.0), TICK)
     ck("　血量 35%、狀態 Wait → 照打", tab._cur is m)
+    # ★★★ 2026-09-09 使用者連退兩次後定案：**血量完全不參與死活判斷**。
+    #   血量是 0~100 的整數百分比（王剩不到 1% 就是 0），而且「怪站著不動」
+    #   是常態 —— 「0 就是死」「0 而且不動就是死」兩種都會把活的當死的。
+    #   死活只認動畫狀態 'Dead'（＋掛機那條「遊戲把目標欄清 0」）。
     dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0)
     tab._fight((10.0, 10.0), TICK)
-    ck("★ 血量 0、狀態還是 Wait（屍體殘留）→ 立刻放掉",
-       tab._cur is None and "血量歸零" in tab.status.text(), tab.status.text())
-    tab._fight((10.0, 10.0), TICK)
-    ck("★ 屍體不會再被挑到（血量 0 的候選直接跳過）", tab._cur is None)
-    # ★★★ 2026-09-09 使用者實機：血量是 0~100 的**整數百分比**，王剩不到 1%
-    #   就讀成 0 —— 還在打人的王不准當屍體丟掉。
+    ck("★★★ 血量 0、狀態 Wait（王剩不到 1% 站著）→ 照打，不准當屍體",
+       tab._cur is m, f"實得 {tab._cur}")
     for _st in ("Att", "Att2", "Cast", "Run"):
         dt.entity.read_live_hp = lambda _sc, e, s=_st: (True, s, (e.x, e.y), 0)
         tab._cur = None
         tab._fight((10.0, 10.0), TICK)
         ck(f"★★★ 血量 0 但狀態 {_st}（王剩不到 1%）→ 當活的照打", tab._cur is m,
            f"實得 {tab._cur}")
+    # ⚠ 「正在打的那隻死了」不歸 _fight 判 —— 那是共用的 TargetWorker 看到
+    #   動畫 'Dead'／目標欄被清 0 就 emit died（副本頁 1766 接的 _on_died）。
+    #   _fight 這裡只負責「掃描清單裡的屍體不要挑」，見下面那組斷言。
     dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
     tab._fight((10.0, 10.0), TICK)
     ck("　血量 −1（沒交戰）→ 當活的、照挑", tab._cur is m)
@@ -1602,12 +1605,11 @@ def main() -> int:
         E(0x3100, 2, 5, "柱子屍體", 12.0, 10.0, kind=4, state="Wait", hp=0),
         E(0x3200, 3, 5, "一般屍體", 12.0, 10.0, kind=4, state="Dead", hp=0),
         E(0x3300, 4, 5, "沒讀到血", 12.0, 10.0, kind=4, state="", hp=-1),
-        # ★★★ 王打到剩不到 1%（整數百分比 → 0）但還在出手：不准當屍體
+        # ★★★ 王打到剩不到 1%（整數百分比 → 0）：不管在不在出手都不准當屍體
         E(0x3400, 5, 5, "王 0% 還在打", 12.0, 10.0, kind=4, state="Att2", hp=0)]
     live = [x.eid for x in dt.DungeonTab._live_monsters(tab)]
-    ck("★ 掃描快照：血量 0 與 'Dead' 都當屍體濾掉、−1 留著",
-       live == [1, 4, 5], str(live))
-    ck("★★★ 血量 0 但在出手（王剩不到 1%）→ 留在清單裡", 5 in live, str(live))
+    ck("★★★ 掃描快照：**只有 'Dead' 才算屍體**，血量 0 的一律留著",
+       live == [1, 2, 4, 5], str(live))
 
     # ★★ 通知（使用者 2026-09-05：「死掉或出問題也要通知，跟自動掛機一樣」）
     print("通知")
