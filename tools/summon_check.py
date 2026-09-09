@@ -24,7 +24,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.game import attack, entity, player, quickbar, skills, summon  # noqa: E402
+from app.game import (attack, entity, move, player, quickbar,  # noqa: E402
+                      skills, summon)
 
 FAILS: list[str] = []
 
@@ -56,7 +57,11 @@ class World:
 
 W = World()
 summon.time = Clock                                    # 控制時間
-attack.cast_at = lambda mv, sid, eid, x, y: (W.casts.append((sid, x, y)), True)[1]
+# ★ 2026-09-09 起召喚走官方施放函式（attack.cast_skill），
+#   簽章是 (mover, 玩家物件−8, 技能, 目標實體, 格x, 格y)。
+attack.cast_skill = (lambda mv, pf, sid, ent=0, x=0.0, y=0.0:
+                     (W.casts.append((sid, x, y)), True)[1])
+move.pathfinder_this = lambda sc: 0x1000                 # 假的玩家物件−8
 quickbar.use = lambda mv, sc, slot, page: (W.key_uses.append((slot, page)), True)[1]
 entity.player_pos = lambda sc, obj: W.pos
 player.pet_eid = lambda sc: W.slot

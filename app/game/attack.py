@@ -46,6 +46,18 @@ CAST_FN = 0x00559EDA        # ③施放。f(技能ID, 目標實體ID, 0, 0, 0)
 # ⚠ 這就是以前拆掉的「第三包 0x559FBE」—— 遊戲 8/4 改版後函式搬到
 #   0x559EA0（當時「實跑還是卡」是因為那晚走位邏輯本身還一團亂，錯怪它了）。
 THIRD_FN = 0x00559EA0
+# ★★★ 官方的「施放技能」入口（2026-09-09 黑狐實機定案，見 cast_skill）。
+#   `usequickkey`（按 F 鍵）那條路最後叫的就是它，對地／對目標／對自己
+#   通通走這一支，差別只在參數怎麼填。
+#     ecx  = move.pathfinder_this()  玩家實體 −8
+#     arg1 = 技能 ID
+#     arg2 = 目標實體位址 −8（沒有目標傳 0）
+#     arg3 = x 世界單位 = 格 × 32（非對地技能傳 0）
+#     arg4 = y 世界單位 = 格 × 32（非對地技能傳 0）
+#   回傳 al：1 = 受理。ret 0x10。
+CAST_SKILL_FN = 0x00548EAE
+# 座標單位換算：實體 +0xBC/+0xC0 是 16.16 定點，高 16 位就是「格 × 32」。
+TILE_UNITS = 32
 # ★ ②選定的種類碼。出處：攔包實錄（檔頭①）＋反組譯遊戲自己的送包點就是推 0xC。
 SELECT_CODE = 0x0C
 # 交戰心跳的泛用代碼（0x5D3D97 是泛用送包，見 [[generic-send-fn]]）。
@@ -109,24 +121,43 @@ def select(mover, target_id: int) -> bool:
     return _send(mover, ((SELECT_FN, (SELECT_CODE, target_id)),))
 
 
-def cast_at(mover, skill_id: int, target_id: int,
-            tile_x: float, tile_y: float) -> bool:
-    """**對地技能專用**：帶著格子座標送施放包（對象＝地面的那 856 個）。
+def cast_skill(mover, pf_this: int, skill_id: int, ent_addr: int = 0,
+               tile_x: float = 0.0, tile_y: float = 0.0) -> bool:
+    """叫遊戲**自己**放這一招（按 F 鍵走的就是這條路）。
 
-    為什麼這種技能不能用 quickbar.use（按 F2）：遊戲會跳出「選範圍」的游標
-    等使用者點地板，角色就站在那不動 —— 使用者實際遇到（爆彈狙擊、
-    麻痺荊棘、瞬移術都是這類）。封包自己帶位置就不必經過那道 UI。
+    ★★★ 2026-09-09 使用者實機抓到的 bug 與定案（見 memory
+      `ground-skill-cast-official-fn`）：以前這裡是**我們自己拼施放封包**
+      （`CAST_FN`），而封包裡的 x/y 我們填「格」、官方填的是**世界單位
+      （格 × 32）** —— 對地技能（冰晶凍氣、邪靈吐息那 856 個）因此落點差
+      32 倍：伺服器照樣受理、MP 照扣，但**一點傷害都沒有**，怪也不會死。
+      使用者原話：「用指定位置的範圍技能打怪都不會出傷害…丟在怪物身上但沒傷害」。
+      ⚠ 所以「送出成功」「MP 有扣」都不能當成打得到 —— 只有怪掉血／死掉算數。
 
-    ⚠ 座標要跟技能放在**同一發**裡，不要另外多送一發「目標 ID = 0 + 座標」
-      的對地施放（舊實測：多送那一發時怪連續 3.3 秒零傷害）。
-    ⚠ 只送這一包：不送動作包、也不傳 `pf`（玩家物件−8 的裸指標）——
-      少一個會讓遊戲當場崩潰的破口（見 [[game-crash-root-causes]] 第②條）。
-      順移實測就是「施放函式帶格子座標」一包搞定。
+    現在改成叫官方那支（`CAST_SKILL_FN`），對地／對目標／對自己同一條路，
+    參數照 GAMEDATA 的「對象」欄填（`skills.target_of`，遊戲自己也是查技能
+    範本 +0x48 做同一件事）：
+
+        對象＝地面        → ent_addr = 目標實體、tile_x/tile_y = 目標的格座標
+        對象＝角色/隊伍/屍體 → ent_addr = 目標實體、座標留 0
+        對象＝自己        → 兩個都留 0
+
+    實機驗證（黑狐，各一發打死）：冰晶凍氣Ⅰ(地面)、邪靈吐息Ⅰ(地面)、
+    末日反噬Ⅳ(角色)。
+
+    ⚠⚠ `pf_this` 與 `ent_addr` 都是**裸指標**，呼叫端必須是當場讀來的
+      （見 [[no-crash-no-lag]]：叫遊戲函式前當場驗參數物件還在）。
     """
-    if not (mover and mover.active and skill_id) or _yield_now(mover):
+    if not (mover and mover.active and skill_id and pf_this):
         return False
-    return _send(mover, ((CAST_FN, (skill_id, target_id,
-                                    int(tile_x), int(tile_y), 0)),))
+    if _yield_now(mover):
+        return False
+    ret = mover.call_sync(
+        CAST_SKILL_FN, int(skill_id),
+        (int(ent_addr) - 8) if ent_addr else 0,
+        int(tile_x * TILE_UNITS), int(tile_y * TILE_UNITS),
+        ecx=int(pf_this), timeout=CALL_TIMEOUT)
+    # 回 al=1 才是受理；逾時（None）與 0 都當沒放出去。
+    return ret is not None and (ret & 0xFF) == 1
 
 
 def strike(mover, pf_this: int, skill_id: int, target_id: int,

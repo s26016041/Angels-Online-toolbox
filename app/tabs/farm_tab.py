@@ -801,6 +801,9 @@ class KeyWorker(_Paced):
         #   留著只是給自動分身當「玩家物件定位好了沒」的判斷用。
         self.pf = None
         self.eid = None             # 現在要打誰
+        # ★ 目標的**實體位址**（叫官方施放函式要它，不是 eid）。GUI 每一拍
+        #   跟座標一起更新；0 ＝ 沒目標。⚠ 裸指標，只在出手那一瞬間用。
+        self.ent_addr = 0
         # 目標的格子座標，填在施放封包裡 —— 順移那類對地技能沒有座標發不動。
         self.pos: tuple[float, float] = (0.0, 0.0)
         # ★★ 目標的**原始**座標（沒四捨五入）—— 出手前量距離要用這份。
@@ -1286,17 +1289,28 @@ class KeyWorker(_Paced):
                             and dist_now > self.reach_of(sid)):
                         continue
                     # 依射程分流（使用者定的）：≤ QUICKKEY_RANGE 叫遊戲的
-                    # 快捷鍵，超過就送帶 ID＋座標的施放封包；對地技能一律封包。
+                    # 快捷鍵，超過就走「叫遊戲自己放這一招」；對地技能一律走後者。
                     # ⛔ 首發**不例外**：2026-08-10 我一度讓首發一律走快捷鍵，
                     #   被使用者退回 ——「射程 < 8 送鍵、> 8 打封包」是他定的
                     #   規則，不准偷改。首發的等待改用欄位驗證（見 _opener_gate），
                     #   兩條路都驗得到，本來就不必動這個分流。
+                    # ★★★ 2026-09-09 改：那條路以前是**我們自己拼施放封包**，
+                    #   座標填「格」而官方要「格×32」→ 對地技能落點差 32 倍，
+                    #   伺服器受理、MP 照扣、卻一點傷害都沒有（使用者實機回報）。
+                    #   現在改叫官方的施放函式（attack.cast_skill），對地帶座標、
+                    #   其餘座標留 0。⚠ 玩家物件與目標實體都要**當場**的位址。
                     rng = skills.range_of(sid)
                     by_packet = (skills.is_ground(sid)
                                  or (rng is not None
                                      and rng > QUICKKEY_RANGE))
                     if by_packet:
-                        ok = attack.cast_at(mover, sid, eid, *pos)
+                        pf = move.pathfinder_this(self.sc)
+                        ent_addr = self.ent_addr
+                        if skills.is_ground(sid):
+                            ok = attack.cast_skill(mover, pf, sid, ent_addr,
+                                                   *pos_f)
+                        else:
+                            ok = attack.cast_skill(mover, pf, sid, ent_addr)
                     elif (quickbar.VK_F1 <= k
                             < quickbar.VK_F1 + quickbar.SLOTS):
                         ok = quickbar.use(mover, self.sc,
@@ -1397,8 +1411,12 @@ class TargetWorker(_Paced):
             #   ⚠ 不需要 self._wrote —— 我們有沒有寫過目標，跟牠死了沒無關。
             # ★ 死活與動畫狀態一次讀回來（相鄰欄位）：以前狀態一次、
             #   下面的 is_alive 又兩次，這是 50Hz 的迴圈。
+            # ★ 死活判斷跟副本頁**共用同一份**（entity.looks_dead，使用者
+            #   2026-09-09：「同樣東西盡量不要有 2 個」）：狀態 'Dead' 就是死；
+            #   血量恰好 0 而且沒在動作也是（那是不會變 'Dead' 的靜止物件）。
+            #   ⚠ 會出手／跑動的一律當活的 —— 王剩不到 1% 血量就讀成 0。
             alive, st, _p = entity.read_live(self.sc, ent)
-            if st == "Dead":
+            if entity.looks_dead(st, self.hp):
                 if self._job is job:
                     self._job = None
                 self._wrote = False
@@ -2551,6 +2569,7 @@ class CharFarmPage(QWidget):
         self.mons = []
         self.pets = []
         self._keys.eid = None
+        self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
         self._keys.stats = None
         self._keys.pf = None
         self._killed.clear()              # 換頻＝整批怪都換了，冷卻名單沒意義
@@ -4658,6 +4677,7 @@ class CharFarmPage(QWidget):
             self._atk.hold_off()
             self._keys.set_on(False)
             self._keys.eid = None
+            self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
             self._cur = None
             # ★ 本體搬家 ＝ 換地圖／換頻道／重連／重生 → 舊的怪物清單整份
             #   過期，不要留給底下那段「掃壞了就沿用上一拍」（SCAN_KEEP_BAD）。
@@ -5172,6 +5192,7 @@ class CharFarmPage(QWidget):
         self._atk.hold_off()
         self._cur = None
         self._keys.eid = None
+        self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
         self._engage(d2, m2, None)
         return True
 
@@ -5210,6 +5231,7 @@ class CharFarmPage(QWidget):
         self._last_hp = -1
         self._atk.attack(self.state, self._cur)   # 寫入執行緒：開始鎖定這隻
         self._keys.eid = self._cur.eid            # 送封包時要指名打誰
+        self._keys.ent_addr = self._cur.addr      # 官方施放函式要目標的實體位址
         self._keys.set_on(True)                   # 攻擊執行緒：開始發動
         if skipped is not None:
             near = sorted(s for s in skipped if s[0] < d)[:5]
@@ -5415,6 +5437,7 @@ class CharFarmPage(QWidget):
                   + f" → 冷卻 {KILL_MEMORY if confirmed else NOHP_MEMORY:.0f} 秒")
         self._cur = None
         self._keys.eid = None                  # 別再對著屍體送封包
+        self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
         if not self.run_cb.isChecked():
             self._keys.set_on(False)
             return
@@ -5442,6 +5465,7 @@ class CharFarmPage(QWidget):
             self._keys.set_on(False)
             self._keys.stop_learning()
             self._keys.eid = None
+            self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
             self._atk.hold_off()
             # 施放廣播監聽：首發不再需要，但自動分身可能還要 → 照需求同步
             self._sync_castwatch()
@@ -5551,6 +5575,7 @@ class CharFarmPage(QWidget):
         self._keys.set_on(False)
         self._keys.stop_learning()
         self._keys.eid = None
+        self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
         self._atk.hold_off()
         # ⚠ 遊戲沒了就別再對它的 IAT 動手（castwatch.release 會寫回原位元組）：
         #   gone=True 時行程已不在，寫入會炸 —— 直接丟掉引用即可。
@@ -5977,6 +6002,9 @@ class CharFarmPage(QWidget):
         if mp:
             self._keys.pos = (round(mp[0]), round(mp[1]))
             self._keys.pos_f = (mp[0], mp[1])       # 量距離用原始座標
+            # ★ 叫官方施放函式要「目標的實體位址」（2026-09-09）——
+            #   跟座標同一拍更新，讀不到座標就不更新（那多半是物件被回收了）。
+            self._keys.ent_addr = m.addr
 
         # 接近規則（改用封包攻擊後，接近**完全由我們自己走**，不靠按鍵）：
         #   ① 中間有障礙物（尋路點數 > 1）→ 走到怪臉上
@@ -6189,6 +6217,7 @@ class CharFarmPage(QWidget):
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
+            self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
             if not self._pick_next():
                 self._keys.set_on(False)
                 self._since_scan = SCAN_NOW
@@ -6395,6 +6424,7 @@ class CharFarmPage(QWidget):
             self._atk.hold_off()
             self._cur = None
             self._keys.eid = None
+            self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
             if not self._pick_next():
                 self._keys.set_on(False)
                 self._since_scan = SCAN_NOW

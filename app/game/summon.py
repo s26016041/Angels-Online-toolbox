@@ -38,8 +38,8 @@
 
 怎麼放
 ------
-召喚是**對地技能**（對象＝地面）：走 `attack.cast_at`（施放封包帶格子座標），
-座標填自己腳下 —— 使用者指定「位置填射程範圍內即可」。
+召喚是**對地技能**（對象＝地面）：走 `attack.cast_skill`（叫遊戲官方那支施放
+函式，位置用世界單位帶進去），座標填自己腳下 —— 使用者指定「位置填射程範圍內即可」。
 不是對地的話退回 `quickbar.use`（按 F11，自我系技能按了就生效）。
 
 技能編號跟分身一樣**直接讀快捷欄 F11 那一格**（呼叫端 adopt），
@@ -295,11 +295,16 @@ class AutoSummon:
         self._slot_at_cast = slot_v or 0
         self._zero_since = None
         if skills.is_ground(self.skill):
-            # 對地：施放封包帶自己腳下的格子座標（實測就長出在**那一格正中**）
+            # 對地：叫官方的施放函式，位置填自己腳下（實測長在**那一格正中**）。
+            # ⚠ 2026-09-09 改：以前是自己拼施放封包、座標填「格」，官方要的是
+            #   世界單位（格×32）—— 對地技能因此落點差 32 倍（見 attack.cast_skill）。
+            #   ⚠ `pathfinder_this` 當場讀（物件會搬家，不能用快取）。
             tx, ty = int(pos[0]), int(pos[1])
             self._cast_tile = (tx, ty)
             self._cast_pos = (tx + 0.5, ty + 0.5)    # 預期的出生點＝格子中心
-            ok = attack.cast_at(mover, self.skill, 0, tx, ty)
+            from app.game import move                 # 避免模組載入期循環相依
+            ok = attack.cast_skill(mover, move.pathfinder_this(scanner),
+                                   self.skill, 0, tx, ty)
         else:
             # 不是對地 → 按 F11（自我系技能按了就直接生效）。
             # 這條路封包裡沒有我們填的座標，退回「腳下附近」認養。

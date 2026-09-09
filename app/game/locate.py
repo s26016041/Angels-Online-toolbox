@@ -105,6 +105,16 @@ SIGS: tuple[Sig, ...] = (
     Sig("attack", "CAST_FN", "fn", None,
         "55 8B EC 83 EC 10 56 8B 75 08 85 F6 7E 3D 6A 12 6A 06 8D 4D F0 E8 ?? ?? ?? ??",
         0x00559EDA),
+    # ★★★ 官方的「施放技能」入口（2026-09-09 找到，見 attack.CAST_SKILL_FN）。
+    #   按 F 鍵那條路最後叫的就是它：usequickkey → 技能分支 → 這一支。
+    #   錨在函式頭（建立區域變數、取 this/技能資料）＋ `[esi+0x1D4]` 取旗標、
+    #   `[ebx+0x5C]`／`[ebx+0x58]` 取技能欄位、`lea ecx,[esi+0x210]` 這串骨架；
+    #   三個 call 的 rel32 一律萬用。
+    Sig("attack", "CAST_SKILL_FN", "fn", None,
+        "55 8B EC 51 8B 45 08 53 56 8B F1 57 85 C0 7E 41 50 E8 ?? ?? ?? ??"
+        " 8B D8 59 85 DB 74 34 8B 8E D4 01 00 00 C1 E9 1F 84 C9 75 30"
+        " FF 73 5C 8B 7B 58 8D 8E 10 02 00 00 57 E8 ?? ?? ?? ?? 84 C0 75 1A",
+        0x00548EAE),
     # 攻擊指令包（近戰物理技能的關鍵，見 attack.THIRD_FN）。錨在
     # push 8/push 5（封包長 8、代號 5）＋把目標寫進封包與全域那幾行；
     # 兩個 call 的 rel32 與兩個全域位址放萬用。known 是 2026-08-06 的位址

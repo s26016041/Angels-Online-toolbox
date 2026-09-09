@@ -1780,6 +1780,7 @@ class DungeonTab(BaseTab):
         if self._keys is not None:
             self._keys.set_on(False)
             self._keys.eid = None
+            self._keys.ent_addr = 0
             self._keys.stop()
             self._keys.wait(500)
             self._keys = None
@@ -1866,12 +1867,13 @@ class DungeonTab(BaseTab):
           **整數百分比**，王的血池大，剩不到 1% 就讀成 0 —— 舊寫法會把還在
           打人的王當屍體濾掉（使用者實機：召喚物打 50 下都不死，他一個技能就死）。
           柱子本來就不會動，照樣判得出來；會動的（Att／Att2／Cast／Run）一律當活的。
+        ★ 判斷本身是 `entity.looks_dead()` ——**跟掛機頁共用同一份**
+          （使用者 2026-09-09：「同樣東西盡量不要有 2 個」）。
         """
         if self._last is None:
             return []
-        busy = entity.ATT_STATES + (entity.STATE_RUN,)
         return [m for m in self._last.mons
-                if not m.dead and not (m.hp_zero and m.state not in busy)]
+                if not entity.looks_dead(m.state, m.hp)]
 
     # -- 這一區走得到哪裡 ---------------------------------------------
     def _refresh_grid(self, me, dt: float) -> None:
@@ -2061,6 +2063,7 @@ class DungeonTab(BaseTab):
         if self._phase != "run" and self._keys is not None:
             self._keys.set_on(False)      # 趕路途中確保不會出手
             self._keys.eid = None
+            self._keys.ent_addr = 0
 
         # ② 沒怪了 → 還在別張圖就先飛過去，在入口那張圖就去撞入口
         if self._phase == "fly":
@@ -2401,8 +2404,7 @@ class DungeonTab(BaseTab):
             #   光看 0 會把還在打人的王當屍體跳過（2026-09-09 使用者實機抓到，
             #   跟 _live_monsters 同一個修正）。
             alive, st, p, hp = entity.read_live_hp(self._sc, m)
-            busy = st in entity.ATT_STATES or st == entity.STATE_RUN
-            if not alive or st == "Dead" or p is None or (hp == 0 and not busy):
+            if not alive or p is None or entity.looks_dead(st, hp):
                 continue
             # ★ 放棄過、而且還站在原地 → 不挑（HOPELESS_MOVE）；牠動了就重新問
             stuck_at = self._hopeless.get(m.eid)
@@ -2532,6 +2534,7 @@ class DungeonTab(BaseTab):
         self._wait_left = 0.0
         self._atk.attack(self._state, mon)
         self._keys.eid = mon.eid
+        self._keys.ent_addr = mon.addr      # 官方施放函式要目標的實體位址
         self._keys.set_on(True)
         self._say(f"鎖定「{mon.name}」　距離 {d:.1f} 格")
         self._runlog_write(
@@ -2565,6 +2568,7 @@ class DungeonTab(BaseTab):
         self._atk.hold_off()
         self._cur = None
         self._keys.eid = None
+        self._keys.ent_addr = 0
         self._engage(d2, m2)
         return True
 
@@ -2698,6 +2702,7 @@ class DungeonTab(BaseTab):
                               f" → 當作這裡清光了")
                 self._keys.set_on(False)
                 self._keys.eid = None
+                self._keys.ent_addr = 0
                 self._last_gave_up = None
                 return False
         m = self._cur
@@ -2710,8 +2715,7 @@ class DungeonTab(BaseTab):
         #     王剩不到 1% 就是 0 —— 還在出手（Att／Att2／Cast）或跑動（Run）的
         #     一律當活的，不然王會被當屍體放掉（使用者實機抓到）。柱子不會動，
         #     照樣判得出來。
-        if (alive and hp_ent == 0
-                and st not in entity.ATT_STATES and st != entity.STATE_RUN):
+        if alive and st != entity.STATE_DEAD and entity.looks_dead(st, hp_ent):
             self._say(f"「{m.name}」血量歸零＝打死了（屍體還在）→ 換下一隻")
             self._last_gave_up = None
             self._drop_target()
@@ -2739,6 +2743,7 @@ class DungeonTab(BaseTab):
         if mp:
             self._keys.pos = (round(mp[0]), round(mp[1]))
             self._keys.pos_f = (mp[0], mp[1])       # 量距離用原始座標
+            self._keys.ent_addr = m.addr            # 叫官方施放函式要它
 
         # ── 每 _path_gap 秒問一次地形圖「我跟這隻怪之間有沒有地形」 ──
         self._path_t += dt
@@ -2894,6 +2899,7 @@ class DungeonTab(BaseTab):
         if self._keys is not None:
             self._keys.set_on(False)
             self._keys.eid = None
+            self._keys.ent_addr = 0
         if self._atk is not None:
             self._atk.hold_off()
         self._nav.reset()
@@ -4219,6 +4225,7 @@ class DungeonTab(BaseTab):
         if self._keys is not None:
             self._keys.set_on(False)
             self._keys.eid = None
+            self._keys.ent_addr = 0
         if self._atk is not None and hasattr(self._atk, "hold_off"):
             self._atk.hold_off()
         self._drop_target()
@@ -4805,6 +4812,7 @@ class DungeonTab(BaseTab):
         if self._keys is not None:
             self._keys.set_on(False)
             self._keys.eid = None
+            self._keys.ent_addr = 0
         if self._atk is not None and hasattr(self._atk, "hold_off"):
             self._atk.hold_off()
         self._drop_target()
