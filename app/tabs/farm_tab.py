@@ -1412,11 +1412,16 @@ class TargetWorker(_Paced):
             # ★ 死活與動畫狀態一次讀回來（相鄰欄位）：以前狀態一次、
             #   下面的 is_alive 又兩次，這是 50Hz 的迴圈。
             # ★ 死活判斷跟副本頁**共用同一份**（entity.looks_dead，使用者
-            #   2026-09-09：「同樣東西盡量不要有 2 個」）：**只認動畫狀態
-            #   'Dead'**。⛔ 不准把血量歸零加回來（王剩不到 1% 就是 0、
-            #   怪站著不動更是常態）—— 理由見 entity.looks_dead。
+            #   2026-09-09：「同樣東西盡量不要有 2 個」）：動畫狀態 'Dead'
+            #   **或**物件已經被遊戲歸還（＝小地圖紅點消失的那個訊號）。
+            #   ⛔ 不准把血量歸零加回來（王剩不到 1% 就是 0、怪站著不動更是
+            #   常態）—— 理由見 entity.looks_dead。
             alive, st, _p = entity.read_live(self.sc, ent)
-            if entity.looks_dead(st):
+            # ⚠ 物件說「不在了」先再讀一次確認：單次讀失敗也會回 False
+            #   （讀不到 ≠ 沒有）。狀態是 'Dead' 就不必多讀那一次。
+            if not alive and st != entity.STATE_DEAD:
+                alive = entity.is_alive(self.sc, ent)
+            if entity.looks_dead(st, alive):
                 if self._job is job:
                     self._job = None
                 self._wrote = False
@@ -1445,7 +1450,9 @@ class TargetWorker(_Paced):
             # ★ cur == 0 ＝ **遊戲自己把選定的目標清掉了**（怪死掉時它會清）。
             #   我們每 20ms 才寫回去一次，所以讀得到那個 0；判死延遲 ≤20ms，
             #   不必等任何秒數（2026-09-09 使用者定：「不能浪費時間判斷死亡」）。
-            if self._wrote and (cur == 0 or corpse or not alive):
+            #   ⚠ 這條天生只對「我們寫過目標欄的那一隻」有效，所以留在這裡；
+            #   「物件被歸還」已經在上面跟 'Dead' 一起判掉了。
+            if self._wrote and (cur == 0 or corpse):
                 if self._job is job:
                     self._job = None
                 self._wrote = False

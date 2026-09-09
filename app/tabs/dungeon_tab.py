@@ -2399,7 +2399,7 @@ class DungeonTab(BaseTab):
             #   ⛔ 血量歸零不算死（王剩不到 1% 就是 0、怪站著不動是常態）——
             #   見 entity.looks_dead 的說明。
             alive, st, p, hp = entity.read_live_hp(self._sc, m)
-            if not alive or p is None or entity.looks_dead(st):
+            if p is None or entity.looks_dead(st, alive):
                 continue
             # ★ 放棄過、而且還站在原地 → 不挑（HOPELESS_MOVE）；牠動了就重新問
             stuck_at = self._hopeless.get(m.eid)
@@ -2703,6 +2703,18 @@ class DungeonTab(BaseTab):
         m = self._cur
         # ★ 正在打的這隻每拍當場重讀一次：物件還在嗎／動畫狀態／血量。
         alive, st, _lp, hp_ent = entity.read_live_hp(self._sc, m)
+        # ★★★ 死了就立刻換下一隻（跟掛機頁同一份判斷 entity.looks_dead）：
+        #   動畫 'Dead'，**或**物件已經被遊戲歸還到物件池 —— 後者正是副本裡
+        #   柱子（封印水晶那種，從不變 'Dead'）唯一的死亡訊號，也是小地圖
+        #   紅點瞬間消失的依據（2026-09-09 實錄：柱子一死就被歸還）。
+        #   ⚠ 「物件不在了」先再讀一次確認，單次讀失敗也會回 False。
+        if not alive and st != entity.STATE_DEAD:
+            alive = entity.is_alive(self._sc, m)
+        if entity.looks_dead(st, alive):
+            self._say(f"「{m.name}」死了 → 換下一隻")
+            self._last_gave_up = None
+            self._drop_target()
+            return True
         # ⛔⛔ 這裡以前有一段「血量歸零＝打死了 → 換下一隻」（2026-09-05 為了
         #   副本柱子加的），2026-09-09 使用者連退兩次後**整段拿掉**：血量是
         #   0~100 的整數百分比，王剩不到 1% 就是 0；改成「0 而且不動」也不行，

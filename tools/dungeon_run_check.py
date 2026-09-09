@@ -395,6 +395,9 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     tab._me = tuple(pos)
     tab._my_pos = lambda: tuple(tab._pos)
     dt.entity.read_live_hp = lambda _sc, m: (True, "", (m.x, m.y), -1)
+    # ★ 2026-09-09：死活多了一個訊號「物件被遊戲歸還」，程式在 alive=False 時
+    #   會再讀一次確認 —— 替身跟著 read_live_hp 的第一個回傳值走。
+    dt.entity.is_alive = lambda _sc, m: dt.entity.read_live_hp(_sc, m)[0]
     tab._notifier = FakeNotifier()          # ⚠ 真的會響警報＋跳視窗
     dt.player.locate_fast = lambda _sc: None   # 死亡判定的基準：測試裡自己塞
     tab._live_monsters = lambda: list(mons)
@@ -1554,11 +1557,15 @@ def main() -> int:
     dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
     tab._fight((10.0, 10.0), TICK)
     tab._live_monsters = lambda: []
+    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
+    tab._fight((10.0, 10.0), TICK)
+    ck("掃描少一拍、但物件還在 → 還不放（可能只是漏掃）", tab._cur is m)
+    # ★★★ 2026-09-09：物件被遊戲歸還（＝小地圖紅點消失）就是死了 → 立刻放掉，
+    #   不必再等兩拍。⚠ 程式會再讀一次確認，所以替身兩次都要回 False。
     dt.entity.read_live_hp = lambda _sc, e: (False, "", None, -1)
     tab._fight((10.0, 10.0), TICK)
-    ck("掃描少一拍 → 還不放（可能只是漏掃）", tab._cur is m)
-    tab._fight((10.0, 10.0), TICK)
-    ck("★ 連續兩拍不在、物件也沒了 → 放掉", tab._cur is None)
+    ck("★★★ 物件被歸還（紅點消失）→ 當拍就放掉", tab._cur is None,
+       f"實得 {tab._cur}")
     dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
     dt.entity.read_pos = lambda _sc, _addr: None
 
@@ -1584,6 +1591,14 @@ def main() -> int:
     tab._fight((10.0, 10.0), TICK)
     ck("★★★ 血量 0、狀態 Wait（王剩不到 1% 站著）→ 照打，不准當屍體",
        tab._cur is m, f"實得 {tab._cur}")
+    # ★★★ 柱子那種：血量 0、狀態永遠 'Wait'，但物件被遊戲歸還 → 這才是死了
+    dt.entity.read_live_hp = lambda _sc, e: (False, "Wait", (e.x, e.y), 0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★★★ 柱子：狀態還是 Wait 但物件被歸還 → 當拍判死、換下一隻",
+       tab._cur is None, f"實得 {tab._cur}")
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0)
+    tab._cur = m
+    tab._keys.eid = m.eid
     for _st in ("Att", "Att2", "Cast", "Run"):
         dt.entity.read_live_hp = lambda _sc, e, s=_st: (True, s, (e.x, e.y), 0)
         tab._cur = None
