@@ -1392,7 +1392,9 @@ class TargetWorker(_Paced):
             # ★★ 同一次讀取順便確認「這個位址還是狀態物件」（比對 vtable）。
             #   物件搬家後這裡若不停手，就是每秒 50 次往別人的記憶體寫 4 bytes
             #   —— 遊戲會在很久以後莫名其妙掛掉。見 entity.read_target_checked。
-            ok, cur, self.hp = entity.read_target_checked(self.sc, state)
+            # ⚠ `_cur_id`（目標欄現值）2026-09-09 起**不再拿來判死**（見下面）；
+            #   這一次讀取的重點是 `ok`（位址還是不是狀態物件）與血量。
+            ok, _cur_id, self.hp = entity.read_target_checked(self.sc, state)
             if not ok:
                 # ⚠ 只清「自己這一步的」job —— GUI 執行緒可能在本步進行中
                 #   剛派了新目標（attack()），無條件清會把新目標丟掉。下同。
@@ -1429,10 +1431,9 @@ class TargetWorker(_Paced):
                 return
             if self.hp > 0:
                 self._saw_hp = True    # 只拿來分辨「屍體 vs 交戰過」，⛔ 不判死
-            # ⛔ 血量歸零**不再當死亡訊號**（2026-09-09 使用者實機抓到，見 HP_SETTLE
+            # ⛔ 血量歸零**不是死亡訊號**（2026-09-09 使用者實機抓到，見 HP_SETTLE
             #   那段的說明）：那是 0~100 的整數百分比，王剩不到 1% 就是 0。
-            #   死亡只認遊戲自己寫的：目標欄被清 0（下面 cur == 0）、動畫狀態 'Dead'
-            #   （上面那段，最快）。
+            #   死活一律問 `entity.looks_dead()`（上面那段）。
             # ★ 屍體：鎖定這麼久了還**從來沒有**看到血量 —— 那是別人先打死的。
             #   搶怪嚴重的地方這種很多，實測 120 秒有 26 隻，白白鎖住 52 秒
             #   ＝ 44% 的時間在對屍體發呆。
@@ -1447,12 +1448,16 @@ class TargetWorker(_Paced):
                 self._since = now
             corpse = (packets and not self._saw_hp
                       and now - self._since >= CORPSE_SECS)
-            # ★ cur == 0 ＝ **遊戲自己把選定的目標清掉了**（怪死掉時它會清）。
-            #   我們每 20ms 才寫回去一次，所以讀得到那個 0；判死延遲 ≤20ms，
-            #   不必等任何秒數（2026-09-09 使用者定：「不能浪費時間判斷死亡」）。
-            #   ⚠ 這條天生只對「我們寫過目標欄的那一隻」有效，所以留在這裡；
-            #   「物件被歸還」已經在上面跟 'Dead' 一起判掉了。
-            if self._wrote and (cur == 0 or corpse):
+            # ⛔⛔ 「遊戲把目標欄清 0（cur == 0）」**已經不當死亡訊號了**
+            #   （2026-09-09 使用者定：「拿掉」）。理由：目標欄被清不只有
+            #   「怪死了」一種原因 —— 換地圖、我們寫進去的目標失效、使用者
+            #   自己在遊戲裡點了別的目標，都會清 → 那些都會被誤記成一次擊殺。
+            #   死活現在只認 `entity.looks_dead()` 的兩個訊號（動畫 'Dead'／
+            #   物件被遊戲歸還），兩個都是遊戲對**那隻怪本身**的狀態，夠準也夠快。
+            #   ⚠ `cur` 還是要讀 —— 底下寫目標欄前要先確認位址還是狀態物件。
+            # ★ 屍體那條（corpse）留著：它管的是「鎖定很久卻從來沒看過血量」，
+            #   ＝ 別人先打死的那種，跟目標欄無關。
+            if self._wrote and corpse:
                 if self._job is job:
                     self._job = None
                 self._wrote = False
