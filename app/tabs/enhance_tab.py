@@ -394,22 +394,15 @@ class EnhanceTab(BaseTab):
         # 上次選的寶石種類（config），寶石背包一列出來就幫他選回去
         self._want_gem = int(config.get("enhance.gem_type", 0) or 0)
 
+        # ⚠ 使用者 2026-09-09 指定：這一排不要「已選：…」、不要「強化到 +」
+        #   字樣，也不要滑鼠提示 —— 選了哪一件看格子的黃框就知道。
         act = QHBoxLayout()
-        self.pick_lbl = QLabel("還沒選裝備")
-        act.addWidget(self.pick_lbl)
         act.addStretch(1)
-        act.addWidget(QLabel("強化到 +"))
         self.target = NumberPicker(
             enhance.MAX_LEVEL, int(config.get("enhance.target", 1) or 1))
-        self.target.setToolTip(
-            "要打到 +幾。點一下就是它，程式不會自己幫你改；\n"
-            "下次開起來預設就是你上次選的那一格。")
         self.target.changed.connect(self._on_target)
         act.addWidget(self.target)
         self.go_btn = QPushButton("強化錘強化")
-        self.go_btn.setToolTip(
-            "對選起來的裝備一直使用強化錘，直到強化次數到達目標。\n"
-            "⚠ 失敗時裝備會消失，一旦消失或退等就會立刻停下來。")
         self.go_btn.clicked.connect(self._on_go)
         act.addWidget(self.go_btn)
         self.stop_btn = QPushButton("停止")
@@ -591,12 +584,7 @@ class EnhanceTab(BaseTab):
 
     def _on_picked(self, _serial: int) -> None:
         g = self.grid.selected()
-        if g is None:
-            self.pick_lbl.setText("還沒選裝備")
-        else:
-            self.pick_lbl.setText(
-                f"已選：{g.name}（目前 +{g.enhance}、{g.holes} 孔 "
-                f"已鑲 {len(g.gems_filled)}、{g.base.get('level', '?')} 級）")
+        if g is not None:
             # ⛔ 這裡以前會把「強化到 +N」「打孔到 N 孔」往上頂到裝備目前的次數＋1
             #   —— 使用者 2026-09-09 明令**不准再偷改他選的數字**。選太低就在
             #   按下去的時候用紀錄告訴他（見 `_on_go` / `_on_go_holes`）。

@@ -69,7 +69,12 @@ assert OFF_ENHANCE < bag.ITEM_SPAN
 TMPL_FLAGS = 0x14           # 旗標；bit 0xC 決定攻擊速度那行印原值還是換算值
                             #   （出處：0x5F04FC 與 0x5EFE26 兩支互補的判斷）
 TMPL_LEVEL = bag.TMPL_LEVEL # 物品等級      74/74（★ 定義在 bag.py，這裡只是別名）
+TMPL_SKILL_IDS = (0x38, 0x3C, 0x40, 0x44, 0x48)   # 技能限制1~5（熟練技能編號）
 TMPL_SKILL_LEVEL = 0x4C     # 技能等限      47/47
+# ↑ 這六欄的出處是 **item.xml 的載入器**（0x56A7AD 起一路 `skill1`→[esi+0x38]、
+#   `skill2`→+0x3C … `skill_level`→+0x4C，每個屬性名都是 .rdata 的字串），
+#   不是拿背包實物湊出來的；同一支載入器把 `level`("物品等級") 寫進 +0x34，
+#   跟 `bag.TMPL_LEVEL` 對得上，可以當這串偏移沒讀錯的旁證。
 TMPL_HP = 0x58              # 最大HP        （提示框 0x5EFF79）
 TMPL_MP = 0x60              # 最大MP        （同上，item.xml 全量比對）
 TMPL_ATK_MIN = 0x6C         # 攻擊下限　★「平均攻擊 ± 攻擊變數」實測 1722/1808
@@ -107,6 +112,24 @@ KIND_NAMES = {
     2: "頭飾", 3: "衣服", 4: "手套", 5: "鞋子", 6: "飾品", 7: "背包",
     8: "披風", 9: "劍", 10: "刀", 11: "斧", 12: "錘", 13: "槍", 14: "杖",
     15: "弓箭", 16: "彈弓", 17: "盾",
+}
+
+
+# 熟練技能編號 → 名字（`技能限制1~5` 填的就是這組編號；法袍／輕裝／重裝／盾防
+# 這幾個就是防具那行「需要法袍技能等級20」的來源）。
+# ★ 這張表由 `tools/build_prof_names.py` 從資源包自動抽（`base/skill.xml` 的編號
+#   ＋ `big5/string/str_skill.xml` 的 1280000000+編號），⛔ 不准手打、不准補猜。
+# ⚠ 官方改版新增熟練技能要重跑那支；認不得的編號一律寫「技能N」。
+PROF_NAMES: dict[int, str] = {
+    1: "生命", 2: "死靈", 3: "混亂", 4: "大地",
+    5: "吟咒", 6: "冥想", 7: "魔導", 8: "法杖",
+    9: "劍術", 10: "斧錘", 11: "槍術", 12: "強身",
+    13: "格鬥", 14: "盾防", 15: "蓄勁", 16: "巧手",
+    17: "弓箭", 18: "狙擊", 19: "鷹眼", 20: "採集",
+    21: "釣魚", 22: "挖礦", 23: "伐木", 24: "機械",
+    25: "駕駛", 26: "武器", 27: "防具", 28: "裁縫",
+    29: "工藝", 30: "影刃", 31: "烹飪", 32: "輕裝",
+    33: "重裝", 34: "法袍", 35: "幻化", 36: "奇襲",
 }
 
 
@@ -172,6 +195,22 @@ def attr_name(attr_id: int) -> str:
     return ATTR_NAMES.get(attr_id, f"屬性{attr_id}")
 
 
+def skill_req(base: dict[str, int]) -> str:
+    """「需要法袍技能等級20」那一行；沒有技能限制就回空字串。
+
+    排法照遊戲自己那支（`0x5F32BE`）：字串 704「需要%s」＋每個多的技能接
+    字串 703「、%s」＋字串 705「技能等級%d」。**判斷條件是第一個技能編號
+    不是 0**（`0x5F32A3` 的 `cmp [esi+0x28], 0`）—— 等限是 0 照樣印，
+    低階防具就是這樣（例：初級輕裝皮甲 → 需要輕裝技能等級0）。
+    ⚠ 遊戲那邊還會把「你練不夠」的這行標紅；我們只顯示，不判顏色。
+    """
+    ids = [int(base.get(f"skill{n}", 0) or 0) for n in range(1, 6)]
+    if not ids[0]:
+        return ""
+    names = [PROF_NAMES.get(i) or f"技能{i}" for i in ids if i]
+    return f"需要{'、'.join(names)}技能等級{int(base.get('skill_level', 0) or 0)}"
+
+
 @dataclass(frozen=True)
 class Gear:
     """一件裝備（`bag.Item` ＋ 裝備才有的那半）。"""
@@ -227,7 +266,8 @@ _BASE_FIELDS = (
     ("atk_speed", TMPL_ATK_SPEED), ("move_speed", TMPL_MOVE_SPEED),
     ("range", TMPL_RANGE), ("weight", TMPL_WEIGHT),
     ("level", TMPL_LEVEL), ("level_req", TMPL_LEVEL_REQ),
-)
+    ("skill_level", TMPL_SKILL_LEVEL),
+) + tuple((f"skill{n}", off) for n, off in enumerate(TMPL_SKILL_IDS, 1))
 
 
 def _base_stats(scanner, blob: bytes) -> dict[str, int]:
@@ -542,6 +582,9 @@ def tooltip(g: Gear, scanner=None) -> list[tuple[str, str]]:
         lines.append((f"重量 {b['weight']}", GREY))
     if b.get("level_req"):
         lines.append((f"需要等級{b['level_req']}以上", GREY))
+    req = skill_req(b)
+    if req:
+        lines.append((req, GREY))
 
     # 剩下的加成（上面沒配到基礎欄位的），照實列出來
     shown = {8, 10, 11, 12, 13, 14, 1, 3, 16}

@@ -307,6 +307,7 @@ py tools\recheck_tables.py        # 要進遊戲，最後會直接給結論
 | `py tools\build_skill_range.py` | `assets/skill_range.tsv.gz` | 技能射程；⛔ 過期＝走位停太遠零傷害 |
 | `py tools\build_skill_names.py` | `assets/skill_names.tsv.gz` | 技能名稱（快捷鍵標名）；過期＝顯示編號 |
 | `py tools\build_scene_names.py` | 寫回 `app/game/scene.py` 裡的地圖名表（151 筆；`--check` 只比對） | 地圖名稱；過期＝顯示場景編號 |
+| `py tools\build_prof_names.py` | 寫回 `app/game/gear.py` 裡的 `PROF_NAMES` 熟練技能名表（36 筆；`--check` 只比對） | 裝備提示框「需要法袍技能等級20」那行的技能名；過期＝寫成「技能37」 |
 | `py tools\build_mapobj.py` | `assets/mapobj_names.tsv.gz` | 場景物件名（副本製作頁）；過期＝顯示外觀編號 |
 | `py tools\build_mapobj_icons.py` | `assets/mapobj_icons.zip` | 場景物件縮圖（副本製作頁）；過期＝沒圖 |
 | `py tools\build_supply_merchants.py` | `assets/supply_merchants.json` | 補給城的買／修／銀行 NPC；⛔ 過期＝補給找不到人 |
