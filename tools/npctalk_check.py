@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding="utf-8")
@@ -122,11 +123,14 @@ seen: list[float] = []
 
 
 AGAIN_SEEN: list = []
+PAGE_SEEN: list = []
 
 
-def fake_wait_dialog(sc, base, timeout=supply.DIALOG_TIMEOUT, again=None, **_kw):
+def fake_wait_dialog(sc, base, timeout=supply.DIALOG_TIMEOUT, again=None,
+                     page_base=supply._UNSET_PAGE, **_kw):
     seen.append(timeout)
     AGAIN_SEEN.append(again)
+    PAGE_SEEN.append(page_base)
     return False                                 # 一律「沒開」，逼它換站位
 
 
@@ -138,14 +142,23 @@ supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=1,
                    confirm=lambda: False, confirm_timeout=0.1)
 check(f"貼身點 → 等 {supply.DIALOG_NEAR_TIMEOUT:.0f} 秒",
       seen == [supply.DIALOG_NEAR_TIMEOUT], f"實得 {seen}")
+# ★★ 2026-09-10 使用者實機回報「買水一直上下、前後走」：貼著點**不准**再每
+#   CLICK_REPEAT 秒補點 —— 那只會把人一直往 NPC 推，_wait_arrival 的「停穩」
+#   永遠過不了 → 判成點不開 → _nudge_toward 穿來穿去。
+check("⛔ 貼身點不給「補點」回呼（不然人被 TryAct 一直推著走）",
+      AGAIN_SEEN == [None], f"實得 {AGAIN_SEEN}")
+check("貼身點也要帶「點之前的對話頁簽章」當第二個訊號",
+      PAGE_SEEN and PAGE_SEEN[-1] is not supply._UNSET_PAGE,
+      f"實得 {PAGE_SEEN}")
 
 seen.clear()
+AGAIN_SEEN.clear()
 GAP[0] = 20.0                                    # 遠處（客戶端要自己走過去）
 supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=1,
                    confirm=lambda: False, confirm_timeout=0.1)
 check(f"遠處點 → 留 {supply.DIALOG_TIMEOUT:.0f} 秒",
       seen == [supply.DIALOG_TIMEOUT], f"實得 {seen}")
-check("等對話框時有給「補點」的回呼（官方那個重試迴圈）",
+check("遠處點照舊給「補點」的回呼（官方那個重試迴圈＝走過去的動力）",
       bool(AGAIN_SEEN) and all(callable(x) for x in AGAIN_SEEN),
       f"實得 {AGAIN_SEEN}")
 
@@ -197,6 +210,33 @@ opened = REAL_WAIT(SC, 7, supply.DIALOG_TIMEOUT)  # 沒給 again ＝ 舊行為
 check("沒給補點回呼時，站著不動 0.8 秒就早退（舊行為不變）",
       opened is False and CLOCK.t - t0 < supply.DIALOG_TIMEOUT,
       f"花了 {CLOCK.t - t0:.1f} 秒")
+
+print()
+print("④b 對話框開了但 WND_MESSAGE 的值沒變（同一個視窗重開＝同一個位址）")
+# ★★★ 2026-09-10：這正是「買水一直上下、前後走」的源頭 —— 代號邊沿看不到 →
+#   判成「沒開」→ _nudge_toward 踩上 NPC／穿到另一側換站位重點。
+#   → 加第二個訊號：**點之前 vs 現在的對話頁簽章**（新的一頁來了就會變）。
+REAL_TALKWND = supply.talkwnd
+PAGE = [types.SimpleNamespace(sig=("舊頁",), wnd=7)]
+supply.talkwnd = types.SimpleNamespace(page=lambda sc: PAGE[0])
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
+check("頁面沒變 → 照舊回 False", opened is False)
+
+PAGE[0] = types.SimpleNamespace(sig=("新的一頁",), wnd=7)   # 代號一樣，內容換了
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
+check("★ 新的一頁來了 → 認定對話開了（代號沒變也算）", opened is True)
+
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT)      # 沒傳 page_base
+check("沒傳頁面基準 ＝ 完全是舊行為（只看代號）", opened is False)
+
+PAGE[0] = None                                             # 頁面讀不到
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
+check("頁面讀不到 → 退回只看代號，不亂判", opened is False)
+supply.talkwnd = REAL_TALKWND
 
 print()
 print("⑤ 走去 NPC：人站在地形圖標成不可走的格上（復活剛落地）")

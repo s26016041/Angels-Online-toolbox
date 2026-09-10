@@ -21,7 +21,10 @@ import time
 
 from app.game import (attack, bag, gather, quickbar, robot, itemname, scene,
                       entity, move, terrain, jumpmap, recall, inventory,
-                      navigate, sell, lua)
+                      navigate, sell, lua, talkwnd)
+
+# 「這個參數沒給」——跟「給了但讀不到（None）」要分得開（見 `_wait_dialog`）。
+_UNSET_PAGE = object()
 
 # --- 位址：能沿用的都沿用已登記 AOB 的（改版自動跟上，呼叫時才讀值） -----
 #   建包 / 送出 / 連線 → jumpmap.BUILD_FN / SEND_FN / CONN_PTR（0x50E0AE / 0x711380 / 0x9B6660）
@@ -579,7 +582,8 @@ def _dialog_token(scanner):
 
 
 def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
-                 again=None, give_up_still: float | None = None) -> bool:
+                 again=None, give_up_still: float | None = None,
+                 page_base=_UNSET_PAGE) -> bool:
     """點 NPC 後等對話框**真的開了**：DIALOG_WND 變成「非 0 且 ≠ baseline」才算。
 
     ★ 用「值變了」不用「非 0」（見 _dialog_token 的坑）；視窗代號是遞增配號
@@ -593,6 +597,16 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
       （使用者 2026-08-27 回報）。所以貼身點的時候呼叫端要傳
       `DIALOG_NEAR_TIMEOUT`（3 秒）當硬上限，別靠這裡的走路判斷。
 
+    page_base（2026-09-10 加）：**點下去之前**的對話頁簽章（`talkwnd.page().sig`）。
+      ★★★ 為什麼要第二個訊號：`WND_MESSAGE` 的值是那個視窗**物件的位址**，同一個
+        視窗重開會拿到同一個值 → 除了「這個 session 第一次開」以外根本看不到邊沿
+        → 這支幾乎每次都回 False → 呼叫端把「驗不了」當成「沒開」→ 跑去 `_nudge_toward`
+        踩上 NPC／穿到另一側換站位重點 —— 使用者 2026-09-10 看到的「一直上下、前後走，
+        雖然最後都會買到」就是這樣來的。
+      ★ 頁面簽章（`MESSAGE_MSG_ID`／選項／圖像／代號）**新的一頁來了就會變**，
+        是比位址邊沿硬得多的「對話真的開了」訊號。⛔ 但不能單獨當「現在開著」用
+        （關掉之後那些值照樣留著，見 `talkwnd.page`）—— 這裡用的是**點之前 vs 點之後
+        變了沒**，所以安全。沒傳就完全是舊行為。
     again（2026-09-03 加，配合 TryAct）：每 `CLICK_REPEAT` 秒補叫一次「點」。
       ★ 官方就是這樣做的（狀態機每 20 拍重叫一次 TryAct），而且**這也是走路的
         動力**：還沒到位的那幾發 TryAct 每一發都會往 NPC 走一步。
@@ -607,8 +621,15 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
     last_click = t0                      # 進來之前呼叫端剛點過一次
     still_at, still_t = None, t0
     while time.time() - t0 < timeout:
-        now = _dialog_token(scanner)
+        # ★ 一次讀完（`talkwnd.page` 跟 `_dialog_token` 走同一條純讀 Lua 全域的路，
+        #   順便把 WND_MESSAGE 的現值一起拿回來）。讀不到才退回只讀代號。
+        pg = talkwnd.page(scanner) if page_base is not _UNSET_PAGE else None
+        now = pg.wnd if pg is not None else _dialog_token(scanner)
         if now is not None and now != baseline and now != 0:
+            return True
+        # ★★ 第二個訊號：**新的一頁來了**（見 page_base 的說明）。
+        if (pg is not None and page_base is not _UNSET_PAGE
+                and page_base is not None and pg.sig != page_base):
             return True
         if again is not None:
             if time.time() - last_click >= CLICK_REPEAT:
@@ -819,9 +840,13 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         gap_now = _npc_gap(scanner, npc_id)
         box_now = _box_status(scanner, npc_id, npc_ent)
         in_box = bool(box_now and box_now["in_box"])
-        wait_dlg = (DIALOG_NEAR_TIMEOUT
-                    if in_box or (gap_now is not None and gap_now <= CLICK_RANGE + 1.0)
-                    else DIALOG_TIMEOUT)
+        near_click = bool(in_box or (gap_now is not None
+                                     and gap_now <= CLICK_RANGE + 1.0))
+        wait_dlg = DIALOG_NEAR_TIMEOUT if near_click else DIALOG_TIMEOUT
+        # ★ 點**之前**的對話頁簽章 —— 點完變了＝對話真的開了（見 _wait_dialog 的
+        #   page_base）。⚠ 一定要在 `_click_npc` 之前讀，點完才讀就沒有「變了」可比。
+        pg0 = talkwnd.page(scanner)
+        page_base = pg0.sig if pg0 is not None else None
         if not _click_npc(mover, scanner, npc_ent):  # TryAct：到位就開對話，沒到就走一步
             _nap(0.5)
             continue
@@ -835,8 +860,16 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         if base is None:                             # 安全退化：全域讀不到才走盲等照送
             _wait_still(scanner, timeout=12.0)
             _nap(TALK_GAP)
-        elif _wait_dialog(scanner, base, wait_dlg, again=_again,
-                          give_up_still=None if in_box else 2.5):
+        # ★★ 2026-09-10 使用者實機回報「買水每次都定位很久、像找不到一樣一直上下前後走」：
+        #   **貼著點的時候不要每 CLICK_REPEAT 秒補點**。補點的用意是「還沒到位就讓官方
+        #   尋路走一步」——人已經在旁邊時它只會把人一直往 NPC 推，`is_walking` 一直是 True
+        #   → 下面那個「人停穩才送選項」的閘門（_wait_arrival）永遠過不了 → 判成「點不開」
+        #   → `_nudge_toward` 踩上 NPC／穿到另一側 …… 就是他看到的前後走。
+        #   遠處點的那條照舊（補點正是走過去的動力）。
+        elif _wait_dialog(scanner, base, wait_dlg,
+                          again=None if near_click else _again,
+                          give_up_still=None if in_box else 2.5,
+                          page_base=page_base):
             if not _wait_arrival(scanner, npc_id):
                 fails += 1                           # 對話開了但人沒到位（被擋/太遠）
                 continue                             # → 絕不送購買選項，調位置重來

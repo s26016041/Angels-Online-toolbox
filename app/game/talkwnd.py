@@ -286,6 +286,8 @@ class Page:
     is_talk: bool                # `MESSAGE_IS_TALK`（⚠ 不是「沒有選項」的意思）
     options: tuple               # 有哪些選項（1 起算）
     sig: tuple                   # 換頁偵測用的整包簽章
+    wnd: int = 0                 # `WND_MESSAGE` 現值（視窗代號；0＝沒有／讀不到）
+    #                              ⚠ 非 0 **不等於**對話開著（見 window_present）
 
     @property
     def has_options(self) -> bool:
@@ -325,7 +327,8 @@ def page(scanner) -> Page | None:
     return Page(is_talk=bool(g.get(TALK_NAME)),
                 options=opts,
                 sig=(bool(g.get(TALK_NAME)), opts, g.get(MSG_NAME),
-                     g.get(FACE_NAME), g.get(WND_NAME)))
+                     g.get(FACE_NAME), g.get(WND_NAME)),
+                wnd=int(g.get(WND_NAME) or 0) & 0xFFFFFFFF)
 
 
 # ★ 關掉對話視窗本身的 Lua 函式（`reports/lua_allglobals_*.txt` 裡有這個全域）。
