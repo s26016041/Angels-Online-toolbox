@@ -170,6 +170,42 @@ check("補點前**重新找那隻 NPC**（不吃上一拍的實體位址）",
 supply._click_npc = lambda *a, **k: True
 
 print()
+print("②b 站定了就**動口不動腳**（使用者 2026-09-10：「走到最近然後別動，別一直抖」）")
+# ★★★★ 站在講話方框內／已經站上「離 NPC 最近可到的格」→ 不再走、也不 _nudge_toward
+#   穿到 NPC 另一側。點不開就原地重點，穿來穿去只會把人晃來晃去（他連續兩次回報）。
+REAL_BOX, REAL_PLAYER_TILE = supply._box_status, supply._player_tile
+nudges: list = []
+walks: list = []
+supply._nudge_toward = lambda *a, **k: nudges.append(1) or True
+supply._walk_to_npc = lambda *a, **k: walks.append(1) or True
+supply._player_tile = lambda sc: (0x3000, (5.5, 5.5))
+BOX = {"in_box": True, "free": [(5, 5)], "npc_tile": (6, 5)}
+supply._box_status = lambda *a, **k: BOX
+supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=3,
+                   confirm=lambda: False, confirm_timeout=0.1)
+check("⛔ 在方框內：一次都不 nudge（不穿到 NPC 另一側）", nudges == [],
+      f"實得 {len(nudges)} 次")
+check("⛔ 在方框內：一步都不走", walks == [], f"實得 {len(walks)} 次")
+
+nudges.clear(); walks.clear()
+BOX = {"in_box": False, "free": [(5, 5)], "npc_tile": (9, 9)}   # 站在最近格上
+supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=3,
+                   confirm=lambda: False, confirm_timeout=0.1)
+check("⛔ 已站在最近可到的格：照樣不 nudge、不走",
+      nudges == [] and walks == [], f"實得 nudge {len(nudges)}／walk {len(walks)}")
+
+nudges.clear(); walks.clear()
+BOX = {"in_box": False, "free": [(20, 20)], "npc_tile": (21, 20)}  # 還沒到位
+supply._wait_arrival = lambda *a, **k: False     # 人沒到位 → fails 才會加（走 nudge 階梯）
+supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=2,
+                   confirm=lambda: False, confirm_timeout=0.1)
+check("★ 還沒到位就照舊：先走過去，點不開才 nudge",
+      walks and nudges, f"實得 walk {len(walks)}／nudge {len(nudges)}")
+supply._wait_arrival = lambda *a, **k: True
+supply._box_status, supply._player_tile = REAL_BOX, REAL_PLAYER_TILE
+supply._nudge_toward = lambda *a, **k: True
+
+print()
 print("③ 人牆卡住時 _approach_npc 不磨滿逾時")
 supply._ent_tile_f = lambda sc, e: (50.0, 50.0)
 supply._player_tile = lambda sc: (0x3000, (40.0, 40.0))
@@ -299,6 +335,27 @@ supply._player_tile = lambda sc: (0x3000, (300.0, 300.0))  # 旁邊一圈也全�
 REAL_WALK(MOVER, SC, 1890, (129, 168), timeout=0.5)
 check("整圈都問不到（地形圖跟人對不上）→ 才硬走表座標（沒有上一個目標可沿用）",
       bool(FakeNav.goals) and FakeNav.goals[0] == (129.5, 168.5), f"實得 {FakeNav.goals[:2]}")
+
+print()
+print("⑥ 走去 NPC：站位**選定就不換**（使用者 2026-09-10「別一直抖動」）")
+# ★★★ 可走區是從「人現在站的格」泛洪算的 → 人一動，「離 NPC 最近可到的格」就可能
+#   跳到另一邊；舊寫法每 ~2 秒重挑一次 → 目標在兩格之間跳 → 人跟著來回走。
+SPOTS = [(10, 10), (30, 30), (10, 10), (30, 30)]
+
+
+def fake_box(*_a, **_k):
+    s = SPOTS.pop(0) if len(SPOTS) > 1 else SPOTS[0]
+    return {"in_box": False, "free": [s], "npc_tile": (11, 10)}
+
+
+supply._box_status = fake_box
+supply.find_npc = lambda sc, nid: (0x1000, 0x2000)
+supply._npc_tile = lambda sc, nid: (11.5, 10.5)
+supply._player_tile = lambda sc: (0x3000, (5.5, 5.5))
+FakeNav.goals.clear()
+REAL_WALK(MOVER, SC, 1, (0, 0), timeout=12.0)
+check("★ 目標只挑一次（後面就算算出別的格也不換）",
+      FakeNav.goals == [(10.5, 10.5)], f"實得 {FakeNav.goals}")
 
 print()
 if FAILS:

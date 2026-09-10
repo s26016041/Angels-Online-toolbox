@@ -795,7 +795,22 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _walk_to_npc(mover, scanner, npc_id, fallback, 30.0, avoid=trip)
             walked = True
             continue
-        if fails > 0:                                # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
+        # ★★★★ 2026-09-10 使用者定（第二次回報「還是一直來回」後）：
+        #   **「走到最近的那格，然後就別動，只管講話」**。站定了（已經在講話方框內、
+        #   或已經站在離 NPC 最近可到的那格）就 ⛔ 不再走任何一步 —— 不重走、也不
+        #   `_nudge_toward` 穿到 NPC 另一側，只在原地重點／送選項到成功或次數用完。
+        #   為什麼安全：TryAct kind 2 的範圍是 |Δx|≤5、|Δy|≤3（隔著櫃檯也開得了），
+        #   人在框內伺服器就吃選項 —— 站定重點本來就夠，穿來穿去只是把人晃來晃去。
+        settled = False
+        box = _box_status(scanner, npc_id, found[0], avoid=trip)
+        if box is not None:
+            _pf, _here = _player_tile(scanner)
+            spot = box["free"][0] if box["free"] else None
+            me_tile = (int(_here[0]), int(_here[1])) if _here else None
+            settled = bool(box["in_box"] or (spot and me_tile == tuple(spot)))
+        if settled:
+            pass                                     # 站定了 → 動口不動腳
+        elif fails > 0:                              # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
             _nudge_toward(mover, scanner, npc_id,
                           NUDGE_STEPS[min(fails - 1, len(NUDGE_STEPS) - 1)])
             walked = True
@@ -805,13 +820,10 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             #   （_walk_to_npc：已在那格馬上回；最後一步被人／NPC 身體擋住也算到）。
             #   講話方框（TALK_BOX_X/Y）只拿來決定「點下去等多久」跟「送選項前到位沒」。
             #   地形圖讀不到（換圖瞬間）才退回舊的：離 NPC > CLICK_RANGE 就用遊戲尋路靠近再點。
-            box = _box_status(scanner, npc_id, found[0], avoid=trip)
+            #   ⚠ box／spot 就用上面 settled 那次算的，不重讀一遍（兩次讀到不一樣的
+            #     「最近格」正是來回走的成因之一）。
             if box is not None:
-                # ★ 使用者 2026-09-06 定：**直接走到離 NPC 最近可到的格**再點（已在那格就
-                #   馬上回；最後一步被身體擋住也算到）。不拿講話方框當「夠近了」的停止線。
-                #   已經貼在那格 2 格內（上一輪走到被擋就回）就別再走一趟白等 NEAR_GIVE_UP 秒。
-                _pf, _here = _player_tile(scanner)
-                spot = box["free"][0] if box["free"] else None
+                # 已經貼在那格 2 格內（上一輪走到被擋就回）就別再走一趟白等 NEAR_GIVE_UP 秒。
                 near = bool(_here and spot and math.hypot(
                     _here[0] - spot[0] - 0.5, _here[1] - spot[1] - 0.5) <= 2.0)
                 if not near:
@@ -1874,7 +1886,14 @@ def _walk_to_npc(mover, scanner, npc_id: int, fallback, timeout: float,
             _nap(0.3)
             continue
         now = time.time()
-        if target is None or now - last_plan > 2.0:      # 每 ~2s 重規劃目標
+        # ★★★ 2026-09-10 使用者定：「走到最近的然後別動」——站位**選定就不換**。
+        #   ⛔ 舊寫法每 ~2 秒重挑一次目標：可走區（`_reach_around`）是從**人現在站的
+        #     格**泛洪算的，人一移動就可能多出／少掉幾格 → 「離 NPC 最近可到的格」
+        #     在兩個方向之間跳 → 人跟著來回走（使用者連續兩次回報「一直上下、前後走」）。
+        #   只有這幾種情況才重挑：還沒有目標、NPC 還沒串流（現在追的只是 .MPC 表座標，
+        #   等他進視野要換成真座標）、或下面 stuck 那條把 last_plan 清 0（要換站位）。
+        if (target is None or last_plan == 0.0
+                or (not streamed and now - last_plan > 2.0)):
             last_plan = now
             # 錨點：NPC 串流進來就用它的真座標（準），否則用 .MPC 表座標把人帶近。
             # 兩者那格都常不可走 → 一律走「離錨點最近的可走格」。
