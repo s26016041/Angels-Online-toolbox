@@ -970,11 +970,15 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
 
     ⚠⚠ **整組加總**，不是「任何一格」：有人紅水配兩格，第一格用完但
       第二格還很多，角色明明還補得到血 —— 那時把人拉回城是錯的。
-    ★ 設成「技能」的格子代表**不靠藥水補**（白狐紅水1 就是技能 64），
-      這一組只要有技能格就直接當「不缺」，不觸發。
+    ★ 設成「技能」的格子（白狐紅水1 就是技能 64）**只是不列入數量**，
+      同一組裡的藥水格照樣數（2026-09-10 使用者定）。
+      ⛔ 以前是「這一組只要有技能格就整組當『不缺』」—— 結果 s26011034 的
+        MP 兩格是「極效藍藥水＋技能（幽靈戰術Ⅲ）」，藍藥水歸零也永遠不算
+        見底，自動練技／掛機都不會回城買水（使用者 2026-09-10 回報）。
     ★ 放的不是藥水（名字不含「藥水」）→ 無視那一格（2026-08-19 使用者要求，
       連數量都不算 —— 一格餅乾 300 個不代表血補得上）。
-    ★ 一格都沒設（或放的都不是藥水）、或設定讀不到，就無從判斷，也不觸發。
+    ★ 一格都沒設（或放的都不是藥水、整組都是技能格）、或設定讀不到，
+      就無從判斷，也不觸發 —— 沒有藥水種類，回城也不知道要買什麼。
     """
     from app.game import bag, inventory               # 避免循環相依
 
@@ -982,7 +986,7 @@ def _potion_out(slots_info: dict, scanner, inv_head: int,
     for base in slots:
         kind, tid = slots_info.get(base, (None, None))
         if kind == SKILLITEM_TYPE_SKILL:
-            return None                    # 有技能可補，不算缺藥水
+            continue                       # 技能格：不數，但也不讓整組作廢
         if kind != SKILLITEM_TYPE_ITEM or not tid:
             continue
         if not _is_potion(tid):
