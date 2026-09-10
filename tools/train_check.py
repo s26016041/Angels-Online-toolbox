@@ -50,12 +50,15 @@ class FakeRobot:
         self.dry = []              # potions_out 的回傳（見底清單）
         self.wing = (5, 30)        # has_recall_item：(格號, 幾個)／()／None
         self.calls = []            # (名字, 參數) 流水帳
+        self.lock = False          # True＝set_run 一律失敗（模擬「子系統還沒好」）
 
     def is_run(self, sc):
         return self.run
 
     def set_run(self, mover, sc, on):
         self.calls.append(("set_run", bool(on)))
+        if self.lock:              # 真的 set_run 也是這樣：旗標不動、回 False
+            return False, "精靈子系統還沒準備好"
         self.run = bool(on)
         return True, ""
 
@@ -363,6 +366,41 @@ page = _spot_case("blocked", "⛔ 連續 3 次重算都完全沒往前走（路�
 check("有第二個點 → 換過去，不停機",
       page.run_cb.isChecked() and page._spot_i == 1,
       f"實得 spot_i={page._spot_i}")
+
+print("⑩ 補給那一趟**整趟**都要維持主開關關著（2026-09-10 使用者定：")
+print("   「回程要先關閉天使精靈主開關，買完回去再打開」）")
+page = build_page()
+SUPPLY.trips.clear()
+ROBOT.calls.clear()
+ROBOT.dry = [("MP", "MP藥水（藍藥水）")]
+ROBOT.run = ROBOT.ex = False
+page.train_cb.setChecked(True)
+tick(page)                              # 見底 → 出發（InlineThread 同步跑完）
+check("出發前主開關關了", ROBOT.run is False)
+check("在補給狀態", page._train_supply is True)
+# 回城／換地圖／重登都可能讓精靈自己跑起來 —— 出發前關過**不算數**，要每拍收斂。
+page._train_result = None                # 假裝這一趟還在路上
+ROBOT.run = True                         # 途中被打開了
+tick(page)
+check("途中被打開 → 下一拍再關掉", ROBOT.run is False)
+check("這時候不准開回去（要等回到原地）", page._train_supply is True)
+
+print("⑩b 主開關關不掉就**不出發**（不帶著精靈去跑補給）")
+page = build_page()
+SUPPLY.trips.clear()
+ROBOT.dry = [("HP", "HP藥水（極效紅藥水）")]
+ROBOT.run = ROBOT.ex = False
+page.train_cb.setChecked(True)
+ROBOT.lock = True                        # set_run 一律失敗，旗標留在「開著」
+tick(page)
+check("關不掉就沒出發", not SUPPLY.trips, f"實得 {SUPPLY.trips}")
+check("畫面說得出原因", "關不掉" in page.status.text(),
+      f"實得「{page.status.text()}」")
+check("練技沒被停掉（暫時性失敗要重試）", page.train_cb.isChecked())
+ROBOT.lock = False
+tick(page)
+check("關得掉之後照樣出發", len(SUPPLY.trips) == 1, f"實得 {SUPPLY.trips}")
+check("出發前主開關關了", ROBOT.run is False)
 
 print()
 if FAILS:

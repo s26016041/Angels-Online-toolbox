@@ -3420,8 +3420,17 @@ class CharFarmPage(QWidget):
         # 藥水種類在主執行緒抓（potion_slots 可能走 Lua，背景執行緒不准碰）。
         plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
         # ★ 出發前關精靈主開關（使用者指定）：路上精靈不能再原地施法。
-        if robot.is_run(self.sc):
-            robot.set_run(self._mover, self.sc, False)
+        # ⚠ 2026-09-10 補強：**一律送、而且要看回傳**。以前寫成「is_run() 是
+        #   True 才關、關完不看結果」，兩個洞：`is_run()` 讀失敗回 False 就
+        #   整個跳過不關；`set_run()` 回「精靈子系統還沒準備好」也沒人管 ——
+        #   兩種都會讓精靈跟著整趟補給一路施法，跟我們走位／講話／買東西打架。
+        #   真的還開著就**這一輪不出發**，見底條件還在，下一拍再試
+        #   （[[transient-failure-auto-retry]]：暫時性失敗重試不設限）。
+        ok, note = robot.set_run(self._mover, self.sc, False)
+        if not ok and robot.is_run(self.sc):
+            self.status.setText(
+                f"🥋 {why} → 精靈主開關關不掉（{note}），這一輪先不出發")
+            return
         self._train_supply = True
         self._train_supply_t = 0.0
         self._train_result = None
@@ -3471,6 +3480,12 @@ class CharFarmPage(QWidget):
         #    主開關是我們**刻意**關的，這時推回去等於邊跑補給邊施法。
         if self._train_supply:
             self._train_supply_t += dt
+            # ★ 「關著」是要**整趟維持**的狀態，不是出發前做過就算（2026-09-10
+            #   使用者定：回程要先關主開關，買完回去再打開）。回城、換地圖、
+            #   重登都可能讓它自己跑起來 —— 每拍純讀確認一次，開著就再關掉。
+            #   ⚠ 開回去的只有一個地方：這一趟收工後的 `_train_push()`。
+            if robot.is_run(self.sc):
+                robot.set_run(self._mover, self.sc, False)
             if self._train_result is not None:
                 ok, msg = self._train_result
                 self._train_result = None
