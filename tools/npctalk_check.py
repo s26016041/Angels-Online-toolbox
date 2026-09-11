@@ -196,12 +196,41 @@ check("⛔ 已站在最近可到的格：照樣不 nudge、不走",
 
 nudges.clear(); walks.clear()
 BOX = {"in_box": False, "free": [(20, 20)], "npc_tile": (21, 20)}  # 還沒到位
-supply._wait_arrival = lambda *a, **k: False     # 人沒到位 → fails 才會加（走 nudge 階梯）
+# ⚠ 只有**真的走不到**（_walk_to_npc 回 False：人牆／算不出路）才照舊走 nudge 階梯；
+#   走到了就舉 arrived 閂，之後怎麼樣都不再動腳（見下一個案例）。
+supply._walk_to_npc = lambda *a, **k: walks.append(1) or False
+supply._wait_arrival = lambda *a, **k: False     # 人沒到位 → fails 才會加
 supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=2,
                    confirm=lambda: False, confirm_timeout=0.1)
-check("★ 還沒到位就照舊：先走過去，點不開才 nudge",
+check("★ 走不到的時候照舊：先走過去，點不開才 nudge",
       walks and nudges, f"實得 walk {len(walks)}／nudge {len(nudges)}")
 supply._wait_arrival = lambda *a, **k: True
+nudges.clear(); walks.clear()
+approaches: list = []
+supply._approach_npc = lambda *a, **k: approaches.append(1)
+supply._wait_arrival = lambda *a, **k: False     # 逼 fails 累加（舊版就會開始 nudge）
+STATE = {"box": {"in_box": False, "free": [(20, 20)], "npc_tile": (21, 20)}}
+supply._box_status = lambda *a, **k: STATE["box"]
+
+
+def walk_then_lose(*_a, **_k):
+    """走到了 → 但之後地形圖讀不到（換圖瞬間／官方 TryAct 把人推離那格）。"""
+    walks.append(1)
+    STATE["box"] = None
+    return True
+
+
+supply._walk_to_npc = walk_then_lose
+supply._engage_npc(MOVER, SC, 1, (0, 0), [10], "", tries=4,
+                   confirm=lambda: False, confirm_timeout=0.1)
+# ★★★★ 使用者 2026-09-11：「走到能走到的 NPC 最近，然後用官方的對話自己把最後那段
+#   小小路走完並對話」——「到過了」是一次性的閂，⛔ 不准因為下一輪判斷變了又走一次
+#   （那就是他看到的「商人旁邊走出去又回去」）。
+check("★ 走到過就不再動腳：只走一次，之後不 nudge、也不 approach",
+      walks == [1] and nudges == [] and approaches == [],
+      f"實得 walk {len(walks)}／nudge {len(nudges)}／approach {len(approaches)}")
+supply._wait_arrival = lambda *a, **k: True
+supply._approach_npc = lambda *a, **k: None
 supply._box_status, supply._player_tile = REAL_BOX, REAL_PLAYER_TILE
 supply._nudge_toward = lambda *a, **k: True
 

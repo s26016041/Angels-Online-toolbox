@@ -783,6 +783,15 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     trip: set = set()  # 這一趟撞到、當牆的人站的格（人不會走開，跨呼叫沿用；換 NPC 才重來）
     fails = 0        # 「點了確認沒開」的次數（決定 nudge 步伐階梯）
     walked = False   # 這一趟 engage 動過腳沒（點擊要跟在移動後面才穩，8/14 flaky 實測）
+    # ★★★★ 2026-09-11 使用者定（第三次回報，原話）：「商人旁邊然後走出去又回去…
+    #   我希望就是走到能走到的 NPC 最近，然後用官方的對話自己把最後那段小小路走完
+    #   並對話」。→ `arrived` 是**一次性的閂**：只要走到過（`_walk_to_npc` 回 True／
+    #   已經在講話方框內／已經站上最近可到的格），這一趟 engage **就再也不送任何
+    #   移動指令**——最後那一小段交給官方 TryAct 自己走。
+    #   ⛔ 不可以每輪重算「站定了沒」就好：官方那一步會把人推離我們挑的格、
+    #     `_box_status` 讀不到（換圖瞬間）也會讓判斷變 False → 我們又走一次、
+    #     `_nudge_toward` 又穿到 NPC 另一側 —— 那就是他看到的「走出去又回去」。
+    arrived = False
     for _ in range(tries):
         # ★★ 每一輪先問「是不是已經成功了」。⚠ 沒有這一句的話，**成功會害死人**：
         #   活動地圖入口 NPC 講完話人就被傳走了，下面 find_npc 在新地圖當然找不到
@@ -809,7 +818,9 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             me_tile = (int(_here[0]), int(_here[1])) if _here else None
             settled = bool(box["in_box"] or (spot and me_tile == tuple(spot)))
         if settled:
-            pass                                     # 站定了 → 動口不動腳
+            arrived = True                           # 閂舉起來就不再放下（見上面）
+        if arrived:
+            pass                                     # 到過了 → 動口不動腳，最後一段給官方走
         elif fails > 0:                              # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
             _nudge_toward(mover, scanner, npc_id,
                           NUDGE_STEPS[min(fails - 1, len(NUDGE_STEPS) - 1)])
@@ -826,8 +837,14 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                 # 已經貼在那格 2 格內（上一輪走到被擋就回）就別再走一趟白等 NEAR_GIVE_UP 秒。
                 near = bool(_here and spot and math.hypot(
                     _here[0] - spot[0] - 0.5, _here[1] - spot[1] - 0.5) <= 2.0)
-                if not near:
-                    _walk_to_npc(mover, scanner, npc_id, fallback, 12.0, avoid=trip)
+                if near:
+                    arrived = True           # 已經在最近格旁邊 ＝ 到了，後面不再動腳
+                else:
+                    # 走到「能走到的最近格」為止。⚠ 回 True＝到了（含「最後一格被
+                    #   身體擋住就算到」）→ 舉 arrived，剩下那一小段交給官方 TryAct。
+                    if _walk_to_npc(mover, scanner, npc_id, fallback, 12.0,
+                                    avoid=trip):
+                        arrived = True
                     walked = True
                     found = find_npc(scanner, npc_id) or found
             else:
@@ -839,6 +856,8 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                     _approach_npc(mover, scanner, npc_id)
                     walked = True
                     found = find_npc(scanner, npc_id) or found
+                elif gap is not None:
+                    arrived = True           # 已經在互動距離內 → 不再動腳
             # ⚠ 2026-09-03 拿掉「已在距離內但站著沒動過腳 → 先穿過 NPC 再點」：
             #   那是 8/14 為了**舊的**點擊（自動走路狀態機）50% 白站才加的暖身動作。
             #   改叫 TryAct 之後，站著不動點下去實測 0.13 秒對話框就開（黑狐 永夜城
