@@ -100,6 +100,9 @@ class FakeRobot:
 
 class FakeSupply:
     SHOP_TABLE = {4836: (2, 30)}   # 有表（_dry_stop 的「表載不到」註記不觸發）
+    # 補給城清單（真的那份是 assets/supply_merchants.json）：場景 900 當城，
+    # 練功點 122 不是城 —— 「人在城裡就不用翼」那條規則靠它分辨。
+    NPC_TABLE = {900: {"potion": (1, 2, 3)}}
 
     def __init__(self):
         self.trips = []            # 每趟 run_full_supply 收到的參數
@@ -401,6 +404,40 @@ ROBOT.lock = False
 tick(page)
 check("關得掉之後照樣出發", len(SUPPLY.trips) == 1, f"實得 {SUPPLY.trips}")
 check("出發前主開關關了", ROBOT.run is False)
+
+print("⑪ 回程點看**出發當下**站的地圖（使用者 2026-09-11：「沒水回程要看當前地圖」）")
+page = build_page()
+SUPPLY.trips.clear()
+ROBOT.dry = [("HP", "HP藥水（極效紅藥水）")]
+ROBOT.run = ROBOT.ex = False
+page.train_cb.setChecked(True)
+tick(page)                              # 見底 → 第 1 趟
+check("回程點＝現在這張圖", SUPPLY.trips[-1]["back_to"] == (10.0, 20.0, 122),
+      f"實得 {SUPPLY.trips[-1]['back_to']}")
+tick(page)                              # 收結果
+page.inv = 0x1000
+page.cur_scene = lambda: 130            # 人換到另一張圖繼續練
+page.my_pos = lambda: (55.0, 66.0)
+tick(page)                              # 安定讀數：還是見底 → 第 2 趟
+check("換了地圖之後回程點跟著換（⛔ 不是開練技那一刻記的）",
+      SUPPLY.trips[-1]["back_to"] == (55.0, 66.0, 130),
+      f"實得 {SUPPLY.trips[-1]['back_to']}")
+
+print("⑫ 人就站在補給城裡 → 直接買水，**不用翼**（也不准為了沒翼停練技）")
+page = build_page()
+SUPPLY.trips.clear()
+ROBOT.wing = ()                         # 背包一張翼都沒有
+ROBOT.dry = [("MP", "MP藥水（極效藍藥水）")]
+ROBOT.run = ROBOT.ex = False
+page.cur_scene = lambda: 900            # 900＝FakeSupply.NPC_TABLE 裡的補給城
+page.train_cb.setChecked(True)
+tick(page)
+check("在城裡沒翼也照樣出發買水", len(SUPPLY.trips) == 1, f"實得 {SUPPLY.trips}")
+check("⛔ 沒有因為沒翼把練技停掉", page.train_cb.isChecked())
+check("回程點＝城裡的原地", SUPPLY.trips[-1]["back_to"] == (10.0, 20.0, 900),
+      f"實得 {SUPPLY.trips[-1]['back_to']}")
+ROBOT.wing = (5, 30)
+ROBOT.dry = []
 
 print()
 if FAILS:

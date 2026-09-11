@@ -3388,35 +3388,51 @@ class CharFarmPage(QWidget):
         run_full_supply（potion_only，不存倉不修裝）→ 回標記地圖。
 
         跟 _start_supply 平行的一套，差在：不動 KeyWorker/TargetWorker
-        （練技時它們本來就沒在跑）、回程點固定是 _train_home（練技的原地，
-        不是巡邏點 —— 使用者指定這功能不走巡邏點）。
+        （練技時它們本來就沒在跑）、回程點＝**出發當下站的地圖與座標**
+        （2026-09-11 使用者：「沒水回程的時候要看當前地圖，買好水自動回到當前
+        地圖」），不是巡邏點 —— 使用者指定這功能不走巡邏點。
+        人本來就站在補給城裡的話連翼都不用（run_full_supply 不燒翼）。
         """
         # ⚠ 背景執行緒的把手跟掛機補給共用（同一隻角色只准有一趟在路上）。
         t = self._supply_thread
         if t is not None and t.is_alive():
             self.status.setText(f"🥋 {why} → 上一趟補給的背景執行緒還沒收工，先等它")
             return
-        if self._train_home is None:
-            # 還沒記到練技位置就不出發 —— 這時讓 run_full_supply 記「出發
-            # 當下」等於把回程點交給運氣（見 _train_home 的說明）。
-            self.status.setText(f"🥋 {why} → 還沒記到練技位置（座標讀不到），下一輪再出發")
+        # ★★ 2026-09-11 使用者定：「沒水回程的時候要看**當前地圖**，買好水自動回到
+        #   當前地圖」—— 回程點是**出發當下站的地方**，不是開練技那一刻記的那個。
+        #   （中途換地圖再練的話，舊寫法會把人買完水丟回舊地圖。）
+        #   ⚠ 讀不到就退回上一次記到的 _train_home；兩個都沒有才不出發。
+        here = self.cur_scene()
+        pos = self.my_pos()
+        home = ((pos[0], pos[1], here) if here is not None and pos is not None
+                else self._train_home)
+        if home is None:
+            self.status.setText(f"🥋 {why} → 讀不到現在的位置，下一輪再出發")
             return
-        have = robot.has_recall_item(self.sc, self.inv)
-        if have is None:
-            self.status.setText(f"🥋 {why} → 背包暫時讀不到，下一輪再試")
-            return
-        if not have:
-            item = itemname.label(recall.RECALL_ITEM)
-            self._train_no_wing += 1
-            if self._train_no_wing < NO_RECALL_TRIES:
-                self.status.setText(
-                    f"🥋 {why} → 找不到「{item}」，{TRAIN_GAP:.0f} 秒後再確認"
-                    f"（第 {self._train_no_wing}/{NO_RECALL_TRIES} 次）")
+        self._train_home = home
+        # ★★ 2026-09-11 使用者定：「如果當前地圖就是主城，直接買水就好」——
+        #   人已經站在補給城裡，run_full_supply 本來就不燒翼（見它的第 2 步），
+        #   所以**這裡也不該要求背包有翼**，更不該為了沒翼把練技停掉。
+        in_city = bool(supply.NPC_TABLE.get(int(home[2])))
+        if in_city:
+            self._train_no_wing = 0
+        else:
+            have = robot.has_recall_item(self.sc, self.inv)
+            if have is None:
+                self.status.setText(f"🥋 {why} → 背包暫時讀不到，下一輪再試")
                 return
-            self._train_stop(f"🥋 {why}，但背包裡找不到「{item}」（回程道具）"
-                             "→ 自動練技已停止")
-            return
-        self._train_no_wing = 0
+            if not have:
+                item = itemname.label(recall.RECALL_ITEM)
+                self._train_no_wing += 1
+                if self._train_no_wing < NO_RECALL_TRIES:
+                    self.status.setText(
+                        f"🥋 {why} → 找不到「{item}」，{TRAIN_GAP:.0f} 秒後再確認"
+                        f"（第 {self._train_no_wing}/{NO_RECALL_TRIES} 次）")
+                    return
+                self._train_stop(f"🥋 {why}，但背包裡找不到「{item}」（回程道具）"
+                                 "→ 自動練技已停止")
+                return
+            self._train_no_wing = 0
         # 藥水種類在主執行緒抓（potion_slots 可能走 Lua，背景執行緒不准碰）。
         plan = robot.potion_buy_ids(self._mover, self.sc, self.pid)
         # ★ 出發前關精靈主開關（使用者指定）：路上精靈不能再原地施法。
@@ -3437,7 +3453,6 @@ class CharFarmPage(QWidget):
         self._train_progress = why
         self._train_gen += 1
         mv, sc, gen = self._mover, self.sc, self._train_gen
-        home = self._train_home
         fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
 
         def _worker():
@@ -3458,8 +3473,11 @@ class CharFarmPage(QWidget):
         t = threading.Thread(target=_worker, daemon=True)
         self._supply_thread = t
         t.start()
-        self.status.setText(f"🥋 {why} → 關精靈主開關，回城找補給商買藥水"
-                            "（不存倉、不修裝）…")
+        self.status.setText(
+            f"🥋 {why} → 關精靈主開關，"
+            + ("就在城裡，直接去找補給商買藥水" if in_city
+               else "回城找補給商買藥水")
+            + "（不存倉、不修裝）…")
 
     def _train_tick(self, dt: float) -> None:
         """自動練技的心跳（只在**沒掛機**時被 tick 呼叫；兩者互斥）。
