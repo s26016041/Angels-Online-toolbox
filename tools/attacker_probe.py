@@ -143,7 +143,11 @@ def main() -> int:
     mon_seen = defaultdict(set)
     me_hit = defaultdict(lambda: [0, 0])
     # 即時顯示用：候選欄位（第一輪跑出來的）
-    CAND_MON_OFF = 0x20      # 怪的實體物件 +0x20 == 我的玩家物件？
+    # ★ 2026-09-12 定案候選：怪的實體物件 +0x34C ＝ **牠正在打的對象的實體編號**
+    #   （遊戲自己的存取器 0x557852：實體編號 → 物件 → 回 [物件+0x354]，
+    #    我們的實體空間差 8 bytes ⇒ +0x34C）
+    CAND_TGT_OFF = 0x34C
+    CAND_MON_OFF = 0x20      # 舊候選：怪的實體物件 +0x20 == 我的玩家物件？
     live_t = 0.0
     ticks = hp_drops = 0
     max_pointing = 0          # 同一拍最多幾隻怪指著我
@@ -221,7 +225,7 @@ def main() -> int:
 
         # 同一拍有幾隻怪的 +0x20 指著我（＝官方「圍毆」數量的候選）
         npoint = sum(1 for m in mons
-                     if player_obj and u32(sc, m.addr + 0x20) == player_obj)
+                     if u32(sc, m.addr + CAND_TGT_OFF) == my_eid)
         point_hist[npoint] += 1
         if npoint > max_pointing:
             max_pointing = npoint
@@ -232,6 +236,8 @@ def main() -> int:
             marks = []
             for m in mons:
                 tags = ""
+                if u32(sc, m.addr + CAND_TGT_OFF) == my_eid:
+                    tags += "◎"
                 if player_obj and u32(sc, m.addr + CAND_MON_OFF) == player_obj:
                     tags += "★"
                 if player_obj and entity.attacking(sc, m, player_obj):
@@ -245,8 +251,8 @@ def main() -> int:
                 ok, tid, thp = entity.read_target_checked(sc, state)
                 if ok and tid:
                     tgt = f" 我選的目標={tid & 0xFFFF:#x}({thp}%)"
-            print(f"  HP={hp:<6} 怪{len(mons):<3}{tgt} "
-                  + ("指著我：" + " ".join(marks) if marks else "（沒有）"))
+            print(f"  HP={hp:<6} 怪{len(mons):<3} 打我{npoint}隻{tgt} "
+                  + ("｜" + " ".join(marks) if marks else "｜（沒有）"))
 
         left = HZ - (time.monotonic() - t0)
         if left > 0:
@@ -258,7 +264,7 @@ def main() -> int:
             f.write(s + "\n")
         w(f"# attacker_probe  pid={pid} {name}  {time.strftime('%Y-%m-%d %H:%M:%S')}")
         w(f"取樣 {ticks} 拍、我掉血 {hp_drops} 拍、怪出手 {att_ticks} 拍次")
-        w(f"同一拍最多有 {max_pointing} 隻怪的 +0x20 指著我；"
+        w(f"同一拍最多有 {max_pointing} 隻怪的 +0x34C 指著我；"
           f"分佈={dict(sorted(point_hist.items()))}")
         w(f"我的實體={my_ent:#x} 編號={my_eid:#x} 伺服器編號={srv:#x} "
           f"玩家物件={player_obj and hex(player_obj)} 狀態物件={state and hex(state)}")
