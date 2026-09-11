@@ -1418,12 +1418,12 @@ class TargetWorker(_Paced):
             #   **或**物件已經被遊戲歸還（＝小地圖紅點消失的那個訊號）。
             #   ⛔ 不准把血量歸零加回來（王剩不到 1% 就是 0、怪站著不動更是
             #   常態）—— 理由見 entity.looks_dead。
-            alive, st, _p = entity.read_live(self.sc, ent)
+            alive, st, _p, flag = entity.read_live(self.sc, ent)
             # ⚠ 物件說「不在了」先再讀一次確認：單次讀失敗也會回 False
             #   （讀不到 ≠ 沒有）。狀態是 'Dead' 就不必多讀那一次。
             if not alive and st != entity.STATE_DEAD:
                 alive = entity.is_alive(self.sc, ent)
-            if entity.looks_dead(st, alive):
+            if entity.looks_dead(st, alive, flag):
                 if self._job is job:
                     self._job = None
                 self._wrote = False
@@ -4758,8 +4758,8 @@ class CharFarmPage(QWidget):
                 cur_eids = {m.eid for m in (s.mons or [])}
                 lost = [m for m in self.mons if m.eid not in cur_eids]
                 for m in lost[:3]:
-                    alive, st, _p = entity.read_live(self.sc, m)
-                    if alive and st != "Dead":
+                    alive, st, _p, flag = entity.read_live(self.sc, m)
+                    if not entity.looks_dead(st, alive, flag):
                         self._ask_full(f"{len(lost)} 隻怪從掃描消失但物件還在")
                         break
             self.mons = s.mons or []
@@ -4820,8 +4820,8 @@ class CharFarmPage(QWidget):
             #   （1/523）。物件還在而且不是屍體 → 一定是掃描端漏了：照打
             #   （攻擊執行緒拿的是位址，不受清單影響），並補一次全掃。
             #   物件沒了才走原本的兩拍判死。
-            alive, st, _p = entity.read_live(self.sc, self._cur)
-            if alive and st != "Dead":
+            alive, st, _p, flag = entity.read_live(self.sc, self._cur)
+            if not entity.looks_dead(st, alive, flag):
                 self._gone = 0
                 self._ask_full(f"目標「{self._cur.name}」被掃描漏掉（物件還在）")
             else:
@@ -5072,7 +5072,7 @@ class CharFarmPage(QWidget):
             # ★ 死活、動畫狀態、座標**一次讀回來**（相鄰欄位，見 read_live）。
             #   底下每個判斷（解禁、收尾、屍體、距離）都用同一份快照。
             #   座標當場讀（怪會走、角色也在走，掃描時記的早就過期了）。
-            alive, st, p = entity.read_live(self.sc, m)
+            alive, st, p, flag = entity.read_live(self.sc, m)
             d = (math.hypot(p[0] - me[0], p[1] - me[1])
                  if p and me else float("inf"))
             if m.eid in self._killed:
@@ -5088,9 +5088,10 @@ class CharFarmPage(QWidget):
                 #   冷卻活怪一律解禁 —— 咬人的怪常常正是被記成「走不到」
                 #   冰起來的那隻，而牠出手當下欄位是空的、動畫又只有幾拍，
                 #   掉血＋距離是唯一一定抓得到的組合。
-                fighting = (alive and st != "Dead" and self.player
+                live = not entity.looks_dead(st, alive, flag)
+                fighting = (live and self.player
                             and self._fighting_me(m, st, p, me))
-                if fighting or (alive and st != "Dead"
+                if fighting or (live
                                 and self._under_attack()
                                 and d <= UNFREEZE_NEAR):
                     del self._killed[m.eid]
@@ -5126,7 +5127,9 @@ class CharFarmPage(QWidget):
             #     （最久 79.8 秒）。挑最近的就常常挑到牠們，鎖上去要等
             #     CORPSE_SECS 才發現不對 —— 每次白花快一秒。
             #   ⚠ is_alive() 擋不掉：它只比對 vtable + 實體 ID，分不出屍體。
-            if st == "Dead":
+            #   ★ 2026-09-11：改問共用的 `looks_dead`（多了死亡旗標 +0x3D6==7）
+            #     —— 副本的柱子那種死了動畫狀態不會變 'Dead'，只有旗標認得出。
+            if entity.looks_dead(st, True, flag):
                 if skipped is not None and p and me:
                     skipped.append((d, m.name, "屍體"))
                 continue

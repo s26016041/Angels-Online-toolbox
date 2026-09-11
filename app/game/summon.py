@@ -240,8 +240,8 @@ class AutoSummon:
                 return self.note                    # None＝這拍讀不到，不動作
             # 退路（槽還沒驗證過／偏移壞掉）：舊的實體追蹤。
             # ⚠ eid 重建時這條路會誤判成不見 → 多放一次（浪費 MP 但不會壞事）。
-            alive, st, _pos = entity.read_live(scanner, self._tracked)
-            if alive and st != "Dead":
+            alive, st, _pos, flag = entity.read_live(scanner, self._tracked)
+            if not entity.looks_dead(st, alive, flag):
                 self._miss = 0
                 return self.note
             self._miss += 1

@@ -120,6 +120,8 @@ class FakeMon:
         self.x, self.y, self.eid, self.name, self.addr = x, y, eid, name, addr
         self.dead = False
         self.hp_zero = False
+        self.state = ""            # 動畫狀態（_live_monsters 的屍體過濾要）
+        self.dead_flag = 0         # 死亡旗標 +0x3D6；7＝死了（見 entity）
 
 
 class FakeNotifier:
@@ -394,7 +396,7 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     tab._pos = list(pos)
     tab._me = tuple(pos)
     tab._my_pos = lambda: tuple(tab._pos)
-    dt.entity.read_live_hp = lambda _sc, m: (True, "", (m.x, m.y), -1)
+    dt.entity.read_live_hp = lambda _sc, m: (True, "", (m.x, m.y), -1, 0)
     # ★ 2026-09-09：死活多了一個訊號「物件被遊戲歸還」，程式在 alive=False 時
     #   會再讀一次確認 —— 替身跟著 read_live_hp 的第一個回傳值走。
     dt.entity.is_alive = lambda _sc, m: dt.entity.read_live_hp(_sc, m)[0]
@@ -1557,16 +1559,16 @@ def main() -> int:
     dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
     tab._fight((10.0, 10.0), TICK)
     tab._live_monsters = lambda: []
-    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1, 0)
     tab._fight((10.0, 10.0), TICK)
     ck("掃描少一拍、但物件還在 → 還不放（可能只是漏掃）", tab._cur is m)
     # ★★★ 2026-09-09：物件被遊戲歸還（＝小地圖紅點消失）就是死了 → 立刻放掉，
     #   不必再等兩拍。⚠ 程式會再讀一次確認，所以替身兩次都要回 False。
-    dt.entity.read_live_hp = lambda _sc, e: (False, "", None, -1)
+    dt.entity.read_live_hp = lambda _sc, e: (False, "", None, -1, 0)
     tab._fight((10.0, 10.0), TICK)
     ck("★★★ 物件被歸還（紅點消失）→ 當拍就放掉", tab._cur is None,
        f"實得 {tab._cur}")
-    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1, 0)
     dt.entity.read_pos = lambda _sc, _addr: None
 
     # ★★ 血量歸零＝打死了（使用者 2026-09-05：副本裡的柱子死掉屍體會留一段時間、
@@ -1580,27 +1582,43 @@ def main() -> int:
     dt.entity.read_pos = lambda _sc, _addr: (12.0, 10.0)
     tab._fight((10.0, 10.0), TICK)
     ck("鎖定柱子", tab._cur is m)
-    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 35)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 35, 0)
     tab._fight((10.0, 10.0), TICK)
     ck("　血量 35%、狀態 Wait → 照打", tab._cur is m)
     # ★★★ 2026-09-09 使用者連退兩次後定案：**血量完全不參與死活判斷**。
     #   血量是 0~100 的整數百分比（王剩不到 1% 就是 0），而且「怪站著不動」
     #   是常態 —— 「0 就是死」「0 而且不動就是死」兩種都會把活的當死的。
     #   死活只認動畫狀態 'Dead'（＋掛機那條「遊戲把目標欄清 0」）。
-    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, 0)
     tab._fight((10.0, 10.0), TICK)
     ck("★★★ 血量 0、狀態 Wait（王剩不到 1% 站著）→ 照打，不准當屍體",
        tab._cur is m, f"實得 {tab._cur}")
     # ★★★ 柱子那種：血量 0、狀態永遠 'Wait'，但物件被遊戲歸還 → 這才是死了
-    dt.entity.read_live_hp = lambda _sc, e: (False, "Wait", (e.x, e.y), 0)
+    dt.entity.read_live_hp = lambda _sc, e: (False, "Wait", (e.x, e.y), 0, 0)
     tab._fight((10.0, 10.0), TICK)
     ck("★★★ 柱子：狀態還是 Wait 但物件被歸還 → 當拍判死、換下一隻",
        tab._cur is None, f"實得 {tab._cur}")
-    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0)
+    # ★★★★ 2026-09-11 使用者「黑狐打類似柱子那種怪物還是一直想打屍體」：
+    #   物件被歸還要等 ~5 秒（無限塔 5 隻實測 3.0~5.4 秒），那 5 秒都在打屍體。
+    #   **死亡旗標 +0x3D6==7 死掉當拍就翻**（entity.OFF_DEAD_FLAG）→ 立刻換下一隻。
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, 0)
+    tab._cur = None
+    tab._fight((10.0, 10.0), TICK)
+    ck("　（先鎖回柱子）", tab._cur is m, f"實得 {tab._cur}")
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, 7)
+    tab._fight((10.0, 10.0), TICK)
+    ck("★★★★ 柱子：物件還在、狀態還是 Wait，但死亡旗標＝7 → 當拍判死",
+       tab._cur is None, f"實得 {tab._cur}")
+    # ⛔ 旗標讀不到（None）不准當死 —— 讀不到 ≠ 死了。
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, None)
+    tab._cur = None
+    tab._fight((10.0, 10.0), TICK)
+    ck("⛔ 旗標讀不到（None）→ 照舊當活的", tab._cur is m, f"實得 {tab._cur}")
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, 0)
     tab._cur = m
     tab._keys.eid = m.eid
     for _st in ("Att", "Att2", "Cast", "Run"):
-        dt.entity.read_live_hp = lambda _sc, e, s=_st: (True, s, (e.x, e.y), 0)
+        dt.entity.read_live_hp = lambda _sc, e, s=_st: (True, s, (e.x, e.y), 0, 0)
         tab._cur = None
         tab._fight((10.0, 10.0), TICK)
         ck(f"★★★ 血量 0 但狀態 {_st}（王剩不到 1%）→ 當活的照打", tab._cur is m,
@@ -1608,7 +1626,7 @@ def main() -> int:
     # ⚠ 「正在打的那隻死了」不歸 _fight 判 —— 那是共用的 TargetWorker 看到
     #   動畫 'Dead'／目標欄被清 0 就 emit died（副本頁 1766 接的 _on_died）。
     #   _fight 這裡只負責「掃描清單裡的屍體不要挑」，見下面那組斷言。
-    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "", (e.x, e.y), -1, 0)
     tab._fight((10.0, 10.0), TICK)
     ck("　血量 −1（沒交戰）→ 當活的、照挑", tab._cur is m)
     dt.entity.read_pos = lambda _sc, _addr: None

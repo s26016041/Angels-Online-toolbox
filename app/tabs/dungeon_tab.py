@@ -1869,7 +1869,8 @@ class DungeonTab(BaseTab):
         """
         if self._last is None:
             return []
-        return [m for m in self._last.mons if not entity.looks_dead(m.state)]
+        return [m for m in self._last.mons
+                if not entity.looks_dead(m.state, True, m.dead_flag)]
 
     # -- 這一區走得到哪裡 ---------------------------------------------
     def _refresh_grid(self, me, dt: float) -> None:
@@ -2398,8 +2399,8 @@ class DungeonTab(BaseTab):
             # ★ 死活當場重讀：**只看動畫狀態 'Dead'**。
             #   ⛔ 血量歸零不算死（王剩不到 1% 就是 0、怪站著不動是常態）——
             #   見 entity.looks_dead 的說明。
-            alive, st, p, hp = entity.read_live_hp(self._sc, m)
-            if p is None or entity.looks_dead(st, alive):
+            alive, st, p, hp, flag = entity.read_live_hp(self._sc, m)
+            if p is None or entity.looks_dead(st, alive, flag):
                 continue
             # ★ 放棄過、而且還站在原地 → 不挑（HOPELESS_MOVE）；牠動了就重新問
             stuck_at = self._hopeless.get(m.eid)
@@ -2673,7 +2674,7 @@ class DungeonTab(BaseTab):
             self._last_gave_up = m.eid
             # ★ 記下牠現在站哪：牠不動就不再挑（使用者 2026-09-05「走不過去的怪物直接無視」）。
             #   位置當場重讀；讀不到就用掃描時的座標（寧可記一個大概的，也不要記不到）。
-            _alive, _st, p, _hp = entity.read_live_hp(self._sc, m)
+            _alive, _st, p, _hp, _flag = entity.read_live_hp(self._sc, m)
             self._hopeless[m.eid] = tuple(p) if p else (m.x, m.y)
             self._notify(f"「{m.name}」{why} → 換一隻（牠不動就不再挑）")
         self._drop_target()
@@ -2702,7 +2703,7 @@ class DungeonTab(BaseTab):
                 return False
         m = self._cur
         # ★ 正在打的這隻每拍當場重讀一次：物件還在嗎／動畫狀態／血量。
-        alive, st, _lp, hp_ent = entity.read_live_hp(self._sc, m)
+        alive, st, _lp, hp_ent, flag = entity.read_live_hp(self._sc, m)
         # ★★★ 死了就立刻換下一隻（跟掛機頁同一份判斷 entity.looks_dead）：
         #   動畫 'Dead'，**或**物件已經被遊戲歸還到物件池 —— 後者正是副本裡
         #   柱子（封印水晶那種，從不變 'Dead'）唯一的死亡訊號，也是小地圖
@@ -2710,7 +2711,7 @@ class DungeonTab(BaseTab):
         #   ⚠ 「物件不在了」先再讀一次確認，單次讀失敗也會回 False。
         if not alive and st != entity.STATE_DEAD:
             alive = entity.is_alive(self._sc, m)
-        if entity.looks_dead(st, alive):
+        if entity.looks_dead(st, alive, flag):
             self._say(f"「{m.name}」死了 → 換下一隻")
             self._last_gave_up = None
             self._drop_target()
@@ -2723,7 +2724,7 @@ class DungeonTab(BaseTab):
         # ★ 正在打的那隻不在掃描結果裡 → 用剛才那次讀取驗物件：還在而且不是屍體
         #   ＝掃描漏了（照打＋補一次全掃）；物件沒了才**連續兩拍**判沒了。
         if not any(x.eid == m.eid for x in self._live_monsters()):
-            if alive and st != "Dead":
+            if not entity.looks_dead(st, alive, flag):
                 self._gone = 0
                 now = time.monotonic()
                 if now - self._full_req_t >= FULL_HUNT_GAP:

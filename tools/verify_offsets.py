@@ -49,6 +49,7 @@ NA = None                       # 「這台驗不了」
 COVERS: tuple[tuple[str, str], ...] = (
     ("entity", "OFF_TARGET"), ("entity", "OFF_TARGET_HP_GAP"),
     ("entity", "OFF_POS_"), ("entity", "OFF_ID"), ("entity", "OFF_STATE"),
+    ("entity", "OFF_DEAD_FLAG"),
     ("entity", "OFF_WEIGHT"), ("entity", "OFF_WEIGHT_MAX"),
     ("team", "MEMBERS_OFF"), ("team", "MEMBER_STRIDE"),
     ("energy", "OFF_"),
@@ -225,6 +226,24 @@ def checks(sc, log):
         put("實體 ID entity.OFF_ID 唯一", uniq, f"{len(ents)} 個實體")
     else:
         put("實體 ID entity.OFF_ID 唯一", NA, "沒掃到實體")
+
+    # entity.OFF_DEAD_FLAG：死亡旗標（+0x3D6==7）
+    # ★ 不變量：**活著的怪不准是 7**（2026-09-11 五台 45 秒約 7,800 次取樣，
+    #   一次都沒有）。反過來「'Dead' 的屍體是 7」只是多數（1702 vs 143），
+    #   所以不拿來當判定 —— 那條是 OR 訊號，不是充要條件。
+    #   ⚠ 這一條紅了代表 +0x3D6 搬家或換了意思：掛機／副本會把活怪當屍體跳過
+    #   （「明明有怪卻說沒怪」），⛔ 不准只把它從 looks_dead 拿掉了事，要重新定位。
+    live_seven = [e for e in ents
+                  if e.is_monster and e.dead_flag == entity.DEAD_FLAG
+                  and e.state != entity.STATE_DEAD and e.hp > 0]
+    seen_flag = [e for e in ents if e.is_monster and e.dead_flag is not None]
+    if not seen_flag:
+        put("死亡旗標 entity.OFF_DEAD_FLAG", NA, "沒掃到怪")
+    else:
+        put("死亡旗標 entity.OFF_DEAD_FLAG", not live_seven,
+            (f"{len(seen_flag)} 隻怪，活著卻是 7 的有 "
+             f"{len(live_seven)} 隻"
+             + (f"（{live_seven[0].name}）" if live_seven else "")))
 
     # entity.OFF_KIND / OFF_TYPE：怪的種類 ID 要查得到範本
     idx = monsters.index_base(sc)

@@ -109,18 +109,23 @@ STATE_RUNNING = "Run"     # 跑動中
 BUSY_STATES = ATT_STATES + (STATE_RUNNING,)
 
 
-def looks_dead(state: str, alive: bool = True) -> bool:
+def looks_dead(state: str, alive: bool = True, flag=None) -> bool:
     """這隻死了沒 —— **掛機頁與副本頁共用這一份判斷**（使用者 2026-09-09：
-    「同樣東西盡量不要有 2 個」）。兩個訊號**任一個**成立就算死：
+    「同樣東西盡量不要有 2 個」）。三個訊號**任一個**成立就算死：
 
     ① 動畫狀態 `'Dead'` —— 一般怪死掉當拍就有（實測 64 隻只有 1 隻後來變回
        'Wait'）。⚠ 但**副本裡的柱子（封印水晶那種）從來不會變 'Dead'**。
     ② `alive=False` ＝ **物件已經不是「活著的實體」了**（vtable 換掉／實體 ID
        對不上，見 `is_alive`）。★ 2026-09-09 實錄：怪一死，遊戲就把那個物件
        **歸還到空物件池**（型別換成池子的 vtable，掃出來 2607 個全是無 ID 空
-       物件）—— 小地圖的紅點瞬間消失就是這個。柱子是**死掉當下**就被歸還
-       （所以這是它唯一的死亡訊號），一般怪則是先變 'Dead'、約 5 秒後才歸還。
-       使用者原話：「怪物死掉我們 UI 地圖會瞬間紅點消失，即時且準確」。
+       物件）—— 小地圖的紅點瞬間消失就是這個。
+       ⛔ 2026-09-11 更正：以前寫「柱子是**死掉當下**就被歸還，所以這是它唯一
+       的死亡訊號」——**是錯的**。無限塔實測 5 隻封印水晶：死後物件還留著
+       （alive=True）**約 5 秒**才被回收，那 5 秒我們一直在打屍體。
+    ③ `flag`（實體 +0x3D6）**== 7 ＝ 死亡旗標**（2026-09-11 找到，見 OFF_DEAD_FLAG
+       的實測紀錄）：柱子死掉當拍就翻 7，而**活著的怪一次都沒有出現過 7**
+       （5 台分身 45 秒約 7,800 次取樣）。`flag=None` ＝ 沒讀到，就當沒有這個
+       訊號（安全退化，不會誤判死）。
 
     ⚠ 呼叫端拿到 `alive=False` 時**最好再讀一次確認**：那個值也可能只是
       「這一拍記憶體讀失敗」（讀不到 ≠ 沒有，見 [[bag-false-empty-guards]]）。
@@ -135,10 +140,10 @@ def looks_dead(state: str, alive: bool = True) -> bool:
       · 想用「0 而且沒在動作」補救也不行 —— **怪站著不動是常態**
         （'Wait' 是最常見的狀態），使用者原話：「怪物不動你都當死亡，
         怪物並不會一直動」「我自動打怪怪物不動都不打她」（第二次退）。
-      副本裡那種「死了也不會變 'Dead'」的柱子，靠上面第②條（物件被歸還）認 ——
-      那是遊戲自己給的訊號，不必猜。
+      副本裡那種「死了也不會變 'Dead'」的柱子，靠上面第③條（死亡旗標）認 ——
+      那是遊戲自己給的訊號，不必猜，而且跟血量無關（王剩不到 1% 不受影響）。
     """
-    return (not alive) or state == STATE_DEAD
+    return (not alive) or state == STATE_DEAD or flag == DEAD_FLAG
 
 
 # ★★ 動畫狀態的 ASCII（不是指標，字串直接內嵌在物件裡）。
@@ -170,6 +175,24 @@ STATE_MAX = 8             # 讀幾 bytes；最長的是 'Att2'
 #   'Dead'，只看 OFF_STATE 會一直對著屍體出手 → 血量歸零就當作打死了。
 OFF_HP_PCT = 0x288
 HP_PCT_NONE = 0xFFFFFFFF   # 還沒交戰（讀回來當 −1）
+
+# ★★★★ **死亡旗標**（2026-09-11 實測找到，見 `looks_dead` 的第③條）。
+#   由來：使用者回報「黑狐打類似柱子那種怪物還是一直想打屍體」。無限塔實測
+#   （scratchpad/pillar_watch.py，40 秒）：封印正義水晶死掉時**動畫狀態仍是
+#   'Wait'、物件也還在**，兩個舊訊號都不成立，要等 ~5 秒物件被遊戲回收才發現
+#   —— 那 5 秒就是對著屍體出手的時間（5 隻量到 3.0/5.4/5.2/5.2/5.25 秒）。
+#   找法：死亡那一拍把整個物件做位元組比對（scratchpad/pillar_diff.py，4 次死亡）
+#   → 每次都有三個欄位一起變：+0x288 血量→0、**+0x3D6→0x07**、+0x18 指標清 0。
+#   驗證：5 台分身 45 秒、約 7,800 次取樣（scratchpad/flag3d6_check.py，
+#   reports/flag3d6_check.txt）——
+#     · 活著的怪（狀態非 'Dead' 且血量非 0）出現 7：**0 次**
+#     · 'Dead' 的屍體是 7：1,702 次（另有 143 次是 0 —— 所以是 OR，不是取代）
+#     · **柱子屍體（狀態還是 'Wait'、血量 0）是 7：96 次** ← 補的就是這個洞
+#   ⚠ 結構偏移，屬「大更新改版面才會壞」那一類：`tools/verify_offsets.py` 有
+#     一條不變量盯著它（活怪不得為 7），改版體檢會紅。讀不到＝沒有這個訊號
+#     （安全退化：不會誤判死）。
+OFF_DEAD_FLAG = 0x3D6
+DEAD_FLAG = 7
 
 # ★ 負重（只有自己的物件有意義）。2026-08-11 五台實測：現值一律小於上限、
 #   五台的上限各不相同（廚狐 34860、其他 11308~13084），跟遊戲介面對得上。
@@ -238,6 +261,7 @@ class Entity:
     kind: int = -1            # 見 OFF_KIND；-1 = 沒讀到
     state: str = ""           # 動畫狀態，見 OFF_STATE
     hp: int = -1              # 血量百分比，見 OFF_HP_PCT；-1 = 沒交戰／沒讀到
+    dead_flag: int | None = None   # 死亡旗標，見 OFF_DEAD_FLAG；None = 沒讀到
 
     @property
     def hp_zero(self) -> bool:
@@ -259,8 +283,10 @@ class Entity:
         地方會一直挑到別人剛殺掉的那具。
         ⚠ 讀不到狀態（空字串）時一律當成活的 —— 寧可多打一隻，
           也不要因為讀取失敗把整批怪都跳過。
+        ★ 2026-09-11 加上**死亡旗標**（+0x3D6==7）：副本的柱子死掉時動畫狀態
+          不會變 'Dead'，只有這個旗標當拍就翻（見 `looks_dead` 第③條）。
         """
-        return self.state == "Dead"
+        return looks_dead(self.state, True, self.dead_flag)
 
     @property
     def is_monster(self) -> bool:
@@ -425,7 +451,9 @@ def locate_state(scanner, should_stop=None) -> int | None:
 
 
 # 一個實體要讀到的最後一個欄位是 OFF_KIND(0x2E4)+4 —— 一次讀這麼多就全有了。
-ENT_SPAN = OFF_KIND + 4
+# ⚠ 2026-09-11 從 OFF_KIND+4 擴到死亡旗標（+0x3D6）：每隻多讀 239 bytes，
+#   **系統呼叫次數不變**，柱子那種怪在清單上就分得出死活。
+ENT_SPAN = max(OFF_KIND + 4, OFF_DEAD_FLAG + 1)
 
 
 def _entity_from_blob(addr: int, blob: bytes) -> Entity | None:
@@ -450,7 +478,9 @@ def _entity_from_blob(addr: int, blob: bytes) -> Entity | None:
                   (vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS,
                   kind=struct.unpack_from("<I", blob, OFF_KIND)[0],
                   state=state,
-                  hp=_hp_pct(struct.unpack_from("<I", blob, OFF_HP_PCT)[0]))
+                  hp=_hp_pct(struct.unpack_from("<I", blob, OFF_HP_PCT)[0]),
+                  dead_flag=(blob[OFF_DEAD_FLAG]
+                             if len(blob) > OFF_DEAD_FLAG else None))
 
 
 def _hp_pct(raw: int) -> int:
@@ -481,7 +511,8 @@ def _build_slow(scanner, addr: int) -> Entity | None:
                   _u32(scanner, addr + OFF_TYPE), name, *pos,
                   kind=_u32(scanner, addr + OFF_KIND),
                   state=read_state(scanner, addr),
-                  hp=read_hp_pct(scanner, addr))
+                  hp=read_hp_pct(scanner, addr),
+                  dead_flag=read_dead_flag(scanner, addr))
 
 
 def _build(scanner, addrs: list[int]) -> list[Entity]:
@@ -730,22 +761,32 @@ def is_alive(scanner, ent: Entity) -> bool:
             and _u32(scanner, ent.addr + OFF_ID) == ent.eid)
 
 
-# 一次讀到 OFF_ID 就涵蓋 vtable(+0)、座標(+0xBC)、狀態(+0x12C)、實體 ID(+0x1C8)
-LIVE_SPAN = OFF_ID + 4
+# 一次讀到死亡旗標（+0x3D6）就涵蓋 vtable(+0)、座標(+0xBC)、狀態(+0x12C)、
+# 實體 ID(+0x1C8)。⚠ 2026-09-11 從 OFF_ID+4 擴到這裡：多讀 ~0x20B bytes，
+# **系統呼叫次數不變**（一次），但柱子那種怪的死亡旗標才讀得到。
+LIVE_SPAN = OFF_DEAD_FLAG + 1
 
 
-def read_live(scanner, ent: Entity) -> tuple[bool, str, tuple[float, float] | None]:
-    """一次讀回 (物件還在嗎, 動畫狀態, 座標)。
+def read_dead_flag(scanner, addr: int):
+    """實體的死亡旗標（+0x3D6）；讀不到回 None（＝沒有這個訊號，不是「活的」）。"""
+    raw = scanner._read_bytes(addr + OFF_DEAD_FLAG, 1)
+    return bytes(raw)[0] if raw else None
 
-    ★ 挑目標時這三件事本來各發一次系統呼叫（`is_alive` 自己就兩次），
-      一隻怪四次、場上幾十隻，而且每殺一隻就重挑一次。四次併成一次。
-    ★ 三個值變成**同一瞬間**的快照，不會出現「還活著但座標是死前的」。
+
+def read_live(scanner, ent: Entity
+              ) -> tuple[bool, str, tuple[float, float] | None, int | None]:
+    """一次讀回 (物件還在嗎, 動畫狀態, 座標, **死亡旗標**)。
+
+    ★ 挑目標時這幾件事本來各發一次系統呼叫（`is_alive` 自己就兩次），
+      一隻怪四次、場上幾十隻，而且每殺一隻就重挑一次。全部併成一次。
+    ★ 每個值都是**同一瞬間**的快照，不會出現「還活著但座標是死前的」。
+    ★ 死活一律交給 `looks_dead(state, alive, flag)` 判 —— 三個回傳值直接餵進去。
     讀不到就退回逐欄位讀，結果跟以前完全一樣。
     """
     blob = scanner._read_bytes(ent.addr, LIVE_SPAN)
     if not blob:
         return (is_alive(scanner, ent), read_state(scanner, ent.addr),
-                read_pos(scanner, ent.addr))
+                read_pos(scanner, ent.addr), read_dead_flag(scanner, ent.addr))
     return _live_from_blob(blob, ent)
 
 
@@ -757,24 +798,27 @@ def _live_from_blob(blob: bytes, ent: Entity):
     except UnicodeDecodeError:
         state = ""
     vx, vy = struct.unpack_from("<II", blob, OFF_POS_X)
-    return alive, state, ((vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS)
+    flag = blob[OFF_DEAD_FLAG] if len(blob) > OFF_DEAD_FLAG else None
+    return (alive, state,
+            ((vx >> 16) / TILE_UNITS, (vy >> 16) / TILE_UNITS), flag)
 
 
-# 再多讀到血量欄（+0x288）—— 物件本體超過 0x500 bytes，這段一定在同一物件裡。
-LIVE_HP_SPAN = OFF_HP_PCT + 4
+# 血量欄（+0x288）在死亡旗標前面，所以這一段跟 LIVE_SPAN 一樣長。
+LIVE_HP_SPAN = max(OFF_HP_PCT + 4, LIVE_SPAN)
 
 
 def read_live_hp(scanner, ent: Entity
-                 ) -> tuple[bool, str, tuple[float, float] | None, int]:
-    """`read_live` 再加一個值：(物件還在嗎, 動畫狀態, 座標, **血量百分比**)。
+                 ) -> tuple[bool, str, tuple[float, float] | None, int,
+                            int | None]:
+    """`read_live` 再加一個值：(物件還在嗎, 動畫狀態, 座標, **血量百分比**, 死亡旗標)。
 
-    血量 **0 ＝ 打死了**、−1 ＝ 沒交戰或讀不到（當活的）。副本用這支：
-    柱子那種死了動畫狀態不變 'Dead' 的，只有血量能分出死活。
+    血量 −1 ＝ 沒交戰或讀不到。⛔ **血量不判死**（王剩不到 1% 也是 0，
+    見 `looks_dead`）—— 它只拿來分辨「交戰過 vs 別人的屍體」與顯示。
     """
     blob = scanner._read_bytes(ent.addr, LIVE_HP_SPAN)
     if not blob:
-        alive, state, pos = read_live(scanner, ent)
-        return alive, state, pos, read_hp_pct(scanner, ent.addr)
-    alive, state, pos = _live_from_blob(blob, ent)
+        alive, state, pos, flag = read_live(scanner, ent)
+        return alive, state, pos, read_hp_pct(scanner, ent.addr), flag
+    alive, state, pos, flag = _live_from_blob(blob, ent)
     return alive, state, pos, _hp_pct(
-        struct.unpack_from("<I", blob, OFF_HP_PCT)[0])
+        struct.unpack_from("<I", blob, OFF_HP_PCT)[0]), flag
