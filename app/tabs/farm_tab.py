@@ -626,6 +626,19 @@ UNREACH_HITS = 3
 # 目標要連續這麼多次掃不到才當作牠死了／離開視野。
 # 熱區掃描偶爾會漏，單次就放棄會在打鬥中間換目標。
 GONE_SCANS = 2
+# ★★★★ 「被伺服器拉回」的偵測與善後（2026-09-11 使用者要求做「B 復原型」）。
+#   量到的形狀（tools/rollback_probe.py 10Hz 純讀，148 秒 5 台）：連續跑了 2 秒
+#   以上之後，位置**一拍**倒退 6~7 格，落點正是 0.7~0.9 秒前走過的地方；終點與
+#   整條軌跡拿地形圖驗過都可走，也沒有切角 —— 也就是客戶端跑在伺服器前面、
+#   伺服器定期把人往回同步。⛔ 這件事我們擋不掉（8/18 白狐 50 分鐘實錄已經把
+#   起跑時機／距離／地形全部檢定過，客戶端側沒有可預防的特徵），但**拉回之後
+#   的連鎖壞事可以修掉**：舊路照走、卡住錨點被倒退洗成「沒進展」、以及拉回那
+#   一瞬間實體清單攪動被當成「打死了」（8/18 實錄抓到現行：打到 55% 的怪被放生
+#   還進了 60 秒黑名單）。
+ROLLBACK_JUMP = 3.0        # 一拍位移超過這麼多格 ＝ 不可能用走的（正常約 1.2 格）
+ROLLBACK_BACK = 1.5        # 落點離「剛剛走過的某一點」這麼近 ＝ 往回拉，不是往前傳送
+ROLLBACK_TRAIL = 12.0      # 軌跡留這麼多秒（要比拉回的回溯距離長）
+ROLLBACK_GRACE = 2.0       # 拉回後這麼久之內，「物件不見了」不算死亡證據
 
 
 class _NoteLabel(QLabel):
@@ -1366,6 +1379,10 @@ class TargetWorker(_Paced):
         # 「選定」封包送出去了沒。⚠ 遊戲收到那一包才會填血量，
         #   所以沒送之前不能開始算屍體 —— 否則走過去的路上會把活怪全丟掉。
         self.engaged = False
+        # ★ 拉回寬限：GUI 執行緒偵測到伺服器拉回時把這個時間往後推
+        #   （單一 float 指派，跨執行緒讀寫是原子的）。寬限內「物件不見了」
+        #   這個訊號不可信 —— 拉回瞬間實體清單會攪動（見 ROLLBACK_GRACE）。
+        self.rollback_until = 0.0
 
     def attack(self, state: int, ent: entity.Entity) -> None:
         self._wrote = False
@@ -1424,6 +1441,13 @@ class TargetWorker(_Paced):
             if not alive and st != entity.STATE_DEAD:
                 alive = entity.is_alive(self.sc, ent)
             if entity.looks_dead(st, alive, flag):
+                # ★★ 拉回後 ROLLBACK_GRACE 秒內：**只有「物件不見了」那個訊號
+                #   不可信**（拉回瞬間實體清單會攪動）。動畫 'Dead' 與死亡旗標
+                #   是遊戲對這隻怪本身的硬證據，照常算數。
+                hard = (st == entity.STATE_DEAD
+                        or flag == entity.DEAD_FLAG)
+                if not hard and time.monotonic() < self.rollback_until:
+                    return              # 這一拍先不下結論，下一拍再驗
                 if self._job is job:
                     self._job = None
                 self._wrote = False
@@ -1736,6 +1760,10 @@ class CharFarmPage(QWidget):
         self._since_scan = 0.0     # 距離上次自動重掃過了多久
         self._stuck = 0.0          # 打不到也走不到的時間（卡住偵測）
         self._anchor = None        # 卡住偵測的錨點（淨位移超過就重設）
+        # ★ 拉回偵測（見 ROLLBACK_JUMP）：最近幾秒的軌跡＋最後一次拉回的時刻
+        self._trail: list[tuple[float, float, float, int]] = []   # (時刻,x,y,場景)
+        self._rollback_t = 0.0     # 上次被伺服器拉回是什麼時候（monotonic）
+        self._rollbacks = 0        # 這一輪掛機累計被拉回幾次（診斷用）
         self._dbg_t = 0.0          # 診斷紀錄的計時（見 _FARM_LOG）
         self._dbg_empty_t = 0.0    # 「挑不到目標」紀錄的節流（見 _pick_next）
         self._want_full = False    # 下一次掃描要求全掃（見 _ask_full）
@@ -5454,6 +5482,71 @@ class CharFarmPage(QWidget):
         self._kills = 0
         self.kills_lbl.setText("已擊殺 0 隻")
 
+    def _note_rollback(self, me, here) -> bool:
+        """位置被伺服器拉回了嗎？是的話順手做善後，回 True。
+
+        ★★★★ 2026-09-11 使用者定的「B 復原型」：**拉回本身擋不掉**（伺服器端的
+          事，8/18 白狐 50 分鐘實錄已經把客戶端側的可疑因子全部檢定過），我們
+          只負責「拉回之後別跟著壞事」——
+
+          ① **舊路作廢**：手上那條繞路是用倒退前的位置算的，照舊路走會走歪、
+             更容易再被拉一次 → 清掉 `_way`／逼下一拍重算。
+          ② **卡住錨點歸零**：卡住偵測看的是「離錨點的淨位移」，位置突然倒退
+             會被當成「一直沒進展」→ 15 秒門檻提早爆掉、把還在打的怪換掉。
+          ③ **死亡訊號降級**（`TargetWorker.rollback_until`）：拉回瞬間實體清單
+             會攪動，「物件不見了」這個訊號在寬限內不算數 —— 8/18 實錄就是這樣
+             把打到 55% 的怪當成打死、灌進擊殺數還冰了 60 秒。
+             ⚠ 動畫 'Dead' 與死亡旗標是硬證據，不受影響。
+
+        判定（跟副本頁 `_rejoin` 的 `_track` 同一招）：**一拍**跳超過
+        ROLLBACK_JUMP 格（正常跑步一拍才 1.2 格），而且落點離「剛剛走過的某一點」
+        不到 ROLLBACK_BACK 格 ＝ 往回拉；落點沒走過的話那是往前傳送（順移／
+        傳點），不能算拉回。⚠ 換地圖那一拍一律不算。
+        """
+        if me is None or here is None:
+            return False
+        now = time.monotonic()
+        trail = self._trail
+        # ⚠ 心跳是 10ms 一拍，軌跡**不必**每拍都記（拉回是一瞬間的事，50ms
+        #   取樣看得一清二楚，而正常跑步 50ms 才走 0.6 格，遠低於門檻）。
+        if trail and now - trail[-1][0] < 0.05:
+            return False
+        trail.append((now, me[0], me[1], here))
+        # 只留最近 ROLLBACK_TRAIL 秒
+        cut = now - ROLLBACK_TRAIL
+        if len(trail) > 8 and trail[0][0] < cut:
+            self._trail = trail = [r for r in trail if r[0] >= cut]
+        if len(trail) < 3:
+            return False
+        prev_t, px, py, pscene = trail[-2]
+        if pscene != here or now - prev_t > 0.5:
+            return False                     # 換地圖／取樣斷掉：不下結論
+        if math.hypot(me[0] - px, me[1] - py) < ROLLBACK_JUMP:
+            return False
+        # 落點是不是「剛剛走過的地方」（至少 0.3 秒前，免得比到自己這一拍）
+        back = None
+        for t, x, y, sc in trail[:-1]:
+            if sc != here or now - t < 0.3:
+                continue
+            if math.hypot(me[0] - x, me[1] - y) <= ROLLBACK_BACK:
+                back = now - t
+                break
+        if back is None:
+            return False                     # 往前瞬移（順移技能／傳點）不算
+        self._rollback_t = now
+        self._rollbacks += 1
+        self._way = []                       # ① 舊路作廢
+        self._path_pts = -1
+        self._path_t = 0.0
+        self._anchor = me                    # ② 卡住錨點跟著人走
+        self._stuck = 0.0
+        if self._atk is not None:             # ③ 死亡訊號降級（見 rollback_until）
+            self._atk.rollback_until = now + ROLLBACK_GRACE
+        self._gone = 0
+        self._dbg(f"伺服器拉回：退到 {back:.1f} 秒前的位置"
+                  f"（累計 {self._rollbacks} 次）→ 重算路線、卡住計時歸零")
+        return True
+
     def _on_died(self, eid: int, confirmed: bool = True) -> None:
         """攻擊執行緒回報目標沒了 —— 立刻從既有清單接下一隻。
 
@@ -5549,6 +5642,9 @@ class CharFarmPage(QWidget):
         #   第一次體檢就因為舊的 _dry_trips 還是 2 → 連一趟都沒跑就再通知一次同一句停機。
         self._dry_trips = 0
         self._broken_trips = 0
+        # 拉回計數與軌跡也是「這一輪」的（診斷用，見 _note_rollback）
+        self._rollbacks = 0
+        self._trail = []
         self._pick_home()                  # 記錄點：巡邏點優先（見 _pick_home）
         # ★ 每次開始都重學一次技能 ID —— 使用者隨時可能換掉那個鍵上的技能。
         #   學法：直讀快捷欄那格（quickbar.py），通常當場拿到；讀不到才退回
@@ -5974,6 +6070,13 @@ class CharFarmPage(QWidget):
             #   在別張圖上完全沒有意義（會照著它往一個不相干的方向走）。
             if was != self._scene:
                 self._nav.reset()
+
+        # ★★★★ 被伺服器拉回了嗎（見 _note_rollback）。放在走位／卡住判斷
+        #   **之前**：拉回會讓「離錨點的淨位移」變成倒退，不先處理的話這一拍
+        #   就會被當成「沒進展」開始累積卡住秒數，手上那條舊路也會照走。
+        if self._note_rollback(me, self._scene):
+            self.status.setText(
+                f"↩ 被伺服器拉回（本輪第 {self._rollbacks} 次）→ 重新規劃路線")
 
         # ★★ 「角色正在走路嗎」——**直接讀遊戲的動畫狀態**（'Run' / 'Wait'），
         #   不要再隔 0.3 秒比一次位置。移動中一律不重下移動指令（會把多點路徑
