@@ -89,6 +89,7 @@ supply.time = CLOCK                 # ⚠ 假時鐘要 patch 進 supply 的命�
 MOVER, SC = FakeMover(), FakeSC()
 
 REAL_WAIT = supply._wait_dialog     # ④ 要用它本人（②會換成替身）
+REAL_TOKEN0 = supply._dialog_token   # ④b 要用它本人（②會換成 lambda sc: 7）
 REAL_WALK = supply._walk_to_npc     # ⑤ 要用它本人（①會換成替身）
 
 print("① 人被傳走之後不會在新地圖亂走（每一輪先問 confirm）")
@@ -323,6 +324,32 @@ PAGE[0] = types.SimpleNamespace(sig=("新的一頁",), wnd=7)
 CLOCK.t = t0
 opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
 check("旗標讀不到 → 退回頁面簽章，不亂判", opened is True)
+
+# ★★★★ 2026-09-12 實機（雪狐 → 暴走穗海農場，兩趟都重現）的真兇：旗標說
+#   「畫面上沒有對話框」，但代號跟基準比起來不一樣（一邊有符號、一邊無符號
+#   ＝同一個代號的兩種寫法）→ 舊寫法宣告「對話開了」→ 對著沒開的對話送掉三個
+#   選項 → 磨滿 20 秒確認逾時 → 再點一次才成。33 秒裡 20 秒是這樣白等的。
+VIS[0] = False
+PAGE[0] = types.SimpleNamespace(sig=("新的一頁",), wnd=2582610512)
+CLOCK.t = t0
+opened = REAL_WAIT(SC, -1712356784, supply.DIALOG_NEAR_TIMEOUT,
+                   page_base=("舊頁",))
+check("★★★ 旗標說沒顯示 → 代號變了／頁面變了**都不算開**（實機那 20 秒的根因）",
+      opened is False, f"回了 {opened}")
+VIS[0] = None                      # 問不到旗標 → 那才是真的「驗不了」，照舊採信
+CLOCK.t = t0
+opened = REAL_WAIT(SC, -1712356784, supply.DIALOG_NEAR_TIMEOUT,
+                   page_base=("舊頁",))
+check("　旗標問不到 → 照舊採信軟訊號（⛔ 不要因為修 bug 把退路也砍了）",
+      opened is True, f"回了 {opened}")
+supply.talkwnd = REAL_TALKWND
+REAL_GLOBALS0 = supply.lua.globals_of
+supply.lua.globals_of = lambda sc, names: {supply.DIALOG_WND: -1712356784}
+check("★ _dialog_token 回**無符號**（跟 talkwnd.Page.wnd 同一種表示法才比得起來）",
+      REAL_TOKEN0(SC) == 2582610512, str(REAL_TOKEN0(SC)))
+supply.lua.globals_of = REAL_GLOBALS0
+supply.talkwnd = types.SimpleNamespace(page=lambda sc: PAGE[0],
+                                       window_visible=lambda sc: VIS[0])
 
 print()
 print("④c 選項之間：看到下一頁就送，⛔ 不睡滿 TALK_GAP（使用者 2026-09-12）")

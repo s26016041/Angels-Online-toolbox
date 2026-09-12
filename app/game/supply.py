@@ -593,7 +593,14 @@ def _dialog_token(scanner):
         return None
     if not g or DIALOG_WND not in g:
         return None
-    return g[DIALOG_WND]
+    # ★★★ 一律回**無符號**（2026-09-12 實機抓到的假邊沿）：這裡以前回 Lua 讀到的
+    #   原值（有符號 -1712356784），而 `talkwnd.Page.wnd` 是 `& 0xFFFFFFFF` 的
+    #   無符號（2582610512）—— 同一個代號、兩種表示法 → `_wait_dialog` 裡
+    #   「代號變了」恆成立 → 每次點 NPC 都假宣告「對話開了」。
+    try:
+        return int(g[DIALOG_WND]) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return g[DIALOG_WND]
 
 
 def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
@@ -643,18 +650,31 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
         #   貼身點明明 0.13 秒就開好了，卻要把 DIALOG_NEAR_TIMEOUT 磨滿才走
         #   「驗不了照送」那條（使用者 2026-09-12：「對話框不是馬上就會出現嗎，
         #   為何要等」）。⚠ 回 None ＝不知道 → 照舊看下面兩個訊號。
-        if talkwnd.window_visible(scanner):
+        vis = talkwnd.window_visible(scanner)
+        if vis:
             return True
-        # ★ 一次讀完（`talkwnd.page` 跟 `_dialog_token` 走同一條純讀 Lua 全域的路，
-        #   順便把 WND_MESSAGE 的現值一起拿回來）。讀不到才退回只讀代號。
-        pg = talkwnd.page(scanner) if page_base is not _UNSET_PAGE else None
-        now = pg.wnd if pg is not None else _dialog_token(scanner)
-        if now is not None and now != baseline and now != 0:
-            return True
-        # ★★ 第二個訊號：**新的一頁來了**（見 page_base 的說明）。
-        if (pg is not None and page_base is not _UNSET_PAGE
-                and page_base is not None and pg.sig != page_base):
-            return True
+        # ★★★★ 2026-09-12 實機（雪狐 → 暴走穗海農場，兩趟都重現）：**旗標說 False
+        #   就是畫面上真的沒有對話框 → 舊訊號一律讓位**。以前這裡是「旗標沒說開，
+        #   那再看看代號／簽章」，結果是：
+        #       4.01s  window_visible = False      ← 硬訊號說沒開
+        #       4.01s  _wait_dialog = True（1ms）   ← ⛔ 代號邊沿卻說開了
+        #   → 對著沒開的對話送掉三個選項（全落空）→ `wait_done` 磨滿 ENTER_WAIT
+        #     20 秒 → 第二次點才真的開對話。33 秒裡有 20 秒是這樣白等的。
+        #   真兇是代號的**表示法**：`_dialog_token` 回有符號（-1712356784）、
+        #   `talkwnd.Page.wnd` 是無符號（2582610512）→ `now != baseline` 恆成立
+        #   ＝每次點下去都宣告「開了」（已一起改成無符號，見 `_dialog_token`）。
+        #   ⚠ 只有旗標回 **None（問不到）** 才回頭看代號／簽章那兩個軟訊號。
+        if vis is None:
+            # ★ 一次讀完（`talkwnd.page` 跟 `_dialog_token` 走同一條純讀 Lua 全域的路，
+            #   順便把 WND_MESSAGE 的現值一起拿回來）。讀不到才退回只讀代號。
+            pg = talkwnd.page(scanner) if page_base is not _UNSET_PAGE else None
+            now = pg.wnd if pg is not None else _dialog_token(scanner)
+            if now is not None and now != baseline and now != 0:
+                return True
+            # ★★ 第二個訊號：**新的一頁來了**（見 page_base 的說明）。
+            if (pg is not None and page_base is not _UNSET_PAGE
+                    and page_base is not None and pg.sig != page_base):
+                return True
         if again is not None:
             if time.time() - last_click >= CLICK_REPEAT:
                 last_click = time.time()
@@ -953,8 +973,9 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             if not _wait_arrival(scanner, npc_id):
                 fails += 1                           # 對話開了但人沒到位（被擋/太遠）
                 continue                             # → 絕不送購買選項，調位置重來
-        elif _dialog_token(scanner) and _wait_arrival(scanner, npc_id,
-                                                      timeout=2.0):
+        elif (talkwnd.window_visible(scanner) is not False
+              and _dialog_token(scanner)
+              and _wait_arrival(scanner, npc_id, timeout=2.0)):
             # ★★ 沒看到邊沿 **≠** 對話框沒開：**本來就開著**的時候代號一動也不動
             #   （2026-09-03 黑狐銀行實測：對話框開著再點，WND_MESSAGE 3 秒沒變，
             #     但兩個選項照送、WND_BANK 真的開了）。舊寫法把這種「驗不了」當成
@@ -962,6 +983,10 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             #   ⚠ 這正是本專案復發七次的「讀不到≠沒有」（bag-false-empty-guards）。
             #   → 人到位（停穩且 ≤ TALK_RANGE）且代號非 0 就照送選項，
             #     成沒成一律交給最後那道視窗檢查判。
+            # ★★★★ 但 2026-09-12 加了第一道閘：**旗標明說 False 就不走這條**。
+            #   「驗不了照送」是給沒有硬訊號的年代用的；現在畫面上確定沒有對話框
+            #   還硬送選項，只會落空然後磨滿確認逾時（實機 20 秒，見 _wait_dialog）。
+            #   旗標回 None（問不到）時這條照舊 —— 那才是真的「驗不了」。
             pass
         else:
             fails += 1
