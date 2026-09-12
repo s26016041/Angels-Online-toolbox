@@ -130,9 +130,9 @@ from app.game import (dungeon, entity, farmsettings, guildbank, itemname, jumpma
                       robot, scene, scenery, sell, skills, supply, talkwnd,
                       team, terrain)
 from app.tabs.base_tab import GROUP_AUTO, BaseTab, fit_spin
-from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, LOOT_GAP, FarmTab,
-                               KeyWorker, MODE_PACKET, ScanWorker, SKILL_KEYS,
-                               TargetWorker, loot_panel)
+from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, GangWorker, LOOT_GAP,
+                               FarmTab, KeyWorker, MODE_PACKET, ScanWorker,
+                               SKILL_KEYS, TargetWorker, loot_panel)
 
 TICK_MS = 100
 # ★ 執行紀錄（2026-09-05 使用者回報「exe 跑一跑會卡住、py 跑就正常」）：exe 沒有主控台、
@@ -661,6 +661,7 @@ class DungeonTab(BaseTab):
         self._script = None
         self._keys = None            # KeyWorker
         self._atk = None             # TargetWorker
+        self._gang = None            # GangWorker（被圍毆就反擊，跟掛機頁同一支）
         self._loading = False        # 正在把設定讀回畫面（這期間不要回存）
         self._farm = None            # 自動掛機頁（平常從主視窗找；測試直接塞假的）
         # 「副本設定」視窗裡的三個值（存 config，照分身；預設見 SCHED_DEFAULTS）
@@ -766,7 +767,10 @@ class DungeonTab(BaseTab):
         root.addLayout(sbar)
 
         g = QGroupBox("攻擊（跟自動掛機同一套）")
-        a = QHBoxLayout(g)
+        # ★ 兩列：第一列是技能鍵，第二列是「被圍毆就反擊」（2026-09-12 新增）。
+        gv = QVBoxLayout(g)
+        a = QHBoxLayout()
+        gv.addLayout(a)
         a.addWidget(QLabel("技能鍵"))
         # 跟掛機同樣的做法：勾幾個 F 鍵，照 F1→F12 輪流放；鍵上放什麼直讀
         # 快捷欄（空格／物品格自動略過）。⚠ 勾選框要包在 QWidgetAction 裡，
@@ -796,6 +800,45 @@ class DungeonTab(BaseTab):
         self._sync_key_btn()
         a.addWidget(self.key_btn)
         a.addStretch(1)
+        # ── 第二列：被圍毆就反擊（跟掛機頁同一套：同一支 GangWorker、同樣的規矩）
+        # 誰在打我是**讀準的**（怪身上的 +0x34C ＝ 牠正在打誰，屍體會排掉），
+        # ⛔ 不看血量、不看距離猜。出手在自己的執行緒，不碰目標欄、不送鍵、不走路。
+        b2 = QHBoxLayout()
+        gv.addLayout(b2)
+        b2.addWidget(QLabel("被"))
+        self.gang_n = QSpinBox()
+        self.gang_n.setRange(0, 30)
+        self.gang_n.setValue(0)
+        fit_spin(self.gang_n)
+        self.gang_n.setToolTip(
+            "幾隻怪同時打我就放下面那幾招。\n"
+            "0 ＝ 關掉這個功能。\n"
+            "「在打我」是讀遊戲自己的「這隻怪正在打誰」，不是看血量、也不是看距離。")
+        self.gang_n.valueChanged.connect(self._gang_changed)
+        b2.addWidget(self.gang_n)
+        b2.addWidget(QLabel("隻怪同時打我就放"))
+        self.gang_btn = QToolButton()
+        self.gang_btn.setPopupMode(QToolButton.InstantPopup)
+        self.gang_btn.setToolTip(
+            "勾要放的技能鍵（可多選），照 F1→F12 順序各放一次。\n"
+            "目標＝正在打我的怪裡離我最近的那一隻，打不到的招自動跳過。\n"
+            "⛔ 不會走路，也不會搶腳本正在打的目標。")
+        gm = QMenu(self.gang_btn)
+        self._gang_cbs: list[tuple[QCheckBox, int, str]] = []
+        for label, vk in SKILL_KEYS:
+            cb = QCheckBox(label)
+            cb.setStyleSheet("padding: 4px 10px;")
+            act = QWidgetAction(gm)
+            act.setDefaultWidget(cb)
+            gm.addAction(act)
+            self._gang_cbs.append((cb, vk, label))
+        for cb, _vk, _lab in self._gang_cbs:
+            cb.toggled.connect(self._gang_changed)
+        gm.aboutToShow.connect(self._label_keys)
+        self.gang_btn.setMenu(gm)
+        self._sync_gang_btn()
+        b2.addWidget(self.gang_btn)
+        b2.addStretch(1)
         root.addWidget(g)
 
         rbar = QHBoxLayout()
@@ -1190,6 +1233,8 @@ class DungeonTab(BaseTab):
         #   exe/py 差異時抓到（[[exe-vs-py-differences]]）。
         config.set(self._key("script"), self._script_stem())
         config.set(self._key("vks"), self._picked_keys())
+        config.set(self._key("gang_n"), int(self.gang_n.value()))
+        config.set(self._key("gang_vks"), self._picked_gang_keys())
         # ⛔ 「從第幾步開始」的開關與步驟**不存**（使用者 2026-09-05：不需要紀錄）。
         config.set(self._key("loop"), bool(self.loop_cb.isChecked()))
         # 副本設定：勾選＋視窗裡的三個值（使用者 2026-09-05：都要記錄）
@@ -1249,6 +1294,12 @@ class DungeonTab(BaseTab):
                 for cb, vk, _lab in self._key_cbs:
                     cb.setChecked(vk in vks)
                 self._sync_key_btn()
+            # 被圍毆就反擊（0 = 關）。舊設定檔沒有這兩個鍵 → 預設關掉。
+            self.gang_n.setValue(int(config.get(self._key("gang_n"), 0) or 0))
+            gvks = config.get(self._key("gang_vks"), []) or []
+            for cb, vk, _lab in self._gang_cbs:
+                cb.setChecked(vk in gvks)
+            self._sync_gang_btn()
         finally:
             self._loading = False
 
@@ -1366,6 +1417,43 @@ class DungeonTab(BaseTab):
         else:
             self.key_btn.setText(f"{labels[0]} 等 {len(labels)} 鍵")
 
+    def _picked_gang_keys(self) -> list[int]:
+        """圍毆反擊勾選的技能鍵（照 F1→F12 順序）。⚠ 沒勾＝不放，不退預設。"""
+        return [vk for cb, vk, _lab in self._gang_cbs if cb.isChecked()]
+
+    def _sync_gang_btn(self) -> None:
+        labels = [lab for cb, _vk, lab in self._gang_cbs if cb.isChecked()]
+        if not labels:
+            self.gang_btn.setText("選技能鍵")
+        elif len(labels) <= 4:
+            self.gang_btn.setText("、".join(labels))
+        else:
+            self.gang_btn.setText(f"{labels[0]} 等 {len(labels)} 鍵")
+
+    def _gang_changed(self) -> None:
+        self._sync_gang_btn()
+        if self._gang is not None:
+            self._gang.need = int(self.gang_n.value())
+            self._gang.vks = self._picked_gang_keys()
+            self._gang._next_qb = 0.0     # 換了鍵就立刻重讀快捷欄
+        self._save_settings()
+
+    def _sync_gang(self, on: bool) -> None:
+        """把「現在看得到誰」餵給圍毆反擊那條執行緒，並決定它動不動。
+
+        ⚠ 餵的是**含屍體**的原始清單 —— 屍體由 `entity.attackers()` 自己濾
+          （2026-09-12 掛機頁踩過：屍體會留著「目標是我」，害人數灌水）。
+        """
+        if self._gang is None:
+            return
+        if not on:
+            self._gang.set_on(False)
+            return
+        self._gang.mons = self._last.mons if self._last is not None else []
+        self._gang.mover = self._mover
+        self._gang.player = self._player
+        self._gang.set_on(True)
+
     def _label_keys(self) -> None:
         """把選單上的 F1~F12 標成「F1（電擊術Ⅳ）」—— 跟掛機頁同一套。
 
@@ -1403,6 +1491,8 @@ class DungeonTab(BaseTab):
                     nm = itemname.of(c.value)
                     text = f"{label}（物品：{nm}）" if nm else f"{label}（物品）"
             cb.setText(text)
+            if i < len(self._gang_cbs):
+                self._gang_cbs[i][0].setText(text)
 
     # ------------------------------------------------------------------
     # 開始／停止
@@ -1772,6 +1862,12 @@ class DungeonTab(BaseTab):
         self._keys.mover = self._mover
         self._keys.vks = self._picked_keys()
         self._keys.start()
+        # 被圍毆就反擊（跟掛機頁同一支）——⛔ 不碰目標欄、不送鍵、不走路。
+        self._gang = GangWorker(sc)
+        self._gang.need = int(self.gang_n.value())
+        self._gang.vks = self._picked_gang_keys()
+        self._gang.mover = self._mover
+        self._gang.start()
         return True
 
     def _teardown(self) -> None:
@@ -1784,6 +1880,11 @@ class DungeonTab(BaseTab):
             self._keys.stop()
             self._keys.wait(500)
             self._keys = None
+        if self._gang is not None:
+            self._gang.set_on(False)
+            self._gang.stop()
+            self._gang.wait(500)
+            self._gang = None
         if self._atk is not None:
             self._atk.stop()
             self._atk.wait(500)
@@ -1963,10 +2064,12 @@ class DungeonTab(BaseTab):
         dt = TICK_MS / 1000.0
         # ⓪-000 副本設定的休息：角色交給掛機頁了，這裡**只倒數**（不掃描、不讀不寫）
         if self._cycle == "rest":
+            self._sync_gang(False)       # 交給掛機頁了，這裡完全讓開
             self._rest_tick(dt)
             return
         # ⓪-000 斷線了 → 等同一個帳號回到線上（不掃描、不讀不寫；見 OFFLINE_POLL）
         if self._cycle == "offline":
+            self._sync_gang(False)       # 斷線中不讀不寫
             self._offline_tick(dt)
             return
         # ⓪-0000 斷線／閃退偵測：一定要在最前面 —— 閃退之後底下每一段都在讀一個
@@ -1982,6 +2085,7 @@ class DungeonTab(BaseTab):
         if self._stuck_watch(dt):
             return
         self._loot_tick(dt)
+        self._sync_gang(True)            # 被圍毆就反擊：清單與跳板跟著更新
         sc = self._sc
 
         # 掃描節奏：有怪要快、趕路可以慢
