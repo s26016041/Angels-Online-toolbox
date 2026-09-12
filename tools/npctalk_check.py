@@ -283,7 +283,9 @@ print("④b 對話框開了但 WND_MESSAGE 的值沒變（同一個視窗重開�
 #   → 加第二個訊號：**點之前 vs 現在的對話頁簽章**（新的一頁來了就會變）。
 REAL_TALKWND = supply.talkwnd
 PAGE = [types.SimpleNamespace(sig=("舊頁",), wnd=7)]
-supply.talkwnd = types.SimpleNamespace(page=lambda sc: PAGE[0])
+VIS = [None]                       # 「視窗顯示中」旗標：None＝不知道（退回舊訊號）
+supply.talkwnd = types.SimpleNamespace(page=lambda sc: PAGE[0],
+                                       window_visible=lambda sc: VIS[0])
 CLOCK.t = t0
 opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
 check("頁面沒變 → 照舊回 False", opened is False)
@@ -301,6 +303,80 @@ PAGE[0] = None                                             # 頁面讀不到
 CLOCK.t = t0
 opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
 check("頁面讀不到 → 退回只看代號，不亂判", opened is False)
+
+# ★★★★ 2026-09-12：有了「視窗真的顯示中」的硬旗標（視窗物件 +0xB4，
+#   talkwnd.window_visible）就不必再等代號／簽章變 —— 使用者問「對話框不是
+#   馬上就會出現嗎，為何要等」，答案是以前**看不出來**，只能把逾時磨滿。
+PAGE[0] = types.SimpleNamespace(sig=("舊頁",), wnd=7)      # 代號、頁面都沒變
+VIS[0] = True
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
+check("★ 旗標說顯示中 → 立刻認定開了（代號沒變、頁面也沒變）", opened is True)
+check("　而且幾乎沒花時間（⛔ 不再磨滿逾時）", CLOCK.t - t0 < 0.3,
+      f"花了 {CLOCK.t - t0:.2f} 秒")
+VIS[0] = False                     # 旗標說沒顯示 → 照舊看另外兩個訊號
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
+check("旗標說沒顯示 → 照舊回 False", opened is False)
+VIS[0] = None                      # 讀不到（改版抄不到偏移）→ 完全是舊行為
+PAGE[0] = types.SimpleNamespace(sig=("新的一頁",), wnd=7)
+CLOCK.t = t0
+opened = REAL_WAIT(SC, 7, supply.DIALOG_NEAR_TIMEOUT, page_base=("舊頁",))
+check("旗標讀不到 → 退回頁面簽章，不亂判", opened is True)
+
+print()
+print("④c 選項之間：看到下一頁就送，⛔ 不睡滿 TALK_GAP（使用者 2026-09-12）")
+PAGE[0] = types.SimpleNamespace(sig=("第一頁",), wnd=7)
+CLOCK.t = t0
+
+
+def _turn_page(_sc):
+    # 第二次問的時候就換頁（＝伺服器回了下一頁）
+    if CLOCK.t - t0 >= supply.TALK_STEP_FLOOR + 0.05:
+        return types.SimpleNamespace(sig=("第二頁",), wnd=7)
+    return PAGE[0]
+
+
+supply.talkwnd = types.SimpleNamespace(page=_turn_page,
+                                       window_visible=lambda sc: None)
+got = supply._wait_page(SC, ("第一頁",), supply.TALK_GAP)
+check("換頁了 → True", got is True)
+check(f"　而且沒睡滿 {supply.TALK_GAP} 秒", CLOCK.t - t0 < supply.TALK_GAP,
+      f"花了 {CLOCK.t - t0:.2f} 秒")
+check(f"　但有留最小間隔 {supply.TALK_STEP_FLOOR} 秒（太快送伺服器不吃）",
+      CLOCK.t - t0 >= supply.TALK_STEP_FLOOR, f"花了 {CLOCK.t - t0:.2f} 秒")
+CLOCK.t = t0
+supply.talkwnd = types.SimpleNamespace(page=lambda sc: PAGE[0],
+                                       window_visible=lambda sc: None)
+got = supply._wait_page(SC, ("第一頁",), supply.TALK_GAP)
+check("一直沒換頁 → False，而且等滿上限（跟以前一樣照送）", got is False
+      and CLOCK.t - t0 >= supply.TALK_GAP - 0.1, f"花了 {CLOCK.t - t0:.2f} 秒")
+CLOCK.t = t0
+supply.talkwnd = types.SimpleNamespace(page=lambda sc: None,
+                                       window_visible=lambda sc: None)
+got = supply._wait_page(SC, ("第一頁",), supply.TALK_GAP)
+check("頁面讀不到 → False（⛔ 不當成換頁了）", got is False)
+
+print()
+print("④d 視窗開了沒：代號非 0 **不算**開著（WND_NPCSALE 關掉不歸零）")
+supply.talkwnd = types.SimpleNamespace(
+    page=lambda sc: None, window_visible=lambda sc: None,
+    id_visible=lambda sc, wnd: VIS[0])
+REAL_GLOBALS = supply.lua.globals_of
+supply.lua.globals_of = lambda sc, names: {n: 0x1234 for n in names}
+VIS[0] = True
+check("代號非 0 ＋ 旗標說顯示中 → 開著",
+      supply._wnd_open(None, SC, "WND_NPCSALE") is True)
+VIS[0] = False
+check("★ 代號非 0 但旗標說沒顯示 → **沒開**（就是「假成功」那個坑）",
+      supply._wnd_open(None, SC, "WND_NPCSALE") is False)
+VIS[0] = None
+check("旗標讀不到 → 沿用舊判斷（代號非 0 就算開）",
+      supply._wnd_open(None, SC, "WND_NPCSALE") is True)
+supply.lua.globals_of = lambda sc, names: {}
+check("代號是 0／讀不到 → 沒開",
+      supply._wnd_open(None, SC, "WND_NPCSALE") is False)
+supply.lua.globals_of = REAL_GLOBALS
 supply.talkwnd = REAL_TALKWND
 
 print()

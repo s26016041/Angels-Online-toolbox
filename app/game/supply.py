@@ -160,7 +160,9 @@ DIALOG_STILL_GRACE = 0.8   # 角色停住這麼久還沒開對話框＝這次點
 # ★ 走近 NPC 時「連續這麼久沒更靠近」＝被卡住了（人牆／伺服器退回移動）
 #   → 不要磨到逾時，直接回去讓呼叫端發互動包（客戶端自己會再走一段）。
 APPROACH_STALL = 3.0
-TALK_GAP = 1.2             # 對話選項之間的間隔——太快送對話會沒作用（8/14 實測）
+TALK_GAP = 1.2             # 對話選項之間**最多**等多久（8/14 盲等值；現在只是上限，
+                           #   看到下一頁就送 —— 見 `_wait_page`）
+TALK_STEP_FLOOR = 0.25     # 兩個對話動作之間的最小間隔（同一拍連送伺服器不吃）
 WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
 # ★ 使用者定調（8/19）：點了沒開對話**不准退後重走**，調位置＝沿「自己→NPC」方向
 #   一路往 NPC 身上靠、甚至穿過他站到另一側（0＝踩上 NPC 本格、正數＝超過他幾格）。
@@ -476,7 +478,20 @@ def _wnd_open(mover, scanner, name: str) -> bool:
         g = lua.globals_of(scanner, (name,))
     except Exception:                                      # noqa: BLE001
         return False
-    return bool(g and g.get(name))
+    wnd = (g or {}).get(name)
+    if not wnd:
+        return False
+    # ★★★ 2026-09-12：代號非 0 **不代表視窗開著** —— `WND_NPCSALE` 關掉不歸零，
+    #   那正是 `close_sale` 檔頭寫的「假成功 → 下一趟直接跳過點 NPC、買不到卻
+    #   一路回報成功」那個坑。現在有硬訊號了（`talkwnd.id_visible`＝視窗物件
+    #   +0xB4，純讀、不佔指令槽），就真的問一句「畫面上有沒有」。
+    #   ⚠ 回 None ＝**不知道**（偏移抄不到／改版改寫了 isvisible）→ 沿用舊判斷，
+    #     ⛔ 不可以當成「沒開」（[[bag-false-empty-guards]]）。
+    try:
+        vis = talkwnd.id_visible(scanner, int(wnd) & 0xFFFFFFFF)
+    except Exception:                                      # noqa: BLE001
+        vis = None
+    return True if vis is None else bool(vis)
 
 
 def _ent_tile_f(scanner, ent: int):
@@ -621,6 +636,15 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
     last_click = t0                      # 進來之前呼叫端剛點過一次
     still_at, still_t = None, t0
     while time.time() - t0 < timeout:
+        # ★★★★ 2026-09-12：**最硬的訊號先問** —— 對話視窗物件 +0xB4 那個
+        #   「顯示中」旗標（`talkwnd.window_visible`，純讀、不佔指令槽）。
+        #   以前沒有這個訊號，只能等「代號變了」或「頁面簽章變了」；而代號
+        #   就是視窗物件的位址（同一個窗重開值一樣）→ 幾乎每次都判不出來 →
+        #   貼身點明明 0.13 秒就開好了，卻要把 DIALOG_NEAR_TIMEOUT 磨滿才走
+        #   「驗不了照送」那條（使用者 2026-09-12：「對話框不是馬上就會出現嗎，
+        #   為何要等」）。⚠ 回 None ＝不知道 → 照舊看下面兩個訊號。
+        if talkwnd.window_visible(scanner):
+            return True
         # ★ 一次讀完（`talkwnd.page` 跟 `_dialog_token` 走同一條純讀 Lua 全域的路，
         #   順便把 WND_MESSAGE 的現值一起拿回來）。讀不到才退回只讀代號。
         pg = talkwnd.page(scanner) if page_base is not _UNSET_PAGE else None
@@ -650,6 +674,30 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
         elif time.time() - last_walk > DIALOG_STILL_GRACE:
             return False
         _nap(0.1)
+    return False
+
+
+def _wait_page(scanner, base_sig, timeout: float,
+               floor: float = TALK_STEP_FLOOR) -> bool:
+    """送完一個對話動作之後，等「**下一頁真的來了**」（頁面簽章變了）。
+
+    回 True＝換頁了（可以送下一項）；False＝等到 `timeout` 還沒換頁（照舊送，
+    跟以前睡滿 `TALK_GAP` 的行為一樣）。
+    ★ `floor` 是最小間隔：同一拍連送兩個對話動作伺服器不吃（8/14 實測的
+      「太快送會沒作用」），所以先睡這麼久再開始看。
+    ⚠ 簽章讀不到（`page` 回 None）或沒有基準 → 退化成睡滿 `timeout`，
+      ⛔ 不可以當成「換頁了」。
+    """
+    _nap(floor)
+    if base_sig is None:
+        _nap(max(0.0, timeout - floor))
+        return False
+    t0 = time.time()
+    while time.time() - t0 < max(0.0, timeout - floor):
+        pg = talkwnd.page(scanner)
+        if pg is not None and pg.sig != base_sig:
+            return True
+        _nap(0.05)
     return False
 
 
@@ -765,7 +813,8 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
          穿過他到另一側（NUDGE_STEPS 逐輪加碼），換站位重點；直到成功或 tries 用完。
     ⚠ 安全退化：DIALOG_WND 全域**讀不到**（改版換名？）才走舊版「等停下＋固定等待」
       照送 talkaction 再驗最終視窗——名字失效只會變慢，不會整條斷掉。
-    ⚠ talkaction 之間的間隔（TALK_GAP）不能省——太快送對話會沒作用（8/14 實測）。
+    ⚠ talkaction 之間要留間隔——太快送對話會沒作用（8/14 實測）；但 2026-09-12 起
+      不睡滿 `TALK_GAP`，改成「看到下一頁來了就送下一項」（`_wait_page`）。
     ⚠⚠ 跨地圖回城後交易是「冷」的：**一定要先用 0x54A520 開真對話**，talkaction 才有效。
     talk_codes: 依序送的對話碼（買=[10]、修=[10]、銀行「我要用倉庫→自己的倉庫」=[11,10]）。
     """
@@ -918,8 +967,15 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             fails += 1
             continue                                 # 確認沒開對話 → 馬上調位置重點
         for code in talk_codes[:-1]:
+            # ★★★ 2026-09-12：選項之間**不再睡滿 TALK_GAP** —— 看到「下一頁真的
+            #   來了」就送下一項（`_wait_page`）。1.2 秒是 8/14 沒有硬訊號時的盲等值，
+            #   銀行要送兩項就先付 2.4 秒（使用者 2026-09-12 問「為何要等」）。
+            #   ⚠ 「太快送會沒作用」那條規矩沒有放掉：換頁本身就是「伺服器準備好了」
+            #     的證據，而且還留 `TALK_STEP_FLOOR` 的最小間隔；等不到換頁就照舊
+            #     磨到 TALK_GAP 才送（不會比以前快，但也不會更慢）。
+            pg = talkwnd.page(scanner)
             _talkaction(mover, scanner, code)
-            _nap(TALK_GAP)                     # ★ 選項之間等夠（太快送會沒作用）
+            _wait_page(scanner, pg.sig if pg is not None else None, TALK_GAP)
         _talkaction(mover, scanner, talk_codes[-1])
         if wait_done():
             return True

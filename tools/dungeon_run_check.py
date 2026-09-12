@@ -361,8 +361,14 @@ class FakeTalk:
 def wire(tab, fake):
     dt.talkwnd.page = fake.page
     dt.talkwnd.window_open = fake.window_open
-    # 純讀那支（沒在等對話時看有沒有對話框）跟 window_open 看同一個假狀態
+    # 純讀那兩支（沒在等對話時看有沒有對話框／視窗顯示中沒）跟 window_open
+    # 看同一個假狀態。⚠ `window_visible`（視窗物件 +0xB4）是 2026-09-12 加的
+    # 硬訊號，產品現在**優先**問它，所以測試也要給，不然每一項都會退回舊路。
     dt.talkwnd.window_present = lambda _sc: fake.window_open(None, None)
+    # ⚠ `window_visible`（視窗物件 +0xB4）是 2026-09-12 加的硬訊號，產品**優先**
+    #   問它 —— 這裡代理「現在掛著的 window_open」，所以底下哪一段換掉
+    #   window_open，硬訊號就自動跟著換（⛔ 不要綁死 fake，那樣換不動）。
+    dt.talkwnd.window_visible = lambda _sc: dt.talkwnd.window_open(None, None)
     dt.talkwnd.message_ended = lambda _sc: fake.ended
     dt.talkwnd.close_page = fake.close
     dt.talkwnd.close_window = lambda *_a: True
@@ -814,8 +820,11 @@ def main() -> int:
     dt.talkwnd.close_page = close_then_reopen
     dt.talkwnd.window_open = wo
     run(tab, dt.MENU_GAP * 12)
-    ck("★ 視窗暫時不見時**沒有**誤判成走完（分頁沒停）", tab.run_cb.isChecked(),
-       tab.status.text())
+    # ⚠ 2026-09-12 改判定方式：狀態機改成每拍看一眼（MENU_POLL）之後，這一整段
+    #   在同樣的秒數內就跑完了（那正是這次要的），所以「分頁還在跑」不再是
+    #   「沒誤判」的證據 —— 改看**實質**：⛔ 不准出現「還有選項沒送到」那種停機。
+    ck("★ 視窗暫時不見時**沒有**誤判成走完（⛔ 沒有「選項沒送到」那種停機）",
+       "沒送到" not in tab.status.text(), tab.status.text())
     ck("★ 下一頁到了照樣把第 1 項送到", 10 in tab.sent, f"送出 {tab.sent}")
 
     print("\n有沒有對話視窗（硬訊號）")
@@ -2276,7 +2285,9 @@ def main() -> int:
     wire(tab, fk)                                          # close_page → fk.closes
     destroyed = []
     dt.talkwnd.close_window = lambda *_a: destroyed.append(1) or True
-    dt.talkwnd.window_present = lambda _sc: True          # 對話框冒出來了
+    dt.talkwnd.window_present = lambda _sc: True
+    dt.talkwnd.window_visible = lambda _sc: True          # 對話框冒出來了
+    dt.talkwnd.window_visible = lambda _sc: True
     tab._stray_dialog(1.1)
     ck("★★ 走路那一步冒出對話框 → 按遊戲的確定鈕（伺服器知道結束）＋送離開互動、狀態列講出來",
        fk.closes == 1 and destroyed == [] and tab.left == [1] and "對話框" in tab.status.text(),
@@ -2293,13 +2304,16 @@ def main() -> int:
     tab._i = 0
     tab._stray_closed = 0.0
     dt.talkwnd.window_present = lambda _sc: None           # 讀不到
+    dt.talkwnd.window_visible = lambda _sc: None
     tab._stray_dialog(1.1)
     ck("　讀不到 ≠ 有對話框 → 不動手", fk.closes == 2, str(fk.closes))
     dt.talkwnd.window_present = lambda _sc: False
+    dt.talkwnd.window_visible = lambda _sc: False
     tab._stray_dialog(1.1)
     ck("　沒有對話框 → 不動手", fk.closes == 2, str(fk.closes))
     # 確定鈕叫不動（Lua 讀不到 WND_MESSAGE）→ 退回 destroy
     dt.talkwnd.window_present = lambda _sc: True
+    dt.talkwnd.window_visible = lambda _sc: True
     dt.talkwnd.close_page = lambda *_a: (False, "讀不到")
     tab._stray_closed = 0.0
     tab._stray_dialog(1.1)

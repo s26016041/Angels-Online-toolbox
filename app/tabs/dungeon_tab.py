@@ -174,6 +174,17 @@ PROP_TOL = 3.0
 #   不給輸入；預設 0.5；不會跟使用者說」→ 製作頁的欄位拿掉、腳本裡舊的 gap
 #   一律忽略，就用這一個值。
 MENU_GAP = 0.5
+# ★★★ 2026-09-12：`MENU_GAP` 原本同時當兩件事用 —— 「送完一個對話動作要隔多久」
+#   跟「多久看一次對話有沒有動靜」。後者被 0.5 秒綁住，於是對話框明明已經開了，
+#   最壞要半秒後才看到（使用者：「刷副本跟機關對話都會卡等待對話框很怪」）。
+#   → 拆開：**看**用 MENU_POLL（純讀 +0xB4／Lua 全域現在不到 1ms，問得勤沒代價），
+#     **送**照舊隔 MENU_GAP（太快送伺服器不吃，這條規矩沒放掉）。
+#   ⚠⚠ 狀態機裡的 `gap` 是「這一輪距上一輪多久」（`self._gone_t += gap`、
+#     `self._close_t += gap`、`self._talk_same * gap` 這些累加全靠它），所以
+#     ① 要記住上一輪設的值（⛔ 不可以寫死成常數）、② **這個值一定要是
+#     `TICK_MS` 的整數倍**，不然「輪距」跟「實際經過時間」會對不上
+#     （0.15 秒配 100ms 的拍＝實際每 2 拍跑一次＝0.2 秒，grace 會慢 33%）。
+MENU_POLL = TICK_MS / 1000.0     # ＝每拍都看一眼（純讀夠便宜了）
 # 按了確定之後連續這麼多輪都沒換頁 ＝ 這段對話走完了（那些全域關掉還會
 # 留著，只能靠「不再變化」判結束，見 talkwnd.page 的說明）。
 TALK_SETTLE = 2
@@ -193,18 +204,23 @@ CLOSE_GIVEUP = 6
 #   所以「視窗不見了」在剛按完確定的那一小段時間**不等於對話結束** —— 要等
 #   CLOSE_GRACE 秒沒有新視窗出現，才算真的走完（不然過場頁後面還有選項的
 #   腳本會被誤判成「對話關掉了但選項沒送到」而停機）。
+#   ⚠⚠ 2026-09-12 試著收到 1.0 秒，`dungeon_run_check`「視窗暫時不見時不准誤判成
+#     走完」當場變紅 —— 這個值**不是**給我們輪詢用的（那一段已經改成每拍純讀），
+#     是給**伺服器把下一頁送來**的寬限，收它就等於在慢一點的來回上誤判「對話結束」
+#     → 整趟停機。所以維持 1.6，⛔ 別再收。
 CLOSE_GRACE = 1.6
 # 「有沒有視窗」要**叫進遊戲**問（call_sync 會等它做完），
 # 所以答案快取這麼久，⛔ 不要每拍問。
 WND_TTL = 0.3
 # ★ 使用者 2026-09-05：「副本自動跑的時候，我們沒在等對話的時候跳出來，要幫我把不該出現的
 #   對話關掉」—— 走路／打怪／傳點／休息期間對話框（劇情、撞到 NPC、機關）冒出來會把人
-#   困住（伺服器認為還在互動，人走不動）。純讀 `talkwnd.window_present` 每 STRAY_WND_POLL 秒
-#   看一次；有就 destroy＋送離開互動，兩次之間至少隔 STRAY_WND_GAP（Lua 不可以叫太密）。
+#   困住（伺服器認為還在互動，人走不動）。純讀「對話框**顯示中**嗎」
+#   （`talkwnd.window_visible`，視窗物件 +0xB4）每 STRAY_WND_POLL 秒看一次；有就
+#   destroy＋送離開互動，兩次之間至少隔 STRAY_WND_GAP（Lua 不可以叫太密）。
 #   ⛔ 對話那一步（interact）與撞入口不管：那兩段本來就在等對話。
-#   ⚠ 一次純讀實測 ~38ms（黑狐，幾乎全是 lua.globals_of 走全域表）—— 跑在 UI 執行緒上，
-#     所以一秒一次（4%）就好，晚一秒關掉沒差；⛔ 別改成每拍。
-STRAY_WND_POLL = 1.0
+#   ⚠ 舊註記「一次純讀 ~38ms」已經不成立：2026-09-12 給 `lua.globals_of` 加了索引
+#     快取（9702 次 ReadProcessMemory → 7 次），現在一次不到 1ms，所以敢問得比較勤。
+STRAY_WND_POLL = 0.3
 STRAY_WND_GAP = 2.0
 # ★★ 順移／換圖之後這麼久內**不收**對話框（2026-09-06 黑狐 11:49 遊戲崩潰實錄）：第 35 步
 #   踩傳點的同一秒跳出對話框 → 我們送 OnMessageClose（＝messageclose）→ 傳點順移把視窗物件
@@ -245,7 +261,13 @@ STILL_WAIT = 1.5
 #   自動接近打斷 —— 使用者 2026-09-02 回報「設定時點得到、跑腳本點不到、
 #   滑鼠點也可以」的差別就在這裡：製作頁點完沒有別人再叫它走路。
 #   只要「離那個物件又更近了」就把計時歸零（＝正在進行中，別插手）。
-CLICK_PROGRESS = 0.5       # 離目標又近了這麼多格就算有進展
+CLICK_PROGRESS = 0.05      # 比「歷史最近」再近這麼多格就算還在靠近
+# ⚠⚠ 2026-09-12：這個值**不可以**跟「一輪多久」耦合。原本 0.5 格是配
+#   0.5 秒一輪（＝走路速度 1 格/秒）調的；狀態機改成每拍看一眼之後，同樣的
+#   速度一輪只縮 0.1 格 → 每一輪都被判成「沒有進展」→ 遊戲正在自己走過去的
+#   期間被我們插手狂點（回歸 dungeon_run_check 當場抓到）。改成「只要比歷史
+#   最近的距離又近了一點就算還在靠近」，跟輪距無關；抖動也不會一直重置，
+#   因為比的是**歷史最佳**（單調變小，卡住就 plateau → 該狂點時照樣會狂點）。
 # ★★ 重點之前先**往那個物件靠上去**，一次比一次近，最後直接穿過去
 #   （使用者 2026-09-02：「如果點了沒反應要調整位置往對話物件靠上去」）。
 #   ⚠ 這是補給點 NPC 驗過的招（見 memory self-supply-buy：「確認沒開就往
@@ -1513,6 +1535,7 @@ class DungeonTab(BaseTab):
         self._step_t = 0.0           # 這一步跑多久了
         self._menu_i = 0             # 對話選項送到第幾個
         self._menu_t = 0.0
+        self._menu_gap = MENU_GAP    # 上一輪設的間隔（累加計時全靠它，見 MENU_POLL）
         self._full_req_t = 0.0       # 補救全掃的節流
         self._talk_sig = None        # 上一輪看到的對話簽章（換頁偵測）
         self._talk_same = 0          # 簽章連續幾輪沒變
@@ -3480,11 +3503,17 @@ class DungeonTab(BaseTab):
         # ★ 這一拍有順移、或順移／換圖後 STRAY_HOLD 秒內 → 不收（遊戲正在拆視窗，見 STRAY_HOLD）
         if self._jumped or time.monotonic() < self._stray_hold:
             return False
+        # ★★★ 2026-09-12 改看「**真的顯示在畫面上**」（視窗物件 +0xB4）而不是
+        #   「管理器裡有這個視窗物件」—— present 連**殘留的**都算，所以以前會
+        #   對著一個畫面上根本沒有的框送確定＋離開互動（白做，還多打擾伺服器）。
+        #   ⚠ 旗標讀不到（None）才退回 present，⛔ 兩者都是 False／None 就不動手。
         try:
-            present = talkwnd.window_present(self._sc)
+            showing = talkwnd.window_visible(self._sc)
+            if showing is None:
+                showing = talkwnd.window_present(self._sc)
         except Exception:                                # noqa: BLE001
-            present = None
-        if not present:                                  # False／None 都不動手
+            showing = None
+        if not showing:                                  # False／None 都不動手
             return False
         now = time.monotonic()
         if now - self._stray_closed < STRAY_WND_GAP or self._mover is None:
@@ -3526,10 +3555,21 @@ class DungeonTab(BaseTab):
     def _wnd_open(self, dt: float) -> bool | None:
         """對話視窗現在開著沒（True／False／**None＝問不到**）。
 
-        ⚠ 這支是叫進遊戲問的（`talkwnd.window_open`，會等遊戲做完），
-          所以 `WND_TTL` 秒內直接用上一次的答案 —— ⛔ 不要每拍問。
-          剛點下去要把 `_wnd_t` 歸零，強制重問。
+        ★★★ 2026-09-12 改走**純讀**（`talkwnd.window_visible`＝視窗物件 +0xB4）：
+          每拍問都不到 1ms，所以不必快取、不佔指令槽、也不必等遊戲主執行緒 ——
+          使用者說「卡很久才知道對話框出現」，有一半就是舊路徑的 `WND_TTL`
+          快取（0.3 秒）＋ `MENU_GAP`（0.5 秒）疊出來的。
+        ⚠ 旗標讀不到（None，例如改版把 isvisible 改寫了）才退回舊路：叫進遊戲
+          問 `ismessageend`（`talkwnd.window_open`，會等遊戲做完）—— 那條照舊用
+          `WND_TTL` 節流，⛔ 不要每拍叫。
         """
+        try:
+            showing = talkwnd.window_visible(self._sc)
+        except Exception:                                # noqa: BLE001
+            showing = None
+        if showing is not None:
+            self._wnd, self._wnd_t = showing, WND_TTL
+            return showing
         self._wnd_t -= dt
         if self._wnd_t > 0:
             return self._wnd
@@ -3778,7 +3818,15 @@ class DungeonTab(BaseTab):
         if gate["phase"] == "ack":
             # ★★★★ **按官方的「確定」**（talkaction 1）——伺服器要收到這一包，
             #   機關才生效（2026-09-07 實測，見 GATE_ACK）。⛔ 不是 close_page。
-            if gate["t"] < GATE_ACK_WAIT:
+            # ★★★ 2026-09-12：對話框**真的冒出來了就馬上按**（視窗物件 +0xB4，
+            #   純讀）—— 使用者：「跟機關對話都會卡等待對話框很怪」。以前沒有
+            #   這個訊號，只能寫死「踩上去後等 GATE_ACK_WAIT 秒」，每一輪都白等。
+            #   ⚠ 旗標讀不到（None）就照舊等滿，⛔ 不可以當成「已經開了」。
+            try:
+                showing = talkwnd.window_visible(self._sc)
+            except Exception:                            # noqa: BLE001
+                showing = None
+            if not showing and gate["t"] < GATE_ACK_WAIT:
                 self._say(f"{tag}　等機關的對話冒出來…"
                           f"（{gate['t']:.1f}/{GATE_ACK_WAIT:.1f} 秒）{blk}")
                 return
@@ -3951,7 +3999,7 @@ class DungeonTab(BaseTab):
             self._wnd, self._wnd_t = None, 0.0   # 強制重問一次
             # ★ 間隔照這一步自己存的（腳本製作那頁可以調）——太快送選項，
             #   伺服器那邊對話還沒準備好就會被拒絕（使用者 2026-09-02）。
-            self._menu_t = MENU_GAP
+            self._menu_t = self._menu_gap = MENU_GAP
             self._say(f"{tag}　已點外觀 {hit[0].model}")
             # ★ 外觀跟腳本記的不一樣＝機關**已經被啟動過**（無限塔雕像 60369→60370、
             #   60394→60395；2026-09-05 第 4 趟第 29 步就是這樣：到的時候已經是 60370，
@@ -3966,11 +4014,12 @@ class DungeonTab(BaseTab):
         #   → 腳本裡**只記要選第幾項**，沒有選項的那些頁自己按確定過掉。
         #   ⚠ 舊腳本裡記的 0（過場）直接忽略：現在是自動的，再送一次會多按。
         menu = [n for n in (step.get("menu") or []) if n]
-        gap = MENU_GAP
+        gap = self._menu_gap or MENU_POLL        # 這一輪距上一輪的**實際**間隔
         self._menu_t -= dt
         if self._menu_t > 0:
             return
-        self._menu_t = gap
+        # 預設是「只看一眼」的短輪詢；真的送出對話動作那幾條會改回 MENU_GAP。
+        self._menu_t = self._menu_gap = MENU_POLL
         # ★★★ 「現在到底有沒有對話視窗」＝**硬訊號**（使用者 2026-09-02：
         #   「請要明確知道有沒有視窗」）—— 問遊戲自己那支「依代號查視窗」的
         #   函式（`talkwnd.window_open`），⛔ 不再靠那幾個 Lua 全域猜，
@@ -4081,6 +4130,7 @@ class DungeonTab(BaseTab):
                 n = menu[self._menu_i]
                 if sell.talk(self._mover, supply.talk_option(n)):
                     self._menu_i += 1
+                self._menu_t = self._menu_gap = MENU_GAP   # 送過了 → 讓伺服器先回
                 self._say(f"{tag}　讀不到對話狀態 → 照腳本送第 {n} 項")
                 return
             supply.leave_npc(self._mover, self._sc)
@@ -4121,6 +4171,7 @@ class DungeonTab(BaseTab):
                     return
                 self._talk_did = "opt"
                 self._wnd_t = 0.0            # 動過了 → 下一拍重問視窗
+                self._menu_t = self._menu_gap = MENU_GAP   # 送過了 → 讓伺服器先回
                 self._say(f"{tag}　已送第 {n} 項"
                           f"（{self._menu_i + 1}/{len(menu)}）")
                 return
@@ -4137,6 +4188,7 @@ class DungeonTab(BaseTab):
             ok, why = talkwnd.close_page(self._mover, self._sc)
             self._talk_did, self._close_t, self._gone_t = "close", 0.0, 0.0
             self._wnd_t = 0.0                # 按了確定 → 下一拍重問視窗
+            self._menu_t = self._menu_gap = MENU_GAP   # 按過了 → 讓伺服器先回
             self._say(f"{tag}　沒有選項的那一頁 → 按確定"
                       f"（{'送出' if ok else why}"
                       f"{'，最後一頁' if self._page_ended else ('，還有下一頁' if self._page_ended is False else '')}）")
