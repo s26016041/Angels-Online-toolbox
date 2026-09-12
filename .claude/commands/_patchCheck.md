@@ -238,6 +238,20 @@ py tools\tab_check.py        # 逐分頁；有幾台就驗幾台
 py tools\selfcheck.py        # 13 項共用底層（tab_check 已涵蓋大半，快就順手跑）
 ```
 
+### ★ 順手跑這兩支離線的（不用進遊戲，但**會去讀磁碟上的 angel.dat**）
+
+```
+py tools\talkwnd_check.py      # 對真檔案重抄：messageclose 本體、GetWindowById、
+                                 #   window.isvisible 的「顯示中」旗標偏移（這版 0xb4）
+py tools\lua_globals_check.py  # Lua 全域表版面＋索引快取（判對話框開沒開的底層）
+```
+
+它們是「② 偏移」層的離線補充：`talkwnd` 判**對話框到底開著沒**靠的是視窗物件裡
+那個顯示旗標，偏移是從 `window.isvisible` 的骨架**當場抄**的（⛔ 沒寫死）——
+改版把那支改寫的話這兩支會當場紅，而產品那邊會安全退化成「不知道」
+（等待邏輯退回舊的簽章／代號偵測，變慢但不會做錯事）。見 memory
+`dialog-visible-flag`。
+
 `tab_check` 的對照表是用 AST 掃 `app/tabs/*_tab.py` 的相依關係列出來的
 （分頁 → 它呼叫哪些讀取函式），不是憑印象寫的。目前涵蓋：
 
