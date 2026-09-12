@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""被圍毆就反擊（GangWorker）的離線回歸 —— 不需要開遊戲。
+"""「誰在打我」那一套的離線回歸（圍毆反擊＋挑目標優先）—— 不需要開遊戲。
 
     py tools\\gang_check.py
 
-驗的是四件**會安靜做錯事**的地方：
+驗的是五件**會安靜做錯事**的地方：
   ① 「誰在打我」只認 `+0x34C == 我的實體編號`，而且會重驗身分
      （位址被回收給別隻時不准算進來）。
   ② ⚠⚠ **屍體不准算**（2026-09-12 使用者實機回報的誤判真因：怪死掉之後
      那個欄位還留著最後打的人，實測 45 秒裡 Dead 指著我的有 352 拍次）。
   ③ 湊不到人數不出手；每一招各自比自己的射程。
   ④ ⛔ 全程不寫目標欄、不送鍵、不下移動指令（＝不跟自動掛機搶、不走路）。
+  ⑤ **挑目標時「正在打我的」優先**（2026-09-13 使用者定：「打我就代表那怪物是
+     活的，正在打我就該打他」）—— 冷卻中、地形圖說走不到都不准把牠濾掉，
+     屍體留著的舊值照樣不算。
 """
 from __future__ import annotations
 
@@ -45,7 +48,8 @@ class FakeScanner:
 
     def put_entity(self, addr: int, eid: int, target: int,
                    state: str = "Wait", flag: int = 0,
-                   vtable: int | None = None) -> None:
+                   vtable: int | None = None,
+                   pos: tuple[float, float] = (0.0, 0.0)) -> None:
         span = max(entity.LIVE_SPAN, entity.attack_target_off() + 4)
         blob = bytearray(span)
         struct.pack_into("<I", blob, 0,
@@ -54,6 +58,9 @@ class FakeScanner:
         struct.pack_into("<I", blob, entity.OFF_ID, eid)
         struct.pack_into("<I", blob, entity.attack_target_off(), target)
         blob[entity.OFF_DEAD_FLAG] = flag
+        # 座標是 16.16 定點數、一格 32 個世界單位（見 entity.TILE_UNITS）
+        struct.pack_into("<II", blob, entity.OFF_POS_X,
+                         int(pos[0] * 32) << 16, int(pos[1] * 32) << 16)
         self.mem[addr] = bytes(blob)
 
     def _read_bytes(self, addr: int, size: int):
@@ -61,6 +68,130 @@ class FakeScanner:
         if got is None or len(got) < size:
             return None
         return got[:size]
+
+
+class FakeMon(FakeEnt):
+    """夠 `CharFarmPage._candidates()` 用的假怪（多了名字與種類編號）。"""
+
+    def __init__(self, addr: int, eid: int, name: str = "稻草人",
+                 type_id: int = 1) -> None:
+        super().__init__(addr, eid)
+        self.name = name
+        self.type_id = type_id
+
+
+class FakeGrid:
+    """假地形圖：`reach` 裡的格才可走，也就是我站的那一塊連通區。"""
+
+    def __init__(self, reach) -> None:
+        self.reach = {tuple(t) for t in reach}
+
+    def nearest_open(self, x: int, y: int, radius: int = 4):
+        return (x, y) if (x, y) in self.reach else None
+
+    def reachable(self, x: int, y: int, avoid=None):
+        return set(self.reach) if (x, y) in self.reach else None
+
+    def route(self, start, goal, relax: int = 4, max_cost=None, avoid=None):
+        s, g = tuple(start), tuple(goal)
+        if s not in self.reach or g not in self.reach:
+            return None                    # ＝走不到
+        path = [s]
+        x, y = s
+        while (x, y) != g:                 # 一格一格斜著走過去就夠算長度了
+            x += (g[0] > x) - (g[0] < x)
+            y += (g[1] > y) - (g[1] < y)
+            path.append((x, y))
+        if max_cost is not None and len(path) - 1 > max_cost:
+            return None
+        return path
+
+
+class FakeMaps:
+    def __init__(self, grid) -> None:
+        self._grid = grid
+
+    def get(self, _sc):
+        return self._grid
+
+
+class FakeKeys:
+    def __init__(self) -> None:
+        self.eid = None
+        self.ent_addr = 0
+        self.on = False
+
+    def set_on(self, on: bool) -> None:
+        self.on = on
+
+
+class FakeAtk:
+    def __init__(self) -> None:
+        self.picked = None
+
+    def attack(self, _state, ent) -> None:
+        self.picked = ent
+
+    def hold_off(self) -> None:
+        self.picked = None
+
+
+class FakeText:
+    def __init__(self) -> None:
+        self._t = ""
+
+    def setText(self, t: str) -> None:
+        self._t = t
+
+    def text(self) -> str:
+        return self._t
+
+
+class FakeCB:
+    def __init__(self, on: bool = False) -> None:
+        self._on = on
+
+    def isChecked(self) -> bool:
+        return self._on
+
+
+def make_farm_tab(sc, mons, me=(10.0, 10.0), grid=None):
+    """組一個**只夠挑目標用**的掛機頁 —— 不建 UI、不開遊戲。"""
+    from app.tabs import farm_tab                # noqa: PLC0415
+    farm_tab.bag.my_entity_id = lambda _sc: MY_EID     # 我的實體編號（假的）
+
+    class PickTab(farm_tab.CharFarmPage):
+        """只借 CharFarmPage（單一分身那一頁）的挑目標邏輯。
+
+        ⛔ **故意不呼叫 `__init__`**：那會建整頁 UI 並開四條 QThread
+          （掃描／寫目標／送鍵／圍毆），離線回歸不需要，而且沒收掉的執行緒
+          會讓腳本印了成功卻回非 0（見 memory packaging-and-release）。
+        """
+
+        def __init__(self) -> None:                    # noqa: D107
+            pass
+
+    tab = PickTab()
+    tab.sc = sc
+    tab.account = "check"
+    tab.mons = list(mons)
+    tab.state = 0x00100000
+    tab.player = 0x0BADF00D
+    tab._killed = {}
+    tab._unreach_n = {}
+    tab._reach = None
+    tab._reach_grid = None
+    tab._maps = FakeMaps(grid)
+    tab._hp_drop_t = -1e9                 # 沒在掉血（＝弱訊號的保底不成立）
+    tab._dbg_empty_t = 0.0
+    tab._kills = 0
+    tab._keys = FakeKeys()
+    tab._atk = FakeAtk()
+    tab.status = FakeText()
+    tab.boss_cb = FakeCB(False)
+    tab.my_pos = lambda: me
+    tab.wanted = lambda: {m.name for m in mons}
+    return tab
 
 
 def check(name: str, got, want) -> bool:
@@ -136,6 +267,46 @@ def main() -> int:
                      ("path_to", "走路")):
         ok &= check(f"沒有 {bad}（{why}）", bad in src, False)
     ok &= check("出手只走官方施放函式", "attack.cast_skill" in src, True)
+
+    print("⑤ 挑目標：正在打我的優先（2026-09-13 使用者定）")
+    # 場景：B 在 4 格但沒理我、C 在 8 格正在咬我。使用者的症狀＝打死目標後
+    # 挑到遠的那隻，因為挑目標整條路**只看最近**、完全不看誰在打我。
+    # ⚠ C 的動畫故意是 'Wait'（兩次揮擊之間的空檔）——舊的弱訊號
+    #   （交戰槽＋動畫 Att）在這一拍**抓不到**，這正是實際會失手的那一拍。
+    sc3 = FakeScanner()
+    near = FakeMon(0x60000000, 0xCC01, name="近的")
+    far = FakeMon(0x60001000, 0xCC02, name="遠的")
+    sc3.put_entity(near.addr, near.eid, 0, pos=(14.0, 10.0))
+    sc3.put_entity(far.addr, far.eid, 0, pos=(18.0, 10.0))
+    grid = FakeGrid([(x, 10) for x in range(5, 25)])
+    tab = make_farm_tab(sc3, [near, far], grid=grid)
+    ok &= check("沒人打我 → 照舊挑最近的",
+                tab._pick_next() and tab._cur.name, "近的")
+    sc3.put_entity(far.addr, far.eid, MY_EID, pos=(18.0, 10.0))
+    tab = make_farm_tab(sc3, [near, far], grid=grid)
+    ok &= check("★ 遠的那隻在咬我 → 挑牠（不再挑近的）",
+                tab._pick_next() and tab._cur.name, "遠的")
+    ok &= check("　攻擊執行緒也鎖到牠身上",
+                (tab._atk.picked is tab._cur, tab._keys.eid, tab._keys.on),
+                (True, far.eid, True))
+    # ★ 使用者實際遇到的：牠先前被記成「走不到」冰起來 → 挑目標永遠跳過牠
+    tab = make_farm_tab(sc3, [near, far], grid=grid)
+    tab._killed[far.eid] = 1e18                 # 冷卻到天荒地老
+    tab._unreach_n[far.eid] = 5
+    ok &= check("★★ 冷卻中但正在咬我 → 無條件解冷卻並挑牠",
+                (tab._pick_next() and tab._cur.name,
+                 far.eid in tab._killed), ("遠的", False))
+    # ★ 地形圖說走不到（牠站的格被判成牆／隔著薄牆）也不准放掉：
+    #   「打我就代表那怪物是活的，正在打我就該打他」
+    tab = make_farm_tab(sc3, [near, far],
+                        grid=FakeGrid([(x, 10) for x in range(5, 16)]))
+    ok &= check("★★ 地形圖說走不到、路徑也算不出來 → 還是挑牠",
+                tab._pick_next() and tab._cur.name, "遠的")
+    # ⛔ 屍體身上那個欄位會留著最後打的人（實測 352 拍次）→ 不准當「在打我」
+    sc3.put_entity(far.addr, far.eid, MY_EID, state="Dead", pos=(18.0, 10.0))
+    tab = make_farm_tab(sc3, [near, far], grid=grid)
+    ok &= check("⛔ 屍體留著「目標是我」不算 → 挑回近的",
+                tab._pick_next() and tab._cur.name, "近的")
 
     print("\n" + ("全部通過" if ok else "⛔ 有項目沒過"))
     return 0 if ok else 1

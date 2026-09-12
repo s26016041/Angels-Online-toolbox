@@ -5260,11 +5260,14 @@ class CharFarmPage(QWidget):
 
     def _candidates(self, quiet: bool = False) -> tuple[
             list[tuple[float, entity.Entity, tuple[float, float] | None]],
-            list[tuple[float, str, str]] | None]:
+            list[tuple[float, str, str]] | None,
+            list[tuple[float, entity.Entity, tuple[float, float] | None]]]:
         """照規則挑出「現在打得了」的怪，**照距離排序**（近→遠）。
 
-        回傳 (候選, 被跳過的診斷紀錄)。挑目標與「有沒有更近的」兩條路都走這一支
-        —— 規則只能有一份，兩邊各寫一套遲早會不一致。
+        回傳 (候選, 被跳過的診斷紀錄, **正在打我的那幾隻**)。挑目標與
+        「有沒有更近的」兩條路都走這一支 —— 規則只能有一份，兩邊各寫一套
+        遲早會不一致。第三份是候選的子集合（同樣已排序），給 `_pick_next`
+        做「正在打我的優先」用。
         quiet=True 時不寫診斷紀錄（「偷看一眼」用的，免得每秒灌一次檔案）。
 
         用名字比對而不是種類 ID，因為使用者要能手動輸入怪物名稱。
@@ -5284,6 +5287,10 @@ class CharFarmPage(QWidget):
         want = self.wanted()
         me = self.my_pos()
         now = time.monotonic()
+        # ★★★ 我的實體編號 —— 底下「牠正在打我嗎」要拿它比對（怪 +0x34C）。
+        #   整支只讀一次（3 次 4-byte 讀取），不是每隻怪讀一次。
+        #   讀不到（還沒進場／換地圖空窗）＝0 → 一律當成沒人打我（安全退化）。
+        my_eid = bag.my_entity_id(self.sc)
         # ★ 只打王：完全不看名字，改看種類 ID 的王旗標。
         #   索引表位址先解一次，迴圈裡每隻只要兩次 4-byte 讀取。
         boss_only = self.boss_cb.isChecked()
@@ -5299,6 +5306,8 @@ class CharFarmPage(QWidget):
         # 診斷用：被跳過的怪（距離, 名字, 原因）。平常是 None，完全不花錢。
         skipped: list[tuple[float, str, str]] | None = (
             [] if (_FARM_LOG and not quiet) else None)
+        # 「正在打我」的那幾隻的實體編號（只收真的進了候選的）。
+        hit_eids: set[int] = set()
         # ★★★ 走不走得到，**挑之前**就要問（見 _reach_set）。
         grid, reach = self._reach_set(me)
         for m in self.mons:
@@ -5313,9 +5322,20 @@ class CharFarmPage(QWidget):
             # ★ 死活、動畫狀態、座標**一次讀回來**（相鄰欄位，見 read_live）。
             #   底下每個判斷（解禁、收尾、屍體、距離）都用同一份快照。
             #   座標當場讀（怪會走、角色也在走，掃描時記的早就過期了）。
-            alive, st, p, flag = entity.read_live(self.sc, m)
+            alive, st, p, flag, foe = entity.read_live_foe(self.sc, m)
             d = (math.hypot(p[0] - me[0], p[1] - me[1])
                  if p and me else float("inf"))
+            dead = entity.looks_dead(st, alive, flag)
+            # ★★★★ **牠正在打我嗎** —— 準確欄位（怪的 +0x34C ＝ 牠正在打誰，
+            #   AOB 自動定位、遊戲自己的 getter 讀的就是它），跟同一次讀取一起
+            #   拿回來，**沒有多讀一次記憶體**（見 entity.read_live_foe）。
+            #   使用者 2026-09-13 定：「打我就代表那怪物是活的，正在打我就該
+            #   打牠」—— 所以這個訊號成立時**不加距離條件**：不管幾格、
+            #   冷不冷卻、地形圖說不說走得到，一律當候選（見底下三處）。
+            #   ⛔ 屍體身上這欄會留著最後打的人（實測 352 拍次），所以先過
+            #     looks_dead 才敢信（跟 entity.attackers 同一條規矩）。
+            #   ⛔ 不看血量、不看動畫、不看距離（跟圍毆反擊同一個判準）。
+            hits_me = bool(my_eid) and not dead and foe == my_eid
             if m.eid in self._killed:
                 # ★★ 冷卻中的怪**正在打我**就立刻解禁。冷卻的用途是別浪費
                 #   時間在屍體／走不到的怪身上 —— 但打得到我的怪，我一定
@@ -5329,16 +5349,19 @@ class CharFarmPage(QWidget):
                 #   冷卻活怪一律解禁 —— 咬人的怪常常正是被記成「走不到」
                 #   冰起來的那隻，而牠出手當下欄位是空的、動畫又只有幾拍，
                 #   掉血＋距離是唯一一定抓得到的組合。
-                live = not entity.looks_dead(st, alive, flag)
+                live = not dead
+                # ★★★ 硬訊號優先：+0x34C 說牠在打我就是在打我（2026-09-13），
+                #   底下那兩個弱訊號（交戰槽會漏、動畫只有幾拍）留著當保底。
                 fighting = (live and self.player
                             and self._fighting_me(m, st, p, me))
-                if fighting or (live
-                                and self._under_attack()
-                                and d <= UNFREEZE_NEAR):
+                if hits_me or fighting or (live
+                                           and self._under_attack()
+                                           and d <= UNFREEZE_NEAR):
                     del self._killed[m.eid]
                     self._unreach_n.pop(m.eid, None)
                     self._dbg(f"解除冷卻：「{m.name}」eid={m.eid:#x} "
-                              + ("正在打我" if fighting
+                              + ("正在打我（+0x34C）" if hits_me
+                                 else "正在打我" if fighting
                                  else f"我在掉血且牠在 {d:.1f} 格內"))
                 else:
                     if skipped is not None and me and m.name in want:
@@ -5370,7 +5393,7 @@ class CharFarmPage(QWidget):
             #   ⚠ is_alive() 擋不掉：它只比對 vtable + 實體 ID，分不出屍體。
             #   ★ 2026-09-11：改問共用的 `looks_dead`（多了死亡旗標 +0x3D6==7）
             #     —— 副本的柱子那種死了動畫狀態不會變 'Dead'，只有旗標認得出。
-            if entity.looks_dead(st, True, flag):
+            if dead:
                 if skipped is not None and p and me:
                     skipped.append((d, m.name, "屍體"))
                 continue
@@ -5387,7 +5410,10 @@ class CharFarmPage(QWidget):
             #   ⚠ 牠站的那格不可走時放寬到附近的可走格再問 —— 怪偶爾會站在
             #     判定為牆的格子上，直接刷掉會漏打。
             #   ⚠ 讀不到地形圖 → reach 是 None → **完全不過濾**（安全退化）。
-            if reach is not None and p is not None:
+            #   ⚠⚠ **正在打我的不受這道過濾**（2026-09-13 使用者定）：牠打得到
+            #     我，我就打得到牠 —— 連通區泛洪說「走不到」多半是牠站的那格
+            #     被判成牆（或隔著薄牆），那是走路的問題，不是「不該打」。
+            if reach is not None and p is not None and not hits_me:
                 t = (int(p[0]), int(p[1]))
                 if t not in reach:
                     t2 = grid.nearest_open(*t)
@@ -5396,6 +5422,8 @@ class CharFarmPage(QWidget):
                             skipped.append((d, m.name, "走不到（不同連通區）"))
                         continue
             pool.append((d, m, p))
+            if hits_me:
+                hit_eids.add(m.eid)
         pool.sort(key=lambda t: t[0])
         if not pool and skipped and now - self._dbg_empty_t >= 5.0:
             # 挑不到時每 0.3 秒就會再試一次，照實寫會灌爆檔案 —— 節流 5 秒。
@@ -5404,7 +5432,7 @@ class CharFarmPage(QWidget):
             self._dbg(f"挑不到目標：清單 {len(self.mons)} 隻、"
                       f"被跳過 {len(skipped)} 隻；"
                       f"最近的是 {name} {dd:.1f} 格（{why}）")
-        return pool, skipped
+        return pool, skipped, [t for t in pool if t[1].eid in hit_eids]
 
     def _pick_next(self) -> bool:
         """挑**路徑最短**的一隻接著打；挑不到回傳 False。
@@ -5412,11 +5440,35 @@ class CharFarmPage(QWidget):
         ★★ 「最近」＝我們自己 A* 算出來的路徑長度（使用者指定），不是直線距離：
           隔著一道牆的怪直線 8 格、實際要繞 40 格，比同一條路上 12 格的還遠。
         ⚠ 讀不到地形圖就退回直線排序（安全退化，維持舊行為）。
+
+        ★★★★ **正在打我的優先**（使用者 2026-09-13：「打我就代表那怪物是活的，
+          正在打我就該打他」）。有人在咬我就只在那幾隻裡面挑，沒有才照舊全場挑。
+          · 訊號是怪身上的 +0x34C（＝牠正在打誰），**不是**猜的（交戰槽會漏、
+            動畫只有幾拍）—— 見 `_candidates` 裡 `hits_me` 那段。
+          · ⛔ 2026-08-10 那次「追 20 格外的仇人去撞牆」是**弱訊號**的錯
+            （動畫＋距離會把別人在拉的怪算成我的仇人），不是優先本身的錯；
+            這次換成硬訊號，所以使用者指定**不加距離上限**。
+          · 名單／只打王照舊過濾（名單外的怪不打，是使用者的規則）——
+            `_candidates` 已經先過完那一關才輪到這裡。
         """
-        pool, skipped = self._candidates()
+        pool, skipped, foes = self._candidates()
         if not pool:
             return False
         grid, _ = self._reach_set(self.my_pos())
+        if foes:
+            # ★ 咬我的那幾隻裡挑路徑最短的。算不出路徑也**不准放掉**
+            #   （牠打得到我，我就打得到牠）→ 退回直線最近的那一隻。
+            best = self._nearest_by_path(foes, grid, self.my_pos())
+            if best is None:
+                d, mon, _p = foes[0]
+                self._dbg(f"正在打我的 {len(foes)} 隻**都算不出路徑** → "
+                          f"照直線挑「{mon.name}」{d:.1f} 格")
+            else:
+                cost, d, mon = best
+                self._dbg(f"正在打我的有 {len(foes)} 隻 → 挑「{mon.name}」"
+                          f"直線 {d:.1f} 格、實走 {cost:.1f} 格")
+            self._engage(d, mon, None)
+            return True
         best = self._nearest_by_path(pool, grid, self.my_pos())
         if best is None and grid is not None:
             # ★★ 有地形圖卻**每一隻都算不出路** = 真的沒有走得到的怪。
@@ -5453,7 +5505,7 @@ class CharFarmPage(QWidget):
         if self._hurt or dist is None or now < self._switch_t:
             return False
         self._switch_t = now + SWITCH_GAP
-        pool, _ = self._candidates(quiet=True)
+        pool, _, _foes = self._candidates(quiet=True)
         me = self.my_pos()
         grid, _reach = self._reach_set(me)
         # 目前這隻的**實走距離**。算不出來（繞太遠／被地形圍住）就當成無限遠，

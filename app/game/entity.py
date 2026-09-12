@@ -261,7 +261,7 @@ def attackers(scanner, ents, my_eid: int) -> list:
         alive, state, _pos, flag = _live_from_blob(blob, e)
         if not alive or looks_dead(state, alive, flag):
             continue                       # 位址被回收、或那是一具屍體
-        if struct.unpack_from("<I", blob, off)[0] == my_eid:
+        if foe_from_blob(blob) == my_eid:
             out.append(e)
     return out
 
@@ -854,6 +854,49 @@ def read_live(scanner, ent: Entity
         return (is_alive(scanner, ent), read_state(scanner, ent.addr),
                 read_pos(scanner, ent.addr), read_dead_flag(scanner, ent.addr))
     return _live_from_blob(blob, ent)
+
+
+def read_attack_target(scanner, addr: int):
+    """實體「牠正在打誰」（+0x34C）的實體編號；讀不到回 None。
+
+    `read_live_foe()` 讀不到整段時的退路 —— 結果跟併讀完全一樣。
+    """
+    raw = scanner._read_bytes(addr + attack_target_off(), 4)
+    return struct.unpack("<I", bytes(raw))[0] if raw else None
+
+
+def read_live_foe(scanner, ent: Entity):
+    """`read_live` 再多一個值：(物件還在嗎, 動畫狀態, 座標, 死亡旗標, **牠正在打誰**)。
+
+    ★ 為什麼併進同一次讀取：「牠正在打誰」在 +0x34C，本來就落在 `LIVE_SPAN`
+      裡面（0x34C < 0x3D7）—— 所以**系統呼叫次數跟 `read_live` 一模一樣**，
+      挑目標那條路每隻怪還是只讀一次（見 `read_live` 的說明）。
+      ⛔ 不要在挑目標的迴圈裡另外叫 `attackers()`：那會把每隻怪再整段讀一遍。
+    ⚠ 讀不到 → 最後那個值是 None ＝**沒有這個訊號**（安全退化，不會誤判成
+      「牠在打我」）。
+    ⛔⛔ 屍體身上這個欄位會**留著最後打的人**（2026-09-12 實測 45 秒裡
+      `Dead` 而且指著我的有 352 拍次）→ 呼叫端一定要先過 `looks_dead()`
+      才能相信它（`attackers()` 就是這樣做的）。
+    """
+    blob = scanner._read_bytes(ent.addr, LIVE_SPAN)
+    if not blob:
+        alive, state, pos, flag = read_live(scanner, ent)
+        return alive, state, pos, flag, read_attack_target(scanner, ent.addr)
+    blob = bytes(blob)
+    alive, state, pos, flag = _live_from_blob(blob, ent)
+    return alive, state, pos, flag, foe_from_blob(blob)
+
+
+def foe_from_blob(blob: bytes):
+    """這一段快照裡「牠正在打誰」的實體編號；段不夠長回 None。
+
+    ★ 「誰在打我」的取值只有這一份（`attackers()` 與 `read_live_foe()` 都走
+      這支）—— 同一件事不准有第二套寫法（使用者 2026-09-09）。
+    """
+    off = attack_target_off()
+    if off <= OFF_ID or len(blob) < off + 4:
+        return None
+    return struct.unpack_from("<I", blob, off)[0]
 
 
 def _live_from_blob(blob: bytes, ent: Entity):
