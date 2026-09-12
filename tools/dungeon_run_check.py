@@ -778,20 +778,77 @@ def main() -> int:
     ck("★ 腳本要第 3 項但這一頁只有 1、2 → 停下來",
        not tab.run_cb.isChecked(), tab.status.text())
 
-    # 對話提早結束、選項還沒送完 → 停下
+    # ★★★★ 對話提早結束、選項還沒送完 → **重新講一次**（使用者 2026-09-12：
+    #   「有時候太早跟機關說話，對話會只有一個無異議對話，可能要等幾秒才會好，
+    #     所以如果這對話沒有成功輸出我們選項那應該要重新講話，就像傳送點那樣」）。
+    #   ⛔ 以前是當成完成一場收掉整趟（白賠一趟＋一次回程補給）。
     fake = FakeTalk([()])
     tab = make_tab([talk_step], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, fake)
     dt.talkwnd.close_page = fake.close_gone   # 按了確定 → 視窗直接不見
     run(tab, 8.0)
-    ck("★ 對話走完了選項卻還沒送到 → 停下來",
-       not tab.run_cb.isChecked(), tab.status.text())
+    ck("★★★ 對話走完了選項卻還沒送到 → **重新講一次**（⛔ 不收掉整趟）",
+       tab.run_cb.isChecked() and tab._talk_redo_n >= 1,
+       f"重講 {getattr(tab, '_talk_redo_n', '?')} 次　{tab.status.text()}")
+    ck("　而且會重新點它（回到「還沒點」的狀態）", tab._clicked is False
+       or tab._menu_i == 0, f"clicked={tab._clicked} menu_i={tab._menu_i}")
+    ck("　⛔ 沒有次數上限（上限交給 20 秒那道回退）",
+       tab._talk_redo_n >= 2 or tab.run_cb.isChecked(),
+       f"重講 {tab._talk_redo_n} 次")
 
     # ★★★ 「到底有沒有對話視窗」＝硬訊號（使用者 2026-09-02：
     #   「對話後關視窗太慢了，不知道在等啥，請要明確知道有沒有視窗」）
     # ★★★ 2026-09-03 確定＝messageclose＋destroy 之後：**不是最後一頁**時視窗會
     #   先不見、下一頁稍後才重建 —— 這段空窗不可以當「對話走完」（會誤停）。
+    print("\n動作卡住 20 秒 → 退回一次（使用者 2026-09-12：每個機關／傳點一次機會）")
+    # 腳本刻意排成「點位 → 傳點 → 點位 → 點位 → 對話」：卡在最後那個對話時，
+    # 落腳點必須是**傳點之後的第一個點位**（第 3 步），⛔ 不可以退到傳點之前
+    # （退過去就要再踩一次傳點、人會被送走）。
+    steps5 = [
+        {"do": "walk", "to": [5, 5]},                              # 1
+        {"do": "portal", "to": [8, 8]},                            # 2 動作：不准跨過
+        {"do": "walk", "to": [10, 10]},                            # 3 ← 落腳點
+        {"do": "walk", "to": [11, 11]},                            # 4
+        {"do": "interact", "at": [20, 20], "model": 60307,
+         "menu": [1], "gap": 0.2},                                 # 5 卡在這
+    ]
+    fake = FakeTalk([])                       # 點了永遠不開對話 → 一直卡著
+    tab = make_tab(steps5, pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    tab._goto(4)
+    run(tab, dt.ACT_STUCK_SECS - 3.0)
+    ck("　還沒滿 20 秒 → 不動（照舊一直點）", tab._i == 4, f"i={tab._i}")
+    run(tab, 4.0)
+    ck("★★★ 卡滿 20 秒 → 退回「那個動作之後的第一個點位」（第 3 步）",
+       tab._i == 2, f"退到第 {tab._i + 1} 步")
+    ck("　⛔ 沒有跨過傳點退到第 1 步", tab._i != 0, f"i={tab._i}")
+    ck("　⛔ 也不是「往回第一個走得到的」那個（第 4 步）", tab._i != 3, f"i={tab._i}")
+    ck("　回退機會記在這一步上（一趟一次）",
+       (tab._rounds, 4) in tab._rolled, str(tab._rolled))
+    ck("　退回之後這一步的計時歸零", tab._act_t == 0.0, str(tab._act_t))
+
+    # ★★★ 機會用掉了 → 再卡滿 20 秒就當成完成一場（沒勾循環＝停下）
+    tab._goto(4)
+    tab._rolled.add((tab._rounds, 4))
+    run(tab, dt.ACT_STUCK_SECS + 4.0)
+    ck("★★★ 退回重來之後又卡 20 秒 → 當成完成一場（沒勾循環就停下）",
+       not tab.run_cb.isChecked(), f"i={tab._i}　{tab.status.text()[:60]}")
+
+    # ⛔ 往回沒有點位可退（第 1 步就是對話）→ **什麼都不做**，交給 2 分鐘看門狗
+    fake = FakeTalk([])
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    run(tab, dt.ACT_STUCK_SECS + 6.0)
+    ck("★★ 往回沒有走得到的點位 → 不退也不收（照舊等 2 分鐘看門狗）",
+       tab.run_cb.isChecked() and tab._i == 0,
+       f"i={tab._i}　{tab.status.text()[:60]}")
+    ck("　而且只算過一次（⛔ 不每拍重新泛洪）", tab._roll_none is True,
+       str(tab._roll_none))
+
     print("\n按完確定視窗暫時不見（不是最後一頁）→ 要等下一頁，不能誤判走完")
     talk_step2 = {"do": "interact", "at": [20, 20], "model": 60307,
                   "menu": [1], "gap": 0.2}

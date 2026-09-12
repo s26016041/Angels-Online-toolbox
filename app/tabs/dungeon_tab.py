@@ -204,11 +204,14 @@ CLOSE_GIVEUP = 6
 #   所以「視窗不見了」在剛按完確定的那一小段時間**不等於對話結束** —— 要等
 #   CLOSE_GRACE 秒沒有新視窗出現，才算真的走完（不然過場頁後面還有選項的
 #   腳本會被誤判成「對話關掉了但選項沒送到」而停機）。
-#   ⚠⚠ 2026-09-12 試著收到 1.0 秒，`dungeon_run_check`「視窗暫時不見時不准誤判成
-#     走完」當場變紅 —— 這個值**不是**給我們輪詢用的（那一段已經改成每拍純讀），
-#     是給**伺服器把下一頁送來**的寬限，收它就等於在慢一點的來回上誤判「對話結束」
-#     → 整趟停機。所以維持 1.6，⛔ 別再收。
-CLOSE_GRACE = 1.6
+#   ⚠⚠ 這個值**不是**給我們輪詢用的（那一段已經改成每拍純讀），是給**伺服器把
+#     下一頁送來**的寬限 —— 收太緊會在慢一點的來回上誤判「對話結束」。
+#   ★ 2026-09-12 使用者同意收到 0.8 秒：實機量到伺服器換頁只要 0.25~0.3 秒
+#     （雪狐那趟 `supply._wait_page` 301ms／252ms 都是真的換頁），0.8 秒還有
+#     兩倍半餘裕。⛔ 再往下收就沒有餘裕了。
+#   ⚠ 多頁純對話（「無異議 → 無異議 → 選項」）就是靠這個寬限一頁一頁翻下去的，
+#     ⛔ 不可以改成「腳本的選項送完就不等」——那會在第一頁就收工。
+CLOSE_GRACE = 0.8
 # 「有沒有視窗」要**叫進遊戲**問（call_sync 會等它做完），
 # 所以答案快取這麼久，⛔ 不要每拍問。
 WND_TTL = 0.3
@@ -229,6 +232,20 @@ STRAY_WND_GAP = 2.0
 #   驗物件，這裡再避開最危險的那一段：一拍有順移、或順移／換圖後 STRAY_HOLD 秒內，
 #   遊戲正在拆視窗，晚幾秒再收沒差。
 STRAY_HOLD = 2.0
+# ★★★★ 動作步驟（傳送點／對話／撞機關）卡住這麼久 → **退回一次**重來
+#   （使用者 2026-09-12 定）。以前只有「同一段超過 STUCK_ABORT_SECS 2 分鐘就當成
+#   完成一場」這一道，卡住要白等 2 分鐘。現在：
+#     · 這一步的**動作階段**（走過去的時間不算）滿 ACT_STUCK_SECS
+#       → 退回「上一個動作之後的第一個點位」重跑（見 `_rollback_spot`）
+#     · **每個傳送點／機關只有一次回退機會**（使用者原話）→ 退回重來之後又卡滿
+#       ACT_STUCK_SECS ＝ 當成完成一場（`_abort_trip`）
+#   ⛔ 走路那種不套這條（使用者 2026-09-12：「走路不用」）——它照舊走 `_rejoin`
+#     「目標在另一區就接回腳本」＋ 2 分鐘看門狗。
+ACT_STUCK_SECS = 20.0
+# 對話結束了但腳本的選項一個都沒送出去 → 等這麼久再重新點它講一次。
+# ★ 出處（使用者 2026-09-12）：「有時候太早跟機關說話，對話會只有一個無異議對話，
+#   可能要等幾秒才會好」—— 所以不是馬上重點，要讓伺服器那邊先過幾秒。
+TALK_REDO_GAP = 2.0
 # ★★ 點下去之後這麼久都沒有任何對話反應 → **再點一次**（使用者 2026-09-02
 #   回報「最後一個石頭雕像點不到」）。點一次就不管是不對的：遊戲是「自己走
 #   過去才開對話」，路上被怪打斷、被人擋住、剛好在走都會讓那一下落空 ——
@@ -1568,6 +1585,10 @@ class DungeonTab(BaseTab):
         self._jump_judged = False    # 這一拍的順移 ⓪-3 已經判過了（`_run_step` 那份保險別再判一次）
         self._track = deque()        # 最近 TRACK_SECS 秒走過的軌跡 [(時刻, (x, y))]（判伺服器拉回）
         self._rollbacks = 0          # 這一步從傳點上跳走卻被當成「拉回」幾次了（見 ROLLBACK_MAX）
+        self._act_t = 0.0            # 這一步的「動作階段」進行多久（走過去的不算，見 ACT_STUCK_SECS）
+        self._roll_none = False      # 這一步往回沒有走得到的點位（算過一次就記住）
+        self._rolled = set()         # {(趟次, 步序)}：這一步的回退機會用掉了（趟次一變自動失效）
+        self._talk_redo_n = 0        # 這一步重新講話幾次（狀態列／紀錄用）
         self._map_settle = 0.0       # 換圖後等座標跟上，這個時刻之前不算任何東西
         self._stray_t = 0.0          # 多久之後再看一次有沒有不該出現的對話框
         self._stray_closed = 0.0     # 上次關掉的時刻（節流）
@@ -3197,6 +3218,10 @@ class DungeonTab(BaseTab):
                 # ★ 已經站在傳點上卻沒被搬走 → 每 PORTAL_POKE 秒對它送一次
                 #   互動（有些傳點要點一下才走）。⛔ 不是每一拍狂送：那是
                 #   洪水，伺服器會擋（跟補給點 NPC 同一個道理）。
+                # ★ 站在傳點上開始算「動作階段」——走過去那一段不算（見 ACT_STUCK_SECS）
+                self._act_t += dt
+                if self._act_stuck("踩傳送點"):
+                    return
                 self._nav.reset()
                 # ★★ 2026-09-05 黑狐實錄（無限塔第 35 步）：傳點那一格在地形圖上是**牆**，
                 #   A* 把終點放寬到旁邊 → 人停在 2.1 格外；隔空送 0x0D 伺服器不理
@@ -3723,6 +3748,10 @@ class DungeonTab(BaseTab):
         """
         ax, ay = step["at"]
         tag = f"第 {self._i + 1} 步"
+        # ★ 撞機關整段都算「動作階段」（走去它旁邊也是撞的一部分，見 ACT_STUCK_SECS）
+        self._act_t += dt
+        if self._act_stuck("撞機關"):
+            return
         # ── ① 開了沒（每 BUMP_POLL 秒問一次，⛔ 不是每拍讀地形）─────
         self._gate_t -= dt
         if self._gate_t <= 0:
@@ -3899,6 +3928,11 @@ class DungeonTab(BaseTab):
         """
         tag = tag or f"第 {self._i + 1} 步"
         finish = finish or self._next
+        # ★ 點過之後才算「動作階段」——走去站位那一段不算（見 ACT_STUCK_SECS）。
+        if self._clicked:
+            self._act_t += dt
+            if self._act_stuck("跟它講話"):
+                return
         ax, ay = step["at"]
         want_model = step.get("model")
         # ⚠ 先走到旁邊再點：太遠就發互動包＝人還沒到、對話先開，選項送出去
@@ -4117,9 +4151,14 @@ class DungeonTab(BaseTab):
                           f"（{self._gone_t:.1f}/{CLOSE_GRACE:.1f} 秒）")
                 return
             if self._menu_i < len(menu):
-                self._abort_trip(f"⛔ {tag}：對話已經關掉了，"
-                                 f"但腳本還有 {len(menu) - self._menu_i} 個選項沒送到"
-                                 f"（NPC 的對話跟腳本記的不一樣？）")
+                # ★★★★ 使用者 2026-09-12：「太早跟機關說話對話會只有一個無異議
+                #   對話，可能要等幾秒才會好，所以如果這對話沒有成功輸出我們選項
+                #   那應該要重新講話，就像傳送點那樣」——**重新點它講一次**，
+                #   ⛔ 不再當成完成一場（以前是 `_abort_trip`，白賠一趟＋一次補給）。
+                #   一直不給選項的話，上面那道 ACT_STUCK_SECS 會回退／收掉，
+                #   所以這裡**不必設次數上限**（跟傳送點「撞到過去為止」同一個哲學）。
+                self._talk_redo(tag, f"對話結束了，但腳本還有 "
+                                     f"{len(menu) - self._menu_i} 個選項沒送到")
                 return
             supply.leave_npc(self._mover, self._sc)
             finish()
@@ -4281,6 +4320,9 @@ class DungeonTab(BaseTab):
         self._gate_base = None
         self._gate_last = None
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
+        self._act_t = 0.0             # 動作階段的計時也是每一步各算（見 ACT_STUCK_SECS）
+        self._roll_none = False
+        self._talk_redo_n = 0
         self._nudge = 0               # 靠近重試的次數歸零
         self._spam = 0                # 狂點的發數歸零
         self._still_t = 0.0
@@ -5728,6 +5770,96 @@ class DungeonTab(BaseTab):
             self._notify(f"⚠ 人在 {f'({me[0]:.0f}, {me[1]:.0f})' if me else '?'}，"
                          f"跟腳本完全對不上（前後都沒有走得到的步驟）")
         return False
+
+    def _talk_redo(self, tag: str, why: str) -> None:
+        """把這一步的對話狀態整組歸零，`TALK_REDO_GAP` 秒後**重新點它講一次**。
+
+        為什麼要有它（使用者 2026-09-12）：太早跟機關講話，伺服器只回一頁**沒有
+        選項**的對話就沒有下一頁了，要等幾秒才會給選項。以前這種情況被當成
+        「對話跟腳本對不上」→ 收掉整趟；現在照傳送點那套「一直試到過去為止」。
+        ⚠ `_menu_i` 要歸零：重新講就是從第一頁開始走，⛔ 不能接在半路。
+        ⚠ 次數上限交給 `ACT_STUCK_SECS`（20 秒回退一次、再卡就當完成一場），
+          這裡不自己設上限。
+        """
+        self._clicked = False
+        self._menu_i = 0
+        self._talk_did = ""
+        self._talk_seen = False
+        self._talk_sig = self._talk_base = None
+        self._close_t, self._close_n = 0.0, 0
+        self._gone_t = 0.0
+        self._spam = 0
+        self._click_t, self._click_best, self._nudge = 0.0, None, 0
+        self._wnd, self._wnd_t = None, 0.0
+        self._menu_t = self._menu_gap = TALK_REDO_GAP
+        self._talk_redo_n += 1
+        msg = (f"{tag}　{why} → {TALK_REDO_GAP:g} 秒後重新講一次"
+               f"（第 {self._talk_redo_n} 次）")
+        self._say(msg)
+        self._runlog_write(msg, force=True)
+
+    def _rollback_spot(self):
+        """回退要落在哪一步（序號）；沒有安全落腳點回 None。
+
+        規則（使用者 2026-09-12 定）：
+          · **只落在點位**（`walk`／`force`）—— ⛔ 不落在傳送點／對話／撞機關那種
+            動作步驟上（落在那裡等於要重做那個動作）。
+          · 往回掃**遇到動作步驟就停**，取「那個動作之後的**第一個**點位」——
+            ⚠ 不是「往回數第一個走得到的」那個（那只會重走最後一小段）；⛔ 不跨過去：
+            傳送點會把人再送走一次、對話傳送同理。所以「這一層重跑一遍」只有在
+            中間全是點位時才成立；中間有機關或對話傳送，就從**那個動作之後的
+            第一個點位**重新開始。
+          · 沒有位置的步驟（休息／清怪）跳過繼續往回找（重做它們無害）。
+          · 連那個點位都走不到 → 回 None（呼叫端當成完成一場）。
+        """
+        steps = self._script.steps if self._script else []
+        spot = None
+        for i in range(self._i - 1, -1, -1):
+            kind = steps[i].get("do")
+            if kind in (dungeon.PORTAL, dungeon.INTERACT, dungeon.BUMP):
+                break                     # ⛔ 不跨過動作步驟（跨過去＝要重做它）
+            if kind in (dungeon.WALK, dungeon.FORCE):
+                pos = self._step_pos(steps[i])
+                if pos is not None and self._can_reach(pos):
+                    spot = i              # 一路往回更新 → 留下「動作之後的第一個」
+        return spot
+
+    def _act_stuck(self, what: str) -> bool:
+        """動作步驟（傳送點／對話／撞機關）的動作階段卡滿 `ACT_STUCK_SECS` 了嗎。
+
+        回 True＝這一拍已經處理掉了（退回或收掉這一趟），呼叫端不要再做別的。
+        **每個步驟只有一次回退機會**（使用者 2026-09-12：「每個機關或傳送點只會
+        有一次回退機會，如果回退後到那邊還是失敗就要當成副本完成」）——
+        記在 `(趟次, 步序)` 上，所以下一趟又是全新的機會。
+        ⛔ 只管人在副本裡跑腳本那段（`cycle=go`／`phase=run`）：撞入口、趕路、
+          補給、復活各有自己的收尾。
+        """
+        if self._act_t < ACT_STUCK_SECS or self._roll_none:
+            return False
+        if not (self._cycle == "go" and self._phase == "run"):
+            return False
+        key = (self._rounds, self._i)
+        secs = f"{ACT_STUCK_SECS:.0f} 秒"
+        if key in self._rolled:
+            self._abort_trip(f"⚠ 第 {self._i + 1} 步 {what} 退回重來之後又卡了"
+                             f"{secs}（{self.status.text()[:100]}）")
+            return True
+        idx = self._rollback_spot()
+        if idx is None:
+            # ⛔ 沒有安全落腳點就**什麼都不做**：照舊交給「同一段超過 2 分鐘」
+            #   那道看門狗（使用者 2026-09-12 點頭的就是這個版本）。⚠ 算一次就
+            #   記住，`_rollback_spot` 每次都要泛洪（~6ms），不可以每拍重算。
+            self._roll_none = True
+            return False
+        self._rolled.add(key)
+        pos = self._step_pos((self._script.steps if self._script else [])[idx])
+        where = f"({pos[0]:.0f}, {pos[1]:.0f})" if pos else "原地"
+        self._event("warn",
+                    f"第 {self._i + 1} 步 {what} 卡了{secs} → 退回第 {idx + 1} 步 "
+                    f"{where} 重來（這一步只有一次回退機會）")
+        self._drop_target()
+        self._goto(idx)
+        return True
 
     def _why_unreachable(self, goal) -> str:
         """停下來時**把證據講出來**：那一格到底是牆，還是在別的區。
