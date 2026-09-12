@@ -444,6 +444,9 @@ def run(tab, secs: float, watch: bool = False) -> None:
     for _ in range(int(secs / TICK)):
         if not tab.run_cb.isChecked():
             return
+        # 手動開掛機就關掉自動刷副本（跟真的 _tick 一樣擺在最前面，休息中也算）
+        if tab._farm_click_stop(TICK):
+            return
         if watch and tab._cycle != "offline" and tab._check_offline(TICK):
             continue
         if watch:
@@ -3184,6 +3187,67 @@ def main() -> int:
        f"{tab._sched_rounds} {tab._sched_rest_min} {tab._sched_farm}")
     ck("　按鈕提示跟著變", "3 場" in tab.sched_btn.toolTip() and "1 小時 30 分" in tab.sched_btn.toolTip(),
        tab.sched_btn.toolTip())
+
+    # =====================================================================
+    # ★★★ 同一台不准兩頁一起指揮（2026-09-13 黑狐實錄：死在副本裡 → 掛機頁的死亡回程
+    #   把人從標記點趴趴GO拉回巡邏點 → 副本頁那趟回程補給被拖爛）：
+    #     · 開跑就先關掉那台的掛機
+    #     · 跑的中途（含休息中）使用者**親手**開掛機 → 自動刷副本自己關掉（掛機照跑）
+    # =====================================================================
+    print("\n兩頁不准一起指揮：開跑先關掛機、手動開掛機就關掉自動刷副本")
+
+    class FarmWithClicks(FakeFarm):
+        """假掛機頁＋「使用者親手勾上掛機」的計數（真的那支只數 clicked）。"""
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.manual = 0
+
+        def manual_on_count(self, pid):
+            return self.manual
+
+    def texts(tab):
+        return [x for _t, _a, _k, x in tab._events]
+
+    # ① 開跑（_launch）→ 先把那台的掛機關掉，而且講出來
+    tab = sched_tab(4, 120, True)
+    tab._farm = FarmWithClicks()
+    world["here"] = 98                        # 人已經在副本裡 → phase=run
+    ok = tab._launch(1, tab._sc, tab._script)
+    ck("★★★ 開跑就先關掉這台的自動掛機", ok and (1, False) in tab._farm.calls,
+       f"{ok} {tab._farm.calls}")
+    ck("　執行紀錄講了一句", any("關掉這台的自動掛機" in x for x in texts(tab)),
+       str(texts(tab)[:3]))
+    ck("　基準線記了（0 次手動）", tab._farm_manual == 0, str(tab._farm_manual))
+
+    # ② 跑的中途使用者親手開掛機 → 自動刷副本自己關掉，⛔ 不回頭去關掛機
+    tab._farm.calls.clear()
+    tab._farm.manual += 1
+    run(tab, dt.FARM_CHECK + 0.3)
+    ck("★★★ 手動開掛機 → 自動刷副本關掉", not tab.run_cb.isChecked()
+       and "自動掛機" in tab.status.text(), tab.status.text())
+    ck("　⛔ 沒有回頭去關掛機（掛機照跑）", tab._farm.calls == [], str(tab._farm.calls))
+    ck("　排程也收乾淨", tab._sched is None and not tab._rest_farm)
+
+    # ③ 副本頁自己開的掛機（休息交棒）不算手動 —— 不然它會把自己關掉
+    tab = sched_tab(1, 60, True)
+    tab._farm = FarmWithClicks()
+    finish_round(tab)
+    world["here"] = 26
+    wait_supply(tab)
+    ck("　1 場滿 → 交棒開掛機、進休息", tab._cycle == "rest"
+       and tab._farm.calls == [(1, True)], f"{tab._cycle} {tab._farm.calls}")
+    run(tab, dt.FARM_CHECK + 0.3)
+    ck("★ 副本頁自己開的掛機不算手動（休息照倒數）", tab._cycle == "rest"
+       and tab.run_cb.isChecked(), f"{tab._cycle} {tab.status.text()}")
+
+    # ④ 休息中親手開掛機 ＝「我不刷了，一直掛機」（使用者 2026-09-13 選的 B）
+    tab._farm.manual += 1
+    run(tab, dt.FARM_CHECK + 0.3)
+    ck("★★★ 休息中手動開掛機 → 取消排程（掛機照跑）", not tab.run_cb.isChecked()
+       and tab._sched is None and "自動掛機" in tab.status.text(),
+       f"{tab._cycle} {tab.status.text()}")
+    ck("　⛔ 沒有回頭去關掛機", tab._farm.calls == [(1, True)], str(tab._farm.calls))
 
     # =====================================================================
     # ★★★ 斷線＝當成一場（使用者 2026-09-06）：「不管是連線斷了還是閃退都算完成一場，

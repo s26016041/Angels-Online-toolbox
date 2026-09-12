@@ -439,6 +439,35 @@ check("回程點＝城裡的原地", SUPPLY.trips[-1]["back_to"] == (10.0, 20.0,
 ROBOT.wing = (5, 30)
 ROBOT.dry = []
 
+# ★★★ 2026-09-13：同一台不准兩頁一起指揮（黑狐死在副本裡，掛機頁的死亡回程把人
+#   趴趴GO拉回巡邏點，副本頁那趟回程補給整趟被拖爛）→ 自動刷副本頁開跑就關掉掛機、
+#   使用者**親手**開掛機就把自動刷副本關掉。這裡驗掛機頁這邊的兩個約定。
+print("⑨ 手動開掛機的計數＋關掛機不建分頁")
+ft = farm_tab.FarmTab()
+ft._watch_start = lambda: None                 # 別去對帳真的遊戲視窗（會把假分頁收掉）
+pg = build_page()
+ft._pages[pg.pid] = pg
+# _client_new 就是這樣接的：clicked（只有親手點才發）→ _on_run_clicked
+pg.run_cb.clicked.connect(lambda _on, x=pg: ft._on_run_clicked(x))
+check("一開始 0 次", ft.manual_on_count(pg.pid) == 0)
+ok, why = ft.set_farming(pg.pid, True)
+check("副本頁叫 set_farming(True) 勾得起來", ok and pg.run_cb.isChecked(), why)
+check("★ 程式勾的不算手動（不然副本頁休息交棒會把自己關掉）",
+      ft.manual_on_count(pg.pid) == 0, str(ft.manual_on_count(pg.pid)))
+ft.set_farming(pg.pid, False)
+pg.run_cb.click()
+check("★★★ 親手點才算手動", ft.manual_on_count(pg.pid) == 1,
+      str(ft.manual_on_count(pg.pid)))
+pg.run_cb.click()                              # 取消勾勾
+check("親手取消不算（只數勾上）", ft.manual_on_count(pg.pid) == 1,
+      str(ft.manual_on_count(pg.pid)))
+ok, why = ft.set_farming(99999, False)
+check("★ 關一台沒開過掛機頁的分身：回成功、⛔ 不去把分頁建出來",
+      ok and 99999 not in ft._pages, f"{ok} {why}")
+ok, why = ft.set_farming(99999, True)
+check("　開那台才大聲說找不到", not ok and "找不到" in why, f"{ok} {why}")
+pg.run_cb.setChecked(False)
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))

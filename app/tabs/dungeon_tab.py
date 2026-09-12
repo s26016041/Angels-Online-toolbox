@@ -350,6 +350,14 @@ TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 #       （使用者 9/7 選的）。「從第幾步」只管第一個副本第一場。
 #     · 「循環打副本」不再因為勾了副本設定變灰：它現在管的是清單走完要不要回去。
 SCHED_DEFAULTS = {"rounds": 4, "rest_min": 120, "farm": True, "give_up_min": 3}
+# ★★★ 同一台不准兩頁一起指揮（2026-09-13 黑狐實錄）：掛機頁的死亡回程規則是
+#   「復活後一定趴趴GO回巡邏點」，副本裡死掉那趟的回程補給就被它拉著走 ——
+#   修裝磨滿 120 秒沒開到視窗、跑去的那張圖表裡沒有補給商所以沒買到水、
+#   趴趴GO 回不去入口。所以：
+#     · 自動刷副本一開跑 → 先把那台的掛機關掉（見 `_launch`）。
+#     · 跑的中途（含休息中）使用者**親手**開掛機 → 自動刷副本自己關掉
+#       （使用者 2026-09-13 明令；`_stop` 本來就不動掛機 → 掛機照跑）。
+FARM_CHECK = 1.0           # 多久比對一次「使用者親手開掛機了沒」
 REST_NOTE = 1.0            # 休息倒數狀態列多久刷一次
 REST_LOG = 60.0            # 休息倒數多久寫一行執行紀錄（每秒寫兩小時就是七千行）
 # ★★★ 斷線＝當成一場（使用者 2026-09-06）：
@@ -703,6 +711,9 @@ class DungeonTab(BaseTab):
         self._gang = None            # GangWorker（被圍毆就反擊，跟掛機頁同一支）
         self._loading = False        # 正在把設定讀回畫面（這期間不要回存）
         self._farm = None            # 自動掛機頁（平常從主視窗找；測試直接塞假的）
+        # 「使用者親手開掛機就關掉自動刷副本」（見 FARM_CHECK）：開跑時記的基準線
+        self._farm_manual = 0
+        self._farm_chk = FARM_CHECK
         # 「副本設定」視窗裡的三個值（存 config，照分身；預設見 SCHED_DEFAULTS）
         self._sched_rounds = SCHED_DEFAULTS["rounds"]
         self._sched_rest_min = SCHED_DEFAULTS["rest_min"]
@@ -1864,6 +1875,10 @@ class DungeonTab(BaseTab):
         self._started = True
         self._back_jumps = 0          # 「往回接回腳本」的次數是每一趟各算的
         self._runlog_open()
+        # ★ 開跑前先把這台的掛機關掉（見 FARM_CHECK 的說明）。⚠ 休息結束再刷那條
+        #   （presupply）在上面就 return 了 —— 它自己已經 `_set_farming(False)` 過。
+        _fok, _fwhy = self._set_farming(False)
+        self._event("info", f"開跑前先關掉這台的自動掛機：{_fwhy}")
         self._event("info", f"開跑「{script.name}」（從第 {self._i + 1} 步"
                             f"，{'循環' if self._loop else '只打一場'}"
                             + (f"，副本設定 {self._queue_desc()}" if self._sched else "")
@@ -1891,6 +1906,9 @@ class DungeonTab(BaseTab):
             return False
         rounds = self._rounds
         self._pid, self._sc, self._script = pid, sc, script
+        # 「使用者親手開掛機就關掉自動刷副本」的基準線（見 FARM_CHECK）
+        self._farm_manual = self._farm_manual_count()
+        self._farm_chk = FARM_CHECK
         self._reset_run()
         self._rounds = rounds            # 趟數跨批次累計（只拿來顯示）
         # 帳號：斷線後靠它認「同一個帳號回來了」（標題讀不到就退回下拉選的那個）
@@ -2106,6 +2124,11 @@ class DungeonTab(BaseTab):
         if not self.run_cb.isChecked() or self._sc is None:
             return
         dt = TICK_MS / 1000.0
+        # ⓪-00000 使用者親手開了這台的「開始掛機」→ 自動刷副本關掉（見 FARM_CHECK）。
+        #   ⚠ 放在最前面：休息中（角色交給掛機頁）也要算 —— 那正是「我不刷了，
+        #   一直掛機」那一手。
+        if self._farm_click_stop(dt):
+            return
         # ⓪-000 副本設定的休息：角色交給掛機頁了，這裡**只倒數**（不掃描、不讀不寫）
         if self._cycle == "rest":
             self._sync_gang(False)       # 交給掛機頁了，這裡完全讓開
@@ -4851,6 +4874,31 @@ class DungeonTab(BaseTab):
         if not home or home[2] is None:
             return None, "掛機頁沒有設巡邏點（記錄點），不知道要回哪裡"
         return (float(home[0]), float(home[1]), int(home[2])), ""
+
+    def _farm_click_stop(self, dt: float) -> bool:
+        """使用者**親手**開了這台的「開始掛機」→ 自動刷副本自己關掉；回 True＝停了。
+
+        每 FARM_CHECK 秒比對一次掛機頁的「手動勾上」計數（見 FARM_CHECK）。
+        ⛔ 不碰掛機的勾勾 —— `_stop` 本來就不動它（掛機照跑，使用者 2026-09-13 選的）。
+        """
+        self._farm_chk -= dt
+        if self._farm_chk > 0:
+            return False
+        self._farm_chk = FARM_CHECK
+        if self._farm_manual_count() <= self._farm_manual:
+            return False
+        self._stop("你手動開了自動掛機 → 自動刷副本關掉")
+        return True
+
+    def _farm_manual_count(self) -> int:
+        """掛機頁那邊「使用者親手勾上開始掛機」的累計次數；問不到回 0（＝不觸發）。"""
+        farm = self._farm_tab()
+        if farm is None or not hasattr(farm, "manual_on_count"):
+            return 0
+        try:
+            return int(farm.manual_on_count(self._pid))
+        except Exception:                                 # noqa: BLE001
+            return 0
 
     def _set_farming(self, on: bool) -> tuple[bool, str]:
         farm = self._farm_tab()

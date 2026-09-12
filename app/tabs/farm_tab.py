@@ -7276,6 +7276,11 @@ class FarmTab(ClientWatchMixin, BaseTab):
         #   遊戲重開會把「原地重複練習技能」關掉，靠這條把練技整包接回來
         #   （接回後 _train_push 看門狗會把練習技能推回開）。
         self._train_intent: dict[str, bool] = {}
+        # ★ 使用者**親手**把「開始掛機」勾上的累計次數（pid → 次數），給自動刷副本頁
+        #   比對用：使用者 2026-09-13 明令「手動開自動掛機就關掉自動刷副本」。
+        #   ⚠ 只數親手點的 —— `set_farming()` 是程式勾的（setChecked 不發 clicked），
+        #     副本頁休息時自己開的掛機不能把自己關掉。
+        self._manual_on: dict[int, int] = {}
 
         root = QVBoxLayout(self)
 
@@ -7344,6 +7349,18 @@ class FarmTab(ClientWatchMixin, BaseTab):
         if page.run_cb.isChecked() and page.account:
             self._train_intent[page.account] = False
 
+    def _on_run_clicked(self, page) -> None:
+        """使用者**親手**點了「開始掛機」勾選框 —— 勾上就記一筆（`_manual_on`），
+        自動刷副本頁看到數字變大就自己關掉。程式自己 `setChecked` 不會走到這裡
+        （clicked 只有真的點擊才發）。"""
+        if page.run_cb.isChecked():
+            self._manual_on[int(page.pid)] = self._manual_on.get(int(page.pid), 0) + 1
+        self._note_farm_intent(page)
+
+    def manual_on_count(self, pid: int) -> int:
+        """那一台「使用者親手勾上掛機」的累計次數（給自動刷副本頁比對；沒有就 0）。"""
+        return int(self._manual_on.get(int(pid), 0))
+
     def _note_train_intent(self, page) -> None:
         """使用者親手點「自動練技」→ 記練技意向；同上，勾上時清掛機意向。"""
         if page.account:
@@ -7391,10 +7408,15 @@ class FarmTab(ClientWatchMixin, BaseTab):
 
     def set_farming(self, pid: int, on: bool) -> tuple[bool, str]:
         """把那一台的「開始掛機」勾上／放掉 —— 當成使用者親手點的（意向一起記，
-        斷線重登才會接回去）。回 (成功?, 說明)。"""
-        page = self.page_for(pid)
+        斷線重登才會接回去）。回 (成功?, 說明)。
+
+        ⚠ **關掉**的時候不叫 `page_for`：那支會把整組分頁＋掃描執行緒建出來，而
+          「關一個還不存在的掛機」本來就沒事可做（自動刷副本一開跑就會叫這支關掉
+          那台的掛機，見 dungeon_tab `_launch`）。
+        """
+        page = self.page_for(pid) if on else self._pages.get(int(pid))
         if page is None:
-            return False, "掛機頁找不到這台分身"
+            return (False, "掛機頁找不到這台分身") if on else (True, "掛機沒在跑")
         if page._halted:
             return False, f"掛機頁已停用：{page._halted}"
         if page.run_cb.isChecked() != bool(on):
@@ -7434,7 +7456,7 @@ class FarmTab(ClientWatchMixin, BaseTab):
                             tgt, keys, None, acct, nm,
                             self.ATTACK_MODE, self.SETTINGS_PREFIX, gang)
         page._notifier.failed.connect(self.found.setText)
-        page.run_cb.clicked.connect(lambda _on, p=page: self._note_farm_intent(p))
+        page.run_cb.clicked.connect(lambda _on, p=page: self._on_run_clicked(p))
         page.train_cb.clicked.connect(
             lambda _on, p=page: self._note_train_intent(p))
         self._pages[w.pid] = page
