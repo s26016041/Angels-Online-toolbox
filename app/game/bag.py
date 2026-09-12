@@ -349,6 +349,22 @@ def _u32(scanner, addr: int) -> int:
     return struct.unpack("<I", bytes(raw))[0] if raw else 0
 
 
+def my_entity_id(scanner) -> int:
+    """**我的實體編號**（場景管理器記的那個）；讀不到／還沒進場回 0。
+
+    拿來跟別人身上的「正在打誰」欄位比對（見 entity.attackers）。
+    ⚠ 換地圖的空窗期這裡可能還是上一張圖的舊編號 —— 那會讓比對通通不成立
+      （＝當成沒人打我），是安全的方向，不要「猜一個」補上去。
+    """
+    mgr = _u32(scanner, quickbar.MGR_PTR)
+    if not mgr:
+        return 0
+    scene = _u32(scanner, mgr + OFF_SCENE_MGR)
+    if not scene:
+        return 0
+    return _u32(scanner, scene + OFF_MY_ID)
+
+
 def player_entity(scanner) -> int | None:
     """我的實體物件；認不出來就回 None（絕不回一個「大概是」的位址）。"""
     mgr = _u32(scanner, quickbar.MGR_PTR)

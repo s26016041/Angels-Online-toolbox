@@ -100,6 +100,28 @@ KIND_MONSTER = 7
 #   「動畫是 ATT_STATES 且離我很近」——見 farm_tab 的 _fighting_me()。
 OFF_FOE = 0x4D8
 FOE_SPAN = 0x4E8 + 4 - OFF_FOE      # 三個槽一次讀回來（+0x4D8 ~ +0x4E8）
+# ★★★ **「這隻正在打誰」** —— 存的是對方的**實體編號**（不是指標）。
+#   2026-09-12 定案，這才是「誰在打我」的準確來源，上面那三個交戰槽不是。
+#
+# 線索是使用者給的：官方「天使守護精靈 → 戰鬥」有一格
+#   「被 __ 隻怪同時攻擊時使用技能」（GAMEDATA wnd01.xml id=10051 圍毆按鈕）
+#   —— 客戶端自己算得出攻擊者**數量**，所以一定有準確來源，不必再靠
+#   「血量在掉」「動畫＋距離」去猜（使用者 2026-09-12 明令：不可以看血量）。
+#
+# ★ 出處（純讀反組譯 angel.dat）＝遊戲自己的存取器 `0x557852`：
+#       push [ebp+8] / mov ecx,[場景管理器] / call 依編號取物件
+#       / test eax,eax / je 回0 / mov eax,[eax+0x354] / ret
+#   一支只做這件事的小 getter；官方掛機 AI（`0x5542fa`）也讀它，用來判
+#   「這隻怪是不是被別人打走了」。
+# ⚠ 反組譯看到的 0x354 是**遊戲空間**，本檔基準差 8 bytes（見檔頭），
+#   所以我們用的是 +0x34C。OFF_ATTACK_TARGET_GAME 由 AOB 自動定位
+#   （locate.SIGS），**要用的時候當場算**（import 時抄一份會凍住舊值）。
+#
+# ★ 實測（黑狐，2026-09-12，`py tools/attacker_probe.py`）：使用者讓三隻怪
+#   打他 → 222/222 拍剛好認出 3 隻（畫面上同時有 14~15 隻怪）；怪出手中的
+#   603 拍次**全中、零漏**；兩次揮刀之間照樣保持（不是只有動畫那幾拍）。
+OFF_ATTACK_TARGET_GAME = 0x354
+VT_SHIFT = 8              # 掃到的位址(VT_ENTITY) − 物件起點(VT_ENTITY2)
 # 攻擊型動畫狀態（出手的那幾拍）。搭配距離就是「正在打我」的另一半訊號。
 ATT_STATES = ("Att", "Att2", "Cast")
 STATE_DEAD = "Dead"       # 屍體（最快也最準的死亡訊號）
@@ -202,9 +224,45 @@ OFF_WEIGHT_MAX = 0x500
 OFF_WEIGHT = 0x504
 
 
+def attack_target_off() -> int:
+    """「正在打誰」欄位在**本檔基準**下的偏移（見 OFF_ATTACK_TARGET_GAME）。"""
+    return OFF_ATTACK_TARGET_GAME - VT_SHIFT
+
+
+def attackers(scanner, ents, my_eid: int) -> list:
+    """`ents` 裡面**正在打我**的那幾隻（維持傳進來的順序）。
+
+    判準只有一個：`+0x34C == 我的實體編號`（見 OFF_ATTACK_TARGET_GAME）。
+    ⛔ 不看血量、不看動畫、不看距離。
+
+    ⚠ 同一次讀取裡**順便重驗身分**（+0x1C8 還是不是原本那隻）——
+      怪一死物件就被歸還空物件池、位址會被回收給別人用，拿舊位址讀出來的
+      東西不能信（見 memory `stale-address-identity-check`、`entity-list-churn`）。
+      驗不過就當成「這一拍讀不到牠」跳過，絕不把別隻算進來。
+    ⚠ `my_eid` 是 0（還沒進場／讀不到）→ 回空清單＝當成沒人打我（安全退化）。
+    """
+    off = attack_target_off()
+    if not my_eid or off <= OFF_ID:
+        return []
+    span = off + 4 - OFF_ID
+    out = []
+    for e in ents:
+        raw = scanner._read_bytes(e.addr + OFF_ID, span)
+        if not raw or len(raw) < span:
+            continue
+        blob = bytes(raw)
+        if struct.unpack_from("<I", blob, 0)[0] != e.eid:
+            continue                       # 位址被回收給別的物件了
+        if struct.unpack_from("<I", blob, off - OFF_ID)[0] == my_eid:
+            out.append(e)
+    return out
+
+
 def attacking(scanner, ent, player_obj: int) -> bool:
     """交戰槽（三個都看）裡有沒有我。
 
+    ⛔⛔ **要問「誰在打我」請改用 `attackers()`**（怪的 +0x34C ＝ 牠正在打誰，
+      2026-09-12 實測 603/603 出手拍全中）。這一支留著只是舊呼叫端還在用。
     ⚠ 這只是「跟我交戰過」的**弱訊號**：怪出手的當下三個槽反而是空的
       （見 OFF_FOE 的實測）。要判「正在打我」請再聯集動畫狀態＋距離
       （farm_tab._fighting_me），單獨用這個一定漏。

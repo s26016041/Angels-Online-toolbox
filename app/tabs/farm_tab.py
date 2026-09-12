@@ -728,6 +728,24 @@ class _NamedKeyBox(QComboBox):
         super().showPopup()
 
 
+def reach_of(sid: int) -> float:
+    """**這一招自己**打得到的距離（格）。
+
+    ★★★ 攻擊距離是**每一招各自的事**，不准取全輪的最短或最長
+      （使用者 2026-08-10 明確指定，見 memory farm-attack-rules）。
+    ⚠ 射程 0 ＝ 對自己的 buff：不看距離（回 inf）。
+    ⚠ 換算：技能表寫的是格數，斜角相鄰算一格，所以歐氏距離 ≈ 射程 + 1；
+      上限 ATTACK_PACKET_RANGE 是封包攻擊實測打得到的最遠距離。
+
+    ★ 只有一份（使用者 2026-09-09：「同樣東西盡量不要有 2 個」）：
+      KeyWorker.reach_of 與圍毆反擊（GangWorker）都走這裡。
+    """
+    r = skills.range_of(sid)
+    if not r:
+        return float("inf")
+    return min(ATTACK_PACKET_RANGE, float(r) + 1.0)
+
+
 class _Paced(QThread):
     """固定節奏的背景迴圈。子類別實作 step()。
 
@@ -939,7 +957,7 @@ class KeyWorker(_Paced):
         return min(out) if out else None
 
     def reach_of(self, sid: int) -> float:
-        """**這一招自己**打得到的距離（格）。
+        """**這一招自己**打得到的距離（格）—— 共用 `reach_of()`（見模組層那份）。
 
         ★★★ 攻擊距離是**每一招各自的事**，不准取全輪的最短或最長
           （使用者 2026-08-10 明確指定）。以前用「輪替裡最短的射程」當
@@ -951,10 +969,7 @@ class KeyWorker(_Paced):
         ⚠ 換算：技能表寫的是格數，斜角相鄰算一格，所以歐氏距離 ≈ 射程 + 1；
           上限 ATTACK_PACKET_RANGE 是封包攻擊實測打得到的最遠距離。
         """
-        r = skills.range_of(sid)
-        if not r:
-            return float("inf")
-        return min(ATTACK_PACKET_RANGE, float(r) + 1.0)
+        return reach_of(sid)
 
     def in_range_of_any(self, dist: float | None) -> bool:
         """這個距離下**有沒有任何一招打得到**（每一招各自比自己的射程）。
@@ -1345,6 +1360,141 @@ class KeyWorker(_Paced):
             pass
 
 
+class GangWorker(_Paced):
+    """**被圍毆就反擊**：正在打我的怪達到 N 隻，就把勾的那幾招各放一次。
+
+    使用者 2026-09-12 指定的規格：
+      · N 由使用者自己輸入（0 ＝ 關掉）。
+      · 技能可以勾多個，跟「技能鍵」一樣照 F1→F12 順序各放一次。
+      · 「指定攻擊隨便一個怪物就好」→ 挑**離我最近的那一隻攻擊者**。
+      · **自己一條執行緒**，節奏跟掛機攻擊一樣（ROUND_GAP）——
+        「這也是戰鬥一環，不需要等」。
+      · ⛔⛔ **不准走路**：這條路一步都不會下移動指令，也不會去搶走路權。
+
+    怎麼知道「誰在打我」（★ 準確、不是猜的）
+    ----------------------------------------
+    `entity.attackers()`：怪的實體物件 `+0x34C` 就是**牠正在打誰的實體編號**
+    （遊戲自己的 getter `0x557852` 讀的就是它；AOB 自動定位）。
+    ⛔ 不看血量（使用者明令）、不看動畫、不看距離。
+    實測：三隻怪打黑狐 → 222/222 拍剛好 3 隻，出手中 603 拍次全中。
+
+    怎麼做到「不跟自動掛機搶」
+    --------------------------
+    ① **完全不碰目標欄**（狀態物件 +0x270 是掛機那條在寫的）——
+       改叫官方施放函式 `attack.cast_skill(…, 目標實體位址)`，
+       目標直接當參數傳進去，所以我們選誰跟掛機在打誰互不影響。
+    ② 不送技能鍵（送鍵是對「遊戲目前選定的目標」出手，那才會打架）。
+    ③ 跳板本來就有指令槽的鎖與讓拍（`attack._yield_now`），走位要用的時候
+       我們自己會讓開。
+    """
+
+    def __init__(self, sc: MemoryScanner) -> None:
+        super().__init__(STRIKE_TICK)
+        self.sc = sc
+        self.vks: list[int] = []      # 使用者勾的技能鍵（照 F1→F12 順序）
+        self.need = 0                 # 幾隻才觸發；0 = 關掉
+        self.mons: list = []          # 附近實體（UI 每次掃描推進來，唯讀）
+        self.mover = None
+        self.player = None            # 玩家物件位址（量距離用）
+        self.count = 0                # 最近一拍數到幾隻在打我（GUI 顯示用）
+        self.skills: dict[int, int] = {}
+        self._qb = quickbar.Reader(sc)
+        self._next_qb = 0.0
+        self._next_round = 0.0
+        self._on = False
+
+    def set_on(self, on: bool) -> None:
+        self._on = on
+        if not on:
+            self.count = 0
+
+    def step(self) -> None:
+        try:
+            if not (self._on and self.need and self.vks):
+                self.count = 0
+                return
+            mover, mons = self.mover, self.mons
+            if mover is None or not mover.active or not mons:
+                self.count = 0
+                return
+            # 換地圖的空窗期自己的實體是 NULL，這時候叫遊戲的函式會當機
+            # （見 memory use-quickkey-fn 的兩道閘）。
+            if not quickbar.self_entity_ok(self.sc):
+                self.count = 0
+                return
+            now = time.perf_counter()
+            if now >= self._next_qb:
+                self._next_qb = now + QB_REFRESH
+                try:
+                    got = self._qb.skills(self.vks)
+                except Exception:              # noqa: BLE001
+                    got = None
+                if got is not None:
+                    self.skills = got
+            # ★ 誰在打我 —— 準確欄位，見類別說明
+            foes = entity.attackers(self.sc, mons, bag.my_entity_id(self.sc))
+            self.count = len(foes)
+            if self.count < self.need or now < self._next_round:
+                return
+            # ⚠ 先排下一輪再開始放：中間任何一招失敗都不影響節奏。
+            self._next_round = now + ROUND_GAP
+            bykey = self.skills
+            usable = [k for k in self.vks if bykey.get(k)]
+            if not usable:
+                return                         # 勾的鍵上沒技能（空格／物品）
+            tgt, dist = self._pick(foes)
+            if tgt is None:
+                return
+            # ⚠⚠ 交給遊戲的位址**送出前當場重驗**（CLAUDE.md 硬規則）：
+            #   怪一死物件就被歸還空物件池，拿回收過的位址叫函式會當機。
+            if not entity.is_alive(self.sc, tgt):
+                return
+            pf = move.pathfinder_this(self.sc)
+            if not pf:
+                return
+            for k in usable:
+                sid = bykey.get(k)
+                if not sid:
+                    continue
+                # ★ 每一招各自比自己的射程（使用者定的規則）——
+                #   打不到就跳過這一輪，不要空放白花 MP／SP。
+                #   ⛔ 打不到也**不准走過去**，這功能沒有走路權。
+                if dist is not None and dist > reach_of(sid):
+                    continue
+                where = skills.target_of(sid)
+                if where == skills.SELF_ONLY:
+                    attack.cast_skill(mover, pf, sid)       # 對自己：不帶目標
+                elif skills.is_ground(sid):
+                    pos = entity.read_pos(self.sc, tgt.addr)
+                    if not pos:
+                        continue
+                    attack.cast_skill(mover, pf, sid, tgt.addr, *pos)
+                else:
+                    attack.cast_skill(mover, pf, sid, tgt.addr)
+        except Exception:                      # noqa: BLE001
+            pass
+
+    def _pick(self, foes):
+        """挑一隻來打：離我最近的那一隻（使用者：隨便一個就好）。
+
+        回 (那一隻, 離我多遠)；量不到距離就回 (第一隻, None)＝不擋射程。
+        """
+        if not foes:
+            return None, None
+        me = entity.read_pos(self.sc, self.player) if self.player else None
+        if not me:
+            return foes[0], None
+        best, best_d = None, None
+        for f in foes:
+            pos = entity.read_pos(self.sc, f.addr)
+            if not pos:
+                continue
+            d = math.hypot(pos[0] - me[0], pos[1] - me[1])
+            if best_d is None or d < best_d:
+                best, best_d = f, d
+        return (best, best_d) if best is not None else (foes[0], None)
+
+
 class TargetWorker(_Paced):
     """**只**負責「現在該打誰」：持續把目標寫回遊戲，並偵測牠死了沒。
 
@@ -1708,7 +1858,8 @@ class CharFarmPage(QWidget):
                  on_scan, tgt: TargetWorker, keys: KeyWorker,
                  notifier: Notifier | None = None,
                  account: str = "", char_name: str = "",
-                 mode: str = MODE_PACKET, prefix: str = "farm") -> None:
+                 mode: str = MODE_PACKET, prefix: str = "farm",
+                 gang: "GangWorker | None" = None) -> None:
         super().__init__()
         self.pid = pid
         self.hwnd = hwnd
@@ -1735,6 +1886,9 @@ class CharFarmPage(QWidget):
         # 本頁只負責「挑要打誰」跟畫面。
         self._atk = tgt
         self._keys = keys
+        # 被圍毆就反擊（2026-09-12 新增）—— 自己一條執行緒，見 GangWorker。
+        # ⚠ 沒傳進來（舊呼叫端）就給一個空殼，UI 照樣接得上、只是不會動。
+        self._gang = gang if gang is not None else GangWorker(sc)
         tgt.died.connect(self._on_died)
         tgt.failed.connect(lambda msg: self._stop_with(f"⚠ 記憶體存取失敗：{msg}"))
         tgt.stale.connect(self._on_state_stale)
@@ -2155,7 +2309,11 @@ class CharFarmPage(QWidget):
 
         # ── 攻擊 ────────────────────────────────────────────
         g_atk = QGroupBox("攻擊")
-        a = QHBoxLayout(g_atk)
+        # ★ 兩列：第一列是原本那排，第二列是「被圍毆就反擊」（2026-09-12 新增）。
+        #   主視窗固定 940 寬，硬擠成一列會把整條撐爆。
+        av = QVBoxLayout(g_atk)
+        a = QHBoxLayout()
+        av.addLayout(a)
         a.addWidget(QLabel("技能鍵"))
         # ★ 可多選（使用者要求）：勾幾個 F 鍵，攻擊照 F1→F12 順序輪流放。
         #   鍵上放什麼是直讀快捷欄的（quickbar.py）：空格／物品格自動略過
@@ -2237,6 +2395,49 @@ class CharFarmPage(QWidget):
         self.summon_cb.toggled.connect(self._save_settings)
         a.addWidget(self.summon_cb)
         a.addStretch(1)
+        # ── 第二列：被圍毆就反擊（使用者 2026-09-12 指定）────────────────
+        # 「被 N 隻怪打我就放這幾招」。誰在打我是**讀準的**（怪身上的
+        #   +0x34C ＝ 牠正在打誰，見 entity.attackers），⛔ 不看血量。
+        # 出手在自己的執行緒（GangWorker），不碰目標欄、不送鍵、**不走路**。
+        b = QHBoxLayout()
+        av.addLayout(b)
+        b.addWidget(QLabel("被"))
+        self.gang_n = QDoubleSpinBox()
+        self.gang_n.setRange(0.0, 30.0)
+        self.gang_n.setSingleStep(1.0)
+        self.gang_n.setDecimals(0)
+        self.gang_n.setValue(0.0)
+        fit_spin(self.gang_n)
+        self.gang_n.setToolTip(
+            "幾隻怪同時打我就放下面那幾招。\n"
+            "0 ＝ 關掉這個功能。\n"
+            "「在打我」是讀遊戲自己的「這隻怪正在打誰」，不是看血量有沒有掉。\n"
+            "⚠ 只有「開始掛機」勾著的時候才會動（補給／死亡回程那段會讓開）。")
+        self.gang_n.valueChanged.connect(self._gang_changed)
+        b.addWidget(self.gang_n)
+        b.addWidget(QLabel("隻怪同時打我就放"))
+        self.gang_btn = QToolButton()
+        self.gang_btn.setPopupMode(QToolButton.InstantPopup)
+        self.gang_btn.setToolTip(
+            "勾要放的技能鍵（可多選），照 F1→F12 順序各放一次。\n"
+            "目標＝正在打我的怪裡離我最近的那一隻，打不到的招自動跳過。\n"
+            "⛔ 這個功能不會走路，也不會搶自動掛機正在打的目標。")
+        gm = QMenu(self.gang_btn)
+        self._gang_cbs: list[tuple[QCheckBox, int, str]] = []
+        for label, vk in SKILL_KEYS:
+            cb = QCheckBox(label)
+            cb.setStyleSheet("padding: 4px 10px;")
+            act = QWidgetAction(gm)
+            act.setDefaultWidget(cb)
+            gm.addAction(act)
+            self._gang_cbs.append((cb, vk, label))
+        for cb, _, _ in self._gang_cbs:
+            cb.toggled.connect(self._gang_changed)
+        gm.aboutToShow.connect(self._label_keys)
+        self.gang_btn.setMenu(gm)
+        self._sync_gang_btn()
+        b.addWidget(self.gang_btn)
+        b.addStretch(1)
         # ★ 攻擊群組跨滿一列 ——「移動與巡邏」整個群組已移除（見下）。
         grid.addWidget(g_atk, 0, 0, 1, 2)
 
@@ -2582,6 +2783,7 @@ class CharFarmPage(QWidget):
         if not self._ensure_mover():
             return False
         self._keys.set_on(False)          # 先停手，別對著要消失的目標送封包
+        self._gang.set_on(False)
         self._atk.hold_off()
         self._cur = None
         if not channel.switch(self._mover, n, self._rot_max):
@@ -2827,6 +3029,7 @@ class CharFarmPage(QWidget):
                            else DEATH_WAIT_MAX)
         # 我們自己完全讓開（跟交棒補給時一樣）：不送技能鍵、不寫目標
         self._keys.set_on(False)
+        self._gang.set_on(False)       # 圍毆反擊一起停手（完全讓開）
         self._atk.hold_off()
         self._cur = None
         # 極罕見：補給跑到一半死掉 → 補給那趟作廢，讓死亡回程接管。
@@ -3110,6 +3313,7 @@ class CharFarmPage(QWidget):
         # 我們自己要完全讓開：不送技能鍵、不寫目標；看門狗照常把精靈自動攻擊關著
         #   （run_full_supply 是我們在開車，精靈不該插手搶怪）。
         self._keys.set_on(False)
+        self._gang.set_on(False)       # 圍毆反擊一起停手（完全讓開）
         self._atk.hold_off()
         self._cur = None
         self._supply = True
@@ -4749,6 +4953,7 @@ class CharFarmPage(QWidget):
         if s.state != self.state:
             self._atk.hold_off()
             self._keys.set_on(False)
+            self._gang.set_on(False)   # 圍毆反擊一起停手
             self._keys.eid = None
             self._keys.ent_addr = 0    # 目標實體位址跟著清（官方施放函式要它）
             self._cur = None
@@ -4802,6 +5007,14 @@ class CharFarmPage(QWidget):
         # 跳板可能是走位那邊裝上的（比開始掛機晚），所以跟著更新
         self._keys.mover = self._mover if (
             self._mover is not None and self._mover.active) else None
+        # 被圍毆就反擊：清單與跳板跟著更新；開關看「掛機正常在跑」——
+        # 補給／死亡回程那種「我們完全讓開」的段落一律不出手（見 set_on(False)）。
+        self._gang.mons = self.mons
+        self._gang.mover = self._keys.mover
+        self._gang.player = s.player
+        self._gang.set_on(bool(self.run_cb.isChecked()
+                               and not self._supply and not self._death
+                               and not self._halted))
         err = s.err
         # 只列中文名字（去重、不顯示數量、不顯示任何 ID）。
         # 掛機時每秒都在刷新，內容沒變就別重建清單 —— 不然使用者的選取會一直被清掉。
@@ -6705,6 +6918,11 @@ class CharFarmPage(QWidget):
         # 找不到（設定壞了）就退回「不指定」，不要當掉。
         idx = self.open_box.findData(int(g(self._key("opener_vk"), 0) or 0))
         self.open_box.setCurrentIndex(idx if idx >= 0 else 0)
+        # 被圍毆就反擊（0 = 關）。舊設定檔沒有這兩個鍵 → 預設關掉，行為不變。
+        self.gang_n.setValue(float(g(self._key("gang_n"), 0) or 0))
+        picked_gang = {int(v) for v in (g(self._key("gang_vks"), []) or [])}
+        for cb, vk, _ in self._gang_cbs:
+            cb.setChecked(vk in picked_gang)
         # ⛔ 舊的 "move"（自動走過去）/"patrol"/"back" 不再讀：走位永遠開、
         #    巡邏＝有設巡邏點就巡（見「移動與巡邏」群組移除處）。
         self.boss_cb.setChecked(bool(g(self._key("boss_only"), False)))
@@ -6811,6 +7029,8 @@ class CharFarmPage(QWidget):
             cb.setText(text)
             # 首次攻擊的下拉：第 0 項是「不指定」，之後才照 F1~F12。
             self.open_box.setItemText(i + 1, text)
+            # 圍毆反擊那排也是同一份快捷欄，順手一起標。
+            self._gang_cbs[i][0].setText(text)
 
     def _opener_label(self) -> str:
         """狀態列用的首發技能名稱：F3（破甲劈擊Ⅳ）；查不到就只寫鍵名。"""
@@ -6834,6 +7054,28 @@ class CharFarmPage(QWidget):
         self._keys.open_wait = 0.0
         # 掛機中臨時設／取消首發 → 照需求裝卸（自動分身要用的話不會被卸掉）
         self._sync_castwatch()
+        self._save_settings()
+
+    def _sel_gang_vks(self) -> list[int]:
+        """圍毆反擊勾選的技能鍵（照 F1→F12 順序）。"""
+        return [vk for cb, vk, _ in self._gang_cbs if cb.isChecked()]
+
+    def _sync_gang_btn(self) -> None:
+        """按鈕字樣＝勾了哪些鍵；勾太多就縮寫，別把整條列撐爆。"""
+        labels = [lab for cb, _, lab in self._gang_cbs if cb.isChecked()]
+        if not labels:
+            self.gang_btn.setText("選技能鍵")
+        elif len(labels) <= 4:
+            self.gang_btn.setText("、".join(labels))
+        else:
+            self.gang_btn.setText(f"{labels[0]} 等 {len(labels)} 鍵")
+
+    def _gang_changed(self) -> None:
+        """圍毆反擊的設定改了：更新按鈕字樣、推給它自己那條執行緒、存檔。"""
+        self._sync_gang_btn()
+        self._gang.need = int(self.gang_n.value())
+        self._gang.vks = self._sel_gang_vks()
+        self._gang._next_qb = 0.0          # 換了鍵就立刻重讀快捷欄
         self._save_settings()
 
     def _sync_key_btn(self) -> None:
@@ -6863,6 +7105,8 @@ class CharFarmPage(QWidget):
         s(self._key("monsters"), self.wanted())
         s(self._key("vks"), self._sel_vks())
         s(self._key("opener_vk"), int(self.open_box.currentData() or 0))
+        s(self._key("gang_n"), int(self.gang_n.value()))
+        s(self._key("gang_vks"), self._sel_gang_vks())
         s(self._key("boss_only"), self.boss_cb.isChecked())
         s(self._key("auto_buff"), self.buff_cb.isChecked())
         s(self._key("buff_skill"), int(self._buff.skill or 0))
@@ -6973,7 +7217,7 @@ class FarmTab(ClientWatchMixin, BaseTab):
         self._worker: ScanWorker | None = None
         self._inv: InvWorker | None = None    # 找物品陣列表頭（AOB 全掃，很慢）
         # 每個分身一對（寫入執行緒, 送鍵執行緒）—— 收掉那台時只停它自己的
-        self._keys: dict[int, tuple[_Paced, _Paced]] = {}
+        self._keys: dict[int, tuple[_Paced, _Paced, _Paced]] = {}
         self._watch_init()
         # ★「自動練技」的意向記憶（帳號→bool），跟 run_cb 的 _intent 同一套
         #   規則：只記使用者親手點的、不進 config、登入驗完名字自動接回去 ——
@@ -7123,9 +7367,11 @@ class FarmTab(ClientWatchMixin, BaseTab):
         self._scanners[w.pid] = sc
         self._ensure_workers()
         tgt, keys = TargetWorker(sc), KeyWorker(w.hwnd, sc)
+        gang = GangWorker(sc)          # 被圍毆就反擊（跟掛機平行，不互搶）
         tgt.start(QThread.HighPriority)
         keys.start(QThread.HighPriority)
-        self._keys[w.pid] = (tgt, keys)
+        gang.start(QThread.HighPriority)
+        self._keys[w.pid] = (tgt, keys, gang)
         acct = charname.account_from_title(w.title)
         # ⚠ 只查預讀快取，**不要在這裡掃記憶體**（GUI 執行緒；全掃一台
         #   1.1~1.8 秒）。新開的還在登入畫面讀不到名字 → 先用帳號當標籤，
@@ -7134,7 +7380,7 @@ class FarmTab(ClientWatchMixin, BaseTab):
         # notifier 傳 None → 每個分頁自己建一個，讀自己那一列的設定
         page = CharFarmPage(w.pid, w.hwnd, w.title, sc, self._request_scan,
                             tgt, keys, None, acct, nm,
-                            self.ATTACK_MODE, self.SETTINGS_PREFIX)
+                            self.ATTACK_MODE, self.SETTINGS_PREFIX, gang)
         page._notifier.failed.connect(self.found.setText)
         page.run_cb.clicked.connect(lambda _on, p=page: self._note_farm_intent(p))
         page.train_cb.clicked.connect(

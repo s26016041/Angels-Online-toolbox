@@ -553,6 +553,20 @@ SIGS: tuple[Sig, ...] = (
     #     / mov ecx,esi / mov [ebp+8],eax / call ID→索引 / push eax / mov ecx,esi
     # ⚠ 兩個 disp32 都是結構偏移（不在模組範圍，`_auto_mask` 不會遮）→
     #   自己寫 `??`，只留指令骨架當錨。
+    # ★★★ 「這隻實體正在打誰」在物件裡的位置（見 entity.OFF_ATTACK_TARGET_GAME）。
+    #   ⛔ 錨**不能**用遊戲那支小 getter `0x557852`（整支就是「編號→取物件→
+    #     回 [物件+0x354]」）：它跟旁邊五支「同一個模子印出來」的 getter
+    #     （回 +0x1AC、+0x1B0…）除了那個 disp32 之外一模一樣 —— 而 disp32
+    #     正是答案，遮掉就剩 6 個候選（實測 verify_sigs hits=6）。
+    #   ★ 改錨在官方掛機 AI 讀它的那一段（`0x5542e4`，用來判「這隻怪是不是
+    #     被別人打走了」）：取物件 → 讀 [物件+0x354] → 跟「我」比對，
+    #     指令骨架夠長也夠特別（verify_sigs 模組內唯一）。
+    # ⚠ 那個 disp32 就是答案，不能當骨架 —— imm_at 指著它，pattern 裡寫 ??。
+    #   全域位址與 call 的 rel32 照規矩遮掉。
+    Sig("entity", "OFF_ATTACK_TARGET_GAME", "off", 24,
+        "8B 03 8B 0D ?? ?? ?? ?? 50 E8 ?? ?? ?? ?? 85 C0 0F 84 ?? ?? ?? ??"
+        " 8B B8 ?? ?? ?? ?? 85 FF 74 ?? E8 ?? ?? ?? ?? 3B F8 0F 84 ?? ?? ?? ??",
+        0x00000354),
     Sig("entity", "OFF_TARGET", "off", 13,
         "FF B6 ?? ?? 00 00 E8 ?? ?? ?? ?? FF B7 ?? ?? ?? ??"
         " 8B CE 89 45 08 E8 ?? ?? ?? ?? 50 8B CE",
