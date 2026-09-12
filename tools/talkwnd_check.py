@@ -44,6 +44,9 @@ lua_calls: list = []
 talkwnd.lua.globals_of = lambda _sc, _names: {"WND_MESSAGE": 0x1234}
 talkwnd.lua.call = lambda _mv, _sc, fn, *a: (lua_calls.append((fn, a)) or (True, None))
 SC = object()
+# ⚠ ①~④ 會把這幾支換成假的（寫死位址）—— ⑤ 之後要對真檔案，先留一份真的。
+_REAL = {n: getattr(talkwnd, n)
+         for n in ('locate', '_wnd_object', '_u32')}
 talkwnd.locate = lambda _sc: None      # ①② 不走防呆包裝（③ 再換成有 Spot 的）
 
 print("① 代號殘留、視窗物件已不在 → 不送（送了遊戲會當）")
@@ -130,45 +133,147 @@ check("視窗在：查一次、送包本體叫一次（世界, 代號）",
 check("　回 1", eax == 1, f"eax={eax:#x}")
 check("　堆疊平衡、esi 還原（本體弄髒了也保得住）", dsp == 8 and esi == 0x5E5E5E5E, f"dsp={dsp} esi={esi:#x}")
 
-print("⑤ 從送包本體的骨架抄 GetWindowById 位址（磁碟上的 angel.dat）")
+print("⑤ 對真的 angel.dat 抄位址／偏移（⛔ 測試裡也不准寫死，改版要自己跟上）")
 GAME = r"D:\AngelsOnline\Angels Online Global\angel.dat"
 if os.path.exists(GAME):
     import struct
+
     data = open(GAME, "rb").read()
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
     nsec = struct.unpack_from("<H", data, e_lfanew + 6)[0]
     opt_size = struct.unpack_from("<H", data, e_lfanew + 20)[0]
     base = struct.unpack_from("<I", data, e_lfanew + 24 + 28)[0]
-    secs = []
+    span = 0
+    img = bytearray(0x1000000)
     for i in range(nsec):
         o = e_lfanew + 24 + opt_size + i * 40
         vsize, va, rsize, raw = struct.unpack_from("<IIII", data, o + 8)
-        secs.append((va, max(vsize, rsize), raw))
-
-    def off(va):
-        rva = va - base
-        for sva, sz, raw in secs:
-            if sva <= rva < sva + sz:
-                return raw + (rva - sva)
-        return None
+        img[va:va + rsize] = data[raw:raw + rsize]
+        span = max(span, va + max(vsize, rsize))
+    img = bytes(img[:span])
 
     class DiskSC:
+        """把磁碟上的 angel.dat 攤成「載入後的樣子」（VA 連續），純讀。"""
+
+        pid = 0
+
         def _read_bytes(self, addr, n):
-            o = off(addr)
-            return data[o:o + n] if o is not None else None
+            i = addr - base
+            return img[i:i + n] if 0 <= i and i + n <= len(img) else None
 
         def module_base(self, _name):
             return base
 
-    talkwnd.roulette._module_span = lambda _sc, _b: 0x800000
-    spot = talkwnd.Spot(cmd_fn=0x5D48C6, world_ptr=0x9F3400, close_fn=0x5D494D)
-    got = talkwnd._find_lookup_fn(DiskSC(), spot)
-    check("抄到的就是反組譯看到的 GetWindowById 0x5037F3", got == 0x5037F3, f"got={got and hex(got)}")
-    bad = talkwnd.Spot(cmd_fn=0x5D48C6, world_ptr=0x9F3400, close_fn=0x5D4918)   # 別的函式：骨架對不上
-    check("骨架對不上 → None（包裝停用、退回 Lua 確定鈕）", talkwnd._find_lookup_fn(DiskSC(), bad) is None)
-else:
-    print("  （沒有 angel.dat，跳過）")
+    talkwnd.roulette._module_span = lambda _sc, _b: len(img)
+    # ⚠ 前面幾段用的是假 scanner（pid 0、同一個 base）——它們的結果還躺在
+    #   `_cache` 裡，不清掉這一段就會拿假位址去對真檔案（會紅得莫名其妙）。
+    talkwnd._cache.clear()
+    talkwnd._vis_cache.clear()
+    for _n, _f in _REAL.items():          # 把 ①~④ 換掉的還原
+        setattr(talkwnd, _n, _f)
+    sc = DiskSC()
+    # ★ 位址一律自己從 UI 指令表推（跟產品同一條路），⛔ 不寫死 ——
+    #   9/8 改版就把 messageclose 本體從 0x5D48C6 搬到 0x5914E0，
+    #   舊版測試寫死那個數字，改版後整項變紅（跟功能無關的假警報）。
+    spot = talkwnd.locate(sc)
+    check("messageclose：從指令表推得出本體＋世界全域", spot is not None
+          and base < spot.close_fn < base + len(img), str(spot))
+    lookup = talkwnd._find_lookup_fn(sc, spot) if spot else None
+    check("　從送包本體的骨架抄得到 GetWindowById",
+          bool(lookup) and base < lookup < base + len(img),
+          f"got={lookup and hex(lookup)}")
+    fspot = talkwnd.find_spot(sc)
+    check("ismessageend：推得出本體＋視窗管理器全域", fspot is not None
+          and base < fspot.world_ptr < base + len(img), str(fspot))
+    if spot:
+        bad = talkwnd.Spot(cmd_fn=spot.cmd_fn, world_ptr=spot.world_ptr,
+                           close_fn=spot.cmd_fn)   # 指令本體：沒有那個骨架
+        check("骨架對不上 → None（包裝停用、退回 Lua 確定鈕）",
+              talkwnd._find_lookup_fn(sc, bad) is None)
 
+    print("⑥ 「視窗真的顯示中」的旗標偏移（從 window.isvisible 骨架抄）")
+    talkwnd._vis_cache.clear()
+    off = talkwnd._vis_off(sc)
+    check("抄得到偏移", off is not None, f"got={off}")
+    check("　落在合理範圍（結構偏移）", off is not None
+          and talkwnd._VIS_MIN <= off <= talkwnd._VIS_MAX, f"off={off}")
+    # 這一版反組譯看到的是 +0xB4（window.show → SetVisible 寫的同一個 byte）。
+    # ⚠ 改版偏移會變 —— 所以**不是**斷言等於 0xB4，只印出來給改版體檢看。
+    print(f"    （這一版抄到 {off:#x}；2026-09-12 反組譯看到的是 0xb4）"
+          if off else "    （抄不到）")
+    vspot = talkwnd._locate_cmd(sc, talkwnd.VIS_CMD, "_vis")
+    # ★★ 交叉驗證：isvisible 本體裡查視窗那支，必須跟 messageclose 骨架抄到的
+    #   是**同一個** GetWindowById（兩支不同指令指到同一支＝抄對了）。
+    check("isvisible 用的查視窗函式＝messageclose 骨架抄到的同一支",
+          bool(vspot) and vspot.close_fn == lookup,
+          f"isvisible={vspot and hex(vspot.close_fn)} "
+          f"messageclose={lookup and hex(lookup)}")
+    check("isvisible 的視窗管理器全域＝ismessageend 那個",
+          bool(vspot) and bool(fspot) and vspot.world_ptr == fspot.world_ptr,
+          f"{vspot} vs {fspot}")
+
+    print("⑦ id_visible／window_visible 的三態（用假記憶體疊在真檔案上）")
+
+    class VisSC(DiskSC):
+        """真檔案 ＋ 假的管理器／視窗物件，驗三態（True／False／None）。"""
+
+        MGR = 0x20000000
+        OBJ = 0x21000000
+
+        def __init__(self, obj_at_slot=True, wnd_id=0x1234, vis=1,
+                     mgr_ok=True, slot_readable=True):
+            self.wnd_id, self.vis = wnd_id, vis
+            self.obj_at_slot, self.mgr_ok = obj_at_slot, mgr_ok
+            self.slot_readable = slot_readable
+
+        def _read_bytes(self, addr, n):
+            off_vis = off
+            slot = self.MGR + (self.wnd_id & talkwnd.WND_SLOT_MASK) * 4 \
+                + talkwnd.WND_TABLE_OFF
+            if addr == fspot.world_ptr and n == 4:
+                return struct.pack("<I", self.MGR if self.mgr_ok else 0)
+            if addr == slot and n == 4:
+                if not self.slot_readable:
+                    return None
+                return struct.pack("<I", self.OBJ if self.obj_at_slot else 0)
+            if addr == self.OBJ + talkwnd.WND_ID_OFF and n == 4:
+                return struct.pack("<I", self.wnd_id)
+            if addr == self.OBJ + off_vis and n == 1:
+                return bytes([self.vis])
+            return DiskSC._read_bytes(self, addr, n)
+
+    check("顯示中 → True", talkwnd.id_visible(VisSC(vis=1), 0x1234) is True)
+    check("旗標 0（殘留的視窗物件）→ False",
+          talkwnd.id_visible(VisSC(vis=0), 0x1234) is False)
+    check("管理器那一格沒物件 → False",
+          talkwnd.id_visible(VisSC(obj_at_slot=False), 0x1234) is False)
+    check("代號 0 → False", talkwnd.id_visible(VisSC(), 0) is False)
+    check("管理器讀不到 → None（⛔ 不是「沒顯示」）",
+          talkwnd.id_visible(VisSC(mgr_ok=False), 0x1234) is None)
+    check("那一格讀不到 → None（讀不到 ≠ 沒有）",
+          talkwnd.id_visible(VisSC(slot_readable=False), 0x1234) is None)
+    check("window_visible：讀 WND_MESSAGE 再看旗標 → True",
+          talkwnd.window_visible(VisSC(vis=1)) is True)
+    check("window_visible：旗標 0（殘留）→ False",
+          talkwnd.window_visible(VisSC(vis=0)) is False)
+    talkwnd._vis_cache.clear()
+    talkwnd._cache.clear()
+
+    class NoVisSC(DiskSC):
+        """抄不到偏移（改版把 isvisible 改寫了）→ 一律 None，不准亂猜。"""
+
+        def _read_bytes(self, addr, n):
+            got = DiskSC._read_bytes(self, addr, n)
+            if got and vspot and addr == vspot.cmd_fn:
+                return bytes(n)                      # 本體變成一片 0：骨架對不上
+            return got
+
+    check("抄不到偏移 → None（大聲不知道）",
+          talkwnd.id_visible(NoVisSC(), 0x1234) is None)
+    talkwnd._vis_cache.clear()
+    talkwnd._cache.clear()
+else:
+    print("  （沒有 angel.dat，跳過 ⑤⑥⑦）")
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))

@@ -169,20 +169,24 @@ WND_TABLE_OFF = 0x20        # 出處：上面 GetWindowById 那行反組譯
 WND_ID_OFF = 0x10           # 出處：上面 GetWindowById 那行反組譯（驗 [物件+0x10] == 代號）
 
 
-def _wnd_object(scanner) -> int | None:
-    """對話視窗物件的位址（純讀，照 GetWindowById 走一遍）；沒有／讀不到回 None。"""
+def _object_by_id(scanner, wnd: int) -> int | None:
+    """代號 `wnd` 的視窗物件位址（純讀，照 GetWindowById 走一遍）；沒有／讀不到回 None。"""
     spot = find_spot(scanner)
-    if spot is None:
+    if spot is None or not wnd:
         return None
     mgr = _u32(scanner, spot.world_ptr)
-    g = lua.globals_of(scanner, [WND_NAME]) or {}
-    wnd = int(g.get(WND_NAME) or 0) & 0xFFFFFFFF
-    if not mgr or not 0x10000 < mgr < 0x7FFF0000 or not wnd:
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000:
         return None
     obj = _u32(scanner, mgr + (wnd & WND_SLOT_MASK) * 4 + WND_TABLE_OFF)
     if not obj or not 0x10000 < obj < 0x7FFF0000:
         return None
     return obj if _u32(scanner, obj + WND_ID_OFF) == wnd else None
+
+
+def _wnd_object(scanner) -> int | None:
+    """對話視窗物件的位址（純讀）；沒有／讀不到回 None。"""
+    g = lua.globals_of(scanner, [WND_NAME]) or {}
+    return _object_by_id(scanner, int(g.get(WND_NAME) or 0) & 0xFFFFFFFF)
 
 
 def window_present(scanner) -> bool | None:
@@ -210,6 +214,111 @@ def window_present(scanner) -> bool | None:
     if not obj or not 0x10000 < obj < 0x7FFF0000:
         return False
     return _u32(scanner, obj + WND_ID_OFF) == wnd
+
+
+# ★★★★ 「這個視窗**現在真的顯示在畫面上**嗎」＝視窗物件 +0xB4 那個 byte
+#   （2026-09-12 反組譯；使用者：「你是不是無法知道對話框出現，我看都卡很久才會知道」）。
+#   出處 —— UI 指令 `window.isvisible` 本體（這版 0x53BA29）：
+#       eax = GetWindowById([管理器], 代號)     ← 跟 messageclose／ismessageend 同一支
+#       test eax, eax ; je → 回 false            （查不到視窗＝畫面上沒有）
+#       cmp byte ptr [eax + 0xB4], bl ; setne bl ← **就是它**
+#   寫的那一邊對得上（兩支不同函式指到同一個 byte ＝ 硬證據）：
+#       `window.show`（0x53B5F2）→ SetVisible（0x650DB7）：
+#           mov cl, [esi + 0xB4] / cmp cl, al / mov byte [esi + 0xB4], al
+#   ★★ 為什麼非它不可：`WND_MESSAGE` 非 0、管理器查得到物件、遊戲自己的
+#     `ismessageend` 回「還沒結束」——**殘留狀態下這三個全部都會騙人**
+#     （2026-09-03 遺落之地實錄：畫面上根本沒有對話框；[[lua-readonly-inspect]]
+#      「WND_xxx 非 0 ≠ 開著」）。+0xB4 是唯一分得出「殘留」跟「真的開著」的。
+#   ⛔ 偏移**不寫死**：`_vis_off` 從 isvisible 本體的骨架當場抄（`test eax,eax`
+#     後面那個 `cmp byte ptr [eax+disp], reg`），改版位址／偏移一起跟著跑；
+#     抄不到回 None ＝**不知道**，呼叫端要退回舊訊號（⛔ 不可以當成「沒顯示」）。
+VIS_CMD = b"isvisible" + bytes(1)
+_VIS_BODY = 0x60                       # 本體很短（到 ret 約 0x48）；多讀一點無妨
+_VIS_MIN, _VIS_MAX = 0x10, 0x1000      # 抄出來的偏移要落在合理範圍才採用
+_vis_cache: dict = {}
+
+
+def _vis_off(scanner) -> int | None:
+    """「顯示中」旗標在視窗物件裡的偏移（從 `window.isvisible` 骨架抄）；抄不到回 None。"""
+    base = scanner.module_base(GAME_MODULE)
+    key = (getattr(scanner, "pid", 0), base or 0)
+    if key in _vis_cache:
+        return _vis_cache[key]
+    off = None
+    spot = _locate_cmd(scanner, VIS_CMD, "_vis")
+    if spot is not None:
+        raw = scanner._read_bytes(spot.cmd_fn, _VIS_BODY)
+        if raw:
+            b = bytes(raw)
+            # 錨＝`test eax,eax`（GetWindowById 回來的那個判斷），它後面緊接著
+            # 就是讀旗標那一句。⚠ 用骨架不是「第幾個 byte」：暫存器換人
+            # （bl→cl…）ModRM 的 reg 欄位會變，所以只認 `rm==eax`。
+            k = b.find(b"\x85\xc0")
+            if k >= 0:
+                for i in range(k + 2, min(k + 10, len(b) - 6)):
+                    if b[i] != 0x38:           # cmp byte ptr [eax + disp], reg
+                        continue
+                    mod, rm = b[i + 1] >> 6, b[i + 1] & 7
+                    if rm != 0:
+                        continue
+                    if mod == 2:
+                        cand = struct.unpack_from("<I", b, i + 2)[0]
+                    elif mod == 1:
+                        cand = b[i + 2]
+                    else:
+                        continue
+                    if _VIS_MIN <= cand <= _VIS_MAX:
+                        off = cand
+                        break
+    _vis_cache[key] = off
+    return off
+
+
+def id_visible(scanner, wnd: int) -> bool | None:
+    """代號 `wnd` 的視窗**現在顯示在畫面上**嗎 —— **純讀**，跟遊戲的
+    `window.isvisible` 走同一條路（查物件 → 讀 +0xB4）。
+
+    True＝顯示中；False＝管理器裡沒這個視窗／旗標是 0；
+    **None＝不知道**（偏移抄不到／管理器讀不到／那一格讀不到）——
+    ⛔ 呼叫端不可以把 None 當成「沒顯示」（[[bag-false-empty-guards]]）。
+    """
+    off = _vis_off(scanner)
+    if off is None:
+        return None
+    if not wnd:
+        return False
+    spot = find_spot(scanner)
+    if spot is None:
+        return None
+    mgr = _u32(scanner, spot.world_ptr)
+    if not mgr or not 0x10000 < mgr < 0x7FFF0000:
+        return None
+    obj = _u32(scanner, mgr + (wnd & WND_SLOT_MASK) * 4 + WND_TABLE_OFF)
+    if obj is None:
+        return None                    # 讀不到那一格 ≠ 沒有這個視窗
+    if not 0x10000 < obj < 0x7FFF0000:
+        return False
+    if _u32(scanner, obj + WND_ID_OFF) != wnd:
+        return False                   # 代號對不上＝那一格住的是別的視窗
+    raw = scanner._read_bytes(obj + off, 1)
+    return bool(bytes(raw)[0]) if raw else None
+
+
+def window_visible(scanner) -> bool | None:
+    """**對話框現在真的開在畫面上嗎**（純讀、不佔指令槽、不叫 Lua）。
+
+    True／False／**None＝不知道**（⛔ 不可以當成「沒有對話框」）。
+    ★ 這支就是 `window_present` 的升級版：present 只說「管理器裡有這個視窗
+      物件」（殘留的也算），visible 說「畫面上看得到」。要判「對話框開了沒」
+      一律優先用這支，present 只留給「連物件都沒有」那種明確情況。
+    """
+    g = lua.globals_of(scanner, [WND_NAME])
+    if g is None:
+        return None
+    wnd = int(g.get(WND_NAME) or 0) & 0xFFFFFFFF
+    if not wnd:
+        return False
+    return id_visible(scanner, wnd)
 
 
 def message_ended(scanner) -> bool | None:
