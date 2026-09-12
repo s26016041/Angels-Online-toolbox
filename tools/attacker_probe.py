@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import struct
 import sys
@@ -152,6 +153,11 @@ def main() -> int:
     ticks = hp_drops = 0
     max_pointing = 0          # 同一拍最多幾隻怪指著我
     point_hist = defaultdict(int)
+    # 「以我為目標」的怪：動畫狀態 × 離我多遠（找「已經在打我」的硬分界）
+    eng_tab = defaultdict(int)
+    eng_state = defaultdict(int)
+    eng_dist = defaultdict(lambda: [99.0, 0.0])   # eid → [最近, 最遠]
+    all_tab = defaultdict(int)    # (動畫狀態, 目標是誰) → 拍次
     att_ticks = 0
     t_end = time.monotonic() + args.secs
     hp_prev = hp0
@@ -230,6 +236,38 @@ def main() -> int:
         if npoint > max_pointing:
             max_pointing = npoint
 
+        # 以我為目標的怪：狀態 × 距離（純讀，幾隻而已）
+        me_pos = entity.read_pos(sc, player_obj) if player_obj else None
+        for m in mons:
+            tv = u32(sc, m.addr + CAND_TGT_OFF)
+            st = entity.read_state(sc, m.addr) or "?"
+            who = "我" if tv == my_eid else ("空" if tv == 0 else "別人")
+            all_tab[(st, who)] += 1
+            if tv != my_eid:
+                continue
+            pos = entity.read_pos(sc, m.addr)
+            d = (math.hypot(pos[0] - me_pos[0], pos[1] - me_pos[1])
+                 if (pos and me_pos) else None)
+            if d is None:
+                bucket = "讀不到"
+            elif d <= 1.5:
+                bucket = "≤1.5"
+            elif d <= 2.5:
+                bucket = "≤2.5"
+            elif d <= 3.5:
+                bucket = "≤3.5"
+            elif d <= 6.0:
+                bucket = "≤6"
+            elif d <= 12.0:
+                bucket = "≤12"
+            else:
+                bucket = ">12"
+            eng_tab[(st, bucket)] += 1
+            eng_state[st] += 1
+            if d is not None:
+                lo, hi = eng_dist[m.eid & 0xFFFF]
+                eng_dist[m.eid & 0xFFFF] = [min(lo, d), max(hi, d)]
+
         # ③ 每秒印一行「現在誰指著我」給使用者對畫面
         if t0 - live_t >= 1.0:
             live_t = t0
@@ -276,6 +314,18 @@ def main() -> int:
                                                    key=lambda kv: -kv[1][0]):
             w(f"  [{space}] +{off:#06x}  {lab:<20} 次數={n:<5} 出手中={a:<5} "
               f"掉血拍={d:<4} 怪數={len(mon_seen[(space, off, lab)])}")
+        w()
+        w("## ③ 以我為目標的怪：動畫狀態 × 離我多遠（拍次）")
+        w("   狀態合計：" + "、".join(f"{k}={v}" for k, v in
+                                  sorted(eng_state.items(), key=lambda kv: -kv[1])))
+        for (st, b), n in sorted(eng_tab.items(), key=lambda kv: -kv[1]):
+            w(f"  {st:<6} {b:<6} {n}")
+        w("   每隻的距離範圍：" + "、".join(
+            f"{eid:#x}[{lo:.1f}~{hi:.1f}]" for eid, (lo, hi) in eng_dist.items()))
+        w()
+        w("## ④ 所有怪：動畫狀態 × +0x34C 指著誰（拍次）")
+        for (st2, who2), n in sorted(all_tab.items(), key=lambda kv: -kv[1]):
+            w(f"  {st2:<6} 目標={who2:<3} {n}")
         w()
         w("## ② 我身上出現「某隻怪」的欄位")
         if not me_hit:
