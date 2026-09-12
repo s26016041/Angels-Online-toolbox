@@ -3,11 +3,13 @@
 
     py tools\\gang_check.py
 
-驗的是三件**會安靜做錯事**的地方：
+驗的是四件**會安靜做錯事**的地方：
   ① 「誰在打我」只認 `+0x34C == 我的實體編號`，而且會重驗身分
      （位址被回收給別隻時不准算進來）。
-  ② 湊不到人數不出手；湊到了每一招各自比自己的射程，打不到就跳過。
-  ③ ⛔ 全程不寫目標欄、不送鍵、不下移動指令（＝不跟自動掛機搶、不走路）。
+  ② ⚠⚠ **屍體不准算**（2026-09-12 使用者實機回報的誤判真因：怪死掉之後
+     那個欄位還留著最後打的人，實測 45 秒裡 Dead 指著我的有 352 拍次）。
+  ③ 湊不到人數不出手；每一招各自比自己的射程。
+  ④ ⛔ 全程不寫目標欄、不送鍵、不下移動指令（＝不跟自動掛機搶、不走路）。
 """
 from __future__ import annotations
 
@@ -41,13 +43,18 @@ class FakeScanner:
     def __init__(self) -> None:
         self.mem: dict[int, bytes] = {}
 
-    def put_entity(self, addr: int, eid: int, target: int) -> None:
-        off = entity.attack_target_off()
-        span = off + 4 - entity.OFF_ID
+    def put_entity(self, addr: int, eid: int, target: int,
+                   state: str = "Wait", flag: int = 0,
+                   vtable: int | None = None) -> None:
+        span = max(entity.LIVE_SPAN, entity.attack_target_off() + 4)
         blob = bytearray(span)
-        struct.pack_into("<I", blob, 0, eid)
-        struct.pack_into("<I", blob, off - entity.OFF_ID, target)
-        self.mem[addr + entity.OFF_ID] = bytes(blob)
+        struct.pack_into("<I", blob, 0,
+                         entity.VT_ENTITY if vtable is None else vtable)
+        blob[entity.OFF_STATE:entity.OFF_STATE + len(state)] = state.encode()
+        struct.pack_into("<I", blob, entity.OFF_ID, eid)
+        struct.pack_into("<I", blob, entity.attack_target_off(), target)
+        blob[entity.OFF_DEAD_FLAG] = flag
+        self.mem[addr] = bytes(blob)
 
     def _read_bytes(self, addr: int, size: int):
         got = self.mem.get(addr)
@@ -58,7 +65,8 @@ class FakeScanner:
 
 def check(name: str, got, want) -> bool:
     ok = got == want
-    print(f"  {'✔' if ok else '✘'} {name}：{got!r}" + ("" if ok else f"（該是 {want!r}）"))
+    print(f"  {'✔' if ok else '✘'} {name}：{got!r}"
+          + ("" if ok else f"（該是 {want!r}）"))
     return ok
 
 
@@ -86,23 +94,39 @@ def main() -> int:
     sc.put_entity(a.addr, 0xBBBB, MY_EID)
     ok &= check("位址被回收（編號對不上）就不算",
                 entity.attackers(sc, ents, MY_EID), [])
-    sc.put_entity(a.addr, a.eid, MY_EID)
+    # vtable 被換掉（物件歸還空物件池）→ 不准算
+    sc.put_entity(a.addr, a.eid, MY_EID, vtable=0x11223344)
+    ok &= check("vtable 換掉（物件被回收）就不算",
+                entity.attackers(sc, ents, MY_EID), [])
 
-    print("② 人數與射程")
-    from app.tabs import farm_tab                 # noqa: PLC0415（要先跑完 ①）
+    print("② 屍體不准算（2026-09-12 誤判真因）")
+    sc.put_entity(a.addr, a.eid, MY_EID, state="Dead")
+    ok &= check("動畫 Dead 的屍體留著「目標是我」也不算",
+                entity.attackers(sc, ents, MY_EID), [])
+    sc.put_entity(a.addr, a.eid, MY_EID, state="Wait", flag=7)
+    ok &= check("死亡旗標 +0x3D6==7（柱子那種）也不算",
+                entity.attackers(sc, ents, MY_EID), [])
+    sc.put_entity(a.addr, a.eid, MY_EID, state="Att")
+    ok &= check("活的、正在揮我 → 算",
+                [e.eid for e in entity.attackers(sc, ents, MY_EID)], [a.eid])
+
+    print("③ 人數與射程")
+    from app.tabs import farm_tab                 # noqa: PLC0415
     sc2 = FakeScanner()
     foes = []
     for i in range(3):
         e = FakeEnt(0x50000000 + i * 0x1000, 0xBB00 + i)
-        sc2.put_entity(e.addr, e.eid, MY_EID)
+        sc2.put_entity(e.addr, e.eid, MY_EID, state="Att")
         foes.append(e)
     ok &= check("三隻都在打我", len(entity.attackers(sc2, foes, MY_EID)), 3)
-
-    # reach_of：射程 0（對自己的 buff）＝不看距離；查不到也不看距離
+    # 其中一隻死了 → 只剩兩隻（門檻 3 就不該觸發）
+    sc2.put_entity(foes[0].addr, foes[0].eid, MY_EID, state="Dead")
+    ok &= check("其中一隻變屍體 → 只剩兩隻",
+                len(entity.attackers(sc2, foes, MY_EID)), 2)
     ok &= check("射程查不到 → inf（不擋）",
                 farm_tab.reach_of(0) == float("inf"), True)
 
-    print("③ 不搶、不走路（靜態檢查 GangWorker.step 的原始碼）")
+    print("④ 不搶、不走路（靜態檢查 GangWorker.step 的原始碼）")
     import inspect                               # noqa: PLC0415
     src = inspect.getsource(farm_tab.GangWorker)
     for bad, why in (("set_target", "寫目標欄＝跟自動掛機搶"),

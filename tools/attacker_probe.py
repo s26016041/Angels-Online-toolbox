@@ -178,7 +178,8 @@ def main() -> int:
         if dropped:
             hp_drops += 1
 
-        mons = [e for e in ents if e.is_monster and not e.dead]
+        mons_all = [e for e in ents if e.is_monster]     # 含屍體（④ 用）
+        mons = [e for e in mons_all if not e.dead]
         scenes = {m.eid: scene_obj(sc, m.eid) for m in mons}
         # ① 怪身上有沒有「我」（兩種物件空間各掃一次）
         for m in mons:
@@ -230,21 +231,26 @@ def main() -> int:
                     me_hit[k][1] += 1
 
         # 同一拍有幾隻怪的 +0x20 指著我（＝官方「圍毆」數量的候選）
-        npoint = sum(1 for m in mons
-                     if u32(sc, m.addr + CAND_TGT_OFF) == my_eid)
+        # ★ 直接走**產品那支** entity.attackers()（含屍體過濾），
+        #   而且故意把含屍體的清單餵進去 —— 跟 farm_tab 給 GangWorker 的一樣。
+        npoint = len(entity.attackers(sc, mons_all, my_eid))
         point_hist[npoint] += 1
         if npoint > max_pointing:
             max_pointing = npoint
 
         # 以我為目標的怪：狀態 × 距離（純讀，幾隻而已）
+        # ④ 含屍體的全表：狀態 × 目標是誰（屍體會不會留著「打我」？）
+        for m in mons_all:
+            tv2 = u32(sc, m.addr + CAND_TGT_OFF)
+            st2 = entity.read_state(sc, m.addr) or "?"
+            who2 = "我" if tv2 == my_eid else ("空" if tv2 == 0 else "別人")
+            all_tab[(st2, who2)] += 1
         me_pos = entity.read_pos(sc, player_obj) if player_obj else None
         for m in mons:
             tv = u32(sc, m.addr + CAND_TGT_OFF)
-            st = entity.read_state(sc, m.addr) or "?"
-            who = "我" if tv == my_eid else ("空" if tv == 0 else "別人")
-            all_tab[(st, who)] += 1
             if tv != my_eid:
                 continue
+            st = entity.read_state(sc, m.addr) or "?"
             pos = entity.read_pos(sc, m.addr)
             d = (math.hypot(pos[0] - me_pos[0], pos[1] - me_pos[1])
                  if (pos and me_pos) else None)

@@ -235,25 +235,33 @@ def attackers(scanner, ents, my_eid: int) -> list:
     判準只有一個：`+0x34C == 我的實體編號`（見 OFF_ATTACK_TARGET_GAME）。
     ⛔ 不看血量、不看動畫、不看距離。
 
-    ⚠ 同一次讀取裡**順便重驗身分**（+0x1C8 還是不是原本那隻）——
+    ⚠⚠ **屍體一定要排掉**（2026-09-12 使用者回報「只有一隻怪打我、門檻設 2，
+      有時候還是會放技能」的真因）：怪死掉之後這個欄位**還留著最後打的人**，
+      實測 45 秒裡 `Dead` 而且指著我的有 **352 拍次**（同一輪活的只有 32 拍）。
+      屍體要 5 秒以上才從清單消失 —— 剛殺掉一隻、又有一隻在咬我，就湊成 2 隻。
+      死活一律問 `looks_dead()`（動畫 'Dead' ／物件被回收 ／死亡旗標，三選一）。
+    ⚠ 同一次讀取裡**順便重驗身分**（vtable ＋ +0x1C8 的編號）——
       怪一死物件就被歸還空物件池、位址會被回收給別人用，拿舊位址讀出來的
       東西不能信（見 memory `stale-address-identity-check`、`entity-list-churn`）。
       驗不過就當成「這一拍讀不到牠」跳過，絕不把別隻算進來。
     ⚠ `my_eid` 是 0（還沒進場／讀不到）→ 回空清單＝當成沒人打我（安全退化）。
+    ★ 一隻怪只讀一次（整段 LIVE_SPAN 一次拿回 vtable／動畫／編號／目標／
+      死亡旗標），每個欄位都是**同一瞬間**的快照。
     """
     off = attack_target_off()
     if not my_eid or off <= OFF_ID:
         return []
-    span = off + 4 - OFF_ID
+    span = max(LIVE_SPAN, off + 4)
     out = []
     for e in ents:
-        raw = scanner._read_bytes(e.addr + OFF_ID, span)
+        raw = scanner._read_bytes(e.addr, span)
         if not raw or len(raw) < span:
             continue
         blob = bytes(raw)
-        if struct.unpack_from("<I", blob, 0)[0] != e.eid:
-            continue                       # 位址被回收給別的物件了
-        if struct.unpack_from("<I", blob, off - OFF_ID)[0] == my_eid:
+        alive, state, _pos, flag = _live_from_blob(blob, e)
+        if not alive or looks_dead(state, alive, flag):
+            continue                       # 位址被回收、或那是一具屍體
+        if struct.unpack_from("<I", blob, off)[0] == my_eid:
             out.append(e)
     return out
 
