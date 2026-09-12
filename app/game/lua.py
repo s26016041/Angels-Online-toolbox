@@ -39,6 +39,7 @@ TValue = 16 bytes：值 8 + 型別 4 + 對齊 4；`lua_State + 8` 就是 top。
 from __future__ import annotations
 
 import struct
+import time
 
 # ⚠ 這四個值會被 locate.warm() 依 AOB 重新定位，不要在別處複製。
 GETFIELD_FN = 0x006A4290     # lua_getfield(L, idx, k)
@@ -407,11 +408,121 @@ def state(scanner) -> int | None:
     return L
 
 
+# ---------------------------------------------------------------------------
+# ★★★ 全域表索引快取（2026-09-12）：把 `globals_of` 從 ~38ms 壓到 <1ms
+# ---------------------------------------------------------------------------
+# 為什麼要做（使用者 2026-09-12：「對話 NPC 很慢」「都卡很久才知道對話框出現」）：
+# 判「對話框開了沒」唯一的純讀路徑就是這支（`WND_MESSAGE`／`MESSAGE_*`），舊寫法
+# **一個節點一次 ReadProcessMemory（32 bytes）** —— 全域表 2~4 千個節點、每個字串
+# 鍵名再各 2 次讀 → 一次呼叫近萬次 syscall，實測 ~38ms（`dungeon_tab.STRAY_WND_POLL`
+# 的註解就是這個數字）。貴到每個呼叫端都得加 0.3~0.5 秒節流，於是「對話框早就開了
+# 卻要等半秒才看到」。
+#
+# 現在分兩段：
+#   ① 建索引（表換位址／查到沒見過的名字才做）：**一次讀完整塊節點陣列**，
+#      每個字串鍵名一次讀（長度＋內容一起）。
+#   ② 平常查值：只讀索引指到的那幾個節點（各 32 bytes），並**當場驗**那一格的鍵
+#      還是同一個 TString（`[節點+24]==T_STRING` 且 `[節點+16]==` 記住的位址）——
+#      對不上就重建（CLAUDE.md「交給遊戲的位址送出前當場重驗」的讀取端版本，
+#      見 [[stale-address-identity-check]]）。
+# ⚠ 索引 key 帶 node 陣列位址：Lua 的 rehash 會重配那塊陣列 → 位址一變就自動失效。
+# ⚠⚠ 但「表還有空位時新增全域」**不會**換陣列位址（Lua 5.1 `newkey` 走 freepos）→
+#   索引會漏掉新名字。所以「要查的名字索引裡沒有」時最多每 `_RESCAN_GAP` 秒重掃
+#   一次去吸收新增的；⛔ 不可以就這樣回報「沒有這個全域」（那是安靜地做錯事）。
+_NODE = 32                   # Lua 5.1 Node ＝ TValue(16) ＋ TKey(16)（x86）
+_K_VAL, _K_TT = 16, 24       # 節點裡「鍵」的 GCObject 指標／型別
+_NAME_MAX = 63               # 全域名字最長（跟舊版的 0 < n < 64 一致）
+_RESCAN_GAP = 5.0            # 查到索引裡沒有的名字，最多這麼頻繁重掃一次
+_INDEX_MAX = 16              # 索引最多留幾份（每台分身／每次 rehash 一份）
+_index: dict = {}            # (pid, node, lsize) → {名字: (節點序號, TString 位址)}
+_rescan_t: dict = {}         # 同一把 key 上次重掃的時間
+_NIL = object()              # 「這個全域是 nil」＝不存在，跟「讀不到」分開
+
+
+def _read_name(scanner, ts: int) -> str | None:
+    """讀一個 TString 的內容（**一次**讀長度＋字串）；不是 ASCII 短名回 None。
+
+    ⚠ 一次讀 `4 + _NAME_MAX` bytes 可能踩到頁尾（後面沒映射就整發失敗）——
+      那時退回舊的兩次讀，⛔ 不可以因此把那個全域當成不存在。
+    """
+    raw = scanner._read_bytes(ts + OFF_TSTRING_LEN, 4 + _NAME_MAX)
+    if raw and len(raw) >= 4 + _NAME_MAX:
+        b = bytes(raw)
+        n = struct.unpack_from("<I", b, 0)[0]
+        if not 0 < n <= _NAME_MAX:
+            return None
+        body = b[4:4 + n]
+    else:
+        n = _u32(scanner, ts + OFF_TSTRING_LEN)
+        if n is None or not 0 < n <= _NAME_MAX:
+            return None
+        raw = scanner._read_bytes(ts + OFF_TSTRING_DATA, n)
+        if not raw:
+            return None
+        body = bytes(raw)
+    try:
+        return body.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def _node_value(b: bytes):
+    """節點前 16 bytes 的 TValue → Python 值。nil 回 `_NIL`。
+
+    ⚠ 數字／布林之外的型別回**型別碼**（非 0），跟舊版一樣只讓呼叫端知道「有東西」。
+    """
+    vtt = struct.unpack_from("<I", b, 8)[0]
+    if vtt == T_NUMBER:
+        v = struct.unpack_from("<d", b, 0)[0]
+        if v != v or v in (float("inf"), float("-inf")):
+            return v
+        return int(v) if v == int(v) else v
+    if vtt == T_BOOL:
+        return bool(struct.unpack_from("<I", b, 0)[0])
+    if vtt == T_NIL:
+        return _NIL
+    return vtt
+
+
+def _build_index(scanner, node: int, lsize: int) -> dict | None:
+    """把整張全域表的字串鍵掃成 {名字: (節點序號, TString 位址)}；讀不到回 None。
+
+    ★ 節點陣列**一次讀完**（2^lsize × 32 bytes，通常 64~128KB）——舊版在這裡花掉
+      幾千次 syscall。讀不到整塊才退回逐節點讀（區段被切開的情況），行為跟舊版一樣。
+    """
+    count = 1 << lsize
+    blob = scanner._read_bytes(node, count * _NODE)
+    if blob is None or len(blob) < count * _NODE:
+        parts = []
+        for i in range(count):
+            one = scanner._read_bytes(node + i * _NODE, _NODE)
+            parts.append(bytes(one) if one and len(one) >= _NODE
+                         else bytes(_NODE))
+        blob = b"".join(parts)
+    b = bytes(blob)
+    idx: dict = {}
+    for i in range(count):
+        off = i * _NODE
+        if struct.unpack_from("<I", b, off + _K_TT)[0] != T_STRING:
+            continue
+        ts = struct.unpack_from("<I", b, off + _K_VAL)[0]
+        if not 0x10000 < ts < 0x7FFF0000:
+            continue
+        name = _read_name(scanner, ts)
+        if name is not None:
+            idx[name] = (i, ts)
+    return idx
+
+
 def globals_of(scanner, names) -> dict | None:
     """**純讀**遊戲 Lua 的全域常數（數字／布林）。讀不到回 None。
 
     不注入、不呼叫 Lua、不動堆疊 —— 只走全域表的雜湊節點陣列，
     跟 `tools/dump_lua_globals.py` 同一條路（那支已經用了很久）。
+
+    ★★ 2026-09-12 加了索引快取（見上面那段說明）：第一次（或表搬家）掃全表，
+      之後只讀要查的那幾個節點 —— 同樣的答案，成本從 ~38ms 掉到 <1ms。
+      ⛔ 判斷邏輯一個字都沒改：回傳的 dict 仍然「只含真的讀到的名字」。
 
     用途：`WND_xxx` 這種「視窗開著沒有」的全域（開著是執行期代號），
     例如製作面板的 `WND_MAKE`。跟 `robot._wnd` 同一招。
@@ -428,48 +539,59 @@ def globals_of(scanner, names) -> dict | None:
     if L is None:
         return None
     tab = _u32(scanner, L + OFF_L_GT)
-    if not 0x10000 < tab < 0x7FFF0000:
+    if tab is None or not 0x10000 < tab < 0x7FFF0000:
         return None
     raw = scanner._read_bytes(tab + 7, 1)
     node = _u32(scanner, tab + 0x10)
-    if not raw or not 0x10000 < node < 0x7FFF0000:
+    if not raw or node is None or not 0x10000 < node < 0x7FFF0000:
         return None
-    lsize = raw[0]
+    lsize = bytes(raw)[0]
     if lsize > 20:                       # 2^20 個節點已經荒謬，當版面對不上
         return None
-    out: dict = {}
-    for i in range(1 << lsize):
-        # Node = 32 bytes：值 TValue(16) + 鍵(值 8 + tt 4 + next 4)
-        blob = scanner._read_bytes(node + i * 32, 32)
-        if not blob or len(blob) < 32:
+    key = (getattr(scanner, "pid", 0), node, lsize)
+    idx = _index.get(key)
+    if idx is None:
+        idx = _build_index(scanner, node, lsize)
+        if idx is None:
+            return None
+        if len(_index) >= _INDEX_MAX:    # 換過幾次版面／幾台分身就清一輪
+            _index.clear()
+            _rescan_t.clear()
+        _index[key] = idx
+        _rescan_t[key] = time.time()
+    for attempt in (0, 1):
+        out: dict = {}
+        stale = missing = False
+        for name in want:
+            hit = idx.get(name)
+            if hit is None:
+                missing = True           # 索引裡沒有 → 可能是後來才新增的全域
+                continue
+            i, ts = hit
+            one = scanner._read_bytes(node + i * _NODE, _NODE)
+            if not one or len(one) < _NODE:
+                stale = True             # 讀不到那一格 → 不敢當「沒有」，重建再看
+                break
+            b = bytes(one)
+            # ⚠ 讀得到 ≠ 還是它：這一格的鍵換人住了（rehash 沒換陣列／被回收）
+            #   就整份索引重建，⛔ 不可以拿別人的值當這個名字的答案。
+            if (struct.unpack_from("<I", b, _K_TT)[0] != T_STRING
+                    or struct.unpack_from("<I", b, _K_VAL)[0] != ts):
+                stale = True
+                break
+            v = _node_value(b)
+            if v is not _NIL:
+                out[name] = v
+        need = stale or (missing and time.time()
+                         - _rescan_t.get(key, 0.0) >= _RESCAN_GAP)
+        if attempt == 0 and need:
+            fresh = _build_index(scanner, node, lsize)
+            _rescan_t[key] = time.time()
+            if fresh is None:
+                return None
+            _index[key] = idx = fresh
             continue
-        b = bytes(blob)
-        if struct.unpack_from("<I", b, 24)[0] != T_STRING:
-            continue
-        ts = struct.unpack_from("<I", b, 16)[0]
-        n = _u32(scanner, ts + OFF_TSTRING_LEN)
-        if not 0 < n < 64:
-            continue
-        s = scanner._read_bytes(ts + OFF_TSTRING_DATA, n)
-        if not s:
-            continue
-        try:
-            name = bytes(s).decode("ascii")
-        except UnicodeDecodeError:
-            continue
-        if name not in want:
-            continue
-        vtt = struct.unpack_from("<I", b, 8)[0]
-        if vtt == T_NUMBER:
-            v = struct.unpack_from("<d", b, 0)[0]
-            out[name] = v if v != v or v in (float("inf"), float("-inf")) \
-                else (int(v) if v == int(v) else v)
-        elif vtt == T_BOOL:
-            out[name] = bool(struct.unpack_from("<I", b, 0)[0])
-        elif vtt == T_NIL:
-            pass                         # nil ＝ 沒有這個全域
-        else:
-            out[name] = vtt              # 別的型別：至少讓呼叫端知道非 0
+        return out
     return out
 
 
