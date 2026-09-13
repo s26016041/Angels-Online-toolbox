@@ -1615,12 +1615,14 @@ class DungeonTab(BaseTab):
         self._team_round_t = 0.0     # 這一輪（邀請＋同意）還能等多久
         self._team_rounds = 0        # 這次組隊走了幾輪（記錄用）
         self._team_invited = False   # 這一輪邀請送出去了沒（一輪只邀一次）
+        self._team_leaves = 0        # 這一輪真的送出去幾次退組（幽靈判定要先送過，見 _team_tick）
         self._join_t = 0.0           # 分身下一次按同意的倒數
         self._team_note_t = 0.0
         self._ppid = None            # 綁定分身 pid
         self._psc = None
         self._pmover = None
         self._partner_name = ""
+        self._my_name = ""           # 自己的角色名（對帳「分身那台看不看得到我」用）
         self._rounds = 0             # 循環跑了幾趟
         self._supply_thread = None
         self._supply_result = None
@@ -1855,6 +1857,7 @@ class DungeonTab(BaseTab):
                 return False
             self._ppid, self._psc = ppid, psc
             self._partner_name = self.partner_box.currentText().split("（")[0].strip()
+            self._my_name = (self.who.currentText() or "").split("（")[0].strip()
         if presupply:
             # 休息完再刷：先補給（回程＝入口那張圖），補完 _plan_route → back → team → go
             self._refresh_steps()
@@ -4591,6 +4594,7 @@ class DungeonTab(BaseTab):
         self._team_round_t = 0.0
         self._team_rounds = 0
         self._team_invited = False
+        self._team_leaves = 0
         self._team_note_t = 0.0
 
     def _team_restart(self, why: str) -> None:
@@ -4600,6 +4604,42 @@ class DungeonTab(BaseTab):
         self._team_sub = "leave"
         self._team_t = 0.0
         self._team_invited = False
+        self._team_leaves = 0
+
+    def _ghost_party(self, mine, his) -> bool:
+        """我這台的隊員名單是**畫面殘影**嗎（2026-09-13 黑狐實錄）。
+
+        ★ 那天卡了 40 分鐘：黑狐名單掛著「北極狐」、北極狐自己那台說沒有隊伍；
+          `groupleave` 每 TEAM_GAP 秒真的有送出去（跳板 `_DONE` 一直加、遊戲函式
+          回 1），但伺服器那邊**根本沒有這個隊伍可以退** → 永遠不會回一包隊伍更新
+          → 名單那一格永遠清不掉 → 舊版就死等在 `leave`。
+          使用者當場實測：直接邀北極狐就組得起來，證實只是客戶端顯示殘留。
+        ★ 判準是**分身那台自己說沒隊伍**（硬訊號，另一台記憶體）：我這台名單裡
+          除了他沒別人 → 那一格是殘影。
+        ⛔ 只在綁定模式用（要有對方那台可以對帳），而且一定要**先真的送過退組**
+          —— 不然真的有隊伍時會直接跳過退組。
+        ⛔ 不准改成「等太久就往下走」：殘影那一格的名字正好就是夥伴，後面
+          `invite` 會馬上判成「已組隊」帶著不存在的隊伍去刷（所以 `_partied_ok`
+          也改成兩台互相看得到才算）。
+        """
+        return bool(mine) and not his and self._team_leaves > 0 \
+            and self._party == "bind" and self._psc is not None \
+            and all(m.name == self._partner_name for m in mine)
+
+    def _partied_ok(self, mine, his) -> bool:
+        """真的組成隊了嗎 —— **兩台都要看得到對方**（見 `_ghost_party`）。
+
+        ⛔ 只看自己那台的名單會被殘影騙成功。讀不到／對方名單還沒出現我 ＝ 這一拍
+          先不算成功（等下一拍，反正有 TEAM_ROUND 在管）。
+        ⚠ 自己的角色名拿不到（`_my_name` 空）時退一步：對方名單非空就算數。
+        """
+        if not mine or self._partner_name not in {m.name for m in mine}:
+            return False
+        if self._psc is None:                 # 理論上 bind 一定有，防呆
+            return True
+        if not his:                           # None（讀不到）或空的都不算
+            return False
+        return not self._my_name or self._my_name in {m.name for m in his}
 
     def _team_tick(self, dt: float) -> None:
         mine = team.members(self._sc)
@@ -4611,6 +4651,12 @@ class DungeonTab(BaseTab):
             if mine is None or his is None:
                 self._say("組隊：讀不到隊伍狀態，等下一拍…")
                 return
+            if self._ghost_party(mine, his):
+                self._event("warn",
+                            f"組隊：退組送了 {self._team_leaves} 次，我這台名單還掛著"
+                            f"「{self._partner_name}」，但他那台說自己沒隊伍 —— "
+                            "伺服器早就沒這個隊伍可退（畫面殘影）→ 當作退組完成往下走")
+                mine = []
             if not mine and not his:
                 if self._party == "bind":
                     self._team_sub = "deny"
@@ -4620,8 +4666,8 @@ class DungeonTab(BaseTab):
                 return
             if self._team_t <= 0:
                 self._team_t = TEAM_GAP
-                if mine:
-                    team.leave(self._mover)
+                if mine and team.leave(self._mover):
+                    self._team_leaves += 1
                 if his and self._pmover is not None:
                     team.leave(self._pmover)
             self._say("組隊：先退組…（等隊伍名單清空）")
@@ -4654,7 +4700,8 @@ class DungeonTab(BaseTab):
             return
         if self._team_sub == "invite":
             names = {m.name for m in (mine or [])}
-            if self._partner_name in names:
+            his = team.members(self._psc) if self._psc is not None else []
+            if self._partied_ok(mine, his):
                 self._notify(f"已跟「{self._partner_name}」組隊（均分）"
                              f"（第 {self._team_rounds} 輪）→ 開跑")
                 self._cycle = "go"
@@ -5408,6 +5455,7 @@ class DungeonTab(BaseTab):
             return
         self._ppid, self._psc = pw.pid, psc
         self._partner_name = txt.split("（")[0].strip()
+        self._my_name = (self.who.currentText() or "").split("（")[0].strip()
 
     # -- 進不去副本＝當這一批刷完（見 SCHED_DEFAULTS 的 give_up_min）-----------------
     def _on_no_entry(self) -> None:
@@ -5431,7 +5479,10 @@ class DungeonTab(BaseTab):
         if self._cycle == "go":
             key = ("go", self._phase, self._i if self._phase == "run" else -1)
         elif self._cycle == "team":
-            key = ("team", self._team_sub, -1)
+            # ⚠ 這裡**不能**把 `_team_sub` 放進 key（2026-09-13）：組不成會
+            #   leave→deny→invite→leave 一直換段，key 一變計時就歸零 ——
+            #   那樣「組隊卡住」永遠數不滿。整個組隊段當一段計時。
+            key = ("team", "", -1)
         else:
             key = None
         if key != self._stuck_key:
@@ -5462,6 +5513,12 @@ class DungeonTab(BaseTab):
         if key[0] == "go" and self._phase == "run" and self._stuck_t >= STUCK_ABORT_SECS:
             self._abort_trip(f"⚠ 卡住：{_where()} 超過 {STUCK_ABORT_SECS / 60:.0f} 分鐘沒前進"
                              f"（{self.status.text()[:100]}）")
+            return True
+        # ★ 組隊段卡住＝**通知＋停機**（使用者 2026-09-13 選的）。以前這裡只記一筆
+        #   事件就繼續等下去，黑狐那次等了 40 分鐘沒人知道（分身被掛機頁帶走、邀不動）。
+        if key[0] == "team" and self._stuck_t >= STUCK_ABORT_SECS:
+            self._stop(f"⚠ {_where()} 超過 {STUCK_ABORT_SECS / 60:.0f} 分鐘沒組成"
+                       f"（{self.status.text()[:100]}）—— 分身在忙／不在線上？")
             return True
         return False
 

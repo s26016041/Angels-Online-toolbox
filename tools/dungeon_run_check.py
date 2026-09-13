@@ -449,7 +449,10 @@ def run(tab, secs: float, watch: bool = False) -> None:
         if watch and tab._cycle != "offline" and tab._check_offline(TICK):
             continue
         if watch:
-            tab._stuck_watch(TICK)
+            # ⚠ 回 True＝這一拍已經收掉這一趟／停機了，真的 _tick 是 return，
+            #   這裡要跟著跳過剩下的（不然停機之後還會再走一段、把訊息蓋掉）。
+            if tab._stuck_watch(TICK):
+                continue
             tab._loot_tick(TICK)
         # 外圈（補給／飛回入口／組隊）有事就先跑外圈（跟真的 _tick 一樣）
         if tab._cycle_tick(TICK):
@@ -2616,6 +2619,7 @@ def main() -> int:
         tab._pid = 1
         tab._ppid, tab._psc, tab._pmover = 2, FakeSc(), object()
         tab._partner_name = "小黑"
+        tab._my_name = "大黑"          # 對帳「分身那台看不看得到我」用（2026-09-13）
         tab._targets = lambda: []
         tab._drop_target = lambda: None
         return tab
@@ -2712,9 +2716,13 @@ def main() -> int:
        and world["joined"] >= 1, f"{world['invited']} joined={world['joined']}")
     ck("　一輪只邀一次（不狂邀）", len(world["invited"]) == 1, str(len(world["invited"])))
     world["mine"] = [M("小黑")]
+    run(tab, 0.3)
+    ck("★★★★ 只有我這台看得到他、他那台沒隊伍 ＝ 殘影，⛔ 不算組成"
+       "（2026-09-13 黑狐）", tab._cycle == "team", f"{tab._cycle}/{tab._team_sub}")
+    world["his"] = [M("大黑")]
     run(tab, 0.6)
-    ck("★ 分身出現在名單 → 組隊完成 → 回到「去撞入口」", tab._cycle == "go"
-       and tab._phase == "enter", f"{tab._cycle}/{tab._phase}")
+    ck("★ 分身出現在名單（兩台都看得到對方）→ 組隊完成 → 回到「去撞入口」",
+       tab._cycle == "go" and tab._phase == "enter", f"{tab._cycle}/{tab._phase}")
 
     # ②b ★★ 使用者 2026-09-06：「不要前面退隊伍了就不檢查一直邀請」——
     #   一輪（邀請＋同意）幾秒沒成隊 → 整套從「退組→拒絕→邀請→同意」再走一次。
@@ -2737,7 +2745,7 @@ def main() -> int:
     ck("★ 清空 → 又拒絕一次 → 第 2 輪再邀", tab._team_rounds == 2
        and len(world["denied"]) == 4 and len(world["invited"]) == 2,
        f"rounds={tab._team_rounds} denied={len(world['denied'])} invited={len(world['invited'])}")
-    world["mine"] = [M("小黑")]
+    world["mine"], world["his"] = [M("小黑")], [M("大黑")]
     run(tab, 0.3)
     ck("　第 2 輪成隊 → 開跑", tab._cycle == "go", tab._cycle)
 
@@ -2754,10 +2762,43 @@ def main() -> int:
        f"{tab._team_sub} left={len(world['left'])}")
     world["mine"] = []
     run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
-    world["mine"] = [M("小黑")]
+    world["mine"], world["his"] = [M("小黑")], [M("大黑")]
     run(tab, 0.3)
     ck("　重走後成隊 → 開跑", tab._cycle == "go" and tab._team_rounds == 2,
        f"{tab._cycle} rounds={tab._team_rounds}")
+
+    # ②d ★★★★ 幽靈隊伍（2026-09-13 黑狐實錄，卡了 40 分鐘）：我這台名單掛著夥伴、
+    #   他那台說自己沒隊伍 —— 伺服器那邊隊伍早就沒了，`groupleave` 送出去回成功也
+    #   永遠不會有隊伍更新包，名單那格清不掉。⛔ 不准死等，要當作已經退組往下走；
+    #   ⛔ 也不准就這樣判成「已組隊」（殘影那格的名字正好就是夥伴）。
+    tab = loop_tab("bind")
+    tab._phase = "enter"
+    world.update(mine=[M("小黑")], his=[], left=[], invited=[], joined=0,
+                 denied=[], here=90)
+    tab._team_begin()
+    run(tab, 0.3)
+    ck("★★★★ 幽靈隊伍：先真的送過退組才判", world["left"], str(world["left"]))
+    ck("★★★★ 他那台說沒隊伍 → 那格是殘影 → 不再死等，往下走",
+       tab._team_sub in ("deny", "invite"), tab._team_sub)
+    run(tab, dt.TEAM_GAP * 2 + 0.6)
+    ck("　照樣走完 拒絕→邀請，⛔ 不准拿殘影當「已組隊」直接開跑",
+       tab._cycle == "team" and len(world["invited"]) == 1,
+       f"{tab._cycle} invited={world['invited']}")
+    world["his"] = [M("大黑")]
+    run(tab, 0.6)
+    ck("　夥伴那台也看到我了 → 這才算組成 → 開跑", tab._cycle == "go", tab._cycle)
+
+    # ②e ★★★ 組隊一直組不成（分身被掛機頁帶走／不在線上）→ 滿 STUCK_ABORT_SECS
+    #   **通知＋停機**（使用者 2026-09-13 選的 B）。⛔ 以前只記一筆事件然後無限等。
+    tab = loop_tab("bind")
+    tab._phase = "enter"
+    world.update(mine=[], his=[], left=[], invited=[], joined=0, denied=[], here=90)
+    tab._team_begin()
+    run(tab, dt.STUCK_ABORT_SECS + 2.0, watch=True)
+    ck("★★★ 組隊卡滿 2 分鐘 → 停機（⛔ 不是一直等下去）",
+       not tab.run_cb.isChecked(), f"{tab.run_cb.isChecked()} {tab.status.text()[:60]}")
+    ck("　停機訊息帶警示記號（才會通知使用者）",
+       tab.status.text()[:1] in dt.PROBLEM_MARKS, tab.status.text()[:60])
 
     # ③ 遊戲自動組隊：退組 → 等名單有人 → 開跑
     tab = loop_tab("auto")
