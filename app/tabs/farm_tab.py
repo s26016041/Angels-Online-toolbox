@@ -1085,6 +1085,20 @@ class KeyWorker(_Paced):
             return f"⚡ SP 不夠，這一隻跳過首發「{name}」"
         return f"⚠ 讀不到 SP／技能消耗 → 這一隻跳過首發「{name}」"
 
+    def _cast_hook(self):
+        """還**真的裝在遊戲裡**的施放廣播監聽；沒裝／被卸掉了回 None。
+
+        ⚠⚠ 2026-09-13 雪狐實錄（一定要用這支，不可以只判斷物件在不在）：
+          hook 被卸掉之後，`castwatch` 這個物件還掛在攻擊執行緒上，而
+          `casts_since()` 一看 `_active` 是 False 就回空清單 → `fired()` 永遠
+          False → **首發永遠不解鎖**：實機 15 秒只出現首發那招（幻影刺殺Ⅳ），
+          輪替那招（極致劈擊Ⅳ）一次都沒放，五台遊戲的 INBOUND_FN 讀出來
+          全是原始 prologue（hook 真的不在）。底下「監聽不可用 → 送一次就算」
+          的保險本來就是為了這種情況，條件看錯東西＝等於沒有保險。
+        """
+        cw = self.castwatch
+        return cw if (cw is not None and getattr(cw, "active", False)) else None
+
     def _opener_gate(self, eid, bykey: dict, now: float) -> int | None:
         """首次攻擊的閘門：回傳「這一輪只准放這個鍵」，None = 沒鎖／已解鎖。
 
@@ -1114,23 +1128,22 @@ class KeyWorker(_Paced):
             self._open_eid = None
             self.open_wait = 0.0
             return None
+        cw = self._cast_hook()                     # ⚠ 一律問這支，見它的說明
         if self._open_eid != eid:                  # 換了一隻 → 重新上鎖
             self._open_eid = eid
             self._opened = False
             self._open_since = now
             # ★ 伺服器施法者ID 每隻重讀（換圖/重連會重建玩家物件，不能快取）。
             self._srv_id = (castwatch.own_server_id(
-                self.sc, bag.player_entity(self.sc))
-                if self.castwatch else None)
+                self.sc, bag.player_entity(self.sc)) if cw else None)
             # 只看「上鎖之後」的廣播（避免上一隻的遲到廣播誤判）。
-            self._cast_since = (self.castwatch.write_count()
-                                if self.castwatch else 0)
+            self._cast_since = cw.write_count() if cw else 0
         if self._opened:
             self.open_wait = 0.0
             return None
         # ★★★ 100% 確認：收到「我放出這一招」的施放廣播 → 解鎖接輪迴。
-        if (self.castwatch and self._srv_id
-                and self.castwatch.fired(self._cast_since, self._srv_id, sid)):
+        if (cw and self._srv_id
+                and cw.fired(self._cast_since, self._srv_id, sid)):
             self._opened = True
             self.open_wait = 0.0
             return None
@@ -1144,11 +1157,11 @@ class KeyWorker(_Paced):
         # ⚠ castwatch 裝不起來（AOB 對不上／改版／拒裝）→ 沒有可靠確認訊號，
         #   退化成「送一次就算」：**這一拍先送首發**（回 vk）、標記已開，
         #   下一拍就轉輪迴。絕不讓角色永遠站著不出手（大聲講）。
-        if not (self.castwatch and self._srv_id):
+        if not (cw and self._srv_id):
             self._opened = True
             self.open_wait = 0.0
-            self.open_note = ("⚠ 施放廣播監聽不可用（改版？）→ 首發送一次就"
-                              "接輪迴（無法逐發確認）")
+            self.open_note = ("⚠ 施放廣播監聽不可用（沒裝／被卸掉）→ 首發送一次"
+                              "就接輪迴（無法逐發確認）")
             return vk
         # ⚠ 下限給一點點：`open_wait > 0` 是掛機那邊「正在等首發」的旗標
         #   （拿來凍住換怪計時器），剛上鎖那一拍差值是 0，不墊高的話那一拍
@@ -4719,6 +4732,14 @@ class CharFarmPage(QWidget):
             if self._castwatch is not None and self._castwatch.active:
                 self._keys.castwatch = self._castwatch
                 return
+            if self._castwatch is not None:
+                # ★ 裝過、現在卻不在了（被卸掉／還掉）—— 把死掉的那份清乾淨，
+                #   並且**給它一次重裝的機會**（`_cw_failed` 是給「一開始就裝
+                #   不起來」用的，不該讓「裝過又不見了」永遠卡在這裡）。
+                #   ⚠ 重裝再失敗會照舊設回 _cw_failed，不會每拍狂試。
+                self._castwatch = None
+                self._keys.castwatch = None
+                self._cw_failed = False
             if self._cw_failed:
                 return
             try:
