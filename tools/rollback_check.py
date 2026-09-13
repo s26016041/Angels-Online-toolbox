@@ -164,6 +164,27 @@ try:
     tgt.step()
     APP.processEvents()
     check("寬限過後：物件不見了 → 照舊判死", len(seen) == 1, f"實得 {seen}")
+    # ★★★ 2026-09-13：「鎖了很久卻沒看到血量 ＝ 屍體」那條**已經刪掉**
+    #   （CORPSE_SECS）。它是用軟訊號推翻硬訊號：`looks_dead()` 說活著，它拿
+    #   「沒血量」把牠當屍體 → 實測冤枉 11% 的活怪、還冰 20 秒（使用者回報
+    #   「周圍明明有怪卻完全不打，最後被別人搶走」）。這裡釘住不准回來。
+    seen.clear()
+    DEAD["alive"], DEAD["state"], DEAD["flag"] = True, "Wait", 0
+    fake.read_target_checked = lambda sc, st: (True, 0, 0)   # 血量永遠沒填
+    tgt.attack(0x2000, ent)
+    t_end = time.monotonic() + 1.2                # 舊門檻 0.8 秒，撐過它
+    while time.monotonic() < t_end:
+        tgt.step()
+        APP.processEvents()
+        time.sleep(0.05)
+    check("★★★ 活著、血量一直沒填 → ⛔ 不准判死（舊 CORPSE_SECS 已刪）",
+          seen == [], f"實得 {seen}")
+    DEAD["state"] = "Dead"                        # 硬訊號來了才算
+    tgt.step()
+    APP.processEvents()
+    check("　硬訊號（動畫 'Dead'）一來就判死", len(seen) == 1, f"實得 {seen}")
+    check("　沒看過血量 → confirmed=False（不灌擊殺數）",
+          seen and seen[0][1] is False, f"實得 {seen}")
 finally:
     farm_tab.entity = real_entity
 

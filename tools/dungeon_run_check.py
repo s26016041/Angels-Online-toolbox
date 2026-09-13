@@ -234,7 +234,6 @@ class FakeAtk:
     def __init__(self):
         self.picked = None
         self.packets = False
-        self.engaged = False
         self.hp = 0                 # 目標血量（真的那支是 TargetWorker 讀回來的）
 
     def attack(self, _state, mon):

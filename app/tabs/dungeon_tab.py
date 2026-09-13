@@ -2993,7 +2993,6 @@ class DungeonTab(BaseTab):
         self._atk.packets = bool(self._keys.mode == MODE_PACKET
                                  and self._keys.packets and self._keys.skill
                                  and self._keys.mover is not None)
-        self._atk.engaged = self._keys.selected
         self._keys.player = self._player
         self._keys.reach = HANDOFF_RANGE if handoff else 0.0
         self._keys.client_walk = handoff
