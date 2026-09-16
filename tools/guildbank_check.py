@@ -4,8 +4,10 @@
 
 驗的規格（2026-09-06 使用者定）：
     ① 清單存 config、勾一下就存檔（config.set 要接 save）
-    ② 只列／只存「能存」的：綁定／不可交易／不可存倉庫（itemflags 三旗）不列不送；
-       表裡沒那筆也不送
+    ② 只列／只存「能存」的 —— **兩層**：表（不可存倉庫／不可交易）＋這一件的
+       **剩餘綁定次數**（記憶體 +0x38，照遊戲 0x005D91E1 抄）。表裡沒那筆也不送。
+       ⚠ 2026-09-16：「裝備綁定」旗標**不再**當成擋——那只說「這類會綁定」，
+       害 3 綁的華麗駱駝被擋在清單外（使用者回報）。
     ③ 開到的不是公會倉（CUR_BANK_TYPE≠1）→ 一件都不送、關窗
     ④ 送了沒進去：單件＝跳過換下一件；連續 FAIL_STREAK 件＝倉庫滿 → 關窗、訊息寫明、
        回 True（安靜，不當失敗）
@@ -24,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding="utf-8")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from app.game import guildbank, itemflags, supply           # noqa: E402
+from app.game import bag as realbag, guildbank, itemflags, supply   # noqa: E402
 
 FAILS: list[str] = []
 
@@ -57,6 +59,11 @@ class FItem:
     type_id: int
     count: int = 1
     icon_id: int = 0
+    bind_left: int = 0        # +0x38 剩餘綁定次數
+    bind_kind: int = 0        # +0x39 bit0 = 綁定制
+
+    # ★ 借真的那支，測的才是產品邏輯（⛔ 不要在測試裡自己再寫一份判斷）
+    tradable = realbag.Item.tradable
 
 
 class Clock:
@@ -73,8 +80,10 @@ class Clock:
 CFG = FakeConfig()
 guildbank.config = CFG
 guildbank.time = Clock()
-# 假旗標表：1905 天使之翼可存、66 可存、137 不可交易+不可存倉庫、500 裝備綁定、999 不在表裡
-itemflags._table = {1905: (0, 11), 66: (0, 12), 137: (3, 0), 500: (4, 0), 4837: (0, 13)}
+# 假旗標表：1905 天使之翼可存、66 可存、137 不可交易+不可存倉庫、
+# 500/501 裝備綁定（⚠ 旗標一樣，能不能存要看**這一件**還剩幾綁）、999 不在表裡
+itemflags._table = {1905: (0, 11), 66: (0, 12), 137: (3, 0), 500: (4, 0),
+                    501: (4, 0), 4837: (0, 13)}
 check("icon_of 查表（4837 → 13）、不在表裡回 0", itemflags.icon_of(4837) == 13 and itemflags.icon_of(999) == 0)
 
 print("① 清單存 config，勾一下就 save")
@@ -87,16 +96,36 @@ check("壞值丟掉", guildbank.wanted() == {66, 1905}, str(guildbank.wanted()))
 
 print()
 print("② 只列／只存能存的")
-BAG = [FItem(20, 1, 1905, 3), FItem(21, 2, 137, 1), FItem(22, 3, 500, 1),
+# ⚠ 500 與 501 的 item.xml 旗標**一模一樣**（都是「裝備綁定」）——
+#   差別只在這一件還剩幾綁：500 剩 3（華麗駱駝那種，遊戲讓交易）、501 剩 0（綁死了）。
+BAG = [FItem(20, 1, 1905, 3), FItem(21, 2, 137, 1),
+       FItem(22, 3, 500, 1, bind_left=3, bind_kind=1),
+       FItem(26, 7, 501, 1, bind_left=0, bind_kind=1),
        FItem(23, 4, 999, 1), FItem(24, 5, 66, 9), FItem(25, 6, 66, 4)]
 COMPLETE = [True]
 guildbank.bag = types.SimpleNamespace(scan=lambda sc: (list(BAG), COMPLETE[0]),
                                       Item=FItem)
 ok, no, complete = guildbank.candidates(None)
-check("能存＝天使之翼＋兩格低效紅藥水", [i.type_id for i in ok] == [1905, 66, 66],
+check("能存＝天使之翼＋還有 3 綁的那件＋兩格低效紅藥水",
+      [i.type_id for i in ok] == [1905, 500, 66, 66],
       str([i.type_id for i in ok]))
-check("不能存＝不可交易／裝備綁定／不在表裡", [i.type_id for i in no] == [137, 500, 999],
+check("不能存＝不可交易／綁定用完／不在表裡",
+      [i.type_id for i in no] == [137, 501, 999],
       str([i.type_id for i in no]))
+
+# ★★ 2026-09-16 使用者回報的那個 bug 本身：旗標說「裝備綁定」不等於這件存不進去
+check("⚠ 旗標一樣但剩餘綁定不同 → 答案要不同（華麗駱駝 3 綁可存）",
+      guildbank.eligible(FItem(1, 1, 500, 1, bind_left=3, bind_kind=1))
+      and not guildbank.eligible(FItem(1, 1, 501, 1, bind_left=0, bind_kind=1)))
+check("非綁定制的東西不受綁定次數影響（bind_left 0 照樣可存）",
+      guildbank.eligible(FItem(1, 1, 66, 1, bind_left=0, bind_kind=0)))
+check("表擋掉的即使還有綁定次數也不能存",
+      not guildbank.eligible(FItem(1, 1, 137, 1, bind_left=3, bind_kind=1)))
+check("不能存的原因講得出來",
+      guildbank.why_not(FItem(1, 1, 501, 1, bind_left=0, bind_kind=1))
+      == "綁定次數已用完"
+      and guildbank.why_not(FItem(1, 1, 500, 1, bind_left=3, bind_kind=1)) == "",
+      guildbank.why_not(FItem(1, 1, 501, 1, bind_left=0, bind_kind=1)))
 pend = guildbank.pending(None, {66, 137, 999})
 check("pending 只挑清單上且能存的", [i.serial for i in pend] == [5, 6], str(pend))
 COMPLETE[0] = False

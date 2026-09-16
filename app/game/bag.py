@@ -93,6 +93,19 @@ ITEM_COUNT = 0x27           # 數量（u16）
 #   結果一樣；改成 u16 是為了時限道具真的出現時不會安靜算錯。
 ITEM_DURA = 0x2C            # 耐久現值（u16）；0 = 沒耐久這回事，或是壞了
 ITEM_TIMELIMIT = 0x2E       # ★ 時限；**0 ＝ 沒時限**。非 0 的東西遊戲不讓分解
+# ★★★ 綁定：**這一件**還剩幾綁（item.xml 的「綁定次數」是初始值，這裡是現值）。
+#   出處＝遊戲自己的「能不能交易」判斷 `0x005D91E1`（印字串 799
+#   「綁定物品不可交易。」那段；esi = 物品物件，同段 `movzx eax, word ptr [esi+0x25]`
+#   取格號，跟 ITEM_SLOT 對得上）：
+#       test byte ptr [esi+0x39], 1   ← 這件是不是「綁定制」
+#       je   放行                      ← 不是 → 可交易
+#       cmp  byte ptr [esi+0x38], 0   ← 剩下幾綁
+#       jne  放行                      ← >0 → 可交易
+#       push 0x31F（799）              ← =0 才拒絕
+#   ✅ 2026-09-16 五台背包 209 件對帳：非綁定制的 +0x38/+0x39 全 0；華麗駱駝 3
+#      （item.xml `綁定次數="3"`、沒用過）、奧羅娜的預言 2（表也是 3，用掉一次）。
+ITEM_BIND_LEFT = 0x38       # u8：剩餘綁定次數（＝還能交易幾次）
+ITEM_BIND_KIND = 0x39       # u8：bit0 = 這件是綁定制的
 ITEM_TMPL = 0x58            # 指向這種物品的範本
 ITEM_SPAN = 0x5C            # 一次要讀多少 bytes 才涵蓋上面全部
 # ★ 能量／經驗值欄（遊戲的 `getenergy`）。紙娃娃裝的是晶化能量、技能經驗球裝的
@@ -272,6 +285,8 @@ class Item:
     icon_id: int = 0        # 範本 +0x00 圖示編號（0 = 沒讀到），見 itemicon.py
     level: int = 0          # 範本 +0x34 物品等級（打孔錘星級、裝備等級都看它）
     param1: int = 0         # 範本 +0x108 動態資料1（寶石＝效果編號、祝福錘＝1）
+    bind_left: int = 0      # +0x38 這一件剩餘綁定次數（見 ITEM_BIND_LEFT）
+    bind_kind: int = 0      # +0x39 bit0 = 綁定制
 
     @property
     def name(self) -> str:
@@ -285,6 +300,24 @@ class Item:
     @property
     def sellable(self) -> bool:
         return self.price > 0
+
+    @property
+    def tradable(self) -> bool:
+        """**這一件**現在還能不能交易（＝還能不能存倉庫／擺攤）。
+
+        ★ 照遊戲自己的判斷抄，一行對一行（`0x005D91E1`，見 ITEM_BIND_LEFT）：
+          不是綁定制 → 能；是綁定制而且**剩餘綁定次數 > 0** → 還能；歸 0 才不能。
+
+        ⚠⚠ 這跟 item.xml 的「裝備綁定」旗標**不是同一件事**：那個旗標只說
+          「這類東西會綁定」，不是這一件的狀態。2026-09-16 使用者回報
+          「黑狐背包有華麗駱駝，存公會清單卻沒有」就是拿旗標一刀切造成的
+          —— 那 5 隻都是 3 綁，還能交易。
+        ⚠ 這是**執行時狀態**，只能讀記憶體，⛔ 不准拿 item.xml 的「綁定次數」
+          （那是初始值）當它用。
+        """
+        if not (self.bind_kind & 1):
+            return True
+        return self.bind_left > 0
 
     @property
     def is_gear(self) -> bool:
@@ -513,6 +546,8 @@ def scan(scanner, first: int = FIRST_SLOT,
         # ⚠ u16 不是 u32 —— +0x2E 是時限，見 ITEM_DURA 的說明。
         dura = struct.unpack_from("<H", b, ITEM_DURA)[0]
         tlimit = struct.unpack_from("<I", b, ITEM_TIMELIMIT)[0]
+        bind_left = b[ITEM_BIND_LEFT]
+        bind_kind = b[ITEM_BIND_KIND]
         tmpl = struct.unpack_from("<I", b, ITEM_TMPL)[0]
         kind, price, grade, dmax, param2, icon, level, param1 = tmpl_cache.get(
             tmpl, (0, 0, 0, 0, 0, 0, 0, 0))
@@ -534,7 +569,8 @@ def scan(scanner, first: int = FIRST_SLOT,
                         type_id=type_id, count=count_, dura=dura,
                         kind=kind, price=price, grade=grade, dura_max=dmax,
                         time_limit=tlimit, decomp_value=param2,
-                        icon_id=icon, level=level, param1=param1))
+                        icon_id=icon, level=level, param1=param1,
+                        bind_left=bind_left, bind_kind=bind_kind))
     # ★★★ 最後一道：**容器同步好了嗎**。換頻道／傳送會斷線重連，重連後容器
     #   會先配好格數、物品才由伺服器一件件推過來 —— 那段空窗裡上面每一格都
     #   「讀取成功但是空的」，`complete` 是 True，結果跟「真的一件都沒有」

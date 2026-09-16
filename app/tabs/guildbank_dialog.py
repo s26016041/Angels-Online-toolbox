@@ -6,7 +6,8 @@
 一樣，補給時每台照這張存自己背包裡有的。
 
 規則：
-  · 不能存的（綁定／不可交易／不可存倉庫，表在 itemflags）**不列**，只在底下報個數。
+  · 不能存的（不可交易／不可存倉庫／綁定次數用完，見 guildbank.eligible）**不列**，
+    只在底下報個數。
   · 右邊只顯示**名字＋圖示**（使用者 2026-09-06：「大家共用存倉庫表，不需要說不在這台背包，
     以後他拿到這東西一樣會存」）；圖示查資料表（itemflags.icon_of，item.xml 原型介面），
     所以別台加的、這台沒有的東西也畫得出來。
@@ -150,7 +151,7 @@ class GuildBankDialog(QDialog):
         self._rebuild(guildbank.wanted())
         parts = [f"這台背包可存 {len(self._agg)} 種"]
         if no:
-            parts.append(f"不能存 {len(no)} 格（綁定／不可交易／不可存倉庫，不列）")
+            parts.append(f"不能存 {len(no)} 格（不可交易／不可存倉庫／綁定用完，不列）")
         if not complete:
             parts.append("⚠ 背包沒讀完整（換圖中？）—— 按「重新讀背包」再試")
         self._summary_tail = "　·　".join(parts)

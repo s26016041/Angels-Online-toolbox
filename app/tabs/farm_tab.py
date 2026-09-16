@@ -2595,7 +2595,7 @@ class CharFarmPage(QWidget):
         self.guildbank_btn.setToolTip(
             "打開小視窗：列這台背包裡能存公會倉庫的東西，打字過濾、勾選＝要存的清單。\n"
             "清單全部分身共用；回程補給到銀行時，每台把清單上、自己背包有的存進社團倉庫。\n"
-            "綁定／不可交易／不可存倉庫的東西不會列出來；公會倉庫滿了就安靜關窗。")
+            "不可交易／不可存倉庫／綁定次數用完的東西不會列出來；公會倉庫滿了就安靜關窗。")
         self.guildbank_btn.clicked.connect(self._open_guildbank)
         t.addWidget(self.guildbank_btn)
         t.addStretch(1)
