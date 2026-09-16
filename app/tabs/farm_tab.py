@@ -2969,7 +2969,8 @@ class CharFarmPage(QWidget):
                 and self._supply_t - self._jump_sent < JUMP_LAND_SECS):
             return "　✈ 趴趴GO已送出，等著陸…"
         pos = self._supply_pos or (None, None)
-        e = jumpmap.nearest(self._supply_scene, pos[0], pos[1])
+        # 有好幾個落點就挑**走過去最短**的（結果有快取，不會每拍重算 A*）
+        e = jumpmap.nearest(self._supply_scene, pos[0], pos[1], self.sc)
         if e is None:
             # 表裡真的沒這張圖的落點 → 再送幾次也變不出來。停掉趴趴GO、
             # 讓精靈自己走回來（SUPPLY_MAX_SECS 當兜底），並且**把原因寫在
@@ -3167,7 +3168,8 @@ class CharFarmPage(QWidget):
             if route is not None:
                 return self._death_event_return(route)
             pos = self._death_pos or (None, None)
-            e = jumpmap.nearest(self._death_scene, pos[0], pos[1])
+            # 同上：挑走過去最短的落點（結果有快取，不會每拍重算）
+            e = jumpmap.nearest(self._death_scene, pos[0], pos[1], self.sc)
             if e is None:
                 self._death_fail(f"{scene.scene_name(self._death_scene)}"
                                  "不在趴趴GO清單裡，沒辦法傳回去")
@@ -4580,8 +4582,10 @@ class CharFarmPage(QWidget):
             # 活動地圖不在趴趴GO 清單裡：改走活動 NPC 的對話選單（見 eventmap）
             act.setText(f"🍺 走去找{route.npc_name}，進"
                         f"{route.label(scene.subspace(sid))}（記錄點跟著改）")
-        elif jumpmap.nearest(sid, x, y) is None:
+        elif not jumpmap.by_scene(sid):
             # 表裡沒這張圖的落點（或 jumpmap.tsv 缺檔）→ 拒絕動作，不猜
+            # ⚠ 這裡只是問「有沒有」，⛔ 別用 nearest()：它現在會算 A*，
+            #   每次彈右鍵選單都跑一次等於在 UI 執行緒上放慢工作。
             act.setEnabled(False)
             act.setText(f"✈ 趴趴GO沒有去{scene.scene_name(sid)}的傳送點")
         # pos 是 viewport 座標（QListWidget 的右鍵事件發在 viewport 上）
@@ -4604,7 +4608,9 @@ class CharFarmPage(QWidget):
         if route is not None:
             self._fly_to_event(route, sid, x, y)
             return
-        e = jumpmap.nearest(sid, x, y)
+        # 有好幾個落點時挑**走過去最短**的那個（2026-09-16 使用者回報：
+        # 右鍵傳過去會挑到隔一道牆的落點，然後繞一大圈）。
+        e = jumpmap.nearest(sid, x, y, self.sc)
         if e is None:
             self.status.setText(f"⚠ 趴趴GO沒有去{scene.scene_name(sid)}的傳送點")
             return

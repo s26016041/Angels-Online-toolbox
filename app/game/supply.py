@@ -2168,10 +2168,14 @@ def _full_supply(mover, scanner, say=None,
     #   這裡就自動退回原本的趴趴GO 行為。
     from app.game import eventmap            # 避免模組載入期循環相依
     ev = None if stay else eventmap.for_scene(start_map)
+    # ★ 傳 scanner：這一拍人還站在練功點那張圖上，所以挑傳送點時可以用
+    #   記憶體那張地形算路徑（最準）；回程的落點常有好幾個，挑**走過去最短**
+    #   的那個（2026-09-16，見 jumpmap.nearest）。
     back = None if (ev or stay) else jumpmap.nearest(
         start_map,
         start_pos[0] if start_pos else None,
-        start_pos[1] if start_pos else None)
+        start_pos[1] if start_pos else None,
+        scanner)
     note(f"記錄練功點：{scene.scene_name(start_map)}"
          + ("（補完留在城裡，不回程）" if stay else
             f"（回程：找{ev.npc_name}）" if ev else

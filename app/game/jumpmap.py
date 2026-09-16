@@ -1,6 +1,7 @@
 """天使趴趴GO：**填一個編號就傳送**，不必開視窗、不必碰 UI。
 
     jumpmap.by_scene(7)                  → [Entry(13, '向日葵平原(LV12~23)入口'), …]
+    jumpmap.nearest(7, 15, 177, sc)      → 走到 (15,177) **路徑最短**的那個傳送點
     jumpmap.teleport(mover, sc, 13)      → True（1 秒後人就到了）
 
 ✅ 實測（黑狐）：千夜魔宮(126) (20.5,23.5) → 送目的地 13 → **+1 秒**
@@ -30,9 +31,18 @@
 
 ⚠ 類別**不是嚴格的樹**：一個傳送點最多掛三個類別標籤（`類別1/2/3`），
   同一個點會同時出現在好幾個類別底下。所以 `by_class()` 是「任一格命中」。
+
+挑哪個傳送點（2026-09-16 改）
+----------------------------
+`nearest()` 以前挑**直線距離**最近的，隔一道牆的落點會被選中再繞一大圈
+（使用者回報：補給用趴趴GO 回巡邏點、右鍵傳送到巡邏點都會這樣）。現在改成用
+地形圖算**真實路徑長度**取最短：人就在那張圖上用記憶體那張地形，要算別張圖
+用離線表 `app/game/mapfile.py`（`assets/map_grids.bin.gz`）。
+算不出來一律**退回直線最近**，⛔ 不准回 None ——「回程回不去」是出過事的。
 """
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -134,20 +144,139 @@ def by_scene(scene_id: int) -> list[Entry]:
     return [e for e in entries() if scene.map_key(e.scene_id) == key]
 
 
-def nearest(scene_id: int, x: float | None = None,
-            y: float | None = None) -> Entry | None:
-    """那張地圖**離 (x,y) 最近**的傳送點。
+_last_pick = ""                  # 最後一次 nearest() 怎麼挑的（診斷／回歸用）
 
-    ★ 一張地圖常有「入口」和「重生點」兩個落點，位置可以差很遠。傳回原本
-      掛機的地方附近那一個，接回自動戰鬥時才不用走一大段。
-      不給座標就給第一個。
+# ⚠⚠ 算路不便宜（泛洪 33ms ＋ 每個傳送點一次 A*），而**呼叫端有的是每拍都問**
+#   （掛機分頁的補給回程／死亡回程 tick 跑在 UI 執行緒上）。同一張圖的地形不會
+#   變、目標也是固定的巡邏點，所以答案直接快取起來：第二拍起 O(1)。
+#   ⛔ 不准拿掉改成每拍重算 —— 那就是 memory `no-crash-no-lag` 說的
+#   「在 UI 執行緒上放慢工作」。key 含場景與目標格，換圖／換目標自然失效。
+_PICK_CACHE_SIZE = 8
+_pick_cache: dict = {}
+_pick_order: list = []
+
+
+def last_pick() -> str:
+    """上一次 `nearest()` 的挑選說明（`tools/mapgrid_check.py` 在驗這個）。"""
+    return _last_pick
+
+
+def clear_pick_cache() -> None:
+    """丟掉挑選快取（測試用；節慶換圖那種極端情況也可以手動清）。"""
+    _pick_cache.clear()
+    _pick_order.clear()
+
+
+def _grid_for(scene_id: int, scanner=None):
+    """算路要用的地形圖：**人就在那張圖上**優先用記憶體那張，否則用離線表。
+
+    ⚠ 記憶體那張是「當下這張圖」的事實（節慶換檔、動態空間都吃得到），所以
+      同一張圖一律以它為準；要算**別張圖**才輪到離線表（見 mapfile 檔頭）。
     """
+    from app.game import mapfile, scene as scn, terrain     # 避免循環相依
+
+    if scanner is not None:
+        try:
+            if scn.map_key(scn.current_id(scanner)) == scn.map_key(scene_id):
+                grid, _why = terrain.load(scanner)
+                if grid is not None:
+                    return grid, "記憶體"
+        except Exception:
+            pass                        # 讀不到就當沒有，往下用離線表
+    return mapfile.grid_of(scene_id), "離線表"
+
+
+def _shortest_walk(scene_id: int, cand: list[Entry], x: float, y: float,
+                   scanner=None) -> tuple[Entry | None, str]:
+    """候選傳送點裡，**走到 (x,y) 路徑最短**的那個；算不出來回 (None, 原因)。
+
+    ⚠ 先用 `reachable()` 從**目標**泛洪一次，把跟目標不連通的傳送點剔掉，
+      再對剩下的算 A*。「走不到的目標最貴」（一次要把整片展開），這道過濾
+      就是 memory `terrain-grid` 量過的做法——⛔ 不是給 A* 距離上限，
+      那是 `wall-stick-detour-cap` 推翻過的寫法。
+    """
+    grid, src = _grid_for(scene_id, scanner)
+    if grid is None:
+        return None, "沒有地形圖"
+    goal = grid.nearest_open(int(x), int(y))
+    if goal is None:
+        return None, f"{src}：目標附近沒有可走格"
+    reach = grid.reachable(goal[0], goal[1])
+    if not reach:
+        return None, f"{src}：目標那格泛洪不出東西"
+
+    best: Entry | None = None
+    best_cost = None
+    unreachable = 0
+    for e in cand:
+        start = grid.nearest_open(int(e.x), int(e.y))
+        if start is None or start not in reach:
+            unreachable += 1
+            continue
+        path = grid.route((e.x, e.y), (x, y))
+        if not path:
+            unreachable += 1
+            continue
+        cost = sum(math.dist(path[i - 1], path[i])
+                   for i in range(1, len(path)))
+        if best_cost is None or cost < best_cost:
+            best, best_cost = e, cost
+    if best is None:
+        return None, f"{src}：{len(cand)} 個傳送點沒有一個走得到目標"
+    return best, (f"{src}：{len(cand)} 個傳送點挑路徑最短的"
+                  f"（{best_cost:.0f} 格；走不到的 {unreachable} 個）")
+
+
+def nearest(scene_id: int, x: float | None = None,
+            y: float | None = None, scanner=None) -> Entry | None:
+    """那張地圖**走過去最短**的傳送點。
+
+    ★ 一張地圖常有「入口」和「重生點」好幾個落點，位置可以差很遠。傳回**走到
+      (x,y) 路徑最短**的那一個，接回自動戰鬥／補給回程時才不用走一大段。
+      不給座標就給第一個。
+
+    ★★ 2026-09-16 使用者提的：舊版挑的是**直線距離**最近
+      （`(e.x-x)**2+(e.y-y)**2`），隔著一道牆的傳送點會被選中、然後繞一大圈。
+      現在改成用地形圖算真實路徑長度；算不出來（沒有那張圖的地形、目標
+      在封閉區、傳送點全都走不到）就**退回舊的直線距離**——⛔ 不准回 None，
+      那會讓補給／死亡回程整個停掉（回程回不去是 memory 裡記過的事故）。
+
+    scanner: 給了而且**人就在那張圖上**，就用記憶體那張地形（最準）；
+      不給或人在別張圖，用離線表 `mapfile`。
+    """
+    global _last_pick
     cand = by_scene(scene_id)
     if not cand:
+        _last_pick = "那張地圖沒有傳送點"
         return None
     if x is None or y is None:
+        _last_pick = "沒給座標 → 第一個"
         return cand[0]
-    return min(cand, key=lambda e: (e.x - x) ** 2 + (e.y - y) ** 2)
+    straight = min(cand, key=lambda e: (e.x - x) ** 2 + (e.y - y) ** 2)
+    if len(cand) == 1:
+        _last_pick = "只有一個傳送點"
+        return cand[0]
+
+    from app.game import scene as scn                # 避免循環相依
+
+    key = (scn.map_key(scene_id), int(x), int(y),
+           tuple(e.jump_id for e in cand))
+    hit = _pick_cache.get(key)
+    if hit is not None:
+        _last_pick = hit[1] + "（快取）"
+        return hit[0]
+
+    best, why = _shortest_walk(scene_id, cand, x, y, scanner)
+    if best is None:
+        best, why = straight, f"退回直線最近（{why}）"
+    else:
+        why += "" if best is straight else "，跟直線最近的不同"
+    _last_pick = why
+    _pick_cache[key] = (best, why)
+    _pick_order.append(key)
+    while len(_pick_order) > _PICK_CACHE_SIZE:
+        _pick_cache.pop(_pick_order.pop(0), None)
+    return best
 
 
 def get(jump_id: int) -> Entry | None:
