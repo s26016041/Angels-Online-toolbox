@@ -1814,13 +1814,32 @@ def _player_tile(scanner):
     return pf, entity.read_pos(scanner, pf + 8)
 
 
-def _wing_slot(scanner):
-    """背包裡天使之翼（回程道具）的格號（物品自記 +0x25）；沒有回 None。"""
+def _wing_slot(scanner) -> tuple[int | None, bool]:
+    """背包裡天使之翼（回程道具）的格號（物品自記 +0x25）。回 (格號, 這個結論可信嗎)：
+
+        (格號, True)   找到了
+        (None, True)   整條陣列**真的走完了**、一個都沒有
+        (None, False)  這一拍背包讀不到／沒走完 —— ⛔ 不准當成「沒有」
+
+    ⚠⚠ [[bag-false-empty-guards]] 第八次（2026-09-17 黑狐實錄）：無限塔第 63 步
+      剛跑完那一拍問這裡，背包容器讀不到 → 舊版回 None → 呼叫端當成「背包沒有
+      天使之翼」整趟補給放棄（背包其實有 50 個，純讀探針對過）→ 人沒回城又開下
+      一場 → 3 秒後伺服器把人送出副本 →「地圖變了」停機六小時。
+    ★ 「沒有」這個結論一定要 `count_by_types()` 並且看第二個值（那支自己的註解
+      就是這樣寫的）—— `find_by_type()` 走的 `_walk()` 對截斷不吭聲。
+    """
     h = bag.head(scanner)
     if not h:
-        return None
+        return None, False
     got = inventory.find_by_type(scanner, h[0], recall.RECALL_ITEM)
-    return got[0] if got else None
+    if got:
+        return got[0], True
+    try:
+        _cnt, complete = inventory.count_by_types(scanner, h[0],
+                                                  [recall.RECALL_ITEM])
+    except Exception:                                      # noqa: BLE001
+        return None, False
+    return None, bool(complete)
 
 
 def _wing_count(scanner):
@@ -2185,13 +2204,30 @@ def _full_supply(mover, scanner, say=None,
     # ★ 已經站在補給城裡（死亡「回標記點」復活後、或人本來就在城裡）→ 不燒翼、不等換圖。
     #   2026-09-05 自動刷副本「死亡當成一場 → 復活回城 → 補給」要走這條；以前會卡在
     #   「回城後地圖沒變」整趟失敗。只認 NPC_TABLE 有的城 —— 不在表裡就照舊用翼。
+    slot, sure = None, True
+    if not NPC_TABLE.get(here):
+        slot, sure = _wing_slot(scanner)
+        if slot is None and not sure:
+            # ★★ 讀不到 ≠ 沒有（[[bag-false-empty-guards]]，見 _wing_slot 的說明）：
+            #   副本最後一步剛跑完那一拍問背包常常整袋讀不到，而且伺服器過幾秒
+            #   就會把人送出副本 —— 等到「人站穩、整袋讀得完」再問一次，順便把
+            #   地圖重讀（等的期間被送回城的話就不用燒翼了）。
+            note("背包這一拍讀不到（剛換圖？）→ 等人站穩再問一次…")
+            _wait_ready(scanner)
+            now = scene.current_id(scanner)
+            if now is not None and now != here:
+                note(f"等的期間被送到「{scene.scene_name(now)}」了")
+                here = now
+            slot, sure = _wing_slot(scanner)
     if NPC_TABLE.get(here):
         home = here
         note(f"已在 {scene.scene_name(home)}，不用回城")
     else:
-        slot = _wing_slot(scanner)
         if slot is None:
-            return False, f"背包沒有{itemname.label(recall.RECALL_ITEM)}（回程道具）"
+            return False, (f"背包沒有{itemname.label(recall.RECALL_ITEM)}（回程道具）"
+                           if sure else
+                           f"背包讀不到，問不出有沒有"
+                           f"{itemname.label(recall.RECALL_ITEM)}（回程道具）")
         before = _wing_count(scanner)
         if not recall.use_item(mover, slot):
             return False, "回程道具送不出去"

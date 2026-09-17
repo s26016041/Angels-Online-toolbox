@@ -1133,6 +1133,61 @@ def main() -> int:
        tab.status.text())
     dt.supply.run_full_supply = _orig_supply
 
+    # ★★★ 2026-09-17 黑狐實錄（無限塔第 9 趟）：腳本跑完那一拍問背包，整袋讀不到 →
+    #   補給回「背包沒有天使之翼（回程道具）」整趟放棄（背包其實有 50 個，純讀探針對過）
+    #   → 舊碼**照常開下一場** → 但人根本沒回城，三秒後伺服器把人送出副本 →
+    #   「⛔ 地圖變了（無限塔 → 棕櫚基地），但第 1 步不是傳點」停機六小時。
+    #   規格：補給沒跑完 → 等 SUPPLY_RETRY 秒**重跑一次**（⛔ 不接著開下一場），
+    #   連 SUPPLY_FAIL_MAX 次沒跑完才大聲停機。
+    print("\n補給沒跑完 → 重跑一次，連兩次才停機")
+    _orig_supply = dt.supply.run_full_supply
+    _orig_scene_id = dt.scene.current_id
+    calls: list[int] = []
+    dt.supply.run_full_supply = lambda *a, **k: (calls.append(1), (False, "背包讀不到"))[1]
+    tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
+    tab._loop = True
+    tab._start_supply_trip()
+    if tab._supply_thread is not None:
+        tab._supply_thread.join(2.0)
+    run(tab, 0.3)
+    ck("★★★ 第 1 次沒跑完 → ⛔ 不開下一場，排隊重跑（還在補給段、沒停機）",
+       tab._cycle == "supply" and tab._supply_retry > 0 and tab.run_cb.isChecked()
+       and len(calls) == 1,
+       f"cycle={tab._cycle} retry={tab._supply_retry} calls={len(calls)} {tab.status.text()}")
+    ck("　狀態列講得出要重跑補給", "重跑一次補給" in tab.status.text(), tab.status.text())
+    run(tab, dt.SUPPLY_RETRY + 0.3)
+    ck(f"★★ 等滿 {dt.SUPPLY_RETRY:.0f} 秒 → 真的重跑一次補給", len(calls) == 2, str(len(calls)))
+    if tab._supply_thread is not None:
+        tab._supply_thread.join(2.0)
+    run(tab, 0.3)
+    ck(f"★★★ 連 {dt.SUPPLY_FAIL_MAX} 次沒跑完 → 停機（⛔ 不接著開下一場）",
+       not tab.run_cb.isChecked() and "不接著開下一場" in tab.status.text(),
+       f"calls={len(calls)} {tab.status.text()}")
+    ck("　重要事件留得下「沒跑完 → 重跑一次」",
+       any(r[2] == "warn" and "重跑一次" in r[3] for r in tab._events),
+       str(tab._events[:2]))
+    # 補給跑完 → 失敗次數歸零、照舊往下（飛回入口那段）
+    dt.supply.run_full_supply = lambda *a, **k: (True, "都夠了")
+    dt.scene.current_id = lambda _sc, **_k: 110
+    tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
+    tab._loop = True
+    tab._supply_fail = 1                       # 前一次沒跑完
+    tab._start_supply_trip()
+    if tab._supply_thread is not None:
+        tab._supply_thread.join(2.0)
+    run(tab, 0.3)
+    ck("　補給跑完 → 連續失敗次數歸零、離開補給段照舊往下（不停機）",
+       tab._supply_fail == 0 and tab._cycle != "supply" and tab._supply_retry == 0.0
+       and tab.run_cb.isChecked(),
+       f"fail={tab._supply_fail} cycle={tab._cycle} {tab.status.text()}")
+    # 停機／取消時排隊中的重跑要一起收掉（不然下次開跑第一拍就被舊的重跑吃掉）
+    tab = make_tab([{"do": "walk", "to": [50, 50]}], pos=(10.0, 10.0))
+    tab._supply_retry = dt.SUPPLY_RETRY
+    tab._stop("測試")
+    ck("　停機 → 排隊中的重跑也取消", tab._supply_retry == 0.0, str(tab._supply_retry))
+    dt.supply.run_full_supply = _orig_supply
+    dt.scene.current_id = _orig_scene_id
+
     # ★★★ 2026-09-05 黑狐實錄（無限塔第 24 步）：踩上傳點的同一拍落點旁邊有怪 →
     #   _fight 先回 True → _run_step 沒跑到 → 順移被下一拍蓋掉 → 步驟停在 24，
     #   打完怪還走回另一區的傳點 → 「走不到傳點…屬於另一區」卡死。

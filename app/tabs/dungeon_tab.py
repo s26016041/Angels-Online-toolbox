@@ -360,6 +360,15 @@ SCHED_DEFAULTS = {"rounds": 4, "rest_min": 120, "farm": True, "give_up_min": 3}
 FARM_CHECK = 1.0           # 多久比對一次「使用者親手開掛機了沒」
 REST_NOTE = 1.0            # 休息倒數狀態列多久刷一次
 REST_LOG = 60.0            # 休息倒數多久寫一行執行紀錄（每秒寫兩小時就是七千行）
+# ★★ 補給沒跑完 → 隔幾秒**重跑一次**，連 SUPPLY_FAIL_MAX 次沒跑完才停機
+#   （2026-09-17 黑狐實錄）：一趟刷完的那拍背包常常整袋讀不到，補給回
+#   「背包沒有天使之翼」就整趟放棄（背包其實有 50 個），舊碼接著照常開下一場 ——
+#   但人根本沒回城，`_plan_route` 拿「人還在副本裡」下判斷，三秒後伺服器把人送
+#   出副本就變成「⛔ 地圖變了…第 1 步不是傳點」停機六小時。讀取端已經在
+#   `supply._wing_slot` 分出「讀不到 ≠ 沒有」，這裡是呼叫端那一半：暫時性失敗
+#   要重試（[[transient-failure-auto-retry]]），真的補不成就大聲停機。
+SUPPLY_RETRY = 5.0         # 補給沒跑完，隔多久重跑一次（等人被送出副本／站穩）
+SUPPLY_FAIL_MAX = 2        # 連續幾次沒跑完就停機通知
 # ★★★ 斷線＝當成一場（使用者 2026-09-06）：
 #   「斷線不管是連線斷了還是閃退，都算完成一場，直接回程當完成。但要注意這遊戲副本
 #     斷線後會在副本出現然後倒數 5 秒自動把你傳回城鎮，所以要小心不要壞掉。
@@ -1628,6 +1637,10 @@ class DungeonTab(BaseTab):
         self._supply_result = None
         self._supply_progress = ""
         self._supply_gen = 0
+        self._supply_fail = 0        # 這一趟的補給連續沒跑完幾次（見 SUPPLY_FAIL_MAX）
+        self._supply_retry = 0.0     # 還有多久重跑一次補給（>0＝正在等）
+        self._supply_why = ""        # 上一次補給沒跑完的原因（狀態列用）
+        self._supply_back = None     # 上一次補給的回程目的地（重跑時照用）
         self._unreach_t = 0.0        # 「沒有路」連續多久了（等門開）
         self._blocked_last = False   # 上一拍是不是卡在「沒有路」
         self._away_t = 0.0           # 連續多久讀到「這一步的目標在另一區」（見 REJOIN_CONFIRM）
@@ -1968,6 +1981,7 @@ class DungeonTab(BaseTab):
                 pass
             self._pmover = None
         self._supply_gen += 1            # 背景補給還在跑的話，結果不要再收
+        self._supply_retry = 0.0         # 排隊中的「重跑一次補給」也一起取消
         if self._mover is not None and self._pid is not None:
             # ★ release() 不是 stop()：跳板是同一個 PID 共用的。
             try:
@@ -4461,6 +4475,8 @@ class DungeonTab(BaseTab):
         gen, mv, sc = self._supply_gen, self._mover, self._sc
         self._supply_result = None
         self._supply_progress = "出發"
+        self._supply_back = back          # 沒跑完要重跑時照同一個目的地（見 _supply_tick）
+        self._supply_retry = 0.0
         self._i = 0                       # 下一趟從頭跑
         self._back_jumps = 0              # 往回接回腳本的次數也跟著歸零（每趟各算）
         self._done = False
@@ -4496,6 +4512,20 @@ class DungeonTab(BaseTab):
             self._say(f"✔ 第 {self._rounds} 趟結束 → 回程補給…")
 
     def _supply_tick(self, dt: float) -> None:
+        if self._supply_retry > 0.0:
+            # ★★ 補給沒跑完 → 原地等幾秒**重跑一次補給**（見 SUPPLY_RETRY）。
+            #   ⛔ 不接著開下一場：沒補給＝沒回城，下一場的 _plan_route 會拿
+            #   「人還在副本裡」下判斷，幾秒後伺服器把人送出去就變成「地圖變了」停機。
+            self._supply_retry -= dt
+            self._say(f"⚠ 補給沒跑完（{self._supply_why}）→ 等 "
+                      f"{max(0.0, self._supply_retry):.0f} 秒重跑一次補給"
+                      f"（第 {self._supply_fail + 1} 次）")
+            if self._supply_retry <= 0.0:
+                self._supply_retry = 0.0
+                self._start_supply_trip(
+                    self._supply_back,
+                    note=f"⚠ 上一次補給沒跑完（{self._supply_why}）→ 再跑一次補給…")
+            return
         res = self._supply_result
         if res is None:
             # 補給要跑好幾分鐘 —— 一直講清楚補完要去哪（交給掛機頁／進休息／回入口）
@@ -4515,6 +4545,23 @@ class DungeonTab(BaseTab):
         self._event("info" if ok else "warn",
                     ("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
         self._supply_result = None
+        if not ok:
+            # ★★ 沒跑完＝人多半還沒回城（2026-09-17 黑狐：背包讀不到被當成
+            #   「沒有天使之翼」→ 整趟補給放棄 → 照常開下一場 → 三秒後被送出副本
+            #   →「地圖變了」停機六小時）。先重跑一次，連 SUPPLY_FAIL_MAX 次沒跑完
+            #   才大聲停機 —— ⛔ 兩種失效模式裡沒有「安靜地接著跑」。
+            self._supply_fail += 1
+            if self._supply_fail >= SUPPLY_FAIL_MAX:
+                self._stop(f"⛔ 補給連 {self._supply_fail} 次沒跑完（{why}）—— "
+                           f"停下來，不接著開下一場")
+                return
+            self._supply_why = why
+            self._supply_retry = SUPPLY_RETRY
+            self._notify(f"⚠ 補給沒跑完（{why}）→ {SUPPLY_RETRY:.0f} 秒後重跑一次")
+            self._event("warn", f"⚠ 補給沒跑完 → {SUPPLY_RETRY:.0f} 秒後重跑一次"
+                                f"（第 {self._supply_fail + 1} 次）")
+            return
+        self._supply_fail = 0
         if self._batch_end and self._batch_stop:
             # ★ 清單全部刷完、沒勾循環（使用者 2026-09-07「補給完就好」）→ 留在城裡停下
             self._stop(f"✔ 副本清單全部刷完（{self._queue_desc()}）、補給完成 —— "
