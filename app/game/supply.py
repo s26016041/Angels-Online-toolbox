@@ -530,6 +530,8 @@ def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int) -> bool:
 
 
 NEAR_SPOT_R = 8            # 找「離 NPC 最近可到的格」時掃 NPC 周圍這麼多格
+NEAR_GIVE_UP = 1.2         # 在目標格 2 格內待了這麼久還站不上去 → 就地算到（最後一格被人占著）
+                           #   ★ 9/6 使用者「到點後卡一下」：走路指令 0.5 秒內就會動，1.2 秒沒動就是被擋，2.5 太久
 # ⚠⚠ **場景實體表（`_scene_entities`）給的指標是「實體物件 −8」**
 #   （跟 `move.pathfinder_this()` 同一種）。兩個獨立佐證：
 #     · 這裡的 `OFF_NPC_NUM`(0x1D8) ＝ `entity.OFF_TYPE`(0x1D0) + 8（同一個欄位）
@@ -870,11 +872,47 @@ def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> 
         _nap(0.1)
 
 
+# ★★★ 2026-09-18 使用者要求：「講不到話」要說得出**卡在哪一關**。
+#   以前 `_engage_npc` 只回 bool，呼叫端一律寫死「開交易失敗（靠不夠近或對話碼不對）」
+#   —— 等於沒講，使用者拿到停機通知也查不出是走不到、還是對話沒開。
+#   ⚠ 這個物件**當 bool 用跟以前一模一樣**（`if not _engage_npc(...)` 不用改），
+#     想知道原因才讀 `.why`。
+TALK_FAIL_TAG = "講不到話"      # ⚠ 煞車靠它分辨「暫時性」失敗，見 was_talk_failure()
+
+
+class Engage:
+    """`_engage_npc` 的結果：成功與否 ＋ 卡在哪一關。"""
+
+    __slots__ = ("ok", "why")
+
+    def __init__(self, ok: bool, why: str = "") -> None:
+        self.ok, self.why = bool(ok), why
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __repr__(self) -> str:                             # 給 log 看
+        return f"Engage({self.ok}, {self.why!r})"
+
+
+def was_talk_failure(msg) -> bool:
+    """這一趟補給的結果訊息，是不是「講不到 NPC」這種**暫時性**失敗？
+
+    ★ 2026-09-18 使用者要求：人多講不到話跟「店裡根本沒賣」是兩回事 ——
+      前者該再跑一趟，後者才該停機。掛機頁的「連續兩趟見底」煞車靠這支分流。
+    ⚠ 判斷靠訊息裡的 `TALK_FAIL_TAG`（`_engage_npc` 失敗時一定會帶上）。
+      認不出來一律回 False ＝ 照舊算一趟（安全的方向：頂多跟以前一樣）。
+    """
+    return bool(msg) and TALK_FAIL_TAG in str(msg)
+
+
 def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str,
                 tries: int = 4, confirm=None,
                 confirm_timeout: float | None = None) -> bool:
     """點 NPC 開對話、送對話選項、**確認對應視窗開了**；沒開才調位置重試。
     **銀行／修裝／買東西共用這一支**，只差 `talk_codes` 與 `wnd_name`。
+
+    回 `Engage`（當 bool 用跟以前一樣；`.why` 是**卡在哪一關**，2026-09-18 加）。
 
     confirm / confirm_timeout（2026-08-27 加，給活動地圖入口 NPC 用）：
       有些 NPC 的「成功」不是開一個視窗，而是**人被傳走了**（啤酒節使者送你進
@@ -900,13 +938,15 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     talk_codes: 依序送的對話碼（買=[10]、修=[10]、銀行「我要用倉庫→自己的倉庫」=[11,10]）。
     """
     if not (mover and mover.active):
-        return False
+        return Engage(False, "跳板沒裝好")
     # 成功判定：預設「那個視窗開了」；confirm 有給就用它（人被傳走那種）。
     done = confirm if confirm is not None else (
         lambda: _wnd_open(mover, scanner, wnd_name))
     wait_done = (lambda: _wait_for(done, confirm_timeout or WND_TIMEOUT))
     if done():                                       # 已經成功了就別重點
-        return True
+        return Engage(True)
+    # ★ 卡在哪一關（每一輪覆寫，最後一輪的就是回報的那個）。
+    why = "沒跑到任何一關"
     # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早也無害——
     #   對話框晚一拍才到，下一輪 _wait_dialog 看到「值已經變了」立刻接上，不重等。
     base = _dialog_token(scanner)
@@ -931,6 +971,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             return True
         found = find_npc(scanner, npc_id)
         if not found:                                # NPC 不在視野 → 用地形圖靠近再試
+            why = "找不到商人（不在視野，還沒走到附近）"
             _walk_to_npc(mover, scanner, npc_id, fallback, 30.0, avoid=trip)
             walked = True
             continue
@@ -948,7 +989,21 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             me_tile = (int(_here[0]), int(_here[1])) if _here else None
             settled = bool(box["in_box"] or (spot and me_tile == tuple(spot)))
         if settled:
-            arrived = True                           # 閂舉起來就不再放下（見上面）
+            arrived = True                           # 閂舉起來就不再放下（見下面的例外）
+        # ★★★★ 2026-09-18 使用者定：「講不到話應該要修正位置，你應該可以找到能靠近的點」。
+        #   ⚠ 這是上面那個「到過了就不再動腳」閂**唯一**的放下條件：
+        #     點過一次沒成功（fails > 0）**而且**算得出來人確實**不在講話方框內**。
+        #   北極狐實測（商人周圍 28 格站著人）：`_walk_to_npc` 停在框外 4 格就回 True
+        #   （逾時後 best ≤ NEAR_ENOUGH 8 格就算到）→ 閂舉起來 → 連點 3 次全部卡在
+        #   「對話開了但人沒走到位」→ **3.1 秒就放棄**，而那當下框內還有 41 格空的。
+        #   → 放下閂 + fails 歸零，下一輪走 `_walk_to_npc`（它已經會優先挑沒人的格），
+        #     而不是 `_nudge_toward` 往 NPC 身上擠。
+        #   ⛔ 不違反「走到最近的那格就別動」那條規矩：那條的用意是「已經夠近就別晃」，
+        #     而**框外＝定義上就是還不夠近**（伺服器只吃框內的選項）。
+        #   ⚠ box 讀不到（None）時維持原行為 —— 不要因為讀不到就開始亂走。
+        if arrived and fails > 0 and box is not None and not box["in_box"]:
+            arrived = False
+            fails = 0
         if arrived:
             pass                                     # 到過了 → 動口不動腳，最後一段給官方走
         elif fails > 0:                              # 上輪確認沒開 → 往 NPC 身上靠/穿過（不退）
@@ -1009,6 +1064,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         pg0 = talkwnd.page(scanner)
         page_base = pg0.sig if pg0 is not None else None
         if not _click_npc(mover, scanner, npc_ent):  # TryAct：到位就開對話，沒到就走一步
+            why = f"互動包送不出去（離 {_dist_to_npc(scanner, npc_id)} 格）"
             _nap(0.5)
             continue
         # ★ 等對話框的期間每 CLICK_REPEAT 秒補點一次（＝官方那個重試迴圈）。
@@ -1032,8 +1088,11 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                           give_up_still=None if in_box else 2.5,
                           page_base=page_base):
             if not _wait_arrival(scanner, npc_id):
-                fails += 1                           # 對話開了但人沒到位（被擋/太遠）
-                continue                             # → 絕不送購買選項，調位置重來
+                # 對話開了但人沒到位（被擋／太遠）→ 絕不送購買選項，調位置重來
+                why = (f"對話開了但人沒走到位（離 {_dist_to_npc(scanner, npc_id)} 格、"
+                       f"{'在' if _npc_in_box(scanner, npc_id) else '不在'}講話方框內）")
+                fails += 1
+                continue
         elif (talkwnd.window_visible(scanner) is not False
               and _dialog_token(scanner)
               and _wait_arrival(scanner, npc_id, timeout=2.0)):
@@ -1050,6 +1109,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             #   旗標回 None（問不到）時這條照舊 —— 那才是真的「驗不了」。
             pass
         else:
+            why = f"點了對話框沒開（離 {_dist_to_npc(scanner, npc_id)} 格）"
             fails += 1
             continue                                 # 確認沒開對話 → 馬上調位置重點
         for code in talk_codes[:-1]:
@@ -1064,11 +1124,15 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _wait_page(scanner, pg.sig if pg is not None else None, TALK_GAP)
         _talkaction(mover, scanner, talk_codes[-1])
         if wait_done():
-            return True
+            return Engage(True)
+        why = (f"選項送完了但{wnd_name or '目標'}視窗沒開"
+               f"（離 {_dist_to_npc(scanner, npc_id)} 格）")
         # 對話框有開但最終視窗沒開（假邊沿/選項沒吃到）→ 刷新基準，下一輪要求新變化，
         # 免得同一個舊值一直當「已開」空轉送選項。
         base = _dialog_token(scanner)
-    return done()
+    if done():
+        return Engage(True)
+    return Engage(False, f"{TALK_FAIL_TAG}：{why}")
 
 
 def talk_to_npc(mover, scanner, npc_id: int, fallback, talk_codes,
@@ -1253,9 +1317,10 @@ def run_repair(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
     """
     if not (mover and mover.active):
         return False, "跳板沒裝好"
-    if not _engage_npc(mover, scanner, npc_id, fallback,
-                       [TALK_REPAIR], WND_REPAIR):
-        return False, "開維修視窗失敗（靠不夠近或對話碼不對）"
+    eng = _engage_npc(mover, scanner, npc_id, fallback,
+                      [TALK_REPAIR], WND_REPAIR)
+    if not eng:
+        return False, f"開維修視窗失敗（{eng.why}）"
     _nap(0.3)
     if not _repair_all(mover, scanner):
         _repair_close(mover, scanner)          # 開了窗就算失敗也把它關掉，別卡住
@@ -1409,11 +1474,11 @@ def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
     if not targets:
         return True, "處理清單沒有標記儲存的物品"
 
-    if not _engage_npc(mover, scanner, npc_id, fallback,
-                       [TALK_BANK_USE, TALK_BANK_SELF], BANK_WND):
+    eng = _engage_npc(mover, scanner, npc_id, fallback,
+                      [TALK_BANK_USE, TALK_BANK_SELF], BANK_WND)
+    if not eng:
         _bank_close(mover, scanner)
-        return False, (f"倉庫開不起來（停在離銀行約 {_dist_to_npc(scanner, npc_id)} 格；"
-                       "靠不夠近或對話碼不對）")
+        return False, f"倉庫開不起來（{eng.why}）"
 
     deposited = 0
     capped = False
@@ -1602,9 +1667,10 @@ def _run_buy(mover, scanner, npc_id: int, fallback, ledger=None) -> tuple[bool, 
             done = "、".join(f"{itemname.label(t)}={k}" for t, k in want)
             return True, f"都夠了：{done}"
 
-        if not _engage_npc(mover, scanner, npc_id, fallback,
-                           [TALK_BUY], WND_SALE):
-            return False, "開交易失敗（靠不夠近或對話碼不對）"
+        eng = _engage_npc(mover, scanner, npc_id, fallback,
+                          [TALK_BUY], WND_SALE)
+        if not eng:
+            return False, f"開交易失敗（{eng.why}）"
         _nap(0.2)
 
         ok, msg = buy(mover, scanner, need)
@@ -1775,9 +1841,10 @@ def _run_potion_fill(mover, scanner, npc_id: int, fallback,
             break
         left_note = "、".join(f"{what}還缺 {n}" for what, _, n in need)
 
-        if not _engage_npc(mover, scanner, npc_id, fallback,
-                           [TALK_BUY], WND_SALE):
-            return False, "開交易失敗（靠不夠近或對話碼不對）"
+        eng = _engage_npc(mover, scanner, npc_id, fallback,
+                          [TALK_BUY], WND_SALE)
+        if not eng:
+            return False, f"開交易失敗（{eng.why}）"
         _nap(0.2)
         moved = False
         for what, bid, qty in need:

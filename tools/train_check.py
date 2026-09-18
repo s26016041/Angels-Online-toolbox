@@ -111,6 +111,13 @@ class FakeSupply:
     def shop_sells(self, tid):
         return self.sell
 
+    # ★ 2026-09-18：掛機／練技收尾要問「這一趟是不是講不到商人」（暫時性失敗，
+    #   不算見底趟）。替身照真的那支的規則：訊息帶 TALK_FAIL_TAG 就是。
+    TALK_FAIL_TAG = "講不到話"
+
+    def was_talk_failure(self, msg):
+        return bool(msg) and self.TALK_FAIL_TAG in str(msg)
+
     def run_full_supply(self, mv, sc, say=None, back_to=None, potions=None,
                         potion_only=False, ledger=None, guild_items=None,
                         fill_pct=None, city=None):
@@ -281,6 +288,62 @@ tick(page)                              # 安定讀數：跑滿兩趟還是見�
 check("第二趟後自動關閉", not page.train_cb.isChecked())
 check("有「還是見底」通知",
       any("還是見底" in m for m in page.notices), f"實得 {page.notices}")
+
+print("⑥b ★★★ 2026-09-18：「講不到補給商」是暫時性失敗 —— 不算見底趟，"
+      f"連續 {farm_tab.TALK_FAIL_MAX} 趟才停")
+SUPPLY.sell = True
+page = build_page()
+ROBOT.calls.clear()
+ROBOT.dry = [("MP", "MP藥水（藍藥水）")]
+ROBOT.run = ROBOT.ex = False
+# 補給「跑完了」但結果是講不到話（真的那支會回 Engage(False, "講不到話：…")）
+o_result = SUPPLY.run_full_supply
+
+
+def _talk_fail(self, mv, sc, **kw):
+    o_result(mv, sc, **kw)
+    return True, "購買:開交易失敗（講不到話：對話開了但人沒走到位（離 4.0 格、不在講話方框內））"
+
+
+SUPPLY.run_full_supply = _talk_fail.__get__(SUPPLY, type(SUPPLY))
+try:
+    page.train_cb.setChecked(True)
+    for i in range(farm_tab.TALK_FAIL_MAX - 1):
+        tick(page)                          # 出發（見底煞車 +1）
+        tick(page)                          # 收結果（講不到話 → 把那 +1 退回去）
+        page.inv = 0x1000
+        check(f"第 {i + 1} 趟：見底煞車沒被記上（現在 {page._train_dry_trips}）",
+              page._train_dry_trips == 0, page._train_dry_trips)
+        check(f"第 {i + 1} 趟：改記成「講不到話」（現在 {page._train_talk_fails}）",
+              page._train_talk_fails == i + 1)
+        check(f"第 {i + 1} 趟：練技還開著（⛔ 不准兩趟就停）", page.train_cb.isChecked())
+    tick(page)                              # 第 MAX 趟出發
+    tick(page)                              # 收結果 → 滿 MAX
+    page.inv = 0x1000
+    tick(page)                              # 安定讀數：該停了
+    check(f"滿 {farm_tab.TALK_FAIL_MAX} 趟才自動關閉", not page.train_cb.isChecked())
+    check("通知講的是「講不到補給商」不是「金幣夠嗎」",
+          any("講不到補給商" in m for m in page.notices), f"實得 {page.notices}")
+    check("通知有教人換一座城",
+          any("補給要去哪座城" in m for m in page.notices), f"實得 {page.notices}")
+finally:
+    SUPPLY.run_full_supply = o_result
+
+print("⑥c 講不到話之後**買到了** → 計數歸零（不是累加到天荒地老）")
+page = build_page()
+ROBOT.dry = [("MP", "MP藥水（藍藥水）")]
+page.train_cb.setChecked(True)
+SUPPLY.run_full_supply = _talk_fail.__get__(SUPPLY, type(SUPPLY))
+try:
+    tick(page)
+    tick(page)
+    check("先記一次", page._train_talk_fails == 1)
+finally:
+    SUPPLY.run_full_supply = o_result
+page.inv = 0x1000
+tick(page)                                  # 這趟正常跑完
+tick(page)
+check("一趟正常的就歸零", page._train_talk_fails == 0, page._train_talk_fails)
 
 print("⑦ 沒回程道具連續確認 → 通知＋自動關閉")
 page = build_page()
