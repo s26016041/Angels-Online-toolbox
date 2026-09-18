@@ -45,6 +45,21 @@ from app.game import entity, terrain
 #   原地抖（實測改成 0.12 秒重送，卡頓從 0.5 秒變成一路互相打斷）。
 #   所以送完先當作「忙碌」這麼久。0.3 秒留了兩倍餘裕。
 SEND_GRACE = 0.30
+# ★★★ 「動畫說在走、人卻釘在原地」的逃生口（2026-09-18 黑狐無限塔第 6 趟實錄）。
+#   現場：第 2 步走到 (152,81)、剩 4.3 格，座標 **128 秒連 0.05 格都沒變**，
+#   狀態列一直停在「走最短路（2/4）」，最後被副本頁那道 2 分鐘看門狗當成
+#   「出狀況 → 這一趟當完成」整趟丟掉。
+#   根因就是下面那道「正在走就什麼都別做」的閘：`is_walking` 讀的是動畫狀態
+#   （'Run'），遊戲自己的走路狀態機卡住／伺服器把人拉回來時它會**一直是 'Run'**
+#   → 這一支每拍早退、不重送、不累加 `_stall`、不重算、也不舉 stuck，
+#   整個尋路器就這樣安靜凍住（見 [[frozen-tick-state-machines]]）。
+#   → 規矩：動畫說在走，但 WALK_STALL 秒內位移不到 WALK_STALL_MOVE 格，
+#     就**當作沒在走**讓這道閘讓開 —— 底下該重送就重送、該繞就繞、該重算就重算。
+#   ⚠ 門檻要留得很鬆才不會誤判真的在走的人：真的在走是 5~10 格/秒，
+#     2 秒走不到 0.5 格等於根本沒動。而且每次送出指令都會把這個碼表歸零
+#     （見 `_sent` 旁邊那行），所以「送出 → 開始動」那 107~154ms 不會被誤判。
+WALK_STALL = 2.0
+WALK_STALL_MOVE = 0.5
 
 ARRIVE = 3.0             # 離目標這麼近就算到了
 NEAR_SUB = 3.0           # 離路線上的轉折點這麼近就算走到了
@@ -158,6 +173,10 @@ class Navigator:
         self._best = None                    # 對目前轉折點的最佳距離
         self._stall = 0                      # 連續幾拍沒進展
         self._sent = 0.0                     # 上次送出移動指令的時間
+        # 「動畫說在走、人卻沒動」看門狗（見 WALK_STALL）：上一次真的挪過位置
+        # 的地方與時間。⚠ 送出移動指令時也會歸零（那一下就是新的起跑點）。
+        self._walk_pos: tuple[float, float] | None = None
+        self._walk_t = 0.0
         self._replans = 0                    # 重算過幾次（防無限重算）
         self._grid_fail = 0                  # 地形圖連續算不出幾次
         # 被擋住時記下的「暫時不可走」格（見 AVOID_AHEAD）；走到轉折點就清。
@@ -255,6 +274,9 @@ class Navigator:
         if here is None:
             self.note = "⚠ 讀不到座標"
             return self.note
+        # 真的挪過位置 → 「沒動」的碼表重新開始（見 WALK_STALL）。
+        if self._walk_pos is None or _d(here, self._walk_pos) > WALK_STALL_MOVE:
+            self._walk_pos, self._walk_t = here, time.monotonic()
         if _d(here, goal) <= arrive:
             self.note = "到了"
             return self.note
@@ -277,8 +299,12 @@ class Navigator:
         # 剛送出指令那 SEND_GRACE 秒也算「忙碌」：那時它還沒開始動，
         # 狀態仍是 'Wait'，不擋的話心跳會每 10ms 重送一次。
         # ★ 例外：剛走到一個轉折點（_go_now）→ 不等停下，直接送下一段。
-        if ((entity.is_walking(scanner, player_obj)
-                or time.monotonic() - self._sent < SEND_GRACE)
+        # ★★★ 例外二：動畫說在走、人卻釘在原地超過 WALK_STALL 秒 ＝ 這個訊號壞了
+        #   （遊戲的走路狀態機卡住／被拉回），不能再拿它擋（見 WALK_STALL 的實錄）。
+        walking = entity.is_walking(scanner, player_obj)
+        if walking and time.monotonic() - self._walk_t >= WALK_STALL:
+            walking = False
+        if ((walking or time.monotonic() - self._sent < SEND_GRACE)
                 and not self._go_now):
             return self.note
 
@@ -340,6 +366,9 @@ class Navigator:
         mover.walk_route(scanner, player_obj, pt[0], pt[1],
                          stop_short=0.0, points=[pt])
         self._sent = time.monotonic()
+        # ⚠ 送出去了＝新的起跑點：碼表歸零，不然「上一段走完停著」那幾拍會被
+        #   算進沒動的時間，一送出去就馬上又被判「卡住」重送（互相打斷）。
+        self._walk_pos, self._walk_t = here, self._sent
         self._go_now = False
         self.note = f"走最短路（{self._ri + 1}/{len(self._route)}）"
         return self.note

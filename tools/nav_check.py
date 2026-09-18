@@ -355,6 +355,48 @@ g12.open[10][11] = 1
 sp = g12.ortho_spot((13.5, 13.5), mon, keep=1.4, reach=2.0)
 check("四個方向都沒得站 → None（呼叫端照舊）", sp is None, f"實得 {sp}")
 
+print("⑬ ★★★ 動畫說在走、人卻釘在原地 → WALK_STALL 秒後這道閘要讓開"
+      "（2026-09-18 黑狐無限塔實錄：第 2 步剩 4.3 格，座標 128 秒沒變、"
+      "狀態列停在「走最短路（2/4）」，一發都沒重送，整趟被 2 分鐘看門狗當完成丟掉）")
+nav, maps = build(GOAL_WP)
+SENT.clear()
+POS[0], POS[1] = 0.0, 0.0
+WALKING[0] = True                        # 動畫狀態一直是 'Run'（遊戲那邊卡住了）
+step(nav)                                # 規劃 ＋ 第一拍（閘擋著）
+t0 = CLOCK.t
+while CLOCK.t - t0 < navigate.WALK_STALL - 0.6:
+    step(nav)                            # 位置從頭到尾不動
+check("沒到 WALK_STALL 之前照舊不重送（⛔ 不准打斷真的在走的人）", SENT == [],
+      f"實得 {SENT}")
+while CLOCK.t - t0 < navigate.WALK_STALL + 0.4:
+    step(nav)
+check(f"★ 釘住超過 {navigate.WALK_STALL:g} 秒 → 當作沒在走，重送走路",
+      len(SENT) == 1, f"實得 {SENT}")
+n0, t1 = len(SENT), CLOCK.t
+while CLOCK.t - t1 < navigate.WALK_STALL - 0.6:
+    step(nav)
+check("　送出去那一下碼表歸零 → 這 2 秒內不會再送（⛔ 連發會互相打斷）",
+      len(SENT) == n0, f"實得 {SENT[n0:]}")
+for _ in range(400):
+    step(nav)
+    if nav.stuck:
+        break
+check("★ 一直釘著最後會判 stuck＝blocked（不再安靜凍住、等副本頁 2 分鐘看門狗丟整趟）",
+      nav.stuck is True and nav.stuck_reason == "blocked",
+      f"stuck={nav.stuck} reason={nav.stuck_reason!r} note「{nav.note}」")
+
+print("　⑬-b 真的在走（每拍都有挪）→ 閘照舊擋著，一步都不重送")
+nav, maps = build(GOAL_WP)
+SENT.clear()
+POS[0], POS[1] = 0.0, 0.0
+WALKING[0] = True
+step(nav)
+for i in range(1, 9):
+    step(nav, i * 0.6, 0.0)              # 每拍挪 0.6 格（> WALK_STALL_MOVE）
+check("完全沒重送（走了 4.8 格、跨過 2 秒）", SENT == [], f"實得 {SENT}")
+WALKING[0] = False
+
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
