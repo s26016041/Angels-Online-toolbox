@@ -313,11 +313,6 @@ NO_RECALL_TRIES = 3
 # ★ 交棒給天使精靈跑補給：多久看一次「回到原地圖了沒」、最多等多久就放棄。
 #   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
-# ★★★ 2026-09-18：連續幾趟「講不到補給商」才停機。
-#   人多講不到話是暫時性的（等一下人就散了／換個位置就好），不該跟
-#   「店裡根本沒賣」共用那個兩趟煞車 —— 但也不能無限重跑，真的一直
-#   講不到要讓使用者知道（而且回城已經不燒翼了，重跑幾乎沒成本）。
-TALK_FAIL_MAX = 5
 SUPPLY_MAX_SECS = 600.0
 # ★ 回程第二段（用道具）暫時送不出去時的重試（跳板重掛／背包表頭剛搬家，
 #   InvWorker 幾秒內就會把表頭找回來：AOB 全掃約 2 秒、失效後最多隔
@@ -1981,14 +1976,6 @@ class CharFarmPage(QWidget):
         # 連續幾趟補給回來藥水**還是見底**（≥2 就大聲停 —— 買水一直買不進來
         #   多半是金幣不夠／背包滿，重試只會每趟燒一張翼；跟壞裝煞車同一套）。
         self._dry_trips = 0
-        # ★★★ 2026-09-18 使用者要求：「講不到話」跟「店裡根本沒賣」是兩回事 ——
-        #   前者是人多造成的**暫時性**失敗（北極狐實測：商人周圍 28 格站著人時，
-        #   人停在講話方框外 4 格，連點 3 次全失敗、3.1 秒就放棄），該再跑一趟；
-        #   後者才該停機。舊版兩種共用 `_dry_trips`，兩趟就停，訊息還問
-        #   「金幣夠嗎？背包滿了嗎？」—— 完全指錯方向。
-        #   → 講不到話那一趟**把 `_dry_trips` 那一次退回去**，改記在這裡；
-        #     但也不能無限重跑（真的一直講不到要讓人知道）→ TALK_FAIL_MAX 才停。
-        self._talk_fails = 0
         self._supply_last = ""       # 最後一趟補給的結果訊息（煞車的訊息要引）
         # ── 自動練技（_train_tick；跟掛機互斥，見 _on_train_toggle）──
         # 練技的「原地」：(x, y, 場景)。開練技後第一次讀到位置就記下來，
@@ -2002,7 +1989,6 @@ class CharFarmPage(QWidget):
         self._train_progress = ""    # 背景執行緒的最新進度（say 回報）
         self._train_gen = 0          # 第幾趟（作廢晚回來的結果）
         self._train_dry_trips = 0    # 連續幾趟回來藥水還是見底（≥2 大聲停）
-        self._train_talk_fails = 0   # 連續幾趟是「講不到商人」（見 _talk_fails）
         self._train_last = ""        # 最後一趟練技補給的結果訊息
         self._train_no_wing = 0      # 連續幾次確認沒回程道具（NO_RECALL_TRIES）
         self._train_lua_t = 0.0      # 上次為了建練習技能記錄退 Lua 的時刻
@@ -3520,12 +3506,6 @@ class CharFarmPage(QWidget):
             #   → 煞車改在 `tick()` 裡那個**已經安定下來**的見底檢查上數
             #     （搜 `self._dry_trips`）。跑的趟數跟舊版一樣，最多兩趟。
             self._supply_last = msg
-            # ★ 講不到商人（人多）→ 這一趟不算「見底趟」，把煞車那一次退回去。
-            if supply.was_talk_failure(msg):
-                self._talk_fails += 1
-                self._dry_trips = max(0, self._dry_trips - 1)
-            else:
-                self._talk_fails = 0
             self._end_supply(f"🔧 補給完成：{msg}　共花 {_mmss(self._supply_t)}")
             return True
         # 逾時兜底：run_full_supply 內部各段都有逾時，正常會自己回結果；
@@ -3574,7 +3554,6 @@ class CharFarmPage(QWidget):
             self.run_cb.setChecked(False)  # 互斥：練技接手，掛機停
         self._train_home = None
         self._train_dry_trips = 0
-        self._train_talk_fails = 0
         self._train_no_wing = 0
         self._train_t = TRAIN_GAP          # 下一拍立刻推開關＋記原地
         notes: list[str] = []
@@ -3582,8 +3561,13 @@ class CharFarmPage(QWidget):
             # 精靈自己的「回城補給」觸發全關掉 —— 補給那趟是我們在開車
             # （跟掛機開始時同一套，見 _on_toggle）。
             notes += robot.disable_return_supply(self._mover, self.sc)
-            # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定：
-            #   那是他自己的設定）。
+            # 購買清單保證有天使之翼×50：每趟補給都燒一張翼回城，
+            # 清單有它補給商那站才會補貨，不然練技幾趟後就回不了城。
+            note = robot.ensure_buy_item(self._mover, self.sc,
+                                         recall.RECALL_ITEM,
+                                         robot.BUY_KEEP_WINGS)
+            if note:
+                notes.append(note)
             self._train_push()             # 立刻把主開關＋練習技能開起來
         self.status.setText(
             "🥋 自動練技中：精靈原地重複練習技能"
@@ -3756,12 +3740,6 @@ class CharFarmPage(QWidget):
                 #   同步，數到 0 是假的（詳見 `_supply_tick` 收尾那段的 ⛔⛔，
                 #   2026-08-24 北極狐實錘）。煞車改在下面那個安定的見底檢查上數。
                 self._train_last = msg
-                # ★ 講不到商人（人多）→ 不算「見底趟」（跟掛機頁同一套，見 _talk_fails）
-                if supply.was_talk_failure(msg):
-                    self._train_talk_fails += 1
-                    self._train_dry_trips = max(0, self._train_dry_trips - 1)
-                else:
-                    self._train_talk_fails = 0
                 self._drop_cached_addrs()  # 補給跑完換過地圖，快取位址作廢
                 self._train_push()         # 回來了 → 主開關＋練習技能開回去
                 self.status.setText(
@@ -3795,12 +3773,6 @@ class CharFarmPage(QWidget):
         if dry is not None and not dry:
             self._train_dry_trips = 0
         if not dry:
-            return
-        if self._train_talk_fails >= TALK_FAIL_MAX:
-            self._train_stop(
-                f"⚠ 連續 {self._train_talk_fails} 趟都講不到補給商"
-                f"（{self._train_last}）→ 自動練技已停止："
-                "那座城人太多嗎？換一座（掛機設定 → 補給要去哪座城）。")
             return
         if self._train_dry_trips >= 2:
             self._train_stop(
@@ -5942,7 +5914,6 @@ class CharFarmPage(QWidget):
         #   2026-09-05 雪狐實錄：兩趟補給失敗停機後，人走回巡邏點按「開始掛機」，
         #   第一次體檢就因為舊的 _dry_trips 還是 2 → 連一趟都沒跑就再通知一次同一句停機。
         self._dry_trips = 0
-        self._talk_fails = 0
         self._broken_trips = 0
         # 拉回計數與軌跡也是「這一輪」的（診斷用，見 _note_rollback）
         self._rollbacks = 0
@@ -5973,8 +5944,15 @@ class CharFarmPage(QWidget):
             # ★ 回程補給改跑我們自己的 → 把天使精靈自己的「回城補給」觸發全關掉
             #   （使用者：「開始掛機把補給流程也關掉」），免得精靈也自己回城跑一趟撞我們。
             notes += robot.disable_return_supply(self._mover, self.sc)
-            # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定：
-            #   要買幾張是他自己的設定）。
+            # ★ 保證購買清單裡有天使之翼×50（使用者要求保留）。藥水補給現在
+            #   全自動（2026-08-19，沒有勾選可看）——一律確保：每趟補給都要用
+            #   翼回城，清單有它 run_full_supply 的買水步驟才會補貨，免得翼
+            #   用完下一趟回不去。⚠ 只加翼、不開精靈的補給旗標。
+            note = robot.ensure_buy_item(
+                self._mover, self.sc, recall.RECALL_ITEM,
+                robot.BUY_KEEP_WINGS)
+            if note:
+                notes.append(note)
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
@@ -6314,13 +6292,6 @@ class CharFarmPage(QWidget):
             #   ⚠ `dry is None` ＝讀不到 → 不加也不清（不確定就不動）。
             if dry is not None and not dry:
                 self._dry_trips = 0
-            if dry and self._talk_fails >= TALK_FAIL_MAX:
-                why = (f"⚠ 連續 {self._talk_fails} 趟都講不到補給商"
-                       f"（{self._supply_last}）—— 已停止掛機："
-                       "那座城人太多嗎？換一座（掛機設定 → 補給要去哪座城）。")
-                self._stop_with(why)
-                self.notify(why)
-                return
             if dry and self._dry_trips >= 2:
                 why = (f"⚠ 連續 {self._dry_trips} 趟補給回來藥水還是見底"
                        f"（{self._supply_last}）—— 已停止掛機："
@@ -7071,7 +7042,12 @@ class CharFarmPage(QWidget):
             self._mover, self.sc,
             jump_back=self.sup_jump_cb.isChecked(),
             revive_mark=self.sup_revive_cb.isChecked())
-        # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定）。
+        # ★ 保證購買清單有天使之翼×50（只加翼，不開精靈補給旗標）。
+        #   藥水補給全自動（2026-08-19）→ 不再看勾選，一律確保。
+        note = robot.ensure_buy_item(
+            self._mover, self.sc, recall.RECALL_ITEM, robot.BUY_KEEP_WINGS)
+        if note:
+            notes.append(note)
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 
