@@ -1787,6 +1787,14 @@ WING_WAIT = 12.0       # 回城後等地圖變的上限（秒）
 #   少了＝傳送在路上，再多等這麼久；沒少＝那一下真的沒生效，照舊算失敗（不盲等）。
 WING_WAIT_LATE = 20.0
 JUMP_TRIES = 3         # 回程趴趴GO 最多重送幾次（★ 送出去≠到得了，見 run_full_supply）
+# ── 回城：趴趴GO 優先、天使之翼當退路（2026-09-18 使用者要求）──────────
+# ★ 為什麼敢這樣改：2026-09-18 白狐／黑狐實測（memory `jumpmap-teleport`）——
+#   趴趴GO **不用道具、沒有冷卻、野外與練功圖都能送、交戰中也能送、活動地圖
+#   分流也送得出來**，5 發全中（0.2~0.6 秒到）。翼那一步是多燒的。
+# ⚠ 但翼**不砍掉**，降成 plan B：送 HOME_TRIES 次還沒落地才燒一張。
+#   「送出去 ≠ 到得了」是這個專案抓過的真根因（memory `jump-back-channel-fix`）。
+HOME_TRIES = 3         # 回城趴趴GO 最多送幾次，之後才退回燒翼
+HOME_WAIT = 8.0        # 每次送出後等「地圖真的變成那座城」的上限（秒）
 # run_full_supply(back_to=STAY)：補完**不回程、留在城裡**（副本頁清單全部刷完、沒勾循環
 # 那條：使用者 2026-09-07「補給完就好」）。⚠ 不是 None：None＝跳回出發當下站的地方。
 STAY = "stay"
@@ -1884,6 +1892,86 @@ def _wait_map_change(scanner, from_map: int, timeout: float):
             return cur
         _nap(0.3)
     return None
+
+
+def _fly_home(mover, scanner, here: int, city, note):
+    """回城：**趴趴GO 優先、天使之翼當退路**。回 (到的城編號 or None, 說明)。
+
+    2026-09-18 使用者要求。順序：
+
+      ① 趴趴GO 飛 `city`（掛機設定，預設棕櫚基地）——
+         落點挑「走過去**第一個要辦事的 NPC** 最短」的那個（`jumpmap.nearest`
+         會用地形算真實路徑；人不在那張圖上時走離線地形表）。
+         ⚠ 驗的是「地圖變成**那座城**」，不是「地圖變了」——
+           送出去 ≠ 到得了（memory `jump-back-channel-fix` 的第四個根因）。
+         沒到就重送，最多 HOME_TRIES 次。
+      ② 還是沒到 → 背包有翼就燒一張（原本那條路整條留著，只是變成 plan B）。
+
+    ⚠ 回來之後**不在**這裡等人站穩 —— 呼叫端接著就做 `_wait_ready()`。
+    """
+    from app.game import farmsettings            # 避免模組載入期循環相依
+
+    want = farmsettings.clamp_city(city)
+    # 落點挑「離第一個要辦事的 NPC 最近」：銀行常在城的另一頭（永夜城實測
+    # 離落點 176 格），挑錯落點等於多走一趟。沒有那座城的 NPC 表就不挑座標。
+    npcs = NPC_TABLE.get(want) or {}
+    aim = npcs.get("bank") or npcs.get("repair") or npcs.get("buy")
+    e = jumpmap.nearest(want, aim[1] if aim else None,
+                        aim[2] if aim else None, scanner)
+    if e is not None:
+        for i in range(HOME_TRIES):
+            note(f"趴趴GO 回{scene.scene_name(want)}…"
+                 + (f"（第 {i + 1} 次）" if i else ""))
+            ok, jmsg = jumpmap.teleport(mover, scanner, e.jump_id)
+            if not ok:
+                note(f"⚠ 傳送送不出去（{jmsg}）")
+                _nap(1.0)
+                continue
+            t0 = time.time()
+            while time.time() - t0 < HOME_WAIT:
+                cur = scene.current_id(scanner)
+                # ★ 只認「真的到了那座城」。分流編號也算（same_map）。
+                if cur is not None and cur != here and scene.same_map(cur, want):
+                    return cur, "趴趴GO，沒燒翼"
+                _nap(0.3)
+    else:
+        note(f"⚠ 傳送表裡沒有去{scene.scene_name(want)}的落點")
+
+    # ── 退路：天使之翼 ──────────────────────────────────────────
+    note("趴趴GO 沒到 → 改用天使之翼")
+    slot, sure = _wing_slot(scanner)
+    if slot is None and not sure:
+        # ★★ 讀不到 ≠ 沒有（memory `bag-false-empty-guards`，見 _wing_slot）：
+        #   副本最後一步剛跑完那一拍問背包常常整袋讀不到 —— 等人站穩再問一次。
+        note("背包這一拍讀不到（剛換圖？）→ 等人站穩再問一次…")
+        _wait_ready(scanner)
+        now = scene.current_id(scanner)
+        if now is not None and now != here:
+            note(f"等的期間被送到「{scene.scene_name(now)}」了")
+            if NPC_TABLE.get(now):
+                return now, "等的期間自己到城裡了"
+            here = now
+        slot, sure = _wing_slot(scanner)
+    if slot is None:
+        return None, (f"趴趴GO 沒到、背包也沒有{itemname.label(recall.RECALL_ITEM)}"
+                      if sure else
+                      f"趴趴GO 沒到、背包讀不到問不出有沒有"
+                      f"{itemname.label(recall.RECALL_ITEM)}")
+    before = _wing_count(scanner)
+    if not recall.use_item(mover, slot):
+        return None, "趴趴GO 沒到、回程道具也送不出去"
+    home = _wait_map_change(scanner, here, WING_WAIT)
+    if home is None:
+        # ★ 12 秒沒換圖：翼少了一張＝傳送在路上（慢載圖），再等；沒少＝沒生效
+        after = _wing_count(scanner)
+        if before is not None and after is not None and after >= before:
+            return None, "回城後地圖沒變、翼也沒少（回程道具沒生效）"
+        note(f"翼用掉了但還沒換圖，再等 {WING_WAIT_LATE:.0f} 秒…")
+        home = _wait_map_change(scanner, here, WING_WAIT_LATE)
+        if home is None:
+            return None, (f"翼用掉了但等了 {WING_WAIT + WING_WAIT_LATE:.0f} 秒"
+                          "地圖還沒變（回程可能失敗）")
+    return home, "燒了一張天使之翼"
 
 
 def _npc_tile(scanner, npc_id: int):
@@ -2124,13 +2212,17 @@ def _full_supply(mover, scanner, say=None,
                  back_to=None, potions=None,
                  potion_only: bool = False,
                  ledger=None, guild_items=None,
-                 fill_pct=None) -> tuple[bool, str]:
+                 fill_pct=None, city=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
 
     fill_pct 可選：藥水買到負重的百分比整數（掛機頁「掛機設定」，全部分身共用；
     None＝預設 95%）。呼叫端在主執行緒用 farmsettings.fill_pct() 讀了帶進來。
 
-    記錄地圖與座標 → 天使之翼回城 → 查表 →（有要存的才去）銀行存 → 修裝全修 →
+    city 可選：回城要去哪座城的**場景編號**（掛機頁「掛機設定」，全部分身共用；
+    呼叫端在主執行緒用 farmsettings.supply_city() 讀了帶進來）。None＝預設棕櫚基地。
+    ⚠ 人已經站在**任何**補給城裡就地補給，不會為了這個設定再飛一趟（使用者定）。
+
+    記錄地圖與座標 → 趴趴GO 回城（翼當退路）→ 查表 →（有要存的才去）銀行存 → 修裝全修 →
     照清單買 → 趴趴GO 跳回原練功點。順序＝**銀行 → 修裝 → 買**（使用者要求）。
     回 (整趟有沒有成功, 說明)。
 
@@ -2200,50 +2292,20 @@ def _full_supply(mover, scanner, say=None,
             f"（回程：找{ev.npc_name}）" if ev else
             f"（回程點：{back.name}）" if back else "（⚠ 沒有回程傳送點）"))
 
-    # 2. 天使之翼回城
-    # ★ 已經站在補給城裡（死亡「回標記點」復活後、或人本來就在城裡）→ 不燒翼、不等換圖。
+    # 2. 回城 —— ★ 趴趴GO 優先，天使之翼降成退路（2026-09-18 使用者要求）
+    # ★ 已經站在補給城裡（死亡「回標記點」復活後、或人本來就在城裡）→ 哪裡都不去。
     #   2026-09-05 自動刷副本「死亡當成一場 → 復活回城 → 補給」要走這條；以前會卡在
-    #   「回城後地圖沒變」整趟失敗。只認 NPC_TABLE 有的城 —— 不在表裡就照舊用翼。
-    slot, sure = None, True
-    if not NPC_TABLE.get(here):
-        slot, sure = _wing_slot(scanner)
-        if slot is None and not sure:
-            # ★★ 讀不到 ≠ 沒有（[[bag-false-empty-guards]]，見 _wing_slot 的說明）：
-            #   副本最後一步剛跑完那一拍問背包常常整袋讀不到，而且伺服器過幾秒
-            #   就會把人送出副本 —— 等到「人站穩、整袋讀得完」再問一次，順便把
-            #   地圖重讀（等的期間被送回城的話就不用燒翼了）。
-            note("背包這一拍讀不到（剛換圖？）→ 等人站穩再問一次…")
-            _wait_ready(scanner)
-            now = scene.current_id(scanner)
-            if now is not None and now != here:
-                note(f"等的期間被送到「{scene.scene_name(now)}」了")
-                here = now
-            slot, sure = _wing_slot(scanner)
+    #   「回城後地圖沒變」整趟失敗。⚠ 認的是 NPC_TABLE **任何**一座城（使用者
+    #   2026-09-18 定：「留下」），不是只認設定裡那一座 —— 人都在能補的城裡了，
+    #   為了設定再飛一趟只是多繞路。
     if NPC_TABLE.get(here):
         home = here
         note(f"已在 {scene.scene_name(home)}，不用回城")
     else:
-        if slot is None:
-            return False, (f"背包沒有{itemname.label(recall.RECALL_ITEM)}（回程道具）"
-                           if sure else
-                           f"背包讀不到，問不出有沒有"
-                           f"{itemname.label(recall.RECALL_ITEM)}（回程道具）")
-        before = _wing_count(scanner)
-        if not recall.use_item(mover, slot):
-            return False, "回程道具送不出去"
-        note("用天使之翼回城中…")
-        home = _wait_map_change(scanner, here, WING_WAIT)
+        home, hmsg = _fly_home(mover, scanner, here, city, note)
         if home is None:
-            # ★ 12 秒沒換圖：翼少了一張＝傳送在路上（慢載圖），再等；沒少＝沒生效
-            after = _wing_count(scanner)
-            if before is not None and after is not None and after >= before:
-                return False, "回城後地圖沒變、翼也沒少（回程道具沒生效）"
-            note(f"翼用掉了但還沒換圖，再等 {WING_WAIT_LATE:.0f} 秒…")
-            home = _wait_map_change(scanner, here, WING_WAIT_LATE)
-            if home is None:
-                return False, (f"翼用掉了但等了 {WING_WAIT + WING_WAIT_LATE:.0f} 秒"
-                               "地圖還沒變（回程可能失敗）")
-        note(f"回到 {scene.scene_name(home)}")
+            return False, hmsg
+        note(f"回到 {scene.scene_name(home)}（{hmsg}）")
         # ★★ 落地要等「人跟背包都讀得到」才准動（2026-09-06 黑狐實跑探針）：
         #   翼用掉 0.5 秒場景編號就換了，但那一瞬間玩家物件還是 NULL、背包半袋
         #   → 舊寫法固定睡 1 秒就往下走 → 「背包讀不到，跳過銀行」＋「背包讀不到，

@@ -113,12 +113,12 @@ class FakeSupply:
 
     def run_full_supply(self, mv, sc, say=None, back_to=None, potions=None,
                         potion_only=False, ledger=None, guild_items=None,
-                        fill_pct=None):
+                        fill_pct=None, city=None):
         # ⚠ 簽名要跟真的 supply.run_full_supply 一樣：掛機頁多帶一個關鍵字
-        #   （9/6 guild_items、fill_pct）替身就 TypeError → 被 except 吞掉 →
-        #   「補給趟跑了」整組紅，卻不是練技邏輯壞。
+        #   （9/6 guild_items、fill_pct；9/18 city）替身就 TypeError →
+        #   被 except 吞掉 →「補給趟跑了」整組紅，卻不是練技邏輯壞。
         self.trips.append({"back_to": back_to, "potions": potions,
-                           "potion_only": potion_only})
+                           "potion_only": potion_only, "city": city})
         if say:
             say("補藥水中…")
         if ledger is not None:                 # 模擬買到 40 顆 4836
