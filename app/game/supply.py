@@ -530,36 +530,96 @@ def _in_talk_box(me_tile, me_size: int, npc_tile, npc_size: int) -> bool:
 
 
 NEAR_SPOT_R = 8            # 找「離 NPC 最近可到的格」時掃 NPC 周圍這麼多格
-NEAR_GIVE_UP = 1.2         # 在目標格 2 格內待了這麼久還站不上去 → 就地算到（最後一格被人占著）
-                           #   ★ 9/6 使用者「到點後卡一下」：走路指令 0.5 秒內就會動，1.2 秒沒動就是被擋，2.5 太久
+# ⚠⚠ **場景實體表（`_scene_entities`）給的指標是「實體物件 −8」**
+#   （跟 `move.pathfinder_this()` 同一種）。兩個獨立佐證：
+#     · 這裡的 `OFF_NPC_NUM`(0x1D8) ＝ `entity.OFF_TYPE`(0x1D0) + 8（同一個欄位）
+#     · 這裡讀座標用 +0xC6 ＝ `entity.OFF_POS_X`(0xBC) 的高 16 位(0xBE) + 8
+#   2026-09-18 實測：拿 snapshot 認出來的 57 個玩家去對，**12/12 都是「位址 −8」
+#   在表裡**，位址本身一個都不在。借 entity.py 的偏移時忘了 +8 → 讀到垃圾值、
+#   而且**不會報錯**（只會安靜地什麼都找不到）。
+ENT_SHIFT = 8
+
+# entity.snapshot 的熱區快取（一台一份）：第一次全掃 ~0.35 秒，之後 10~18ms。
+_BUSY_HOT: dict = {}
 
 
-def _near_spots(scanner, g, here, npc_ent: int, npc_tile, avoid=None):
+def _busy_tiles(scanner, center, radius: int = NEAR_SPOT_R + 1) -> set:
+    """`center` 附近**站著角色**（其他玩家／怪／NPC）的格。讀不到一律回空集合。
+
+    ★★★ 2026-09-18 使用者要求：「講不到話應該要修正位置，你應該可以找到能靠近的點」。
+      實測現場（棕櫚基地補給商，周圍 51 個真人）：講話方框 77 格裡**空著又走得到的
+      有 61 格**，被人站住的只有 6 格 —— 從來不缺地方站，是我們挑的那一格剛好有人。
+      舊行為：`_near_spots` 只看「離 NPC 最近」，挑到有人的格就走不進去，要**撞上去**
+      才由 `navigate` 記進 `avoid`（反應式）。三台依序走同一個商人，第一台 6.4 秒、
+      第二台 18.1 秒、**第三台磨滿 60 秒逾時**（實測）；而 `_engage_npc` 給走路的
+      預算只有 12 秒 → 人多就變成「講不到話」。
+
+    ⚠⚠ 這是**排序用的軟訊號**：有人的格往後排，⛔ 不剔除、⛔ 不提前放棄 ——
+      2026-09-06 使用者叫我刪掉的「框內的格被別人站著就放棄」（commit 60f4411）
+      不要回來。全部候選都有人時排序不變，行為跟以前一樣。
+    ⚠ 自己站的那格不算「有人」—— 不然人已經站在最佳格上還會被自己趕走。
+
+    ★ 認角色用 `entity.snapshot`（vtable 比對）——那是本專案唯一驗過的認法。
+      ⛔ 不要自己從場景表用欄位硬濾：2026-09-18 試過「+0x1D8 是大指標值就當玩家」
+      得到 2108 個「玩家」（景物全被算進去），用 `kind` 欄位則發現玩家的 kind
+      有 1/2/3/4 好幾種（`entity.py` 註解寫的「2＝其他玩家」只是當時那一隻）。
+    """
+    pid = getattr(scanner, "_pid", None)
+    try:
+        _st, _pl, ents, hot, _x = entity.snapshot(scanner,
+                                                  regions=_BUSY_HOT.get(pid))
+        me = bag.player_entity(scanner)
+    except Exception:                                      # noqa: BLE001
+        return set()
+    if ents:
+        _BUSY_HOT[pid] = hot or None
+    else:
+        _BUSY_HOT.pop(pid, None)     # 熱區過期（換圖／重連）→ 下次全掃重來
+        return set()
+    cx, cy = int(center[0]), int(center[1])
+    out = set()
+    for e in ents:
+        if e.addr == me:
+            continue
+        tx, ty = int(e.x), int(e.y)
+        if abs(tx - cx) <= radius and abs(ty - cy) <= radius:
+            out.add((tx, ty))
+    return out
+
+
+def _near_spots(scanner, g, here, npc_ent: int, npc_tile, avoid=None, busy=None):
     """離 NPC **最近、可走且從我這區走得到**的格，近的在前（同距離同行同列的排前面）。
 
     ★ 使用者 2026-09-06 定：走位目標就是「離 NPC 最近可到的格」，不用講話方框當停止線
       （方框 TALK_BOX_X/Y 只留給「點下去要等多久」跟「送選項前到位沒」用）。
     NPC 本格不算（伺服器不給站）。
-    ⚠ 不看別的玩家站不站在那（使用者定：人牆偵測刪掉）——站不上去由 _walk_to_npc 的
-      「最後一步走不進去就算到」收尾。
+    ★★★ 2026-09-18 使用者要求：**現在站著人的格排到後面**（`busy`，見 `_busy_tiles`）。
+      站不上去的格排第一名，只會讓人走過去磨到逾時 —— 人多的時候旁邊多的是空格。
+      ⚠ 只是**排序**：有人的格還在清單裡（全部都有人時順序跟以前一樣），
+        ⛔ 不剔除、⛔ 不提前放棄。`busy=None` ＝ 不問，行為完全同舊版。
     """
     reach = _reach_around(g, here, avoid) or set()
     r = NEAR_SPOT_R
+    busy = busy or set()
     out = []
     for dx in range(-r, r + 1):
         for dy in range(-r, r + 1):
             c = (npc_tile[0] + dx, npc_tile[1] + dy)
             if c == npc_tile or c not in reach:
                 continue
-            out.append((math.hypot(dx, dy), 0 if (dx == 0 or dy == 0) else 1, c))
+            out.append((1 if c in busy else 0,          # ★ 有人站著的排後面
+                        math.hypot(dx, dy), 0 if (dx == 0 or dy == 0) else 1, c))
     out.sort()
-    return [c for _d, _o, c in out]
+    return [c for _b, _d, _o, c in out]
 
 
 def _box_status(scanner, npc_id: int, npc_ent: int, avoid=None):
     """我現在講不講得到這隻 NPC、框內還有哪些格能站。地形圖／座標讀不到回 None。
 
-    回 {"in_box": 我已在互動方框內, "free": [離 NPC 最近可到的格，近的在前…], "npc_tile": NPC 的 tile}。
+    回 {"in_box": 我已在互動方框內, "free": [離 NPC 最近可到的格，近的在前…],
+        "npc_tile": NPC 的 tile, "busy": 那附近站著人的格}。
+
+    ★ `free` 的排序會把**現在站著人的格排到後面**（2026-09-18，見 `_busy_tiles`）。
     """
     g, _why = terrain.load(scanner)
     pf, here = _player_tile(scanner)
@@ -570,8 +630,9 @@ def _box_status(scanner, npc_id: int, npc_ent: int, avoid=None):
     me_tile = (int(here[0]), int(here[1]))
     in_box = _in_talk_box(me_tile, _act_size(scanner, pf + 8),
                           npc_tile, _act_size(scanner, npc_ent))
-    free = _near_spots(scanner, g, here, npc_ent, npc_tile, avoid)
-    return {"in_box": in_box, "free": free, "npc_tile": npc_tile}
+    busy = _busy_tiles(scanner, npc_tile)
+    free = _near_spots(scanner, g, here, npc_ent, npc_tile, avoid, busy)
+    return {"in_box": in_box, "free": free, "npc_tile": npc_tile, "busy": busy}
 
 
 def _dist_to_npc(scanner, npc_id: int):
