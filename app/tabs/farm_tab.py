@@ -3339,7 +3339,6 @@ class CharFarmPage(QWidget):
         mv, sc, gen = self._mover, self.sc, self._supply_gen
         gitems = guildbank.wanted()    # 公會倉庫清單（全部分身共用；主執行緒讀 config）
         fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
-        city = farmsettings.supply_city()  # 回城要去哪座城（掛機設定；主執行緒讀）
 
         def _worker():
             try:
@@ -3350,7 +3349,6 @@ class CharFarmPage(QWidget):
                     ledger=self._record_purchase,   # 購買紀錄（純資料 append）
                     guild_items=gitems,             # 順手存公會倉庫（2026-09-06）
                     fill_pct=fill,
-                    city=city,         # 回城飛哪座城（掛機設定，預設棕櫚基地）
                     # ★ 中途叫停：這一趟被作廢（關掉掛機／又開了新一趟）就當場停
                     #   （2026-09-09 使用者要求，見 _start_supply 檔頭）
                     should_stop=lambda: gen != self._supply_gen)
@@ -3700,7 +3698,6 @@ class CharFarmPage(QWidget):
         self._train_gen += 1
         mv, sc, gen = self._mover, self.sc, self._train_gen
         fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
-        city = farmsettings.supply_city()  # 回城要去哪座城（掛機設定；主執行緒讀）
 
         def _worker():
             try:
@@ -3711,8 +3708,7 @@ class CharFarmPage(QWidget):
                     potions=plan,          # 藥水買到負重 N%（掛機設定）
                     potion_only=True,      # 只跑補給商：不存倉、不修裝
                     ledger=self._record_purchase,   # 購買紀錄（純資料 append）
-                    fill_pct=fill,
-                    city=city)         # 回城飛哪座城（掛機設定，預設棕櫚基地）
+                    fill_pct=fill)
             except Exception as exc:                      # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             if gen == self._train_gen:     # 這一趟還沒被作廢才收結果

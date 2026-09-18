@@ -153,8 +153,8 @@ from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (bag, balls, ballswap, entity, farmsettings, gather,
-                      itemname, mall, jumpmap, locate, lua, move,
+from app.game import (bag, balls, ballswap, entity, gather, itemname, mall,
+                      jumpmap, locate, lua, move,
                       navigate, produce, recall, recipes, robot, scene, scenery,
                       supply)
 from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list,
@@ -921,14 +921,12 @@ class CharProducePage(QWidget):
                "progress": "壞裝→回程補給", "scene": sid}
         self._sup = sup
         mv, sc = self._mover, self.sc
-        city = farmsettings.supply_city()  # 回城要去哪座城（掛機設定；主執行緒讀）
 
         def _worker():
             try:
-                time.sleep(1.2)          # 等 ESC 生效（退出採集狀態）再回城
+                time.sleep(1.2)          # 等 ESC 生效（退出採集狀態）再用翼
                 res = supply.run_full_supply(
-                    mv, sc, say=lambda m: sup.__setitem__("progress", m),
-                    city=city)
+                    mv, sc, say=lambda m: sup.__setitem__("progress", m))
             except Exception as exc:                          # noqa: BLE001
                 res = (False, f"補給出錯：{exc}")
             sup["result"] = res      # 寫進這一份 sup（就算 self._sup 已換人也無害）
