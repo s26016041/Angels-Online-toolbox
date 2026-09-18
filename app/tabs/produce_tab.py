@@ -660,13 +660,10 @@ class CharProducePage(QWidget):
                 self._note("⚠ 上一趟回程補給還在背景收尾 —— 等它結束會自動開工",
                            warn=True)
                 return
-            # ★ 保證購買清單有天使之翼×50（使用者要求保留）：生產壞裝一定會觸發回程補給，
-            #   每趟都要用翼回城，清單有它 run_full_supply 的買水步驟才會補貨。只加翼、不開精靈旗標。
-            # ★ 並把天使精靈自己的「回城補給」觸發全關掉（使用者要求）——回程補給改跑我們自己的，
+            # ★ 把天使精靈自己的「回城補給」觸發全關掉（使用者要求）——回程補給改跑我們自己的，
             #   精靈別再自己回城跑一趟撞我們。
+            # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定）。
             try:
-                robot.ensure_buy_item(self._mover, self.sc, recall.RECALL_ITEM,
-                                      robot.BUY_KEEP_WINGS)
                 robot.disable_return_supply(self._mover, self.sc)
             except Exception:                          # noqa: BLE001
                 pass

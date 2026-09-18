@@ -3561,13 +3561,8 @@ class CharFarmPage(QWidget):
             # 精靈自己的「回城補給」觸發全關掉 —— 補給那趟是我們在開車
             # （跟掛機開始時同一套，見 _on_toggle）。
             notes += robot.disable_return_supply(self._mover, self.sc)
-            # 購買清單保證有天使之翼×50：每趟補給都燒一張翼回城，
-            # 清單有它補給商那站才會補貨，不然練技幾趟後就回不了城。
-            note = robot.ensure_buy_item(self._mover, self.sc,
-                                         recall.RECALL_ITEM,
-                                         robot.BUY_KEEP_WINGS)
-            if note:
-                notes.append(note)
+            # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定：
+            #   那是他自己的設定）。
             self._train_push()             # 立刻把主開關＋練習技能開起來
         self.status.setText(
             "🥋 自動練技中：精靈原地重複練習技能"
@@ -5944,15 +5939,8 @@ class CharFarmPage(QWidget):
             # ★ 回程補給改跑我們自己的 → 把天使精靈自己的「回城補給」觸發全關掉
             #   （使用者：「開始掛機把補給流程也關掉」），免得精靈也自己回城跑一趟撞我們。
             notes += robot.disable_return_supply(self._mover, self.sc)
-            # ★ 保證購買清單裡有天使之翼×50（使用者要求保留）。藥水補給現在
-            #   全自動（2026-08-19，沒有勾選可看）——一律確保：每趟補給都要用
-            #   翼回城，清單有它 run_full_supply 的買水步驟才會補貨，免得翼
-            #   用完下一趟回不去。⚠ 只加翼、不開精靈的補給旗標。
-            note = robot.ensure_buy_item(
-                self._mover, self.sc, recall.RECALL_ITEM,
-                robot.BUY_KEEP_WINGS)
-            if note:
-                notes.append(note)
+            # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定：
+            #   要買幾張是他自己的設定）。
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
@@ -7042,12 +7030,7 @@ class CharFarmPage(QWidget):
             self._mover, self.sc,
             jump_back=self.sup_jump_cb.isChecked(),
             revive_mark=self.sup_revive_cb.isChecked())
-        # ★ 保證購買清單有天使之翼×50（只加翼，不開精靈補給旗標）。
-        #   藥水補給全自動（2026-08-19）→ 不再看勾選，一律確保。
-        note = robot.ensure_buy_item(
-            self._mover, self.sc, recall.RECALL_ITEM, robot.BUY_KEEP_WINGS)
-        if note:
-            notes.append(note)
+        # ⛔ 2026-09-18 起不再幫他把天使之翼補進購買清單（使用者定）。
         if notes:
             self.status.setText("精靈設定：" + "、".join(notes))
 

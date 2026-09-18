@@ -190,8 +190,8 @@ check("主開關開了", ROBOT.run is True)
 check("練習技能開了", ROBOT.ex is True)
 check("精靈自己的回城補給觸發關掉了",
       ("disable_return_supply",) in ROBOT.calls)
-check("購買清單保證有翼×50", ("ensure_buy", farm_tab.recall.RECALL_ITEM,
-                              50) in ROBOT.calls)
+check("⛔ 不再碰他的購買清單（2026-09-18 使用者定）",
+      not [c for c in ROBOT.calls if c and c[0] == "ensure_buy"])
 
 print("② 互斥：練技中開掛機 → 練技放掉、精靈關回去")
 page.run_cb.setChecked(True)

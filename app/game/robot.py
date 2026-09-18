@@ -207,8 +207,10 @@ _L_COUNT, _L_ELEMS, _L_CAP = 0x0C, 0x10, 0x7CF
 # 髒 byte 設 1（0x54EDEF 整支就這一行）—— 我們編輯完也照做，
 # 遊戲才知道設定變了。⚠ 只有 1 個 byte。
 _MGR_DIRTY_OFF = 0x4C
-# ⚠ 使用者定的數量（不能自己改）：回程補給要幫他保持的天使之翼張數。
-BUY_KEEP_WINGS = 50
+# ⛔ 2026-09-18 使用者定：**不要再幫他把天使之翼補進購買清單**（以前是固定
+#   50 張）。理由是那是他自己的設定，要買幾張由他調。原本的 BUY_KEEP_WINGS
+#   常數與五個呼叫點一起拿掉；`ensure_buy_item()` 本身留著（清單編輯的手法
+#   是反組譯出來的，別再重做一次），只是沒有人自動呼叫它了。
 
 # ★「輔助」頁的陣亡自動復活。DATAID 從遊戲的 Lua 全域常數純讀出來
 #   （DATAID_AUTO_RESURRECTION_CHECK / _MODE），「復活方式」的值意義是把
@@ -573,10 +575,8 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
     · supply         勾了**任何一個**回程補給觸發（壞裝／HP水／MP水）→
                      把補給那一趟「進了城要做的事」推到位（使用者要求）：
                      開「裝備損壞回城」「修理裝備」「購買物品保持身上數量」，
-                     再把天使之翼補進購買清單保持 `BUY_KEEP_WINGS` 個 ——
-                     免得補給跑了裝沒修、翼用完了下一趟連回程都回不去。
-                     ★ 購買清單**只加翼這一項**，他原本設的都不動；
-                       翼已經設更多也不改小（見 `ensure_buy_item`）。
+                     ⛔ 2026-09-18 起**不再碰購買清單**：買幾張天使之翼是
+                       使用者自己的設定，我們不替他決定。
     · produce        開始自動生產 → 生產頁的「自動採集」「採集指定資源」
                      **兩個都關掉**（使用者要求）：那兩項會讓精靈跑去採集
                      （「自動採集」自己還會關掉自動攻擊、把中心點設在原地），
@@ -612,10 +612,6 @@ def apply_prefs(mover, scanner, *, main_switch: bool = False,
             if ok and cur is not True:
                 set_bool(mover, scanner, var_id, True)
                 notes.append(f"開了「{label}」")
-        note = ensure_buy_item(mover, scanner, recall.RECALL_ITEM,
-                               BUY_KEEP_WINGS)
-        if note:
-            notes.append(note)
 
     if produce:
         # ★ 只往「關掉」推：本來就是關的完全不碰（連寫入都不會發生）。
