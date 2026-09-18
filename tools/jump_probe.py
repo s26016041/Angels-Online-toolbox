@@ -48,9 +48,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import charname, injector, preload         # noqa: E402
 from app.core.memory import MemoryScanner                # noqa: E402
-from app.game import entity, jumpmap, locate, move, scene  # noqa: E402
+from app.game import (attack, bag, entity, jumpmap,  # noqa: E402
+                      locate, move, quickbar, scene)
 
 WATCH = 25.0          # 送出後盯多久
+FIGHT_WAIT = 90.0     # --fight：等多久才放棄「等怪來咬我」
 POLL = 0.2
 
 
@@ -217,6 +219,121 @@ def _go(who: str, pid: int, jump_id: int) -> int:
     return 0
 
 
+def _pick(who: str, pid: int):
+    """挑出**剛好一台**、而且沒被工具箱驅動的分身。回 (win, scanner) 或 (None, None)。"""
+    wins = preload.windows()
+    if pid:
+        wins = [w for w in wins if w.pid == pid]
+    elif who:
+        keep = []
+        for w in wins:
+            sc0 = MemoryScanner()
+            try:
+                sc0.open(w.pid)
+                if who in w.title or who in _name_of(w, sc0):
+                    keep.append(w)
+            except Exception:                  # noqa: BLE001
+                pass
+            finally:
+                sc0.close()
+        wins = keep
+    if len(wins) != 1:
+        print(f"⛔ --who/--pid 要**剛好**指到一台（現在 {len(wins)} 台）")
+        return None, None
+    w = wins[0]
+    sc = MemoryScanner()
+    sc.open(w.pid)
+    locate.warm(sc)
+    if _hooked(sc, w.pid) is not False:
+        print("⛔ 這台正被工具箱驅動（或判不出來）—— 跨行程跳板會互拆，不碰。")
+        sc.close()
+        return None, None
+    return w, sc
+
+
+def _fight(who: str, pid: int, jump_id: int, slot: int = 1) -> int:
+    """★ 測「交戰中能不能趴趴GO」：走去最近的怪、等牠咬我，一咬到就送。
+
+    交戰的硬訊號 = `entity.attackers()`（怪的 +0x34C == 我的實體編號，
+    memory `foe-field-unreliable` 實測 603/603 出手拍全中），⛔ 不看血量。
+    """
+    e = jumpmap.get(jump_id)
+    if e is None:
+        print(f"⛔ 表裡沒有編號 {jump_id}")
+        return 2
+    w, sc = _pick(who, pid)
+    if w is None:
+        return 3
+    owner = object()
+    mv = None
+    try:
+        mv = move.acquire(w.pid, injector.process_path(w.pid), owner)
+        my_eid = bag.my_entity_id(sc)
+        pf = move.pathfinder_this(sc)
+        if not my_eid or not pf:
+            print("⛔ 讀不到自己的實體")
+            return 3
+        hot = None
+        hit: list = []
+        hurt = None
+        t0 = time.time()
+        while time.time() - t0 < FIGHT_WAIT and not hit:
+            _st, _pl, ents, hot, _x = entity.snapshot(sc, regions=hot)
+            hot = hot or None
+            hit = entity.attackers(sc, ents, my_eid)
+            if hit:
+                break
+            me = entity.player_pos(sc, pf + 8)
+            mobs = [m for m in ents
+                    if m.kind == entity.KIND_MONSTER
+                    and not entity.looks_dead(m.state, True, m.dead_flag)]
+            if me and mobs:
+                m = min(mobs, key=lambda q: (q.x - me[0]) ** 2 + (q.y - me[1]) ** 2)
+                d = ((m.x - me[0]) ** 2 + (m.y - me[1]) ** 2) ** 0.5
+                if 0 < m.hp < 100:
+                    hurt = m
+                    print(f"  ★ {m.name} 採到 {m.hp}%（我打傷它了）")
+                    break
+                print(f"  打 {m.name or m.type_id}（{d:.1f} 格，血 {m.hp}）")
+                if d > 2.5:
+                    mv.walk_near(sc, pf + 8, m.x, m.y, 1.5)
+                attack.select(mv, m.eid)
+                quickbar.use(mv, sc, slot, 0)
+            time.sleep(1.0)
+        if not hit and hurt is None:
+            print(f"✘ {FIGHT_WAIT:.0f} 秒內沒有怪來咬我（沒進交戰）—— 沒測到")
+            return 4
+        names = ("、".join((m.name or str(m.type_id)) for m in hit)
+                 or (hurt.name if hurt else ""))
+        why = (f"{len(hit)} 隻在打我" if hit
+               else f"我把 {names} 打到 {hurt.hp}%")
+        print(f"★ 交戰中：{why} → 馬上送")
+        sid0, name0, _p = _where(sc)
+        t1 = time.time()
+        ok, msg = jumpmap.teleport(mv, sc, jump_id)
+        print(f"送出：{msg}")
+        if not ok:
+            return 4
+        while time.time() - t1 < WATCH:
+            time.sleep(POLL)
+            sid, name, pos = _where(sc)
+            if sid is not None and sid != sid0:
+                print(f"✅ {time.time() - t1:.1f} 秒後到了：{name}（{sid}）")
+                print("   → **交戰中照樣飛** —— 伺服器沒驗戰鬥狀態。")
+                return 0
+        sid, name, _p = _where(sc)
+        print(f"✘ {WATCH:.0f} 秒都沒動（還在 {name}（{sid}））")
+        print("   → **交戰中被擋下** —— 補給流程要留退路。")
+    except Exception as exc:                   # noqa: BLE001
+        print(f"⛔ 出事：{exc}")
+        return 5
+    finally:
+        if mv is not None:
+            move.release(w.pid, owner)
+        sc.close()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--who", default="", help="視窗標題含這個字串的那台")
@@ -224,7 +341,13 @@ def main() -> int:
     ap.add_argument("--go", type=int, default=0, help="跳地圖編號（會真的送）")
     ap.add_argument("--list", dest="key", nargs="?", const="", default=None,
                     help="列出傳送表（可給關鍵字）")
+    ap.add_argument("--slot", type=int, default=1,
+                    help="--fight 用哪一格快捷欄出手（0 起算）")
+    ap.add_argument("--fight", type=int, default=0,
+                    help="走去最近的怪、被咬到就送這個編號（測交戰中能不能飛）")
     a = ap.parse_args()
+    if a.fight:
+        return _fight(a.who, a.pid, a.fight, a.slot)
     if a.go:
         return _go(a.who, a.pid, a.go)
     if a.key is not None:
