@@ -587,6 +587,14 @@ NEAR_WALK = 4.0
 #   為什麼要分：射程是每個角色不一樣的，近戰在 10 格外送施放伺服器不理
 #   —— 實測雪狐就是這樣完全打不到怪。
 MELEE_RANGE = 2.0
+# ★★★ 普攻（空的技能鍵，2026-09-20 使用者定）用哪把尺：**跟近戰同一把**。
+#   他的原話：「一樣可以跟近戰一樣走到那個範圍，然後讓官方自己處理後面」。
+#   BASIC_RANGE 是「射程幾格」（走位用，跟技能表同單位），BASIC_REACH 是
+#   換算後打得到的歐氏距離（＝射程+1，跟 reach_of 同一套）＝ MELEE_RANGE。
+# ⚠ 官方的 TryAct 自己還會再判一次距離、不到就自己走 —— 這個數字只決定
+#   「我們走多近才開始叫它」，不是伺服器的判定。
+BASIC_RANGE = 1
+BASIC_REACH = float(BASIC_RANGE) + 1.0
 # ★ 自動分身按哪個鍵（使用者指定 F12）。技能編號不寫死 ——
 #   按一次讀「角色屬性 −0x50」就知道，再去 skills.py 查持續時間。
 BUFF_KEY = 0x7B                 # VK_F12
@@ -715,6 +723,13 @@ def _send_scan(hwnd: int, vk: int = DEFAULT_KEY) -> None:
     win.send_key(hwnd, vk, SEND_TIMEOUT_MS)
 
 
+def _key_label(vk: int) -> str:
+    """鍵碼 → 給人看的鍵名（F1~F12，其餘寫十六進位）。只有這一份。"""
+    return (f"F{vk - quickbar.VK_F1 + 1}"
+            if quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS
+            else f"鍵{vk:#x}")
+
+
 class _NamedKeyBox(QComboBox):
     """按下去才去讀「這個鍵現在放什麼技能」的下拉（首次攻擊用）。
 
@@ -826,6 +841,11 @@ class KeyWorker(_Paced):
         self.sc = sc
         self.vks: list[int] = [DEFAULT_KEY]   # 使用者勾的技能鍵（輪流用）
         self.skills: dict[int, int] = {}      # 鍵碼 → 快捷欄解析出的技能 ID
+        # ★★★ 勾了、但快捷欄那一格是**空的**的鍵（2026-09-20 使用者定：
+        #   「技能鍵選到空的技能就是用普攻的意思」）。輪到它就打普攻
+        #   （attack.basic ＝ 官方左鍵點怪 TryAct(eid,1)）。
+        # ⚠ **空格**才算，放物品的格不算（那是舊規矩：不進循環，免得誤按吃藥）。
+        self.empties: set[int] = set()
         self.qb_ok = False          # 上一次快捷欄讀取有沒有成功（UI 提示用）
         self._rot = 0               # 輪到循環裡的第幾個
         self._qb = quickbar.Reader(sc)
@@ -897,6 +917,16 @@ class KeyWorker(_Paced):
                 return sid
         return None
 
+    @property
+    def has_attack(self) -> bool:
+        """這一輪有沒有東西可以出手（技能，或**空格＝普攻**）。
+
+        ★ 寫目標那條執行緒用它決定「要不要替目標寫血量」：
+          官方路徑（快捷鍵／施放函式／普攻 TryAct）都**不必**寫，血量交給
+          遊戲填、讀到才是真訊號；只有「純送鍵」那條退路要寫（見呼叫點）。
+        """
+        return bool(self.skill or self.empties)
+
     def skip_note(self) -> str:
         """勾到的鍵裡有非攻擊技能就提一下（**只是提醒，照樣會放**）。
 
@@ -907,10 +937,7 @@ class KeyWorker(_Paced):
         for vk in self.vks:
             sid = self.skills.get(vk)
             if sid and not skills.is_attack(sid):
-                key = (f"F{vk - quickbar.VK_F1 + 1}"
-                       if quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS
-                       else f"鍵{vk:#x}")
-                note.append(f"{key}（{skills.name_of(sid) or sid}）")
+                note.append(f"{_key_label(vk)}（{skills.name_of(sid) or sid}）")
         return ("　※ " + "、".join(note) + " 不是攻擊型技能（照樣會放）"
                 if note else "")
 
@@ -961,6 +988,11 @@ class KeyWorker(_Paced):
         """
         out = [r for r in (skills.range_of(self.skills.get(vk) or 0)
                            for vk in self.all_keys()) if r]
+        # ★ 空格＝普攻，射程照近戰（BASIC_RANGE）——沒把它算進來的話，
+        #   只勾空格時 min_range 回 None → 走位退回 12 格，人站在遠處
+        #   一直叫普攻（官方會自己慢慢走，但那就是使用者最討厭的發呆）。
+        if any(vk in self.empties for vk in self.all_keys()):
+            out.append(BASIC_RANGE)
         return min(out) if out else None
 
     def reach_of(self, sid: int) -> float:
@@ -993,6 +1025,11 @@ class KeyWorker(_Paced):
         known = False
         for vk in self.all_keys():
             sid = self.skills.get(vk)
+            if not sid and vk in self.empties:     # 空格＝普攻（近戰距離）
+                known = True
+                if dist <= BASIC_REACH:
+                    return True
+                continue
             r = skills.range_of(sid) if sid else None
             if not r:
                 continue
@@ -1032,12 +1069,12 @@ class KeyWorker(_Paced):
         self._open_eid = None          # 重新開始 → 首發重新上鎖
         self.open_wait = 0.0
         try:
-            got = self._qb.skills(self.all_keys())
+            got = self._qb.look(self.all_keys())
             self._page = self._qb.page()       # 出手要指名頁＋格
         except Exception:                      # noqa: BLE001
             got = None
         self.qb_ok = got is not None
-        self.skills = got or {}
+        self.skills, self.empties = got if got is not None else ({}, set())
         if got is not None:
             return      # 快捷欄讀得到：結果就是答案（沒技能＝不出手）
         # 快捷欄整個讀不到 —— 單鍵才能用舊法：「最近使用的技能」認不出
@@ -1235,13 +1272,13 @@ class KeyWorker(_Paced):
                 self._next_qb = now + QB_REFRESH
                 try:
                     # ⚠ 要連首發鍵一起讀（它可以是沒勾的鍵）—— 見 all_keys()
-                    got = self._qb.skills(self.all_keys())
+                    got = self._qb.look(self.all_keys())
                     self._page = self._qb.page()   # 使用者中途翻頁也要跟上
                 except Exception:              # noqa: BLE001
                     got = None
                 self.qb_ok = got is not None
                 if got is not None:
-                    self.skills = got
+                    self.skills, self.empties = got
             # ⚠ 這份快照**不可以**叫 `skills` —— 那會把 app.game.skills 模組
             #   遮住，底下 `skills.is_ground()` 之類就會丟 AttributeError，
             #   而整個 step() 被 try 包著、例外被吞掉 = 完全不出手也沒訊息。
@@ -1266,9 +1303,13 @@ class KeyWorker(_Paced):
             #   ⛔ 曾經加過「只收攻擊型技能」，被使用者否決：瞬移術那類
             #     位移技能他要能正常用。非攻擊技能只在選單與狀態列標示
             #     （skills.is_attack），要不要放由使用者決定。
-            usable = [k for k in vks if bykey.get(k)]
+            # ★★★ 2026-09-20 使用者定：**勾到的鍵是空格＝那一輪打普攻**
+            #   （attack.basic ＝ 官方左鍵點怪，走到近戰距離剩下交官方）。
+            #   ⚠ 只有**空格**算，放物品的格照舊不進循環（不會誤按吃藥）。
+            blank = self.empties
+            usable = [k for k in vks if bykey.get(k) or k in blank]
             if not usable and self.qb_ok:
-                return                    # 快捷欄讀得到、但勾的鍵上沒技能
+                return                    # 快捷欄讀得到、但勾的鍵上沒技能也不是空格
             # ★★ 首次攻擊（使用者要求）：這一隻的第一下**一定要是**指定的那招。
             #   還沒真的放出去之前，這一輪就只試它一個 —— 那招在冷卻就等，
             #   等多久都等（不設上限，出口是「暫停」；狀態列會顯示等了幾秒）。
@@ -1321,10 +1362,32 @@ class KeyWorker(_Paced):
             #   也不會因為某次例外就再也不出手。
             self._next_round = now + ROUND_GAP
             struck = False
+            # ★★ 這一輪有沒有**真的試過**（沒被自己的射程擋掉）。
+            #   ⚠ 整輪都因為太遠被跳過時**不可以**落到下面的送鍵退路：
+            #     那條是給「快捷欄叫不動」用的，太遠而不出手是正確行為，
+            #     再去按一次鍵只是白按（空格那一輪更是毫無意義）。
+            #   走封包那一段沒跑到（按鍵模式）時維持 True ＝ 舊行為不變。
+            tried = True
             if mode == MODE_PACKET and packets and eid and mover is not None:
+                tried = False
                 for k in usable:
                     sid = bykey.get(k)
                     if not sid:
+                        # ★★★ 空格＝普攻（使用者 2026-09-20：「技能鍵選到空的
+                        #   技能就是用普攻的意思…跟近戰一樣走到那個範圍，然後
+                        #   讓官方自己處理後面」）。attack.basic ＝ 官方左鍵點怪
+                        #   （TryAct(eid,1)）：在範圍內當場動手，沒到就它自己
+                        #   走一步，下一輪再叫就繼續走。
+                        # ⚠ 距離照近戰那把尺（BASIC_REACH）；交棒那輪不擋
+                        #   （同下面技能那條的理由）。
+                        if k not in blank:
+                            continue          # 物品格：照舊不進循環
+                        if (not self.client_walk and dist_now is not None
+                                and dist_now > BASIC_REACH):
+                            continue
+                        tried = True
+                        struck = attack.basic(mover, self.sc,
+                                              self.ent_addr) or struck
                         continue
                     # ★★★ **每一招各自比自己的射程**（使用者 2026-08-10 指定：
                     #   攻擊距離不准取全輪的最短或最長）。輪替裡混著近戰與遠程
@@ -1347,6 +1410,7 @@ class KeyWorker(_Paced):
                     #   伺服器受理、MP 照扣、卻一點傷害都沒有（使用者實機回報）。
                     #   現在改叫官方的施放函式（attack.cast_skill），對地帶座標、
                     #   其餘座標留 0。⚠ 玩家物件與目標實體都要**當場**的位址。
+                    tried = True
                     rng = skills.range_of(sid)
                     by_packet = (skills.is_ground(sid)
                                  or (rng is not None
@@ -1366,8 +1430,10 @@ class KeyWorker(_Paced):
                     else:
                         ok = False
                     struck = struck or ok
-            if not struck:
+            if not struck and tried:
                 # 退路：快捷欄叫不動（改版位移／物件還沒建）就送鍵。
+                # ⚠ `tried` ＝ 這一輪真的有招出手過（見上面）——整輪都因為
+                #   太遠被跳過時不走這條。
                 # ⚠ 送鍵一次要按住 40ms，一輪送一個就好（見 [[key-send-hold]]）。
                 vk = (usable or vks)[self._rot % len(usable or vks)]
                 _send_scan(self.hwnd, vk)
@@ -2310,8 +2376,9 @@ class CharFarmPage(QWidget):
         av.addLayout(a)
         a.addWidget(QLabel("技能鍵"))
         # ★ 可多選（使用者要求）：勾幾個 F 鍵，攻擊照 F1→F12 順序輪流放。
-        #   鍵上放什麼是直讀快捷欄的（quickbar.py）：空格／物品格自動略過
-        #   不進循環、掛機中換技能幾秒內跟上。
+        #   鍵上放什麼是直讀快捷欄的（quickbar.py）：**空格＝那一輪打普攻**
+        #   （使用者 2026-09-20 定），物品格自動略過不進循環、
+        #   掛機中換技能幾秒內跟上。
         #   用按鈕＋下拉選單裝 12 個勾選框 —— 一整排 12 個會把這條列撐爆
         #   （主視窗固定 940 寬）。
         #   ⚠ 勾選框要包在 QWidgetAction 裡：點了選單不會關，才能一次勾多個。
@@ -2319,7 +2386,8 @@ class CharFarmPage(QWidget):
         self.key_btn.setPopupMode(QToolButton.InstantPopup)
         self.key_btn.setToolTip(
             "勾要輪流放的技能鍵（可多選），照 F1→F12 順序施放。\n"
-            "放什麼直接讀遊戲快捷欄：空格、物品自動略過。")
+            "放什麼直接讀遊戲快捷欄：勾到空格就是那一輪打普攻，\n"
+            "放物品的格照舊略過（不會誤按把藥吃掉）。")
         km = QMenu(self.key_btn)
         self._key_cbs: list[tuple[QCheckBox, int, str]] = []
         for label, vk in SKILL_KEYS:
@@ -5956,17 +6024,26 @@ class CharFarmPage(QWidget):
         # 技能鍵的體檢結果也說出來 —— 勾的鍵上沒技能時會完全不出手，
         # 不講的話使用者只會看到「走過去不打」。
         skill_note = ""
-        if not self._keys.skills:
+        blanks = [vk for vk in self._keys.vks if vk in self._keys.empties]
+        if not self._keys.skills and not blanks:
             skill_note = ("　⚠ 快捷欄讀不到，技能鍵改用純按鍵"
                           if not self._keys.qb_ok else
-                          "　⚠ 勾的技能鍵上沒有技能（空格／物品會略過）")
+                          "　⚠ 勾的技能鍵上沒有技能（放物品的格會略過）")
         else:
             skill_note = self._keys.skip_note()   # 只是提醒，不會過濾
+        # ★ 空格＝普攻（2026-09-20 使用者定）—— 講清楚是「那個鍵會打普攻」，
+        #   免得他以為又是「沒技能所以不出手」。
+        if blanks:
+            skill_note += ("　※ " + "、".join(_key_label(vk) for vk in blanks)
+                           + " 是空格 → 那一輪打普攻")
         # 首發鍵設了、但那個鍵上沒技能 → 閘門會自動失效，講一聲免得他以為有在等。
         if self._keys.opener_vk and not self._keys.skills.get(
                 self._keys.opener_vk):
-            skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} 上沒有技能"
-                           "（空格／物品）→ 這次不生效")
+            why = ("是空格（普攻沒有施放廣播可以確認）"
+                   if self._keys.opener_vk in self._keys.empties
+                   else "上沒有技能（放的是物品）")
+            skill_note += (f"　⚠ 首次攻擊的 {self._opener_label()} {why}"
+                           " → 這次不生效")
         self.status.setText(
             ("掛機中：只打「" + "、".join(want) + "」" if want
              else "掛機中：還沒選任何怪物 —— 點右邊的名字加進「選中怪物」")
@@ -6697,7 +6774,7 @@ class CharFarmPage(QWidget):
         #   封包攻擊：**不寫**，血量交給遊戲，讀到 0 就是死亡訊號
         #   按鍵攻擊：**要寫**，遊戲出手前會檢查 +0x2DC > 0，不餵就不打
         self._atk.packets = bool(self._keys.mode == MODE_PACKET
-                                 and self._keys.packets and self._keys.skill
+                                 and self._keys.packets and self._keys.has_attack
                                  and self._keys.mover is not None)
         # 選定封包送出去之後，才開始算「多久沒看到血量 = 屍體」
         # 出手執行緒自己也會用這兩個再驗一次距離（見 KeyWorker.step）
@@ -7059,7 +7136,7 @@ class CharFarmPage(QWidget):
         """把「技能鍵」選單與「首次攻擊」下拉標上快捷欄現在放什麼。
 
         技能格 → F1（電擊術Ⅳ）、物品格 → F5（物品：高效紅藥水）、
-        空格 → F7（空）。讀不到快捷欄（還沒進遊戲／改版位移）就維持
+        空格 → F7（空 → 普攻）。讀不到快捷欄（還沒進遊戲／改版位移）就維持
         素的 F1~F12，不亂標。純讀取，開著掛機點開也沒差。
 
         ⚠ 只改字（setText/setItemText），**不重建清單** —— 重建會讓順序跳動
@@ -7074,7 +7151,7 @@ class CharFarmPage(QWidget):
             if cells is not None:
                 c = cells[i]
                 if c is None:
-                    text = f"{label}（空）"
+                    text = f"{label}（空 → 普攻）"
                 elif c.is_skill:
                     nm = skills.name_of(c.value) or f"技能{c.value}"
                     # 位移／補血／buff 這類放進攻擊循環只會幫倒忙，標出來
@@ -7096,9 +7173,7 @@ class CharFarmPage(QWidget):
         vk = self._keys.opener_vk
         if not vk:
             return ""
-        key = (f"F{vk - quickbar.VK_F1 + 1}"
-               if quickbar.VK_F1 <= vk < quickbar.VK_F1 + quickbar.SLOTS
-               else f"鍵{vk:#x}")
+        key = _key_label(vk)
         sid = self._keys.skills.get(vk)
         nm = skills.name_of(sid) if sid else ""
         return f"{key}（{nm}）" if nm else key

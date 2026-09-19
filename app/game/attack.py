@@ -189,3 +189,34 @@ def strike(mover, pf_this: int, skill_id: int, target_id: int,
     return _send(mover, ((ACTION_FN, (pf_this, ACTION_CODE)),
                          (THIRD_FN, (target_id, 0)),
                          (CAST_FN, (skill_id, target_id, 0, 0, 0))))
+
+
+def basic(mover, scanner, ent_addr: int) -> bool:
+    """普攻一下＝**跟滑鼠左鍵點那隻怪一模一樣**：`TryAct(eid, 1)`。
+
+    ★★★ 2026-09-20 使用者給的封包實錄（`封包/普攻打死怪.txt`，他左鍵點怪把怪
+      打死）＋反組譯定案，整條路都是官方的：
+        ① 滑鼠命中判定 `0x5AAE74` 看游標下是什麼，往 out 參數寫「動作種類」：
+           敵對目標 → **1**（友方／NPC → 2、場景物件 → 3…），再帶著它叫
+           `TryAct(eid, 種類)`（`0x5AC8D5`）。
+        ② `TryAct`（`supply.TRY_ACT_FN`）把種類寫進 `+0x34C`、目標 eid 寫進
+           `+0x354`，距離（`0x508DF6`）與視線（`0x5B87E4`）都過就叫 `0x5065E7`：
+           送**動作包**（52 13）並丟 `"R011"` 事件 → 事件層再送**攻擊指令包**
+           （5d 13）。不在範圍它就用官方尋路自己走一步，下一拍再叫就繼續走
+           —— 跟我們點 NPC 講話同一個機制。
+        ③ 封包實錄裡只有 52 13 / 5d 13，**沒有施放包**（那兩發 43 13 是角色
+           自己身上的熔甲屏障Ⅰ／煉獄之甲Ⅲ 自我 buff，不是攻擊）——
+           跟「自送封包只打得出普攻、MP 一格不扣」的舊實測完全對得上。
+    ⚠ 這支**不能**拿來放技能（它就是普攻）；技能一律走 `quickbar.use` /
+      `cast_skill`（見 [[use-quickkey-fn]]）。
+    ⚠ eid 由 `supply.click_object` 當場從實體 `+0xBC` 重讀（CLAUDE.md：交給
+      遊戲的位址送出前當場重驗），所以這裡收的是**實體位址**。
+    ⚠ 回 True 只代表「這一發送進去了」，不代表打到 —— 打沒打到只有怪的血知道。
+    """
+    if not (mover and mover.active and ent_addr):
+        return False
+    if _yield_now(mover):
+        return False
+    from app.game import supply          # 延後匯入：supply 會匯入本模組
+    return supply.click_object(mover, scanner, ent_addr,
+                               kind=supply.KIND_ATTACK)

@@ -299,11 +299,14 @@ class Reader:
         v = _node_number(self._sc, self._page_node, "QUICK_COMMAND_PAGE")
         return int(v) if v is not None and 0 <= v < PAGES else 0
 
-    def skills(self, vks) -> dict[int, int] | None:
-        """這些（F 鍵）鍵碼各對到目前頁上的哪個技能 → {鍵碼: 技能 ID}。
+    def look(self, vks) -> tuple[dict[int, int], set[int]] | None:
+        """**一次**把這些（F 鍵）鍵碼看清楚 → ({鍵碼: 技能 ID}, {空格的鍵碼})。
 
-        **只收技能格** —— 空格、物品格、非 F 鍵都不會出現在結果裡
-        （使用者指定：非技能不進攻擊循環）。
+        ★ 為什麼要分「空格」與「物品格」（2026-09-20 使用者定：**空的技能鍵
+          ＝ 用普攻**）：兩者在舊的 `skills()` 裡長得一模一樣（都不在結果裡），
+          但意思完全不同 —— 空格是「這一輪打普攻」，物品格是「別動它，免得
+          誤按把藥吃掉」。所以判斷一定要看格子的 `kind`，⛔ 不可以拿
+          「`skills()` 裡沒有這個鍵」當成空格。
         整頁讀不到（沒進遊戲／改版位移）回 None，跟「頁上沒技能」的
         空 dict 區分開，呼叫端才知道該不該退回按鍵舊法。
         """
@@ -311,9 +314,23 @@ class Reader:
         if cells is None:
             return None
         out: dict[int, int] = {}
+        empty: set[int] = set()
         for vk in vks:
             if VK_F1 <= vk < VK_F1 + SLOTS:
                 c = cells[vk - VK_F1]
-                if c is not None and c.is_skill:
+                if c is None:
+                    empty.add(vk)
+                elif c.is_skill:
                     out[vk] = c.value
-        return out
+        return out, empty
+
+    def skills(self, vks) -> dict[int, int] | None:
+        """這些（F 鍵）鍵碼各對到目前頁上的哪個技能 → {鍵碼: 技能 ID}。
+
+        **只收技能格** —— 空格、物品格、非 F 鍵都不會出現在結果裡。
+        要分辨「空格」與「物品格」請改用 `look()`（掛機的空格＝普攻走那條）。
+        整頁讀不到（沒進遊戲／改版位移）回 None，跟「頁上沒技能」的
+        空 dict 區分開，呼叫端才知道該不該退回按鍵舊法。
+        """
+        got = self.look(vks)
+        return None if got is None else got[0]
