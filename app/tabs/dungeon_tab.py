@@ -113,8 +113,10 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
+    QWidget,
     QWidgetAction,
 )
 
@@ -701,19 +703,158 @@ def _pick(items, want=None):
     return live[:1]
 
 
-class DungeonTab(BaseTab):
-    TAB_TITLE = "自動刷副本"
-    GROUP = GROUP_AUTO
-    ORDER = 6                        # 排在副本腳本製作（6）後面
+class EventLog:
+    """重要事件：**所有分身共用一份**（時間／帳號／事件），新的在最上面。
+
+    ★ 使用者 2026-09-06 要的那張表（幾場完整完成／死亡／斷線／進不去、停機原因、
+      卡住），2026-09-20 改成每台分身一個分頁之後仍然**共用一份** —— 表上本來就有
+      帳號欄，一眼看完所有分身比每頁各一張有用。「重新計算」清的也是整份。
+    ⚠ 只留 EVENTS_MAX 筆、關程式清空（跟自動回連的紀錄同規矩）。
+    ⚠ 視窗開著時是**插一列**、不整張重畫（[[qt-ui-pitfalls]] 追加式紀錄表）。
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, str, str, str]] = []
+        self.dlg = None
+        self.tbl = None
+        self.head = None
 
     # ------------------------------------------------------------------
-    def build_ui(self) -> None:
-        self._scanners: dict[int, MemoryScanner] = {}
-        self._hwnds: dict[int, int] = {}
-        self._titles: dict[int, str] = {}   # pid → 視窗標題（看分流用）
+    def add(self, acct: str, kind: str, text: str) -> None:
+        row = (time.strftime("%m/%d %H:%M:%S"), acct, kind, text)
+        self.rows.insert(0, row)
+        del self.rows[EVENTS_MAX:]
+        if self.tbl is None or self.dlg is None or not self.dlg.isVisible():
+            return
+        try:
+            self.tbl.insertRow(0)
+            for c, cell in enumerate(self.cells(row)):
+                self.tbl.setItem(0, c, QTableWidgetItem(cell))
+            while self.tbl.rowCount() > EVENTS_MAX:
+                self.tbl.removeRow(self.tbl.rowCount() - 1)
+            if self.head is not None:
+                self.head.setText(self.summary())
+        except RuntimeError:                             # 視窗已被刪掉
+            self.dlg = self.tbl = self.head = None
+
+    @staticmethod
+    def cells(row) -> tuple[str, str, str]:
+        ts, acct, _kind, text = row
+        return ts, acct, text
+
+    def summary(self) -> str:
+        """各帳號的場數統計：完整完成／死亡當成完成／斷線當成完成／進不去當成完成，
+        另加停機幾次、卡住幾次。"""
+        per: dict[str, dict[str, int]] = {}
+        for _ts, acct, kind, _text in self.rows:
+            per.setdefault(acct, {})
+            per[acct][kind] = per[acct].get(kind, 0) + 1
+        if not per:
+            return "還沒有事件 —— 開跑之後每一場怎麼結束、停機原因、卡住都會記在這裡。"
+        lines = []
+        for acct, cnt in per.items():
+            parts = [f"{label} {cnt.get(k, 0)} 場" for k, label in EVENT_ROUND_KINDS]
+            extra = []
+            if cnt.get("stop"):
+                extra.append(f"停機 {cnt['stop']} 次")
+            if cnt.get("stuck"):
+                extra.append(f"卡住 {cnt['stuck']} 次")
+            lines.append(f"{acct}：" + "／".join(parts)
+                         + (f"（{'、'.join(extra)}）" if extra else ""))
+        return "\n".join(lines)
+
+    def reset(self) -> None:
+        """「重新計算」：清紀錄、統計歸零（⛔ 不動任何一頁正在跑的那一趟）。"""
+        self.rows.clear()
+        try:
+            if self.tbl is not None:
+                self.tbl.setRowCount(0)
+            if self.head is not None:
+                self.head.setText(self.summary())
+        except RuntimeError:                             # 視窗已被刪掉
+            self.dlg = self.tbl = self.head = None
+
+    def show(self, parent) -> None:
+        """開（或叫回）事件視窗。非強制回應，開著照跑、有新事件就插列。"""
+        if self.dlg is not None and self.dlg.isVisible():
+            self.dlg.raise_()
+            self.dlg.activateWindow()
+            return
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("自動刷副本 — 重要事件（全部分身）")
+        dlg.resize(760, 420)
+        lay = QVBoxLayout(dlg)
+        head = QLabel(self.summary())
+        head.setWordWrap(True)
+        head.setStyleSheet("font-weight: bold;")
+        lay.addWidget(head)
+        hint = QLabel(f"從程式開啟以來**所有分身**的事件，最新的在最上面"
+                      f"（最多保留 {EVENTS_MAX} 筆，關閉程式就清空）。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.TEXT_MUT};")
+        lay.addWidget(hint)
+        tbl = QTableWidget(0, 3)
+        tbl.setHorizontalHeaderLabels(["時間", "帳號", "事件"])
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.NoSelection)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setAlternatingRowColors(True)
+        tbl.setWordWrap(False)
+        hh = tbl.horizontalHeader()
+        # ⚠ 不開 ResizeToContents（qt-ui-pitfalls 5d）：前兩欄照字寬釘一次，「事件」吃剩下的。
+        fm = tbl.fontMetrics()
+        hh.setSectionResizeMode(QHeaderView.Stretch)
+        for col, sample in ((0, "00/00 00:00:00"), (1, "w" * 14)):
+            hh.setSectionResizeMode(col, QHeaderView.Fixed)
+            hh.resizeSection(col, fm.horizontalAdvance(sample) + 24)
+        tbl.setRowCount(len(self.rows))
+        for r, row in enumerate(self.rows):
+            for c, cell in enumerate(self.cells(row)):
+                tbl.setItem(r, c, QTableWidgetItem(cell))
+        lay.addWidget(tbl, 1)
+        # ★ 「重新計算」（使用者 2026-09-20 要求）：把紀錄清乾淨、統計歸零，
+        #   從按下去那一刻重新算（跟「副本收益」那顆同一個意思）。
+        #   ⚠ 只清紀錄與統計，**不影響任何一頁正在跑的那一趟**。
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        reset_btn = QPushButton("重新計算")
+        reset_btn.setToolTip("把事件紀錄與上面的場數統計清空，從現在重新開始算"
+                             "（不會影響正在跑的副本）。")
+        reset_btn.clicked.connect(self.reset)
+        bar.addWidget(reset_btn)
+        lay.addLayout(bar)
+        self.dlg, self.tbl, self.head = dlg, tbl, head
+        dlg._tbl, dlg._head, dlg._reset = tbl, head, reset_btn
+        dlg.show()
+
+
+class CharDungeonPage(QWidget):
+    """**一台分身**的自動刷副本：腳本、技能鍵、開跑鈕，整套跑副本的邏輯都在這裡。
+
+    ★★★★ 2026-09-20 使用者要求：「目前自動刷副本一次只能跑一個人，而且在跑的時候
+      還不能切換分身，這要改掉，每個都是獨立的並且可以全部同時跑」→ 照自動掛機那一頁
+      的做法拆成兩層：容器 `DungeonTab`（列分身、對帳、共用資源）＋這個類別（一台一份）。
+      ⛔ 從此**沒有「換分身就停機」這件事** —— 每一頁自己的腳本、自己的跳板、
+      自己的執行緒，切到別頁只是不看它而已。
+    共用的東西由容器給（`tab`）：掃描執行緒、地形快取、重要事件表、各 pid 的 scanner。
+    ⚠ 這一頁的身分是**帳號**不是 pid：遊戲閃退／斷線重開時 pid 會變，這一頁留著自己的
+      進度等同一個帳號回來再接上（見 `_offline_tick` → `_adopt_client`）。
+    """
+
+    def __init__(self, tab, pid: int, sc, hwnd: int, acct: str,
+                 char_name: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self.tab = tab                       # 容器（DungeonTab）
+        self.account = acct                  # 這一頁是誰（設定、斷線重連都認它）
+        self.char_name = char_name or acct   # 分頁標籤；背景解出來才換
+        self.build_ui(pid, sc, hwnd)
+
+    # ------------------------------------------------------------------
+    def build_ui(self, pid: int, sc, hwnd: int) -> None:
         self._mover = None
-        self._pid = None
-        self._sc = None
+        self._pid = pid
+        self._sc = sc
+        self._hwnd = hwnd
         self._script = None
         self._keys = None            # KeyWorker
         self._atk = None             # TargetWorker
@@ -733,19 +874,17 @@ class DungeonTab(BaseTab):
         # 副本收益（照帳號各一份；只在人在副本裡跑腳本時對帳，見 _loot_tick）
         self._loots: dict[str, loot.Loot] = {}
         self._loot_dlg = None
-        # 重要事件（時間, 帳號, 種類, 文字），新的在前；視窗開著時插列更新
-        self._events: list[tuple[str, str, str, str]] = []
-        self._events_dlg = None
-        self._events_tbl = None
-        self._events_head = None
+        # 重要事件：**全部分身共用一份**（表上有帳號欄，一眼看完所有分身）——
+        # 容器持有（EventLog），這裡只留參照。
+        self._log = self.tab.events
         self._qb_sc = None           # 技能鍵標名字用的 Reader（跟著分身換）
         self._qb_ui = None
-        self._scan = ScanWorker()
-        self._scan.done.connect(self._on_scan)
-        self._scan.start()
+        # ★ 掃描執行緒與地形快取**所有分身共用一份**（容器建的）：掃描本來就照
+        #   pid 排隊、熱區也照 pid 記；地形快取共用還省下每台一份地圖的記憶體。
         # ⚠ 尋路跟我們自己**共用同一份**地形快取：兩份的話門開了只有一邊
         #   會跟上，另一邊拿舊的牆算路（使用者 2026-09-02 提醒門會開關）。
-        self._maps = terrain.Cache()
+        self._scan = self.tab.scan
+        self._maps = self.tab.maps
         self._nav = navigate.Navigator(self._maps)
         self._runlog = None            # 執行紀錄檔（開跑才開，見 RUNLOG_NAME）
         self._runlog_last = ""
@@ -798,19 +937,9 @@ class DungeonTab(BaseTab):
                      self.tg_id.text()))
         _NOTIFY_PAGES.add(self)
 
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("分身"))
-        self.who = QComboBox()
-        self.who.setFixedWidth(240)
-        self.who.currentIndexChanged.connect(self._on_who_changed)
-        bar.addWidget(self.who)
-        b = QPushButton("重新整理")
-        b.setToolTip("重新列出目前開著的遊戲分身。")
-        b.clicked.connect(lambda: self.reload_instances(force_names=True))
-        bar.addWidget(b)
-        bar.addStretch(1)
-        root.addLayout(bar)
-
+        # ⛔ 這裡原本有「分身」下拉＋重新整理鈕（換一台就 `_stop("換了分身")`）——
+        #   2026-09-20 整條拿掉：現在一台分身一個分頁（容器 DungeonTab 在管），
+        #   切分頁不會停機，每一頁各跑各的。
         sbar = QHBoxLayout()
         sbar.addWidget(QLabel("腳本"))
         self.files = QComboBox()
@@ -1012,9 +1141,8 @@ class DungeonTab(BaseTab):
         root.addWidget(self.status)
         self._notifier.failed.connect(self.status.setText)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(TICK_MS)
+        # ⚠ 心跳在容器那邊（一條 QTimer 轉給每一頁，見 `DungeonTab._tick_pages`）——
+        #   一台一條 QTimer 只是白耗。
         self._reload_files()
         self._load_settings()
         self._load_notify()
@@ -1023,54 +1151,23 @@ class DungeonTab(BaseTab):
     # 分身與腳本
     # ------------------------------------------------------------------
     def on_show(self) -> None:
-        if not self._scanners:
-            self.reload_instances()
+        """切到這一頁（或切回這個分類）時：腳本清單與設定重讀一次。
+        ⛔ 已經沒有「列舉分身」這件事了 —— 那是容器（DungeonTab）在做。"""
         self._reload_files()
         self._load_settings()
 
-    def reload_instances(self, force_names: bool = False) -> None:
-        self._stop(quiet=True)
-        self.who.blockSignals(True)
-        self.who.clear()
-        for sc in self._scanners.values():
-            sc.close()
-        self._scanners.clear()
-        self._hwnds.clear()
-        seen = set()
-        for w in win.enumerate_windows(title_contains="Angels Online"):
-            if "_MIDAGEONL_" not in w.class_name or w.pid in seen:
-                continue
-            seen.add(w.pid)
-            sc = MemoryScanner()
-            try:
-                sc.open(w.pid)
-            except Exception:                            # noqa: BLE001
-                continue
-            try:
-                locate.warm(sc)
-            except Exception:                            # noqa: BLE001
-                pass
-            acc = charname.account_from_title(w.title)
-            self._scanners[w.pid] = sc
-            self._hwnds[w.pid] = w.hwnd
-            self._titles[w.pid] = w.title
-            self.who.addItem(
-                f"{preload.name_of(w.pid, sc, acc, force=force_names)}"
-                f"（{acc}）", w.pid)
-        # ★ 挑回上次用的那一台（使用者 2026-09-02：設定要記在使用者那邊）
-        last = str(config.get("dungeon.last_account", "") or "")
-        if last:
-            self.who.blockSignals(True)
-            for i in range(self.who.count()):
-                if f"（{last}）" in self.who.itemText(i):
-                    self.who.setCurrentIndex(i)
-                    break
-            self.who.blockSignals(False)
-        self.who.blockSignals(False)
-        if not self._scanners:
-            self.status.setText("找不到分身 —— 遊戲開著嗎？")
-        self._refresh_partner_box()
-        self._load_settings()
+    def attach_client(self, w, sc) -> None:
+        """容器對帳時發現「同一個帳號換了視窗」（閃退重開／手動重登）→ 換過來。
+
+        ⚠ **只有沒在跑的時候**容器才會叫這一支：正在跑的那一頁自己有一套等回線的
+          流程（`_offline_tick`：要等進到世界、站穩才接手），在那之前先被換掉 pid
+          的話整套判斷就亂了。
+        """
+        self._pid = int(w.pid)
+        self._sc = sc
+        self.sc = sc
+        self._hwnd = int(w.hwnd)
+        self.tab.note_client(w)
 
     # ------------------------------------------------------------------
     # 設定（存在使用者那邊的 config.json，使用者 2026-09-02 要求）
@@ -1080,11 +1177,8 @@ class DungeonTab(BaseTab):
         return f"dungeon.{self._account()}.{field}"
 
     def _account(self) -> str:
-        """目前選的分身帳號（拿不到就用 'default'，設定照樣存得住）。"""
-        txt = self.who.currentText() or ""
-        if "（" in txt and txt.endswith("）"):
-            return txt[txt.rindex("（") + 1:-1]
-        return txt or "default"
+        """這一頁的帳號 —— 設定就存在這個名字底下（拿不到用 'default'）。"""
+        return self.account or "default"
 
     def _on_start_toggled(self, on: bool) -> None:
         """「從第幾步開始」的開關：沒打開下拉是灰的（而且一律從第 1 步）。不存設定。"""
@@ -1307,7 +1401,6 @@ class DungeonTab(BaseTab):
         config.set(self._key("partner"),
                    self.partner_box.currentText().split("（")[-1].rstrip("）")
                    if self.partner_box.currentIndex() >= 0 else "")
-        config.set("dungeon.last_account", self._account())
         config.save()
 
     def _load_settings(self) -> None:
@@ -1341,7 +1434,7 @@ class DungeonTab(BaseTab):
             mode = str(config.get(self._key("party"), "none") or "none")
             j = self.party_box.findData(mode)
             self.party_box.setCurrentIndex(j if j >= 0 else 0)
-            self._refresh_partner_box()
+            self.refresh_partner_box()
             want = str(config.get(self._key("partner"), "") or "")
             if want:
                 for k in range(self.partner_box.count()):
@@ -1417,25 +1510,21 @@ class DungeonTab(BaseTab):
         self._refresh_start_box()
         self._save_settings()
 
-    def _on_who_changed(self) -> None:
-        # 換分身＝換一個人的設定（腳本／技能鍵／起始步驟各記各的）
-        self._stop("換了分身")
-        self._load_settings()
-
     def _on_party_changed(self) -> None:
         self.partner_box.setEnabled(self.party_box.currentData() == "bind")
         self._save_settings()
 
-    def _refresh_partner_box(self) -> None:
-        """綁定分身的候選＝其他開著的分身（排掉自己）。"""
+    def refresh_partner_box(self) -> None:
+        """綁定分身的候選＝**其他分頁**（容器給的；排掉自己）。容器每次對帳完會叫。
+
+        ⚠ 只列出來，不在這裡擋「那台自己也在刷副本」—— 那是開跑當下才驗得準
+          （見 `_attach`），現在擋了他中途把對方停掉也選不回來。
+        """
         keep = self.partner_box.currentText()
-        me = self.who.currentData()
         self.partner_box.blockSignals(True)
         self.partner_box.clear()
-        for i in range(self.who.count()):
-            pid = self.who.itemData(i)
-            if pid != me:
-                self.partner_box.addItem(self.who.itemText(i), pid)
+        for label, pid in self.tab.sibling_items(self):
+            self.partner_box.addItem(label, pid)
         k = self.partner_box.findText(keep)
         if k >= 0:
             self.partner_box.setCurrentIndex(k)
@@ -1524,7 +1613,7 @@ class DungeonTab(BaseTab):
         ⚠ 這一頁的分身是可以換的，所以 Reader 每次照「現在選的那台」開，
           不像掛機頁綁死一顆（換了分身還用舊的＝標到別隻角色的技能）。
         """
-        sc = self._scanners.get(self.who.currentData())
+        sc = self._sc
         cells = None
         if sc is not None:
             if getattr(self, "_qb_sc", None) is not sc:
@@ -1725,7 +1814,7 @@ class DungeonTab(BaseTab):
         if not on:
             self._stop("已停止")
             return
-        pid = self.who.currentData()
+        pid = self._pid
         path = self.files.currentData()
         if pid is None:
             self._stop("先選一台分身")
@@ -1738,7 +1827,7 @@ class DungeonTab(BaseTab):
         if script is None:
             self._stop(f"⚠ 腳本讀不進來：{why}")
             return
-        sc = self._scanners.get(int(pid))
+        sc = self._sc
         if sc is None:
             self._stop("這台分身不見了")
             return
@@ -1852,12 +1941,19 @@ class DungeonTab(BaseTab):
         self._map_key = here
         if self._party == "bind":
             ppid = self.partner_box.currentData()
-            psc = self._scanners.get(ppid) if ppid is not None else None
+            psc = self.tab.scanner_for(ppid) if ppid is not None else None
             if psc is None or ppid == pid:
                 self._stop("⛔ 綁定分身：先在「綁定分身」選另一台開著的分身")
                 return False
-            mine = charname.channel_from_title(self._titles.get(pid, ""))
-            his = charname.channel_from_title(self._titles.get(ppid, ""))
+            # ★★ 2026-09-20（改成每台各跑各的之後才會發生）：綁的那台**自己也在
+            #   刷副本**＝兩邊會同時指揮同一隻角色（走位、組隊互相搶）→ 大聲擋下來。
+            pp = self.tab.page_of_pid(ppid)
+            if pp is not None and pp is not self and pp.run_cb.isChecked():
+                self._stop(f"⛔ 綁定分身「{pp.char_name}」自己也在刷副本 —— "
+                           "同一隻會被兩邊搶；先把它那一頁停掉再開")
+                return False
+            mine = charname.channel_from_title(self.tab.titles.get(pid, ""))
+            his = charname.channel_from_title(self.tab.titles.get(ppid, ""))
             if mine and his and mine != his:
                 # 跨分流組不了隊（實測：邀請送得出去、對方永遠收不到）
                 self._stop(f"⛔ 綁定分身在「{his}」、你在「{mine}」—— 跨分流組不了隊，"
@@ -1870,7 +1966,7 @@ class DungeonTab(BaseTab):
                 return False
             self._ppid, self._psc = ppid, psc
             self._partner_name = self.partner_box.currentText().split("（")[0].strip()
-            self._my_name = (self.who.currentText() or "").split("（")[0].strip()
+            self._my_name = self.char_name
         if presupply:
             # 休息完再刷：先補給（回程＝入口那張圖），補完 _plan_route → back → team → go
             self._refresh_steps()
@@ -1928,13 +2024,13 @@ class DungeonTab(BaseTab):
         self._reset_run()
         self._rounds = rounds            # 趟數跨批次累計（只拿來顯示）
         # 帳號：斷線後靠它認「同一個帳號回來了」（標題讀不到就退回下拉選的那個）
-        self._acct = (charname.account_from_title(self._titles.get(pid, ""))
+        self._acct = (charname.account_from_title(self.tab.titles.get(pid, ""))
                       or self._account())
         self._atk = TargetWorker(sc)
         self._atk.died.connect(self._on_died)
         self._atk.packets = True
         self._atk.start()
-        self._keys = KeyWorker(self._hwnds.get(pid, 0), sc)
+        self._keys = KeyWorker(self._hwnd or 0, sc)
         self._keys.mode = MODE_PACKET
         self._keys.packets = True
         self._keys.mover = self._mover
@@ -5397,49 +5493,29 @@ class DungeonTab(BaseTab):
         return None
 
     def _adopt_client(self, w):
-        """接上這個視窗：pid 沒變就沿用 scanner；換了就開新的、收掉舊的、把下拉那一項
-        的 pid 換掉（⛔ 不重建下拉：重建會觸發「換了分身」把整趟停掉）。回 scanner，
-        開不了回 None。"""
+        """接上這個視窗（同一個帳號、可能是新的 pid）。回 scanner，開不了回 None。
+
+        ★ 遊戲閃退／斷線重開之後 pid 會變，但**這一頁還是同一個帳號的**：
+          scanner 跟容器要（一個 pid 一份，分頁之間共用），舊的那個 pid 沒人用了
+          就請容器收掉。⛔ 分頁本身不重建 —— 重建就把整趟進度丟了。
+        """
         old = self._pid
         if w.pid == old and self._sc is not None:
             sc = self._sc                                # 同一個行程回來了（手動重登）
         else:
-            sc = self._scanners.get(w.pid)
+            sc = self.tab.scanner_for(w.pid)
             if sc is None:
-                sc = MemoryScanner()
-                try:
-                    sc.open(w.pid)
-                except Exception:                        # noqa: BLE001
-                    return None
-                try:
-                    locate.warm(sc)
-                except Exception:                        # noqa: BLE001
-                    pass
-                self._scanners[w.pid] = sc
+                return None
         if old is not None and old != w.pid:
-            osc = self._scanners.pop(old, None)
-            if osc is not None and osc is not sc:
-                try:
-                    osc.close()
-                except Exception:                        # noqa: BLE001
-                    pass
-            self._hwnds.pop(old, None)
-            self._titles.pop(old, None)
-            try:
-                preload.forget(old)
-            except Exception:                            # noqa: BLE001
-                pass
-            for i in range(self.who.count()):
-                if self.who.itemData(i) == old:
-                    self.who.setItemData(i, w.pid)
-                    break
+            self.tab.drop_client(old, keep=sc)
             for i in range(self.partner_box.count()):
                 if self.partner_box.itemData(i) == old:
                     self.partner_box.setItemData(i, w.pid)
                     break
         self._pid, self._sc = w.pid, sc
-        self._hwnds[w.pid] = w.hwnd
-        self._titles[w.pid] = w.title
+        self.sc = sc
+        self._hwnd = w.hwnd
+        self.tab.note_client(w)
         return sc
 
     def _after_reconnect(self, w, sc, here) -> None:
@@ -5483,17 +5559,11 @@ class DungeonTab(BaseTab):
             self._event("warn", f"⚠ 綁定分身「{acct}」不在線上 → 這之後不組隊")
             self._notify(f"⚠ 綁定分身「{acct}」不在線上 → 這之後不組隊")
             return
-        psc = self._scanners.get(pw.pid)
+        psc = self.tab.scanner_for(pw.pid)
         if psc is None:
-            psc = MemoryScanner()
-            try:
-                psc.open(pw.pid)
-                locate.warm(psc)
-            except Exception:                            # noqa: BLE001
-                self._party = "none"
-                self._event("warn", f"⚠ 綁定分身「{acct}」接不上 → 這之後不組隊")
-                return
-            self._scanners[pw.pid] = psc
+            self._party = "none"
+            self._event("warn", f"⚠ 綁定分身「{acct}」接不上 → 這之後不組隊")
+            return
         try:
             self._pmover = move.acquire(pw.pid, injector.process_path(pw.pid), self)
         except Exception as exc:                         # noqa: BLE001
@@ -5502,7 +5572,7 @@ class DungeonTab(BaseTab):
             return
         self._ppid, self._psc = pw.pid, psc
         self._partner_name = txt.split("（")[0].strip()
-        self._my_name = (self.who.currentText() or "").split("（")[0].strip()
+        self._my_name = self.char_name
 
     # -- 進不去副本＝當這一批刷完（見 SCHED_DEFAULTS 的 give_up_min）-----------------
     def _on_no_entry(self) -> None:
@@ -5618,7 +5688,7 @@ class DungeonTab(BaseTab):
         acct = self._acct or self._account()
         lt = self._loot_for(acct)
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"副本收益 — {self.who.currentText() or acct}")
+        dlg.setWindowTitle(f"副本收益 — {self.char_name or acct}")
         v = QVBoxLayout(dlg)
         panel = loot_panel(dlg, lt, lambda: self._reset_loot(lt),
                            note="（只算人在副本裡跑腳本的時候）")
@@ -5628,124 +5698,50 @@ class DungeonTab(BaseTab):
         self._loot_dlg = dlg
         dlg.show()
 
-    # -- 重要事件（記憶體裡 EVENTS_MAX 筆、關程式清空）--------------------------------
+    # -- 重要事件（**全部分身共用一份**，實作在 EventLog）------------------------------
     def _event(self, kind: str, text: str) -> None:
-        """記一筆：時間／帳號／種類／文字。視窗開著時**插一列**（qt-ui-pitfalls 5d：
-        追加式紀錄表不整張重畫）。同一行也寫進執行紀錄檔（不節流）。"""
-        row = (time.strftime("%m/%d %H:%M:%S"), self._acct or self._account(), kind, text)
-        self._events.insert(0, row)
-        del self._events[EVENTS_MAX:]
-        self._runlog_write(f"◆ {text}", force=True)
-        tbl = self._events_tbl
-        if tbl is not None and self._events_dlg is not None and self._events_dlg.isVisible():
-            try:
-                tbl.insertRow(0)
-                for c, cell in enumerate(self._event_cells(row)):
-                    tbl.setItem(0, c, QTableWidgetItem(cell))
-                while tbl.rowCount() > EVENTS_MAX:
-                    tbl.removeRow(tbl.rowCount() - 1)
-                if self._events_head is not None:
-                    self._events_head.setText(self._events_summary())
-            except RuntimeError:                         # 視窗已被刪掉
-                self._events_tbl = self._events_dlg = self._events_head = None
+        """記一筆：時間／帳號／種類／文字。同一行也寫進**這一台自己的**執行紀錄檔。
 
-    @staticmethod
-    def _event_cells(row) -> tuple[str, str, str]:
-        ts, acct, _kind, text = row
-        return ts, acct, text
+        ★ 2026-09-20 起事件表是所有分身共用的（表上有帳號欄）——「重要事件」那顆鈕
+          不管從哪一頁按，看到的都是同一份、包含每一台。
+        """
+        self._runlog_write(f"◆ {text}", force=True)
+        self._log.add(self._acct or self._account(), kind, text)
 
     def _events_summary(self) -> str:
-        """各帳號的場數統計：完整完成／死亡當成完成／斷線當成完成／進不去當成完成，
-        另加停機幾次、卡住幾次。"""
-        per: dict[str, dict[str, int]] = {}
-        for _ts, acct, kind, _text in self._events:
-            per.setdefault(acct, {})
-            per[acct][kind] = per[acct].get(kind, 0) + 1
-        if not per:
-            return "還沒有事件 —— 開跑之後每一場怎麼結束、停機原因、卡住都會記在這裡。"
-        lines = []
-        for acct, cnt in per.items():
-            parts = [f"{label} {cnt.get(k, 0)} 場" for k, label in EVENT_ROUND_KINDS]
-            extra = []
-            if cnt.get("stop"):
-                extra.append(f"停機 {cnt['stop']} 次")
-            if cnt.get("stuck"):
-                extra.append(f"卡住 {cnt['stuck']} 次")
-            lines.append(f"{acct}：" + "／".join(parts)
-                         + (f"（{'、'.join(extra)}）" if extra else ""))
-        return "\n".join(lines)
+        return self._log.summary()
 
     def _show_events(self) -> None:
-        """「重要事件」鈕：開（或叫回）事件視窗。非強制回應，開著照跑、有新事件就插列。"""
-        if self._events_dlg is not None and self._events_dlg.isVisible():
-            self._events_dlg.raise_()
-            self._events_dlg.activateWindow()
-            return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("自動刷副本 — 重要事件")
-        dlg.resize(760, 420)
-        lay = QVBoxLayout(dlg)
-        head = QLabel(self._events_summary())
-        head.setWordWrap(True)
-        head.setStyleSheet("font-weight: bold;")
-        lay.addWidget(head)
-        hint = QLabel(f"從程式開啟以來的事件，最新的在最上面"
-                      f"（最多保留 {EVENTS_MAX} 筆，關閉程式就清空）。")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {theme.TEXT_MUT};")
-        lay.addWidget(hint)
-        tbl = QTableWidget(0, 3)
-        tbl.setHorizontalHeaderLabels(["時間", "帳號", "事件"])
-        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        tbl.setSelectionMode(QTableWidget.NoSelection)
-        tbl.verticalHeader().setVisible(False)
-        tbl.setAlternatingRowColors(True)
-        tbl.setWordWrap(False)
-        hh = tbl.horizontalHeader()
-        # ⚠ 不開 ResizeToContents（qt-ui-pitfalls 5d）：前兩欄照字寬釘一次，「事件」吃剩下的。
-        fm = tbl.fontMetrics()
-        hh.setSectionResizeMode(QHeaderView.Stretch)
-        for col, sample in ((0, "00/00 00:00:00"), (1, "w" * 14)):
-            hh.setSectionResizeMode(col, QHeaderView.Fixed)
-            hh.resizeSection(col, fm.horizontalAdvance(sample) + 24)
-        tbl.setRowCount(len(self._events))
-        for r, row in enumerate(self._events):
-            for c, cell in enumerate(self._event_cells(row)):
-                tbl.setItem(r, c, QTableWidgetItem(cell))
-        lay.addWidget(tbl, 1)
-        # ★ 「重新計算」（使用者 2026-09-20 要求）：把紀錄清乾淨、統計歸零，
-        #   從按下去那一刻重新算（跟「副本收益」那顆同一個意思）。
-        #   ⚠ 只清紀錄與統計，**不影響正在跑的那一趟**（場數進度在 _rounds）。
-        bar = QHBoxLayout()
-        bar.addStretch(1)
-        reset_btn = QPushButton("重新計算")
-        reset_btn.setToolTip("把事件紀錄與上面的場數統計清空，從現在重新開始算"
-                             "（不會影響正在跑的副本）。")
-        reset_btn.clicked.connect(self._reset_events)
-        bar.addWidget(reset_btn)
-        lay.addLayout(bar)
-        self._events_dlg, self._events_tbl, self._events_head = dlg, tbl, head
-        dlg._tbl, dlg._head, dlg._reset = tbl, head, reset_btn
-        dlg.show()
+        """「重要事件」鈕：開（或叫回）那個共用的視窗。開著照跑、有新事件就插列。"""
+        self._log.show(self)
 
     def _reset_events(self) -> None:
         """「重新計算」：事件紀錄與場數統計全部清掉，從現在重新算。"""
-        self._events.clear()
-        tbl, head = self._events_tbl, self._events_head
-        try:
-            if tbl is not None:
-                tbl.setRowCount(0)
-            if head is not None:
-                head.setText(self._events_summary())
-        except RuntimeError:                             # 視窗已被刪掉
-            self._events_tbl = self._events_dlg = self._events_head = None
+        self._log.reset()
+
+    # ⚠ 下面四個是**給離線測試與舊呼叫端**看的轉接（本體都在 EventLog）。
+    @property
+    def _events(self):
+        return self._log.rows
+
+    @property
+    def _events_dlg(self):
+        return self._log.dlg
+
+    @property
+    def _events_tbl(self):
+        return self._log.tbl
+
+    @property
+    def _events_head(self):
+        return self._log.head
 
     # -- 通知（跟自動掛機那一頁同一套、同一份設定）-----------------------
     def notify(self, msg: str) -> None:
         """送警報通知（受「啟用通知」總開關管；關掉只是不送，該停還是停）。"""
         if self._notifier is None or not self.notify_cb.isChecked():
             return
-        who = self.who.currentText() or "自動刷副本"
+        who = self.char_name or self.account or "自動刷副本"
         note = self._notifier.fire(who, msg)
         self.status.setText(self.status.text() + f"　[{note}]")
 
@@ -6055,6 +6051,287 @@ class DungeonTab(BaseTab):
 
     # ------------------------------------------------------------------
     def on_close(self) -> None:
+        """收掉**這一頁**：停跑、還跳板、停自己的執行緒。
+
+        ⚠ 共用的東西（掃描執行緒、scanner、地形快取）由容器 `DungeonTab.on_close`
+          收 —— 這裡收的話別頁就沒得用了。
+        ⚠⚠ 一定要有人叫到這裡：分頁是塞在 QTabWidget 裡的子視窗，Qt 不會對它
+          發 close 事件；主視窗關閉走的是 `MainWindow.closeEvent` → 各分頁
+          `on_close()` → 容器再逐頁叫這一支。掃描執行緒沒收好會丟
+          「QThread: Destroyed while thread is still running」甚至 0xC0000409。
+        """
+        self._stop(quiet=True)
+
+
+class DungeonTab(BaseTab):
+    """自動刷副本 —— **一台分身一個分頁，各跑各的、可以同時跑**。
+
+    ★★★★ 2026-09-20 使用者要求：「目前自動刷副本一次只能跑一個人而且在跑的時候
+      還不能切換分身，這要改掉，每個都是獨立的並且可以全部同時跑」。
+      這個類別只做四件事：列分身、對帳、發心跳、拿著大家共用的東西。
+      真正在跑副本的是 `CharDungeonPage`（一台一份）。
+
+    ## 分頁是照**帳號**收的，不是照 pid（跟自動掛機那一頁不一樣）
+
+    刷副本的一趟會跨越「遊戲閃退／斷線重開」：那一頁要留著自己的進度，等**同一個
+    帳號**登回來（pid 會變）再接上去繼續（`CharDungeonPage._offline_tick` →
+    `_adopt_client`）。照 pid 收的話那台一消失分頁就被拆掉，整趟進度就沒了。
+    ⚠ 身分一律用**視窗標題裡的帳號**驗（[[client-watch-and-intent]] 8/15 事故：
+      只認 pid 會讓 A 的分頁指揮 B 的角色）。還沒登入（標題沒帳號）的視窗不開分頁
+      —— 設定本來就是照帳號存的，沒登入也沒得設；上面那行字會講還有幾台沒登入。
+
+    ## 共用的東西（放這裡，不是每頁一份）
+
+    · `scan`：掃描執行緒（本來就照 pid 排隊、熱區也照 pid 記）
+    · `maps`：地形快取（每頁一份的話同一張圖會載很多次）
+    · `events`：重要事件（表上有帳號欄，所有分身共用一份）
+    · `scanners`：pid → MemoryScanner（綁定分身那種「A 頁要讀 B 台」也走這裡，
+      一個 pid 只開一份控制碼）
+    """
+
+    TAB_TITLE = "自動刷副本"
+    GROUP = GROUP_AUTO
+    ORDER = 6                        # 排在副本腳本製作（6）後面
+    WATCH_MS = 3000                  # 多久對一次帳（跟自動掛機同節奏）
+    RESOLVE_RETRY_SECS = 10.0        # 角色名還沒解出來時，多久在背景重讀一次
+
+    # ------------------------------------------------------------------
+    def build_ui(self) -> None:
+        self.pages: dict[str, CharDungeonPage] = {}     # 帳號 → 分頁
+        self.scanners: dict[int, MemoryScanner] = {}    # pid → scanner（分頁共用）
+        self.titles: dict[int, str] = {}                # pid → 視窗標題（看分流用）
+        self.events = EventLog()
+        self.maps = terrain.Cache()
+        self.scan = ScanWorker()
+        self.scan.done.connect(self._on_scan)
+        self.scan.start()
+        self._nm_busy: set[str] = set()                 # 正在背景讀名字的帳號
+        self._nm_done: dict[str, str] = {}              # 帳號 → 讀到的角色名
+        self._nm_next: dict[str, float] = {}            # 帳號 → 下次可以重讀的時刻
+        self._watch_timer = None
+
+        root = QVBoxLayout(self)
+        self.found = QLabel("尚未偵測")
+        self.found.setStyleSheet(f"color: {theme.TEXT_MUT};")
+        root.addWidget(self.found)
+        self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_page_shown)
+        root.addWidget(self.tabs, 1)
+
+        # ★ 一條心跳轉給每一頁（⛔ 不要一頁一條 QTimer）
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick_pages)
+        self._timer.start(TICK_MS)
+
+    # ------------------------------------------------------------------
+    def on_show(self) -> None:
+        """第一次切過來才開始對帳（懶載入照舊）；之後切走也繼續對 ——
+        刷副本中分身當掉／重開時，人多半正看著別頁。"""
+        if self._watch_timer is None:
+            self._watch_timer = QTimer(self)
+            self._watch_timer.timeout.connect(self._watch_tick)
+            self._watch_timer.start(self.WATCH_MS)
+        self._watch_tick()
+        self._on_page_shown()
+
+    def _on_page_shown(self, *_a) -> None:
+        page = self.tabs.currentWidget()
+        if isinstance(page, CharDungeonPage):
+            page.on_show()
+
+    # -- 共用資源 ------------------------------------------------------
+    def scanner_for(self, pid):
+        """這個 pid 的 scanner（沒有就開一份；開不了回 None）。一個 pid 只開一份 ——
+        綁定分身那種「A 頁要讀 B 台」也走這裡。"""
+        if pid is None:
+            return None
+        pid = int(pid)
+        sc = self.scanners.get(pid)
+        if sc is not None:
+            return sc
+        sc = MemoryScanner()
+        try:
+            sc.open(pid)
+        except Exception:                                # noqa: BLE001
+            return None
+        try:
+            locate.warm(sc)
+        except Exception:                                # noqa: BLE001
+            pass
+        self.scanners[pid] = sc
+        return sc
+
+    def drop_client(self, pid, keep=None) -> None:
+        """這個 pid 已經沒人用了 → 收掉 scanner 與快取。`keep` 是「別關的那一份」
+        （同一個行程重開時新舊可能是同一個物件）。"""
+        pid = int(pid)
+        sc = self.scanners.pop(pid, None)
+        if sc is not None and sc is not keep:
+            try:
+                sc.close()
+            except Exception:                            # noqa: BLE001
+                pass
+        self.titles.pop(pid, None)
+        try:
+            preload.forget(pid)
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def note_client(self, w) -> None:
+        """記下這個視窗的標題（看分流、驗帳號用）。"""
+        self.titles[int(w.pid)] = w.title
+
+    def page_of_pid(self, pid):
+        """現在**哪一頁**正在用這個 pid（沒有回 None）。"""
+        for page in self.pages.values():
+            if page._pid == pid:
+                return page
+        return None
+
+    def sibling_items(self, me) -> list[tuple[str, int]]:
+        """「綁定分身」的候選：其他分頁的 (標籤, pid)。"""
+        out = []
+        for page in self.pages.values():
+            if page is me or page._pid is None:
+                continue
+            out.append((f"{page.char_name}（{page.account}）", page._pid))
+        return out
+
+    def _on_scan(self, s) -> None:
+        """掃描結果 → 轉給**那個 pid 的那一頁**（一條執行緒服務所有分身）。"""
+        page = self.page_of_pid(s.pid)
+        if page is not None:
+            page._on_scan(s)
+
+    def _tick_pages(self) -> None:
+        for page in list(self.pages.values()):
+            page._tick()
+
+    # -- 分身對帳（照帳號）---------------------------------------------
+    def _watch_tick(self) -> None:
+        """每 WATCH_MS 對一次帳：新登入的開分頁、換了 pid 的接上去、
+        帳號不在了的收掉（**正在跑的留著**，它自己會等回線）。"""
+        # 1. 收背景解出來的角色名（換分頁標籤）
+        for acct, nm in list(self._nm_done.items()):
+            self._nm_done.pop(acct, None)
+            page = self.pages.get(acct)
+            if page is None or not nm or nm == page.char_name:
+                continue
+            page.char_name = nm
+            i = self.tabs.indexOf(page)
+            if i >= 0:
+                self.tabs.setTabText(i, nm)
+            self._refresh_partners()
+
+        # 2. 視窗對帳
+        # ⚠ 列舉失敗（系統記憶體吃緊時 EnumWindows 會回錯）→ **這一拍跳過**：
+        #   ⛔ 不可以把「問不到」當成「所有分身都關了」，那會把跑到一半的全收掉。
+        try:
+            wins = list(preload.windows())
+        except Exception:                                # noqa: BLE001
+            return
+        by_acct: dict[str, object] = {}
+        anon = 0
+        for w in wins:
+            acct = charname.account_from_title(w.title)
+            self.titles[int(w.pid)] = w.title
+            if acct:
+                by_acct.setdefault(acct, w)              # 同帳號多開：認第一個
+            else:
+                anon += 1
+
+        changed = False
+        for acct, w in by_acct.items():
+            page = self.pages.get(acct)
+            if page is None:
+                if self._new_page(acct, w):
+                    changed = True
+                continue
+            if page._pid != w.pid:
+                # 同一個帳號換了視窗（閃退重開、手動重登）。
+                # ⚠ **正在跑的那一頁不要在這裡動它** —— 它自己的等回線流程會接
+                #   （`_offline_tick`：要等進到世界、站穩才接手，這裡接等於搶在
+                #   它前面改 pid，整套判斷就亂了）。
+                if not page.run_cb.isChecked():
+                    sc = self.scanner_for(w.pid)
+                    if sc is not None:
+                        old = page._pid
+                        page.attach_client(w, sc)
+                        if old is not None and self.page_of_pid(old) is None:
+                            self.drop_client(old, keep=sc)
+                        changed = True
+
+        for acct in [a for a in self.pages if a not in by_acct]:
+            page = self.pages[acct]
+            if page.run_cb.isChecked():
+                continue        # 正在跑（多半是斷線等回線）→ 留著，別拆進度
+            self._drop_page(acct)
+            changed = True
+
+        # 3. 角色名還沒解出來的：丟背景執行緒重讀（節流、一個帳號一條）
+        #    ⚠ 一台約 0.7 秒，放 GUI 執行緒會一頓一頓的。
+        now = time.monotonic()
+        for acct, page in list(self.pages.items()):
+            if (page.char_name and page.char_name != acct) or acct in self._nm_busy:
+                continue
+            if now < self._nm_next.get(acct, 0.0):
+                continue
+            self._nm_next[acct] = now + self.RESOLVE_RETRY_SECS
+            self._nm_busy.add(acct)
+            threading.Thread(target=self._nm_worker,
+                             args=(acct, page._pid, page._sc),
+                             daemon=True).start()
+
+        note = f"偵測到 {len(self.pages)} 個分身" if self.pages else "找不到分身"
+        if anon:
+            note += f"（另有 {anon} 台還沒登入 —— 登入後才會開分頁）"
+        self.found.setText(note)
+        if changed:
+            self._refresh_partners()
+
+    def _nm_worker(self, acct: str, pid, sc) -> None:
+        try:
+            nm = preload.name_of(pid, sc, acct, force=True)
+        except Exception:                                # noqa: BLE001
+            nm = ""
+        self._nm_done[acct] = nm or ""
+        self._nm_busy.discard(acct)
+
+    def _new_page(self, acct: str, w) -> bool:
+        sc = self.scanner_for(w.pid)
+        if sc is None:
+            return False
+        try:
+            nm = preload.name_of(w.pid, sc, acct)        # 快取裡有就用，⛔ 不 force
+        except Exception:                                # noqa: BLE001
+            nm = acct
+        page = CharDungeonPage(self, int(w.pid), sc, int(w.hwnd), acct, nm)
+        self.pages[acct] = page
+        self.tabs.addTab(page, nm or acct)
+        return True
+
+    def _drop_page(self, acct: str) -> None:
+        page = self.pages.pop(acct, None)
+        if page is None:
+            return
+        i = self.tabs.indexOf(page)
+        if i >= 0:
+            self.tabs.removeTab(i)
+        pid = page._pid
+        try:
+            page.on_close()
+        except Exception:                                # noqa: BLE001
+            pass
+        page.deleteLater()
+        if pid is not None and self.page_of_pid(pid) is None:
+            self.drop_client(pid)
+
+    def _refresh_partners(self) -> None:
+        for page in self.pages.values():
+            page.refresh_partner_box()
+
+    # ------------------------------------------------------------------
+    def on_close(self) -> None:
         """應用程式關閉前的收尾。
 
         ⚠⚠ **一定要是 `on_close()` 不是 `closeEvent()`**：分頁是塞在
@@ -6065,9 +6342,19 @@ class DungeonTab(BaseTab):
           嚴重時直接 0xC0000409 當掉（跟自我監察那條同一個坑）。
         """
         self._timer.stop()
-        self._stop(quiet=True)
-        self._scan.stop()
-        self._scan.wait(800)
-        for sc in self._scanners.values():
-            sc.close()
-        self._scanners.clear()
+        if self._watch_timer is not None:
+            self._watch_timer.stop()
+        for page in list(self.pages.values()):
+            try:
+                page.on_close()
+            except Exception:                            # noqa: BLE001
+                pass
+        self.pages.clear()
+        self.scan.stop()
+        self.scan.wait(800)
+        for sc in self.scanners.values():
+            try:
+                sc.close()
+            except Exception:                            # noqa: BLE001
+                pass
+        self.scanners.clear()

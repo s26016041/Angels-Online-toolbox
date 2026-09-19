@@ -386,8 +386,15 @@ def wire(tab, fake):
 
 
 def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
-    """建一個分頁，內部狀態直接擺好，跳過「選分身／裝跳板」那一段。"""
-    tab = dt.DungeonTab()
+    """建一個分頁，內部狀態直接擺好，跳過「選分身／裝跳板」那一段。
+
+    ⚠ 2026-09-20 起自動刷副本是「容器 DungeonTab ＋ 一台分身一頁 CharDungeonPage」：
+      這裡建的是**分頁**（跑副本的邏輯都在它身上），容器只負責列分身、發心跳、
+      拿著共用的掃描執行緒／地形快取／重要事件表。
+    """
+    holder = dt.DungeonTab()
+    holder._timer.stop()                 # 心跳由測試自己推（run()）
+    tab = dt.CharDungeonPage(holder, 1, object(), 0, "acct", "測試角")
     tab._script = dungeon.Script(name="t", steps=list(steps))
     tab._sc = object()
     tab._pid = 1
@@ -409,10 +416,11 @@ def make_tab(steps, pos=(10.0, 10.0), props=(), mons=()):
     dt.player.locate_fast = lambda _sc: None   # 死亡判定的基準：測試裡自己塞
     tab._live_monsters = lambda: list(mons)
     tab._refresh_steps = lambda: None
-    # ⚠ 掃描是真的 QThread：測試裡換成假的（也順便收掉，不然一堆殘留執行緒）
-    tab._scan.stop()
-    tab._scan.wait(500)
-    tab._scan = FakeScan()
+    # ⚠ 掃描是真的 QThread（容器持有）：測試裡換成假的（也順便收掉，
+    #   不然一堆殘留執行緒）
+    holder.scan.stop()
+    holder.scan.wait(500)
+    tab._scan = holder.scan = FakeScan()
     tab.run_cb.blockSignals(True)
     tab.run_cb.setChecked(True)
     tab.run_cb.blockSignals(False)
@@ -1766,7 +1774,7 @@ def main() -> int:
         E(0x3300, 4, 5, "沒讀到血", 12.0, 10.0, kind=4, state="", hp=-1),
         # ★★★ 王打到剩不到 1%（整數百分比 → 0）：不管在不在出手都不准當屍體
         E(0x3400, 5, 5, "王 0% 還在打", 12.0, 10.0, kind=4, state="Att2", hp=0)]
-    live = [x.eid for x in dt.DungeonTab._live_monsters(tab)]
+    live = [x.eid for x in dt.CharDungeonPage._live_monsters(tab)]
     ck("★★★ 掃描快照：**只有 'Dead' 才算屍體**，血量 0 的一律留著",
        live == [1, 2, 4, 5], str(live))
 
@@ -2495,8 +2503,8 @@ def main() -> int:
        str(_cfg.get("dungeon.測試帳號.script")))
     ck("　舊 config 存了標籤字也找得到", tab._script_index("無限塔（內建）") == 1)
     ck("　py 那種不帶標的名字也找得到", tab._script_index("吞噬之間") == 0)
-    ck("　記得上次是哪一台分身",
-       _cfg.get("dungeon.last_account") == "測試帳號")
+    # ⛔ 「記得上次是哪一台分身」的規格 2026-09-20 沒了：現在一台分身一個分頁，
+    #    沒有「選哪一台」這件事（dungeon.last_account 不再寫）。
     # ⚠ `_load_settings` 會先照「目前選的腳本檔」重建下拉；測試裡沒有真的檔，
     #   所以把重建換掉 —— 要驗的是「重讀設定會把開關關掉、不套用舊的 start」。
     tab._refresh_start_box = lambda: None
@@ -3059,7 +3067,7 @@ def main() -> int:
         b.entrance = {"scene": 70, "to": [5.0, 6.0], "model": 60002, "menu": [1]}
         tab._queue = [tab._script, b]
         tab._qi = 0
-        tab._refresh_steps = lambda: dt.DungeonTab._refresh_steps(tab)   # 夾具停掉的，這組要真的
+        tab._refresh_steps = lambda: dt.CharDungeonPage._refresh_steps(tab)   # 夾具停掉的，這組要真的
         tab._refresh_steps()
         return tab
 
@@ -3362,12 +3370,11 @@ def main() -> int:
         else:
             tab = sched_tab(rounds, 60, True)
         tab._loop = loop
-        tab._sc = FakeAliveSc()
-        tab._scanners = {1: tab._sc}
-        tab.who.blockSignals(True)
-        tab.who.clear()
-        tab.who.addItem("小天使（acct）", 1)
-        tab.who.blockSignals(False)
+        tab._sc = tab.sc = FakeAliveSc()
+        # 容器持有 scanner／標題（分頁跟它要）——⚠ 2026-09-20 多分身改版
+        tab.tab.scanners = {1: tab._sc}
+        tab.tab.titles = {1: "Angels Online - acct"}
+        tab.char_name = "小天使"
         tab._keys, tab._atk = FakeWorker(), FakeWorker()
         tab._pos = [30.0, 30.0]
         world["here"] = 98
@@ -3432,10 +3439,11 @@ def main() -> int:
     run(tab, 14.0, watch=True)
     ck("★★★ 同帳號換了 pid 回來 → 接上新視窗 → 補給", tab._cycle == "supply"
        and tab._pid == 5 and tab._sc.opened == 5, f"{tab._cycle} pid={tab._pid}")
-    ck("　下拉那一項的 pid 換成新的（沒重建、沒觸發「換了分身」）",
-       tab.who.itemData(0) == 5 and tab.run_cb.isChecked(), str(tab.who.itemData(0)))
-    ck("　舊的 scanner 關掉、清單裡換成新的", old_sc.closed and 1 not in tab._scanners
-       and tab._scanners.get(5) is tab._sc)
+    ck("★★ 這一頁**沒有被拆掉**（還在跑，整趟進度留著）—— 2026-09-20 多分身改版",
+       tab.run_cb.isChecked() and tab._pid == 5, f"pid={tab._pid}")
+    ck("　舊的 scanner 關掉、容器換成新的那份",
+       old_sc.closed and 1 not in tab.tab.scanners
+       and tab.tab.scanners.get(5) is tab._sc)
     supply_gate.set()
 
     # ③ 崩潰對話框：連兩拍才算
@@ -3616,7 +3624,7 @@ def main() -> int:
     # =====================================================================
     print("\n重要事件")
     tab = off_tab()
-    tab._events.clear()
+    tab._log.rows.clear()
     tab._event("full", "第 1 趟：完整完成")
     tab._event("death", "第 2 趟：死亡當成完成")
     tab._event("offline", "第 3 趟：斷線當成完成")
@@ -3654,7 +3662,7 @@ def main() -> int:
     #   ⚠ 用「撞入口」那段驗純紀錄（沒勾副本設定＝沒有 N 分鐘放棄）：副本裡跑腳本那段
     #     9/7 起記事件跟收掉同一拍（見上面 ★★ 卡住那組）。
     tab = off_tab(rounds=None)
-    tab._events.clear()
+    tab._log.rows.clear()
     tab._phase, tab._cycle = "enter", "go"
     tab._enter_t = tab._poke_total = tab._poke_t = 0.0
     tab._stuck_watch(TICK)
@@ -3671,7 +3679,7 @@ def main() -> int:
        f"{tab._stuck_t} {tab._stuck_noted}")
     # 停機原因進重要事件（開跑之後）
     tab = off_tab()
-    tab._events.clear()
+    tab._log.rows.clear()
     tab._started = True
     tab._stop("⛔ 地圖變了")
     ck("★ 出問題停機 → 記「停機」", kinds(tab) == ["stop"] and "地圖變了" in tab._events[0][3],
@@ -4177,6 +4185,72 @@ def main() -> int:
        clicked0 and tab.portal_sent == [], f"{len(clicked0)} 發 {tab.portal_sent}")
     ck("　⛔ 也不會去撞（那是踩的傳點才有的動作）", tab._bump is None,
        str(tab._bump))
+
+    # =====================================================================
+    # ★★★★ 容器：一台分身一頁、各跑各的（使用者 2026-09-20）
+    # =====================================================================
+    print("")
+    print("多分身（容器 DungeonTab）")
+    keep_wins, keep_mem = NET["wins"], dt.MemoryScanner
+    dt.MemoryScanner = FakeAliveSc
+    dt.preload.name_of = lambda pid, sc, acct, force=False: f"角色{pid}"
+    holder = dt.DungeonTab()
+    holder._timer.stop()
+    NET["wins"] = [FakeWin(1, "aaa"), FakeWin(2, "bbb")]
+    holder._watch_tick()
+    ck("★ 兩台登入的分身 → 開兩頁", sorted(holder.pages) == ["aaa", "bbb"],
+       str(sorted(holder.pages)))
+    ck("　分頁標籤是角色名", holder.tabs.tabText(0) == "角色1",
+       holder.tabs.tabText(0))
+    ck("　各自記各自的帳號（設定鍵照帳號分開）",
+       holder.pages["aaa"]._key("script") == "dungeon.aaa.script",
+       holder.pages["aaa"]._key("script"))
+    ck("★ 掃描結果照 pid 送對頁", holder.page_of_pid(2) is holder.pages["bbb"])
+    ck("★ 「綁定分身」只列別台",
+       holder.sibling_items(holder.pages["aaa"]) == [("角色2（bbb）", 2)],
+       str(holder.sibling_items(holder.pages["aaa"])))
+    ck("　重要事件是共用的一份",
+       holder.pages["aaa"]._log is holder.pages["bbb"]._log)
+    holder.pages["aaa"]._event("full", "甲完成一場")
+    holder.pages["bbb"]._event("full", "乙完成一場")
+    ck("★ 兩台的事件都進同一張表（帳號欄分得出誰是誰）",
+       [r[1] for r in holder.events.rows] == ["bbb", "aaa"],
+       str([r[1] for r in holder.events.rows]))
+    # 還沒登入的視窗不開分頁（標題沒帳號 → 設定沒地方存）
+    NET["wins"] = [FakeWin(1, "aaa"), FakeWin(2, "bbb"), FakeWin(3, "")]
+    holder._watch_tick()
+    ck("★ 還沒登入的那台不開分頁、但字要講出來", len(holder.pages) == 2
+       and "還沒登入" in holder.found.text(), holder.found.text())
+    # 沒在跑的那台不見了 → 收掉
+    NET["wins"] = [FakeWin(1, "aaa")]
+    holder._watch_tick()
+    ck("★ 分身關掉（沒在跑）→ 收掉那一頁", sorted(holder.pages) == ["aaa"],
+       str(sorted(holder.pages)))
+    # ★★★ 正在跑的那台不見了 → **不准拆**（它自己在等回線，整趟進度要留著）
+    NET["wins"] = [FakeWin(1, "aaa"), FakeWin(2, "bbb")]
+    holder._watch_tick()
+    run_page = holder.pages["bbb"]
+    run_page.run_cb.blockSignals(True)
+    run_page.run_cb.setChecked(True)
+    run_page.run_cb.blockSignals(False)
+    NET["wins"] = [FakeWin(1, "aaa")]
+    holder._watch_tick()
+    ck("★★★ 正在跑的那一頁：分身不見了也**留著**（等回線，⛔ 不丟進度）",
+       holder.pages.get("bbb") is run_page, str(sorted(holder.pages)))
+    # 同帳號換了 pid：沒在跑的那頁當場換過去
+    NET["wins"] = [FakeWin(9, "aaa"), FakeWin(2, "bbb")]
+    holder._watch_tick()
+    ck("★ 沒在跑的那頁：同帳號換了 pid → 直接接上新的",
+       holder.pages["aaa"]._pid == 9, str(holder.pages["aaa"]._pid))
+    ck("　⛔ 正在跑的那頁不在這裡被換（它自己的等回線流程會接）",
+       run_page._pid != 2 or run_page.run_cb.isChecked())
+    run_page.run_cb.blockSignals(True)
+    run_page.run_cb.setChecked(False)
+    run_page.run_cb.blockSignals(False)
+    holder.on_close()
+    ck("　收尾：分頁清空、掃描執行緒停掉",
+       not holder.pages and not holder.scan.isRunning())
+    NET["wins"], dt.MemoryScanner = keep_wins, keep_mem
 
     print(f"\n通過 {PASS}　失敗 {FAIL}")
     return 1 if FAIL else 0
