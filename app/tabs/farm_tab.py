@@ -3547,6 +3547,14 @@ class CharFarmPage(QWidget):
         if self._supply_result is not None:
             ok, msg = self._supply_result
             self._supply_result = None
+            # ★★★ 「20 秒都講不到話」→ **通知＋停機**（使用者 2026-09-20 定）。
+            #   這不是暫時性失敗：人已經走到商人旁邊、官方的 TryAct 也送了
+            #   十發（每 2 秒一發），還是開不了對話 —— 再跑一趟只是再燒一張翼，
+            #   而且沒買到水的話接下來也撐不住。訊息裡那句話由 supply 給
+            #   （supply.TALK_FAIL，只有那一份）。
+            if not ok and supply.TALK_FAIL in msg:
+                self._end_supply(f"🔧 {msg} → 已停止掛機", stop=True)
+                return True
             # ★★ 補給回來裝備**還是壞的**？連續兩趟就大聲停 —— 那不是暫時性
             #   失敗（該城沒維修商／修裝一直失敗），再重試只是每趟燒一張翼
             #   （跟 produce_tab 同一套煞車）。
@@ -3804,6 +3812,11 @@ class CharFarmPage(QWidget):
                 ok, msg = self._train_result
                 self._train_result = None
                 self._train_supply = False
+                # ★★★ 「20 秒都講不到話」→ 通知＋停止（跟掛機那條同一個規矩，
+                #   使用者 2026-09-20 定）：買不到水，練技再跑下去也是白跑。
+                if not ok and supply.TALK_FAIL in msg:
+                    self._train_stop(f"🥋 練技補給：{msg} → 自動練技已停止")
+                    return
                 # ⛔⛔ **這裡不准判「藥水還是見底」** —— 落地那一瞬間背包還在
                 #   同步，數到 0 是假的（詳見 `_supply_tick` 收尾那段的 ⛔⛔，
                 #   2026-08-24 北極狐實錘）。煞車改在下面那個安定的見底檢查上數。
