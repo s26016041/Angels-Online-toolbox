@@ -3633,6 +3633,22 @@ def main() -> int:
     ck("開著時插一列（不整張重畫）", tab._events_tbl.rowCount() == 5
        and tab._events_tbl.item(0, 2).text().startswith("卡住"))
     ck("　統計跟著更新", "卡住 1 次" in tab._events_head.text(), tab._events_head.text())
+    # ★ 「重新計算」（使用者 2026-09-20 要求）：清紀錄＋統計歸零，⛔ 不動正在跑的那一趟
+    dlg = tab._events_dlg
+    ck("★ 視窗有「重新計算」鈕", getattr(dlg, "_reset", None) is not None)
+    rounds_before = tab._rounds
+    dlg._reset.click()
+    ck("★★ 按下去 → 紀錄清空", tab._events == [], str(tab._events[:2]))
+    ck("★★ 　表也清空", tab._events_tbl.rowCount() == 0,
+       str(tab._events_tbl.rowCount()))
+    ck("★ 　統計歸零（回到「還沒有事件」）",
+       "還沒有事件" in tab._events_head.text(), tab._events_head.text())
+    ck("　⛔ 不影響正在跑的那一趟（場數沒被動到）", tab._rounds == rounds_before,
+       f"{tab._rounds} vs {rounds_before}")
+    tab._event("full", "清空之後又完成一場")
+    ck("　清空後照樣繼續記", len(tab._events) == 1
+       and tab._events_tbl.rowCount() == 1,
+       f"{len(tab._events)} / {tab._events_tbl.rowCount()}")
     tab._events_dlg.close()
     # 卡住偵測：同一段超過 STUCK_EVENT_SECS 沒前進 → 記一筆（帶狀態列）、一段只記一次、不停機
     #   ⚠ 用「撞入口」那段驗純紀錄（沒勾副本設定＝沒有 N 分鐘放棄）：副本裡跑腳本那段

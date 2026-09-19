@@ -5713,9 +5713,32 @@ class DungeonTab(BaseTab):
             for c, cell in enumerate(self._event_cells(row)):
                 tbl.setItem(r, c, QTableWidgetItem(cell))
         lay.addWidget(tbl, 1)
+        # ★ 「重新計算」（使用者 2026-09-20 要求）：把紀錄清乾淨、統計歸零，
+        #   從按下去那一刻重新算（跟「副本收益」那顆同一個意思）。
+        #   ⚠ 只清紀錄與統計，**不影響正在跑的那一趟**（場數進度在 _rounds）。
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        reset_btn = QPushButton("重新計算")
+        reset_btn.setToolTip("把事件紀錄與上面的場數統計清空，從現在重新開始算"
+                             "（不會影響正在跑的副本）。")
+        reset_btn.clicked.connect(self._reset_events)
+        bar.addWidget(reset_btn)
+        lay.addLayout(bar)
         self._events_dlg, self._events_tbl, self._events_head = dlg, tbl, head
-        dlg._tbl, dlg._head = tbl, head
+        dlg._tbl, dlg._head, dlg._reset = tbl, head, reset_btn
         dlg.show()
+
+    def _reset_events(self) -> None:
+        """「重新計算」：事件紀錄與場數統計全部清掉，從現在重新算。"""
+        self._events.clear()
+        tbl, head = self._events_tbl, self._events_head
+        try:
+            if tbl is not None:
+                tbl.setRowCount(0)
+            if head is not None:
+                head.setText(self._events_summary())
+        except RuntimeError:                             # 視窗已被刪掉
+            self._events_tbl = self._events_dlg = self._events_head = None
 
     # -- 通知（跟自動掛機那一頁同一套、同一份設定）-----------------------
     def notify(self, msg: str) -> None:
