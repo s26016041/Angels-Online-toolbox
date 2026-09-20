@@ -60,17 +60,27 @@ from app.core.memory import MemoryScanner
 from app.game import bag, dailygift, exchange, itemname, locate, move
 from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
-TICK_MS = 200             # 領獎：一拍送一包（6 格 × 5 台 ≈ 6 秒，不急）
-OPEN_WAIT_MS = 900        # 開兌換商店 → 等伺服器回清單
-SETTLE_MS = 900           # 送出兌換 → 等結果寫進背包
+# ★★★★ 2026-09-20 使用者：「她（間隔）CD 太長，能不能快速一直打直到兌換介面
+#   出來然後再兌換…領取每日獎勵也很慢」→ 實測重訂（工具箱關掉、五台實跑）：
+#     · 開兌換商店 → 視窗**真的開**：175／181／210ms（舊：盲等 900ms）
+#       ⚠ 而且 5 次裡有 2 次**根本沒開起來**（關完馬上重開那種）——
+#         舊寫法不會發現，照樣往下送兌換、白繞一整輪。
+#     · 6 格領獎連續送完只要 80~91ms（舊：一拍一包 200ms＝1.2 秒）
+#   → 規矩：**每一步都等硬訊號**（視窗真的開了／背包真的變了），
+#     等不到就補送，⛔ 不再睡固定秒數。
+TICK_MS = 200             # 步驟之間的一般節奏（收尾、讓路那種）
+OPEN_POLL_MS = 50         # 開店後多久問一次「兌換視窗開了沒」
+OPEN_RESEND_MS = 400      # 這麼久還沒開 → 補送一次開店包（實測會有開不起來的）
+OPEN_GIVE_UP_MS = 5000    # 補送到這麼久還是沒開 → 這一輪算失敗（重來一輪）
+SETTLE_POLL_MS = 60       # 送出兌換後多久看一次背包
+SETTLE_MAX_MS = 4000      # 背包這麼久都沒變 → 重新開店再換一次
+CLAIM_WAIT_MS = 2500      # 領完獎等券進背包的上限（等不到＝這台早就領過了）
 RETRY_MS = 250            # 排不進指令槽 → 等這麼久再試。掛機的攻擊迴圈約 50ms
                           #   一拍、拍與拍之間會放開槽，250ms 幾乎一定輪得到。
 # ⚠ 重試**沒有上限**（使用者指定：伺服器忙那類問題就一直試，嫌久按「暫停」）。
 #   下面兩個門檻不是放棄門檻，是「讓路」門檻：同一台重試超過這個次數，
 #   之後的重試改排到隊伍最後，別讓其他分身全排在它後面乾等（見 _retry）。
 SLOT_YIELD = 12           # 指令槽重試 12 次（約 3 秒）還進不去 → 開始讓路。
-CHECK_TRIES = 4           # 兌換後背包沒變 → 先多看幾拍（每拍隔 SETTLE_MS）——
-                          #   伺服器忙的時候只是回得慢，急著重送等於多繞一整輪。
 EX_YIELD = 3              # 「開店→兌換→驗背包」整輪重來 3 輪還不成 → 開始讓路。
                           #   背包沒變最常見的原因是開店那包沒被受理（不開店兌換
                           #   伺服器完全不理，見 _ex_begin），所以重來從開店做起。
@@ -110,6 +120,9 @@ class DailyTab(BaseTab):
         self._done = 0                            # 完成幾台（收尾訊息用）
         self._find_gen = None                     # 分次掃描的產生器
         self._ex_target = WING_ITEM               # 這一輪兌換的獎賞編號
+        # ★ 這一輪「領完還是沒券」而跳過的分身：全部跑完再看一次（伺服器慢
+        #   的時候券會晚幾秒才進背包，不能第一次沒看到就當它沒有）。
+        self._skipped: list[tuple[int, str]] = []
         self._paused = False
         self._summary = None                      # 全部做完時的收尾訊息
         self._wing_dlg = None                     # 「當前翅膀數量」視窗（單例）
@@ -123,25 +136,22 @@ class DailyTab(BaseTab):
         root.addWidget(hint)
 
         bar = QHBoxLayout()
-        self.claim_btn = QPushButton("領取在線獎勵")
-        # ⚠ tooltip 一律短（2026-08-19 使用者：太長太繁瑣，改簡單明瞭）。
-        self.claim_btn.setToolTip(
-            "對每一台分身把 6 格在線獎勵全領一次（重複送沒影響）。")
-        self.claim_btn.clicked.connect(self._start_claim)
-        bar.addWidget(self.claim_btn)
-
+        # ⛔ 「領取在線獎勵」那顆獨立按鈕 2026-09-20 拿掉了（使用者：「把每日獎勵
+        #   領取刪除只留兌換部分…沒有領要幫忙領然後再兌換」）——
+        #   兌換鈕自己會先幫每一台把 6 格領一遍（80~91ms，快到看不見），
+        #   再看背包有沒有券：有才開店兌換、沒有就跳過這台。
         self.ex_btn = QPushButton("全部換取翔宇聖翼")
         self.ex_btn.setToolTip(
-            "把每台身上的「勤奮在線獎勵卷」全部換成翔宇聖翼（券 1 天過期）。\n"
-            "過程中跳出的兌換商店視窗會自動關掉。")
+            "先幫每台把 6 格在線獎勵領一次，再把身上的「勤奮在線獎勵卷」\n"
+            "全部換成翔宇聖翼；沒有券的分身直接跳過。")
         self.ex_btn.clicked.connect(
             lambda _=False: self._start_exchange(WING_ITEM))
         bar.addWidget(self.ex_btn)
 
         self.ex_guide_btn = QPushButton("全部換取導引之翼")
         self.ex_guide_btn.setToolTip(
-            "把每台身上的「勤奮在線獎勵卷」全部換成導引之翼（券 1 天過期）。\n"
-            "過程中跳出的兌換商店視窗會自動關掉。")
+            "先幫每台把 6 格在線獎勵領一次，再把身上的「勤奮在線獎勵卷」\n"
+            "全部換成導引之翼；沒有券的分身直接跳過。")
         self.ex_guide_btn.clicked.connect(
             lambda _=False: self._start_exchange(GUIDE_ITEM))
         bar.addWidget(self.ex_guide_btn)
@@ -268,7 +278,6 @@ class DailyTab(BaseTab):
         # ⚠ 換掉上一輪掃到一半的產生器 —— 兩顆兌換鈕找的是不同獎賞，
         #   沿用舊產生器會把「翔宇聖翼那筆」存成「導引之翼的兌換」送出去。
         self._find_gen = None
-        self.claim_btn.setEnabled(False)
         self.ex_btn.setEnabled(False)
         self.ex_guide_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
@@ -292,7 +301,6 @@ class DailyTab(BaseTab):
 
     def _finish(self) -> None:
         self._timer.stop()
-        self.claim_btn.setEnabled(True)
         self.ex_btn.setEnabled(True)
         self.ex_guide_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
@@ -313,7 +321,6 @@ class DailyTab(BaseTab):
             self._paused = True
             self._timer.stop()
             self.pause_btn.setText("繼續")
-            self.claim_btn.setEnabled(True)
             self.ex_btn.setEnabled(True)
             self.ex_guide_btn.setEnabled(True)
             self.status.setText(
@@ -321,7 +328,6 @@ class DailyTab(BaseTab):
         else:
             self._paused = False
             self.pause_btn.setText("暫停")
-            self.claim_btn.setEnabled(False)
             self.ex_btn.setEnabled(False)
             self.ex_guide_btn.setEnabled(False)
             self._tick()
@@ -418,13 +424,65 @@ class DailyTab(BaseTab):
             return
         self._jobs = clients
         self._ex_target = target
+        self._skipped = []
         steps = [self._ex_scan]                        # 先確認兌換項目
         for pid, label in clients:
-            steps.append(lambda p=pid, l=label: self._ex_begin(p, l))
+            # ★★ 2026-09-20 使用者定：「沒有領要幫忙領然後再兌換」——
+            #   每台先把 6 格領一遍（80~91ms），再看背包有沒有券。
+            steps.append(lambda p=pid, l=label: self._ex_claim(p, l))
+        steps.append(self._ex_recheck)                  # 跳過的最後再看一次
         self.status.setText("確認兌換項目…")
         self._begin(steps, summary=lambda m=len(clients): (
             f"兌換完成：{self._done} 台換到東西"
             + (f"，{m - self._done} 台沒換" if self._done < m else "")))
+
+    def _ex_claim(self, pid: int, label: str) -> int:
+        """先幫這台把在線獎勵全領一遍（⛔ 不判斷領過沒 —— 遊戲沒給我們那個欄位，
+        重複領伺服器本來就忽略，而 6 格連續送完實測只要 80~91ms）。"""
+        mv = self._mover(pid)
+        sc = self._scanner(pid)
+        if mv is None or sc is None:
+            self._log(label, self._ex_act(), "⚠ 接不上這台（視窗關了？）")
+            return 0
+        ids = dailygift.reward_ids(sc)
+        sent = 0
+        for rid in ids:
+            # 指令槽忙就原地再試幾次（一次約 20ms）；全滿也不卡住整輪。
+            for _t in range(SLOT_YIELD):
+                if dailygift.claim(mv, rid):
+                    sent += 1
+                    break
+        self.status.setText(f"{label}：領了 {sent}/{len(ids)} 格，等券進背包…")
+        self._steps.insert(0, lambda: self._ex_wait_token(pid, label))
+        return 0
+
+    def _ex_wait_token(self, pid: int, label: str, waited: int = 0) -> int:
+        """等券進背包（硬訊號）。有券 → 去兌換；等滿 CLAIM_WAIT_MS 還是沒有
+        ＝ 這隻今天早就領過、身上也沒券 → **跳過**（最後再回頭看一次）。"""
+        sc = self._scanners.get(pid)
+        got = self._count(sc) if sc is not None else None
+        if got is not None and got[0] > 0:
+            self._steps.insert(0, lambda: self._ex_begin(pid, label))
+            return 0
+        if waited < CLAIM_WAIT_MS:
+            self._steps.insert(
+                0, lambda: self._ex_wait_token(pid, label,
+                                               waited + SETTLE_POLL_MS))
+            return SETTLE_POLL_MS
+        self._skipped.append((pid, label))
+        self._log(label, self._ex_act(), "沒有券（今天的已經領過了）→ 跳過")
+        return 0
+
+    def _ex_recheck(self) -> int:
+        """整輪跑完，回頭看一次剛才跳過的那幾台 —— 券晚幾秒才進背包的情況。"""
+        again = [(p, l) for p, l in self._skipped
+                 if (lambda g: g is not None and g[0] > 0)(
+                     self._count(self._scanners.get(p)))]
+        self._skipped = []
+        for pid, label in again:
+            self._log(label, self._ex_act(), "券晚到了 → 回頭換一次")
+            self._steps.append(lambda p=pid, l=label: self._ex_begin(p, l))
+        return 0
 
     def _ex_act(self) -> str:
         """記錄欄「動作」名：換翔宇聖翼／換導引之翼。"""
@@ -569,9 +627,38 @@ class DailyTab(BaseTab):
                         tries, SLOT_YIELD)
             return RETRY_MS
         self.status.setText(f"{label}：{have} 張券 → 換 {times} 次")
+        # ★★ 2026-09-20：**等視窗真的開**，⛔ 不再盲等 900ms（實測 175~210ms 開，
+        #   而且 5 次有 2 次根本沒開起來 —— 那時候盲等就是白繞一整輪）。
         self._steps.insert(
-            0, lambda: self._ex_confirm(pid, label, cycle, have, wings))
-        return OPEN_WAIT_MS
+            0, lambda: self._ex_wait_open(pid, label, cycle, have, wings))
+        return OPEN_POLL_MS
+
+    def _ex_wait_open(self, pid: int, label: str, cycle: int,
+                      have: int, wings: int, waited: int = 0) -> int:
+        """盯「兌換商店視窗開了沒」：開了就送兌換；每 OPEN_RESEND_MS 補送一次
+        開店包；撐到 OPEN_GIVE_UP_MS 還沒開 → 這一輪重來（從開店做起）。"""
+        sc, mv = self._scanners.get(pid), self._movers.get(pid)
+        ent = _entries.get(self._ex_target)
+        if sc is None or mv is None or ent is None:
+            return 0
+        if exchange.shop_open(sc):
+            self._steps.insert(
+                0, lambda: self._ex_confirm(pid, label, cycle, have, wings))
+            return 0
+        if waited >= OPEN_GIVE_UP_MS:
+            self.status.setText(
+                f"{label}：兌換視窗一直沒開，重來一輪（第 {cycle + 2} 輪…"
+                "嫌久可按「暫停」）")
+            self._retry(lambda: self._ex_begin(pid, label, cycle + 1),
+                        cycle, EX_YIELD)
+            return TICK_MS
+        if waited and waited % OPEN_RESEND_MS < OPEN_POLL_MS:
+            exchange.open_shop(mv, ent.group)          # 沒開 → 再點一次
+            self.status.setText(f"{label}：兌換視窗還沒開，補送開店包…")
+        self._steps.insert(
+            0, lambda: self._ex_wait_open(pid, label, cycle, have, wings,
+                                          waited + OPEN_POLL_MS))
+        return OPEN_POLL_MS
 
     def _ex_confirm(self, pid: int, label: str, cycle: int,
                     have0: int, wings0: int, tries: int = 0,
@@ -602,14 +689,16 @@ class DailyTab(BaseTab):
         if times <= 0:
             # 開店時還有券、現在沒了 —— 幾乎一定是前一發其實成功了
             # （逾時≠沒送出）。交給驗背包那步對帳，翅膀有變多就算成功。
+            # ⚠ probes 給到接近上限：這裡只是「回頭對帳一下」，不必再盯滿 4 秒。
             self._steps.insert(0, lambda: self._ex_check(
-                pid, label, have0, wings0, cycle, CHECK_TRIES - 1))
+                pid, label, have0, wings0, cycle,
+                max(0, SETTLE_MAX_MS // SETTLE_POLL_MS - 5)))
             return 0
         ok, why = exchange.confirm(mv, sc, ent.id, times)
         if ok:
             self._steps.insert(0, lambda: self._ex_check(
                 pid, label, have, wings, cycle))
-            return SETTLE_MS
+            return SETTLE_POLL_MS
         # 排不進指令槽／正在重連之類的暫時狀況 → 等一下再送，試到送出去為止。
         # 每次重送前都重新數券（上面），前一發真的有送到也不會多換。
         self.status.setText(
@@ -651,12 +740,13 @@ class DailyTab(BaseTab):
             self._log(label, self._ex_act(),
                       f"★ 換到 {got} 個{self._name(self._ex_target)}"
                       f"（用掉 {used} 張券，還剩 {now_tok} 張）")
-        elif probes + 1 < CHECK_TRIES:
-            self.status.setText(
-                f"{label}：等伺服器結算…（{probes + 2}/{CHECK_TRIES}）")
+        elif probes * SETTLE_POLL_MS < SETTLE_MAX_MS:
+            # ★ 2026-09-20：改成**盯著背包**（每 SETTLE_POLL_MS 看一次），
+            #   換到了就立刻往下走；⛔ 不再每次都固定睡 900ms。
+            self.status.setText(f"{label}：等伺服器結算…")
             self._steps.insert(0, lambda: self._ex_check(
                 pid, label, have, wings, cycle, probes + 1))
-            return SETTLE_MS
+            return SETTLE_POLL_MS
         else:
             self.status.setText(
                 f"{label}：伺服器沒接受，重新開店再換一次"

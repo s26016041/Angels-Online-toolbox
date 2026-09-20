@@ -97,13 +97,16 @@ class FakeBag:
 class FakeMover:
     active = True
 
+    def __init__(self, pid=0):
+        self.pid = pid
+
 
 class FakeMove:
     Mover = FakeMover
 
     @staticmethod
     def acquire(pid, path, owner):
-        return FakeMover()
+        return FakeMover(pid)
 
     @staticmethod
     def release(pid, owner):
@@ -126,6 +129,10 @@ class FakeExchange:
         self.missing: set[int] = set()    # 這些獎賞「表裡找不到」
         self.sent: list[tuple[int, int, int]] = []   # (pid, 兌換編號, 次數)
         self.opened: list[tuple[int, int]] = []      # (pid, 群組)
+        # ★ 2026-09-20：視窗要「真的開了」才會送兌換。`fail_opens` ＝ 前幾發
+        #   開店包當作沒開起來（實測 5 次有 2 次這樣），驗補送那條路。
+        self.fail_opens = 0
+        self.open_state: set[int] = set()
 
     def finder(self, sc, reward, material):
         yield None                        # 還沒掃完，讓 GUI 喘一口氣
@@ -135,8 +142,16 @@ class FakeExchange:
         yield ent
 
     def open_shop(self, mover, group):
-        self.opened.append((getattr(mover, "pid", 0), group))
+        pid = getattr(mover, "pid", 0)
+        self.opened.append((pid, group))
+        if self.fail_opens > 0:
+            self.fail_opens -= 1          # 這一發「沒開起來」
+        else:
+            self.open_state.add(pid)
         return True
+
+    def shop_open(self, sc):
+        return getattr(sc, "pid", 0) in self.open_state
 
     def confirm(self, mover, sc, entry_id, times):
         ent = next((e for e in self.ENTRIES.values() if e.id == entry_id), None)
@@ -149,6 +164,7 @@ class FakeExchange:
         return True, ""
 
     def close_window(self, mover, sc):
+        self.open_state.discard(getattr(sc, "pid", 0))
         return True, ""
 
 
@@ -161,6 +177,9 @@ class FakeDailyGift:
 
     @staticmethod
     def claim(mover, rid):
+        c = CLIENTS.get(getattr(mover, "pid", 0))
+        if c is not None:
+            c.claims.append(rid)
         return True
 
 
@@ -195,6 +214,8 @@ def setup(*clients: Client) -> "daily_tab.DailyTab":
     daily_tab._entries.clear()
     EX.sent.clear()
     EX.opened.clear()
+    EX.open_state.clear()
+    EX.fail_opens = 0
     return daily_tab.DailyTab()
 
 
@@ -291,14 +312,45 @@ a.items[GUIDE] = 99
 page._fill_wing_counts()
 check("重新整理會重讀", page._wing_table.item(0, 1).text() == "99")
 
-print("⑥ 領取在線獎勵（回歸）")
-a, b = Client(101, "小狐"), Client(102, "小白")
+print("⑥ 兌換前**先幫忙領**、沒券就跳過（使用者 2026-09-20）")
+a, b = Client(101, "小狐", tokens=3), Client(102, "小白", tokens=0)
 page = setup(a, b)
-page.claim_btn.click()
+page.ex_btn.click()
 pump(page)
-check("兩台都送滿 6 格", page._sent == {101: 6, 102: 6}, f"實得 {page._sent}")
-check("按鈕恢復可按", page.claim_btn.isEnabled()
-      and page.ex_guide_btn.isEnabled())
+check("★ 兩台都先把 6 格領過一遍（⛔ 不判斷領過沒，重複領伺服器自己忽略）",
+      a.claims == [1, 2, 3, 4, 5, 6] and b.claims == [1, 2, 3, 4, 5, 6],
+      f"實得 {a.claims} / {b.claims}")
+check("★ 有券的那台照常換到", a.items[WING] == 15 and a.items[TOKEN] == 0,
+      f"實得 wing={a.items[WING]} token={a.items[TOKEN]}")
+check("★ 領完還是沒券的那台**直接跳過**（連商店都不開）",
+      all(pid != 102 for pid, _g in EX.opened), f"實得 {EX.opened}")
+check("　紀錄寫「已經領過了」", any(
+    "領過" in (page.log.item(r, 2).text() or "") + (page.log.item(r, 3).text() or "")
+    for r in range(page.log.rowCount())),
+      f"實得 {[page.log.item(r, 3).text() for r in range(page.log.rowCount())]}")
+check("　⛔ 已經沒有「領取在線獎勵」那顆鈕了", not hasattr(page, "claim_btn"))
+check("按鈕恢復可按", page.ex_btn.isEnabled() and page.ex_guide_btn.isEnabled())
+
+print("⑥b 券晚幾秒才進背包 → 最後回頭那一次要補換到")
+a = Client(101, "小狐", tokens=0)
+page = setup(a)
+page.ex_btn.click()
+for _ in range(8):                      # 先跑幾拍（這時還沒有券 → 會被跳過）
+    page._tick()
+a.items[TOKEN] = 2                      # 券晚到
+pump(page)
+check("★ 回頭那一次換到了", a.items[WING] == 10 and a.items[TOKEN] == 0,
+      f"實得 wing={a.items[WING]} token={a.items[TOKEN]}")
+
+print("⑥c 開店包沒生效 → 自己補送，⛔ 不會盲等一輪就算失敗")
+a = Client(101, "小狐", tokens=1)
+page = setup(a)
+EX.fail_opens = 2                       # 前兩發開店當作沒開起來
+page.ex_btn.click()
+pump(page, limit=4000)
+check("★ 補送了開店包（不只一發）", len(EX.opened) >= 2, f"實得 {EX.opened}")
+check("★ 最後還是換到了", a.items[WING] == 5 and a.items[TOKEN] == 0,
+      f"實得 wing={a.items[WING]} token={a.items[TOKEN]}")
 
 print("⑦ 寫死的道具編號在資源包表裡對得上")
 check("82050 = 導引之翼", itemname.of(GUIDE) == "導引之翼",

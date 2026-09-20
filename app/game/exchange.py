@@ -209,6 +209,28 @@ def open_shop(mover, group: int) -> bool:
     return attack._send(mover, ((attack.SELECT_FN, (OPEN_CODE, group)),))
 
 
+def shop_open(scanner) -> bool:
+    """兌換商店視窗**真的開著**嗎（純讀，不佔指令槽）。
+
+    ★ 2026-09-20 使用者：「能不能快速一直打直到兌換介面出來然後再兌換」——
+      這就是那個硬訊號。實測送出開店包後 175~210ms 視窗就開；而且 5 次裡有 2 次
+      **根本沒開起來**（關完馬上重開那種），所以呼叫端要「沒開就補送」。
+    ⚠ 兩道都要過：`WND_EXCHANGE` 非 0（Lua 全域，純讀雜湊節點）**而且**那個視窗
+      物件 +0xB4「顯示中」旗標是真的 —— 代號關窗不歸零，只看它會假成功
+      （[[dialog-visible-flag]] 同一個坑）。旗標問不到（None）才退回只看代號。
+    """
+    from app.game import lua, talkwnd
+    try:
+        g = lua.globals_of(scanner, ("WND_EXCHANGE",))
+    except Exception:                                      # noqa: BLE001
+        return False
+    wnd = (g or {}).get("WND_EXCHANGE")
+    if not wnd:
+        return False
+    vis = talkwnd.id_visible(scanner, int(wnd) & 0xFFFFFFFF)
+    return True if vis is None else bool(vis)
+
+
 def close_window(mover, scanner) -> tuple[bool, str]:
     """關掉兌換商店視窗（送了開商店那包之後客戶端會自己開起來）。
 
