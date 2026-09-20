@@ -4245,6 +4245,50 @@ def main() -> int:
     run_page.run_cb.blockSignals(True)
     run_page.run_cb.setChecked(False)
     run_page.run_cb.blockSignals(False)
+
+    # ★★★ 好幾頁綁同一隻分身 → 先打的整批刷完才換下一個（使用者 2026-09-20）
+    NET["wins"] = [FakeWin(9, "aaa"), FakeWin(2, "bbb"), FakeWin(3, "ccc")]
+    holder._watch_tick()
+    pa, pb = holder.pages["aaa"], holder.pages["bbb"]
+    for p in (pa, pb):
+        p.run_cb.blockSignals(True)
+        p.run_cb.setChecked(True)
+        p.run_cb.blockSignals(False)
+        p._party, p._pacct, p._partner_name = "bind", "ccc", "角色3"
+        p._mover, p._pmover = FakeMover(), FakeMover()
+    sent = []
+    keep_leave, keep_deny = dt.team.leave, dt.team.deny
+    dt.team.leave = lambda m: sent.append(("leave", m)) or True
+    dt.team.deny = lambda m: sent.append(("deny", m)) or True
+    pa._team_begin()
+    ck("★ 先到的那一頁佔到分身、照常進組隊段",
+       pa._cycle == "team" and holder.partner_claims.get("ccc") is pa, pa._cycle)
+    n = len(sent)
+    pb._team_begin()
+    ck("★★★ 後到的那一頁：排隊等（⛔ 一包退組／拒絕都不准送）",
+       pb._cycle == "pwait" and len(sent) == n, f"{pb._cycle} {sent[n:]}")
+    pb._pwait_tick(dt.PARTNER_WAIT_POLL + 0.1)
+    ck("　先到的還沒刷完 → 繼續等", pb._cycle == "pwait" and len(sent) == n, pb._cycle)
+    holder.release_partner(pa)             # `_batch_full` 清單刷完／`_teardown` 都走這支
+    pb._pwait_tick(dt.PARTNER_WAIT_POLL + 0.1)
+    ck("★★★ 先到的整批刷完放手 → 後到的接手、開始組隊",
+       pb._cycle == "team" and holder.partner_claims.get("ccc") is pb
+       and len(sent) > n, f"{pb._cycle} {sent[n:]}")
+    pa._team_begin()
+    ck("　換先到的回頭要用 → 輪到它排隊", pa._cycle == "pwait", pa._cycle)
+    pb.run_cb.blockSignals(True)
+    pb.run_cb.setChecked(False)
+    pb.run_cb.blockSignals(False)
+    pa._pwait_tick(dt.PARTNER_WAIT_POLL + 0.1)
+    ck("★ 佔著的那一頁已經沒在跑（殘留）→ 不准卡死別人，直接讓出來",
+       pa._cycle == "team" and holder.partner_claims.get("ccc") is pa, pa._cycle)
+    pa._teardown()
+    ck("★ 停機（_teardown）一定放手", "ccc" not in holder.partner_claims,
+       str(list(holder.partner_claims)))
+    dt.team.leave, dt.team.deny = keep_leave, keep_deny
+    pa.run_cb.blockSignals(True)
+    pa.run_cb.setChecked(False)
+    pa.run_cb.blockSignals(False)
     holder.on_close()
     ck("　收尾：分頁清空、掃描執行緒停掉",
        not holder.pages and not holder.scan.isRunning())

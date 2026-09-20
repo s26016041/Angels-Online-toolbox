@@ -334,6 +334,7 @@ TEAM_JOIN_GAP = 0.4        # 分身補送「同意」的間隔（實測中位 1 
 # ⚠ 實測最慢 0.96 秒，這裡留 6 倍餘裕；⛔ 不要再調回 12 秒（那是 3 秒間隔年代的數字）。
 TEAM_ROUND = 6.0
 TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
+PARTNER_WAIT_POLL = 1.0    # 綁定分身被別頁佔著 → 每這麼久再問一次（純查表，不碰遊戲）
 # ★★★ 副本設定（使用者 2026-09-05：「這遊戲有鎖副本並且未來會改所以需要一個設定」）：
 #   一次連續刷幾場、全部刷完後休息多久再刷、全部場次結束後要不要回自動掛機的點位開掛機。
 #   勾了「副本設定」就由它接管循環（「循環打副本」變灰）：
@@ -1733,6 +1734,8 @@ class CharDungeonPage(QWidget):
         self._psc = None
         self._pmover = None
         self._partner_name = ""
+        self._pacct = ""             # 綁定分身的帳號（佔用表的鍵；pid 重登會變，帳號不會）
+        self._pwait_t = 0.0          # 等別頁用完分身：下一次再問的倒數（見 _team_begin）
         self._my_name = ""           # 自己的角色名（對帳「分身那台看不看得到我」用）
         self._rounds = 0             # 循環跑了幾趟
         self._supply_thread = None
@@ -1979,7 +1982,12 @@ class CharDungeonPage(QWidget):
                 return False
             self._ppid, self._psc = ppid, psc
             self._partner_name = self.partner_box.currentText().split("（")[0].strip()
+            self._pacct = self.partner_box.currentText().split("（")[-1].rstrip("）")
             self._my_name = self.char_name
+            if self._i != 0:
+                # 從中間開跑＝人已經帶著分身在副本裡 → 先登記佔用（佔不到也不等：
+                #   副本裡沒得等，下一趟 `_team_begin` 會照規矩排隊）
+                self.tab.claim_partner(self._pacct, self)
         if presupply:
             # 休息完再刷：先補給（回程＝入口那張圖），補完 _plan_route → back → team → go
             self._refresh_steps()
@@ -2089,6 +2097,7 @@ class CharDungeonPage(QWidget):
             except Exception:                            # noqa: BLE001
                 pass
             self._pmover = None
+        self.tab.release_partner(self)   # 停機／斷線／交棒掛機 → 分身讓給在等的那一頁
         self._supply_gen += 1            # 背景補給還在跑的話，結果不要再收
         self._supply_retry = 0.0         # 排隊中的「重跑一次補給」也一起取消
         if self._mover is not None and self._pid is not None:
@@ -4549,6 +4558,9 @@ class CharDungeonPage(QWidget):
         if self._cycle == "team":
             self._team_tick(dt)
             return True
+        if self._cycle == "pwait":
+            self._pwait_tick(dt)
+            return True
         if self._cycle == "back":
             self._back_tick(dt)
             return True
@@ -4744,10 +4756,29 @@ class CharDungeonPage(QWidget):
         if self._party == "none":
             self._cycle = "go"
             return
+        # ★ 好幾頁綁同一隻分身（使用者 2026-09-20）：別頁正在用 → **排隊等它整批刷完**
+        #   （清單一輪／停機／斷線才放手，見 `release_partner` 的呼叫點）。
+        #   ⛔ 等的時候不送退組／拒絕／邀請 —— 那會把正在刷的那一頁的隊伍拆掉。
+        if self._party == "bind":
+            holder = self.tab.claim_partner(self._pacct, self)
+            if holder is not self:
+                if self._cycle != "pwait":
+                    self._event("info", f"組隊：分身「{self._partner_name}」正被"
+                                        f"「{holder.char_name}」用著 → 等它整批刷完再換我")
+                self._cycle = "pwait"
+                self._pwait_t = PARTNER_WAIT_POLL
+                self._say(f"等「{holder.char_name}」刷完放開分身「{self._partner_name}」…")
+                return
         self._cycle = "team"
         self._team_rounds = 0
         self._team_note_t = 0.0
         self._team_enter("leave")
+
+    def _pwait_tick(self, dt: float) -> None:
+        """排隊等分身（見 `_team_begin`）：每 PARTNER_WAIT_POLL 秒再問一次，佔到就照常組隊。"""
+        self._pwait_t -= dt
+        if self._pwait_t <= 0:
+            self._team_begin()
 
     def _team_enter(self, _sub: str) -> None:
         """進入（或重新進入）「退組」那一步：拒絕＋退組同一拍送出去。
@@ -4936,6 +4967,8 @@ class CharDungeonPage(QWidget):
             self._event("info", text)
             self._start_supply_trip(note=f"✔ {text} → 回程補給，補完飛去它的入口…")
             return
+        # ★ 清單一輪刷完＝分身用完了 → 放手給在排隊的那一頁（最後這趟補給用不到分身）
+        self.tab.release_partner(self)
         if sch.get("loop", True):        # 舊的 _sched 沒這鍵＝照舊回去掛機／休息
             self._end_batch()
             return
@@ -6116,6 +6149,7 @@ class DungeonTab(BaseTab):
         self.pages: dict[str, CharDungeonPage] = {}     # 帳號 → 分頁
         self.scanners: dict[int, MemoryScanner] = {}    # pid → scanner（分頁共用）
         self.titles: dict[int, str] = {}                # pid → 視窗標題（看分流用）
+        self.partner_claims: dict[str, CharDungeonPage] = {}   # 綁定分身帳號 → 佔著它的那一頁
         self.events = EventLog()
         self.maps = terrain.Cache()
         self.scan = ScanWorker()
@@ -6203,6 +6237,24 @@ class DungeonTab(BaseTab):
             if page._pid == pid:
                 return page
         return None
+
+    def claim_partner(self, acct: str, page):
+        """`page` 要用帳號 `acct` 那隻綁定分身。回**現在佔著它的那一頁**：
+        回的就是 `page`＝佔到了；是別頁＝要排隊等（使用者 2026-09-20：好幾頁綁同一隻，
+        先打的整批刷完才換下一個）。
+        ★ 照**帳號**記不照 pid（分身重登 pid 會變）。佔著的那一頁已經沒在跑＝殘留，
+          直接讓出來 —— 不准有「佔著不放卡死別人」這種狀態。"""
+        holder = self.partner_claims.get(acct)
+        if (holder is not None and holder is not page
+                and holder in self.pages.values() and holder.run_cb.isChecked()):
+            return holder
+        self.partner_claims[acct] = page
+        return page
+
+    def release_partner(self, page) -> None:
+        """`page` 放開它佔著的綁定分身（沒佔就沒事）。"""
+        for acct in [a for a, p in self.partner_claims.items() if p is page]:
+            del self.partner_claims[acct]
 
     def sibling_items(self, me) -> list[tuple[str, int]]:
         """「綁定分身」的候選：其他分頁的 (標籤, pid)。"""
