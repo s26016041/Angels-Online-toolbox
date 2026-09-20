@@ -20,13 +20,19 @@ Windows 不允許覆寫執行中的檔案，但**允許改名**。所以流程�
 """
 from __future__ import annotations
 
+import collections
 import hashlib
+import http.client
 import json
 import os
 import shutil
 import ssl
 import subprocess
 import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -48,7 +54,24 @@ UA = {"User-Agent": "AngelsOnlineToolbox-Updater"}
 #   ③ **鏡像優先**：config 的 `update.mirror` 填一個 base URL（例如自己的 CDN），
 #     就先從那裡抓、失敗自動退回 GitHub。⚠ 不管從哪抓，**最後都用 GitHub API 給的
 #     sha256 對一次**（對不上就丟掉）——鏡像被換掉也裝不進來。
+# ★★★★ 2026-09-20 同一天第二輪（使用者：「我去 github 直接下載才 10 秒內」）→ 真因：
+#   **每一條連線是快是慢像擲骰子，而且定了就不變**（同一時間開 16 條 keep-alive 連線：
+#   13 條 0.05MB/s、3 條 1.7~4.3MB/s，快的每一段都快、慢的每一段都慢；四個 CDN IP
+#   輪三輪也一樣是「偶爾一條快」→ 跟 IP／快取節點無關，是路徑）。單線九成機率抽到
+#   慢的＝整趟 48KB/s（60 秒 2.8MB）。上面「平行分段沒用」是因為**把抽到的慢連線原樣
+#   留著**：8 條全慢＝0.35MB/s。
+#   正解（`_fetch_parallel`）＝多條連線分段抓、**慢的斷掉重撥（重擲骰子）、快的留著
+#   一直用**：同一個 80MB 檔實測 10／15／26／34 秒抓完、sha256 全對（舊法要 27 分鐘）。
+#   ⛔ 別改回「每段開新連線」（urllib 那種）：快慢跟著連線走，換連線＝把好籤丟掉。
 MIRROR_KEY = "update.mirror"
+PAR_CONNS = 16           # 同時幾條連線（實測 16 條找到快連線比 8 條快一倍）
+PAR_CHUNK = 1 << 20      # 一段多大
+PAR_PROBE = 1.0          # 秒：一條連線看這麼久就知道它快還是慢（快的第 1 秒就 >1MB/s）
+PAR_SLOW = 200_000       # B/s：比這慢＝抽到壞路徑，斷掉重撥（慢的實測 4~9 萬）
+PAR_REDIAL = 8           # 一條工人最多重撥幾次（線路本來就慢的人不要無限重撥）
+PAR_STALL = 45.0         # 秒：全部連線這麼久沒進半個位元組＝網路斷了，收工
+PAR_ERRORS = 5           # 一條工人連續出錯幾次就退場
+PAR_RERESOLVE = 5.0      # 秒：簽名網址過期要重走轉址，但這麼短的時間內不重走第二次
 
 
 def mirror_base() -> str:
@@ -256,26 +279,313 @@ def _fetch(url: str, info: dict, dest: Path, progress=None) -> bool:
     return False
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):                   # noqa: ANN002, ANN003
+        return None
+
+
+def _resolve(url: str):
+    """跟著 302 走到真正放檔案的那台，回 (host, path, ssl_context)。
+
+    GitHub 的下載網址會轉到一個**有期限的簽名網址**；平行抓要在同一條連線上連續送
+    Range，所以得先把轉址走完。憑證那套跟 `_urlopen` 一樣：驗不過退回不驗證
+    （最後有 sha256 把關）。
+    """
+    last: Exception | None = None
+    for verify in (True, False):
+        ctx = ssl.create_default_context()
+        if not verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        op = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=ctx))
+        cur = url
+        try:
+            for _ in range(5):
+                req = urllib.request.Request(cur, headers=UA, method="HEAD")
+                try:
+                    op.open(req, timeout=TIMEOUT).close()
+                    break
+                except urllib.error.HTTPError as e:
+                    loc = e.headers.get("Location")
+                    if e.code in (301, 302, 303, 307, 308) and loc:
+                        cur = urllib.parse.urljoin(cur, loc)
+                        continue
+                    raise
+            p = urllib.parse.urlsplit(cur)
+            if p.scheme != "https":
+                raise OSError("不是 https")
+            return p.netloc, (p.path or "/") + ("?" + p.query if p.query else ""), ctx
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:                             # noqa: BLE001
+            last = e
+    raise last or OSError("resolve")
+
+
+def _par_conn(host: str, ctx):
+    """開一條 keep-alive 連線（測試會換掉這支）。"""
+    return http.client.HTTPSConnection(host, timeout=20.0, context=ctx)
+
+
+def _merge(ranges) -> list:
+    out: list = []
+    for s, e in sorted(tuple(r) for r in ranges):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _holes(done, total: int) -> list:
+    """還沒抓的部分，切成一段一段 [start, end)。"""
+    out, pos = [], 0
+    for s, e in _merge(done) + [[total, total]]:
+        while pos < s:
+            nxt = min(s, pos + PAR_CHUNK)
+            out.append((pos, nxt))
+            pos = nxt
+        pos = max(pos, e)
+    return out
+
+
+class _Par:
+    """平行下載的共用狀態：待抓的段、已抓的範圍、目前最快的連線有多快。"""
+
+    def __init__(self, url: str, total: int, part: Path, done: list) -> None:
+        self.url, self.total, self.part = url, total, part
+        self.cond = threading.Condition()
+        self.done = [tuple(r) for r in done]   # 已經寫進檔案的 [start, end)
+        self.queue = collections.deque(_holes(self.done, total))
+        self.got = sum(e - s for s, e in _merge(self.done))
+        self.inflight = 0
+        self.idle = []                         # 沒事做的連線各自多快（收尾讓段用）
+        self.best = 0.0
+        self.abort = False
+        self.redials = 0                       # 診斷用：總共重撥幾次
+        self.last_progress = time.time()
+        self._tlock = threading.Lock()
+        self._target = None
+        self._target_at = 0.0
+
+    def where(self, force: bool = False):
+        """(host, path, ctx)。簽名網址有期限 → 出錯時 force 重新走一次轉址。"""
+        with self._tlock:
+            if self._target is None or (
+                    force and time.time() - self._target_at >= PAR_RERESOLVE):
+                self._target = _resolve(self.url)
+                self._target_at = time.time()
+            return self._target
+
+    def take(self, mine: float):
+        """領下一段。mine＝我這條連線上一段多快（剛重撥、還沒證明過自己的＝0）。
+
+        ★ 收尾禮讓：剩下的段數不比「閒著、而且比我快三倍的連線」多 → 留給它們。
+          少了這條，慢連線重撥完**自己馬上又把剛放回去的那截領走**（它就在迴圈裡、
+          搶得比誰都快），快的連線在旁邊閒著看 —— 實測最後 1MB 拖 9~12 秒。
+        """
+        with self.cond:
+            while True:
+                if self.abort:
+                    return None
+                faster = sum(1 for r in self.idle if r > mine * 3)
+                if self.queue and len(self.queue) > faster:
+                    self.inflight += 1
+                    return self.queue.popleft()
+                if self.inflight == 0 and not self.queue:
+                    return None
+                self.idle.append(mine)
+                self.cond.wait(0.3)
+                self.idle.remove(mine)
+
+    def give_back(self, start: int, n: int, end: int, rate: float) -> None:
+        with self.cond:
+            if n:
+                self.done.append((start, start + n))
+            if start + n < end:                # 沒抓完的那截放回去給別人
+                self.queue.appendleft((start + n, end))
+            elif rate:
+                self.best = max(self.best, rate)
+            self.inflight -= 1
+            self.cond.notify_all()
+
+    def work(self) -> None:
+        conn, redials, errors, mine = None, 0, 0, 0.0
+        with open(self.part, "r+b") as f:
+            while True:
+                item = self.take(mine)
+                if item is None:
+                    break
+                start, end = item
+                n, verdict, rate = 0, "ok", 0.0
+                try:
+                    if conn is None:
+                        host, path, ctx = self.where()
+                        conn = _par_conn(host, ctx)
+                    else:
+                        path = self.where()[1]
+                    conn.request("GET", path, headers={
+                        **UA, "Range": f"bytes={start}-{end - 1}"})
+                    resp = conn.getresponse()
+                    if resp.status != 206:
+                        raise OSError(f"HTTP {resp.status}")
+                    t1 = time.time()
+                    while n < end - start:
+                        # 還沒證明過自己的連線小口讀：read() 要等整塊到齊才回來，慢連線
+                        # （有時只剩 5KB/s）一口 64KB 會卡十幾秒、卡住就沒機會判它慢。
+                        blk = resp.read(min(65536 if mine else 16384, end - start - n))
+                        if not blk:
+                            raise OSError("eof")
+                        f.seek(start + n)
+                        f.write(blk)
+                        n += len(blk)
+                        with self.cond:
+                            self.got += len(blk)
+                            self.last_progress = time.time()
+                            if self.abort:
+                                raise OSError("abort")
+                            idle_top = max(self.idle, default=0.0)
+                        el = time.time() - t1
+                        if el >= PAR_PROBE and n < end - start:
+                            now = n / el
+                            # ★ 抽到慢路徑 → 斷掉重撥（新連線＝重擲骰子）
+                            #   重撥次數有上限是給「線路本來就慢」的人；已經看過快的
+                            #   連線（best）就代表好路徑存在 → 慢的繼續重撥不設限。
+                            if now < PAR_SLOW and (redials < PAR_REDIAL
+                                                   or now < self.best * 0.1):
+                                verdict = "redial"
+                                break
+                            # 收尾：有比我快三倍的連線閒著 → 手上這段讓給它
+                            #   （⛔ 別拿 best 比：頻寬被幾條快連線分掉之後，誰都不到
+                            #   best 的一半，結果沒人算「快」、最後 1MB 被慢連線拖 12 秒）
+                            if now * 3 < idle_top:
+                                verdict = "yield"
+                                break
+                    else:
+                        rate = mine = n / max(time.time() - t1, 1e-3)
+                except Exception:                          # noqa: BLE001
+                    verdict = "error"
+                self.give_back(start, n, end, rate)
+                if verdict == "ok":
+                    errors = 0
+                    continue
+                try:                           # 回應沒讀完的連線不能再用
+                    if conn is not None:
+                        conn.close()
+                except Exception:                          # noqa: BLE001
+                    pass
+                conn = None
+                if verdict == "redial":
+                    redials += 1
+                    self.redials += 1
+                    mine = 0.0                 # 新連線還沒證明過自己
+                elif verdict == "yield":
+                    break
+                else:
+                    errors += 1
+                    if errors > PAR_ERRORS or self.abort:
+                        break
+                    try:
+                        self.where(force=True)
+                    except Exception:                      # noqa: BLE001
+                        pass
+                    time.sleep(0.3)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:                              # noqa: BLE001
+                pass
+
+
+def _fetch_parallel(url: str, info: dict, dest: Path, progress=None):
+    """多條連線分段抓，**慢的連線斷掉重撥、快的留著一直用**（為什麼：見檔頭 2026-09-20）。
+
+    回 True＝抓完且驗過；False＝抓到一半斷了（半成品 `<dest>.par`＋`.par.json` 留著，
+    下次從缺的地方接著抓）；None＝這條路走不通（一個位元組都沒進來／抓完驗不過）
+    → 呼叫端退回單線 `_fetch`。
+    """
+    total = info.get("size") or 0
+    if not total:
+        return None
+    part = dest.with_name(dest.name + ".par")
+    side = dest.with_name(dest.name + ".par.json")
+    key = [total, info.get("sha256") or ""]
+    done: list = []
+    try:
+        saved = json.loads(side.read_text("utf-8"))
+        if saved.get("key") == key and part.stat().st_size == total:
+            done = [r for r in saved["ranges"] if 0 <= r[0] < r[1] <= total]
+    except Exception:                                      # noqa: BLE001
+        done = []
+
+    def _drop():
+        part.unlink(missing_ok=True)
+        side.unlink(missing_ok=True)
+
+    try:
+        if not done:
+            with part.open("wb") as f:
+                f.truncate(total)
+        st = _Par(url, total, part, done)
+        st.where()
+    except Exception:                                      # noqa: BLE001
+        if not done:
+            _drop()
+        return None
+    got0 = st.got
+    workers = [threading.Thread(target=st.work, daemon=True)
+               for _ in range(min(PAR_CONNS, max(1, len(st.queue))))]
+    for t in workers:
+        t.start()
+    while any(t.is_alive() for t in workers):
+        time.sleep(0.2)
+        if progress:
+            progress(min(st.got, total), total)
+        if time.time() - st.last_progress > PAR_STALL:
+            st.abort = True
+    if not st.queue and _holes(st.done, total) == []:
+        side.unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+        part.replace(dest)
+        if _good(dest, info):
+            return True
+        dest.unlink(missing_ok=True)           # 驗不過的一定要丟
+        return None
+    if st.got <= got0:                         # 這一趟什麼都沒抓到 → 這條路不通
+        if not done:
+            _drop()
+        return None
+    try:
+        side.write_text(json.dumps({"key": key, "ranges": _merge(st.done)}), "utf-8")
+    except OSError:
+        _drop()
+    return False
+
+
 def download(info: dict, dest: Path, progress=None) -> bool:
     """下載新版到 dest。progress(已下載, 總量) 可選。
 
     ① 設定了鏡像（`update.mirror`）就**先從鏡像抓**，失敗才退回 GitHub。
-    ② 斷點續傳：上次沒抓完的接著抓（GitHub 與一般 CDN 都支援 Range）。
-    ③ 不管從哪抓，最後都驗大小＋PE 標頭＋**GitHub API 給的 sha256**，
+    ② GitHub 那份走**平行分段＋慢連線重撥**（`_fetch_parallel`）；那條路走不通
+       （擋 Range 的代理之類）才退回單線續傳 `_fetch`。
+    ③ 斷點續傳：上次沒抓完的接著抓（GitHub 與一般 CDN 都支援 Range）。
+    ④ 不管從哪抓，最後都驗大小＋PE 標頭＋**GitHub API 給的 sha256**，
        對不上就丟掉重來 —— 鏡像被動手腳也裝不進來。
     """
-    urls = []
     base = mirror_base()
+    url = info.get("url")
     if base:
-        urls.append(f"{base}/{info.get('name') or ASSET_NAME}")
-    if info.get("url"):
-        urls.append(info["url"])
-    for k, url in enumerate(urls):
-        if _fetch(url, info, dest, progress):
+        if _fetch(f"{base}/{info.get('name') or ASSET_NAME}", info, dest, progress):
             return True
-        if k + 1 < len(urls):                  # 鏡像不行 → 換 GitHub，從頭抓
-            dest.unlink(missing_ok=True)
-    return False
+        if url:
+            dest.unlink(missing_ok=True)       # 鏡像不行 → 換 GitHub，從頭抓
+    if not url:
+        return False
+    ok = _fetch_parallel(url, info, dest, progress)
+    if ok is None:
+        ok = _fetch(url, info, dest, progress)
+    return bool(ok)
 
 
 def apply_and_restart(new_file: Path) -> bool:
