@@ -11,12 +11,14 @@
 
 規格：
     ① 已經成功（confirm 進場就 True）→ 立刻收工，一步都不走
-    ② **走一次**就好：只叫一次 `_approach_npc`；⛔ 舊的那一套（地形圖挑可走格
-       `_walk_to_npc`、踩上 NPC／穿到另一側換站位 `_nudge_toward`）整組刪掉，
-       這裡連「模組裡還有沒有那些名字」都驗 —— 不准偷偷寫回來
+    ② **先自己走到他旁邊，再用官方**（2026-09-20 使用者補充：「不用一定要走到
+       那個點位，因為可能被其他玩家佔住，所以靠近後不動了就可以換官方，防止
+       卡住」）：走得動就自己走（⑩），走完沒更靠近就交給 TryAct（⑩b）；
+       ⛔ 舊的那一套（地形圖挑可走格 `_walk_to_npc`、踩上 NPC／穿到另一側換
+       站位 `_nudge_toward`）整組刪掉，這裡連「模組裡還有沒有那些名字」都驗
     ③ 沒看到對話 → 每 `TALK_CLICK_GAP`(2 秒) 補送一次官方 TryAct，
        而且每一發都**重新找那隻 NPC**（實體會被回收，位址不能留過夜）
-    ④ 看得到 NPC 之後滿 `TALK_GIVE_UP`(20 秒) 還講不到話 → 回 False，
+    ④ **不再靠近他之後**滿 `TALK_GIVE_UP`(20 秒) 還講不到話 → 回 False，
        `talk_failure()` 說得出原因；`run_full_supply` 的訊息帶 `TALK_FAIL`
        （掛機頁據此**通知＋停機**）
     ⑤ 對話開了 → 送選項 → 目標視窗開了 → True
@@ -28,11 +30,13 @@
     ⑨ `_approach_npc`：走不走得到都照走（官方尋路 `walk_route`），
        連續 `APPROACH_STALL` 秒沒更靠近就回去讓 TryAct 收尾；
        NPC 還看不到就先往 .MPC 表座標走
+    ⑩ 看得到他但還在講話方框外 → **自己一路走過去**，而且那段時間 ⛔ 不算
+       進 20 秒碼錶（2026-09-20 實機誤報：人還在半路就發「講不到話」通知＋停機）
+    ⑩b 走一段沒更靠近（人牆／被佔住）→ 不再自己走，換官方 TryAct 收尾
 ⚠ 純離線：假時鐘／假跳板／假實體，**只換 I/O，判斷邏輯跑真的**。
 """
 from __future__ import annotations
 
-import math
 import os
 import sys
 import threading
@@ -330,6 +334,55 @@ MOVER.walks.clear()
 supply._player_tile = lambda sc: (None, None)     # 讀不到自己
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
 check("　讀不到玩家座標就安全退出（不亂走）", MOVER.walks == [])
+
+print()
+print("⑩ 先自己走到他旁邊再點官方；⚠ 走過去那段**不算**講不到話（9/20 誤報通知）")
+# ★★★★ 2026-09-20 實機：使用者收到「講不到話」通知＋停機，人其實還在走過去的
+#   路上 —— 舊版一看到 NPC 實體（常在 20~30 格外）就開始跑 20 秒碼錶，而且看到
+#   他之後**完全不自己走**，只靠 TryAct 拖。使用者定：「先自己走到 NPC 旁邊，
+#   然後再用官方……靠近後不動了就可以換官方，防止卡住。」
+reset()
+supply._wait_dialog = no_dialog
+supply._wnd_open = lambda m, s, n: False
+supply._is_walking = lambda sc: False
+supply._npc_in_box = lambda sc, nid: False            # 一直在講話方框外
+GAP = [30.0]
+supply._npc_gap = lambda sc, nid: GAP[0]
+
+
+def walk_closer(*_a, **_k):
+    APPROACHES.append(1)
+    CLOCK.sleep(5.0)
+    GAP[0] = max(3.0, GAP[0] - 3.0)                   # 每走一段都更靠近他
+
+
+supply._approach_npc = walk_closer
+T0 = CLOCK.time()
+ok = supply._engage_npc(MOVER, SC, 1, (170, 90), [10], "WND_NPCSALE")
+TOOK = CLOCK.time() - T0
+check("★ 看得到他但在方框外 → **自己一路走過去**（⛔ 不是站著只點）",
+      len(APPROACHES) >= 8, str(len(APPROACHES)))
+check("★★ 還在靠近他 → 20 秒碼錶不跑（⛔ 舊版 20 秒就發誤報通知）",
+      TOOK > supply.TALK_GIVE_UP * 2, f"{TOOK:.0f}s")
+check("★ 走不動了 → 換官方 TryAct（使用者：防止卡住）", CLICKS != [],
+      str(len(CLICKS)))
+check("　最後還是講不到話才回 False＋記一筆",
+      ok is False and supply.talk_failure() != "", supply.talk_failure())
+
+print()
+print("⑩b 一開始就走不動（人牆／被佔住）→ 走一段就換官方，⛔ 不在那裡磨")
+reset()
+supply._wait_dialog = no_dialog
+supply._wnd_open = lambda m, s, n: False
+GAP[0] = 30.0                                          # 走了也沒更靠近
+supply._approach_npc = lambda *a, **k: (APPROACHES.append(1),
+                                        CLOCK.sleep(5.0))
+ok = supply._engage_npc(MOVER, SC, 1, (170, 90), [10], "WND_NPCSALE")
+check("★ 只走進場那一次＋再試一段（沒更靠近就不再走）",
+      len(APPROACHES) <= 2, str(len(APPROACHES)))
+check("★ 換成官方 TryAct 收尾", CLICKS != [], str(len(CLICKS)))
+check("　還是不行 → 回 False（呼叫端通知＋停機）", ok is False)
+supply._npc_in_box = lambda sc, nid: True              # 還原給後面用
 
 print()
 if FAILS:

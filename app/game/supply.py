@@ -185,7 +185,12 @@ DIALOG_STILL_GRACE = 0.8   # 角色停住這麼久還沒開對話框＝這次點
 # ★ 走近 NPC 時「連續這麼久沒更靠近」＝被卡住了（人牆／伺服器退回移動）
 #   → 不要磨到逾時，直接回去讓呼叫端發互動包（客戶端自己會再走一段）。
 APPROACH_STALL = 3.0
-TALK_GAP = 1.2             # 對話選項之間**最多**等多久（8/14 盲等值；現在只是上限，
+# ★★★★ 2026-09-20 使用者定：「先自己走到 NPC 旁邊，然後再用官方；不用一定要走到
+#   那個點位（可能被其他玩家佔住），靠近後不動了就可以換官方，防止卡住。」
+#   → 看得到他但還講不到話時，每次自己走**一段**（這麼多秒）就回來補一發官方
+#     TryAct；走不動（APPROACH_STALL 3 秒沒位移）本來就會提早回來。
+APPROACH_STEP = 10.0
+TALK_GAP = 1.2            # 對話選項之間**最多**等多久（8/14 盲等值；現在只是上限，
                            #   看到下一頁就送 —— 見 `_wait_page`）
 TALK_STEP_FLOOR = 0.25     # 兩個對話動作之間的最小間隔（同一拍連送伺服器不吃）
 WND_TIMEOUT = 3.0          # 最後一個選項送出後，輪詢目標視窗（販售/維修/倉庫）的上限
@@ -551,6 +556,16 @@ def _npc_gap(scanner, npc_id: int):
     return math.hypot(here[0] - nt[0], here[1] - nt[1])
 
 
+def _is_walking(scanner) -> bool:
+    """角色現在正在走路嗎（讀不到當「沒在走」）。
+
+    ★ 兩個地方要問：補點間隔（走路時踩油門 0.35 秒）、以及「要不要自己再走
+      一段」—— 官方正在帶人走的時候 ⛔ 不要插手重下走路指令。
+    """
+    pf = move.pathfinder_this(scanner)
+    return bool(pf and entity.is_walking(scanner, pf + 8))
+
+
 def _act_size(scanner, ent: int) -> int:
     """實體的互動框邊長（[+0x1A4]）；讀不到／不合理當 1（NPC 與玩家實測都是 1）。"""
     v = _u32(scanner, ent + OFF_ACT_SIZE) if ent else 0
@@ -813,17 +828,21 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
                 confirm_timeout: float | None = None) -> bool:
     """點 NPC 開對話、送對話選項、**確認對應視窗開了**。買／修／銀行共用這一支。
 
-    ★★★★ 2026-09-20 使用者定（原話見 TALK_GIVE_UP 上面那段）——**走一次，
-      之後只動口不動腳**：
-        ① 直接往 NPC 本人走（`_approach_npc` ＝ 官方尋路）。⛔ 不挑「離他最近
-           的可走格」、⛔ 不管走不走得到：走不到、被人擋住、卡住不動，通通
-           直接進 ②（「反正角色不動了就發送官方的」）。
-        ② 送官方的 `TryAct`（＝滑鼠點他）：在互動範圍內當場開對話，不在範圍
-           它自己用官方尋路把最後一段走完 —— 「讓官方自己走然後對話」。
-        ③ 沒看到對話就每 `TALK_CLICK_GAP`（2 秒）再送一次。
-        ④ 看得到 NPC 之後滿 `TALK_GIVE_UP`（20 秒）還講不到話 → 記一筆
+    ★★★★ 2026-09-20 使用者定（原話見 TALK_GIVE_UP 上面那段）——**先自己走到他
+      旁邊，再用官方**：
+        ① 自己往 NPC 本人走（`_approach_npc` ＝ 官方尋路）。⛔ 不挑「離他最近
+           的可走格」、⛔ 不管走不走得到：「不用一定要走到那個點位，因為可能被
+           其他玩家佔住，所以靠近後不動了就可以換官方，防止卡住」。
+        ② 到了講話方框內（或走不動了）→ 送官方的 `TryAct`（＝滑鼠點他）：
+           在互動範圍內當場開對話，不在範圍它自己再把最後一段走完。
+        ③ 沒看到對話就補送（站定在框內 2 秒一發；人還在走 0.35 秒一發＝油門）。
+        ④ **不再靠近他之後**滿 `TALK_GIVE_UP`（20 秒）還講不到話 → 記一筆
            `TALK_FAIL`、回 False，由呼叫端（掛機頁）**通知＋停機**。
-    ⚠ 「還沒看到 NPC」不算講不到話（跨城走一半而已）：那段給 `WALK_TIMEOUT`，
+        ⑤ 還是走不到／講不到 → `WALK_TIMEOUT`（90 秒）硬收工（同樣算失敗）。
+    ⚠⚠ 碼錶 ⛔ 不准從「看到他」起算（2026-09-20 實機誤報：人還在半路走，
+      20 秒一到就發通知＋停機）——**還在靠近他就重新算**，方框外站著不動、
+      或已經站進方框才是真的「講不到話」。
+    ⚠ 「還沒看到 NPC」也不算講不到話（跨城走一半而已）：那段給 `WALK_TIMEOUT`，
       繼續往 .MPC 表座標走；真的走完還看不到才算失敗。
     ⚠ 安全退化：對話框那個全域（`DIALOG_WND`）讀不到（改版換名）→ 退回
       「等人停穩＋固定等待」照送選項，最後一樣驗目標視窗 —— 名字失效只會
@@ -850,8 +869,10 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
     # ★ 邊沿基準只在進場記**一次**（不是每輪重記）：判失敗判得早也無害——
     #   對話框晚一拍才到，下一輪 `_wait_dialog` 看到「值已經變了」立刻接上。
     base = _dialog_token(scanner)
-    walk_t0 = time.time()      # 「還沒看到 NPC」的走路預算（不算講不到話）
-    talk_t0 = None             # 看到他的那一刻才開始算 20 秒
+    walk_t0 = time.time()      # 整段（走過去＋講話）的硬上限，見 WALK_TIMEOUT
+    talk_t0 = None             # 「人已經不再靠近他了」才開始算 20 秒（見下）
+    best = None                # 看過離他最近的距離（有縮短＝還在往他走）
+    handed = False             # 已經「走不動了 → 交給官方」（⛔ 不再自己走）
     fails = 0                  # 對話開了、選項送了，卻沒換到視窗的次數
     why = f"{TALK_GIVE_UP:.0f} 秒都沒開對話"      # 失敗原因（break 時會改成實際那條）
     while True:
@@ -866,6 +887,35 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _approach_npc(mover, scanner, npc_id, fallback)
             _nap(0.3)          # ⚠ 它可能瞬間就返回（讀不到座標）→ 這裡不睡會空轉燒 CPU
             continue
+        # ★★★★ 2026-09-20 實機：使用者收到「講不到話」的**誤報**通知（＋停機）。
+        #   真因兩個，都在這裡：
+        #   ① 看得到他 **≠** 到得了他 —— NPC 一串流進來（20~30 格外）就開始跑
+        #      20 秒碼錶，而那 20 秒全花在走過去的路上。
+        #   ② 看得到他之後我們**完全不自己走了**，只靠 TryAct 讓官方帶人走。
+        #   使用者定的規格（原話）：「先自己走到 NPC 旁邊，然後再用官方；不用一定要
+        #   走到那個點位，因為可能被其他玩家佔住，所以靠近後不動了就可以換官方。」
+        #   → 講話方框外：人沒在走就自己走一段（`_approach_npc`，不動 3 秒它自己
+        #     會回來換官方）；只要還在**靠近**他，碼錶就重新算。
+        #   ⚠ 座標讀不到（box is None）＝不知道 → 安全退化成舊行為（照樣點、照算）。
+        if time.time() - walk_t0 > WALK_TIMEOUT:
+            why = (f"走了 {WALK_TIMEOUT:.0f} 秒還是講不到話"
+                   f"（離他 {_dist_to_npc(scanner, npc_id)} 格）")
+            break
+        if _npc_in_box(scanner, npc_id) is False:
+            gap_now = _npc_gap(scanner, npc_id)
+            if gap_now is not None and (best is None or gap_now < best - 0.5):
+                best, talk_t0, handed = gap_now, None, False   # 還在靠近他
+            if not handed and not _is_walking(scanner):  # ⛔ 官方正帶著走別插手
+                _approach_npc(mover, scanner, npc_id, fallback,
+                              timeout=APPROACH_STEP)
+                after = _npc_gap(scanner, npc_id)
+                # ★ 走完這一段還是沒更靠近＝走不動了（人牆／櫃檯）→ **換官方**，
+                #   別在這裡磨（使用者：「靠近後不動了就可以換官方，防止卡住」）。
+                if (gap_now is None or after is None
+                        or after >= gap_now - 0.5):
+                    handed = True
+                _nap(0.1)      # ⚠ 它可能瞬間返回（讀不到座標）→ 不睡會空轉燒 CPU
+                continue
         if talk_t0 is None:
             talk_t0 = time.time()
         left = TALK_GIVE_UP - (time.time() - talk_t0)
@@ -896,8 +946,7 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         #   還在走路／還沒進講話方框 → CLICK_REPEAT(0.35s)，因為每一發 TryAct
         #   就是官方把人往前帶一步的動力；站定且在框內 → TALK_CLICK_GAP(2s)。
         def _gap(_s=scanner, _id=npc_id):
-            pf = move.pathfinder_this(_s)
-            if pf and entity.is_walking(_s, pf + 8):
+            if _is_walking(_s):
                 return CLICK_REPEAT
             box = _npc_in_box(_s, _id)
             return TALK_CLICK_GAP if box else CLICK_REPEAT
