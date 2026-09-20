@@ -20,6 +20,7 @@ Windows 不允許覆寫執行中的檔案，但**允許改名**。所以流程�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -37,6 +38,26 @@ API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 ASSET_NAME = "AngelsOnlineToolbox.exe"
 TIMEOUT = 15.0
 UA = {"User-Agent": "AngelsOnlineToolbox-Updater"}
+# ★★★★ 2026-09-20 使用者：「自動更新下載很久」→ 實測（同一台機器、同一個檔）：
+#     Python 抓 GitHub 的 Release：0.07~1.3 MB/s（單條連線連抓 90 秒全程 0.10）
+#     curl   抓同一個檔          ：0.05~5.7 MB/s（一樣飄）
+#     Python 抓 Cloudflare 測速檔：**7.9 MB/s** ← 線路本身沒問題
+#     4/8 條平行分段 0.25/0.35、每 4MB 換連線 0.13、換 API assets 端點 0.14 → 全都沒用
+#   ＝ **GitHub 的 Release 通道從這條線出去常常只有 0.1MB/s**，不是我們的 bug。
+#   能做的三件事：① exe 變小（見 .spec 的 DROP_BINARIES）②**斷點續傳**（下面）
+#   ③ **鏡像優先**：config 的 `update.mirror` 填一個 base URL（例如自己的 CDN），
+#     就先從那裡抓、失敗自動退回 GitHub。⚠ 不管從哪抓，**最後都用 GitHub API 給的
+#     sha256 對一次**（對不上就丟掉）——鏡像被換掉也裝不進來。
+MIRROR_KEY = "update.mirror"
+
+
+def mirror_base() -> str:
+    """鏡像的 base URL（沒設就是空字串）。設定檔壞掉一律當沒設。"""
+    try:
+        from app.config import config
+        return str(config.get(MIRROR_KEY, "") or "").strip().rstrip("/")
+    except Exception:                                      # noqa: BLE001
+        return ""
 
 
 def is_frozen() -> bool:
@@ -64,6 +85,21 @@ def is_newer(remote: str, local: str) -> bool:
     a += (0,) * (n - len(a))
     b += (0,) * (n - len(b))
     return a > b
+
+
+def _urlopen_req(req, timeout: float = TIMEOUT):
+    """跟 `_urlopen` 同一套（憑證失敗退回不驗證），但收的是現成的 Request
+    —— 續傳要自己帶 Range 標頭。"""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except Exception as first:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except Exception:
+            raise first
 
 
 def _urlopen(url: str, timeout: float = TIMEOUT):
@@ -118,10 +154,14 @@ def latest_release() -> dict | None:
     picked = pick_asset(data.get("assets") or [])
     if picked is None:
         return None
+    # ★ GitHub 會給 "sha256:xxxx"（新版 API）—— 有就帶著，下載完對一次。
+    dig = str(picked.get("digest") or "")
     return {
         "version": tag,
         "url": picked.get("browser_download_url"),
         "size": int(picked.get("size") or 0),
+        "name": picked.get("name") or ASSET_NAME,
+        "sha256": dig.split(":", 1)[1].lower() if dig.startswith("sha256:") else "",
         "notes": (data.get("body") or "").strip(),
     }
 
@@ -152,36 +192,90 @@ def check() -> dict | None:
     return info if is_newer(info["version"], __version__) else None
 
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def _good(dest: Path, info: dict) -> bool:
+    """下載完的檔案能不能用：大小對、是 Windows 執行檔、sha256 對得上。"""
+    if not dest.exists() or dest.stat().st_size <= 1_000_000:
+        return False
+    total = info.get("size") or 0
+    if total and dest.stat().st_size != total:
+        return False
+    with dest.open("rb") as f:
+        if f.read(2) != b"MZ":                 # 抓到錯誤頁面那種
+            return False
+    want = (info.get("sha256") or "").lower()
+    return (not want) or _sha256(dest) == want
+
+
+def _fetch(url: str, info: dict, dest: Path, progress=None) -> bool:
+    """把 `url` 抓成 `dest`。**支援斷點續傳**：dest 已經有一半就從那裡接著抓。
+
+    ⚠ 網路中斷時**不刪掉半成品**（下一次啟動接著抓）；只有「抓完卻驗不過」
+      才刪 —— 那種檔案留著會一直續傳到同一個壞結果。
+    """
+    total = info.get("size") or 0
+    have = dest.stat().st_size if dest.exists() else 0
+    if total and have >= total:                # 上次其實抓完了
+        return _good(dest, info) or (dest.unlink(missing_ok=True) or False)
+    headers = dict(UA)
+    mode = "wb"
+    if have > 0:
+        headers["Range"] = f"bytes={have}-"
+        mode = "ab"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = _urlopen_req(req, timeout=60.0)
+    except Exception:                                      # noqa: BLE001
+        return False
+    with resp:
+        if have > 0 and resp.status != 206:     # 伺服器不吃續傳 → 從頭來
+            have, mode = 0, "wb"
+        try:
+            with dest.open(mode) as f:
+                got = have
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if progress:
+                        progress(got, total)
+        except Exception:                                  # noqa: BLE001
+            return False                       # ⚠ 半成品留著，下次續傳
+    if _good(dest, info):
+        return True
+    dest.unlink(missing_ok=True)               # 驗不過的一定要丟
+    return False
+
+
 def download(info: dict, dest: Path, progress=None) -> bool:
     """下載新版到 dest。progress(已下載, 總量) 可選。
 
-    下載完會檢查大小與 PE 標頭（MZ）—— 抓到半截或抓到錯誤頁面時不會拿去覆蓋。
+    ① 設定了鏡像（`update.mirror`）就**先從鏡像抓**，失敗才退回 GitHub。
+    ② 斷點續傳：上次沒抓完的接著抓（GitHub 與一般 CDN 都支援 Range）。
+    ③ 不管從哪抓，最後都驗大小＋PE 標頭＋**GitHub API 給的 sha256**，
+       對不上就丟掉重來 —— 鏡像被動手腳也裝不進來。
     """
-    total = info.get("size") or 0
-    try:
-        with _urlopen(info["url"], timeout=60.0) as resp, dest.open("wb") as f:
-            got = 0
-            while True:
-                chunk = resp.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                if progress:
-                    progress(got, total)
-    except Exception:
-        dest.unlink(missing_ok=True)
-        return False
-
-    ok = dest.exists() and dest.stat().st_size > 1_000_000
-    if ok and total:
-        ok = dest.stat().st_size == total
-    if ok:
-        with dest.open("rb") as f:
-            ok = f.read(2) == b"MZ"      # 確定是 Windows 執行檔
-    if not ok:
-        dest.unlink(missing_ok=True)
-    return ok
+    urls = []
+    base = mirror_base()
+    if base:
+        urls.append(f"{base}/{info.get('name') or ASSET_NAME}")
+    if info.get("url"):
+        urls.append(info["url"])
+    for k, url in enumerate(urls):
+        if _fetch(url, info, dest, progress):
+            return True
+        if k + 1 < len(urls):                  # 鏡像不行 → 換 GitHub，從頭抓
+            dest.unlink(missing_ok=True)
+    return False
 
 
 def apply_and_restart(new_file: Path) -> bool:

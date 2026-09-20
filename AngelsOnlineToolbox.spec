@@ -48,10 +48,47 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # ★★★★ 2026-09-20 使用者：「自動更新下載很久」。實測 GitHub 的 Release 通道
+    #   從他那條線出去**常常只有 0.1 MB/s**（同一台機器抓 Cloudflare 是 7.9 MB/s），
+    #   97MB 慢的時候要十幾分鐘 → **exe 能小一點就小一點**。
+    #   這些是 PySide6／PIL 硬塞進來、我們**一行都沒用到**的東西。
+    excludes=[
+        'PySide6.QtQuick', 'PySide6.QtQuick3D', 'PySide6.QtQuickWidgets',
+        'PySide6.QtQml', 'PySide6.QtQmlModels',      # 沒有任何 QML
+        'PySide6.QtPdf', 'PySide6.QtPdfWidgets',     # 不做 PDF
+        'PySide6.Qt3DCore', 'PySide6.QtCharts', 'PySide6.QtDataVisualization',
+        'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
+        'tkinter', 'unittest', 'pydoc_data',
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# ★ 上面的 excludes 只擋得住 Python 模組；Qt 的 DLL 是 PySide6 的 hook 直接塞進
+#   binaries 的，要在這裡按檔名剔除。⚠ 只剔除**確定沒用到**的：
+#     opengl32sw.dll  19.7MB  軟體 OpenGL —— 我們是純 QtWidgets，沒有 QOpenGLWidget
+#     Qt6Quick/Qml    12.4MB  QML 引擎
+#     Qt6Pdf           4.4MB  PDF 模組
+#     PIL/_avif        7.5MB  AVIF 影像編碼（PIL 本體要留：app/core/window.py 在用）
+#   ⛔ **不要**剔除 avcodec/avformat（警報聲 mp3 要它）、libcrypto/libssl
+#     （更新檢查要 HTTPS）、numpy 的 OpenBLAS（掃描在用）、Qt6Svg（介面的勾勾/箭頭）。
+DROP_BINARIES = (
+    'opengl32sw.dll',
+    'qt6quick', 'qt6qml',
+    'qt6pdf',
+    'pil/_avif',                 # ⚠ 比對前已把反斜線換成 '/'，這裡只寫斜線版
+)
+
+
+def _keep(entry):
+    name = str(entry[0]).lower().replace(chr(92), '/')
+    return not any(d.replace(chr(92), '/') in name for d in DROP_BINARIES)
+
+
+_before = len(a.binaries)
+a.binaries = [x for x in a.binaries if _keep(x)]
+print(f'[spec] 剔除用不到的二進位檔：{_before} → {len(a.binaries)} 個')
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
