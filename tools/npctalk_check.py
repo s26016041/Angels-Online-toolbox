@@ -352,9 +352,18 @@ check("★ 已經夠近就一步都不走", STEPS == [] and MOVER.walks == [],
 STEPS.clear()
 HERE[0] = (5.5, 5.5)
 FakeNav.last_sent = True
+_WALK0 = supply._is_walking
+supply._is_walking = lambda sc: True
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★★ 最後一個轉折點送出去了 → 當場交棒官方 TryAct，不等人走到那格",
+check("★★ 最後一個轉折點送出去、人開始動了 → 交棒官方 TryAct，不等人走到那格",
       len(STEPS) == 1, str(len(STEPS)))
+
+STEPS.clear()
+supply._is_walking = lambda sc: False             # 送了但人沒動
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★★ 送出去人卻沒動 → 同一個點一直重送（不只送一次），不動滿 APPROACH_STALL 才收工",
+      len(STEPS) >= 3, str(len(STEPS)))
+supply._is_walking = _WALK0
 
 STEPS.clear()
 supply.find_npc = lambda sc, nid: None            # 還沒串流

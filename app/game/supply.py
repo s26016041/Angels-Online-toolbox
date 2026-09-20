@@ -885,6 +885,28 @@ def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> 
         _nap(0.1)
 
 
+LAST_MOVE_WAIT = 0.8       # 最後一點送出後等這麼久看人有沒有動（下指令 ~0.46s 才變 Run）
+LAST_MOVE_STEP = 0.3       # 位置挪了這麼多格也算「在動」（動畫訊號讀不到時的第二證據）
+
+
+def _started_moving(scanner, was) -> bool:
+    """最後一個點送出去之後，人**真的開始動了**嗎（`LAST_MOVE_WAIT` 秒內）。
+
+    兩個訊號任一：動畫在走（`_is_walking`）或位置比送出那拍 `was` 挪了
+    `LAST_MOVE_STEP` 格。都沒有回 False → 呼叫端重送同一個點。
+    """
+    t0 = time.time()
+    while time.time() - t0 < LAST_MOVE_WAIT:
+        if _is_walking(scanner):
+            return True
+        _, here = _player_tile(scanner)
+        if here is not None and was is not None and math.hypot(
+                here[0] - was[0], here[1] - was[1]) > LAST_MOVE_STEP:
+            return True
+        _nap(0.05)
+    return False
+
+
 def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str,
                 tries: int = 4, confirm=None,
                 confirm_timeout: float | None = None) -> bool:
@@ -1146,8 +1168,14 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
         #   **發出去了**就可以換官方的對話走路」—— 硬等人站上最後那格，那格有人／
         #   站不上去就會卡住。官方 TryAct 自己會接手走完剩下那段。
         #   ⚠ 看得到他才交棒（還對著表座標走＝只是進串流範圍，TryAct 沒對象）。
+        # ★ 同日再補（使用者：「發送最後一個點位**直到在移動**就可以停了，我怕只發送
+        #   一次會卡住」）：送出去不算數，要**看到人真的動了**才交棒；`LAST_MOVE_WAIT`
+        #   秒內沒動 → 回迴圈頂，`Navigator` 會把同一個點再送一次（一直不動由上面
+        #   `APPROACH_STALL` 收工）。
         if found and nav.last_sent:
-            return
+            if _started_moving(scanner, here):
+                return
+            continue
         _wait_move_done(scanner, timeout=8.0)
 
 
