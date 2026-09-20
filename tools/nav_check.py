@@ -105,7 +105,7 @@ SENT = []
 MOVER = types.SimpleNamespace(
     active=True,
     walk_route=lambda sc, obj, x, y, stop_short=0.0, points=None:
-        SENT.append((x, y)))
+        SENT.append((x, y)) or 1)      # 真的那支回路徑點數（0＝沒送成）
 
 
 def build(wp):

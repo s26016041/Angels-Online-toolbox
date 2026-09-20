@@ -168,6 +168,11 @@ class Navigator:
         #     只有被推得比舉旗時更遠（> 1 格）才重新規劃。
         self.exhausted = False
         self._exh_d = 0.0                    # 舉旗時離目標幾格
+        # ★ 「最短路的**最後一個轉折點已經送給遊戲了**」（2026-09-20 使用者定）：
+        #   補給找 NPC 看到這面旗就直接切官方 TryAct，不等人真的站上那一格 ——
+        #   硬要走到最後那格，那格有人／站不上去就會卡住。
+        #   重新規劃（換目標／被擋重算）就放下；只是個訊號，不影響這裡怎麼走。
+        self.last_sent = False
         self._route: list | None = None      # 目前這條最短路的轉折點
         self._ri = 0                         # 走到第幾個轉折點
         self._best = None                    # 對目前轉折點的最佳距離
@@ -235,6 +240,7 @@ class Navigator:
         self.stuck = False
         self.stuck_reason = ""
         self._route = [(float(x) + 0.5, float(y) + 0.5) for x, y in wp]
+        self.last_sent = False
         self._ri = 0
         self._best = None
         self._stall = 0
@@ -351,6 +357,7 @@ class Navigator:
                 self._replans += 1
                 self._mark_blocked(here, pt, goal)
                 self._route = None
+                self.last_sent = False     # 要重算了 → 上一條的「最後一點」不算數
                 self._maps.drop()          # 順便重讀圖（可能換圖了）
                 if self._replans > REPLAN_MAX:
                     self.stuck = True
@@ -363,8 +370,10 @@ class Navigator:
                 return self.note
         # ★ 最短路的每一段本來就保證直線可通 → 直接把終點交給遊戲的走路常式，
         #   不必再請它尋一次路（省一次呼叫、不佔指令槽）。
-        mover.walk_route(scanner, player_obj, pt[0], pt[1],
-                         stop_short=0.0, points=[pt])
+        n = mover.walk_route(scanner, player_obj, pt[0], pt[1],
+                             stop_short=0.0, points=[pt])
+        # 最後一個轉折點**真的送出去了**（回 0＝沒送成，不算）→ 見 `last_sent`。
+        self.last_sent = n > 0 and self._ri == len(self._route) - 1
         self._sent = time.monotonic()
         # ⚠ 送出去了＝新的起跑點：碼表歸零，不然「上一段走完停著」那幾拍會被
         #   算進沒動的時間，一送出去就馬上又被判「卡住」重送（互相打斷）。

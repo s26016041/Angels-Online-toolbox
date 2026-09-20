@@ -1142,6 +1142,12 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
         #   講不到話（2026-09-06 棕櫚基地銀行停在 4.26 格失敗三趟的教訓）。
         nav = _push_toward(mover, scanner, pf + 8, goal[0], goal[1], nav,
                            arrive=GOAL_ARRIVE)
+        # ★ 2026-09-20 使用者定：「不需要一定要走到最後那個點，只要最後那個點
+        #   **發出去了**就可以換官方的對話走路」—— 硬等人站上最後那格，那格有人／
+        #   站不上去就會卡住。官方 TryAct 自己會接手走完剩下那段。
+        #   ⚠ 看得到他才交棒（還對著表座標走＝只是進串流範圍，TryAct 沒對象）。
+        if found and nav.last_sent:
+            return
         _wait_move_done(scanner, timeout=8.0)
 
 

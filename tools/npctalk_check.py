@@ -322,6 +322,7 @@ REAL_NAV = supply.navigate
 
 class FakeNav:
     stuck = False
+    last_sent = False          # 「最後一個轉折點已經送出去了」（見 Navigator.last_sent）
 
     def step(self, sc, mover, obj, gx, gy, arrive=None):
         STEPS.append((gx, gy))
@@ -350,7 +351,19 @@ check("★ 已經夠近就一步都不走", STEPS == [] and MOVER.walks == [],
 
 STEPS.clear()
 HERE[0] = (5.5, 5.5)
+FakeNav.last_sent = True
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★★ 最後一個轉折點送出去了 → 當場交棒官方 TryAct，不等人走到那格",
+      len(STEPS) == 1, str(len(STEPS)))
+
+STEPS.clear()
 supply.find_npc = lambda sc, nid: None            # 還沒串流
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("⛔ 還看不到他（對著表座標走）→ 最後一點送出去也不交棒", len(STEPS) > 1,
+      str(len(STEPS)))
+FakeNav.last_sent = False
+
+STEPS.clear()
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
 check("★ 看不到他 → 改走 .MPC 表座標（把人帶進串流範圍）",
       bool(STEPS) and all(s == (170.0, 90.0) for s in STEPS), str(STEPS[:3]))
