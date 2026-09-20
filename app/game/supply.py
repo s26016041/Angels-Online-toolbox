@@ -668,9 +668,14 @@ def _wait_dialog(scanner, baseline, timeout: float = DIALOG_TIMEOUT,
                     and page_base is not None and pg.sig != page_base):
                 return True
         if again is not None:
-            # gap：多久補送一次「點」。預設 CLICK_REPEAT（官方狀態機那個重試）；
-            # 走到 NPC 旁邊講話那條用 TALK_CLICK_GAP（2 秒，使用者 2026-09-20 定）。
-            if time.time() - last_click >= gap:
+            # gap：多久補送一次「點」。可以給**函式**（每一拍現算）——
+            # ★★★★ 2026-09-20 實機回報「等超久才走去」的真因就在這裡：TryAct
+            #   那一發**同時是讓官方把人走過去的動力**（見上面 again 的說明）。
+            #   人還沒到位時要用 CLICK_REPEAT(0.35s) 一直踩油門；站定了才換成
+            #   TALK_CLICK_GAP(2s)（使用者：「角色不動了就發送官方的，2 秒沒偵測到
+            #   對話就再發送一次」）。⛔ 不准一路用 2 秒 —— 那等於把油門收掉 6 倍。
+            now_gap = gap() if callable(gap) else gap
+            if time.time() - last_click >= now_gap:
                 last_click = time.time()
                 again()
             # ★ give_up_still（2026-09-06 棕櫚基地銀行實錄）：人在互動方框外時 TryAct 唯一的
@@ -881,18 +886,27 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
             _nap(0.3)
             continue
 
-        # ★ 等對話框的期間每 TALK_CLICK_GAP 秒補送一次（＝「2 秒沒偵測到對話
-        #   就再發送一次官方的」）。⚠ 每一發都**重新找那隻 NPC**：實體會被
+        # ★ 等對話框的期間補送 TryAct。⚠ 每一發都**重新找那隻 NPC**：實體會被
         #   回收／換一格，上一拍的位址不能信（CLAUDE.md「送出前當場重驗」）。
         def _again(_m=mover, _s=scanner, _id=npc_id):
             f = find_npc(_s, _id)
             return bool(f) and _click_npc(_m, _s, f[0])
 
+        # ★★★★ 補點間隔要**看狀況**（2026-09-20 實機「等超久才走去」）：
+        #   還在走路／還沒進講話方框 → CLICK_REPEAT(0.35s)，因為每一發 TryAct
+        #   就是官方把人往前帶一步的動力；站定且在框內 → TALK_CLICK_GAP(2s)。
+        def _gap(_s=scanner, _id=npc_id):
+            pf = move.pathfinder_this(_s)
+            if pf and entity.is_walking(_s, pf + 8):
+                return CLICK_REPEAT
+            box = _npc_in_box(_s, _id)
+            return TALK_CLICK_GAP if box else CLICK_REPEAT
+
         if base is None:                             # 安全退化：全域讀不到 → 盲等照送
             _wait_still(scanner, timeout=min(12.0, left))
             _nap(TALK_GAP)
         elif not _wait_dialog(scanner, base, left, again=_again,
-                              page_base=page_base, gap=TALK_CLICK_GAP):
+                              page_base=page_base, gap=_gap):
             # ★★ 沒看到對話 **≠** 一定沒開：對話框**本來就開著**時代號一動也不動
             #   （2026-09-03 黑狐銀行實測）。「讀不到≠沒有」是本專案復發八次的坑
             #   （[[bag-false-empty-guards]]）→ 旗標沒有明說 False、代號又非 0、
@@ -963,8 +977,8 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
     if not (mover and mover.active):
         return
     t0 = time.time()
-    best = None                      # 目前為止最近的距離
-    best_t = t0                      # 上次「真的更靠近」是什麼時候
+    was = None                       # 上次看到的位置
+    moved_t = t0                     # 上次「人真的有動」是什麼時候
     while time.time() - t0 < timeout:
         _abort_check()
         pf, here = _player_tile(scanner)
@@ -979,9 +993,14 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
         gap = math.hypot(here[0] - nt[0], here[1] - nt[1])
         if found and gap <= CLICK_RANGE:
             return                   # 到了（⚠ 看得到他才算數）
-        if best is None or gap < best - 0.5:         # 有進展 → 續命
-            best, best_t = gap, time.time()
-        elif time.time() - best_t > APPROACH_STALL:  # 卡住了 → 別磨，回去點
+        # ★★★★ 2026-09-20 實機「一直卡住」的真因：舊寫法是「**沒更靠近 0.5 格**
+        #   就算卡住」，而這個迴圈一圈要等 `_wait_move_done`（最多 8 秒）——
+        #   正常走一段只縮短 0.4 格也會被判成卡住、當場不走了。
+        #   → 改成看**人有沒有在動**（位置變了就續命），跟使用者的說法一致：
+        #     「反正角色不動了就發送官方的」。
+        if was is None or math.hypot(here[0] - was[0], here[1] - was[1]) > 0.5:
+            was, moved_t = here, time.time()
+        elif time.time() - moved_t > APPROACH_STALL:   # 真的不動了 → 回去點
             return
         if mover.walk_route(scanner, pf + 8, nt[0], nt[1],
                             stop_short=1.5) <= 0:

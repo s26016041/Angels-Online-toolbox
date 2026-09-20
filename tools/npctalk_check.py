@@ -107,6 +107,8 @@ supply._wait_still = lambda *a, **k: None
 supply._talkaction = lambda *a, **k: True
 supply._wait_page = lambda *a, **k: True
 supply._wait_arrival = lambda *a, **k: True
+supply._npc_in_box = lambda sc, nid: True          # 預設：已經站在講話方框內
+supply.move = type("M", (), {"pathfinder_this": staticmethod(lambda sc: 0)})()
 supply.talkwnd = type("T", (), {
     "page": staticmethod(lambda sc: None),
     "window_visible": staticmethod(lambda sc: None),
@@ -180,8 +182,17 @@ supply.find_npc = lambda sc, nid: FOUND.append(nid) or (0x1000, 0x2000)
 supply._wait_dialog = spy_wait_dialog
 supply._wnd_open = lambda m, s, n: False
 ok = supply._engage_npc(MOVER, SC, 1, (170, 90), [10], "WND_NPCSALE")
-check("★ 補點間隔＝TALK_CLICK_GAP(2 秒)",
-      all(g == supply.TALK_CLICK_GAP for _t, g in GAPS), str(GAPS))
+# ★★★★ 2026-09-20 實機「等超久才走去」→ 補點間隔改成**看狀況**：TryAct 那一發
+#   同時是「官方把人走過去」的油門，所以人還在走／還沒進講話方框時要用
+#   CLICK_REPEAT(0.35s)，站定且在框內才用 TALK_CLICK_GAP(2s)。
+_gaps = [g() if callable(g) else g for _t, g in GAPS]
+check("★ 站定且在講話方框內 → 2 秒補一次（使用者要的節奏）",
+      all(g == supply.TALK_CLICK_GAP for g in _gaps), str(_gaps))
+supply._npc_in_box = lambda sc, nid: False        # 還沒進框（在走過去）
+_gaps2 = [g() if callable(g) else g for _t, g in GAPS]
+check("★★ 還沒到位 → 回到 0.35 秒踩油門（⛔ 不准一路 2 秒，那會「等超久才走去」）",
+      all(g == supply.CLICK_REPEAT for g in _gaps2), str(_gaps2))
+supply._npc_in_box = lambda sc, nid: True
 check("★ 等待上限就是剩下的預算（≤ TALK_GIVE_UP）",
       GAPS and GAPS[0][0] <= supply.TALK_GIVE_UP, str(GAPS))
 check("★ 補點會重新找 NPC 再點", AGAIN and all(AGAIN), str(AGAIN))
