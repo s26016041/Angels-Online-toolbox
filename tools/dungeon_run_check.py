@@ -2756,25 +2756,23 @@ def main() -> int:
     world["here"] = 90
     world["mine"], world["his"] = [M("小黑")], [M("黑狐")]
     run(tab, 0.3)
-    ck("★ 落地 → 進組隊段，先退組（兩隻都送）", tab._cycle == "team"
-       and tab._team_sub == "leave" and len(world["left"]) >= 2,
-       f"{tab._cycle}/{tab._team_sub} left={len(world['left'])}")
+    ck("★ 落地 → 進組隊段：**拒絕＋退組同一拍**（兩隻都送）", tab._cycle == "team"
+       and tab._team_sub == "leave" and len(world["left"]) >= 2
+       and len(world["denied"]) == 2,
+       f"{tab._cycle}/{tab._team_sub} left={len(world['left'])} "
+       f"denied={len(world['denied'])}")
     world["mine"], world["his"] = [], []
     run(tab, 0.3)
-    ck("★★ 名單清空 → ⛔ 不是馬上拒絕，先隔 TEAM_GAP（使用者 2026-09-08）",
-       tab._team_sub == "deny" and not world["denied"],
-       f"{tab._team_sub} denied={len(world['denied'])}")
-    run(tab, dt.TEAM_GAP)
-    ck("★ 隔完 → 兩隻都先拒絕一次掛著的邀請 → 換成邀請（使用者 9/6）",
-       tab._team_sub == "invite" and len(world["denied"]) == 2,
-       f"{tab._team_sub} denied={len(world['denied'])}")
-    ck("　拒絕完先隔 TEAM_GAP 才邀請（拒絕包先到）", not world["invited"],
-       str(world["invited"]))
-    run(tab, dt.TEAM_GAP + 0.3)
-    ck("★★ 邀請送出後也先隔 TEAM_GAP 才按同意", world["invited"]
-       and world["joined"] == 0, f"{world['invited']} joined={world['joined']}")
-    run(tab, dt.TEAM_GAP)
-    ck("★ 刷副本這隻當隊長邀請綁定分身、**均分**、分身按同意",
+    # ★★★★ 2026-09-20 實測重訂（雪狐＋北極狐 45 趟 0 失敗，見 dungeon_tab 的
+    #   TEAM_LEAVE_GAP 那段）：名單一清空就**立刻**邀請，⛔ 不再隔 3 秒；
+    #   「拒絕」已經在退組那一拍送過了，⛔ 不可以再放到邀請前面（會把自己的邀請拒掉）。
+    ck("★★ 名單清空 → 立刻邀請（⛔ 沒有固定等待、⛔ 沒有第二次拒絕）",
+       tab._team_sub == "invite" and len(world["invited"]) == 1
+       and len(world["denied"]) == 2,
+       f"{tab._team_sub} invited={len(world['invited'])} "
+       f"denied={len(world['denied'])}")
+    run(tab, 0.3)
+    ck("★ 刷副本這隻當隊長邀請綁定分身、**均分**、分身立刻按同意",
        world["invited"] and world["invited"][0] == ("小黑", dt.team.SHARE_EVEN)
        and world["joined"] >= 1, f"{world['invited']} joined={world['joined']}")
     ck("　一輪只邀一次（不狂邀）", len(world["invited"]) == 1, str(len(world["invited"])))
@@ -2793,18 +2791,18 @@ def main() -> int:
     tab._phase = "enter"
     world.update(mine=[], his=[], left=[], invited=[], joined=0, denied=[], here=90)
     tab._team_begin()
-    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
+    run(tab, 0.9)
     ck("循環組隊：第 1 輪 邀請送出", tab._team_rounds == 1 and len(world["invited"]) == 1,
        f"rounds={tab._team_rounds} invited={len(world['invited'])}")
     # 分身這時接了**別人**的邀請 → 在別隊裡（隊長名單還是空的）
     world["his"] = [M("路人甲")]
-    run(tab, dt.TEAM_ROUND + 0.3)
+    run(tab, dt.TEAM_ROUND + 0.3)   # 一輪逾時（6 秒，舊版是 12）
     ck("★ 這一輪沒成隊 → 回頭重走：分身在別隊 → 叫它退組", tab._team_sub == "leave"
        and world["left"], f"{tab._team_sub} left={len(world['left'])}")
     ck("　沒成隊的這段期間沒有再狂邀（一輪一次）", len(world["invited"]) == 1,
        str(len(world["invited"])))
     world["his"] = []
-    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
+    run(tab, 0.9)
     ck("★ 清空 → 又拒絕一次 → 第 2 輪再邀", tab._team_rounds == 2
        and len(world["denied"]) == 4 and len(world["invited"]) == 2,
        f"rounds={tab._team_rounds} denied={len(world['denied'])} invited={len(world['invited'])}")
@@ -2817,14 +2815,14 @@ def main() -> int:
     tab._phase = "enter"
     world.update(mine=[], his=[], left=[], invited=[], joined=0, denied=[], here=90)
     tab._team_begin()
-    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
+    run(tab, 0.9)
     world["mine"] = [M("路人乙")]
     run(tab, 0.3)
     ck("★ 隊長名單裡是別人 → 立刻退組重走（不在別人的隊裡刷）",
        tab._team_sub == "leave" and world["left"] and tab._cycle == "team",
        f"{tab._team_sub} left={len(world['left'])}")
     world["mine"] = []
-    run(tab, 0.3 + dt.TEAM_GAP * 2 + 0.6)
+    run(tab, 0.9)
     world["mine"], world["his"] = [M("小黑")], [M("大黑")]
     run(tab, 0.3)
     ck("　重走後成隊 → 開跑", tab._cycle == "go" and tab._team_rounds == 2,
@@ -2842,9 +2840,9 @@ def main() -> int:
     run(tab, 0.3)
     ck("★★★★ 幽靈隊伍：先真的送過退組才判", world["left"], str(world["left"]))
     ck("★★★★ 他那台說沒隊伍 → 那格是殘影 → 不再死等，往下走",
-       tab._team_sub in ("deny", "invite"), tab._team_sub)
-    run(tab, dt.TEAM_GAP * 2 + 0.6)
-    ck("　照樣走完 拒絕→邀請，⛔ 不准拿殘影當「已組隊」直接開跑",
+       tab._team_sub == "invite", tab._team_sub)
+    run(tab, 0.9)
+    ck("　照樣把邀請送出去，⛔ 不准拿殘影當「已組隊」直接開跑",
        tab._cycle == "team" and len(world["invited"]) == 1,
        f"{tab._cycle} invited={world['invited']}")
     world["his"] = [M("大黑")]

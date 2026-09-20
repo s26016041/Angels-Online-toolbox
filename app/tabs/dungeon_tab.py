@@ -307,19 +307,32 @@ CLEAR_SETTLE = 3.0
 #   裡就好，人在哪不管）／遊戲自動組隊（遊戲裡自己設定，我們只做「退組 → 等隊伍
 #   名單出現人」）。
 PARTY_MODES = (("none", "不組隊"), ("bind", "綁定分身"), ("auto", "遊戲自動組隊"))
-# ★★★ 2026-09-08 使用者定：「組隊你只要執行好我說的流程，每次跑都是那個流程必定
-#   可以組隊，不過可以寫個間隔 3 秒」——**這一套的每一個動作之間一律隔 TEAM_GAP**
-#   （退組 → 拒絕 → 邀請 → 同意）。
-#   為什麼要隔：2026-09-08 的執行紀錄裡，刷邪靈古船時第 1 輪都組得起來，換成無限塔
-#   之後 16 次全部第 1 輪失敗、第 2 輪才成 —— 動作全擠在 1 秒內送出去，中間任何一段
-#   沒被伺服器收乾淨就整輪白走。⛔ 真正的原因我沒查到（不是動作節流：反組譯過
-#   team.ACTION_FN／INVITE_FN 都是直接 call 送包函式，中間沒有那道閘），所以這裡
-#   照使用者指定的做法辦：把流程走好、每步隔開，不自作聰明。
-TEAM_GAP = 3.0             # 這一套流程每一個動作之間隔多久（退組／拒絕／邀請／同意）
-# 一輪（拒絕→邀請→同意）等這麼久沒成隊 → 整套從「退組」再走一次。
-# ⚠ 一定要放得下「拒絕 +3 邀請 +3 第一次同意」再加幾次補按，⛔ 不能比 TEAM_GAP*2 短
-#   （那樣會在分身還沒按到同意之前就把整輪重走）。
-TEAM_ROUND = 12.0
+# ★★★★ 2026-09-20 使用者：「組隊那邊有點慢，把它速度拉快…一直測試找出一個最快
+#   最完整的方式同時還要很穩定」→ 拿雪狐（隊長）＋北極狐（分身）實跑
+#   （scratchpad/team_bench*.py，每種設定 6~30 趟）。**結論跟舊的 3 秒間隔相反**：
+#
+#     設定                       成功/失敗   中位數
+#     每步隔 3 秒（舊）              6/0      6.3 秒
+#     每步隔 0.5 秒                 6/0      1.3 秒
+#     零等待、拒絕緊接著邀請         4/2 ✘    0.5 秒   ← 失敗 2 趟
+#     零等待、不拒絕                 6/0      0.3 秒
+#
+#   ★★★ 真兇是**「拒絕」緊接著「邀請」會把我們自己剛送出去的那張邀請也拒掉**：
+#     「舊邀請掛著 → 拒絕後 0 秒就邀請」8 趟失敗 4 趟，隔 0.3 秒就 8/8。
+#     9/08 那次「無限塔 16 次全部第 1 輪失敗」多半就是這個，3 秒間隔只是把它蓋住。
+#   ★★★ 而且**舊邀請根本不擋新邀請**：上一輪沒人理的邀請還掛著時，重邀一次 8/8
+#     （0.3 秒），連重送邀請都不必、分身直接按同意就進隊（8/8）。所以「拒絕」只剩
+#     「清掉**別人**掛著的邀請」這一個用途 → 移到最前面跟退組同一拍，離邀請很遠。
+#   → 新流程（45 趟 0 失敗、中位 0.5 秒、最慢 0.96 秒）：
+#       ① 同一拍：兩隻都拒絕 ＋ 兩隻都退組
+#       ② 等兩邊名單**真的清空**（硬訊號，實測 0.2 秒；沒清就每 TEAM_LEAVE_GAP 補送）
+#       ③ 隊長送邀請 → ④ 分身每 TEAM_JOIN_GAP 補送同意，直到兩邊互相看得到對方
+#   ⛔ 不要再放「睡 N 秒」進這條路：每一步都有硬訊號可以等（名單清空／名單出現對方）。
+TEAM_LEAVE_GAP = 1.0       # 名單還沒清空 → 每這麼久補送一次退組
+TEAM_JOIN_GAP = 0.4        # 分身補送「同意」的間隔（實測中位 1 次就進隊）
+# 一輪（邀請→同意）等這麼久沒成隊 → 整套從「退組」再走一次。
+# ⚠ 實測最慢 0.96 秒，這裡留 6 倍餘裕；⛔ 不要再調回 12 秒（那是 3 秒間隔年代的數字）。
+TEAM_ROUND = 6.0
 TEAM_NOTE = 3.0            # 等組隊時狀態列多久刷一次
 # ★★★ 副本設定（使用者 2026-09-05：「這遊戲有鎖副本並且未來會改所以需要一個設定」）：
 #   一次連續刷幾場、全部刷完後休息多久再刷、全部場次結束後要不要回自動掛機的點位開掛機。
@@ -4716,38 +4729,55 @@ class CharDungeonPage(QWidget):
     def _team_begin(self) -> None:
         """進入組隊段。綁定分身模式是**一個循環**（使用者 2026-09-06 定）：
 
-            有隊伍就退組（兩隻都退，等名單真的清空）
-            → 兩隻都拒絕一次邀請（可能掛著別人的／上一輪沒回的；沒有就是空包）
-            → 隊長邀請 → 分身同意
-            → TEAM_ROUND 秒內分身沒出現在隊長名單 → **整套從退組再走一次**
+            兩隻都拒絕一次邀請 ＋ 兩隻都退組（同一拍送）
+            → 等兩邊名單**真的清空**
+            → 隊長邀請 → 分身一直補送同意，直到兩邊互相看得到對方
+            → TEAM_ROUND 秒內沒成 → **整套再走一次**
 
-        ★ 2026-09-08 使用者定：**每一個動作之間隔 TEAM_GAP 秒**（「執行好我說的
-          流程、每次跑都是那個流程必定可以組隊，不過可以寫個間隔 3 秒」）。
+        ★ 2026-09-20 使用者要求「拉快」→ 實測重訂節奏（數字與證據見 TEAM_LEAVE_GAP
+          上面那段）：**每一步都等硬訊號，不睡固定秒數**；拒絕一定要跟邀請離開
+          （緊接著送會把自己的邀請拒掉）。
 
-        ⛔ 不准「開頭退一次組、後面只顧一直邀請」：分身接了別人的邀請、或掛著舊邀請
-          把新的擋掉，那樣會永遠邀不進來又不會發現。
+        ⛔ 不准「開頭退一次組、後面只顧一直邀請」：分身接了別人的邀請、或人還掛在
+          別的隊伍裡，那樣會永遠邀不進來又不會發現。
         遊戲自動組隊模式照舊：退組 → 等遊戲自己配到隊伍。"""
         if self._party == "none":
             self._cycle = "go"
             return
         self._cycle = "team"
+        self._team_rounds = 0
+        self._team_note_t = 0.0
+        self._team_enter("leave")
+
+    def _team_enter(self, _sub: str) -> None:
+        """進入（或重新進入）「退組」那一步：拒絕＋退組同一拍送出去。
+
+        ★ 拒絕放在這裡而不是邀請前面 —— 實測「拒絕後 0 秒就邀請」會把自己剛送出去
+          的邀請拒掉（8 趟失敗 4 趟）。放這裡離邀請有「等名單清空」那段距離。
+        ⚠ 拒絕是無條件送的空包（有沒有人在邀請我讀不到，見 `team.deny`）。
+        ⛔ **只有綁定分身模式才送拒絕**：遊戲自動組隊是「等遊戲把我配進某個隊伍」，
+          那張邀請正是我們要的，送拒絕等於把它擋掉。
+        """
         self._team_sub = "leave"
-        self._team_t = 0.0
+        self._team_t = TEAM_LEAVE_GAP
         self._join_t = 0.0
         self._team_round_t = 0.0
-        self._team_rounds = 0
         self._team_invited = False
         self._team_leaves = 0
-        self._team_note_t = 0.0
+        if self._party == "bind":
+            team.deny(self._mover)
+            if self._pmover is not None:
+                team.deny(self._pmover)
+        if team.leave(self._mover):
+            self._team_leaves += 1
+        if self._pmover is not None:
+            team.leave(self._pmover)
 
     def _team_restart(self, why: str) -> None:
         """這一輪沒組成 → 從「退組」整套再走一次（見 _team_begin）。"""
         self._event("warn", f"組隊：第 {self._team_rounds} 輪沒組成（{why}）→ "
-                            "重走 退組→拒絕→邀請→同意")
-        self._team_sub = "leave"
-        self._team_t = 0.0
-        self._team_invited = False
-        self._team_leaves = 0
+                            "重走 拒絕＋退組→邀請→同意")
+        self._team_enter("leave")
 
     def _ghost_party(self, mine, his) -> bool:
         """我這台的隊員名單是**畫面殘影**嗎（2026-09-13 黑狐實錄）。
@@ -4801,37 +4831,24 @@ class CharDungeonPage(QWidget):
                             "伺服器早就沒這個隊伍可退（畫面殘影）→ 當作退組完成往下走")
                 mine = []
             if not mine and not his:
-                if self._party == "bind":
-                    self._team_sub = "deny"
-                else:
+                # ★ 名單真的清空了（硬訊號，實測 0.2 秒）→ 直接進下一步，
+                #   ⛔ 不再睡固定秒數。拒絕已經在 `_team_enter` 跟退組同一拍送過了。
+                if self._party != "bind":
                     self._team_sub = "wait"
-                self._team_t = TEAM_GAP     # ★ 退組之後隔 TEAM_GAP 才拒絕
+                    return
+                self._team_rounds += 1
+                self._team_sub = "invite"
+                self._team_invited = False
+                self._join_t = 0.0
+                self._team_round_t = TEAM_ROUND
                 return
             if self._team_t <= 0:
-                self._team_t = TEAM_GAP
+                self._team_t = TEAM_LEAVE_GAP
                 if mine and team.leave(self._mover):
                     self._team_leaves += 1
                 if his and self._pmover is not None:
                     team.leave(self._pmover)
             self._say("組隊：先退組…（等隊伍名單清空）")
-            return
-        if self._team_sub == "deny":
-            # ★ 兩隻都拒絕一次：有人正在邀請（別人的、或上一輪沒回的）會擋住新邀請。
-            #   「有沒有人在邀請我」讀不到（team.PENDING_OFF 不可信），所以無條件送，
-            #   沒掛著就是空包。
-            if self._team_t > 0:            # 退組跟拒絕之間也要隔開（見 TEAM_GAP）
-                self._say(f"組隊：退組了，等 {self._team_t:.0f} 秒讓伺服器收乾淨…")
-                return
-            team.deny(self._mover)
-            if self._pmover is not None:
-                team.deny(self._pmover)
-            self._team_rounds += 1
-            self._team_sub = "invite"
-            self._team_invited = False
-            self._team_t = TEAM_GAP                     # 拒絕 → 隔 TEAM_GAP → 邀請
-            self._join_t = TEAM_GAP * 2                 # 邀請 → 隔 TEAM_GAP → 按同意
-            self._team_round_t = TEAM_ROUND
-            self._say(f"組隊：第 {self._team_rounds} 輪 —— 兩隻都先拒絕掛著的邀請…")
             return
         if self._team_sub == "wait":
             # 遊戲自動組隊（遊戲裡設定）：只等隊伍名單出現人
@@ -4859,17 +4876,16 @@ class CharDungeonPage(QWidget):
                 self._team_restart(f"{TEAM_ROUND:g} 秒內分身沒進隊")
                 return
             if not self._team_invited:
-                if self._team_t > 0:
-                    self._say(f"組隊：第 {self._team_rounds} 輪 —— 拒絕送出了，"
-                              f"等 {self._team_t:.0f} 秒再邀請…")
-                    return
+                # ★ 名單一清空就送邀請（⛔ 沒有等待：那個等待是舊的 3 秒間隔）
                 ok, why = team.invite(self._mover, self._partner_name, team.SHARE_EVEN)
                 if not ok:
                     self._say(f"組隊：邀請送不出去（{why}），重試中…")
                     return
                 self._team_invited = True                # 一輪只邀一次
             if self._join_t <= 0 and self._pmover is not None:
-                self._join_t = TEAM_GAP
+                # ★ 邀請送出去的下一拍就按同意，之後每 TEAM_JOIN_GAP 補一次
+                #   （實測中位數 1 次就進隊）。
+                self._join_t = TEAM_JOIN_GAP
                 team.join(self._pmover, self._psc)
             self._say(f"組隊：第 {self._team_rounds} 輪 —— 邀請「{self._partner_name}」"
                       f"入隊中（均分），分身按同意…")
