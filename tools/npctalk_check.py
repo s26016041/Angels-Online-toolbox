@@ -27,12 +27,12 @@
     ⑦ 旗標**明說** False（畫面上確定沒有對話框）→ 不硬送選項
     ⑧ NPC 還沒串流進來（跨城走一半）**不算**講不到話：繼續走，
        走滿 `WALK_TIMEOUT` 才算失敗
-    ⑨ `_approach_npc`：走不走得到都照走（官方尋路 `walk_route`），
-       連續 `APPROACH_STALL` 秒沒更靠近就回去讓 TryAct 收尾；
+    ⑨ `_approach_npc`（2026-09-20 晚使用者定：「先用我們自己算路徑走到最近
+       可以走到的地方，然後切官方的」）：走**我們自己算的路徑**（地形圖 A*，
+       `navigate.Navigator`），目標＝NPC 本人（終點在櫃檯裡由 `terrain.route`
+       放寬到最近可走格）；人不動 `APPROACH_STALL` 秒就回去讓 TryAct 收尾；
        NPC 還看不到就先往 .MPC 表座標走
-    ⑨b 官方尋路**算不出長路**（回 0，跨城那種）→ 改用地形圖 A*
-       （`navigate.Navigator`）自己走，目標一樣是 NPC 本人；連地形圖都說
-       走不到才 `walk_near` 直走 —— ⛔ 這是**走路手段**，不是挑站位
+    ⑨b 地形圖說走不到 → 才問官方 `walk_route`；官方也回 0 → `walk_near` 直走
     ⑩ 看得到他但還在講話方框外 → **自己一路走過去**，而且那段時間 ⛔ 不算
        進 20 秒碼錶（2026-09-20 實機誤報：人還在半路就發「講不到話」通知＋停機）
     ⑩b 走一段沒更靠近（人牆／被佔住）→ 不再自己走，換官方 TryAct 收尾
@@ -307,44 +307,13 @@ check("　原因是「看不到他」不是「沒開對話」",
       "看不到他" in supply.talk_failure(), supply.talk_failure())
 
 print()
-print("⑨ _approach_npc：走不走得到都照走，卡住就回去讓 TryAct 收尾")
+print("⑨ _approach_npc：先用我們自己算的路徑走到最近可走的地方，走不動就回去切官方")
+# ★★★★ 2026-09-20 晚使用者定（原話）：「先用我們自己算路徑走到最近可以走到的地方，
+#   然後切官方的」。早上 e682764 把 `_walk_to_npc` 整支刪掉時連「地形圖 A* 自己走」
+#   也砍了，只剩官方尋路 —— 它算不出長路就回 0 → 銀行／跨城的 NPC 一步都走不出去
+#   （使用者：「他就是不動」）。
 supply._approach_npc = REAL_APPROACH
 supply._wait_move_done = lambda *a, **k: CLOCK.sleep(0.5)
-HERE = [(5.5, 5.5)]
-supply._player_tile = lambda sc: (0x3000, HERE[0])
-supply._ent_tile_f = lambda sc, ent: (20.5, 5.5)
-supply.find_npc = lambda sc, nid: (0x1000, 0x2000)
-MOVER.walks.clear()
-REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★ 卡住（位置一直沒變）→ APPROACH_STALL 秒內就回來，不磨滿",
-      0 < len(MOVER.walks) <= supply.APPROACH_STALL / 0.5 + 2,
-      str(len(MOVER.walks)))
-check("★ 走的是**官方尋路**對 NPC 本人（⛔ 不是挑出來的可走格）",
-      all(w[1:] == (20.5, 5.5) for w in MOVER.walks), str(MOVER.walks[:3]))
-
-MOVER.walks.clear()
-HERE[0] = (19.0, 5.5)                 # 已經在 CLICK_RANGE 內
-REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★ 已經夠近就一步都不走", MOVER.walks == [], str(MOVER.walks))
-
-MOVER.walks.clear()
-HERE[0] = (5.5, 5.5)
-supply.find_npc = lambda sc, nid: None            # 還沒串流
-REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★ 看不到他 → 改走 .MPC 表座標（把人帶進串流範圍）",
-      bool(MOVER.walks) and all(w[1:] == (170.0, 90.0) for w in MOVER.walks),
-      str(MOVER.walks[:3]))
-
-MOVER.walks.clear()
-supply._player_tile = lambda sc: (None, None)     # 讀不到自己
-REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("　讀不到玩家座標就安全退出（不亂走）", MOVER.walks == [])
-
-print()
-print("⑨b 官方尋路算不出長路（回 0）→ 改用地形圖 A* 自己走（⛔ 不是站著不動）")
-# ★★★★ 2026-09-20 晚回歸：早上 e682764 把 `_walk_to_npc` 整支刪掉時，連「跨城
-#   長距離用地形圖 A* 自己走」那一半也砍了 → 官方尋路對長路一律回 0 → 銀行／
-#   跨城的 NPC **一步都走不出去**（使用者：「他就是不動」）。
 STEPS: list = []
 REAL_NAV = supply.navigate
 
@@ -358,29 +327,58 @@ class FakeNav:
 
 
 supply.navigate = type("N", (), {"Navigator": FakeNav})()
+HERE = [(5.5, 5.5)]
 supply._player_tile = lambda sc: (0x3000, HERE[0])
-supply._ent_tile_f = lambda sc, ent: (60.5, 5.5)      # 55 格外（跨城那種）
+supply._ent_tile_f = lambda sc, ent: (20.5, 5.5)
 supply.find_npc = lambda sc, nid: (0x1000, 0x2000)
-HERE[0] = (5.5, 5.5)
-MOVER.route_ok = False                                # 官方：算不出路
 MOVER.walks.clear()
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★ 官方回 0 → 真的改用 A* 走（Navigator.step）", STEPS != [],
-      str(len(STEPS)))
-check("★ A* 的目標就是 NPC 本人（⛔ 沒有挑站位、沒有自己選格子）",
-      all(s == (60.5, 5.5) for s in STEPS), str(STEPS[:2]))
-check("⛔ 地形圖走得動時不亂送 walk_near 直走",
-      not any(w[0] == "near" for w in MOVER.walks), str(MOVER.walks[:3]))
+check("★ 卡住（位置一直沒變）→ APPROACH_STALL 秒內就回來，不磨滿",
+      0 < len(STEPS) <= supply.APPROACH_STALL / 0.5 + 2, str(len(STEPS)))
+check("★★ 走的是**我們自己算的路徑**（地形圖 A*），目標＝NPC 本人",
+      all(s == (20.5, 5.5) for s in STEPS), str(STEPS[:3]))
+check("⛔ A* 走得動時不去問官方尋路、也不亂直走", MOVER.walks == [],
+      str(MOVER.walks[:3]))
 
 STEPS.clear()
-MOVER.walks.clear()
-FakeNav.stuck = True                                  # 地形圖也說走不到
+HERE[0] = (19.0, 5.5)                 # 已經在 CLICK_RANGE 內
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★ 連地形圖都說走不到 → walk_near 直走當最後退路",
+check("★ 已經夠近就一步都不走", STEPS == [] and MOVER.walks == [],
+      f"{STEPS} {MOVER.walks}")
+
+STEPS.clear()
+HERE[0] = (5.5, 5.5)
+supply.find_npc = lambda sc, nid: None            # 還沒串流
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★ 看不到他 → 改走 .MPC 表座標（把人帶進串流範圍）",
+      bool(STEPS) and all(s == (170.0, 90.0) for s in STEPS), str(STEPS[:3]))
+
+STEPS.clear()
+supply._player_tile = lambda sc: (None, None)     # 讀不到自己
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("　讀不到玩家座標就安全退出（不亂走）", STEPS == [] and MOVER.walks == [])
+
+print()
+print("⑨b 地形圖說走不到 → 才問官方尋路；官方也算不出來 → 直走當最後退路")
+supply._player_tile = lambda sc: (0x3000, HERE[0])
+supply.find_npc = lambda sc, nid: (0x1000, 0x2000)
+HERE[0] = (5.5, 5.5)
+FakeNav.stuck = True
+MOVER.route_ok = True
+MOVER.walks.clear()
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★ A* 走不到 → 退官方 walk_route",
+      any(w[0] == "route" for w in MOVER.walks), str(MOVER.walks[:3]))
+check("　官方算得出來就不直走",
+      not any(w[0] == "near" for w in MOVER.walks), str(MOVER.walks[:3]))
+MOVER.route_ok = False
+MOVER.walks.clear()
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★ 官方也回 0 → walk_near 直走當最後退路",
       any(w[0] == "near" for w in MOVER.walks), str(MOVER.walks[:3]))
 FakeNav.stuck = False
-supply.navigate = REAL_NAV
 MOVER.route_ok = True
+supply.navigate = REAL_NAV
 
 print()
 print("⑩ 先自己走到他旁邊再點官方；⚠ 走過去那段**不算**講不到話（9/20 誤報通知）")

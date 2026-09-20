@@ -557,25 +557,29 @@ def _npc_gap(scanner, npc_id: int):
 
 
 def _push_toward(mover, scanner, player_obj, tx: float, ty: float, nav=None):
-    """往 (tx, ty) 走 —— **三段退路**，回傳這趟用的 `Navigator`（沒用到回 None）。
+    """往 (tx, ty) 走 —— **先用我們自己算的路徑**，回傳這趟用的 `Navigator`。
 
-    ① 官方尋路 `walk_route`（近距離最準，它自己會繞地形）。
-    ② 官方回 0 ＝**算不出路**（跨城那種長路它一律回 0，實測 236 格就回 0）
-       → 自己讀地形圖算 A\*（`navigate.Navigator`，純讀記憶體、不呼叫遊戲的
-       尋路）分段走。★★★★ 2026-09-20 晚：早上把 `_walk_to_npc` 整支刪掉時連
-       這一半也砍了 → 銀行／跨城的 NPC **一步都走不出去**（使用者：「他就是
-       不動」），所以接回來。⚠ 目標永遠是**對方本人／表座標**，
-       `terrain.route` 自己會把落在櫃檯裡的終點放寬到最近可走格 —— ⛔ 這裡
-       沒有、也不准有任何「挑站位／換站位」的東西。
-    ③ 連地形圖都說走不到 → `walk_near` 直走一步當最後退路。
+    ★★★★ 2026-09-20 晚使用者定（原話）：「**先用我們自己算路徑走到最近可以走到的
+      地方，然後切官方的**」。所以順序是：
+    ① **地形圖 A***（`navigate.Navigator`，純讀記憶體、不呼叫遊戲的尋路）。
+       目標給 NPC 本人／`.MPC` 表座標就好 —— `terrain.route` 會把落在櫃檯裡的
+       終點放寬到**離他最近的可走格**（`GOAL_RELAX`），那就是「最近可以走到的
+       地方」。走到了（或走不動了）由呼叫端 `_approach_npc` 收工、`_engage_npc`
+       切官方 `TryAct`。
+       ⚠ 早上 e682764 把 `_walk_to_npc` 整支刪掉時連這一半也砍了，只剩官方尋路，
+         而官方尋路**算不出長路就回 0**（實測 236 格直接回 0）→ 銀行／跨城的
+         NPC 一步都走不出去（使用者：「他就是不動」）。
+    ② 地形圖說走不到（`nav.stuck`）→ 才問官方 `walk_route`。
+    ③ 官方也算不出來 → `walk_near` 直走一步當最後退路。
+    ⛔ 這裡**沒有**「反覆重挑站位／點不開就換站位」—— 那才是他連三次回報的
+      「來回踱步」，不准寫回來。目標一趟只有一個（NPC 本人）。
     """
-    if mover.walk_route(scanner, player_obj, tx, ty, stop_short=1.5) > 0:
-        return nav
     if nav is None:
         nav = navigate.Navigator()
     nav.step(scanner, mover, player_obj, tx, ty, arrive=CLICK_RANGE)
     if nav.stuck:
-        mover.walk_near(scanner, player_obj, tx, ty, move.MIN_GAP)
+        if mover.walk_route(scanner, player_obj, tx, ty, stop_short=1.5) <= 0:
+            mover.walk_near(scanner, player_obj, tx, ty, move.MIN_GAP)
     return nav
 
 
@@ -1040,18 +1044,19 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
       反正角色不動了就發送官方的」。所以這裡只有一條路：**官方尋路**
       （`walk_route`，stop_short 留 1.5 免得撞進 NPC 本格）直接對 NPC 本人；
       他還沒串流進來就對 .MPC 表座標 `fallback` 走（只為把人帶進串流範圍）。
-      官方算不出路 → **自己讀地形圖走 A\***（`navigate.Navigator`，見下），
-      連地形圖都說走不到才 `walk_near` 直走當最後退路。
+      ★ 走路手段（2026-09-20 晚使用者定）：**先用我們自己算的路徑**（地形圖
+      A*，`navigate.Navigator`）走到離他最近可以走到的地方；地形圖說走不到
+      才問官方尋路，最後才 `walk_near` 直走（見 `_push_toward`）。
       ⛔ 不挑「離他最近的可走格」、⛔ 不用地形圖判斷「走不走得到」再決定去不去、
       ⛔ 不換站位 —— 那一整套（`_walk_to_npc` 的挑格那半／`_nudge_toward`）
       就是使用者連三次回報的「來回踱步」，2026-09-20 刪了、不准寫回來。
 
     ★★★★ 2026-09-20 晚回歸修正（使用者：「他就是不動……應該是走路問題」）：
       早上 e682764 把 `_walk_to_npc` **整支**刪掉時，連「跨城長距離用地形圖
-      A\* 自己走」那一半也一起砍了，只剩官方尋路 —— 而官方尋路**算不出長路
+      A* 自己走」那一半也一起砍了，只剩官方尋路 —— 而官方尋路**算不出長路
       就回 0**（舊註解實測：236 格 `walk_route` 直接回 0）→ 銀行／跨城的 NPC
       一步都走不出去，站到逾時。藥水商人在附近所以看起來正常。
-      → 這裡把 A\* **只當走路手段**接回來：目標還是 NPC 本人／`.MPC` 表座標
+      → 這裡把 A* **只當走路手段**接回來：目標還是 NPC 本人／`.MPC` 表座標
         （`terrain.route` 自己會把落在櫃檯裡的終點放寬到最近可走格，
         `GOAL_RELAX`），⛔ 沒有任何「挑站位／換站位」的東西。
     ⚠ **走不動就別磨滿 timeout**（2026-08-27 使用者回報「點不到的時候會等很久
@@ -1088,7 +1093,7 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
             was, moved_t = here, time.time()
         elif time.time() - moved_t > APPROACH_STALL:   # 真的不動了 → 回去點
             return
-        # 官方尋路 → 算不出長路就地形圖 A* → 都不行才直走（見 `_push_toward`）
+        # 先走我們自己算的路徑（地形圖 A*）→ 走不到才官方尋路 → 最後直走（見 `_push_toward`）
         nav = _push_toward(mover, scanner, pf + 8, nt[0], nt[1], nav)
         _wait_move_done(scanner, timeout=8.0)
 

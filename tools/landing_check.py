@@ -9,10 +9,10 @@
   （[[bag-false-empty-guards]]：讀不到被當成沒有 → 整趟補給放棄），不是腳。
 
 驗的規格：
-    ① 人的座標一讀得到就往第一站 NPC 的 .MPC 表座標送走路，⛔ 不等背包
+    ① 人的座標一讀得到就往第一站 NPC 的 .MPC 表座標送走路，⛔ 不等背包；
+       走的是**我們自己算的路徑**（地形圖 A*，使用者 2026-09-20 晚定）
     ② 沒在走才補送（每 `HEAD_START_GAP` 秒一發）—— ⛔ 官方正帶著走不插手
-    ③ 官方尋路算不出長路（跨城那種一律回 0）→ 地形圖 A*
-       （`navigate.Navigator`）；連 A* 都說走不到才 `walk_near` 直走
+    ③ 地形圖說走不到 → 才問官方 `walk_route`；官方也回 0 → `walk_near` 直走
     ④ 背包整袋讀得完 → 回 True（原本的保證**一點都不能少**）
     ⑤ 沒帶 head_to → 完全是舊行為（只等，一步都不走）
     ⑥ 人的座標還讀不到 → ⛔ 不送走路（不對著 NULL 下指令）
@@ -82,33 +82,6 @@ supply._is_walking = lambda sc: WALKING[0]
 
 SHOP = (12345, 170, 90)                # NPC_TABLE 的值：(編號, x, y)
 
-print("① 背包還沒同步 → 人先走去第一站（⛔ 不是站在原地發呆）")
-BAG_OK[0], WALKING[0], HERE[0] = False, False, (0x3000, (5.0, 5.0))
-MV = FakeMover()
-SAID.clear()
-ok = supply._wait_ready(SC, mover=MV, head_to=SHOP[1:], say=SAID.append)
-ck("★ 有送走路指令（⛔ 舊版整整 15 秒一發都沒送）", MV.walks != [],
-   str(MV.walks))
-ck("★ 走的是第一站 NPC 的表座標",
-   all(w[1:] == (170.0, 90.0) for w in MV.walks), str(MV.walks[:3]))
-ck("★ 沒在走就補送，間隔 HEAD_START_GAP（不是每一拍狂送）",
-   1 <= len(MV.walks) <= supply.LAND_READY_WAIT / supply.HEAD_START_GAP + 1,
-   f"{len(MV.walks)} 發")
-ck("★ 等的期間有回報進度（狀態列別看起來像當掉）", SAID != [],
-   str(SAID[:1]))
-ck("⑦ 背包一直讀不到 → 逾時回 False（呼叫端照舊往下）", ok is False)
-
-print()
-print("② 官方正帶著人走 → ⛔ 不插手重送")
-BAG_OK[0], WALKING[0] = False, True
-MV2 = FakeMover()
-supply._wait_ready(SC, mover=MV2, head_to=SHOP[1:])
-ck("★ 一發都沒送", MV2.walks == [], str(MV2.walks))
-
-print()
-print("③ 官方尋路算不出長路 → 地形圖 A*；連 A* 都說走不到才直走")
-# ★★★★ 跨城的第一站（銀行常在城另一頭）官方尋路一律回 0 —— 沒有 A* 這條
-#   就等於站在落點不動（2026-09-20 晚使用者：「他就是不動」）。
 STEPS: list = []
 
 
@@ -122,24 +95,48 @@ class FakeNav:
 
 REAL_NAV = supply.navigate
 supply.navigate = types.SimpleNamespace(Navigator=FakeNav)
-BAG_OK[0], WALKING[0] = False, False
-MV3 = FakeMover(route_ok=False)
-supply._wait_ready(SC, mover=MV3, head_to=SHOP[1:])
-ck("★ 官方回 0 → 改用地形圖 A* 走（⛔ 不是站著發呆）", STEPS != [],
-   str(len(STEPS)))
-ck("★ A* 的目標就是第一站 NPC 的表座標",
-   all(s == (170.0, 90.0) for s in STEPS), str(STEPS[:2]))
-ck("⛔ A* 走得動時不亂送 walk_near",
-   not any(w[0] == "near" for w in MV3.walks), str(MV3.walks[:3]))
 
+print("① 背包還沒同步 → 人先走去第一站（⛔ 不是站在原地發呆）")
+BAG_OK[0], WALKING[0], HERE[0] = False, False, (0x3000, (5.0, 5.0))
+MV = FakeMover()
+SAID.clear()
 STEPS.clear()
+ok = supply._wait_ready(SC, mover=MV, head_to=SHOP[1:], say=SAID.append)
+ck("★ 有送走路（⛔ 舊版整整 15 秒一發都沒送）", STEPS != [], str(STEPS[:2]))
+ck("★★ 走的是**我們自己算的路徑**（地形圖 A*），目標＝第一站 NPC 的表座標",
+   all(s == (170.0, 90.0) for s in STEPS), str(STEPS[:3]))
+ck("⛔ A* 走得動時不去問官方尋路、也不亂直走", MV.walks == [],
+   str(MV.walks[:3]))
+ck("★ 沒在走就補送，間隔 HEAD_START_GAP（不是每一拍狂送）",
+   1 <= len(STEPS) <= supply.LAND_READY_WAIT / supply.HEAD_START_GAP + 1,
+   f"{len(STEPS)} 發")
+ck("★ 等的期間有回報進度（狀態列別看起來像當掉）", SAID != [],
+   str(SAID[:1]))
+ck("⑦ 背包一直讀不到 → 逾時回 False（呼叫端照舊往下）", ok is False)
+
+print()
+print("② 官方／我們正帶著人走 → ⛔ 不插手重送")
+BAG_OK[0], WALKING[0] = False, True
+MV2 = FakeMover()
+STEPS.clear()
+supply._wait_ready(SC, mover=MV2, head_to=SHOP[1:])
+ck("★ 一發都沒送", STEPS == [] and MV2.walks == [], f"{STEPS} {MV2.walks}")
+
+print()
+print("③ 地形圖說走不到 → 才問官方尋路；官方也算不出來 → 直走當最後退路")
+BAG_OK[0], WALKING[0] = False, False
 FakeNav.stuck = True
+MV3 = FakeMover(route_ok=True)
+supply._wait_ready(SC, mover=MV3, head_to=SHOP[1:])
+ck("★ A* 走不到 → 退官方 walk_route",
+   any(w[0] == "route" for w in MV3.walks), str(MV3.walks[:3]))
+ck("　官方算得出來就不直走",
+   not any(w[0] == "near" for w in MV3.walks), str(MV3.walks[:3]))
 MV3b = FakeMover(route_ok=False)
 supply._wait_ready(SC, mover=MV3b, head_to=SHOP[1:])
-ck("★ 連地形圖都說走不到 → walk_near 直走當最後退路",
+ck("★ 官方也回 0 → walk_near 直走當最後退路",
    any(w[0] == "near" for w in MV3b.walks), str(MV3b.walks[:3]))
 FakeNav.stuck = False
-supply.navigate = REAL_NAV
 
 print()
 print("④ 背包讀得完 → 回 True（原本的保證不變）")
@@ -155,24 +152,27 @@ print()
 print("⑤ 沒帶 head_to → 舊行為：只等，一步都不走")
 BAG_OK[0] = False
 MV5 = FakeMover()
+STEPS.clear()
 ok5 = supply._wait_ready(SC, mover=MV5)
-ck("★ 一步都不走", MV5.walks == [], str(MV5.walks))
+ck("★ 一步都不走", STEPS == [] and MV5.walks == [], f"{STEPS} {MV5.walks}")
 ck("　一樣逾時回 False", ok5 is False)
 
 print()
 print("⑥ 人的座標還讀不到 → ⛔ 不對著 NULL 下走路指令")
 HERE[0] = (None, None)
 MV6 = FakeMover()
+STEPS.clear()
 supply._wait_ready(SC, mover=MV6, head_to=SHOP[1:])
-ck("★ 一步都不走", MV6.walks == [], str(MV6.walks))
+ck("★ 一步都不走", STEPS == [] and MV6.walks == [], f"{STEPS} {MV6.walks}")
 HERE[0] = (0x3000, (5.0, 5.0))
 
 print()
 print("⑦ 跳板沒裝好（mover 不能用）→ 不走，也不能炸")
 MV7 = FakeMover()
 MV7.active = False
+STEPS.clear()
 ok7 = supply._wait_ready(SC, mover=MV7, head_to=SHOP[1:])
-ck("★ 一步都不走", MV7.walks == [], str(MV7.walks))
+ck("★ 一步都不走", STEPS == [] and MV7.walks == [], f"{STEPS} {MV7.walks}")
 ck("　照樣回得了 False", ok7 is False)
 
 print()
