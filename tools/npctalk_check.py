@@ -352,18 +352,26 @@ check("★ 已經夠近就一步都不走", STEPS == [] and MOVER.walks == [],
 STEPS.clear()
 HERE[0] = (5.5, 5.5)
 FakeNav.last_sent = True
-_WALK0 = supply._is_walking
+_WALK0, _BOX0 = supply._is_walking, supply._npc_in_box
 supply._is_walking = lambda sc: True
+supply._npc_in_box = lambda sc, nid: True
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
-check("★★ 最後一個轉折點送出去、人開始動了 → 交棒官方 TryAct，不等人走到那格",
+check("★★ 最後一個轉折點送出去、人走進講話方框 → 交棒官方 TryAct，不等人站上那格",
       len(STEPS) == 1, str(len(STEPS)))
+
+STEPS.clear()
+_T = CLOCK.time()
+supply._npc_in_box = lambda sc, nid: False        # 還在走、還沒進框（最後一段很長）
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("⛔ 還在走但沒進框 → 不交棒（2026-09-20 雪狐：19.6 格外交棒被 TryAct 打斷、站 20 秒）",
+      CLOCK.time() - _T >= supply.LAST_BOX_WAIT, f"{CLOCK.time() - _T:.1f}s")
 
 STEPS.clear()
 supply._is_walking = lambda sc: False             # 送了但人沒動
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
 check("★★ 送出去人卻沒動 → 同一個點一直重送（不只送一次），不動滿 APPROACH_STALL 才收工",
       len(STEPS) >= 3, str(len(STEPS)))
-supply._is_walking = _WALK0
+supply._is_walking, supply._npc_in_box = _WALK0, _BOX0
 
 STEPS.clear()
 supply.find_npc = lambda sc, nid: None            # 還沒串流

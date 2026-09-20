@@ -885,24 +885,34 @@ def _wait_move_done(scanner, start_grace: float = 0.8, timeout: float = 4.0) -> 
         _nap(0.1)
 
 
-LAST_MOVE_WAIT = 0.8       # 最後一點送出後等這麼久看人有沒有動（下指令 ~0.46s 才變 Run）
-LAST_MOVE_STEP = 0.3       # 位置挪了這麼多格也算「在動」（動畫訊號讀不到時的第二證據）
+LAST_BOX_WAIT = 10.0       # 最後一點送出後最多盯這麼久（一段再長也走得完；外層還有 timeout）
+LAST_STILL = 0.8           # 沒在走這麼久又還沒進框 ＝ 這一發沒生效 → 重送（下指令 ~0.46s 才變 Run）
 
 
-def _started_moving(scanner, was) -> bool:
-    """最後一個點送出去之後，人**真的開始動了**嗎（`LAST_MOVE_WAIT` 秒內）。
+def _walked_into_box(scanner, npc_id: int) -> bool:
+    """最後一個點送出去之後，盯到人**走進講話方框**（`TALK_BOX_X/Y`）才回 True。
 
-    兩個訊號任一：動畫在走（`_is_walking`）或位置比送出那拍 `was` 挪了
-    `LAST_MOVE_STEP` 格。都沒有回 False → 呼叫端重送同一個點。
+    ★★★★ 2026-09-20 雪狐 棕櫚基地銀行實錄：最短路 8 段、最後一段很長，最後一點
+      送出去時人還在 **19.6 格外** —— 那時就交棒，官方 TryAct 那一下點擊把我們正在
+      走的路**打斷**，而官方在那麼遠自己算不出路 → 人站著被連點 20 秒（29.6 秒失敗）。
+      → 交棒條件＝**進講話方框**（框內任何一格伺服器都吃，[[nav-blocked-detour]]），
+        一樣不必站上最後那格（那格有人也沒差）。實機三趟 11.4／12.1／11.4 秒、各點 1 發。
+    回 False ＝ 沒在走 `LAST_STILL` 秒又還沒進框（這一發沒生效／被擋住）→ 呼叫端
+      回迴圈頂重送同一個點（使用者：「我怕只發送一次會卡住」）。
+    方框讀不到（None）當還沒進。
     """
     t0 = time.time()
-    while time.time() - t0 < LAST_MOVE_WAIT:
+    still = None
+    while time.time() - t0 < LAST_BOX_WAIT:
+        _abort_check()
+        if _npc_in_box(scanner, npc_id):
+            return True
         if _is_walking(scanner):
-            return True
-        _, here = _player_tile(scanner)
-        if here is not None and was is not None and math.hypot(
-                here[0] - was[0], here[1] - was[1]) > LAST_MOVE_STEP:
-            return True
+            still = None
+        else:
+            still = still or time.time()
+            if time.time() - still > LAST_STILL:
+                return False
         _nap(0.05)
     return False
 
@@ -1168,12 +1178,12 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
         #   **發出去了**就可以換官方的對話走路」—— 硬等人站上最後那格，那格有人／
         #   站不上去就會卡住。官方 TryAct 自己會接手走完剩下那段。
         #   ⚠ 看得到他才交棒（還對著表座標走＝只是進串流範圍，TryAct 沒對象）。
-        # ★ 同日再補（使用者：「發送最後一個點位**直到在移動**就可以停了，我怕只發送
-        #   一次會卡住」）：送出去不算數，要**看到人真的動了**才交棒；`LAST_MOVE_WAIT`
-        #   秒內沒動 → 回迴圈頂，`Navigator` 會把同一個點再送一次（一直不動由上面
-        #   `APPROACH_STALL` 收工）。
+        # ★ 同日再補（使用者：「發送最後一個點位直到在移動就可以停了，我怕只發送一次
+        #   會卡住」）＋實機更正：**送出去／開始動都還不能交棒**（最後一段很長時人還在
+        #   20 格外，TryAct 會把我們的路打斷）→ 盯到**走進講話方框**才交棒；沒在走又
+        #   沒進框就回迴圈頂重送同一個點（見 `_walked_into_box`）。
         if found and nav.last_sent:
-            if _started_moving(scanner, here):
+            if _walked_into_box(scanner, npc_id):
                 return
             continue
         _wait_move_done(scanner, timeout=8.0)
