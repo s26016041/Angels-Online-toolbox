@@ -1790,20 +1790,47 @@ def _wing_count(scanner):
 LAND_READY_WAIT = 15.0     # 落地後等「玩家物件＋整袋背包」讀得到的上限（秒）
 
 
-def _wait_ready(scanner, timeout: float = LAND_READY_WAIT) -> bool:
+HEAD_START_GAP = 1.5       # 落地後「先開始走」的補送間隔（沒在走就再送一發）
+
+
+def _wait_ready(scanner, timeout: float = LAND_READY_WAIT,
+                mover=None, head_to=None, say=None) -> bool:
     """換圖落地後等到「玩家物件讀得到座標、背包整袋讀得完」才回 True；逾時回 False。
 
     ⚠ 場景編號換了 ≠ 人站穩了：實測（黑狐 2026-09-06）翼用掉 0.5 秒場景就變、
       但玩家物件 NULL／背包半袋還要再一陣子。任何「落地就讀背包做決定」的地方
       都要先過這裡，不然就是 bag-false-empty-guards 復發（讀不到被當成沒有／整趟放棄）。
+
+    ★★★★ head_to / mover（2026-09-20 使用者回報「回程後原地發呆超級久」）：
+      這個閘擋的是**判斷**，不是腳 —— 走去商人根本不用背包。所以人的座標一讀
+      得到就先往 head_to（第一站 NPC 的 .MPC 表座標）走，**背包邊走邊等**。
+      沒在走就每 `HEAD_START_GAP` 秒補送一發（落地那一瞬間送的常常會被吃掉）。
+      ⛔ 不傳 head_to 就完全是舊行為（只等，不走）。
+    say(訊息) 可選：等的期間每隔一下回報一次，狀態列才不會看起來像當掉。
     """
     t0 = time.time()
+    sent = 0.0
+    told = 0.0
     while time.time() - t0 < timeout:
         pf, here = _player_tile(scanner)
         if pf and here is not None:
+            # ★ 先走起來（人讀得到就夠了，不等背包）
+            if (head_to and mover is not None
+                    and getattr(mover, "active", False)
+                    and time.time() - sent >= HEAD_START_GAP
+                    and not _is_walking(scanner)):
+                sent = time.time()
+                hx, hy = float(head_to[0]), float(head_to[1])
+                if mover.walk_route(scanner, pf + 8, hx, hy,
+                                    stop_short=1.5) <= 0:
+                    mover.walk_near(scanner, pf + 8, hx, hy, move.MIN_GAP)
             _items, complete = bag.scan(scanner)
             if complete:
                 return True
+        if say and time.time() - told >= 2.0:
+            told = time.time()
+            say(f"等背包同步（{time.time() - t0:.0f} 秒）"
+                + ("…人已經先走去第一站了" if head_to else "…"))
         _nap(0.3)
     return False
 
@@ -2003,7 +2030,17 @@ def _full_supply(mover, scanner, say=None,
         #   先不動」→ 整趟什麼都沒做、翼白燒一張、趴趴GO 第一發也送在人還沒站穩
         #   的時候（10 秒沒落地才重送第二發）。這是 bag-false-empty-guards 那一族：
         #   讀取端擋住了沒做錯事，但呼叫端要等到讀得到再問，不是問一次就放棄整趟。
-        if not _wait_ready(scanner):
+        # ★★★★ 2026-09-20 使用者回報「回程後原地發呆超級久」：落地後這一段原本
+        #   是**乾等**「整袋背包讀得完」（最多 LAND_READY_WAIT 秒）才准往下，
+        #   而走去商人根本不需要背包 —— 那個閘擋的是判斷（[[bag-false-empty-guards]]）
+        #   不是腳。→ 人的座標一讀得到就**先往第一站走**，背包邊走邊等。
+        #   第一站挑「這趟一定會去的那個」：練技那趟只有補給商，其餘先走維修商
+        #   （無腦全修一定跑）—— 銀行是「有東西要存才去」，不拿它當起跑方向。
+        _ent = NPC_TABLE.get(home) or {}
+        _first = _ent.get("buy") if potion_only else (
+            _ent.get("repair") or _ent.get("buy") or _ent.get("bank"))
+        if not _wait_ready(scanner, mover=mover,
+                           head_to=_first[1:] if _first else None, say=note):
             note(f"⚠ 落地 {LAND_READY_WAIT:.0f} 秒人／背包還讀不到，照舊往下（各步驟自己會擋）")
 
     # ── 回程收尾（★★ 不准射後不理）────────────────────────────
