@@ -21,7 +21,7 @@ import time
 
 from app.game import (attack, bag, gather, quickbar, robot, itemname, scene,
                       entity, move, jumpmap, recall, inventory,
-                      navigate, sell, lua, talkwnd)
+                      navigate, sell, lua, talkwnd, terrain)
 
 # 「這個參數沒給」——跟「給了但讀不到（None）」要分得開（見 `_wait_dialog`）。
 _UNSET_PAGE = object()
@@ -190,6 +190,7 @@ APPROACH_STALL = 3.0
 #   → 看得到他但還講不到話時，每次自己走**一段**（這麼多秒）就回來補一發官方
 #     TryAct；走不動（APPROACH_STALL 3 秒沒位移）本來就會提早回來。
 APPROACH_STEP = 10.0
+GOAL_ARRIVE = 1.0          # 離「走得到的最近格」這麼近就算站上去了 → 切官方 TryAct
 TALK_GAP = 1.2            # 對話選項之間**最多**等多久（8/14 盲等值；現在只是上限，
                            #   看到下一頁就送 —— 見 `_wait_page`）
 TALK_STEP_FLOOR = 0.25     # 兩個對話動作之間的最小間隔（同一拍連送伺服器不吃）
@@ -556,7 +557,41 @@ def _npc_gap(scanner, npc_id: int):
     return math.hypot(here[0] - nt[0], here[1] - nt[1])
 
 
-def _push_toward(mover, scanner, player_obj, tx: float, ty: float, nav=None):
+def _reach_goal(scanner, here, tx: float, ty: float):
+    """「最近**可以走到**的地方」：在**我站的那一塊連通區**裡，挑離 (tx, ty) 最近的格。
+
+    ★★★★ 2026-09-20 晚雪狐實機（棕櫚基地銀行 2256，表座標 (184,139)）：
+      表座標在牆裡 → `terrain.route` 的 `nearest_open` 往旁邊找「最近的可走格」
+      挑到 (183,139)，那格在**櫃檯裡面的孤島**，從外面走不進去 → A* 回「到不了」、
+      官方尋路也回 0 → 人 **90 秒一格都沒動**，最後報「走到了還是看不到他」。
+      而人站的連通區（27182 格）裡離銀行最近的格是 (185,137)，才 **2.2 格**。
+      差別就在「可走」**≠**「走得到」—— 使用者講的是後者。
+    ⚠ 連通區是整塊（跟人站哪一格無關），所以這個答案**不會因為人移動而跳**
+      —— 2026-09-10 那個「目標在兩個方向之間跳 → 來回踱步」的坑不會回來。
+      呼叫端還是照「目標沒換就不重挑」快取（見 `_approach_npc`）。
+    讀不到地形圖／我站的格不可走 → 回 None（呼叫端照原座標走，安全退化）。
+    """
+    grid, _why = terrain.load(scanner)
+    if grid is None or here is None:
+        return None
+    hx, hy = int(here[0]), int(here[1])
+    if not grid.walkable(hx, hy):          # 落點在不可走格 → 從旁邊最近的可走格算
+        near = grid.nearest_open(hx, hy)
+        if near is None:
+            return None
+        hx, hy = near
+    reach = grid.reachable(hx, hy)
+    if not reach:
+        return None
+    gx, gy = int(tx), int(ty)
+    if (gx, gy) in reach:
+        return float(tx), float(ty)
+    bx, by = min(reach, key=lambda c: (c[0] - tx) ** 2 + (c[1] - ty) ** 2)
+    return bx + 0.5, by + 0.5
+
+
+def _push_toward(mover, scanner, player_obj, tx: float, ty: float, nav=None,
+                 arrive: float = CLICK_RANGE):
     """往 (tx, ty) 走 —— **先用我們自己算的路徑**，回傳這趟用的 `Navigator`。
 
     ★★★★ 2026-09-20 晚使用者定（原話）：「**先用我們自己算路徑走到最近可以走到的
@@ -576,7 +611,7 @@ def _push_toward(mover, scanner, player_obj, tx: float, ty: float, nav=None):
     """
     if nav is None:
         nav = navigate.Navigator()
-    nav.step(scanner, mover, player_obj, tx, ty, arrive=CLICK_RANGE)
+    nav.step(scanner, mover, player_obj, tx, ty, arrive=arrive)
     if nav.stuck:
         if mover.walk_route(scanner, player_obj, tx, ty, stop_short=1.5) <= 0:
             mover.walk_near(scanner, player_obj, tx, ty, move.MIN_GAP)
@@ -1069,7 +1104,8 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
     t0 = time.time()
     was = None                       # 上次看到的位置
     moved_t = t0                     # 上次「人真的有動」是什麼時候
-    nav = None                       # 官方尋路算不出路時才建（地形圖 A*）
+    nav = None                       # 我們自己的導航器（地形圖 A*）
+    goal_key = goal = None           # 挑好的終點（他的座標沒換就不重挑）
     while time.time() - t0 < timeout:
         _abort_check()
         pf, here = _player_tile(scanner)
@@ -1093,8 +1129,19 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
             was, moved_t = here, time.time()
         elif time.time() - moved_t > APPROACH_STALL:   # 真的不動了 → 回去點
             return
+        # ★ 終點＝**我走得到的範圍裡**離他最近的格（見 `_reach_goal`）。他的座標
+        #   沒換就沿用上次挑的（⛔ 不每圈重挑；表座標 → 真座標那一次才重挑）。
+        key = (int(nt[0]), int(nt[1]))
+        if goal_key != key:
+            goal_key, goal = key, (_reach_goal(scanner, here, nt[0], nt[1])
+                                   or (nt[0], nt[1]))
+        if math.hypot(here[0] - goal[0], here[1] - goal[1]) <= GOAL_ARRIVE:
+            return                   # 已經站在最近走得到的那格 → 交給官方 TryAct
         # 先走我們自己算的路徑（地形圖 A*）→ 走不到才官方尋路 → 最後直走（見 `_push_toward`）
-        nav = _push_toward(mover, scanner, pf + 8, nt[0], nt[1], nav)
+        # ⚠ arrive 給 GOAL_ARRIVE：終點已經是「走得到的最近格」，再差 2~3 格就可能
+        #   講不到話（2026-09-06 棕櫚基地銀行停在 4.26 格失敗三趟的教訓）。
+        nav = _push_toward(mover, scanner, pf + 8, goal[0], goal[1], nav,
+                           arrive=GOAL_ARRIVE)
         _wait_move_done(scanner, timeout=8.0)
 
 
@@ -1852,7 +1899,8 @@ def _wait_ready(scanner, timeout: float = LAND_READY_WAIT,
     t0 = time.time()
     sent = 0.0
     told = 0.0
-    nav = None                 # 官方尋路算不出路時才建（地形圖 A*）
+    nav = None                 # 我們自己的導航器（地形圖 A*）
+    head_goal = None           # 第一站「走得到的最近格」（只算一次）
     while time.time() - t0 < timeout:
         pf, here = _player_tile(scanner)
         if pf and here is not None:
@@ -1862,8 +1910,11 @@ def _wait_ready(scanner, timeout: float = LAND_READY_WAIT,
                     and time.time() - sent >= HEAD_START_GAP
                     and not _is_walking(scanner)):
                 sent = time.time()
+                if head_goal is None:      # 只算一次（見 `_reach_goal`）
+                    hx, hy = float(head_to[0]), float(head_to[1])
+                    head_goal = _reach_goal(scanner, here, hx, hy) or (hx, hy)
                 nav = _push_toward(mover, scanner, pf + 8,
-                                   float(head_to[0]), float(head_to[1]), nav)
+                                   head_goal[0], head_goal[1], nav)
             _items, complete = bag.scan(scanner)
             if complete:
                 return True

@@ -33,6 +33,8 @@
        放寬到最近可走格）；人不動 `APPROACH_STALL` 秒就回去讓 TryAct 收尾；
        NPC 還看不到就先往 .MPC 表座標走
     ⑨b 地形圖說走不到 → 才問官方 `walk_route`；官方也回 0 → `walk_near` 直走
+    ⑨c 終點＝**我走得到的範圍（連通區）裡**離他最近的格 —— ⛔ 不是「最近的可走格」
+       （那會挑到櫃檯裡的孤島：2026-09-20 雪狐棕櫚基地銀行 90 秒不動的真因）
     ⑩ 看得到他但還在講話方框外 → **自己一路走過去**，而且那段時間 ⛔ 不算
        進 20 秒碼錶（2026-09-20 實機誤報：人還在半路就發「講不到話」通知＋停機）
     ⑩b 走一段沒更靠近（人牆／被佔住）→ 不再自己走，換官方 TryAct 收尾
@@ -379,6 +381,52 @@ check("★ 官方也回 0 → walk_near 直走當最後退路",
 FakeNav.stuck = False
 MOVER.route_ok = True
 supply.navigate = REAL_NAV
+
+print()
+print("⑨c 終點＝**我走得到的範圍裡**離他最近的格（⛔ 不是「最近的可走格」）")
+# ★★★★ 2026-09-20 晚雪狐實機（棕櫚基地銀行，表座標 (184,139) 在牆裡）：舊寫法往
+#   旁邊找「最近的可走格」挑到櫃檯**裡面的孤島** → A* 回「到不了」、官方尋路也
+#   回 0 → 人 90 秒一格都沒動。我走得到的範圍裡離他最近的格其實只差 2.2 格。
+from app.game import terrain as _terrain                 # noqa: E402
+
+#   0123456789
+ART = ["..........",      # y0
+       "..........",      # y1
+       "..#####...",      # y2   牆
+       "..#oN#....",      # y3   N＝NPC 表座標（牆裡）；o＝櫃檯裡的孤島（可走但進不去）
+       "..#####...",      # y4
+       "..........",      # y5
+       ".........."]      # y6
+
+
+class ArtGrid:
+    """只實作 `_reach_goal` 用到的三支；連通規則借真的 `terrain.Grid.reachable`。"""
+    w, h = 10, 7
+
+    def walkable(self, x, y):
+        return 0 <= x < self.w and 0 <= y < self.h and ART[y][x] in ".o"
+
+    def _walk_fn(self, avoid):
+        return self.walkable
+
+    reachable = _terrain.Grid.reachable
+    nearest_open = _terrain.Grid.nearest_open
+
+
+REAL_LOAD = supply.terrain.load
+supply.terrain.load = lambda sc: (ArtGrid(), "")
+got = supply._reach_goal(SC, (0.5, 6.5), 4.0, 3.0)
+check("★★ 挑的是走得到的那格（⛔ 不是櫃檯裡的孤島 (3,3)）",
+      got is not None and (int(got[0]), int(got[1])) != (3, 3), str(got))
+check("★ 而且是離他最近的（牆外緊貼著的那一圈）",
+      got is not None and abs(got[0] - 4.5) <= 2.0 and abs(got[1] - 3.5) <= 2.0,
+      str(got))
+check("　他站的格本來就走得到 → 原座標照用",
+      supply._reach_goal(SC, (0.5, 6.5), 8.0, 5.0) == (8.0, 5.0))
+supply.terrain.load = lambda sc: (None, "讀不到")
+check("　地形圖讀不到 → 回 None（呼叫端照原座標走，安全退化）",
+      supply._reach_goal(SC, (0.5, 6.5), 4.0, 3.0) is None)
+supply.terrain.load = REAL_LOAD
 
 print()
 print("⑩ 先自己走到他旁邊再點官方；⚠ 走過去那段**不算**講不到話（9/20 誤報通知）")

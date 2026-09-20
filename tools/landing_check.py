@@ -79,6 +79,7 @@ SAID: list[str] = []
 supply.bag = types.SimpleNamespace(scan=lambda sc: ([], BAG_OK[0]))
 supply._player_tile = lambda sc: HERE[0]
 supply._is_walking = lambda sc: WALKING[0]
+supply._reach_goal = lambda sc, here, tx, ty: None   # 地形圖讀不到 → 照原座標走
 
 SHOP = (12345, 170, 90)                # NPC_TABLE 的值：(編號, x, y)
 
