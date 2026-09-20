@@ -30,6 +30,9 @@
     ⑨ `_approach_npc`：走不走得到都照走（官方尋路 `walk_route`），
        連續 `APPROACH_STALL` 秒沒更靠近就回去讓 TryAct 收尾；
        NPC 還看不到就先往 .MPC 表座標走
+    ⑨b 官方尋路**算不出長路**（回 0，跨城那種）→ 改用地形圖 A*
+       （`navigate.Navigator`）自己走，目標一樣是 NPC 本人；連地形圖都說
+       走不到才 `walk_near` 直走 —— ⛔ 這是**走路手段**，不是挑站位
     ⑩ 看得到他但還在講話方框外 → **自己一路走過去**，而且那段時間 ⛔ 不算
        進 20 秒碼錶（2026-09-20 實機誤報：人還在半路就發「講不到話」通知＋停機）
     ⑩b 走一段沒更靠近（人牆／被佔住）→ 不再自己走，換官方 TryAct 收尾
@@ -76,13 +79,14 @@ class FakeMover:
         self.active = True
         self.lock = threading.Lock()
         self.walks: list[tuple] = []
+        self.route_ok = True          # 官方尋路算得出路嗎（長路它會回 0）
 
     def call_sync(self, *a, **k):
         return 1
 
     def walk_route(self, sc, pf, x, y, stop_short=0.0):
         self.walks.append(("route", x, y))
-        return 1
+        return 1 if self.route_ok else 0
 
     def walk_near(self, sc, pf, x, y, keep):
         self.walks.append(("near", x, y))
@@ -112,7 +116,8 @@ supply._talkaction = lambda *a, **k: True
 supply._wait_page = lambda *a, **k: True
 supply._wait_arrival = lambda *a, **k: True
 supply._npc_in_box = lambda sc, nid: True          # 預設：已經站在講話方框內
-supply.move = type("M", (), {"pathfinder_this": staticmethod(lambda sc: 0)})()
+supply.move = type("M", (), {"pathfinder_this": staticmethod(lambda sc: 0),
+                             "MIN_GAP": 1.4})()
 supply.talkwnd = type("T", (), {
     "page": staticmethod(lambda sc: None),
     "window_visible": staticmethod(lambda sc: None),
@@ -334,6 +339,48 @@ MOVER.walks.clear()
 supply._player_tile = lambda sc: (None, None)     # 讀不到自己
 REAL_APPROACH(MOVER, SC, 1, (170, 90))
 check("　讀不到玩家座標就安全退出（不亂走）", MOVER.walks == [])
+
+print()
+print("⑨b 官方尋路算不出長路（回 0）→ 改用地形圖 A* 自己走（⛔ 不是站著不動）")
+# ★★★★ 2026-09-20 晚回歸：早上 e682764 把 `_walk_to_npc` 整支刪掉時，連「跨城
+#   長距離用地形圖 A* 自己走」那一半也砍了 → 官方尋路對長路一律回 0 → 銀行／
+#   跨城的 NPC **一步都走不出去**（使用者：「他就是不動」）。
+STEPS: list = []
+REAL_NAV = supply.navigate
+
+
+class FakeNav:
+    stuck = False
+
+    def step(self, sc, mover, obj, gx, gy, arrive=None):
+        STEPS.append((gx, gy))
+        return "走"
+
+
+supply.navigate = type("N", (), {"Navigator": FakeNav})()
+supply._player_tile = lambda sc: (0x3000, HERE[0])
+supply._ent_tile_f = lambda sc, ent: (60.5, 5.5)      # 55 格外（跨城那種）
+supply.find_npc = lambda sc, nid: (0x1000, 0x2000)
+HERE[0] = (5.5, 5.5)
+MOVER.route_ok = False                                # 官方：算不出路
+MOVER.walks.clear()
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★ 官方回 0 → 真的改用 A* 走（Navigator.step）", STEPS != [],
+      str(len(STEPS)))
+check("★ A* 的目標就是 NPC 本人（⛔ 沒有挑站位、沒有自己選格子）",
+      all(s == (60.5, 5.5) for s in STEPS), str(STEPS[:2]))
+check("⛔ 地形圖走得動時不亂送 walk_near 直走",
+      not any(w[0] == "near" for w in MOVER.walks), str(MOVER.walks[:3]))
+
+STEPS.clear()
+MOVER.walks.clear()
+FakeNav.stuck = True                                  # 地形圖也說走不到
+REAL_APPROACH(MOVER, SC, 1, (170, 90))
+check("★ 連地形圖都說走不到 → walk_near 直走當最後退路",
+      any(w[0] == "near" for w in MOVER.walks), str(MOVER.walks[:3]))
+FakeNav.stuck = False
+supply.navigate = REAL_NAV
+MOVER.route_ok = True
 
 print()
 print("⑩ 先自己走到他旁邊再點官方；⚠ 走過去那段**不算**講不到話（9/20 誤報通知）")

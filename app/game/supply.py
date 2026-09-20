@@ -21,7 +21,7 @@ import time
 
 from app.game import (attack, bag, gather, quickbar, robot, itemname, scene,
                       entity, move, jumpmap, recall, inventory,
-                      sell, lua, talkwnd)
+                      navigate, sell, lua, talkwnd)
 
 # 「這個參數沒給」——跟「給了但讀不到（None）」要分得開（見 `_wait_dialog`）。
 _UNSET_PAGE = object()
@@ -556,6 +556,29 @@ def _npc_gap(scanner, npc_id: int):
     return math.hypot(here[0] - nt[0], here[1] - nt[1])
 
 
+def _push_toward(mover, scanner, player_obj, tx: float, ty: float, nav=None):
+    """往 (tx, ty) 走 —— **三段退路**，回傳這趟用的 `Navigator`（沒用到回 None）。
+
+    ① 官方尋路 `walk_route`（近距離最準，它自己會繞地形）。
+    ② 官方回 0 ＝**算不出路**（跨城那種長路它一律回 0，實測 236 格就回 0）
+       → 自己讀地形圖算 A\*（`navigate.Navigator`，純讀記憶體、不呼叫遊戲的
+       尋路）分段走。★★★★ 2026-09-20 晚：早上把 `_walk_to_npc` 整支刪掉時連
+       這一半也砍了 → 銀行／跨城的 NPC **一步都走不出去**（使用者：「他就是
+       不動」），所以接回來。⚠ 目標永遠是**對方本人／表座標**，
+       `terrain.route` 自己會把落在櫃檯裡的終點放寬到最近可走格 —— ⛔ 這裡
+       沒有、也不准有任何「挑站位／換站位」的東西。
+    ③ 連地形圖都說走不到 → `walk_near` 直走一步當最後退路。
+    """
+    if mover.walk_route(scanner, player_obj, tx, ty, stop_short=1.5) > 0:
+        return nav
+    if nav is None:
+        nav = navigate.Navigator()
+    nav.step(scanner, mover, player_obj, tx, ty, arrive=CLICK_RANGE)
+    if nav.stuck:
+        mover.walk_near(scanner, player_obj, tx, ty, move.MIN_GAP)
+    return nav
+
+
 def _is_walking(scanner) -> bool:
     """角色現在正在走路嗎（讀不到當「沒在走」）。
 
@@ -904,7 +927,10 @@ def _engage_npc(mover, scanner, npc_id: int, fallback, talk_codes, wnd_name: str
         if _npc_in_box(scanner, npc_id) is False:
             gap_now = _npc_gap(scanner, npc_id)
             if gap_now is not None and (best is None or gap_now < best - 0.5):
-                best, talk_t0, handed = gap_now, None, False   # 還在靠近他
+                # 還在靠近他 → 兩個碼錶都重新算（⚠ 跨城走一趟本來就要幾十秒，
+                # 人在往他那邊移動就不是「走不到」也不是「講不到話」）
+                best, talk_t0, handed = gap_now, None, False
+                walk_t0 = time.time()
             if not handed and not _is_walking(scanner):  # ⛔ 官方正帶著走別插手
                 _approach_npc(mover, scanner, npc_id, fallback,
                               timeout=APPROACH_STEP)
@@ -1014,10 +1040,20 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
       反正角色不動了就發送官方的」。所以這裡只有一條路：**官方尋路**
       （`walk_route`，stop_short 留 1.5 免得撞進 NPC 本格）直接對 NPC 本人；
       他還沒串流進來就對 .MPC 表座標 `fallback` 走（只為把人帶進串流範圍）。
-      官方算不出路（貼身尋路必回 0 的老坑）→ `walk_near` 直走。
-      ⛔ 不挑「離他最近的可走格」、⛔ 不用地形圖判斷走不走得到、⛔ 不換站位
-      —— 那一整套（`_walk_to_npc`／`_nudge_toward`）就是使用者連三次回報的
-      「來回踱步」，2026-09-20 一起刪了。
+      官方算不出路 → **自己讀地形圖走 A\***（`navigate.Navigator`，見下），
+      連地形圖都說走不到才 `walk_near` 直走當最後退路。
+      ⛔ 不挑「離他最近的可走格」、⛔ 不用地形圖判斷「走不走得到」再決定去不去、
+      ⛔ 不換站位 —— 那一整套（`_walk_to_npc` 的挑格那半／`_nudge_toward`）
+      就是使用者連三次回報的「來回踱步」，2026-09-20 刪了、不准寫回來。
+
+    ★★★★ 2026-09-20 晚回歸修正（使用者：「他就是不動……應該是走路問題」）：
+      早上 e682764 把 `_walk_to_npc` **整支**刪掉時，連「跨城長距離用地形圖
+      A\* 自己走」那一半也一起砍了，只剩官方尋路 —— 而官方尋路**算不出長路
+      就回 0**（舊註解實測：236 格 `walk_route` 直接回 0）→ 銀行／跨城的 NPC
+      一步都走不出去，站到逾時。藥水商人在附近所以看起來正常。
+      → 這裡把 A\* **只當走路手段**接回來：目標還是 NPC 本人／`.MPC` 表座標
+        （`terrain.route` 自己會把落在櫃檯裡的終點放寬到最近可走格，
+        `GOAL_RELAX`），⛔ 沒有任何「挑站位／換站位」的東西。
     ⚠ **走不動就別磨滿 timeout**（2026-08-27 使用者回報「點不到的時候會等很久
       才橋位置」）：連續 `APPROACH_STALL` 秒沒更靠近就回去，讓 `TryAct` 自己
       走最後一段（NPC 旁邊圍滿人時距離根本縮不了）。
@@ -1028,6 +1064,7 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
     t0 = time.time()
     was = None                       # 上次看到的位置
     moved_t = t0                     # 上次「人真的有動」是什麼時候
+    nav = None                       # 官方尋路算不出路時才建（地形圖 A*）
     while time.time() - t0 < timeout:
         _abort_check()
         pf, here = _player_tile(scanner)
@@ -1051,9 +1088,8 @@ def _approach_npc(mover, scanner, npc_id: int, fallback=None,
             was, moved_t = here, time.time()
         elif time.time() - moved_t > APPROACH_STALL:   # 真的不動了 → 回去點
             return
-        if mover.walk_route(scanner, pf + 8, nt[0], nt[1],
-                            stop_short=1.5) <= 0:
-            mover.walk_near(scanner, pf + 8, nt[0], nt[1], move.MIN_GAP)
+        # 官方尋路 → 算不出長路就地形圖 A* → 都不行才直走（見 `_push_toward`）
+        nav = _push_toward(mover, scanner, pf + 8, nt[0], nt[1], nav)
         _wait_move_done(scanner, timeout=8.0)
 
 
@@ -1811,6 +1847,7 @@ def _wait_ready(scanner, timeout: float = LAND_READY_WAIT,
     t0 = time.time()
     sent = 0.0
     told = 0.0
+    nav = None                 # 官方尋路算不出路時才建（地形圖 A*）
     while time.time() - t0 < timeout:
         pf, here = _player_tile(scanner)
         if pf and here is not None:
@@ -1820,10 +1857,8 @@ def _wait_ready(scanner, timeout: float = LAND_READY_WAIT,
                     and time.time() - sent >= HEAD_START_GAP
                     and not _is_walking(scanner)):
                 sent = time.time()
-                hx, hy = float(head_to[0]), float(head_to[1])
-                if mover.walk_route(scanner, pf + 8, hx, hy,
-                                    stop_short=1.5) <= 0:
-                    mover.walk_near(scanner, pf + 8, hx, hy, move.MIN_GAP)
+                nav = _push_toward(mover, scanner, pf + 8,
+                                   float(head_to[0]), float(head_to[1]), nav)
             _items, complete = bag.scan(scanner)
             if complete:
                 return True

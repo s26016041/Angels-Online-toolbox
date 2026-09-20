@@ -11,7 +11,8 @@
 驗的規格：
     ① 人的座標一讀得到就往第一站 NPC 的 .MPC 表座標送走路，⛔ 不等背包
     ② 沒在走才補送（每 `HEAD_START_GAP` 秒一發）—— ⛔ 官方正帶著走不插手
-    ③ 官方尋路算不出路（回 ≤0）→ 退 `walk_near` 直走
+    ③ 官方尋路算不出長路（跨城那種一律回 0）→ 地形圖 A*
+       （`navigate.Navigator`）；連 A* 都說走不到才 `walk_near` 直走
     ④ 背包整袋讀得完 → 回 True（原本的保證**一點都不能少**）
     ⑤ 沒帶 head_to → 完全是舊行為（只等，一步都不走）
     ⑥ 人的座標還讀不到 → ⛔ 不送走路（不對著 NULL 下指令）
@@ -105,12 +106,40 @@ supply._wait_ready(SC, mover=MV2, head_to=SHOP[1:])
 ck("★ 一發都沒送", MV2.walks == [], str(MV2.walks))
 
 print()
-print("③ 官方尋路算不出路 → 退 walk_near 直走")
+print("③ 官方尋路算不出長路 → 地形圖 A*；連 A* 都說走不到才直走")
+# ★★★★ 跨城的第一站（銀行常在城另一頭）官方尋路一律回 0 —— 沒有 A* 這條
+#   就等於站在落點不動（2026-09-20 晚使用者：「他就是不動」）。
+STEPS: list = []
+
+
+class FakeNav:
+    stuck = False
+
+    def step(self, sc, mover, obj, gx, gy, arrive=None):
+        STEPS.append((gx, gy))
+        return "走"
+
+
+REAL_NAV = supply.navigate
+supply.navigate = types.SimpleNamespace(Navigator=FakeNav)
 BAG_OK[0], WALKING[0] = False, False
 MV3 = FakeMover(route_ok=False)
 supply._wait_ready(SC, mover=MV3, head_to=SHOP[1:])
-ck("★ 每一發都有 near 當退路",
-   any(w[0] == "near" for w in MV3.walks), str(MV3.walks[:4]))
+ck("★ 官方回 0 → 改用地形圖 A* 走（⛔ 不是站著發呆）", STEPS != [],
+   str(len(STEPS)))
+ck("★ A* 的目標就是第一站 NPC 的表座標",
+   all(s == (170.0, 90.0) for s in STEPS), str(STEPS[:2]))
+ck("⛔ A* 走得動時不亂送 walk_near",
+   not any(w[0] == "near" for w in MV3.walks), str(MV3.walks[:3]))
+
+STEPS.clear()
+FakeNav.stuck = True
+MV3b = FakeMover(route_ok=False)
+supply._wait_ready(SC, mover=MV3b, head_to=SHOP[1:])
+ck("★ 連地形圖都說走不到 → walk_near 直走當最後退路",
+   any(w[0] == "near" for w in MV3b.walks), str(MV3b.walks[:3]))
+FakeNav.stuck = False
+supply.navigate = REAL_NAV
 
 print()
 print("④ 背包讀得完 → 回 True（原本的保證不變）")
