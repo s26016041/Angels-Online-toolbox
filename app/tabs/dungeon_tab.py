@@ -3505,10 +3505,18 @@ class CharDungeonPage(QWidget):
             # ★ 人不在傳點上就跳了 ＝ 不是傳點搬的（伺服器拉回／被擊退）
             #   → 不算完成、更不能當「傳到別的地方」停下
             #   （2026-09-05 無限塔第 41／52 步的誤停就是這個）。
-            self._notify(f"第 {self._i + 1} 步　位置一拍跳了 "
-                         f"{_d(frm, me):.0f} 格，但跳之前離傳點 "
-                         f"{_d((gx, gy), frm):.0f} 格（不在傳點上）"
-                         f"→ 不算傳送，繼續走")
+            # ★ 2026-09-22：同一趟同一步只**通知**一次，之後只寫執行紀錄 —— 往傳點的路上
+            #   打怪時順移技能每放一次就跳一次（實錄第 18 步 60 秒洗了 15 則通知）。
+            msg = (f"第 {self._i + 1} 步　位置一拍跳了 "
+                   f"{_d(frm, me):.0f} 格，但跳之前離傳點 "
+                   f"{_d((gx, gy), frm):.0f} 格（不在傳點上）"
+                   f"→ 不算傳送，繼續走")
+            key = (self._rounds, self._i)
+            if getattr(self, "_jump_said", None) != key:
+                self._jump_said = key
+                self._notify(msg)
+            else:
+                self._runlog_write(msg)
             return False
         if land and not near_land:
             jump = _d(frm, me)
