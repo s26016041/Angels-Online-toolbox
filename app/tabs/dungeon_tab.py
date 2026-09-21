@@ -131,6 +131,7 @@ from app.game import (dungeon, entity, farmsettings, guildbank, itemname, jumpma
                       move, navigate, player, portal, produce, quickbar, revive,
                       robot, scene, scenery, sell, skills, supply, talkwnd,
                       team, terrain)
+from app.game import channel
 from app.tabs.base_tab import GROUP_AUTO, BaseTab, fit_spin
 from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, GangWorker, LOOT_GAP,
                                FarmTab, KeyWorker, MODE_PACKET, ScanWorker,
@@ -1727,6 +1728,9 @@ class CharDungeonPage(QWidget):
         self._team_round_t = 0.0     # 這一輪（邀請＋同意）還能等多久
         self._team_rounds = 0        # 這次組隊走了幾輪（記錄用）
         self._team_invited = False   # 這一輪邀請送出去了沒（一輪只邀一次）
+        self._team_inv_why = ""      # 這一輪邀請的回傳（診斷用，見 _team_diag）
+        self._team_joins = 0         # 這一輪分身送了幾次同意
+        self._team_join_why = ""     # 最後一次同意的回傳
         self._team_leaves = 0        # 這一輪真的送出去幾次退組（幽靈判定要先送過，見 _team_tick）
         self._join_t = 0.0           # 分身下一次按同意的倒數
         self._team_note_t = 0.0
@@ -4797,6 +4801,9 @@ class CharDungeonPage(QWidget):
         self._join_t = 0.0
         self._team_round_t = 0.0
         self._team_invited = False
+        self._team_inv_why = ""
+        self._team_joins = 0
+        self._team_join_why = ""
         self._team_leaves = 0
         if self._party == "bind":
             team.deny(self._mover)
@@ -4811,7 +4818,36 @@ class CharDungeonPage(QWidget):
         """這一輪沒組成 → 從「退組」整套再走一次（見 _team_begin）。"""
         self._event("warn", f"組隊：第 {self._team_rounds} 輪沒組成（{why}）→ "
                             "重走 拒絕＋退組→邀請→同意")
+        self._runlog_write("　組隊診斷：" + self._team_diag(), force=True)
         self._team_enter("leave")
+
+    def _team_diag(self) -> str:
+        """這一輪為什麼沒組成 —— 把每一環的**當場**狀態寫成一行（純讀，只進 dungeon_run.log）。
+
+        ★ 2026-09-21：黑狐邀北極狐連 20 輪失敗停機，紀錄只有「分身沒進隊」，邀請有沒有
+          送出去、同意有沒有送成功、分身跳板還活著沒、兩台在不在同一分流全都看不到。"""
+        def names(sc):
+            if sc is None:
+                return "沒開"
+            ms = team.members(sc)
+            return "讀不到" if ms is None else ("、".join(m.name for m in ms) or "空")
+        out = [f"邀請={self._team_inv_why or '沒送'}",
+               f"同意送 {self._team_joins} 次（{self._team_join_why or '沒送'}）"]
+        try:
+            pm = self._pmover
+            out.append("分身跳板=" + ("沒有" if pm is None else "有效" if pm.active else "失效"))
+            out.append("我的跳板=" + ("有效" if (self._mover and self._mover.active) else "失效"))
+            est = set(netstat.established_pids())
+            hw = {w.pid: w.hwnd for w in preload.windows()}
+            for tag, pid in (("我", self._pid), ("分身", self._ppid)):
+                ch = channel.current(hw[pid]) if pid in hw else None
+                out.append(f"{tag}：分流 {ch if ch is not None else '？'}／"
+                           f"{'連線中' if pid in est else '⚠ 沒連線'}")
+            out.append(f"我的名單={names(self._sc)}")
+            out.append(f"分身名單={names(self._psc)}")
+        except Exception as e:                           # noqa: BLE001
+            out.append(f"（診斷讀取失敗：{e!r}）")
+        return "；".join(out)
 
     def _ghost_party(self, mine, his) -> bool:
         """我這台的隊員名單是**畫面殘影**嗎（2026-09-13 黑狐實錄）。
@@ -4912,15 +4948,23 @@ class CharDungeonPage(QWidget):
             if not self._team_invited:
                 # ★ 名單一清空就送邀請（⛔ 沒有等待：那個等待是舊的 3 秒間隔）
                 ok, why = team.invite(self._mover, self._partner_name, team.SHARE_EVEN)
+                self._team_inv_why = why
                 if not ok:
                     self._say(f"組隊：邀請送不出去（{why}），重試中…")
                     return
                 self._team_invited = True                # 一輪只邀一次
-            if self._join_t <= 0 and self._pmover is not None:
+            if self._pmover is None or not self._pmover.active:
+                # ⛔ 以前這裡安靜跳過：分身跳板沒了＝同意一包都送不出去，卻照樣一輪輪重邀。
+                self._team_join_why = "分身跳板沒裝上／失效"
+                self._say(f"⚠ 組隊：分身「{self._partner_name}」的跳板失效，同意送不出去"
+                          "（分身那台的掛機／別頁重開過？）")
+                return
+            if self._join_t <= 0:
                 # ★ 邀請送出去的下一拍就按同意，之後每 TEAM_JOIN_GAP 補一次
                 #   （實測中位數 1 次就進隊）。
                 self._join_t = TEAM_JOIN_GAP
-                team.join(self._pmover, self._psc)
+                _ok, self._team_join_why = team.join(self._pmover, self._psc)
+                self._team_joins += 1
             self._say(f"組隊：第 {self._team_rounds} 輪 —— 邀請「{self._partner_name}」"
                       f"入隊中（均分），分身按同意…")
             return

@@ -2680,7 +2680,7 @@ def main() -> int:
         tab._party = party if tab._loop else "none"
         tab._i = start
         tab._pid = 1
-        tab._ppid, tab._psc, tab._pmover = 2, FakeSc(), object()
+        tab._ppid, tab._psc, tab._pmover = 2, FakeSc(), FakeMover()
         tab._partner_name = "小黑"
         tab._my_name = "大黑"          # 對帳「分身那台看不看得到我」用（2026-09-13）
         tab._targets = lambda: []
