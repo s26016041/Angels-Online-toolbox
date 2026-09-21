@@ -2854,6 +2854,11 @@ class CharDungeonPage(QWidget):
         now = time.monotonic()
         if self._hurt or dist is None or now < self._switch_t:
             return False
+        # ★ 首發已確認打在牠身上＝打過了，不准換（同掛機頁 _switch_closer 的說明）
+        k = self._keys
+        if (getattr(k, "opener_vk", 0) and getattr(k, "_opened", False)
+                and getattr(k, "_open_eid", None) == cur.eid):
+            return False
         self._switch_t = now + SWITCH_GAP
         pool = self._candidates()
         me, grid = self._me, self._grid
@@ -3096,7 +3101,10 @@ class CharDungeonPage(QWidget):
                                      * PATH_BUDGET),
                                  PATH_GAP_MAX)
         blocked = self._path_pts > 1
-        rng = self._keys.walk_range     # 首發還沒放出去 → 照首發的射程走（見 walk_range）
+        # ⛔ 這裡一度改問 walk_range（首發沒放出去就停在 10 格）—— 2026-09-21 使用者退回：
+        #   「首發攻擊的那隻怪物不可以停頓，發送首發後要馬上接技能鍵」。停在 10 格等確認
+        #   ＝首發到輪替中間空 3 秒。只有「首發冷卻中」才停（見 opener_hold）。
+        rng = self._keys.min_range
         reach_walk = (ATTACK_PACKET_RANGE if rng is None
                       else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
         handoff = bool(self._keys.handoff and not blocked
