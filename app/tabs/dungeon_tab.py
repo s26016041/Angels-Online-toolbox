@@ -3514,13 +3514,26 @@ class CharDungeonPage(QWidget):
                    f"{_d(frm, me):.0f} 格，但跳之前離傳點 "
                    f"{_d((gx, gy), frm):.0f} 格（不在傳點上）"
                    f"→ 不算傳送，繼續走")
-            key = (self._rounds, self._i)
-            if getattr(self, "_jump_said", None) != key:
-                self._jump_said = key
-                self._notify(msg)
-            else:
-                self._runlog_write(msg)
+            self._jump_note(msg)
             return False
+        # ★★★ 2026-09-22 實錄（莉薇坦的寢室第 18 步，整趟被誤收掉）：在傳點旁邊清怪，打怪的
+        #   順移每一兩秒就讓位置一拍跳 3~11 格；有一次落在離傳點 8.5 格（> PORTAL_FROM）→ 被當成
+        #   「傳點把人送到別的地方」。
+        #   → 正在打怪、而且從跳之前的位置**走得到**落點（實走 ≤ MAX_PATH）＝同一個房間裡的
+        #     移動（順移／擊退），不是傳點搬的。⚠ 只在打怪中才套、也不累計 `_rollbacks`；沒在
+        #     打怪照舊走下面的拉回判斷（ROLLBACK_MAX 那道「傳點一直把人送回來」的保險要留著）。
+        #     ⚠ 讀不到地形圖 → 不放寬，照舊判。
+        #   ⛔ 不拿「對話傳送還沒點物件（`_clicked`）」當依據：對話走完人沒被搬走會整段重來
+        #     （`_clicked` 歸零），伺服器晚一拍才搬人的話那時 `_clicked` 正好是 False。
+        if not near_land and self._cur is not None:
+            jump = _d(frm, me)
+            if (jump <= MAX_PATH
+                    and self._path_cost(self._grid, frm, me,
+                                        max_cost=MAX_PATH) is not None):
+                self._jump_note(f"第 {self._i + 1} 步　位置一拍跳了 {jump:.0f} 格"
+                                f"（離傳點 {_d((gx, gy), me):.1f} 格），正在打怪、落點從原地"
+                                f"走得到 → 不是傳點搬的，不算傳送，繼續走")
+                return False
         if land and not near_land:
             jump = _d(frm, me)
             back = self._rolled_back(me)
@@ -3570,6 +3583,16 @@ class CharDungeonPage(QWidget):
         self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f}){off}")
         self._next()
         return True
+
+    def _jump_note(self, msg: str) -> None:
+        """「這次跳位不算傳送」的說明：同一趟同一步只**通知**一次，其餘只寫執行紀錄
+        （打怪時順移每放一次就跳一次，實錄第 18 步 60 秒洗了 15 則通知）。"""
+        key = (self._rounds, self._i)
+        if getattr(self, "_jump_said", None) != key:
+            self._jump_said = key
+            self._notify(msg)
+        else:
+            self._runlog_write(msg)
 
     def _reach_covers(self, me) -> bool:
         """現在這份可達區是不是**為這個位置算的**（⓪-2 站到區外就重算；人落在不可走格上時

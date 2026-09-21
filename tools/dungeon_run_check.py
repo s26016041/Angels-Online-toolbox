@@ -1301,6 +1301,29 @@ def main() -> int:
     run(tab, 0.1)
     ck("　跳之前不在傳點上、出口也走不到 → 還是「不算傳送」（伺服器拉回）",
        tab._i == 0 and tab._cycle == "go" and "不算傳送" in tab.status.text(), tab.status.text())
+    # ★★★ 2026-09-22：在傳點旁邊清怪，順移把人一拍搬了 8 格 → 不是傳點搬的，⛔ 不准收掉這一趟
+    _room41 = {(43, 89), (44, 85), (37, 95)}      # 出口 (107,161) 在別區
+    tab = make_tab(LAND41, pos=(37.5, 95.5))      # 落點離傳點 8.6 格（> PORTAL_FROM）
+    tab._loop = True
+    tab._grid = FakeGrid(_room41)
+    tab._reach = set(_room41)
+    tab._jumped = (44.5, 85.5)                    # 跳之前離傳點 3.8 格（在傳點上）
+    tab._cur = FakeMon(x=36.0, y=96.0, eid=92, name="傳點旁的怪")
+    tab._fight = lambda _me, _dt: False           # 這裡只驗跳位怎麼判
+    run(tab, 0.1)
+    ck("★★★ 正在打怪、落點從原地走得到（同一個房間）→ 不算傳送、不收這一趟、不累計拉回次數",
+       tab._i == 0 and tab._cycle == "go" and tab._rollbacks == 0
+       and "不是傳點搬的" in tab.status.text(),
+       f"i={tab._i} cycle={tab._cycle} rb={tab._rollbacks} {tab.status.text()}")
+    tab = make_tab(LAND41, pos=(37.5, 95.5))
+    tab._loop = True
+    tab._grid = FakeGrid(_room41)
+    tab._reach = set(_room41)
+    tab._jumped = (44.5, 85.5)
+    run(tab, 0.1)                                 # 同樣的跳位，但**沒在打怪**
+    ck("　沒在打怪 → 照舊判（落點不在傳點旁、也不在軌跡上 → 當成傳到別的地方）",
+       tab._cycle == "supply", f"cycle={tab._cycle} {tab.status.text()}")
+
     tab = make_tab(LAND41, pos=(109.5, 163.5))    # 離記的出口只有 2.8 格
     tab._loop = True
     tab._grid = FakeGrid({(109, 163)}, others={(43, 89), (107, 161), (96, 166)})   # 但隔牆
