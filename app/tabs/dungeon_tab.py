@@ -3127,7 +3127,9 @@ class CharDungeonPage(QWidget):
         walk_gap = (WALK_GAP_FAR if (gd is not None and gd > FAR_ENOUGH)
                     else WALK_GAP)
         self._walk_t += dt
-        if (me and mp and not self._busy_walking()
+        # ★ 首發還在冷卻 → 原地等它好再走過去（同掛機頁，見 KeyWorker.opener_hold）
+        opener_hold = self._keys.opener_hold()
+        if (me and mp and not self._busy_walking() and not opener_hold
                 and self._walk_t >= walk_gap and need_walk):
             self._walked_ok = self._walk_toward(mp[0], mp[1], me, keep,
                                                 reach=reach_keep) > 0
@@ -3140,7 +3142,7 @@ class CharDungeonPage(QWidget):
         self._keys.client_walk = handoff
         self._keys.set_on(in_range)               # ★ 邊走邊打
 
-        waiting_opener = getattr(self._keys, "open_wait", 0.0) > 0.0
+        waiting_opener = getattr(self._keys, "open_wait", 0.0) > 0.0 or opener_hold
         if in_range and dist is not None and dist <= keep:
             self._why = "出手中"
         elif in_range:

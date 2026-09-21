@@ -155,6 +155,9 @@ class FakeKeys:
         self.open_wait = 0.0
         self.open_note = ""
 
+    def opener_hold(self):
+        return False                 # 假的沒有首發 → 從不原地等
+
     @property
     def walk_range(self):
         return self.min_range        # 假的沒有首發 → 走位射程＝最短射程（同 KeyWorker.walk_range）

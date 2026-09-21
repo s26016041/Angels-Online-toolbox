@@ -75,6 +75,7 @@ from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
+from app.game import skillcd
 from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
                       channel, entity, eventmap, farmsettings, guildbank, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
@@ -561,6 +562,9 @@ QUICKKEY_RANGE = 8
 HANDOFF_RANGE = 12.0
 # 交棒之後這麼久還沒真的接戰（還在技能射程外、也沒掉過血）就收回來自己走。
 HANDOFF_WAIT = 3.0
+# 原地等首發冷卻最多等這麼久（見 KeyWorker.opener_hold）。冷卻＝技能後置時間，實測 1~6 秒；
+# 這個上限只是防「清單讀到殘留節點」害角色永遠站著，不是預期會等到的數字。
+OPENER_HOLD_MAX = 30.0
 # 攻擊方式。⛔ 以前還有一個 MODE_KEY（「自動掛機（按鍵）」那個分頁），
 #   分頁已經拿掉了，常數也跟著移除 —— 現在只剩封包這一種。
 #   （KeyWorker 裡「不是封包模式就送鍵」那條路還在，當作封包送不出去時的退路。）
@@ -887,6 +891,9 @@ class KeyWorker(_Paced):
         self.opener_vk = 0
         self._open_eid = None       # 現在這道鎖是針對哪一隻（換怪就重新上鎖）
         self._opened = False        # 這一隻的首發已經**真的**放出去了（收到廣播）
+        self._hold_next = 0.0       # opener_hold 的 0.1 秒快取
+        self._hold_last = False
+        self._hold_since = 0.0      # 這一段原地等首發冷卻是從什麼時候開始的
         # ★★ 首發確認靠「施放廣播監聽」（castwatch，100% 訊號）——
         #   收到「我(srv_id)放出這一招」的伺服器廣播才算數，拒收不會有。
         self.castwatch = None       # CastHook（分頁 acquire 後塞進來；None=退舊行為）
@@ -1023,6 +1030,41 @@ class KeyWorker(_Paced):
             if r:
                 return r
         return self.min_range
+
+    def opener_hold(self) -> bool:
+        """現在要不要**原地不動等首發冷卻**（掛機頁／副本頁走位前問這支）。
+
+        ★ 使用者 2026-09-21：「首發射出如果怪物沒死要馬上接技能鍵（不是等首發 CD）；
+          如果怪物死掉、首發還沒好，要在原地等首發 CD 好再去打下一隻。」
+          → 只在「這一隻的首發還沒確認放出去」而且「首發那招正在冷卻」時回 True。
+        冷卻＝遊戲 UI 把圖示變黑的同一個判斷（app/game/skillcd.py，純讀）。
+        不擋的情況（＝照舊往下走，安全退化）：
+          · 沒設首發／那格沒技能／這隻首發已放完
+          · 讀不到冷卻清單（None＝不知道）
+          · SP 不夠：SP 是打怪打出來的，站著等永遠不會好（見 _sp_blocked）
+          · 等超過 OPENER_HOLD_MAX 秒：清單讀到殘留節點之類，不准永遠站著
+        ⚠ 0.1 秒快取：這支是 GUI 執行緒每拍在問的，不要每拍都走訪清單。
+        """
+        vk = self.opener_vk
+        sid = self.skills.get(vk) if vk else None
+        eid = self.eid
+        if not sid or eid is None or (self._opened and self._open_eid == eid):
+            self._hold_since = 0.0
+            return False
+        now = time.monotonic()
+        if now < self._hold_next:
+            return self._hold_last
+        self._hold_next = now + 0.1
+        hold = bool(skillcd.cooling(self.sc, bag.player_entity(self.sc) or 0, sid))             and not self._sp_blocked(sid)
+        if hold:
+            if not self._hold_since:
+                self._hold_since = now
+            elif now - self._hold_since > OPENER_HOLD_MAX:
+                hold = False
+        else:
+            self._hold_since = 0.0
+        self._hold_last = hold
+        return hold
 
     def reach_of(self, sid: int) -> float:
         """**這一招自己**打得到的距離（格）—— 共用 `reach_of()`（見模組層那份）。
@@ -6810,7 +6852,11 @@ class CharFarmPage(QWidget):
         # ★ 還在趕路（離目標 > FAR_ENOUGH）就用短冷卻，貼身微調維持 0.4 秒。
         walk_gap = (WALK_GAP_FAR if (gd is not None and gd > FAR_ENOUGH)
                     else WALK_GAP)
-        if (me and not self._moving
+        # ★ 首發還在冷卻（上一隻被首發打死、這一隻的首發還沒放）→ **原地不動等它好**，
+        #   好了才走過去（使用者 2026-09-21，見 KeyWorker.opener_hold）。出手不受影響：
+        #   已經在首發射程內的話，閘門照樣一直送首發，冷卻一好就出去。
+        opener_hold = self._keys.opener_hold()
+        if (me and not self._moving and not opener_hold
                 and self._walk_t >= walk_gap and need_walk):
             # ⚠ 這個回傳值**不能**寫進 _path_pts —— 它是「走到中繼點」的路徑
             #   點數，不是「跟怪之間有沒有地形」（見上面那段說明）。
@@ -6839,7 +6885,7 @@ class CharFarmPage(QWidget):
         #   直接標出來才不必猜。
         # ★★ 等首發技能：這段是**故意不出手**的（使用者要的「第一下一定要是
         #   那一招」），所以底下所有「沒進展就換一隻」的計時器都要凍住。
-        waiting_opener = self._keys.open_wait > 0.0
+        waiting_opener = self._keys.open_wait > 0.0 or opener_hold
         # 跳過首發（SP 不夠／讀不到）要**講出來**，不能安靜地發生。
         if self._keys.open_note:
             self.status.setText(self._keys.open_note)
