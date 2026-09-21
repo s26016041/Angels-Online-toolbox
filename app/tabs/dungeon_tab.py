@@ -451,6 +451,13 @@ REJOIN_BACK_MAX = 2         # 一趟最多往回跳幾次
 #   病灶：往怪物走 → 走到一半怪掉出遊戲的串流範圍（掃不到）→ 改去點位 →
 #   一靠近又掃到 → 再追 …… 無限輪迴。9/4 純讀：開闊地圖掃得到 37 格外的怪，30 安全。
 MAX_CHASE = 30.0
+# ★★★ **實走**超過這麼多格的怪也不看（使用者 2026-09-22 定 40）。
+#   病灶（莉薇坦的寢室，dungeon_run.log 23:58:33 起）：怪在牆另一邊、直線 28 格，跟我同一區
+#   （`_can_reach` 過了）但路要繞整張圖 —— 「魅影舞孃@27.3→427.1」照樣被鎖定；400 格的終點
+#   一次丟給 WALK_FN 人根本不動，10 秒沒進展換一隻又是同款，同一隻被鎖 4 次。
+#   那份紀錄裡正常挑到的實走都 ≤ 21 格、壞的都 ≥ 395 格。
+#   ⚠ 放在 `_candidates` 不是 `_pick_next`：「清光才算到點位」問的也是 `_candidates`。
+MAX_PATH = 40.0
 # ★★ 放棄過的怪只要**還站在原地**就不再挑（使用者 2026-09-05：「走不過去的怪物應該要直接
 #   無視」）。病灶：劇情王會瞬移到旁邊一個走不過去也打不到的位置，15 秒沒進展放棄後
 #   沒別隻可挑 → 立刻又挑回牠 → 永遠卡在那。⚠ 這不是黑名單：以**牠的位置**為鍵，
@@ -1785,6 +1792,7 @@ class CharDungeonPage(QWidget):
         self._spam = 0               # 「點了沒反應」先狂點幾發（見 SPAM_SHOTS）
         self._notice_t = 0.0
         self._reach = None           # 「我這一區」走得到的格子（None＝沒有圖）
+        self._too_far = {}           # (我的格, 怪的格) → 實走超過 MAX_PATH？（地形重讀就清）
         self._reach_n = 0            # 上次那一區有幾格（拿來看門開了沒）
         self._grid = None            # 上次讀到的地形圖（判斷怪站的是不是可走格）
         # ---- 打怪流程（掛機頁的複本，見檔頭）：這些全是「跟目前目標綁在一起」
@@ -1803,7 +1811,7 @@ class CharDungeonPage(QWidget):
         self._gate_poke = 0.0        # 距離下次對機關送 0x0D 還有多久
         self._gate_base = None       # 剛到時那個機關周圍有幾格 bit0（⚠ None＝還沒讀到）
         self._gate_last = None       # 最近一次讀到的格數（只拿來回報）
-        self._left_out = (0, 0, 0)   # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地)
+        self._left_out = (0, 0, 0, 0)  # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地, 繞太遠)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
         self._anchor = None          # 卡住偵測的錨點（淨位移 > STUCK_EPS 才重設）
@@ -2215,6 +2223,7 @@ class CharDungeonPage(QWidget):
                     best = cand
             got = best
         self._grid = grid
+        self._too_far.clear()            # 地形重讀了 → 實走距離重新問
         if not got:
             self._reach, self._reach_n = None, 0
             return
@@ -2702,7 +2711,7 @@ class CharDungeonPage(QWidget):
         """
         me = self._me
         pool: list = []
-        far = unreach = hopeless = 0
+        far = unreach = hopeless = detour = 0
         for m in self._live_monsters():
             if not m.eid:
                 continue                 # eid=0 挑到整條攻擊鏈都會空轉
@@ -2726,10 +2735,31 @@ class CharDungeonPage(QWidget):
             if not self._can_reach(p):
                 unreach += 1
                 continue
+            if self._path_too_far(p):
+                detour += 1
+                continue
             pool.append((d, m, p))
         pool.sort(key=lambda t: t[0])
-        self._left_out = (far, unreach, hopeless)
+        self._left_out = (far, unreach, hopeless, detour)
         return pool
+
+    def _path_too_far(self, pos) -> bool:
+        """走到 pos 的**實走距離**超過 MAX_PATH 嗎（見 MAX_PATH 的說明）。
+
+        `route(max_cost=)` 展開到 MAX_PATH 就收手，再用 (我的格, 怪的格) 記住答案 ——
+        `_candidates` 一拍會被問好幾次。⚠ 沒地形圖／沒座標回 False＝不過濾（安全退化）。
+        """
+        grid, me = self._grid, self._me
+        if grid is None or not me or not pos:
+            return False
+        key = (int(me[0]), int(me[1]), int(pos[0]), int(pos[1]))
+        hit = self._too_far.get(key)
+        if hit is None:
+            if len(self._too_far) > 512:
+                self._too_far.clear()
+            hit = grid.route(key[:2], key[2:], max_cost=MAX_PATH) is None
+            self._too_far[key] = hit
+        return hit
 
     def _targets(self) -> list:
         """**現在**打得了的活怪（清怪／休息／到點位的判定用）。每次都重新問。"""
@@ -2737,12 +2767,14 @@ class CharDungeonPage(QWidget):
 
     def _left_out_note(self) -> str:
         """上一輪不打的怪各是為什麼（給狀態列，一定要講得出來）。"""
-        far, unreach, hopeless = self._left_out
+        far, unreach, hopeless, detour = self._left_out
         parts = []
         if far:
             parts.append(f"{far} 隻超過 {MAX_CHASE:.0f} 格")
         if unreach:
             parts.append(f"{unreach} 隻走不到（隔壁區／沒有路）")
+        if detour:
+            parts.append(f"{detour} 隻繞太遠（實走超過 {MAX_PATH:.0f} 格）")
         if hopeless:
             parts.append(f"{hopeless} 隻放棄過還站在原地（走不到／打不中）")
         return "、".join(parts)
