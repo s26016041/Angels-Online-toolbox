@@ -2912,6 +2912,9 @@ class CharDungeonPage(QWidget):
         if spot is None:
             return None
         if math.hypot(spot[0] - me[0], spot[1] - me[1]) < 0.6:
+            # ★ 站在那格卻還打不到（射程邊緣差 0.03 格）→ 照舊往怪再靠一點，見掛機頁同段。
+            if reach is not None and math.hypot(gx - me[0], gy - me[1]) > reach:
+                return None
             return 0
         mtile = (int(me[0]), int(me[1]))
         stile = (int(spot[0]), int(spot[1]))

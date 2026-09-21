@@ -964,9 +964,17 @@ class KeyWorker(_Paced):
         ⚠ 走封包的（射程 > 8、或對地技能）**不會**有這個行為 —— 那是
           快捷鍵函式自己做的事，封包只是把「我要放這招」告訴伺服器。
         ⚠ 只要輪裡有任何一招要走封包，就不能交棒（那招會在遠處空放）。
+        ★ 例外（2026-09-21 實錄）：**只當首發、不進輪替**的那一招，在這一隻的首發
+          已經確認放出去之後就不再列入 —— 它這隻不會再放了。以前把它算進去，
+          「首發幻影刺殺(12)＋輪替劈擊(1)」的雪狐／北極狐整場都不交棒，改由我們
+          自己貼到 2／3 格（＝射程邊緣），差 0.03 格就站著不打 15~24 秒。
         """
+        opener_done = bool(self._opened and self._open_eid is not None
+                           and self._open_eid == self.eid)
         got = False
         for vk in self.all_keys():
+            if opener_done and vk == self.opener_vk and vk not in self.vks:
+                continue
             sid = self.skills.get(vk)
             if not sid:
                 continue
@@ -4873,6 +4881,12 @@ class CharFarmPage(QWidget):
         if spot is None:
             return None
         if math.hypot(spot[0] - me[0], spot[1] - me[1]) < 0.6:
+            # ★ 已經站在那格**卻還打不到** → 回 None 讓呼叫端照舊往怪再靠一點。
+            #   近戰的站位格剛好在射程邊緣（射程 1 → 站 2 格、reach 2.0），人的 Y 是
+            #   格+0.47、怪也不一定在格子正中 → 實距 2.03 > 2.0：不出手、這裡又說
+            #   「到了」不走，站到 STUCK 才換怪（2026-09-21 實錄雪狐 15.3／24.4 秒）。
+            if reach is not None and math.hypot(gx - me[0], gy - me[1]) > reach:
+                return None
             return 0                                   # 已經站在那格
         mtile = (int(me[0]), int(me[1]))
         stile = (int(spot[0]), int(spot[1]))
