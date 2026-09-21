@@ -3146,6 +3146,15 @@ class CharDungeonPage(QWidget):
                                      (time.perf_counter() - plan_t0)
                                      * PATH_BUDGET),
                                  PATH_GAP_MAX)
+        # ★★ 2026-09-22：**鎖定之後**路才變遠的也要馬上換（不等 STUCK_SECS）。
+        #   實錄第 17 步：鎖了實走 35.5 格的怪，走近後石像的阻擋串流進來、路斷了只剩繞整張圖
+        #   那條 → 400 格的終點丟給 WALK_FN 人不動，站在機關上 12 秒才放棄。
+        #   只在隔著地形時問（直線可通不可能繞太遠）；打傷過的、貼身的不算；答案有快取。
+        if (self._path_pts > 1 and not self._hurt and mp is not None
+                and dist is not None and dist > NO_PATH_NEED
+                and self._path_too_far(mp)):
+            self._give_up(f"路變遠了（實走超過 {MAX_PATH:.0f} 格，直線 {dist:.1f} 格）")
+            return True
         blocked = self._path_pts > 1
         # ⛔ 這裡一度改問 walk_range（首發沒放出去就停在 10 格）—— 2026-09-21 使用者退回：
         #   「首發攻擊的那隻怪物不可以停頓，發送首發後要馬上接技能鍵」。停在 10 格等確認

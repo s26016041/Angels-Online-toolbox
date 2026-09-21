@@ -1687,6 +1687,38 @@ def main() -> int:
        66 in tab._hopeless and tab._cur is None and "走不到" in tab.status.text(),
        f"hopeless={tab._hopeless} cur={tab._cur} {tab.status.text()}")
 
+    # ★★ 2026-09-22：鎖定之後路才變遠（機關的阻擋走近才串流進來）→ 馬上換，不等 10 秒
+    class FakeGridDetour(FakeGridOpen):
+        far = False
+
+        def clear_line(self, a, b):
+            return not self.far
+
+        def waypoints(self, a, b, relax=4, max_cost=None):
+            return [(15, 30), b]
+
+        def route(self, start, goal, relax=4, max_cost=None):
+            return None if (self.far and max_cost is not None) else [start, goal]
+
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    m = FakeMon(x=24.0, y=10.0, eid=68, name="門後面的")
+    tab._live_monsters = lambda: [m]
+    tab._keys, tab._atk, tab._mover = FakeKeys(), FakeAtk(), FakeMover()
+    tab._keys.min_range = 3
+    g = FakeGridDetour()
+    tab._reach, tab._grid = None, g
+    dt.entity.read_pos = lambda _sc, _addr: (24.0, 10.0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("　路還近的時候照常鎖定", tab._cur is m, str(tab._cur))
+    g.far = True
+    tab._too_far.clear()                          # 地形重讀（阻擋串流進來了）
+    for _ in range(int(1.0 / TICK)):
+        tab._fight((10.0, 10.0), TICK)
+    ck(f"★★ 鎖定後實走變成超過 {dt.MAX_PATH:.0f} 格 → 1 秒內就換（⛔ 不站著等 "
+       f"{dt.STUCK_SECS:.0f} 秒）、之後也不再挑牠",
+       tab._cur is None and "路變遠了" in tab.status.text() and not tab._targets(),
+       f"cur={tab._cur} {tab.status.text()}")
+
     # 目標從掃描消失、物件也沒了 → 兩拍後放掉（一拍漏掃不算）
     tab = make_tab([{"do": "walk", "to": [50, 50]}])
     m = FakeMon(x=12.0, y=10.0, eid=67, name="消失的")
