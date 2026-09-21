@@ -701,6 +701,7 @@ BUMP_CLEAR = 4             # bit0 格數比一開始少這麼多（或歸零）�
 GATE_NEAR = 12.0           # 離機關這麼近才判（物件都串流進來了）
 GATE_CORE = 3              # 看機關自己 ± 這麼多格的 bit0
 GATE_CORE_HITS = 2         # 連續這麼多次（每 BUMP_POLL 秒一次）都是 0 格才算開了
+GATE_FIGHT_POLL = 0.5      # 撞機關那步正在打怪時，多久看一次機關開了沒（見 _gate_watch）
 # ⛔ 沒有次數上限（同傳點的撞法：副本的門本來就是解謎才開，出口是取消勾選）。
 # ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
 #   壞掉，那個拔掉」）—— 傳點過不去就一直打，出口是取消勾選。
@@ -2388,6 +2389,8 @@ class CharDungeonPage(QWidget):
         #      回 False 代表**打得到的怪一隻都不剩**，才輪到腳本。
         #    ⛔ **只在副本裡面打**（使用者 2026-09-02：「進入副本前不要
         #      自動打怪」）——去副本路上遇到什麼都不理，直接趕路。
+        if self._phase == "run":
+            self._gate_watch(me, dt)      # 撞機關那步邊打怪邊看門開了沒
         if self._phase == "run" and self._fight(me, dt):
             return
         if self._phase != "run" and self._keys is not None:
@@ -3989,6 +3992,54 @@ class CharDungeonPage(QWidget):
                 return float(cx), float(cy)
         return float(ax), float(ay)
 
+    def _gate_done(self, tag: str, why: str) -> None:
+        """機關開了 → 收尾＋往下一步（`_do_bump` 與打怪中的 `_gate_watch` 共用）。"""
+        # 牆變路了 → 地形快取一定要丟掉重讀，不然後面每一步都拿舊的牆
+        #   算路（「解完謎卻說走不到」，見 _refresh_grid）。
+        self._maps.drop()
+        self._grid_t = 0.0
+        self._reach, self._reach_n = None, 0
+        self._hopeless.clear()       # 門開了 → 放棄過的怪重新問一輪
+        self._notify(f"{tag}　機關開了：{why} → 下一步")
+        # ★★ 2026-09-22：門開了，踩開關跳出來的那個框**當場收掉** —— 這一步
+        #   `_stray_dialog` 不准碰，下一步要是「對話傳送／對話」它一樣不碰，
+        #   框就一路殘留到再下一步（執行紀錄第 17→19 步掛了 44 秒），還會
+        #   擋到下一步自己的對話。純讀確認真的顯示著才收（見 _stray_dialog）。
+        try:
+            showing = talkwnd.window_visible(self._sc)
+        except Exception:                                # noqa: BLE001
+            showing = None
+        if showing and self._mover is not None:
+            self._dismiss_dialog("機關開了")
+        self._nav.reset()
+        self._gate = None
+        self._next()
+
+    def _gate_watch(self, me, dt: float) -> None:
+        """撞機關那一步**正在打怪**時也照樣看機關開了沒（只在 GATE_NEAR 內）。
+
+        ★★ 2026-09-22 實錄（第 5 步）：踩完開關門一開、怪變成走得到，當拍就交給 `_fight`，
+          `_do_bump` 沒在跑 → 沒人判；打怪把人拉到 88 格外，打完還要**整段走回機關旁邊**
+          才判得到「開了」（白走 8 秒，使用者看起來就是「判別不到」）。
+          → 人還在機關旁邊的那幾拍就判掉，步驟先往下走，怪照打。
+        ⚠ `"wrong"`（選錯物件要停機）不在這裡判，留給 `_do_bump`。
+        """
+        if self._cur is None or me is None or self._gate is None:
+            return                       # 沒在打怪 → `_do_bump` 自己會判；還沒開始撞 → 不管
+        steps = self._script.steps if self._script else []
+        step = steps[self._i] if self._i < len(steps) else None
+        if step is None or step.get("do") != dungeon.BUMP:
+            return
+        if _d(tuple(step["at"]), me) > GATE_NEAR:
+            return
+        self._gate_t -= dt
+        if self._gate_t > 0:
+            return
+        self._gate_t = GATE_FIGHT_POLL
+        verdict, why = self._gate_open(step, me)
+        if verdict == "open":
+            self._gate_done(f"第 {self._i + 1} 步", why)
+
     def _do_bump(self, step: dict, me, dt: float) -> None:
         """來回撞一個機關，撞到它蓋的阻擋消失為止（使用者 2026-09-07）。
 
@@ -4044,26 +4095,7 @@ class CharDungeonPage(QWidget):
                            f"　請回副本腳本製作頁重新設定這一步")
                 return
             if verdict == "open":
-                # 牆變路了 → 地形快取一定要丟掉重讀，不然後面每一步都拿舊的牆
-                #   算路（「解完謎卻說走不到」，見 _refresh_grid）。
-                self._maps.drop()
-                self._grid_t = 0.0
-                self._reach, self._reach_n = None, 0
-                self._hopeless.clear()       # 門開了 → 放棄過的怪重新問一輪
-                self._notify(f"{tag}　機關開了：{why} → 下一步")
-                # ★★ 2026-09-22：門開了，踩開關跳出來的那個框**當場收掉** —— 這一步
-                #   `_stray_dialog` 不准碰，下一步要是「對話傳送／對話」它一樣不碰，
-                #   框就一路殘留到再下一步（執行紀錄第 17→19 步掛了 44 秒），還會
-                #   擋到下一步自己的對話。純讀確認真的顯示著才收（見 _stray_dialog）。
-                try:
-                    showing = talkwnd.window_visible(self._sc)
-                except Exception:                        # noqa: BLE001
-                    showing = None
-                if showing and self._mover is not None:
-                    self._dismiss_dialog("機關開了")
-                self._nav.reset()
-                self._gate = None
-                self._next()
+                self._gate_done(tag, why)
                 return
         # ── ② 踩開關 → 按確定（找不到開關才退回亂走）────────────────
         gate = self._gate

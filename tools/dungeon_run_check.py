@@ -4123,6 +4123,25 @@ def main() -> int:
     ck("★★ 離太遠讀到 0 格 ⛔ 不准判「腳本選錯物件」停機", tab.run_cb.isChecked(),
        tab.status.text())
 
+    # ★★ 2026-09-22：撞機關那步**正在打怪**也要看門開了沒（不然打完要整段走回去才判得到）
+    tab = bump_tab([163, 140], cells=_cells, core=5)
+    wire_room(tab, [FakeTrig(23.0, 10.0, 60305)])
+    run(tab, 0.3)                                  # 近處記到基準 163、開始踩
+    tab._cur = FakeMon(x=25.0, y=10.0, eid=91, name="門後的怪")
+    tab._gate_watch((60.0, 10.0), dt.BUMP_POLL + 1.0)
+    ck("　打怪中但人已經離機關 > GATE_NEAR → 不判（遠處讀的不算數）", tab._i == 0,
+       f"第 {tab._i + 1} 步")
+    tab._gate_watch((19.0, 10.0), dt.BUMP_POLL + 1.0)
+    ck("★★★ 打怪中、人還在機關旁邊、阻擋掉了 → **當場**判開了往下一步（怪照打）",
+       tab._i == 1 and tab._gate is None and tab._cur is not None,
+       f"第 {tab._i + 1} 步 gate={tab._gate}")
+    tab = bump_tab([163], cells=_cells, core=5)
+    wire_room(tab, [FakeTrig(23.0, 10.0, 60305)])
+    run(tab, 0.3)
+    tab._cur = None
+    tab._gate_watch((19.0, 10.0), dt.BUMP_POLL + 1.0)
+    ck("　沒在打怪 → `_gate_watch` 不插手（`_do_bump` 自己會判）", tab._i == 0)
+
     tab = wire_room(bump_tab([None], cells=_cells), [])   # 地形讀不到
     run(tab, 3 * dt.BUMP_POLL)
     ck("★★ 地形讀不到 ⛔ 不可以當成「開了」（讀不到 ≠ 沒有阻擋）",
