@@ -3761,9 +3761,14 @@ class CharDungeonPage(QWidget):
         #   收掉的那一發就算白踩也無妨：打完 `_do_bump` 會重掃再踩一輪。
         bumping = (step is not None and step.get("do") == dungeon.BUMP
                    and self._cur is None)
-        if step is not None and (step.get("do") == dungeon.INTERACT or bumping
-                                 or (step.get("do") == dungeon.PORTAL
-                                     and "menu" in step)):
+        # ★★ 2026-09-22：對話／對話傳送那一步也一樣，**點下去之後**（`_clicked`）才是在等
+        #   對話；還在走去站位、路上在打怪時冒出來的框＝殘留，照收。
+        #   實錄：第 17 步機關開了的那一拍框還沒跳出來（晚一點才跳），下一步是對話傳送 →
+        #   整段豁免 → 框掛了 80 秒，到站位「點之前先收殘留」才收掉。
+        talking = (step is not None and self._clicked
+                   and (step.get("do") == dungeon.INTERACT
+                        or (step.get("do") == dungeon.PORTAL and "menu" in step)))
+        if bumping or talking:
             # ⚠ 對話傳送那一步也在等對話（點它、選第 N 項），這支收掉就白點了。
             return False
         self._stray_t -= dt

@@ -2459,8 +2459,16 @@ def main() -> int:
     ck("　還在 → 隔了間隔再關一次", fk.closes == 2, str(fk.closes))
     tab._i = 1                                             # 換到對話那一步
     tab._stray_closed = 0.0
+    tab._clicked = True                                    # 物件點下去了，正在等它的對話
     tab._stray_dialog(1.1)
-    ck("★ 對話那一步不管（本來就在等對話）", fk.closes == 2, str(fk.closes))
+    ck("★ 對話那一步**點下去之後**不管（本來就在等對話）", fk.closes == 2, str(fk.closes))
+    tab._clicked = False                                   # 還在走去站位／路上打怪
+    tab._stray_closed = 0.0
+    tab._stray_dialog(1.1)
+    ck("★★ 對話那一步**還沒點**就冒出來的框＝殘留 → 照收（實錄掛了 80 秒）",
+       fk.closes == 3, str(fk.closes))
+    fk.closes = 2                                          # 下面幾條照舊從 2 數起
+    tab.left.pop()
     tab._i = 0
     tab._stray_closed = 0.0
     dt.talkwnd.window_present = lambda _sc: None           # 讀不到
@@ -4209,8 +4217,10 @@ def main() -> int:
     tab.trigs = [FakeTrig(50.0, 50.0, 60123)]
     dt.entity.is_walking = lambda _sc, _p: False
     wire(tab, FakeTalk([(1, 2), ()]))
-    ck("★★★ 對話傳送這一步**不准**讓「自動收殘留對話」插手（收掉就白點了）",
+    tab._clicked = True
+    ck("★★★ 對話傳送這一步**點下去之後不准**讓「自動收殘留對話」插手（收掉就白點了）",
        tab._stray_dialog(1.0) is False)
+    tab._clicked = False
     run(tab, 4.0)
     from app.game import supply as _sup4
     ck("★★ 對話傳送＝走到站位、點它、送選項（⛔ 不是踩上去打 0x0D）",
