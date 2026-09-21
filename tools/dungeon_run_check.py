@@ -4082,6 +4082,10 @@ def main() -> int:
     ck("★★★ 離機關 > GATE_NEAR：格數掉了／機關那幾格 0 格 ⛔ 都不算開了"
        "（那一片阻擋只是還沒串流進來）", tab._i == 0 and tab._gate_base is None,
        f"第 {tab._i + 1} 步　base={tab._gate_base}")
+    ck("★★ 離機關還很遠 → 先**用尋路**走回機關旁邊（退開點），⛔ 不直走、不踩、不算動作階段",
+       tab._nav.calls > 0 and not tab.walked and tab._gate is None
+       and tab._act_t == 0.0 and "旁邊" in tab.status.text(),
+       f"nav={tab._nav.calls} walked={tab.walked} act={tab._act_t} {tab.status.text()}")
     tab = bump_tab([0], props=[FakeProp(20.0, 10.0, 60414)], pos=(60.0, 10.0))
     run(tab, 0.3)
     ck("★★ 離太遠讀到 0 格 ⛔ 不准判「腳本選錯物件」停機", tab.run_cb.isChecked(),

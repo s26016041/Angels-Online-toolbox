@@ -3992,6 +3992,24 @@ class CharDungeonPage(QWidget):
         """
         ax, ay = step["at"]
         tag = f"第 {self._i + 1} 步"
+        # ★★ 2026-09-22：離機關還很遠（上一步的點位本來就遠、或打怪被拉走）→ **先用尋路走回
+        #   機關旁邊**，到 GATE_NEAR 內才開始判／踩。以前這段直接進踩開關那一套：開關還沒
+        #   串流進來（掃到 0 個）、`_walk_onto` 是 walk_exact 直送不尋路，實錄離開關 143 格
+        #   人一步都不動 → 卡滿 ACT_STUCK 20 秒退回、再卡停機。
+        #   ⚠ 趕路不算動作階段（不累計 `_act_t`）；到了從頭重掃（`_gate = None`）。
+        if _d((ax, ay), me) > GATE_NEAR:
+            spot = step.get("stand")
+            if not spot or _d((ax, ay), spot) > GATE_NEAR:
+                spot = (ax, ay)
+            gx, gy = float(spot[0]), float(spot[1])
+            self._gate = None
+            note, no_path = self._go_to(gx, gy)
+            if no_path:
+                self._blocked(dt, f"走不到機關旁邊 ({gx:g}, {gy:g})", (gx, gy))
+                return
+            self._say(f"{tag}　先走到機關 ({ax}, {ay}) 旁邊 ({gx:g}, {gy:g})"
+                      f"　離機關 {_d((ax, ay), me):.1f} 格　{note}　{self._mon_note()}")
+            return
         # ★ 撞機關整段都算「動作階段」（走去它旁邊也是撞的一部分，見 ACT_STUCK_SECS）
         self._act_t += dt
         if self._act_stuck("撞機關"):
