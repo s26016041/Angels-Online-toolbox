@@ -3935,14 +3935,15 @@ def main() -> int:
        "來回撞機關" in dungeon.describe({"do": dungeon.BUMP, "at": [9, 9]}),
        dungeon.describe({"do": dungeon.BUMP, "at": [9, 9]}))
 
-    def bump_tab(seq, model=60414, props=(), stand=[10, 10], cells=None):
+    def bump_tab(seq, model=60414, props=(), stand=[10, 10], cells=None,
+                 core=None, pos=(19.0, 10.0)):
         """`seq` ＝ terrain.object_blocked 每次回什麼（用完停在最後一個）；
         `cells` ＝ terrain.object_block_cells 回什麼（亂走的半徑照它算）。"""
         step = {"do": dungeon.BUMP, "at": [20, 10], "model": model}
         if stand:
             step["stand"] = list(stand)
         t = make_tab([step, {"do": dungeon.WAIT, "secs": 5}],
-                     pos=(19.0, 10.0), props=props)
+                     pos=pos, props=props)
         t.walked = []
         t._mover = type("M", (), {
             "walk_exact":
@@ -3955,8 +3956,16 @@ def main() -> int:
         #   都會被當成「正在走」—— 那道閘本身別處已經驗過。
         t._busy_walking = lambda: False
         left = list(seq)
-        dt.terrain.object_blocked = lambda _sc, x, y, r: (
-            left.pop(0) if len(left) > 1 else left[0])
+        last = [left[0]]
+
+        def _blocked(_sc, x, y, r):
+            # r＝BUMP_R：周圍的總格數（照 seq 走）；r＝GATE_CORE：機關自己那幾格
+            #（`core` 沒給就跟總格數同一個值 —— 關著兩個都有、整片不見兩個都 0）。
+            if r != dt.BUMP_R:
+                return last[0] if core is None else core
+            last[0] = left.pop(0) if len(left) > 1 else left[0]
+            return last[0]
+        dt.terrain.object_blocked = _blocked
         # 亂走的半徑是問「阻擋鋪到哪幾格」算的 —— 預設讀不到（→ 退回預設半徑），
         # 要驗半徑的測試自己再 wire 一次。
         dt.terrain.object_block_cells = lambda _sc, x, y, r: cells
@@ -4057,6 +4066,26 @@ def main() -> int:
     ck("★★ 開了要把地形快取丟掉重讀（不然後面每一步都拿舊的牆算路）",
        tab._reach is None and tab._grid_t == 0.0,
        f"reach={tab._reach} grid_t={tab._grid_t}")
+
+    # ★★★ 2026-09-22 側錄定案：物件蓋的阻擋跟著物件串流進出，遠處讀的不算數
+    tab = bump_tab([160], cells=_cells, core=0)   # 周圍一直 160 格，機關自己那幾格 0 格
+    wire_room(tab, [FakeTrig(23.0, 10.0, 60305)])
+    run(tab, dt.BUMP_POLL * 0.5)
+    ck("　機關自己那幾格 0 格 —— 只讀到一次還不算（半串流會騙人）", tab._i == 0,
+       f"第 {tab._i + 1} 步")
+    run(tab, dt.GATE_CORE_HITS * dt.BUMP_POLL)
+    ck("★★★ **一到就已經開著**（總格數沒變、機關自己 ±3 格連兩次 0 格）→ 開了，往下一步",
+       tab._i == 1, f"第 {tab._i + 1} 步　{tab.status.text()}")
+    tab = bump_tab([163, 140, 140, 140], cells=_cells, core=0, pos=(60.0, 10.0))
+    wire_room(tab, [FakeTrig(23.0, 10.0, 60305)])
+    run(tab, 4 * dt.BUMP_POLL)
+    ck("★★★ 離機關 > GATE_NEAR：格數掉了／機關那幾格 0 格 ⛔ 都不算開了"
+       "（那一片阻擋只是還沒串流進來）", tab._i == 0 and tab._gate_base is None,
+       f"第 {tab._i + 1} 步　base={tab._gate_base}")
+    tab = bump_tab([0], props=[FakeProp(20.0, 10.0, 60414)], pos=(60.0, 10.0))
+    run(tab, 0.3)
+    ck("★★ 離太遠讀到 0 格 ⛔ 不准判「腳本選錯物件」停機", tab.run_cb.isChecked(),
+       tab.status.text())
 
     tab = wire_room(bump_tab([None], cells=_cells), [])   # 地形讀不到
     run(tab, 3 * dt.BUMP_POLL)

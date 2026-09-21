@@ -688,6 +688,19 @@ GATE_GO_SECS = 20.0        # 走去一個開關最多花幾秒（走不到就跳
 # ⛔ 離腳本自己記的傳點這麼近的觸發物件**不踩**（那是真傳點，踩了會被搬走）。
 GATE_PORTAL_TOL = 2.0
 BUMP_CLEAR = 4             # bit0 格數比一開始少這麼多（或歸零）就算「開了」
+# ★★★ 2026-09-22 側錄定案（scratchpad/gate_watch.py，莉薇坦的寢室 6 個機關關／開都有讀數）：
+#   **物件蓋的阻擋(bit0)跟著物件串流進出** —— 離機關約 >30 格那一片根本不在（讀數＝開了的值：
+#   步5 140／步27 160…），走進 ~25 格才蓋上（163／178…），走遠又消失，27~40 格之間時有時無。
+#   → 遠處讀的格數**完全沒意義**：基準在遠處記＝開了的值 → 永遠判不到開（第 27 步卡 20 秒
+#     退回、再卡停機）；關著時被怪拉遠、格數掉回去 → 反而會**誤判開了**。
+#   → **只在離機關 GATE_NEAR 格內才判**（開了／選錯物件／記基準 全部都是）。
+#   可靠訊號＝機關 `at` ±GATE_CORE 格的 bit0：關著 6~10 格、開了 0 格，6 個機關零反例
+#   —— 也接得住「一到就已經開著」（第 27 步是被別的機關連帶打開的，而且腳本記的 60406 是
+#   同格疊著、**不會變**的那一尊，外觀訊號只有碰運氣才判得到）。
+#   ⚠ 半串流陷阱：34 格外讀過「只掃到一個開關、±3 格 0 格」但其實關著 → 所以要限近處＋連兩次。
+GATE_NEAR = 12.0           # 離機關這麼近才判（物件都串流進來了）
+GATE_CORE = 3              # 看機關自己 ± 這麼多格的 bit0
+GATE_CORE_HITS = 2         # 連續這麼多次（每 BUMP_POLL 秒一次）都是 0 格才算開了
 # ⛔ 沒有次數上限（同傳點的撞法：副本的門本來就是解謎才開，出口是取消勾選）。
 # ⛔ 沒有「撐多久就放棄」這種東西（使用者 2026-09-02：「不會有幾秒沒到就
 #   壞掉，那個拔掉」）—— 傳點過不去就一直打，出口是取消勾選。
@@ -1811,6 +1824,7 @@ class CharDungeonPage(QWidget):
         self._gate_poke = 0.0        # 距離下次對機關送 0x0D 還有多久
         self._gate_base = None       # 那個機關周圍 bit0 格數**看過的最大值**（⚠ None＝還沒讀到）
         self._gate_last = None       # 最近一次讀到的格數（只拿來回報）
+        self._gate_core0 = 0         # 近處連續幾次讀到「機關 ±GATE_CORE 格 0 格阻擋」
         self._left_out = (0, 0, 0, 0)  # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地, 繞太遠)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
         self._stuck = 0.0            # 沒掉血、也沒前進多久了
@@ -3829,7 +3843,7 @@ class CharDungeonPage(QWidget):
             return f"外觀從 {want} 換成 {hit[0].model}（機關啟動後的樣子）"
         return ""
 
-    def _gate_open(self, step: dict) -> tuple[str, str]:
+    def _gate_open(self, step: dict, me=None) -> tuple[str, str]:
         """那個機關開了沒。回 (結果, 說明)：
           `"open"` ＝開了、`"wrong"` ＝**它根本沒有阻擋**（腳本選錯物件，
           要通知使用者來改）、`""` ＝還沒開（含讀不到，繼續撞）。
@@ -3848,6 +3862,10 @@ class CharDungeonPage(QWidget):
         ax, ay = step["at"]
         n = terrain.object_blocked(self._sc, ax, ay, BUMP_R)
         self._gate_last = n
+        # ★★★ 離太遠讀到的一律不算數（見 GATE_NEAR：那一片阻擋還沒串流進來）
+        if me is None or _d((ax, ay), me) > GATE_NEAR:
+            self._gate_core0 = 0
+            return "", ""
         changed = self._gate_model_changed(step)
         if n is not None:
             if self._gate_base is None:
@@ -3866,6 +3884,15 @@ class CharDungeonPage(QWidget):
                 return "open", f"它蓋的阻擋從 {self._gate_base} 格變成 {n} 格"
         if changed:
             return "open", changed
+        # ★★★ 機關自己那幾格沒有阻擋了 ＝ 開了（含「一到就已經開著」，見 GATE_NEAR 那段）
+        core = terrain.object_blocked(self._sc, ax, ay, GATE_CORE)
+        if core == 0:                                    # ⚠ None（讀不到）不算
+            self._gate_core0 += 1
+            if self._gate_core0 >= GATE_CORE_HITS:
+                return "open", (f"機關自己 ±{GATE_CORE} 格的阻擋是 0 格"
+                                f"（周圍 {BUMP_R} 格共 {n} 格）")
+        else:
+            self._gate_core0 = 0
         return "", ""
 
     def _gate_radius(self, step: dict) -> float | None:
@@ -3973,7 +4000,7 @@ class CharDungeonPage(QWidget):
         self._gate_t -= dt
         if self._gate_t <= 0:
             self._gate_t = BUMP_POLL
-            verdict, why = self._gate_open(step)
+            verdict, why = self._gate_open(step, me)
             if verdict == "wrong":
                 # ⛔ 使用者 2026-09-07 明令：沒阻擋＝腳本選錯物件 → 通知他來改，
                 #   ⛔ 不准自己編個半徑繼續繞著空氣走。
@@ -4546,6 +4573,7 @@ class CharDungeonPage(QWidget):
         self._gate_poke = 0.0
         self._gate_base = None
         self._gate_last = None
+        self._gate_core0 = 0
         self._rollbacks = 0           # 「從傳點上跳走卻沒到出口」的拉回次數是每一步各算的
         self._act_t = 0.0             # 動作階段的計時也是每一步各算（見 ACT_STUCK_SECS）
         self._roll_none = False
