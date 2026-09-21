@@ -3721,8 +3721,13 @@ class CharDungeonPage(QWidget):
         step = steps[self._i] if self._i < len(steps) else None
         # ⚠⚠ 撞機關那一步也**不准插手**（2026-09-07）：機關的對話要按官方的
         #   「確定」（talkaction 1）才會生效，這支跑去 destroy 掉就等於白撞。
-        if step is not None and (step.get("do") in (dungeon.INTERACT,
-                                                    dungeon.BUMP)
+        # ★★ 2026-09-22：撞機關那步**正在打怪**（`_cur` 有目標）時不算 —— 門一開怪變成
+        #   走得到就整段交給 `_fight`，`_do_bump` 根本沒在跑、沒有人會去按那個「確定」，
+        #   框就整場打怪掛在畫面上（執行紀錄：第 11 步掛 34 秒、第 17 步掛 44 秒）。
+        #   收掉的那一發就算白踩也無妨：打完 `_do_bump` 會重掃再踩一輪。
+        bumping = (step is not None and step.get("do") == dungeon.BUMP
+                   and self._cur is None)
+        if step is not None and (step.get("do") == dungeon.INTERACT or bumping
                                  or (step.get("do") == dungeon.PORTAL
                                      and "menu" in step)):
             # ⚠ 對話傳送那一步也在等對話（點它、選第 N 項），這支收掉就白點了。
@@ -3978,6 +3983,16 @@ class CharDungeonPage(QWidget):
                 self._reach, self._reach_n = None, 0
                 self._hopeless.clear()       # 門開了 → 放棄過的怪重新問一輪
                 self._notify(f"{tag}　機關開了：{why} → 下一步")
+                # ★★ 2026-09-22：門開了，踩開關跳出來的那個框**當場收掉** —— 這一步
+                #   `_stray_dialog` 不准碰，下一步要是「對話傳送／對話」它一樣不碰，
+                #   框就一路殘留到再下一步（執行紀錄第 17→19 步掛了 44 秒），還會
+                #   擋到下一步自己的對話。純讀確認真的顯示著才收（見 _stray_dialog）。
+                try:
+                    showing = talkwnd.window_visible(self._sc)
+                except Exception:                        # noqa: BLE001
+                    showing = None
+                if showing and self._mover is not None:
+                    self._dismiss_dialog("機關開了")
                 self._nav.reset()
                 self._gate = None
                 self._next()
