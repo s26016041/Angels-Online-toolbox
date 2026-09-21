@@ -1809,7 +1809,7 @@ class CharDungeonPage(QWidget):
         self._gate_t = 0.0           # 距離下次重讀地形還有多久
         self._gate_send = 0.0        # 距離下次補送目的地還有多久
         self._gate_poke = 0.0        # 距離下次對機關送 0x0D 還有多久
-        self._gate_base = None       # 剛到時那個機關周圍有幾格 bit0（⚠ None＝還沒讀到）
+        self._gate_base = None       # 那個機關周圍 bit0 格數**看過的最大值**（⚠ None＝還沒讀到）
         self._gate_last = None       # 最近一次讀到的格數（只拿來回報）
         self._left_out = (0, 0, 0, 0)  # 上一輪不打的怪：(超過 MAX_CHASE, 走不到, 放棄過還站原地, 繞太遠)
         self._hopeless = {}          # eid → 放棄時牠站的位置（見 HOPELESS_MOVE）
@@ -3856,6 +3856,12 @@ class CharDungeonPage(QWidget):
                     if changed:
                         return "open", changed
                     return "wrong", "它周圍一格「物件蓋的阻擋」都沒有"
+            elif n > self._gate_base:
+                # ★★ 2026-09-22：基準＝**看過的最大值**。石像的阻擋是人走近了才蓋上去的
+                #   （執行紀錄第 17 步：離 16 格讀到 90、貼到 3 格變 103），而這一步常常
+                #   離機關幾十格就開始讀（第 27 步 74 格外讀到 160 ＝ 開了之後也是 160
+                #   → 基準＝開了的值，永遠判不到開 → 卡 20 秒退回、再卡就停機）。
+                self._gate_base = n
             elif n == 0 or n <= self._gate_base - BUMP_CLEAR:
                 return "open", f"它蓋的阻擋從 {self._gate_base} 格變成 {n} 格"
         if changed:
