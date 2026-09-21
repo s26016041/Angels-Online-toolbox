@@ -1003,6 +1003,27 @@ class KeyWorker(_Paced):
             out.append(BASIC_RANGE)
         return min(out) if out else None
 
+    @property
+    def walk_range(self) -> int | None:
+        """**走位**要照哪個射程走進去（格）—— 掛機頁／副本頁算 keep 都問這支。
+
+        ★ 這一隻的首發還沒確認放出去 → 照**首發那一招**的射程（使用者 2026-09-21：
+          「怪死了但首發 CD 還沒好，請原地發呆，不要走到另一隻怪身上」）。那段時間
+          閘門本來就只准放首發（見 _opener_gate），貼到近戰距離只是站在怪臉上乾等；
+          照首發射程走＝停在 10 格外等 CD，已經在射程內就一步都不動。
+        ⚠ CD 還剩幾秒讀不到（表裡沒有、記憶體沒找過）→ 不猜：判準只有
+          「這隻的首發收到施放廣播了沒」（_opened），跟閘門同一個訊號。
+        首發放完（或沒設首發／那格沒技能）→ 照舊 min_range。
+        """
+        vk = self.opener_vk
+        sid = self.skills.get(vk) if vk else None
+        if sid and not (self._opened and self._open_eid is not None
+                        and self._open_eid == self.eid):
+            r = skills.range_of(sid)
+            if r:
+                return r
+        return self.min_range
+
     def reach_of(self, sid: int) -> float:
         """**這一招自己**打得到的距離（格）—— 共用 `reach_of()`（見模組層那份）。
 
@@ -6665,7 +6686,7 @@ class CharFarmPage(QWidget):
         #   in_range_of_any）。這裡只剩下一個「走多近」要決定 —— 走位本來就
         #   只能站在一個位置上，所以它照**最短**射程走進去（走到那裡，輪替裡
         #   每一招才都用得到）。⚠ 這是**走位**的數字，不是攻擊距離。
-        rng = self._keys.min_range
+        rng = self._keys.walk_range     # 首發還沒放出去 → 照首發的射程走（見 walk_range）
         reach_walk = (ATTACK_PACKET_RANGE if rng is None
                       else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
         # ★★★ 「最後一段交給客戶端自己走」（使用者的點子，2026-08-06 實測驗證）

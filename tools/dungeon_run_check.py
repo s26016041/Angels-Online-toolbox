@@ -155,6 +155,10 @@ class FakeKeys:
         self.open_wait = 0.0
         self.open_note = ""
 
+    @property
+    def walk_range(self):
+        return self.min_range        # 假的沒有首發 → 走位射程＝最短射程（同 KeyWorker.walk_range）
+
     def in_range_of_any(self, dist):
         # 跟真的一樣：歐氏距離 ≈ 射程 + 1，上限 12
         return dist is None or dist <= min(12.0, float(self.min_range) + 1.0)

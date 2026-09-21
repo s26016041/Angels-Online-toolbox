@@ -3096,7 +3096,7 @@ class CharDungeonPage(QWidget):
                                      * PATH_BUDGET),
                                  PATH_GAP_MAX)
         blocked = self._path_pts > 1
-        rng = self._keys.min_range
+        rng = self._keys.walk_range     # 首發還沒放出去 → 照首發的射程走（見 walk_range）
         reach_walk = (ATTACK_PACKET_RANGE if rng is None
                       else min(ATTACK_PACKET_RANGE, float(rng) + 1.0))
         handoff = bool(self._keys.handoff and not blocked
