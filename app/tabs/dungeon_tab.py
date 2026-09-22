@@ -1735,6 +1735,7 @@ class CharDungeonPage(QWidget):
         self._roll_none = False      # 這一步往回沒有走得到的點位（算過一次就記住）
         self._rolled = set()         # {(趟次, 步序)}：這一步的回退機會用掉了（趟次一變自動失效）
         self._talk_redo_n = 0        # 這一步重新講話幾次（狀態列／紀錄用）
+        self._redo_wait = 0.0        # _talk_redo 之後還要等幾秒才重新點（見 TALK_REDO_GAP）
         self._map_settle = 0.0       # 換圖後等座標跟上，這個時刻之前不算任何東西
         self._stray_t = 0.0          # 多久之後再看一次有沒有不該出現的對話框
         self._stray_closed = 0.0     # 上次關掉的時刻（節流）
@@ -4338,6 +4339,11 @@ class CharDungeonPage(QWidget):
         self._nav.reset()
 
         if not self._clicked:
+            # ★ _talk_redo 要求的「等幾秒再重新講」在這裡等（見那支）
+            if self._redo_wait > 0.0:
+                self._redo_wait -= dt
+                self._say(f"{tag}　等 {max(self._redo_wait, 0.0):.1f} 秒再重新講一次…")
+                return
             # ★ 站穩了才點：走路中送互動包，人還沒到、對話開不起來
             #   （補給那邊同一條規矩「先走到位才發互動包」）。
             #   ⚠ 但**最多等 STILL_WAIT 秒**：`is_walking` 有可能恆為 True
@@ -4680,6 +4686,7 @@ class CharDungeonPage(QWidget):
         self._act_t = 0.0             # 動作階段的計時也是每一步各算（見 ACT_STUCK_SECS）
         self._roll_none = False
         self._talk_redo_n = 0
+        self._redo_wait = 0.0         # 「等幾秒再重新講」也是這一步自己的
         self._nudge = 0               # 靠近重試的次數歸零
         self._spam = 0                # 狂點的發數歸零
         self._still_t = 0.0
@@ -6273,6 +6280,9 @@ class CharDungeonPage(QWidget):
         self._click_t, self._click_best, self._nudge = 0.0, None, 0
         self._wnd, self._wnd_t = None, 0.0
         self._menu_t = self._menu_gap = TALK_REDO_GAP
+        # ⚠ _menu_t 只有點完之後才有人扣（見 _do_interact 對話那段），點之前沒人看
+        #   → 以前「2 秒後重講」實際是下一拍就點（2026-09-22 稽核）。用獨立欄位擋。
+        self._redo_wait = TALK_REDO_GAP
         self._talk_redo_n += 1
         msg = (f"{tag}　{why} → {TALK_REDO_GAP:g} 秒後重新講一次"
                f"（第 {self._talk_redo_n} 次）")
