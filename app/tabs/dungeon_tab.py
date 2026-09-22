@@ -386,6 +386,7 @@ REST_LOG = 60.0            # 休息倒數多久寫一行執行紀錄（每秒寫
 #   要重試（[[transient-failure-auto-retry]]），真的補不成就大聲停機。
 SUPPLY_RETRY = 5.0         # 補給沒跑完，隔多久重跑一次（等人被送出副本／站穩）
 SUPPLY_FAIL_MAX = 2        # 連續幾次沒跑完就停機通知
+PLAN_SCENE_WAIT = 30.0     # 補給完場景讀不到（傳送中）最多等這麼久才規劃下一段；到了大聲停
 # ★★★ 斷線＝當成一場（使用者 2026-09-06）：
 #   「斷線不管是連線斷了還是閃退，都算完成一場，直接回程當完成。但要注意這遊戲副本
 #     斷線後會在副本出現然後倒數 5 秒自動把你傳回城鎮，所以要小心不要壞掉。
@@ -1769,6 +1770,7 @@ class CharDungeonPage(QWidget):
         self._supply_gen = 0
         self._supply_fail = 0        # 這一趟的補給連續沒跑完幾次（見 SUPPLY_FAIL_MAX）
         self._supply_retry = 0.0     # 還有多久重跑一次補給（>0＝正在等）
+        self._plan_wait = 0.0        # 補給完場景讀不到，已經等了多久（見 PLAN_SCENE_WAIT）
         self._supply_why = ""        # 上一次補給沒跑完的原因（狀態列用）
         self._supply_back = None     # 上一次補給的回程目的地（重跑時照用）
         self._unreach_t = 0.0        # 「沒有路」連續多久了（等門開）
@@ -4864,6 +4866,21 @@ class CharDungeonPage(QWidget):
                       + f"補給中：{self._supply_progress}{tail}")
             return
         ok, why = res
+        # ★★ 補給執行緒一回來人多半還在傳送（回程順移那一瞬間），場景這時讀不到。
+        #   ⚠ 讀不到 ≠ 「在副本裡」：_plan_route 拿 None 會落到「直接跑」那條 →
+        #   在城裡照副本座標走路打怪、_map_key=None 讓換圖偵測整趟失效
+        #   （2026-09-22 稽核）。這裡先等場景讀得到再往下，等太久大聲停。
+        if ok and scene.map_key(scene.current_id(self._sc)) is None:
+            self._plan_wait += dt
+            if self._plan_wait < PLAN_SCENE_WAIT:
+                self._say(f"補給完成，等場景讀得到再規劃下一段…"
+                          f"（{self._plan_wait:.0f}/{PLAN_SCENE_WAIT:.0f} 秒）")
+                return
+            self._supply_result = None
+            self._stop(f"⛔ 補給完成後 {PLAN_SCENE_WAIT:.0f} 秒都讀不到場景 —— "
+                       f"不知道人在哪，停下（{why}）")
+            return
+        self._plan_wait = 0.0
         self._notify(("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
         self._event("info" if ok else "warn",
                     ("補給完成" if ok else "⚠ 補給沒跑完") + f"：{why}")
@@ -4902,6 +4919,10 @@ class CharDungeonPage(QWidget):
         """照現在人在哪決定下一段（跟開跑時同一套）：別張圖 → 飛；入口那張圖 →
         撞入口；副本裡 → 直接跑。回 False＝已經 _stop 了。"""
         here = scene.map_key(scene.current_id(self._sc))
+        if here is None:
+            # ⚠ 讀不到 ≠ 在副本裡（呼叫端 _supply_tick 已先等過 PLAN_SCENE_WAIT）
+            self._stop("⛔ 讀不到場景，不知道人在哪 —— 不敢照腳本跑")
+            return False
         ent = self._script.entrance or {}
         self._map_key = here
         self._fly = None
