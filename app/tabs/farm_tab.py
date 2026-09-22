@@ -315,6 +315,8 @@ NO_RECALL_TRIES = 3
 #   一趟補給要回城、找 NPC、修裝、買東西、再走回來，慢的時候好幾分鐘。
 SUPPLY_POLL = 5.0               # 使用者指定的間隔
 SUPPLY_MAX_SECS = 600.0
+# 跳板（move.acquire）裝失敗後隔多久再試一次（見 _ensure_mover；⚠ 自家門檻）
+MOVER_RETRY_S = 30.0
 # ★ 回程第二段（用道具）暫時送不出去時的重試（跳板重掛／背包表頭剛搬家，
 #   InvWorker 幾秒內就會把表頭找回來：AOB 全掃約 2 秒、失效後最多隔
 #   INV_RELOCATE_GAP 秒重試）。以前不重試，直接放著吊到 10 分鐘超時。
@@ -2187,7 +2189,7 @@ class CharFarmPage(QWidget):
         self._evgo_result = None
         self._evgo_progress = ""
         self._mover: move.Mover | None = None
-        self._mover_failed = False   # 裝過一次失敗了就別每一拍重試
+        self._mover_failed = 0.0     # 上次裝跳板失敗的時刻（0＝沒失敗過）；MOVER_RETRY_S 後才再試
         self._castwatch = None       # 施放廣播監聽（首發＋補分身的 100% 確認用）
         self._cw_failed = False      # 裝失敗過就別每拍狂試（重開掛機會再試一次）
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
@@ -4825,15 +4827,19 @@ class CharFarmPage(QWidget):
         """
         if self._mover is not None and self._mover.active:
             return True
-        if self._mover_failed:
-            return False                       # 之前裝失敗過，別一直重試
+        # ⚠ 失敗後不是永久放棄：裝不上多半是暫時的（遊戲正在重載／重連），
+        #   以前一次失敗就把走位／補給／死亡回程／換球／召喚全關到重開工具箱。
+        #   但也不能每一拍重試（每拍都注入一次），所以隔 MOVER_RETRY_S 秒再試。
+        if self._mover_failed and time.monotonic() - self._mover_failed < MOVER_RETRY_S:
+            return False
         try:
             self._mover = move.acquire(
                 self.pid, injector.process_path(self.pid), self)
+            self._mover_failed = 0.0
             return True
         except Exception as exc:               # noqa: BLE001
             self._mover = None
-            self._mover_failed = True
+            self._mover_failed = time.monotonic()
             self.status.setText(f"⚠ 無法啟用移動：{exc}（掛機其他功能不受影響）")
             return False
 
