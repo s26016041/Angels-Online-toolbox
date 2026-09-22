@@ -100,15 +100,22 @@ VK_F1 = 0x70                  # F1~F12 = 0x70~0x7B
 #   NULL** 就 `mov [實體+0x464], al`。換地圖／死亡復活／重連的實體重建
 #   空窗裡查不到 → 往 NULL 寫 → 遊戲當場崩潰。真人按不到鍵（載圖時吃
 #   不到輸入），只有跳板照按 —— 所以按之前**自己先純讀驗一次**。
-#   （0x2A90 是世界物件內的結構偏移，屬「大更新才會壞」類；出處 0x5B76D5。）
-OWN_EID_OFF = 0x2A90
+#   （0x2A90 是世界物件內的結構偏移；出處 0x5B76D5。）
+# ⚠⚠ 這個偏移**跟 `bag.OFF_MY_ID` 是同一個欄位**（[0x9B669C]+8 與 [MGR_PTR]+8
+#   是同一個場景物件，2026-09-22 五台實測位址與讀值全部相同）。bag 那份在
+#   locate.SIGS 會自動跟改版；這裡以前自己抄了一份 0x2A90 —— 正是 CLAUDE.md
+#   禁止的「同一個位址記兩處」：改版後 bag 跟上、這裡不跟，self_entity_ok
+#   讀到錯的 dword → 永遠 False → 整輪不出手而且沒訊息。改成轉問 bag。
+def _own_eid_off() -> int:
+    from app.game import bag             # 延後 import：bag 會 import 本模組
+    return bag.OFF_MY_ID
 
 
 def self_entity_ok(scanner) -> bool:
     """「自己實體」現在查得到嗎（純讀重現 usequickkey 開頭那次查表）。
 
     回 False ＝ 正處於換圖／重連的實體重建空窗 —— 這時叫 `use()` 遊戲會
-    NULL 崩潰（見 OWN_EID_OFF 的說明）。呼叫端這一拍**整輪別出手**
+    NULL 崩潰（見 _own_eid_off 上面的說明）。呼叫端這一拍**整輪別出手**
     （含送鍵退路），下一拍再看。
     ⚠ 讀不到也回 False：讀不到本身就是「世界正在拆建」的訊號 ——
       寧可少打一拍（約 0.1 秒），也不要拿遊戲的命去賭。
@@ -120,7 +127,7 @@ def self_entity_ok(scanner) -> bool:
     world = _u32(scanner, mgr + 8)
     if not world or not 0x10000 < world < 0x7FFF0000:
         return False
-    eid = _u32(scanner, world + OWN_EID_OFF)
+    eid = _u32(scanner, world + _own_eid_off())
     return bool(eid) and move.entity_alive(scanner, eid)
 
 
