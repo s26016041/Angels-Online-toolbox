@@ -86,7 +86,7 @@ G_SPAN = 0x18                # ⚠ 一筆讀到這裡（涵蓋 G_PRICE +0x14）�
 REMAP_LO, REMAP_HI = 0xF3D, 0xF4C
 
 # 商城倉庫（管理器 + 這裡）。★ 管理器指標借 gather.WORLD_PTR，不再寫一份。
-STORAGE_OFF = 0xCEC4
+STORAGE_OFF = 0xCECC              # ★ locate.SIGS 自動跟（9/22 起）；這只是退路
 STORAGE_STRIDE = 0x37            # 出處：memset 0x226 ＝ 10 格 × 0x37（見下一行）
 STORAGE_SLOTS = 10               # 0x5D38B1 `cmp eax,9`／memset 0x226 兩處印證
 ST_SERIAL, ST_ITEM, ST_COUNT = 0x00, 0x04, 0x08
@@ -102,7 +102,7 @@ ST_SERIAL, ST_ITEM, ST_COUNT = 0x00, 0x04, 0x08
 #     Lua 的 `MallBuyCheck` 被 `game.isdef('__MILE_MALL')` 關著、`checkmilemall`
 #     沒註冊進 game 表；精靈變數 `AM_INT_CURRENTPOINT`(1602) 只有**開了自動商城**
 #     才會填，五台實測全 0。
-POINTS_OFF = 0xD0EC
+POINTS_OFF = 0xD0F4               # ★ locate.SIGS 自動跟（9/22 起）；這只是退路
 # 合理性上界（驗不過就當讀到垃圾回 None）。
 POINTS_MAX = 100_000_000
 # ★★ 點數讀到「不夠」要**連續一段時間都這樣**才算數（2026-09-05 使用者實機：

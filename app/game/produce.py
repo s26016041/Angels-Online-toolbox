@@ -262,15 +262,23 @@ CTRL_QTY = 0xB03              # 數量輸入框
 # ⚠ 出處同上（GET_CTRL 的 id 參數）。
 CTRL_MAKELIST = 0xB0F         # 製作清單（makestart 讀它、客戶端續做也讀它）
 # 控制項裡的結構偏移（反組譯出處見下）：
-#   0x625487：item = [ctrl+0x150 + index*4]；資料 = [item+0x8c]
-CTRL_VEC_FIRST, CTRL_VEC_LAST = 0x150, 0x154
-# ⚠ 出處＝反組譯 0x625487（同上）：資料 = [item+0x8C]。
+#   9/22 版 0x64A070：item = [ctrl+0x160 + index*4]；資料 = [item+0x8c]
+# ★ 清單控制項的項目向量偏移**跟登入畫面的伺服器清單是同一個類別的同一格**
+#   （login.ITEM_VEC_BEGIN，已進 locate.SIGS 自動跟）。2026-09-22 改版 0x150 → 0x160，
+#   這裡以前自己抄一份 0x150 —— 正是 CLAUDE.md 禁止的「同一個偏移記兩處」：登入那份
+#   跟上、這份不跟，_rows() 讀到別的欄位。改成用時轉問 login，不再記第二份。
+def _vec_first() -> int:
+    from app.game import login          # 延後 import：避免循環
+    return login.ITEM_VEC_BEGIN
+# ⚠ 出處＝反組譯 0x64A070（同上）：資料 = [item+0x8C]（9/22 改版沒動，新舊映像各 14/15 處）。
 ITEM_DATA_OFF = 0x8C          # 配方清單：=配方ID；製作清單：=配方<<16|剩餘數量
 #   ⚠ 出處＝反組譯 0x625252：找第一個 [item+6]!=0 的列＝選中的那一列
 ITEM_SEL_OFF = 0x06
-#   ⚠ 出處＝反組譯數量框取值虛擬函式 0x625E9D＝`mov eax,[ctrl+0xf8]` → 字串緩衝
-#   指標，makeadd 對它做**窄字元 atoi**（0x757F96）→ 要寫**窄 ASCII 數字**。
-QTY_STR_OFF = 0xF8
+#   ⚠ 出處＝反組譯數量框取值虛擬函式（9/22 版 0x64AA86）＝`mov eax,[ctrl+0x108]` →
+#   字串緩衝指標，makeadd 對它做**窄字元 atoi**（0x757F96）→ 要寫**窄 ASCII 數字**。
+#   2026-09-22 改版 0xF8 → 0x108（視窗類長了 0x10）；已進 locate.SIGS（kind="off"）
+#   自動跟，下面只是退路。
+QTY_STR_OFF = 0x108
 _CALL_T = 0.6
 # make_batch 專用回傳：開到的面板裡**沒有**這個配方（多半是別種生產的檯子）。
 # 呼叫端看到它就該「關掉這個面板、換下一個站台點」，而不是在原面板一直重試。
@@ -300,8 +308,8 @@ def _rows(scanner, ctrl: int) -> list[int] | None:
       把真站台拉黑一整個 session；製作清單讀不到 → already=0 → 整批疊大 ——
       正是檔頭說要防的那件事（2026-09-22 稽核）。
     """
-    raw_f = scanner._read_bytes(ctrl + CTRL_VEC_FIRST, 4)
-    raw_l = scanner._read_bytes(ctrl + CTRL_VEC_LAST, 4)
+    raw_f = scanner._read_bytes(ctrl + _vec_first(), 4)
+    raw_l = scanner._read_bytes(ctrl + _vec_first() + 4, 4)
     if not raw_f or not raw_l or len(raw_f) < 4 or len(raw_l) < 4:
         return None
     first = struct.unpack("<I", bytes(raw_f))[0]
@@ -433,8 +441,8 @@ def make_left(scanner, mk_ctrl: int, recipe_id: int) -> int | None:
     """
     if not (mk_ctrl and _PTR_LO < mk_ctrl < _PTR_HI):
         return None
-    first = _u32(scanner, mk_ctrl + CTRL_VEC_FIRST)
-    last = _u32(scanner, mk_ctrl + CTRL_VEC_LAST)
+    first = _u32(scanner, mk_ctrl + _vec_first())
+    last = _u32(scanner, mk_ctrl + _vec_first() + 4)
     if first == 0 and last == 0:
         return 0                       # 沒配置過的空 vector＝清單空
     if not (_PTR_LO < first < _PTR_HI and first <= last

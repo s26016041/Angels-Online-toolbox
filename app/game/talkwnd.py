@@ -163,7 +163,10 @@ def find_spot(scanner) -> Spot | None:
 #   OnUpdateMessage（Lua）就是拿它決定要不要顯示「結束」。
 #   GetWindowById = `[管理器 + (代號 & 0x1FFF)*4 + 0x20]`，再驗 `[物件+0x10] == 代號`。
 #   ⚠ 這幾個是結構偏移（允許寫死，出處如上），改版靠 patch-doctor 重驗。
-MSG_END_OFF = 0x148
+#   ★ MSG_END_OFF 2026-09-22 改版 0x148 → 0x158（視窗類長了 0x10；9/22 版本體
+#     0x53CF47 `movzx eax, byte [eax+0x158]`）。已進 locate.SIGS（kind="off"，錨在
+#     ismessageend 本體的骨架）自動跟；下面只是退路。GetWindowById 的 +0x20/+0x10 沒動。
+MSG_END_OFF = 0x158
 WND_SLOT_MASK = 0x1FFF      # 出處：上面 GetWindowById 那行反組譯（代號 & 0x1FFF）
 WND_TABLE_OFF = 0x20        # 出處：上面 GetWindowById 那行反組譯
 WND_ID_OFF = 0x10           # 出處：上面 GetWindowById 那行反組譯（驗 [物件+0x10] == 代號）

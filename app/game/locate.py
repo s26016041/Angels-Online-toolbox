@@ -242,6 +242,21 @@ SIGS: tuple[Sig, ...] = (
         " C6 85 FC FD FF FF 00 6A 00 50 E8 ?? ?? ?? ?? 68 41 9C 00 00 56"
         " 68 BC AF 7D 00",
         0x00997394, str_at=58, str_val=b"Mall"),
+    # 商城倉庫 10 格陣列在管理器物件裡的偏移。錨在遊戲自己的「取第 n 格」小存取子
+    # 整支（9/22 版 0x5D3BE0）：`push ebp / mov ebp,esp / mov eax,[ebp+8] / cmp eax,9 /
+    # ja / imul eax,eax,0x37 / add eax,偏移 / add eax,ecx / jmp / lea eax,[ecx+偏移] /
+    # pop ebp / ret 4`。2026-09-22 改版 0xCEC4 → 0xCECC（管理器物件 +8 那批），以前
+    # 沒錨、讀取端也只有「格數合理」擋著 —— 所以進來自動跟。⚠ off 類偏移自己寫 ??。
+    Sig("mall", "STORAGE_OFF", "off", 15,
+        "55 8B EC 8B 45 08 83 F8 09 77 0C 6B C0 37 05 ?? ?? ?? ?? 03 C1 EB 06"
+        " 8D 81 ?? ?? ?? ?? 5D C2 04 00",
+        0x0000CECC),
+    # 我的商城點數（管理器 + 偏移）。錨在「剩餘可用點數」存取子整支（9/22 版
+    # 0x5D3D21）：`mov eax,[ecx+點數] / sub eax,[ecx+0x84] / push 0 / pop ecx /
+    # cmovs eax,ecx / ret`（負數夾成 0）。同上 2026-09-22 0xD0EC → 0xD0F4。
+    Sig("mall", "POINTS_OFF", "off", 2,
+        "8B 81 ?? ?? ?? ?? 2B 81 ?? ?? ?? ?? 6A 00 59 0F 48 C1 C3",
+        0x0000D0F4),
     Sig("lua", "GETFIELD_FN", "fn", None,
         "55 8B EC 83 EC 10 53 56 8B 75 08 57 FF 75 0C 56 E8 ?? ?? ?? ??"
         " 8B 55 10 83 C4 08 8B CA 8B F8 8D 59 01 8A 01 41 84 C0 75 F9"
@@ -724,6 +739,17 @@ SIGS: tuple[Sig, ...] = (
         " 8B D8 85 DB 74 61 8B B3 ?? ?? ?? ?? EB 27 FF 36 8B CF"
         " E8 ?? ?? ?? ?? 85 C0 74 17",
         0x00649BB5),
+    # 數量輸入框「取字串緩衝」的虛擬函式（9/22 版 0x64AA86）：`mov eax,[ecx+偏移] / ret`
+    # 本體只有 7 bytes 沒得錨，所以連著它**下一支同類別的方法**一起蓋（class 方法是
+    # 照宣告順序連著編出來的，比跨到前一支穩）：`push ebp / mov ebp,esp / push esi /
+    # mov esi,[ebp+8] / push edi / mov edi,ecx / jmp / cmp [eax+0x14],0 / je /
+    # mov esi,[eax+0x14] / mov ecx,edi / push esi / call / test / jne / pop edi /
+    # mov eax,esi / pop esi / pop ebp / ret 4`。2026-09-22 改版 0xF8 → 0x108（視窗類
+    # 長了 0x10）；新舊映像各唯一命中。⚠ off 類偏移自己寫 ??；call 的 rel32 遮。
+    Sig("produce", "QTY_STR_OFF", "off", 2,
+        "8B 81 ?? ?? ?? ?? C3 55 8B EC 56 8B 75 08 57 8B F9 EB 0B 83 78 14 00"
+        " 74 0F 8B 70 14 8B CF 56 E8 ?? ?? ?? ?? 85 C0 75 EB 5F 8B C6 5E 5D C2 04 00",
+        0x00000108),
     # ── 製作／公會貢獻（見 app/game/recipes.py）──────────────────
     # 前三段是「依 ID 查表」那種函式，模組裡有 41 支長得一模一樣
     # （怪物表、技能表都是），差別只有邊界值與錯誤訊息裡的**表名字串**。
@@ -774,6 +800,17 @@ SIGS: tuple[Sig, ...] = (
         "33 D2 8B CF 83 E1 1F 42 D3 E2 8B C7 85 C0 79 03 83 C0 1F C1 F8 05"
         " 85 94 83 ?? ?? ?? ?? 74 ?? 57 E8 ?? ?? ?? ??",
         0x00005900),
+    # 對話視窗「最後一頁」旗標在視窗物件裡的偏移（見 app/game/talkwnd.py MSG_END_OFF）。
+    # 錨在 UI 指令 `ismessageend` 本體（9/22 版 0x53CF47）：`push 1 / mov [ebp-4],esi /
+    # mov byte [ebp-8],0 / call 取參數 / mov ecx,[視窗管理器] / push eax / call
+    # GetWindowById / test eax,eax / je +9 / movzx eax,byte [eax+偏移] / jmp +3 /
+    # xor eax,eax / inc eax / push eax / push esi / call lua_push`。
+    # 2026-09-22 改版 0x148 → 0x158（視窗類長了 0x10）；新舊映像各唯一命中。
+    # ⚠ off 類偏移自己寫 ??；兩個 call 的 rel32 與管理器全域交給遮罩。
+    Sig("talkwnd", "MSG_END_OFF", "off", 33,
+        "6A 01 89 75 FC C6 45 F8 00 E8 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 50 E8 ?? ?? ?? ??"
+        " 85 C0 74 09 0F B6 80 ?? ?? ?? ?? EB 03 33 C0 40 50 56 E8",
+        0x00000158),
     # ── 失焦不凍畫面（見 app/game/unfreeze.py）──────────────────────
     # 要 patch 的位址：「切換 active 狀態」那個共用小函式裡的狀態比較那一行。
     # v4（2026-09-01）：官方把 v3 內聯在 WM_ACTIVATEAPP handler 裡的狀態機

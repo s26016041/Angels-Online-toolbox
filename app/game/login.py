@@ -213,7 +213,12 @@ CHAR_FLAG_OFF = -0x10
 #   跟畫面對上（驗證過才用）。
 CHAR_NAME_OFF = 0x04
 CHAR_BLOCKED = 0x40000000
-MAX_SLOTS = 8
+# ★ 出處：遊戲自己走訪角色陣列的迴圈（9/22 版 0x50F6AC）：`mov eax,CHAR_HAS /
+#   cmp [eax],edx / je / add eax,0xB7 / inc / cmp eax,CHAR_HAS+3*0xB7 / jl` ——
+#   陣列就是 **3 格**。以前寫 8：第 4 格起已經是隔壁的全域（9/22 起那裡是
+#   登入伺服器 IP 字串「.137.147」），character() 讀出一個叫「.147」的假角色；
+#   enter_game 拿它送出去伺服器會直接斷線。
+MAX_SLOTS = 3
 
 # 掃到 VT_LOGIN 之後還要對上的副 vtable（建構函式 0x5363A0 一口氣寫的那組）。
 # ⚠ 只取建構函式**不會再改寫**的四個：+0x30/+0x34 後面會被覆蓋成別的值。
