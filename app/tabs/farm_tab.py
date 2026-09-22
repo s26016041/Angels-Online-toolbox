@@ -3510,7 +3510,11 @@ class CharFarmPage(QWidget):
                 ok, msg = False, f"出錯：{exc}"
             say(("✔ " if ok else "✘ ") + msg)
 
-        threading.Thread(target=_worker, daemon=True).start()
+        # ★ 登記進 _supply_thread：上面那道「上一趟還沒收工」的閘才看得到它 ——
+        #   以前沒登記，連按兩次就兩條走位在同一台互搶（2026-09-22 稽核）。
+        t = threading.Thread(target=_worker, daemon=True)
+        self._supply_thread = t
+        t.start()
         return True
 
     def _test_supply(self) -> None:
