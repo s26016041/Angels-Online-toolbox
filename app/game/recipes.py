@@ -53,7 +53,7 @@ from app.game import gather
 MAKE_TAB = 0x0098BCA0      # [這裡] + 配方ID*4 → 配方記錄
 GC_TAB = 0x0098FD2C        # [這裡] + 編號*4 → 貢獻品記錄；[這裡+4] = 筆數
 ITEM_TAB = 0x0098BC70      # [這裡] + 物品ID*4 → 物品範本
-OFF_LEARNED = 0x58F8       # 主物件 + 這裡 = 「配方學會了沒」位元圖
+OFF_LEARNED = 0x5900       # 主物件 + 這裡 = 「配方學會了沒」位元圖
 
 # ⚠ 主物件的全域指標不在這裡重寫 —— 跟 gather 是同一個位址，
 #   同一個位址不准登記兩次（CLAUDE.md）。

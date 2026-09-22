@@ -136,12 +136,12 @@ GAME_EXE = "angel.dat"      # 遊戲本體（副檔名不是 exe，但就是個�
 LOGIN_FN = 0x00538959       # thiscall(this)：登入按鈕的完整動作
 PICK_CHANNEL_FN = 0x00537353  # thiscall(this)：確定分流，畫面推進到選角色
 ENTER_FN = 0x0050F880       # stdcall(角色格號)：進入遊戲
-GETWIDGET_FN = 0x00624D17   # stdcall(視窗id, 控制項id)，ecx=UI管理者：取控制項
+GETWIDGET_FN = 0x00649BB5   # stdcall(視窗id, 控制項id)，ecx=UI管理者：取控制項
 
 # --- 資料位址（定位失敗會保留下面寫死的值，讀錯只會「做不到」不會崩潰）---
 VT_LOGIN = 0x007D6C94       # 登入畫面／登入連線物件的主 vtable
 ACCOUNT = 0x00890980        # 帳號緩衝區，20 bytes
-PASSWORD = 0x00890998       # 密碼緩衝區，32 bytes
+PASSWORD = 0x008D24C0       # 密碼緩衝區，32 bytes
 FLAG_BLOB = 0x00890997      # ≠0 → 用 0x890D30 的 512-byte 憑證
 FLAG_TOKEN = 0x008909B9     # ≠0 → 用 0x890FCC 的 token（啟動器社群登入）
 CHAR_SLOT = 0x00890BE8      # 選中的角色格號（0 起算）

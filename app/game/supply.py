@@ -151,7 +151,7 @@ TALK_REPAIR = 10
 #   清單、逐件送修裝包 0x3B。開維修視窗後直接叫它就全修（repairone 是 0x5D6320）。
 #   ★ AOB 定位（locate.py supply.REPAIR_ALL_FN，錨在 push 2/push 0x3C 分家 repairone）。
 #     送的是「修裝全部」包 opcode 0x3C（repairone 是逐件 0x3B）。反組譯 reports/repair_disasm.txt。
-REPAIR_ALL_FN = 0x005D62C1
+REPAIR_ALL_FN = 0x005D675F
 # 「關維修畫面」＝ repairclose UI 指令本體（0x5906CB）：找 WND_REPAIR、送「離開 NPC」包
 #   0x5D29C1(0x22,0)。⚠ **修完不叫它角色會卡住不能走**（伺服器端還在維修互動狀態，
 #   實測 2026-08-14 嵐狐）。純叫這支即可，它會自己判斷有沒有窗、送離開包、關窗。

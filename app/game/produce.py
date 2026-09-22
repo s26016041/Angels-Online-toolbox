@@ -250,7 +250,7 @@ def click_bench(mover, scanner, prop) -> tuple[bool, str]:
 #   失敗」對話框），還會卡住遊戲訊息迴圈。要走這條「填清單→makestart→放手」。
 #
 # GET_CTRL(ecx=[世界指標+0xC], window, 控制項id) → 控制項指標（已 AOB 登記）。
-GET_CTRL = 0x00624FCC
+GET_CTRL = 0x00649BB5
 # ★ 世界指標＝gather.WORLD_PTR（0x9B669C）。⚠ 不在這裡再寫一份位址 ——
 #   那個全域已登記 AOB（locate gather.WORLD_PTR，交叉驗證兩處），
 #   用時直接讀 gather.WORLD_PTR 拿 warm() 之後的值（同 supply.py 的做法）。

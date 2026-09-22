@@ -197,14 +197,16 @@ SIGS: tuple[Sig, ...] = (
         0x00506784),
     # 「全修」本體（repairall UI 指令 0x5906BD 呼叫的）：找 WND_REPAIR 視窗、檢查有東西
     # 要修就送修裝全部包（opcode 0x3C）。三個位址（[0x890FF0]、字串 0x7D9230、[0x9B669C]）與
-    # 兩個 call 的 rel32 放萬用；錨在 +0x154/+0x150 那對視窗欄位、視窗 id 0xB55、與 push 2/push
+    # 兩個 call 的 rel32 放萬用；錨在那對視窗欄位的減法骨架、視窗 id 0xB55、與 push 2/push
     # 0x3C（body 2、代號 0x3C）—— 那個 0x3C 是跟 repairone(0x3B) 分家的關鍵，一定要蓋到。
+    # ⚠ 2026-09-22 改版那對視窗欄位 +0x154/+0x150 搬到 +0x164/+0x160，整段沒中 →
+    #   兩個 disp32 改放萬用（它們是結構偏移、不在模組範圍，_auto_mask 不會自動遮）。
     Sig("supply", "REPAIR_ALL_FN", "fn", None,
         "55 8B EC 8B 0D ?? ?? ?? ?? 83 EC 10 68 ?? ?? ?? ?? 8D 49 04"
         " E8 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 68 55 0B 00 00 50 8B 49 0C"
-        " E8 ?? ?? ?? ?? 8B 88 54 01 00 00 2B 88 50 01 00 00 F7 C1 FC FF FF FF"
+        " E8 ?? ?? ?? ?? 8B 88 ?? ?? ?? ?? 2B 88 ?? ?? ?? ?? F7 C1 FC FF FF FF"
         " 74 1C 6A 02 6A 3C",
-        0x005D62C1),
+        0x005D675F),
     # 「關維修畫面」（repairclose UI 指令 0x5906CB）：找 WND_REPAIR、送「離開 NPC」包
     # 0x5D29C1(0x22,0)。修完不叫它角色會卡住不能走（伺服器端還在維修互動）。
     # 錨在兩個 test/je 骨架＋ push 0/push 0x22（0x22 是「離開」代碼，關鍵），位址與 rel32 放萬用。
@@ -440,9 +442,11 @@ SIGS: tuple[Sig, ...] = (
     Sig("login", "ACCOUNT", "data", 7,
         "6A 14 8D 45 E4 50 68 80 09 89 00 E8 ?? ?? ?? ?? 8B 03 83 C4 1C 8B CB",
         0x00890980),
+    # ⚠ 2026-09-22 改版：取密碼字串那個虛函式從 vtable+0x40 變 +0x50（視窗類多了
+    #   一個虛函式），整段沒中 → 槽位放萬用；骨架靠 push 0x20／push eax／push 全域／call。
     Sig("login", "PASSWORD", "data", 7,
-        "6A 20 FF 50 40 50 68 98 09 89 00 E8 ?? ?? ?? ?? 8B 7D DC 83 C4 0C",
-        0x00890998),
+        "6A 20 FF 50 ?? 50 68 C0 24 8D 00 E8 ?? ?? ?? ?? 8B 7D DC 83 C4 0C",
+        0x008D24C0),
     # 兩支「用哪一種憑證」的旗標。BLOB 錨在 0x537041（帶帳號+512bytes 憑證
     # 登入）裡把它設 1 那行；TOKEN 錨在登入按鈕判斷「要不要讀 UI」那行。
     Sig("login", "FLAG_BLOB", "data", 7,
@@ -466,10 +470,13 @@ SIGS: tuple[Sig, ...] = (
         0x00537353),
     # 「依 id 取控制項」。stdcall(視窗id, 控制項id)，ecx = UI 管理者。
     # 純查表、不抽訊息，所以拿來取伺服器清單控制項很安全。
+    # ⚠ 2026-09-22 改版：函式裡讀的視窗欄位 +0xC8 搬到 +0xD8，整段沒中 →
+    #   那個 disp32 放萬用（結構偏移不在模組範圍，_auto_mask 不會自動遮）。
+    #   跟 produce.GET_CTRL 是同一支函式（兩邊各自登記、各自驗）。
     Sig("login", "GETWIDGET_FN", "fn", None,
         "55 8B EC 83 7D 08 00 53 56 57 8B F9 74 47 FF 75 08 E8 ?? ?? ?? ??"
-        " 8B D8 85 DB 74 61 8B B3 C8 00 00 00 EB 27",
-        0x00624D17),
+        " 8B D8 85 DB 74 61 8B B3 ?? ?? ?? ?? EB 27",
+        0x00649BB5),
     # 「授權合約已同意」旗標。==1 就整段跳過 EULA（唯一的讀在 0x539B5A、
     # 唯一的寫在 0x539BA7）。自己開 angel.dat 時先寫 1 就不會跳合約視窗。
     Sig("login", "EULA_OK", "data", 2,
@@ -699,11 +706,13 @@ SIGS: tuple[Sig, ...] = (
     # mov esi,[ebx+0xC8] / jmp …`。兩個 rel32 的 call 交給遮罩，靠指令骨架當錨。
     # ⚠ 這一族「佈景/可點物件 vtable 0x7D8140」的舊特徵已拿掉：製作檯其實不是
     #   0x7D8140（那是純裝飾），是 gather.VT_RESOURCE（已登記），見 scenery.py。
+    # ⚠ 2026-09-22 改版：`mov esi,[ebx+0xC8]` 變 +0xD8，整段沒中 → disp32 放萬用
+    #   （結構偏移不在模組範圍，_auto_mask 不會自動遮）。
     Sig("produce", "GET_CTRL", "fn", None,
         "55 8B EC 83 7D 08 00 53 56 57 8B F9 74 47 FF 75 08 E8 ?? ?? ?? ??"
-        " 8B D8 85 DB 74 61 8B B3 C8 00 00 00 EB 27 FF 36 8B CF"
+        " 8B D8 85 DB 74 61 8B B3 ?? ?? ?? ?? EB 27 FF 36 8B CF"
         " E8 ?? ?? ?? ?? 85 C0 74 17",
-        0x00624FCC),
+        0x00649BB5),
     # ── 製作／公會貢獻（見 app/game/recipes.py）──────────────────
     # 前三段是「依 ID 查表」那種函式，模組裡有 41 支長得一模一樣
     # （怪物表、技能表都是），差別只有邊界值與錯誤訊息裡的**表名字串**。
@@ -742,15 +751,18 @@ SIGS: tuple[Sig, ...] = (
         " 68 A0 88 7D 00",
         0x0098FD9C, str_at=52, str_val=b"OnlineGift"),
     # 「這個配方學會了沒」的位元圖偏移。錨在 `initmakeclasswnd` 逐一檢查
-    # 配方那段：`xor edx,edx / mov ecx,edi / and ecx,0x1F / inc edx /
-    # shl edx,cl / mov eax,edi / mov ecx,[ebp-0x18] / shr eax,5 /
-    # test [ecx+eax*4+位元圖], edx`。
+    # 配方那段（2026-09-22 改版後編譯器把 `shr eax,5` 改成帶正負號的
+    # `test eax,eax / jns / add eax,0x1F / sar eax,5`，暫存器也換了；
+    # 新版 0x5C9A45）：`xor edx,edx / mov ecx,edi / and ecx,0x1F / inc edx /
+    # shl edx,cl / mov eax,edi / test eax,eax / jns +3 / add eax,0x1F /
+    # sar eax,5 / test [ebx+eax*4+位元圖], edx / je / push edi / call 查Make表`。
+    # ebx 是 `mov ebx,[WORLD_PTR]`（0x5C9A39）—— 位元圖掛在管理員物件本身。
     # ⚠ off 類不會自動遮，偏移自己寫 ??；後面那個 call 打到的正是上面
     #   那支 Make 查表函式，rel32 一律遮。
-    Sig("recipes", "OFF_LEARNED", "off", 21,
-        "33 D2 8B CF 83 E1 1F 42 D3 E2 8B C7 8B 4D E8 C1 E8 05"
-        " 85 94 81 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? 57 E8 ?? ?? ?? ??",
-        0x000058F8),
+    Sig("recipes", "OFF_LEARNED", "off", 25,
+        "33 D2 8B CF 83 E1 1F 42 D3 E2 8B C7 85 C0 79 03 83 C0 1F C1 F8 05"
+        " 85 94 83 ?? ?? ?? ?? 74 ?? 57 E8 ?? ?? ?? ??",
+        0x00005900),
     # ── 失焦不凍畫面（見 app/game/unfreeze.py）──────────────────────
     # 要 patch 的位址：「切換 active 狀態」那個共用小函式裡的狀態比較那一行。
     # v4（2026-09-01）：官方把 v3 內聯在 WM_ACTIVATEAPP handler 裡的狀態機
