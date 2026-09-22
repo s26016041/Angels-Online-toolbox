@@ -209,14 +209,19 @@ def basic(mover, scanner, ent_addr: int) -> bool:
            跟「自送封包只打得出普攻、MP 一格不扣」的舊實測完全對得上。
     ⚠ 這支**不能**拿來放技能（它就是普攻）；技能一律走 `quickbar.use` /
       `cast_skill`（見 [[use-quickkey-fn]]）。
-    ⚠ eid 由 `supply.click_object` 當場從實體 `+0xBC` 重讀（CLAUDE.md：交給
+    ⚠ eid 由 `supply.click_object` 當場從物件 `+0xBC` 重讀（CLAUDE.md：交給
       遊戲的位址送出前當場重驗），所以這裡收的是**實體位址**。
+    ⚠⚠ 基準差 8：這裡收的 `ent_addr` 是掃 VT_ENTITY 得到的（entity.py 基準，
+      +0xBC 是 **X 座標**），`click_object` 要的是**物件起點**（NPC／場景物件那些
+      呼叫端傳的都是起點；起點 +0xBC 才是 eid）—— 跟 `cast_skill` 一樣要先 −8。
+      2026-09-22 稽核抓到：沒減 8 就把 X 座標當 eid 送 TryAct，回 True 但什麼
+      都沒發生（5 台 54 隻怪純讀驗證：−8 全部對得上實體表，不減 0/54）。
     ⚠ 回 True 只代表「這一發送進去了」，不代表打到 —— 打沒打到只有怪的血知道。
     """
     if not (mover and mover.active and ent_addr):
         return False
     if _yield_now(mover):
         return False
-    from app.game import supply          # 延後匯入：supply 會匯入本模組
-    return supply.click_object(mover, scanner, ent_addr,
+    from app.game import entity, supply  # 延後匯入：supply 會匯入本模組
+    return supply.click_object(mover, scanner, ent_addr - entity.VT_SHIFT,
                                kind=supply.KIND_ATTACK)
