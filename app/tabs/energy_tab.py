@@ -594,6 +594,12 @@ class EnergyTab(BaseTab):
             return
         self._decomp_all = bool(all_items)
         what = "件可分解的東西" if self._decomp_all else "顆"
+        # ⚠ 「全部」的確認框是最後一道安全網：背包讀不到那一拍 decomposable() 是
+        #   空的，框會寫「目前沒有可拆的東西」，按下去第一拍讀得到就把真的有的
+        #   東西全拆了。讀不完整就拒開，請他再按一次（2026-09-22 稽核）。
+        if self._decomp_all and not bag.scan(sc)[1]:
+            self.status.setText("⚠ 背包現在讀不到（換地圖中？），確認清單列不出來 —— 等一下再按")
+            return
         found = energy.decomposable(sc, self._decomp_all)
         n = len(found)
         # ⚠⚠ 「全部」開跑前先把**即將被拆掉的東西逐項列出來讓他確認**。
