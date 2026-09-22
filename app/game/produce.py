@@ -293,14 +293,31 @@ def _ctrl(mover, scanner, wnd: int, ctrl_id: int):
     return ptr if ptr and _PTR_LO < ptr < _PTR_HI else None
 
 
-def _rows(scanner, ctrl: int) -> list[int]:
-    """控制項的項目指標陣列（vector）。"""
-    first = _u32(scanner, ctrl + CTRL_VEC_FIRST)
-    last = _u32(scanner, ctrl + CTRL_VEC_LAST)
-    if not first or last is None or last < first:
-        return []
+def _rows(scanner, ctrl: int) -> list[int] | None:
+    """控制項的項目指標陣列（vector）；**讀不到回 None**（≠ 空清單）。
+
+    ⚠ 以前讀不到也回 []：配方清單那一拍讀不到 → 被當「點錯站台」（WRONG_PANEL）
+      把真站台拉黑一整個 session；製作清單讀不到 → already=0 → 整批疊大 ——
+      正是檔頭說要防的那件事（2026-09-22 稽核）。
+    """
+    raw_f = scanner._read_bytes(ctrl + CTRL_VEC_FIRST, 4)
+    raw_l = scanner._read_bytes(ctrl + CTRL_VEC_LAST, 4)
+    if not raw_f or not raw_l or len(raw_f) < 4 or len(raw_l) < 4:
+        return None
+    first = struct.unpack("<I", bytes(raw_f))[0]
+    last = struct.unpack("<I", bytes(raw_l))[0]
+    if first == last:
+        return []                       # 真的空（vector begin == end）
+    if not (_PTR_LO < first < _PTR_HI) or last < first:
+        return None                     # 垃圾 → 不知道
     n = (last - first) // 4
-    return [_u32(scanner, first + i * 4) for i in range(min(n, 4096))]
+    out = []
+    for i in range(min(n, 4096)):
+        raw = scanner._read_bytes(first + i * 4, 4)
+        if not raw or len(raw) < 4:
+            return None
+        out.append(struct.unpack("<I", bytes(raw))[0])
+    return out
 
 
 def make_batch(mover, scanner, wnd: int, recipe_id: int,
@@ -335,7 +352,10 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
 
     # ① 選配方：清掉所有列的選取旗標，只把目標那列設 1（0x625252 認第一個 !=0）
     target = None
-    for it in _rows(scanner, rec_c):
+    rec_rows = _rows(scanner, rec_c)
+    if rec_rows is None:
+        return False, 0, mk_c, "配方清單讀不到（面板還沒開好？）"
+    for it in rec_rows:
         if not (it and _PTR_LO < it < _PTR_HI):
             continue
         mover.write(it + ITEM_SEL_OFF, b"\x00")
@@ -351,7 +371,11 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
     # ①b 清單裡已經排著幾個？（makeadd 是**累加**，只補差額，見檔頭說明）
     from app.game import lua
     already = 0
-    for it in _rows(scanner, mk_c):
+    mk_rows = _rows(scanner, mk_c)
+    if mk_rows is None:
+        # ⚠ 讀不到 ≠ 清單是空的：當 0 會把整批疊大（見 _rows）
+        return False, 0, mk_c, "製作清單讀不到（面板還沒開好？）"
+    for it in mk_rows:
         if not (it and _PTR_LO < it < _PTR_HI):
             continue
         data = _u32(scanner, it + ITEM_DATA_OFF) or 0
@@ -372,7 +396,14 @@ def make_batch(mover, scanner, wnd: int, recipe_id: int,
         ok, _v = lua.call(mover, scanner, "game.makeadd", wnd)
         if not ok:
             return False, already, mk_c, f"makeadd 沒成功（{_v}）"
-        for it in _rows(scanner, mk_c):
+        mk_rows = _rows(scanner, mk_c)
+        if mk_rows is None:
+            # ⚠ 讀不到 ≠ 沒排進去（那會被當 ADD_REFUSED 叫人去清成品）。
+            #   回「讀不到」讓呼叫端重試：下一次 make_batch 會看到 already 只補差額。
+            return False, already, mk_c, "makeadd 之後製作清單讀不到，重試"
+        for it in mk_rows:
+            if not (it and _PTR_LO < it < _PTR_HI):
+                continue
             data = _u32(scanner, it + ITEM_DATA_OFF) or 0
             if (data >> 16) == recipe_id:
                 added = max(added, data & 0xFFFF)
