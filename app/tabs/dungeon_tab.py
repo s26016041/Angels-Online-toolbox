@@ -6545,7 +6545,26 @@ class DungeonTab(BaseTab):
 
     def _tick_pages(self) -> None:
         for page in list(self.pages.values()):
-            page._tick()
+            try:
+                page._tick()
+            except Exception as exc:               # noqa: BLE001
+                self._page_failed(page, exc)
+
+    def _page_failed(self, page, exc: Exception) -> None:
+        """一台的心跳丟例外 → **只停那一台**（同掛機頁 `_page_failed`）。
+
+        ⚠⚠ tick 掛在 QTimer 上（UI 執行緒），沒接住的例外會走到 main.py 的全域
+          攔截 → 訊息框 → **整個程式關閉**；接住但不處理則後面的分頁全部餓死
+          （迴圈在第一台就斷了）。2026-09-22 稽核：掛機頁早有這層，這裡沒有。
+        ★ 不是安靜吞掉：那一台停下、狀態列紅字、traceback 寫進 crash.log。
+        """
+        from app.core import crashlog
+        path = crashlog.record(f"副本分頁 心跳例外（PID {page._pid}）", exc)
+        try:
+            page._stop(f"⛔ 這台發生未預期的錯誤，已停止：{exc}"
+                       + (f"　紀錄檔：{path}" if path else ""))
+        except Exception:                          # noqa: BLE001
+            pass                                   # 停用流程本身也不准再炸
 
     # -- 分身對帳（照帳號）---------------------------------------------
     def _watch_tick(self) -> None:
