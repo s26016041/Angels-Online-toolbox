@@ -1801,6 +1801,31 @@ def main() -> int:
     tab._fight((10.0, 10.0), TICK)
     ck("★★★★ 柱子：物件還在、狀態還是 Wait，但死亡旗標＝7 → 當拍判死",
        tab._cur is None, f"實得 {tab._cur}")
+    # ★★ 2026-09-22 黑狐莉薇坦的寢室第 18 步：那一區 40 多隻怪、清怪要超過 2 分鐘，
+    #   看門狗只看「還在同一步」→ 正在清怪的一趟被當成卡住收掉。打死一隻＝有進展、計時歸零。
+    tab._loop = True
+    tab._phase, tab._cycle = "run", "go"
+    tab._stuck_watch(TICK)
+    tab._stuck_watch(dt.STUCK_ABORT_SECS - 10.0)
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, 0)
+    tab._cur = None
+    tab._fight((10.0, 10.0), TICK)
+    ck("　（鎖定怪）", tab._cur is m, f"實得 {tab._cur}")
+    dt.entity.read_live_hp = lambda _sc, e: (True, "Dead", (e.x, e.y), 0, 0)
+    tab._fight((10.0, 10.0), TICK)
+    ck("　打死一隻 → 卡住計時歸零", tab._cur is None and tab._stuck_t == 0.0,
+       f"_stuck_t={tab._stuck_t} _cur={tab._cur}")
+    handled = tab._stuck_watch(dt.STUCK_ABORT_SECS - 10.0)
+    ck(f"★★ 同一步清怪超過 {dt.STUCK_ABORT_SECS / 60:.0f} 分鐘、期間有怪死 → 不算卡住、不收掉這一趟",
+       not handled and tab._cycle == "go" and tab.run_cb.isChecked()
+       and not any(r[2] == "stuck" for r in tab._events), tab.status.text())
+    _orig_supply2 = dt.supply.run_full_supply
+    dt.supply.run_full_supply = lambda *a, **k: None
+    handled = tab._stuck_watch(11.0)
+    ck("　之後一隻都沒打死再滿 2 分鐘 → 照舊收掉", handled and tab._cycle != "go",
+       f"cycle={tab._cycle} {tab.status.text()}")
+    dt.supply.run_full_supply = _orig_supply2
+    tab._cycle, tab._phase = "go", "run"
     # ⛔ 旗標讀不到（None）不准當死 —— 讀不到 ≠ 死了。
     dt.entity.read_live_hp = lambda _sc, e: (True, "Wait", (e.x, e.y), 0, None)
     tab._cur = None

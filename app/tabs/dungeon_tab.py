@@ -3081,6 +3081,11 @@ class CharDungeonPage(QWidget):
         if entity.looks_dead(st, alive, flag):
             self._say(f"「{m.name}」死了 → 換下一隻")
             self._last_gave_up = None
+            # ★★ 打死一隻＝這一步有進展（2026-09-22 黑狐莉薇坦的寢室第 18 步實錄）：那一區
+            #   40 多隻怪、每 1~2 秒打死一隻、人一路從 (398,207) 打到 (235,222)，看門狗只看
+            #   「還在同一步」→ 2 分鐘到就「卡住…當成完成一場」把正在清怪的一趟收掉（02:03／05:07
+            #   兩趟）。這裡歸零，連續 STUCK_ABORT_SECS 一隻都沒打死、步驟也沒前進才算卡住。
+            self._stuck_t = 0.0
             self._drop_target()
             return True
         # ⛔⛔ 這裡以前有一段「血量歸零＝打死了 → 換下一隻」（2026-09-05 為了
