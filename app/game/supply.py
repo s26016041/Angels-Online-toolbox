@@ -85,7 +85,7 @@ def _nap(secs: float) -> None:
     _abort_check()
 
 
-BUY_OPCODE = 0x27          # 跟 NPC 買
+BUY_OPCODE = 0x27          # 跟 NPC 買；2026-08-14 嵐狐實測序列③（見下段）；出處 memory self-supply-buy
 
 # ★★★ 開交易的完整序列（2026-08-14 嵐狐實測跨圖冷交易 39→44 確認）：
 #   ① 點 NPC → 開對話框（WND_MESSAGE）。
@@ -223,7 +223,7 @@ TALK_RANGE = 4.0           # 送對話選項前的直線門檻 —— ⚠ 只剩
 #   ⚠ 反組譯 0x508DF6 是 AABB 相交（我框邊長＝[+0x1A4]+2·range），但 range 那張表沒讀出來，
 #     兩軸為什麼不一樣也沒追；先用實測數字。舊的 kind 3 是 Chebyshev ≤2（另一組數字）。
 TALK_BOX_X = 5
-TALK_BOX_Y = 3
+TALK_BOX_Y = 3             # 同上 2026-09-06 黑狐實測：(3,-3) 開、(3,-4) 不開；⚠ 兩軸為何不同沒追
 OFF_ACT_SIZE = 0x1A4       # 實體互動框邊長（TryAct 距離檢查用；NPC 實測 1）
 
 # ★★★ 銀行存款（2026-08-14 擷取＋反組譯，見 memory self-supply-buy）

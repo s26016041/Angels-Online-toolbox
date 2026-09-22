@@ -38,7 +38,7 @@ OFF_CD_LIST = 0x418           # 實體 +0x418：冷卻清單（std::list 哨兵�
 NODE_SKILL = 0x10             # 節點 +0x10：技能 ID；出處 0x506F01
 TMPL_FLAGS = 0x4C             # 範本 +0x4C：旗標（0x800＝同群組共 CD）；出處 0x506F0A
 TMPL_GROUP = 0xE8             # 範本 +0xE8：共 CD 的分組值（≠ 群組編號，見檔頭）；出處 0x506EC5
-FLAG_GROUP_CD = 0x800
+FLAG_GROUP_CD = 0x800         # 範本 +0x4C 的 bit；出處＝檔頭反組譯 0x506E80 那段 `[+0x4C] & 0x800`
 MAX_NODES = 64                # 實測同時最多 1~2 顆；超過＝讀到垃圾
 
 

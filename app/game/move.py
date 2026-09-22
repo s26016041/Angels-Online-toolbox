@@ -257,7 +257,7 @@ _AUX_CODE = 0x200
 # ⚠ lua.py 的 stub 實測 308 bytes（0x200~0x334）；給它留到 0x400，之後是第三段。
 _AUX_CODE_MAX = 0x400 - _AUX_CODE
 # 第三段程式碼區：talkwnd.py 的 messageclose 防呆包裝（幾十 bytes）放這裡。
-_AUX2_CODE = 0x400
+_AUX2_CODE = 0x400          # ⚠ 自家注入區版面，跟遊戲無關：lua stub 留到 0x400，之後才是第三段
 _AUX2_CODE_MAX = _SCRATCH - _AUX2_CODE
 
 

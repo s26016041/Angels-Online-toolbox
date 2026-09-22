@@ -32,9 +32,9 @@ from app.game import bag, itemflags, itemname, lua, scene, supply
 CFG_KEY = "guildbank.items"      # 清單：物品種類 ID 的 list（全部分身共用）
 
 TALK_GUILD = 11                  # 「我要用倉庫」之後的子選單第 2 項＝社團的倉庫（實測）
-BANK_TYPE_GUILD = 1              # Lua 全域 BANK_TYPE_GUILD（dump_lua_globals 實讀）
+BANK_TYPE_GUILD = 1              # Lua 全域 BANK_TYPE_GUILD（dump_lua_globals 實讀）；黑狐實測開公會倉 CUR_BANK_TYPE==1
 BANK_TYPE_KEY = "CUR_BANK_TYPE"  # 開窗時 CreateBankWnd 寫的（關窗不歸零）
-FAIL_STREAK = 2                  # 連續幾件送了沒進去＝倉庫滿了（單件＝被拒收，跳過）
+FAIL_STREAK = 2                  # ⚠ 自家門檻不是遊戲值：拒收跟倉庫滿客戶端分不出來（檔頭），連兩件沒進去才當滿
 
 
 # ---------------------------------------------------------------------------

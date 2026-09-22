@@ -33,9 +33,9 @@ from app.paths import resource
 
 DATA_FILE = "assets/item_flags.tsv.gz"
 
-NO_BANK = 1      # 不可存倉庫
-NO_TRADE = 2     # 不可交易
-BIND = 4         # 裝備綁定
+NO_BANK = 1      # 不可存倉庫；⚠ 自家位元編碼，非遊戲值；build_item_flags.py 抽 item.xml
+NO_TRADE = 2     # 不可交易；⚠ 同上，build_item_flags.py 抽 item.xml
+BIND = 4         # 裝備綁定；⚠ 同上，item.xml；⛔ 不擋存倉（見檔頭 2026-09-16 修）
 
 _NAMES = ((NO_BANK, "不可存倉庫"), (NO_TRADE, "不可交易"), (BIND, "裝備綁定"))
 

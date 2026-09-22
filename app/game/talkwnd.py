@@ -233,7 +233,7 @@ def window_present(scanner) -> bool | None:
 #     後面那個 `cmp byte ptr [eax+disp], reg`），改版位址／偏移一起跟著跑；
 #     抄不到回 None ＝**不知道**，呼叫端要退回舊訊號（⛔ 不可以當成「沒顯示」）。
 VIS_CMD = b"isvisible" + bytes(1)
-_VIS_BODY = 0x60                       # 本體很短（到 ret 約 0x48）；多讀一點無妨
+_VIS_BODY = 0x60                       # ⚠ 自家讀取長度，跟遊戲無關；本體到 ret 約 0x48，多讀一點無妨
 _VIS_MIN, _VIS_MAX = 0x10, 0x1000      # 抄出來的偏移要落在合理範圍才採用
 _vis_cache: dict = {}
 
