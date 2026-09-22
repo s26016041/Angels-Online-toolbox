@@ -295,16 +295,25 @@ class Reader:
         self._page_node: int | None = None
 
     def page(self) -> int:
-        """目前顯示（＝F 鍵作用）的頁碼 0~3；讀不到就當第 0 頁。"""
+        """目前顯示（＝F 鍵作用）的頁碼 0~3；讀不到就當第 0 頁（**顯示用**）。
+
+        ⛔ 要拿頁碼去**出手**的請用 `page_or_none()`：讀不到當第 0 頁會讓
+        掛機那 2 秒拿第 0 頁的格子出手（空格還會被當成普攻）。
+        """
+        v = self.page_or_none()
+        return 0 if v is None else v
+
+    def page_or_none(self) -> int | None:
+        """同 `page()`，但讀不到回 None（＝不知道，呼叫端保留上一次的頁碼）。"""
         if self._page_node is not None:
             v = _node_number(self._sc, self._page_node, "QUICK_COMMAND_PAGE")
             if v is not None:
-                return int(v) if 0 <= v < PAGES else 0
+                return int(v) if 0 <= v < PAGES else None
         self._page_node = _find_global_node(self._sc, "QUICK_COMMAND_PAGE")
         if self._page_node is None:
-            return 0
+            return None
         v = _node_number(self._sc, self._page_node, "QUICK_COMMAND_PAGE")
-        return int(v) if v is not None and 0 <= v < PAGES else 0
+        return int(v) if v is not None and 0 <= v < PAGES else None
 
     def look(self, vks) -> tuple[dict[int, int], set[int]] | None:
         """**一次**把這些（F 鍵）鍵碼看清楚 → ({鍵碼: 技能 ID}, {空格的鍵碼})。
@@ -317,7 +326,11 @@ class Reader:
         整頁讀不到（沒進遊戲／改版位移）回 None，跟「頁上沒技能」的
         空 dict 區分開，呼叫端才知道該不該退回按鍵舊法。
         """
-        cells = read_page(self._sc, self.page())
+        # ⚠ 頁碼讀不到＝整份不知道（不能拿第 0 頁充數，見 page()）
+        pg = self.page_or_none()
+        if pg is None:
+            return None
+        cells = read_page(self._sc, pg)
         if cells is None:
             return None
         out: dict[int, int] = {}

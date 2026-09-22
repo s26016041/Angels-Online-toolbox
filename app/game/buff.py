@@ -399,7 +399,12 @@ class AutoBuff:
         slot = self.vk - quickbar.VK_F1
         if self._rd is None or self._rd._sc is not scanner:
             self._rd = quickbar.Reader(scanner)
-        page = self._rd.page()               # F12 作用在「目前顯示的頁」
+        page = self._rd.page_or_none()       # F12 作用在「目前顯示的頁」
+        if page is None:
+            # ⚠ 讀不到頁碼 ≠ 第 0 頁：拿第 0 頁充數會收下別頁的技能／按錯頁。
+            self.note = f"⚠ 讀不到快捷欄頁碼 → {RETRY:.0f} 秒後再看"
+            self._sent_at = now
+            return self.note
         try:
             cells = quickbar.read_page(scanner, page)
         except Exception:                              # noqa: BLE001

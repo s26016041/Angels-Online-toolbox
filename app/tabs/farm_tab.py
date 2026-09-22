@@ -1323,7 +1323,11 @@ class KeyWorker(_Paced):
                 try:
                     # ⚠ 要連首發鍵一起讀（它可以是沒勾的鍵）—— 見 all_keys()
                     got = self._qb.look(self.all_keys())
-                    self._page = self._qb.page()   # 使用者中途翻頁也要跟上
+                    # 使用者中途翻頁也要跟上；⚠ 讀不到保留舊頁（look 這時也回
+                    # None），⛔ 不能拿第 0 頁充數 —— 那 2 秒會拿第 0 頁的格子出手
+                    pg = self._qb.page_or_none()
+                    if pg is not None:
+                        self._page = pg
                 except Exception:              # noqa: BLE001
                     got = None
                 self.qb_ok = got is not None
