@@ -168,6 +168,19 @@ def run(mover, scanner, npc_id: int, fallback, ids: set[int]) -> tuple[bool, str
         if not pend:
             break
         it = pend[0]                 # 每一件都是剛讀到的（格號送出前當場重讀，鐵則）
+        # ★ 每一件送之前都重驗「開著的還是公會倉」：存款包沒有倉庫種類欄，伺服器
+        #   看的是「現在開著哪個」，中途窗被換掉／關掉，剩下的會存進個人倉庫。
+        #   ⚠ 讀不到（None）先重讀幾次再放棄 —— 一次讀失敗不該把整趟收掉。
+        opened = is_open(scanner)
+        for _ in range(3):
+            if opened is not None:
+                break
+            time.sleep(0.1)
+            opened = is_open(scanner)
+        if opened is not True:
+            supply._bank_close(mover, scanner)
+            return (deposited > 0), (f"公會倉庫視窗中途不見了（或變成別的倉庫）→ 停止；"
+                                     f"已存 {deposited} 件到公會倉庫")
         ok, msg = supply.deposit_slot(mover, scanner, it.slot)
         if not ok:
             supply._bank_close(mover, scanner)
