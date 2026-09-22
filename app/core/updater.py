@@ -245,6 +245,24 @@ def _fetch(url: str, info: dict, dest: Path, progress=None) -> bool:
       才刪 —— 那種檔案留著會一直續傳到同一個壞結果。
     """
     total = info.get("size") or 0
+    # ★ 半成品是不是**這一版**的？側檔記 [size, sha256]（跟 _fetch_parallel 的 .par.json
+    #   同一個鑰匙）；對不上就丟掉從頭抓 —— 不然舊版留下的半成品接上新版的尾巴，
+    #   sha256 必定驗不過，白抓一整份（2026-09-22 稽核）。
+    #   ⚠ 沒有側檔（舊版工具箱留的半成品）當「不知道」照舊續傳，最後靠 sha256 把關。
+    side = dest.with_name(dest.name + ".new.json")
+    key = [total, info.get("sha256") or ""]
+    stale = False
+    if side.exists():
+        try:
+            stale = json.loads(side.read_text("utf-8")).get("key") != key
+        except Exception:                                  # noqa: BLE001
+            stale = True
+    if dest.exists() and stale:
+        dest.unlink(missing_ok=True)
+    try:
+        side.write_text(json.dumps({"key": key}), "utf-8")
+    except OSError:
+        pass
     have = dest.stat().st_size if dest.exists() else 0
     if total and have >= total:                # 上次其實抓完了
         return _good(dest, info) or (dest.unlink(missing_ok=True) or False)
@@ -275,8 +293,10 @@ def _fetch(url: str, info: dict, dest: Path, progress=None) -> bool:
         except Exception:                                  # noqa: BLE001
             return False                       # ⚠ 半成品留著，下次續傳
     if _good(dest, info):
+        side.unlink(missing_ok=True)
         return True
     dest.unlink(missing_ok=True)               # 驗不過的一定要丟
+    side.unlink(missing_ok=True)
     return False
 
 
