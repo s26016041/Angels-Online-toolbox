@@ -110,6 +110,9 @@ AUTO_MS = 1000              # 自動賣出的間隔 —— 使用者 2026-08-27 
 # 但那包含伺服器換場景；單純扣物品加錢快得多。0.9 秒是保守值，
 # 沒結算完也不會漏 —— 下一輪會再看到那件東西，頂多晚一輪記帳。
 SETTLE_MS = 900
+# ⚠ 對帳那一拍背包讀不到（換地圖／容器搬家）→ 再等一拍重對，最多幾次；
+#   到底了就說「驗不了」，⛔ 不准把「讀不到」記成「全部賣掉」（bag-false-empty-guards）。
+SETTLE_RETRY_MAX = 10
 
 
 class SellTab(BaseTab):
@@ -131,7 +134,7 @@ class SellTab(BaseTab):
         self._listed: dict[int, int] = {}    # pid -> 表定金額總和
         self._earned: dict[int, int] = {}    # pid -> 金幣實際增加的總和
         self._auto: frozenset[int] | None = None   # 自動賣哪些品質；None = 沒在跑
-        self._pending = None                 # (pid, {鍵: 物品}, 賣之前的金幣)
+        self._pending = None                 # (pid, {鍵: 物品}, 賣之前的金幣, 重對第幾次)
 
         root = QVBoxLayout(self)
 
@@ -527,22 +530,35 @@ class SellTab(BaseTab):
             self.status.setText("⚠ " + msg)
             return
         self.status.setText(f"{msg}　確認中…")
-        self._pending = (pid, keys, before)
+        self._pending = (pid, keys, before, 0)
         QTimer.singleShot(SETTLE_MS, self._settle)
 
     def _settle(self) -> None:
-        """對一次背包：真的消失的才算賣掉，金額用金幣的實際變化量。"""
+        """對一次背包：真的消失的才算賣掉，金額用金幣的實際變化量。
+
+        ⚠ 一定要用 `bag.scan()` 看第二個值：`items()` 讀不到回空清單，那一拍會把
+          整批記成「賣掉」（紀錄／統計全假）。不完整就再等一拍重對（2026-09-22 稽核）。
+        """
         if self._pending is None:
             return
-        pid, keys, before = self._pending
+        pid, keys, before, tries = self._pending
         self._pending = None
         sc = self._scanners.get(pid)
         if sc is None:
             return
         try:
-            rows = bag.items(sc)
+            rows, complete = bag.scan(sc)
             after = bag.gold(sc)
         except Exception:                                # noqa: BLE001
+            rows, complete, after = [], False, None
+        if not complete:
+            if tries + 1 < SETTLE_RETRY_MAX:
+                self._pending = (pid, keys, before, tries + 1)
+                self.status.setText(f"確認中…背包暫時讀不到，再等一下（{tries + 1}）")
+                QTimer.singleShot(SETTLE_MS, self._settle)
+            else:
+                self.status.setText("⚠ 封包送出去了，但背包一直讀不到 —— 這批賣沒賣掉驗不了，"
+                                    "沒記進紀錄（下一輪看得到的話會再賣一次）")
             return
         still = {(it.serial, it.stamp) for it in rows}
         sold = [it for k, it in keys.items() if k not in still]
