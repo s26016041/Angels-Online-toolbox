@@ -166,12 +166,13 @@ OBJ_WIN_ID = 0x1064         # 這個畫面的視窗 id（取控制項的第一�
 # 伺服器清單控制項。⚠ 這是 UI 定義檔給的編號、不是程式碼位址，沒得 AOB 定位；
 # 改版動 UI 才會變，屆時 pick_server() 會「找不到控制項」而不是選錯。
 SERVER_LIST_ID = 0xA92
-# ★ 出處：反組譯遊戲自己的「取選取索引」0x624F9D —— 掃 [控制項+0x150]~[+0x154]
-#   的項目向量，回傳第一個「項目+6 非 0」的索引。實機驗證：三個項目只有索引 2
-#   是 1，跟 SERVER_INDEX 讀到的 2（雅典娜）完全吻合。
-ITEM_VEC_BEGIN = 0x150      # 控制項的項目向量（begin/end）
-# ★ 同上出處（BEGIN+4 = vector 的 end 指標）。
-ITEM_VEC_END = 0x154
+# ★ 出處：反組譯遊戲自己的「取選取索引」（9/22 版 0x649E3B）—— 掃 [控制項+0x160]
+#   ~[+0x164] 的項目向量，回傳第一個「項目+6 非 0」的索引。實機驗證：三個項目只有
+#   索引 2 是 1，跟 SERVER_INDEX 讀到的 2（雅典娜）完全吻合。
+# ⚠ 2026-09-22 改版清單控制項長了 0x10：0x150 → 0x160，pick_server 讀到別的欄位
+#   → 「伺服器清單是空的」→ 自動登入整個停。所以進 locate.SIGS（kind="off"）自動跟；
+#   下面的值只是退路。end 指標固定在 BEGIN+4（vector 版面），不另記一份。
+ITEM_VEC_BEGIN = 0x160      # 控制項的項目向量（begin；end 在 +4）
 # ★ 同上出處（0x624F9D 認「項目+6 非 0 = 被選中」）。
 ITEM_SELECTED = 6           # 項目物件 +6：非 0 = 被選中
 
@@ -447,7 +448,7 @@ def pick_server(mover, scanner, index: int) -> str:
 def _list_items(scanner, widget: int) -> list[int]:
     """清單控制項的項目物件位址；讀不到或數量不合理回空清單。"""
     beg = _u32(scanner, widget + ITEM_VEC_BEGIN)
-    end = _u32(scanner, widget + ITEM_VEC_END)
+    end = _u32(scanner, widget + ITEM_VEC_BEGIN + 4)
     if not beg or not end or end < beg:
         return []
     n = (end - beg) // 4

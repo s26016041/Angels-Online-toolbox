@@ -470,6 +470,17 @@ SIGS: tuple[Sig, ...] = (
         0x00537353),
     # 「依 id 取控制項」。stdcall(視窗id, 控制項id)，ecx = UI 管理者。
     # 純查表、不抽訊息，所以拿來取伺服器清單控制項很安全。
+    # 清單控制項的「項目向量 begin」偏移（end 固定在 +4）。錨在遊戲自己的
+    # 「取選取索引」小函式整支（9/22 版 0x649E3B）：`mov edx,[ecx+begin] / push esi /
+    # mov esi,[ecx+end] / xor ecx,ecx / sub esi,edx / sar esi,2 / test / jle /
+    # mov eax,[edx] / cmp byte [eax+6],0 / jne / inc ecx / add edx,4 / cmp / jl /
+    # or eax,-1 / pop esi / ret`。2026-09-22 改版 0x150 → 0x160，pick_server 讀到
+    # 別的欄位變「伺服器清單是空的」，自動登入整個停 —— 所以進來自動跟。
+    # ⚠ off 類不會自動遮，兩個偏移自己寫 ??。
+    Sig("login", "ITEM_VEC_BEGIN", "off", 2,
+        "8B 91 ?? ?? ?? ?? 56 8B B1 ?? ?? ?? ?? 33 C9 2B F2 C1 FE 02 85 F6 7E 10"
+        " 8B 02 80 78 06 00 75 0D 41 83 C2 04 3B CE 7C F0 83 C8 FF 5E C3",
+        0x00000160),
     # ⚠ 2026-09-22 改版：函式裡讀的視窗欄位 +0xC8 搬到 +0xD8，整段沒中 →
     #   那個 disp32 放萬用（結構偏移不在模組範圍，_auto_mask 不會自動遮）。
     #   跟 produce.GET_CTRL 是同一支函式（兩邊各自登記、各自驗）。
