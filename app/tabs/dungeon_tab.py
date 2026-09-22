@@ -4796,7 +4796,11 @@ class CharDungeonPage(QWidget):
         self._supply_progress = "出發"
         self._supply_back = back          # 沒跑完要重跑時照同一個目的地（見 _supply_tick）
         self._supply_retry = 0.0
-        self._i = 0                       # 下一趟從頭跑
+        # ⚠ 一定要走 _goto(0) 不是只改 _i：撞機關／已點對話／拉回次數那些
+        #   「跟一步綁在一起」的狀態不歸零，會漏到下一趟的第 0 步（死在撞傳點
+        #   那一步 → 下一趟第 0 步先去撞上一間房的傳點；死在點完物件後 →
+        #   第 0 步的對話被當已經點過直接跳掉）。2026-09-22 稽核抓到。
+        self._goto(0)                     # 下一趟從頭跑
         self._back_jumps = 0              # 往回接回腳本的次數也跟著歸零（每趟各算）
         self._done = False
         self._empty_since = 0.0
@@ -5198,8 +5202,7 @@ class CharDungeonPage(QWidget):
             self._qi += 1
             self._batch_done = 0
             self._script = q[self._qi]
-            self._i = 0
-            self._refresh_steps()
+            self._goto(0)                # ⚠ 不是只改 _i（見 _start_supply_trip）；含 _refresh_steps
             text = (f"「{prev}」{sch['rounds']} 場刷完 → 換清單下一個副本"
                     f"「{self._script.name}」（{self._qi + 1}/{len(q)}）")
             self._event("info", text)
@@ -5315,7 +5318,7 @@ class CharDungeonPage(QWidget):
         if self._queue:                  # 新一輪從清單第 1 個副本開始（2026-09-07）
             self._qi = 0
             self._script = self._queue[0]
-            self._i = 0
+            self._goto(0)                # ⚠ 不是只改 _i（見 _start_supply_trip）
         w = self._find_client()
         sc = self._adopt_client(w) if w is not None else None
         if sc is None:
