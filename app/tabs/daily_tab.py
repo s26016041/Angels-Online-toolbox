@@ -470,7 +470,11 @@ class DailyTab(BaseTab):
                                                waited + SETTLE_POLL_MS))
             return SETTLE_POLL_MS
         self._skipped.append((pid, label))
-        self._log(label, self._ex_act(), "沒有券（今天的已經領過了）→ 跳過")
+        # ⚠ 「讀不到背包」跟「真的沒有券」要分開講（bag-false-empty-guards）——
+        #   兩者都只是跳過（最後 _ex_recheck 會再看一次），但結論不能講錯。
+        self._log(label, self._ex_act(),
+                  "背包讀不到，驗不了有沒有券 → 先跳過（最後再看一次）"
+                  if got is None else "沒有券（今天的已經領過了）→ 跳過")
         return 0
 
     def _ex_recheck(self) -> int:
