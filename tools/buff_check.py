@@ -77,6 +77,9 @@ class FakeQuickbar:
         def page(self):
             return 0
 
+        def page_or_none(self):          # buff.step() 出手前問的是這個（讀不到 → None）
+            return 0
+
     def read_page(self, sc, page):
         if self.cell_skill == "unreadable":
             return None

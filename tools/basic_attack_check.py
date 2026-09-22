@@ -51,7 +51,8 @@ print("① quickbar.look()：空格 vs 物品格")
 
 
 class FakeSc:
-    pass
+    def _read_bytes(self, addr, n):      # quickbar.Reader 找 Lua 全域節點會先讀記憶體；假的一律讀不到
+        return None
 
 
 CELLS = [None] * quickbar.SLOTS
@@ -62,6 +63,7 @@ CELLS[2] = quickbar.QuickSlot(kind=quickbar.KIND_ITEM, value=1905, value2=0)
 quickbar.read_page = lambda sc, page: CELLS
 rd = quickbar.Reader(FakeSc())
 rd.page = lambda: 0
+rd.page_or_none = lambda: 0        # look() 出手前問的是這個（讀不到 → None）
 got = rd.look([F1, F2, F3])
 check("讀得到", got is not None)
 skl, blank = got
