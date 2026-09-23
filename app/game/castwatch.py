@@ -56,6 +56,18 @@ OFF_CASTER = 2           # 施法者伺服器ID（u32）；出處見上
 OFF_SUB = 6              # 子類型（u16）；出處見上
 OFF_SKILL = 8            # 技能ID（u32）；出處見上
 
+# ★ 死亡廣播＝「誰殺的」（2026-09-23 fred26016041 實錄 90 秒解出，memory
+#   `kill-credit-packet`）：`0a 00 | 怪 eid u32@2 | 殺手伺服器ID u32@6 | 07 00 00 00 @10`
+#   殺手 == 我的伺服器ID ＝ 伺服器明講這隻是我殺的（100%）；被搶＝殺手是別人。
+#   ⛔ 經驗上漲**不是**擊殺訊號（AO 按傷害分經驗，別人補刀我也拿得到）。
+#   @10 那個 7 在實錄裡恆定；認它是為了少誤認別種 0x0a——語意變了會**少算**
+#   （擊殺數不動＝看得到），不會多算。
+KILL_OP = 0x0A
+KILL_OFF_VICTIM = 2
+KILL_OFF_KILLER = 6
+KILL_OFF_TAG = 10
+KILL_TAG = 7
+
 # 玩家實體 + 這個 ＝ 我的施法者伺服器ID（拿來認「這一包是不是我放的」）。
 # ⚠ 結構偏移，改版可能搬家；搬家的症狀是**永遠認不出自己的廣播**＝等不到確認，
 #   同樣退回安全路而不是亂送。實測五台的值都對得上自己的施放廣播。
@@ -221,25 +233,31 @@ class CastHook:
         except Exception:                      # noqa: BLE001
             return 0
 
-    def casts_since(self, since: int) -> list[tuple[int, int]]:
-        """自 `since`（write_count 的值）以來的**施放廣播** [(施法者ID, 技能ID)]。
-
-        只回子類型 0x0301 的（主施放），別的事件濾掉。讀壞就當沒有。
-        """
+    def _slots_since(self, since: int) -> list[bytes]:
+        """自 `since`（write_count 的值）以來每一包的前 16 bytes。讀壞就當沒有。
+        ⚠ 先讀 wcnt 再讀槽：stub 是「寫完槽才 inc wcnt」，所以 < wc 的槽都是完整的。"""
         if not self._active:
             return []
         try:
             wc = self._pm.read_uint(self._wcnt)
         except Exception:                      # noqa: BLE001
             return []
-        out: list[tuple[int, int]] = []
-        start = max(since, wc - _N)
-        for i in range(start, wc):
+        out: list[bytes] = []
+        for i in range(max(since, wc - _N), wc):
             s = self._ring + (i % _N) * _SLOT
             try:
-                data = bytes(self._pm.read_bytes(s + 4, _CAP))
+                out.append(bytes(self._pm.read_bytes(s + 4, _CAP)))
             except Exception:                  # noqa: BLE001
                 continue
+        return out
+
+    def casts_since(self, since: int) -> list[tuple[int, int]]:
+        """自 `since`（write_count 的值）以來的**施放廣播** [(施法者ID, 技能ID)]。
+
+        只回子類型 0x0301 的（主施放），別的事件濾掉。讀壞就當沒有。
+        """
+        out: list[tuple[int, int]] = []
+        for data in self._slots_since(since):
             if len(data) < OFF_SKILL + 4:
                 continue
             if struct.unpack_from("<H", data, 0)[0] != CAST_OP:
@@ -249,6 +267,26 @@ class CastHook:
             caster = struct.unpack_from("<I", data, OFF_CASTER)[0]
             skill = struct.unpack_from("<I", data, OFF_SKILL)[0]
             out.append((caster, skill))
+        return out
+
+    def kills_since(self, since: int) -> list[tuple[int, int]]:
+        """自 `since` 以來的**死亡廣播** [(怪 eid, 殺手伺服器ID)]（版面見 KILL_*）。
+
+        殺手 == own_server_id() 就是伺服器明講「我殺的」；呼叫端自己比對
+        （也可以把自己的召喚物 eid 算進來）。
+        """
+        out: list[tuple[int, int]] = []
+        for data in self._slots_since(since):
+            if len(data) < KILL_OFF_TAG + 4:
+                continue
+            if struct.unpack_from("<H", data, 0)[0] != KILL_OP:
+                continue
+            if struct.unpack_from("<I", data, KILL_OFF_TAG)[0] != KILL_TAG:
+                continue
+            victim = struct.unpack_from("<I", data, KILL_OFF_VICTIM)[0]
+            killer = struct.unpack_from("<I", data, KILL_OFF_KILLER)[0]
+            if victim and killer:
+                out.append((victim, killer))
         return out
 
     def fired(self, since: int, server_id: int, skill_id: int) -> bool:

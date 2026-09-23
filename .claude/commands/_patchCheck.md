@@ -259,6 +259,20 @@ py tools\lua_globals_check.py  # Lua 全域表版面＋索引快取（判對話�
 （等待邏輯退回舊的簽章／代號偵測，變慢但不會做錯事）。見 memory
 `dialog-visible-flag`。
 
+### ★ 封包版面（AOB 救不了、只有官方改協定才會變）——改版後進遊戲驗一次
+
+```
+py tools\kills_check.py                      # 離線：死亡廣播解包＋擊殺歸屬邏輯
+py tools\killattr_probe.py --pid <pid> --secs 60   # 進遊戲：錄入向封包對事件
+```
+
+掛機的「已擊殺 N 隻」**只認**伺服器死亡廣播 `op=0x0a [怪 eid@2][殺手@6][7@10]`
+（`castwatch.KILL_*`，memory `kill-credit-packet`）。改版後跑探針看
+`reports/killattr_probe.txt`：每次 EXP 漲當拍要有一包 `op=0x000a` 且 `@6=我srv`；
+沒有＝協定變了 → 產品那邊擊殺數會**停數並標「監聽沒裝，停數」**（不會亂算），
+要重解版面改 `KILL_*`。同一份實錄也順便驗施放廣播 `op=0x1d sub=0x0301`。
+⛔ 跑探針前確認那台沒有工具箱的 castwatch hook（探針自己會判，見檔頭）。
+
 `tab_check` 的對照表是用 AST 掃 `app/tabs/*_tab.py` 的相依關係列出來的
 （分頁 → 它呼叫哪些讀取函式），不是憑印象寫的。目前涵蓋：
 

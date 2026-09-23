@@ -2190,8 +2190,16 @@ class CharFarmPage(QWidget):
         self._evgo_progress = ""
         self._mover: move.Mover | None = None
         self._mover_failed = 0.0     # 上次裝跳板失敗的時刻（0＝沒失敗過）；MOVER_RETRY_S 後才再試
-        self._castwatch = None       # 施放廣播監聽（首發＋補分身的 100% 確認用）
+        self._castwatch = None       # 施放廣播監聽（首發＋補分身＋擊殺歸屬的 100% 確認用）
         self._cw_failed = False      # 裝失敗過就別每拍狂試（重開掛機會再試一次）
+        # ★ 擊殺數只認伺服器的死亡廣播（castwatch.kills_since，殺手==我／我的召喚物）。
+        #   _kill_cw 記「上次數的是哪一份 hook」：換了一份就從它現在的 write_count
+        #   起算（剛裝的 hook 環槽裡是舊包，不能算）。
+        self._kill_cw = None
+        self._kill_wc = 0
+        self._kill_poll_t = 0.0
+        self._recent_tid: dict[int, tuple[int, float]] = {}   # 剛死的怪 eid → (種類ID, 時刻)，打王判定用
+        self._pet_eids: dict[int, float] = {}                 # 最近看過的我的召喚物 eid → 時刻
         self._walk_t = 0.0         # 距離上次下移動指令過了多久
         # 巡邏點：沒怪時依序走過去找怪（取代原本的單一「原點」）。
         # 每個點記 (x, y, 場景編號)；場景編號 None = 舊版存的、沒標記地圖。
@@ -4441,8 +4449,11 @@ class CharFarmPage(QWidget):
         self._rot_t = 0.0
         self._rot_boss_hit = False
 
-    def _note_boss_kill(self, m) -> None:
+    def _note_boss_kill(self, type_id: int | None) -> None:
         """確認打死的是不是王 —— 是王就讓「打王換頻道」下一拍出發。
+
+        呼叫端＝ `_poll_kills`（伺服器死亡廣播說殺手是我），type_id 是那隻怪的
+        種類 ID；None＝那隻已經不在清單裡查不到 → 不算王、不觸發。
 
         ⚠ `is_boss` 回 **None ＝ 查不到**（改版位移、範本表還沒載完）：
           一律**不算王、不觸發**。寧可不換頻，也不要拿猜的值去動作。
@@ -4453,11 +4464,11 @@ class CharFarmPage(QWidget):
           （2026-08-28 使用者定案：忽略，把這輪跑完就待命）——
           不然王多的地方會一輪接一輪永遠停不下來。
         """
-        if m is None or not self.rot_boss_cb.isChecked():
+        if type_id is None or not self.rot_boss_cb.isChecked():
             return
         if self._rot_seq or self._rot_settle > 0:
             return
-        if monsters.is_boss(self.sc, m.type_id) is not True:
+        if monsters.is_boss(self.sc, type_id) is not True:
             return
         self._rot_boss_hit = True
 
@@ -4848,9 +4859,10 @@ class CharFarmPage(QWidget):
             return False
 
     def _want_castwatch(self) -> bool:
-        """誰需要施放廣播監聽：①掛機中有設首次攻擊（首發逐發確認）
-        ②自動分身學到技能（補放要確認伺服器受理）。都不要就不該裝著。"""
-        return bool((self.run_cb.isChecked() and self._keys.opener_vk)
+        """誰需要入向封包監聽：①掛機中（擊殺數只認伺服器的死亡廣播，見 _poll_kills；
+        首發逐發確認也靠它）②自動分身學到技能（補放要確認伺服器受理）。
+        都不要就不該裝著。"""
+        return bool(self.run_cb.isChecked()
                     or (self.buff_cb.isChecked() and self._buff.skill))
 
     def _sync_castwatch(self) -> None:
@@ -4881,7 +4893,7 @@ class CharFarmPage(QWidget):
             self._keys.castwatch = self._castwatch
             if self._castwatch is None:
                 self._cw_failed = True
-                self.status.setText("⚠ 施放廣播監聽裝不起來（改版？）→ "
+                self.status.setText("⚠ 入向封包監聽裝不起來（改版？）→ 擊殺數停數、"
                                     "首發/補分身改『送出就算』，其餘不受影響")
             return
         self._release_castwatch()
@@ -5905,12 +5917,77 @@ class CharFarmPage(QWidget):
 
     def _bump_kills(self) -> None:
         self._kills += 1
-        self.kills_lbl.setText(f"已擊殺 {self._kills} 隻")
+        self._show_kills()
+
+    def _show_kills(self, unconfirmed: bool = False) -> None:
+        text = f"已擊殺 {self._kills} 隻" + ("（監聽沒裝，停數）" if unconfirmed else "")
+        if text != self.kills_lbl.text():
+            self.kills_lbl.setText(text)
 
     def _reset_kills(self) -> None:
         """歸零鈕。擊殺數不存設定：開程式從 0 起算，重開始也不歸零。"""
         self._kills = 0
-        self.kills_lbl.setText("已擊殺 0 隻")
+        self._show_kills()
+
+    def _poll_kills(self) -> None:
+        """擊殺數的**唯一**來源：伺服器的死亡廣播（castwatch.kills_since）。
+
+        ★★★ 2026-09-23 使用者：「被搶也算、怪物出地圖也算，導致殺怪數量是假的……
+          我要 100% 確認的」→ 只認 op=0x0a `[怪 eid][殺手]`，殺手 == 我，或 ==
+          我的召喚物（使用者定：「我的召喚物殺的才算」）。經驗上漲被否決
+          （AO 按傷害分經驗，別人補刀我也拿得到）。版面出處 memory `kill-credit-packet`。
+        · 監聽沒裝（改版對不上）→ 擊殺數**停數**並在標籤上標明，⛔ 不退回舊的
+          「Dead 就 +1」算法（那就是假數字）。
+        · 換了一份 hook（重裝）→ 從它現在的 write_count 起算，環槽裡的舊包不算。
+        · 召喚物 eid 會被伺服器整隻重建（summon.py 開頭），所以記最近 15 秒看過
+          的每一個，廣播晚到也對得上。
+        · 打王換頻的引信也從這裡舉：那隻的種類 ID 先查現在的清單，再查
+          `_recent_tid`（廣播可能比 Dead 晚 0.7 秒，清單可能已經沒牠）。
+        每 0.25 秒一次（一次讀 wcnt＋幾個槽，成本可忽略）。
+        """
+        now = time.monotonic()
+        if now - self._kill_poll_t < 0.25:
+            return
+        self._kill_poll_t = now
+        cw = self._castwatch
+        if cw is None or not cw.active:
+            self._kill_cw = None
+            self._show_kills(unconfirmed=True)
+            return
+        if cw is not self._kill_cw:
+            self._kill_cw = cw
+            self._kill_wc = cw.write_count()
+            self._show_kills()
+            return
+        wc = cw.write_count()
+        hits = cw.kills_since(self._kill_wc)
+        self._kill_wc = wc
+        # 召喚物 eid：每次都重讀（會重建），留 15 秒
+        pet = player.pet_eid(self.sc)
+        if pet:
+            self._pet_eids[pet] = now
+        for eid, t in list(self._pet_eids.items()):
+            if now - t > 15.0:
+                del self._pet_eids[eid]
+        for eid, t in list(self._recent_tid.items()):
+            if now - t[1] > 30.0:
+                del self._recent_tid[eid]
+        if not hits:
+            return
+        me = self._my_id()
+        for victim, killer in hits:
+            mine = bool(me) and (killer == me or killer in self._pet_eids)
+            tid = next((m.type_id for m in self.mons if m.eid == victim), None)
+            if tid is None and victim in self._recent_tid:
+                tid = self._recent_tid[victim][0]
+            if not mine:
+                self._dbg(f"怪 {victim & 0xFFFF:#x} 是 {killer:#x} 殺的（不是我）→ 不算")
+                continue
+            self._bump_kills()
+            self._note_boss_kill(tid)
+            self._dbg(f"伺服器確認：怪 {victim & 0xFFFF:#x} 是"
+                      + ("我的召喚物" if killer != me else "我")
+                      + f"殺的（累計 {self._kills} 隻）")
 
     def _note_rollback(self, me, here) -> bool:
         """位置被伺服器拉回了嗎？是的話順手做善後，回 True。
@@ -5995,11 +6072,13 @@ class CharFarmPage(QWidget):
             self._killed[eid] = time.monotonic() + (
                 KILL_MEMORY if confirmed else NOHP_MEMORY)
             return
-        if confirmed:
-            self._bump_kills()
-            # ★ 打王換頻道的引信：**只認自己確認打死的那一隻**。
-            #   遲到的回報（eid 對不上）在上面就 return 了，不會走到這裡。
-            self._note_boss_kill(m)
+        # ⛔⛔ 這裡**不再**加擊殺數、也不再舉打王旗（2026-09-23 使用者：「被搶也算、
+        #   怪物出地圖也算，導致殺怪數量是假的……我要 100% 確認的」）。
+        #   「牠死了」≠「我殺的」——被搶／走出視野／消失全會走到這裡。
+        #   擊殺歸屬只認伺服器的死亡廣播（_poll_kills）；這裡只記「剛死的怪是
+        #   哪一種」給那邊查王旗（廣播可能比 Dead 晚 0.7 秒到，清單那時可能已沒牠）。
+        if m is not None:
+            self._recent_tid[eid] = (m.type_id, time.monotonic())
         # 免得又挑到同一具還沒回收的屍體（存到期時間，見 _pick_next）
         self._killed[eid] = time.monotonic() + (
             KILL_MEMORY if confirmed else NOHP_MEMORY)
@@ -6340,6 +6419,11 @@ class CharFarmPage(QWidget):
             # ★ 自動換球同樣獨立於掛機（技能球在**練技**時也一樣會滿，手動
             #   打王時也會）—— 已經在上面所有 return 之前跑過了，這裡不必再叫。
             return
+
+        # ★ 擊殺數：伺服器死亡廣播說「殺手是我」才 +1（_poll_kills，自帶 0.25s 節流）。
+        #   放在所有提早 return 之前——廣播比怪變 Dead 晚到，換頻／回程那幾拍也要收。
+        self._sync_castwatch()
+        self._poll_kills()
 
         # ★ 死亡回程要在最前面：死亡／復活／傳送期間 state 常常是 None、
         #   也絕不能讓巡迴換頻道插進來，所以整個 tick 都讓給它。
