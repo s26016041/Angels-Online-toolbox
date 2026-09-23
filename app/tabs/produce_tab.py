@@ -230,6 +230,9 @@ BATCH_STALL_MAX = 600.0
 #   整趟砍掉、勾勾放掉，遊戲自己把已排進去的那批（≤999 個）做完就停，
 #   看起來就是「工具說 9000 多、遊戲做 900 多、做完發呆」。
 CRAFT_MAX_SECS = 3600.0
+# 配方表連續讀不到這麼久就大聲講（改版把配方欄位搬了時的症狀；2026-09-23
+# 之前是安靜跳「半成品做完了 0 個」，見 recipes.layout_ok）。
+RECIPE_NIL_WARN_SECS = 15.0
 # ★★ 使用者要求：**要走到他定的那個點**，不要有差距（2026-08-12）。
 #   所以門檻是「站上同一格」而不是「靠近就好」——格子座標都是 x.5，
 #   同一格的距離差不會超過 ~0.7。
@@ -1517,12 +1520,33 @@ class CharProducePage(QWidget):
                    數量, "mk":製作清單控制項指標, "left":清單還剩幾個,
                    "kicks":逾時重踢了幾次（每踢一次等待加倍；有進度歸零）}）
             scene  開始做的時候在哪張圖（點到門被帶走時看得出來）
+            nil_since 配方表從什麼時候開始連續讀不到（None=讀得到）；超過
+                   RECIPE_NIL_WARN_SECS 就大聲警示，不再安靜等
         """
         return {"idx": 0, "sig": None, "last_drop": 0.0, "made": 0,
                 "t0": time.monotonic(), "plans": None,
                 "total": None, "first": None, "per": None,
                 "props": None, "pi": 0, "poked": None,
-                "wnd": None, "batch": None, "scene": None}
+                "wnd": None, "batch": None, "scene": None,
+                "nil_since": None}
+
+    # ------------------------------------------------------------------
+    def _recipes_nil(self, c: dict) -> None:
+        """配方表這一拍讀不到：記下起點，連續太久就**大聲**講。
+
+        ★ 2026-09-23 教訓：9/22 改版把配方記錄的欄位整段搬了 0x10，舊偏移讀到
+          「沒有任何半成品配方」→ 一到製作檯就「半成品做完了，一共 0 個」。
+          現在 recipes.layout_ok() 驗不過會回 None（讀不到）；這裡負責不讓
+          「讀不到」變成永遠安靜地等。
+        """
+        now = time.monotonic()
+        if c.get("nil_since") is None:
+            c["nil_since"] = now
+            return
+        if now - c["nil_since"] >= RECIPE_NIL_WARN_SECS:
+            self._note(f"⚠ 配方表連續 {now - c['nil_since']:.0f} 秒讀不到 —— "
+                       "遊戲改版把配方欄位搬了？請跑 py tools\verify_offsets.py"
+                       "（「配方記錄版面」那條）", bad=True)
 
     # ------------------------------------------------------------------
     def _poke_bench(self, c: dict, advance: bool = False) -> str:
@@ -1639,7 +1663,9 @@ class CharProducePage(QWidget):
         if c["total"] is None:
             sched = recipes.schedule(self.sc, have)
             if sched is None:
-                return                             # 配方表讀不到，等下一拍
+                self._recipes_nil(c)               # 配方表讀不到，等下一拍
+                return
+            c["nil_since"] = None
             c["total"] = sum(n for _r, n in sched)
             if c["total"]:
                 what = "、".join(f"{itemname.of(r.product)}×{n}"
@@ -1652,15 +1678,18 @@ class CharProducePage(QWidget):
         if c["plans"] is None:
             plans = recipes.plan(self.sc, have)
             if plans is None:
-                return                             # 配方表讀不到，等下一拍
+                self._recipes_nil(c)               # 配方表讀不到，等下一拍
+                return
+            c["nil_since"] = None
             c["plans"], c["idx"] = plans, 0
             c["sig"], c["batch"] = None, None
         if c["idx"] >= len(c["plans"]):
             c["plans"] = None
             left_plans = recipes.plan(self.sc, have)
             if left_plans is None:
-                return          # ⚠ 表讀不到 ≠ 做完了 —— 等下一拍再確認
-                                #   （None/[] 混在一起就是第七次 false-empty）
+                self._recipes_nil(c)   # ⚠ 表讀不到 ≠ 做完了 —— 等下一拍再確認
+                return                 #   （None/[] 混在一起就是第七次 false-empty）
+            c["nil_since"] = None
             if not left_plans:
                 s["step"] = "dispose"
                 self._note(f"半成品做完了，一共 {c['made']} 個")

@@ -37,7 +37,7 @@ from app.game import bag, energy, enhance, entity, gear      # noqa: E402
 from app.game import inventory, itemname                     # noqa: E402
 from app.game import locate, login, monsters, move, player  # noqa: E402
 from app.game import quickbar, scene, skillcost, skills     # noqa: E402
-from app.game import scenery, team, terrain                 # noqa: E402
+from app.game import recipes, scenery, team, terrain        # noqa: E402
 
 OUT = ROOT / "reports" / "offset_verify.txt"
 NA = None                       # 「這台驗不了」
@@ -74,6 +74,8 @@ COVERS: tuple[tuple[str, str], ...] = (
     #   **那支根本不存在** —— 等於掛著一張沒人在驗的保證書（2026-08-28 /_audit）。
     #   偏移的不變量本來就都住在這一支，所以補在這裡，不另開一支。
     ("gear", "OFF_"), ("gear", "TMPL_"),
+    # 配方記錄版面（旗標 3/5、材料種類數＝材料格數）；要掛生產職才驗得到
+    ("recipes", "R_STAGE"), ("recipes", "R_MAT_KINDS"), ("recipes", "R_MAT_ID"),
 )
 
 
@@ -181,6 +183,17 @@ def checks(sc, log):
     page = quickbar.read_page(sc, 0)
     put("快捷欄 quickbar.TABLE_OFF", page is not None,
         f"第 0 頁 {sum(1 for s in (page or []) if s)} 格有東西")
+
+    # recipes.R_STAGE／R_MAT_KINDS／R_MAT_ID：配方記錄版面（disp8 偏移，AOB 跟不了）。
+    #   學會的每一筆配方旗標必須是 3/5、材料種類數要等於材料格數。
+    #   ⚠ 只有學了配方的角色（廚狐這類生產職）驗得到 —— 戰鬥職一律 NA，
+    #     改版體檢**要掛一台生產職**才算驗過（2026-09-23 就是這樣漏掉的）。
+    lay = recipes.layout_ok(sc)
+    nrec = len(recipes.learned_ids(sc) or [])
+    put("配方記錄版面 recipes.R_STAGE／R_MAT_KINDS",
+        NA if lay is None else lay,
+        f"學會 {nrec} 個配方" + ("" if nrec else "（這台沒學配方，換生產職驗）")
+        + ("" if lay is not False else " —— 旗標不是 3/5 或材料數對不上，版面搬了"))
 
     # robot.ROBOT_READY_OFF：那一格是布林，只准 0/1
     from app.game import robot

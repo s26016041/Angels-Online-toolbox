@@ -16,16 +16,28 @@
                  bit 索引就是配方ID（`initmakeclasswnd` 0x58F13D 那行
                  `test [ecx+eax*4+0x58F8], edx`）
 
-配方記錄的欄位（`makeitemnum` / `makeadd` / `initmakeclasswnd` 逐行讀出來的）
+配方記錄的欄位（2026-09-22 版；新舊映像各 27 個「查 Make 表」呼叫點逐一對出來的）
 --------------------------------------------------------------------------
     +0x00  產物 ID           +0x04 != 0 時產物是**技能**不是物品
-    +0x0C  生產類別（烹飪 31…）
-    +0x18  需要的技能等級
-    +0x28  成功率（實測都是 100）
-    +0x2C ~ +0x3C  材料物品 ID ×5
-    +0x40 ~ +0x50  各材料要幾個 ×5
-    +0x54  用到幾種材料
-    +0x58  3 = 半成品、5 = 成品（跟下面的分類 27 完全一致，當交叉驗證）
+    +0x0C ~ +0x1C  生產類別 ×5（烹飪 31…；★9/22 改版從 1 格變 5 格，一個配方可以
+                   屬好幾種類別 —— 遊戲自己的比對函式 0x552866 就是「+0x0C 起 5 格
+                   逐一 cmp」；後面所有欄位因此整段往後搬 0x10）
+    +0x20  需要的技能等級（⚠ 只憑資料對得上 Lv1/Lv5/Lv11 產物，沒有反組譯出處；
+           程式裡**沒有任何判斷用到它**，只是顯示／參考）
+    +0x38  成功率（實測都是 100；舊版 +0x28，0x5ecca0 讀）
+    +0x3C ~ +0x4C  材料物品 ID ×5（舊版 +0x2C；0x59a48d／0x5e4cd1 讀）
+    +0x50 ~ +0x60  各材料要幾個 ×5（舊版 +0x40；0x556374／0x5af959 讀）
+    +0x64  用到幾種材料（舊版 +0x54；0x59a48d／0x5af959 讀）
+    +0x68  3 = 半成品、5 = 成品（舊版 +0x58；0x59a1cd／0x5ea3dd／0x603457 讀；
+           跟下面的分類 27 完全一致，當交叉驗證）
+
+    ⚠ 這些是 disp8（1 byte）偏移，`locate` 的 off 類只解得了 4-byte disp32，
+      所以**沒辦法 AOB 自動跟**。改版後的防線是 `layout_ok()`：學會的配方裡
+      只要有一筆旗標不是 3/5、或材料種類數對不上材料數，就當版面搬了 →
+      清單類全部回 None（讀不到）而不是空清單，掛機分頁會大聲警示；
+      `tools/verify_offsets.py` 也有一條同樣的檢查給 /_patchCheck 用。
+    ⚠ 2026-09-23 踩過：舊偏移讀新版記錄，旗標全 0 → 「沒有半成品配方」→
+      一到製作檯就「半成品做完了，一共 0 個」。安靜做錯事的典型。
 
 ## 「半成品」不是猜的
 
@@ -71,12 +83,15 @@ ITEM_CLASS_SEMI = 27
 #   不單獨拿來判定（見 semi_finished）。
 STAGE_SEMI = 3
 
-# 配方記錄的欄位
+# 配方記錄的欄位（2026-09-22 版；出處見檔頭。⚠ disp8 偏移，AOB 跟不了，
+# 靠 layout_ok() 當防線）
 R_PRODUCT, R_IS_SKILL, R_CLASS = 0x00, 0x04, 0x0C
-R_NEED_LEVEL, R_RATE = 0x18, 0x28
-R_MAT_ID, R_MAT_NUM, R_MAT_KINDS, R_STAGE = 0x2C, 0x40, 0x54, 0x58
-R_SIZE = 0x5C              # ⚠ 一筆讀到這裡（涵蓋 R_STAGE +0x58）；欄位出處見檔頭
+CLASS_SLOTS = 5            # +0x0C 起 5 格生產類別（0x552866 的迴圈上限就是 5）
+R_NEED_LEVEL, R_RATE = 0x20, 0x38
+R_MAT_ID, R_MAT_NUM, R_MAT_KINDS, R_STAGE = 0x3C, 0x50, 0x64, 0x68
+R_SIZE = 0x6C              # ⚠ 一筆讀到這裡（涵蓋 R_STAGE +0x68）；欄位出處見檔頭
 MAT_SLOTS = 5
+STAGE_FULL = 5             # +0x68 的另一個合法值（成品）；旗標只會是 3 或 5
 
 # 貢獻品記錄的欄位
 G_ID, G_ITEM, G_GROUP, G_POINTS = 0x00, 0x04, 0x08, 0x0C
@@ -98,7 +113,8 @@ class Recipe:
     product_is_skill: bool
     need_level: int
     mats: tuple[tuple[int, int], ...]
-    stage: int             # +0x58：3 半成品／5 成品
+    stage: int             # +0x68：3 半成品／5 成品
+    classes: tuple[int, ...] = ()   # +0x0C 起 5 格生產類別（非 0 的那些）
 
     @property
     def looks_semi(self) -> bool:
@@ -169,7 +185,39 @@ def recipe(scanner, rid: int) -> Recipe | None:
                   bool(struct.unpack_from("<I", raw, R_IS_SKILL)[0]),
                   struct.unpack_from("<I", raw, R_NEED_LEVEL)[0],
                   tuple(mats),
-                  struct.unpack_from("<I", raw, R_STAGE)[0])
+                  struct.unpack_from("<I", raw, R_STAGE)[0],
+                  tuple(c for c in struct.unpack_from(f"<{CLASS_SLOTS}I", raw, R_CLASS)
+                        if c))
+
+
+def layout_ok(scanner) -> bool | None:
+    """配方記錄的欄位版面還對不對。True 對／False **搬了**／None 讀不到。
+
+    ★ 這是 disp8 偏移沒有 AOB 可跟的防線（見檔頭）。判法只用「一定成立」的
+      不變量：學會的每一筆配方，旗標 +0x68 必須是 3 或 5、材料種類數 +0x64
+      必須等於材料格裡非 0 的格數。版面一搬，這兩個欄位讀到的就是別的東西
+      （2026-09-23 實錄：旗標全 0）。
+    ⚠ 沒學任何配方的角色（戰鬥職）驗不了 → None，不是 False。
+    """
+    ids = learned_ids(scanner)
+    if ids is None or not ids:
+        return None
+    tab = _table(scanner, MAKE_TAB)
+    if tab is None:
+        return None
+    seen = 0
+    for rid in ids:
+        raw = _record(scanner, tab, rid, R_SIZE)
+        if raw is None or not struct.unpack_from("<I", raw, R_PRODUCT)[0]:
+            continue
+        seen += 1
+        stage = struct.unpack_from("<I", raw, R_STAGE)[0]
+        kinds = struct.unpack_from("<I", raw, R_MAT_KINDS)[0]
+        n = sum(1 for k in range(MAT_SLOTS)
+                if struct.unpack_from("<I", raw, R_MAT_ID + k * 4)[0])
+        if stage not in (STAGE_SEMI, STAGE_FULL) or kinds != n:
+            return False
+    return True if seen else None
 
 
 def learned_ids(scanner) -> list[int] | None:
@@ -207,6 +255,10 @@ def learned(scanner) -> list[Recipe] | None:
     """學會、而且記錄讀得起來的所有配方。讀不到回 None。"""
     ids = learned_ids(scanner)
     if ids is None:
+        return None
+    # ★ 版面驗不過＝「讀不到」，不是「沒有」—— 舊偏移讀新版記錄會把每一筆
+    #   都讀成垃圾，回空清單就是安靜做錯事（2026-09-23）。
+    if layout_ok(scanner) is False:
         return None
     out = []
     for rid in ids:
