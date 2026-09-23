@@ -5950,6 +5950,12 @@ class CharFarmPage(QWidget):
             return
         self._kill_poll_t = now
         cw = self._castwatch
+        if cw is not None and cw.active and not cw.installed():
+            # ★ 2026-09-23：監聽被拆了（別的行程／重開沒收乾淨）—— 旗標還舉著、
+            #   環槽沒人寫，擊殺數會安靜地停住。放下旗標，下一拍 _sync_castwatch
+            #   看到不 active 就重裝；重裝不成標籤會寫「停數」，不會裝死。
+            cw.mark_lost()
+            self._dbg("入向封包監聽不在遊戲裡了（被拆？）→ 重裝")
         if cw is None or not cw.active:
             self._kill_cw = None
             self._show_kills(unconfirmed=True)

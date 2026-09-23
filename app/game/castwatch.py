@@ -301,6 +301,34 @@ class CastHook:
                 return True
         return False
 
+    def installed(self) -> bool:
+        """遊戲裡 INBOUND_FN 開頭那 7 bytes **還是跳到我這一份 stub** 嗎（比照 Mover.installed）。
+
+        ★ 2026-09-23：`active` 只是「我裝過」的旗標。監聽被別的東西拆掉（另一個
+          行程的工具、工具箱重開沒收乾淨、手動還原）之後旗標還舉著，`kills_since`
+          讀的是一塊沒人再寫的環槽 → 擊殺數**安靜地停住**、首發確認全逾時，畫面
+          沒有任何提示。這支每次讀 7 bytes 當場驗，讀不到／對不上都算「不在」。
+        """
+        if not (self._active and self._pm and self._block):
+            return False
+        try:
+            cur = bytes(self._pm.read_bytes(INBOUND_FN, STOLEN))
+        except Exception:                      # noqa: BLE001
+            return False
+        if len(cur) != STOLEN or cur[0] != 0xE9:
+            return False
+        target = INBOUND_FN + 5 + int.from_bytes(cur[1:5], "little", signed=True)
+        return target == self._ring + _N * _SLOT
+
+    def mark_lost(self) -> None:
+        """監聽已經不在遊戲裡了（installed() 為 False）→ 只放下旗標，⛔ 不寫回原始
+        位元組：現在那 7 bytes 是別人的（或已經是原始碼），蓋回去等於拆別人的 hook。
+        呼叫端接著走 acquire 重裝（start 會驗 prologue，對不上照樣拒裝）。"""
+        self._active = False
+        with _shared_lock:
+            if _shared.get(self._pid) is self:
+                _shared.pop(self._pid, None)
+
     def stop(self) -> None:
         """卸 hook、還原原始位元組。"""
         if not self._active:

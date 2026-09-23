@@ -74,6 +74,13 @@ class Ring:
     def __init__(self):
         self.pk: list[bytes] = []
         self.active = True
+        self.inst = True                 # 遊戲裡那 7 bytes 還指著我（installed()）
+
+    def installed(self):
+        return self.inst
+
+    def mark_lost(self):
+        self.active = False
 
     def write_count(self):
         return len(self.pk)
@@ -184,6 +191,29 @@ check("同一批不重複數", p._kills == 8, str(p._kills))
 ring.active = False
 p.poll()
 check("hook 死了 → 標停數、不當機", "停數" in p.kills_lbl.text())
+
+ring2 = Ring()
+ring2.pk = [kill_pkt(0xAAAA, ME)]
+p._castwatch = ring2
+p.poll()
+ring2.pk += [kill_pkt(0xBBBB, ME)]
+p.poll()
+n_before = p._kills
+ring2.inst = False                        # 監聽被別的行程拆了：旗標還舉著、環槽沒人寫
+ring2.pk += [kill_pkt(0xCCCC, ME)]        # 這包其實不會再進來，模擬舊槽殘留
+p.poll()
+check("hook 被拆（installed 為 False）→ 放下旗標、標停數、不再數",
+      not ring2.active and "停數" in p.kills_lbl.text() and p._kills == n_before,
+      f"{ring2.active} {p.kills_lbl.text()} {p._kills}")
+check("被拆有 debug 說明", any("被拆" in x for x in p.dbg))
+ring3 = Ring()
+ring3.pk = [kill_pkt(0xDDDD, ME)]         # 重裝前的舊包
+p._castwatch = ring3
+p.poll()
+ring3.pk += [kill_pkt(0xEEEE, ME)]
+p.poll()
+check("重裝後從新 hook 起算、繼續數", p._kills == n_before + 1 and "停數" not in p.kills_lbl.text(),
+      f"{p._kills} {p.kills_lbl.text()}")
 
 print("失敗 %d 項" % fails)
 raise SystemExit(1 if fails else 0)
