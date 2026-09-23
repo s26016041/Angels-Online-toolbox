@@ -1815,6 +1815,12 @@ class CharDungeonPage(QWidget):
         # ---- 打怪流程（掛機頁的複本，見檔頭）：這些全是「跟目前目標綁在一起」
         #      的狀態，換目標一律走 _engage() 整組重設 ----
         self._last_gave_up = None    # 剛換掉的那一隻（有別隻時先挑別隻；⛔ 不是黑名單）
+        # ★ 這一趟鎖定過的怪物**種類**（type_id）。使用者 2026-09-23：「每次進副本會優先打
+        #   沒見過的怪物，每次刷副本都要重置」—— 王一場只出一隻、種類跟小怪不同，先挑
+        #   沒打過的種類就等於先打王。⚠ 只改候選的**排序**，距離／可達那些規則照舊；
+        #   每趟開始（_plan_route）清空。
+        self._fought: set = set()
+        self._cur_fresh = False      # 目前鎖的是不是沒打過的種類（_engage 設）
         self._me = None              # 這一拍我的位置（挑目標／算路徑用）
         self._force_t = 0.0          # 「強制走到」距離下次補送還有多久
         self._force_n = 0            # 這一步強制走送了幾次（只拿來回報）
@@ -2840,8 +2846,16 @@ class CharDungeonPage(QWidget):
                                               if len(pool) > len(rank) else "")
         return best
 
+    def _fresh(self, pool: list) -> list:
+        """候選裡這一趟**還沒打過的種類**（見 _fought）；一隻都沒有就回原池。"""
+        fresh = [t for t in pool if t[1].type_id not in self._fought]
+        return fresh or pool
+
     def _pick_next(self) -> bool:
-        """挑**路徑最短**的一隻接著打；挑不到回 False。⛔ 沒有黑名單。"""
+        """挑**路徑最短**的一隻接著打；挑不到回 False。⛔ 沒有黑名單。
+
+        ★ 沒打過的種類優先（_fought）：先在那群裡挑路徑最短的，全都走不到才看全部。
+        """
         pool = self._candidates()
         if not pool:
             return False
@@ -2849,7 +2863,10 @@ class CharDungeonPage(QWidget):
         if self._last_gave_up is not None and len(pool) > 1:
             pool = [t for t in pool if t[1].eid != self._last_gave_up] or pool
         grid, me = self._grid, self._me
-        best = self._nearest_by_path(pool, grid, me)
+        fresh = self._fresh(pool)
+        best = self._nearest_by_path(fresh, grid, me)
+        if best is None and grid is not None and fresh is not pool:
+            best = self._nearest_by_path(pool, grid, me)      # 沒打過的都沒路 → 全部
         if best is None and grid is not None:
             # 有地形圖卻每一隻都算不出路 ＝ 真的沒有走得到的怪，這一輪不挑
             #（⛔ 不退回直線最近：那等於明知走不到還鎖上去）。
@@ -2890,13 +2907,19 @@ class CharDungeonPage(QWidget):
         self._empty_since = 0.0
         # ★ 打起來了 → 正在數的「休息」作廢（使用者 9/2：清乾淨才算進入休息）
         self._wait_left = 0.0
+        first = mon.type_id not in self._fought
+        self._cur_fresh = first             # 鎖定的是沒打過的種類（_switch_closer 用）
+        if mon.type_id:
+            self._fought.add(mon.type_id)
         self._atk.attack(self._state, mon)
         self._keys.eid = mon.eid
         self._keys.ent_addr = mon.addr      # 官方施放函式要目標的實體位址
         self._keys.set_on(True)
-        self._say(f"鎖定「{mon.name}」　距離 {d:.1f} 格")
+        self._say(f"鎖定「{mon.name}」　距離 {d:.1f} 格" + ("（這趟沒打過的種類）" if first else ""))
         self._runlog_write(
-            f"鎖定 {mon.name} eid={mon.eid} 直線 {d:.1f}　候選：{self._rank_note or '（沒地形圖，照直線）'}"
+            f"鎖定 {mon.name} eid={mon.eid} 直線 {d:.1f}"
+            + ("　★沒打過的種類" if first else "")
+            + f"　候選：{self._rank_note or '（沒地形圖，照直線）'}"
             + (f"　不打：{self._left_out_note()}" if self._left_out_note() else ""),
             force=True)
 
@@ -2920,8 +2943,14 @@ class CharDungeonPage(QWidget):
             cur_cost = dist
         elif cur_cost is None:
             cur_cost = float("inf")
+        # ★ 目前鎖的是沒打過的種類 → 只准換到同樣沒打過的種類（目前這隻的種類已經記進
+        #   _fought，要扣掉它）：不會為了一隻打過的小怪比較近，就放掉還沒打過的王。
+        others = [t for t in pool if t[1].eid != cur.eid]
+        if self._cur_fresh:
+            others = [t for t in others
+                      if t[1].type_id not in (self._fought - {cur.type_id})]
         best = self._nearest_by_path(
-            [t for t in pool if t[1].eid != cur.eid], grid, me,
+            others, grid, me,
             cap=None if cur_cost == float("inf") else cur_cost - SWITCH_GAIN)
         if best is None or best[0] > cur_cost - SWITCH_GAIN:
             return False
@@ -4944,6 +4973,7 @@ class CharDungeonPage(QWidget):
         self._fly = None
         self._drop_target()
         self._nav.reset()
+        self._fought.clear()         # ★ 新的一趟：「沒打過的種類」重新算（使用者 9/23）
         if here is not None and self._script.scene is not None and here != self._script.scene:
             if not ent:
                 self._stop("⛔ 這份腳本沒記入口傳送點，回不去副本")

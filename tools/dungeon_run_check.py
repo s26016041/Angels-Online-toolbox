@@ -116,8 +116,9 @@ class FakeNav:
 class FakeMon:
     """最小的假怪：挑目標／可達過濾／收工判定只用到這幾個欄位。"""
 
-    def __init__(self, x=10.0, y=10.0, eid=1, name="怪", addr=0x3000):
+    def __init__(self, x=10.0, y=10.0, eid=1, name="怪", addr=0x3000, type_id=0):
         self.x, self.y, self.eid, self.name, self.addr = x, y, eid, name, addr
+        self.type_id = type_id     # 種類（「沒打過的種類優先」看這個；0＝不分種類）
         self.dead = False
         self.hp_zero = False
         self.state = ""            # 動畫狀態（_live_monsters 的屍體過濾要）
@@ -1627,6 +1628,38 @@ def main() -> int:
     tab._live_monsters = lambda: [far]
     ck("★ 只剩超過 30 格的 → 不追、跑腳本", not tab._fight((10.0, 10.0), TICK))
     ck("　訊息講得出原因", "超過 30 格" in tab.status.text(), tab.status.text())
+
+    # ★★ 使用者 2026-09-23：「每次進副本會優先打沒見過的怪物，每次刷副本都要重置」
+    #   → 這一趟沒鎖定過的**種類**優先（王一場一隻、種類跟小怪不同＝先打王）。
+    print("\n沒打過的種類優先；每趟重置（2026-09-23）")
+    tab = make_tab([{"do": "walk", "to": [50, 50]}])
+    tab._reach = None
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    mob1 = FakeMon(x=11.0, y=10.0, eid=201, name="小怪", type_id=4548)
+    mob2 = FakeMon(x=12.0, y=10.0, eid=202, name="小怪", type_id=4548)
+    boss = FakeMon(x=20.0, y=10.0, eid=203, name="王", type_id=4551)
+    tab._live_monsters = lambda: [mob1, mob2, boss]
+    ck("★ 第一隻：都沒打過 → 照最近挑（小怪）", tab._pick_next() and tab._cur is mob1,
+       f"cur={tab._cur and tab._cur.name}")
+    ck("　鎖定過的種類記下來了", tab._fought == {4548}, str(tab._fought))
+    tab._cur = None
+    ck("★★ 第二隻：另一隻小怪更近，但王的種類沒打過 → 先打王",
+       tab._pick_next() and tab._cur is boss, f"cur={tab._cur and tab._cur.name}")
+    tab._cur = None
+    tab._live_monsters = lambda: [mob1, mob2]
+    ck("　全都打過的種類 → 退回照最近挑", tab._pick_next() and tab._cur is mob1)
+    # 趕路途中冒出更近的：鎖的是沒打過的王 → 不會為了打過的小怪換掉
+    tab._live_monsters = lambda: [mob1, mob2, boss]
+    tab._cur = None
+    tab._fought = {4548}
+    tab._pick_next()
+    tab._switch_t = 0.0
+    ck("★ 鎖著沒打過的王、旁邊小怪更近 → 不換", tab._cur is boss
+       and not tab._switch_closer(boss, 10.0) and tab._cur is boss,
+       f"cur={tab._cur and tab._cur.name}")
+    tab._fought = {4548, 4551, 9999}
+    tab._reset_run()                              # 開跑走這裡；每趟補給完的 _plan_route 也清
+    ck("★ 開跑／新的一趟 → 種類紀錄清空", tab._fought == set(), str(tab._fought))
 
     # ★★★ 掛機那套：「近」＝我們自己 A* 算的路徑長度，不是直線
     print("\n挑目標＝路徑最短（掛機頁的複本）")
