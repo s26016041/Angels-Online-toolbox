@@ -43,7 +43,7 @@ from app.tabs.base_tab import GROUP_CHORES, BaseTab
 from app.tabs.enhance_tab import CELL, Cell, IconGrid
 
 REFRESH_MS = 400
-RUN_MS = 200
+RUN_MS = 50                      # 敲錘中多久看一次結果（使用者 2026-09-23 嫌慢；讀一格只要幾毫秒）
 HIST_MAX = 300
 TARGET_MAX = 9999
 

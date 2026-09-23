@@ -328,17 +328,21 @@ class Run:
         return []
 
     def _rolled(self, f: Furn) -> list[Event]:
+        ms = (time.monotonic() - self.sent_at) * 1000
         self.sent_at = 0.0
         self.resend = 0
         self.strikes += 1
         same = "（一樣）" if f.bonus == self.before else ""
         evs = [Event(ROLLED, f"第 {self.strikes} 錘：加成 {self.before} → {f.bonus}{same}"
-                             f"，魔力值 {f.total}", f.total)]
+                             f"，魔力值 {f.total}（{ms:.0f} ms）", f.total)]
         if f.total >= self.target:
             self.done = True
             evs.append(Event(DONE, f"{self.name} 魔力值 {f.total}（{f.base}+{f.bonus}）"
                                    f"≥ {self.target}，停", f.total))
-        return evs
+            return evs
+        # ★ 結果驗完就當場送下一錘，不多等一拍（使用者 2026-09-23 嫌慢）。
+        #   _send() 照樣重讀那一格、認 serial、重找錘子 —— 驗證一步都沒少。
+        return evs + self._send()
 
     def _check(self) -> list[Event]:
         f, st = read_state(self.sc, self.slot, self.serial)

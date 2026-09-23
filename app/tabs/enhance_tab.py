@@ -76,7 +76,8 @@ PICK_EDGE = "#FFD400"          # 選起來的黃色粗框
 PICK_WIDTH = 3
 
 REFRESH_MS = 400               # 背包多久對一次帳
-RUN_MS = 200                   # 強化狀態機多久跑一拍
+RUN_MS = 200                   # 打孔狀態機多久跑一拍
+STRIKE_MS = 50                 # 強化錘多久看一次結果（使用者 2026-09-23 嫌慢；讀一格背包只要幾毫秒）
 HIST_MAX = 300
 # 選裝備時「寶石等限 ≤」自動填成 裝備等級 − 這個數（使用者 2026-09-03 定 15 → 同日改 10），仍可手改
 GEM_CAP_BELOW = 10
@@ -661,7 +662,7 @@ class EnhanceTab(BaseTab):
         self._run = enhance.Run(sc, mv, g.slot, g.serial, target, g.name)
         self._log(f"開始：{g.name} +{g.enhance} → +{target}", "#7CD8FF")
         self.status.setText(f"強化中… {g.name} → +{target}")
-        self._run_timer.start(RUN_MS)
+        self._run_timer.start(STRIKE_MS)
         self._update_buttons()
 
     def _on_go_holes(self) -> None:

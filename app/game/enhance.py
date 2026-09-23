@@ -242,15 +242,19 @@ class Run:
             return self._stop(GONE, f"{self.name} 強化失敗消失", self.before)
         self.grace.pop("gear", None)
         if g.enhance > self.before:
+            ms = (time.monotonic() - self.sent_at) * 1000
             self.sent_at = 0.0
             self.resend = 0
-            evs = [Event(SUCCESS, f"{self.name} 強化成功 → +{g.enhance}",
+            evs = [Event(SUCCESS, f"{self.name} 強化成功 → +{g.enhance}（{ms:.0f} ms）",
                          g.enhance)]
             if g.enhance >= self.target:
                 self.done = True
                 evs.append(Event(DONE, f"{self.name} 已達目標 +{g.enhance}",
                                  g.enhance))
-            return evs
+                return evs
+            # ★ 結果驗完就當場送下一發，不多等一拍（使用者 2026-09-23 嫌慢）。
+            #   _send() 照樣重讀那一格、認 serial、重找錘子 —— 驗證一步都沒少。
+            return evs + self._send()
         if g.enhance < self.before:
             return self._stop(DOWNGRADE,
                               f"{self.name} 強化失敗退等 → +{g.enhance}",
