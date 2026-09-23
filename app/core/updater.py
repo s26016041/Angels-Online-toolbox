@@ -73,6 +73,31 @@ PAR_REDIAL = 8           # 一條工人最多重撥幾次（線路本來就慢�
 PAR_STALL = 45.0         # 秒：全部連線這麼久沒進半個位元組＝網路斷了，收工
 PAR_ERRORS = 5           # 一條工人連續出錯幾次就退場
 PAR_RERESOLVE = 5.0      # 秒：簽名網址過期要重走轉址，但這麼短的時間內不重走第二次
+PAR_STALL_KICKS = 1      # 整體停滯先「重解網址＋全部重撥」幾輪，過了才放棄（2026-09-23）
+LOG_NAME = "update.log"  # 下載紀錄，放 exe 旁（開發時放 reports/）；卡住時才有東西看
+LOG_MAX = 512 * 1024     # 超過就從頭寫
+
+
+def log_path() -> Path:
+    base = exe_path().parent if is_frozen() else Path(__file__).resolve().parents[2] / "reports"
+    return base / LOG_NAME
+
+
+_log_lock = threading.Lock()
+
+
+def _log(msg: str) -> None:
+    """一行紀錄（時間＋訊息）。⚠ 寫不進去就算了，絕不能因為 log 讓更新失敗。"""
+    try:
+        path = log_path()
+        with _log_lock:
+            mode = "a"
+            if path.exists() and path.stat().st_size > LOG_MAX:
+                mode = "w"
+            with path.open(mode, encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:                                      # noqa: BLE001
+        pass
 
 
 def mirror_base() -> str:
@@ -385,6 +410,9 @@ class _Par:
         self.best = 0.0
         self.abort = False
         self.redials = 0                       # 診斷用：總共重撥幾次
+        self.yields = 0                        # 診斷用：讓段幾次
+        self.errors = 0                        # 診斷用：錯誤幾次
+        self.kick = 0                          # 整體停滯時 +1：每條工人看到就斷線重撥
         self.last_progress = time.time()
         self._tlock = threading.Lock()
         self._target = None
@@ -432,7 +460,7 @@ class _Par:
             self.cond.notify_all()
 
     def work(self) -> None:
-        conn, redials, errors, mine = None, 0, 0, 0.0
+        conn, redials, errors, mine, seen_kick = None, 0, 0, 0.0, self.kick
         with open(self.part, "r+b") as f:
             while True:
                 item = self.take(mine)
@@ -440,6 +468,15 @@ class _Par:
                     break
                 start, end = item
                 n, verdict, rate = 0, "ok", 0.0
+                if self.kick != seen_kick:     # 整體停滯過 → 手上這條連線不要了，重擲骰子
+                    seen_kick = self.kick
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:                  # noqa: BLE001
+                            pass
+                        conn = None
+                    mine = 0.0
                 try:
                     if conn is None:
                         host, path, ctx = self.where()
@@ -485,8 +522,9 @@ class _Par:
                                 break
                     else:
                         rate = mine = n / max(time.time() - t1, 1e-3)
-                except Exception:                          # noqa: BLE001
+                except Exception as exc:                   # noqa: BLE001
                     verdict = "error"
+                    err = f"{type(exc).__name__}: {exc}"
                 self.give_back(start, n, end, rate)
                 if verdict == "ok":
                     errors = 0
@@ -501,16 +539,25 @@ class _Par:
                     redials += 1
                     self.redials += 1
                     mine = 0.0                 # 新連線還沒證明過自己
+                    _log(f"  重撥：{n / max(time.time() - t1, 1e-3) / 1e3:.0f}KB/s 太慢"
+                         f"（段 {start >> 20}MB，第 {redials} 次）")
                 elif verdict == "yield":
-                    break
+                    # ★ 2026-09-23 改：讓段之後**不退場**，斷線重撥後照樣排隊（mine=0 →
+                    #   take() 會禮讓快的）。以前是 break 直接走人：一趟下來讓過段的
+                    #   工人越走越少，尾段碰到壞連線就沒人接手 → 88% 卡住整包放棄。
+                    self.yields += 1
+                    mine = 0.0
                 else:
                     errors += 1
+                    self.errors += 1
+                    _log(f"  錯誤：{err}（段 {start >> 20}MB，連續第 {errors} 次）")
                     if errors > PAR_ERRORS or self.abort:
+                        _log("  這條工人退場（錯太多次／已放棄）")
                         break
                     try:
                         self.where(force=True)
-                    except Exception:                      # noqa: BLE001
-                        pass
+                    except Exception as exc:               # noqa: BLE001
+                        _log(f"  重解網址失敗：{type(exc).__name__}: {exc}")
                     time.sleep(0.3)
         if conn is not None:
             try:
@@ -550,11 +597,15 @@ def _fetch_parallel(url: str, info: dict, dest: Path, progress=None):
                 f.truncate(total)
         st = _Par(url, total, part, done)
         st.where()
-    except Exception:                                      # noqa: BLE001
+    except Exception as exc:                               # noqa: BLE001
+        _log(f"平行：起頭就失敗（{type(exc).__name__}: {exc}）→ 退回單線")
         if not done:
             _drop()
         return None
     got0 = st.got
+    _log(f"平行：開始，{total / 1e6:.1f}MB，已有 {got0 / 1e6:.1f}MB，缺 {len(st.queue)} 段")
+    t0 = time.time()
+    kicks = 0
     workers = [threading.Thread(target=st.work, daemon=True)
                for _ in range(min(PAR_CONNS, max(1, len(st.queue))))]
     for t in workers:
@@ -563,17 +614,38 @@ def _fetch_parallel(url: str, info: dict, dest: Path, progress=None):
         time.sleep(0.2)
         if progress:
             progress(min(st.got, total), total)
-        if time.time() - st.last_progress > PAR_STALL:
-            st.abort = True
+        if time.time() - st.last_progress > PAR_STALL and not st.abort:
+            # ★ 2026-09-23：整體停滯先別放棄 —— 簽名網址可能過期／握著尾段的連線全是
+            #   壞路徑。重解一次網址、叫每條工人斷線重撥（kick），再給一輪 PAR_STALL。
+            if kicks < PAR_STALL_KICKS:
+                kicks += 1
+                _log(f"平行：{PAR_STALL:.0f} 秒沒進半個位元組（{st.got / 1e6:.1f}MB）"
+                     f"→ 重解網址＋全部重撥（第 {kicks} 輪）")
+                try:
+                    st.where(force=True)
+                except Exception as exc:                   # noqa: BLE001
+                    _log(f"  重解網址失敗：{type(exc).__name__}: {exc}")
+                with st.cond:
+                    st.kick += 1
+                    st.last_progress = time.time()
+                    st.cond.notify_all()
+            else:
+                _log(f"平行：又停滯 {PAR_STALL:.0f} 秒 → 放棄這一趟（{st.got / 1e6:.1f}MB）")
+                st.abort = True
+    _log(f"平行：收工 {time.time() - t0:.1f} 秒，抓到 {st.got / 1e6:.1f}MB，"
+         f"重撥 {st.redials}／讓段 {st.yields}／錯誤 {st.errors}")
     if not st.queue and _holes(st.done, total) == []:
         side.unlink(missing_ok=True)
         dest.unlink(missing_ok=True)
         part.replace(dest)
         if _good(dest, info):
+            _log("平行：抓完、驗過 ✔")
             return True
+        _log("平行：抓完但驗不過（大小／MZ／sha256）→ 丟掉")
         dest.unlink(missing_ok=True)           # 驗不過的一定要丟
         return None
     if st.got <= got0:                         # 這一趟什麼都沒抓到 → 這條路不通
+        _log("平行：這一趟半個位元組都沒進來")
         if not done:
             _drop()
         return None
@@ -581,6 +653,7 @@ def _fetch_parallel(url: str, info: dict, dest: Path, progress=None):
         side.write_text(json.dumps({"key": key, "ranges": _merge(st.done)}), "utf-8")
     except OSError:
         _drop()
+    _log("平行：抓到一半斷了，半成品留著")
     return False
 
 
@@ -596,16 +669,30 @@ def download(info: dict, dest: Path, progress=None) -> bool:
     """
     base = mirror_base()
     url = info.get("url")
+    _log(f"下載 {info.get('version') or ''} {info.get('name') or ''} "
+         f"{(info.get('size') or 0) / 1e6:.1f}MB")
     if base:
         if _fetch(f"{base}/{info.get('name') or ASSET_NAME}", info, dest, progress):
+            _log("鏡像：抓完 ✔")
             return True
+        _log("鏡像：失敗 → 改抓 GitHub")
         if url:
             dest.unlink(missing_ok=True)       # 鏡像不行 → 換 GitHub，從頭抓
     if not url:
         return False
     ok = _fetch_parallel(url, info, dest, progress)
+    if ok is False:
+        # ★ 2026-09-23：抓到一半斷了不要馬上跳「更新失敗」—— 同一次啟動內再接一次
+        #   （只抓缺的）。這一次也半個位元組都沒進來（None）＝網路真的不通，
+        #   ⛔ 不退回單線從頭抓（半成品留著，下次啟動接著）。
+        _log("再接一次…")
+        ok = _fetch_parallel(url, info, dest, progress)
+        if ok is None:
+            ok = False
     if ok is None:
+        _log("退回單線抓")
         ok = _fetch(url, info, dest, progress)
+    _log("結果：" + ("成功 ✔" if ok else "失敗 ✘"))
     return bool(ok)
 
 

@@ -188,7 +188,8 @@ updater.PAR_CHUNK = 256 * 1024                    # 2MB 的假檔切成 8 段
 updater.PAR_PROBE = 0.05
 updater.PAR_RERESOLVE = 0.0
 NET = {"path": "/blob?sig=1", "budget": None, "slow_first": 0, "corrupt": False,
-       "sent": 0}                                 # sent＝真的送出去幾個位元組
+       "sent": 0, "stall_first": 0, "budget_once": False,
+       "attempt": 0}                              # sent＝真的送出去幾個位元組；attempt＝第幾趟平行
 NLOCK = threading.Lock()
 CONNS: list = []
 REQS: list[tuple[int, int]] = []                  # 每一發 Range 的 [start, end)
@@ -200,12 +201,18 @@ class ParResp:
         self.conn, self.data, self.status, self.pos = conn, data, status, 0
 
     def read(self, n=-1):
+        if self.conn.stall:                       # 卡死的連線：半個位元組都不給，最後逾時
+            time.sleep(0.3)
+            raise TimeoutError("timed out（測試）")
         if self.conn.slow:                        # 抽到壞路徑的連線：一次只給 1KB
             time.sleep(0.02)
             n = min(n, 1024)
         blk = self.data[self.pos:self.pos + n]
         with NLOCK:
-            if NET["budget"] is not None:
+            # budget_once：只有第一趟平行有額度限制，第二趟網路就好了
+            budgeted = NET["budget"] is not None and (
+                not NET["budget_once"] or NET["attempt"] <= 1)
+            if budgeted:
                 if NET["budget"] < len(blk):
                     raise ConnectionResetError("網路斷了（測試）")
                 NET["budget"] -= len(blk)
@@ -218,6 +225,7 @@ class ParConn:
     def __init__(self):
         with NLOCK:
             self.slow = len(CONNS) < NET["slow_first"]
+            self.stall = len(CONNS) < NET["stall_first"]
             CONNS.append(self)
         self.closed = False
         self.served = 0
@@ -245,7 +253,8 @@ class ParConn:
 
 def par_net(**kw):
     NET.update({"path": "/blob?sig=1", "budget": None, "slow_first": 0,
-                "corrupt": False, "sent": 0})
+                "corrupt": False, "sent": 0, "stall_first": 0, "budget_once": False,
+                "attempt": 0})
     NET.update(kw)
     CONNS.clear()
     REQS.clear()
@@ -258,6 +267,20 @@ def par_net(**kw):
     updater._resolve = _res
     updater._par_conn = lambda host, ctx: ParConn()
     updater._urlopen_req = _single_forbidden
+    updater._fetch_parallel = _counted_par
+
+
+_orig_par = updater._fetch_parallel
+
+
+def _counted_par(*a, **kw):
+    NET["attempt"] += 1
+    return _orig_par(*a, **kw)
+
+
+def _log_text() -> str:
+    lp = updater.log_path()
+    return lp.read_text("utf-8") if lp.exists() else ""
 
 
 def _single_forbidden(req, timeout=None):
@@ -353,6 +376,47 @@ check("★ 判定失敗", not updater.download(INFO, dest))
 check("★ 壞檔、半成品都不留", not dest.exists()
       and not list(dest.parent.glob("*.par*")))
 check("　有退回單線再試一次", bool(CALLS))
+
+print("⑬ 整體停滯 → 先重解網址＋全部重撥一輪，⛔ 不准 45 秒一到就放棄（2026-09-23：88% 卡住）")
+# 卡死的連線 0.3 秒才逾時、再 0.3 秒才重撥；8 段＝8 條工人，前 8 條全卡死 → 第一批全停
+#   → 0.45 秒就算停滯（真實世界：socket 20 秒逾時、PAR_STALL 45 秒，比例一樣）
+updater.PAR_STALL = 0.45
+par_net(stall_first=8)
+dest = tmp()
+t0 = time.time()
+mark = len(_log_text())
+ok = updater.download(INFO, dest)
+check("★ 照樣抓完", ok and dest.read_bytes() == BODY, f"ok={ok}")
+check("★ 停滯時先重解網址＋全部重撥（kick），不是直接放棄",
+      "全部重撥（第 1 輪）" in _log_text()[mark:] and "放棄這一趟" not in _log_text()[mark:])
+check("　卡死的連線都被關掉", all(c.closed for c in CONNS if c.stall),
+      f"{sum(c.closed for c in CONNS if c.stall)}/{sum(c.stall for c in CONNS)}")
+check("　沒有等到天荒地老", time.time() - t0 < 10.0, f"{time.time() - t0:.1f}s")
+updater.PAR_STALL = 45.0
+
+print("⑭ 抓到一半斷了 → 同一次啟動內再接一次（只抓缺的），⛔ 不准馬上跳更新失敗")
+updater.PAR_ERRORS = 1
+par_net(budget=900_000, budget_once=True)          # 第一趟抓 90 萬就斷，第二趟網路好了
+dest = tmp()
+ok = updater.download(INFO, dest)
+check("★ 一次 download() 就成功", ok and dest.read_bytes() == BODY, f"ok={ok}")
+check("★ 真的是第二趟接上的", NET["attempt"] == 2, str(NET["attempt"]))
+check("★ 第二趟只抓缺的（總送出＝整包，沒重抓）", NET["sent"] == len(BODY),
+      f"送出 {NET['sent']}，整包 {len(BODY)}")
+check("　沒退回單線", not CALLS, str(CALLS))
+par_net(budget=900_000)                           # 第二趟也不通 → 才失敗、半成品留著
+dest = tmp()
+check("　第二趟也不通才失敗", not updater.download(INFO, dest))
+check("　半成品留著、沒退回單線從頭抓",
+      dest.with_name(dest.name + ".par").exists() and not CALLS, str(CALLS))
+updater.PAR_ERRORS = 5
+
+print("⑮ 下載紀錄 update.log")
+lp = updater.log_path()
+text = lp.read_text("utf-8") if lp.exists() else ""
+check("★ 有寫紀錄檔", lp.exists() and text, str(lp))
+check("　記到停滯重撥與再接一次", "全部重撥" in text and "再接一次" in text)
+check("　記到結果", "結果：成功" in text and "結果：失敗" in text)
 
 print()
 if FAILS:
