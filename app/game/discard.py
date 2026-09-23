@@ -5,9 +5,12 @@
 
 丟棄封包（2026-09-23 從遊戲自己的 Lua 綁定 `game.destroyitemslot` 反組譯，這版 0x596D50）：
   · 它拿 (視窗資源 id, 格號)，把資源 id 換成背包種類；背包（ITEM_CHAR＝1）那條分支是
-    找到那格的物品物件後叫 `0x5D30B3(格號, [物件+8])`：
+    找到那格的物品物件（`0x507F0D`＝實體+0x2FC 那個 vector 的第 n 格，跟 bag.py 讀的同一個
+    指標）後叫 `0x5D30B3(格號, [物件+8])`：
         push 8 / push 0x13 → 建包（＝jumpmap.BUILD_FN，已 AOB）
-        [內文+2] = u16 格號、[內文+4] = u32 物品序號（物件 +0x00 序號＝bag.Item.serial）
+        [內文+2] = u16 格號、[內文+4] = u32 **物品種類 ID**（物件 +0x08＝bag.ITEM_TYPE）
+        ⚠⚠ 第一版抄成序號（+0x00）→ 伺服器不認、東西不走、旅行背包被報成「丟不掉」
+          （使用者 2026-09-23 實測）。+8 是種類不是序號，⛔ 別再改回去。
         送出 ＝ jumpmap.SEND_FN（[jumpmap.CONN_PTR]，已 AOB）
     → 代號 **0x13**、內文 **8 bytes**；建/送/連線完全沿用存倉庫那組，零新位址。
   · 非背包分支走 `0x5D2DC5(0x13, 種類, 格號)`（倉庫／娃娃欄那些）——我們只丟背包，不用。
@@ -32,9 +35,9 @@ CFG_KEY = "discard.items"        # 清單：物品種類 ID 的 list（全部分
 # ★ 出處：0x5D30B3 反組譯 `push 8 / push 0x13 / call BUILD_FN`（檔頭）。
 DISCARD_OPCODE = 0x13
 DISCARD_BODY = 8
-# ★ 出處同上：內文 +2 u16 格號、+4 u32 序號（+0 代號由建構函式寫）。
+# ★ 出處同上：內文 +2 u16 格號、+4 u32 種類 ID（+0 代號由建構函式寫）。
 _OFF_SLOT = 2
-_OFF_SERIAL = 4
+_OFF_TYPE = 4
 SCRATCH_OFF = 0x1E0              # 相對 mover.scratch()；避開 jumpmap 0x100/sell 0x140/supply 0x180/team 0x1C0
 CALL_TIMEOUT = 1.0
 MAX_PER_RUN = 60                 # 一輪最多丟幾件（防呆上限；正常一批遠少於此）
@@ -88,15 +91,15 @@ def pending(scanner, ids: set[int]) -> list[bag.Item] | None:
 # ---------------------------------------------------------------------------
 # 丟
 # ---------------------------------------------------------------------------
-def discard_slot(mover, scanner, slot: int, serial: int) -> tuple[bool, str]:
-    """送一包「丟棄」。slot = 物品格號（bag.Item.slot）、serial = 物品序號（bag.Item.serial）。
+def discard_slot(mover, scanner, slot: int, type_id: int) -> tuple[bool, str]:
+    """送一包「丟棄」。slot = 物品格號（bag.Item.slot）、type_id = 物品種類 ID（bag.Item.type_id）。
 
-    封包＝代號 0x13、內文 8：u16 格號 + u32 序號。建/送同存倉庫（supply.deposit_slot）。
+    封包＝代號 0x13、內文 8：u16 格號 + u32 種類 ID。建/送同存倉庫（supply.deposit_slot）。
     """
     if not (jumpmap.BUILD_FN and jumpmap.SEND_FN):
         return False, "送包位址還沒定位（改版？先跑 patch_doctor）"
-    if not (0 <= slot <= 0xFFFF) or not (0 < serial < 0xFFFFFFFF):
-        return False, "格號／序號不合理，不送"
+    if not (0 <= slot <= 0xFFFF) or not (0 < type_id < 0xFFFFFFFF):
+        return False, "格號／種類不合理，不送"
     with mover.lock:
         buf = mover.scratch() + SCRATCH_OFF
         mover.write(buf, b"\0" * 16)
@@ -106,8 +109,8 @@ def discard_slot(mover, scanner, slot: int, serial: int) -> tuple[bool, str]:
         data = supply._u32(scanner, buf + 4)
         if not 0x10000 < data < 0x7FFF0000:
             return False, "封包資料指標不合理"
-        # data+0 代號已由建構函式寫；我們填 +2 格號、+4 序號。
-        payload = struct.pack("<HI", slot & 0xFFFF, serial & 0xFFFFFFFF)
+        # data+0 代號已由建構函式寫；我們填 +2 格號、+4 種類 ID。
+        payload = struct.pack("<HI", slot & 0xFFFF, type_id & 0xFFFFFFFF)
         if not mover.write(data + _OFF_SLOT, payload):
             return False, "寫封包內容失敗"
         conn = supply._u32(scanner, jumpmap.CONN_PTR)
@@ -126,7 +129,7 @@ def run(mover, scanner, ids: set[int] | None = None, say=None,
         should_stop=None) -> tuple[bool, str]:
     """把背包裡清單上的東西一件一件丟掉。回 (接得起來嗎, 訊息)。
 
-    每一件送之前都重掃背包（格號／序號當場重讀）；送完 poll 到序號消失才算。
+    每一件送之前都重掃背包（格號／種類當場重讀）；送完 poll 到那件的序號消失才算。
     沒消失＝伺服器不讓丟（安全鎖／不可丟棄的東西）→ 這個序號跳過，訊息裡點名。
     """
     def note(m):
@@ -155,7 +158,7 @@ def run(mover, scanner, ids: set[int] | None = None, say=None,
             break
         it = pend[0]                 # 剛讀到的（格號／序號送出前當場重讀，鐵則）
         note(f"丟棄 {itemname.label(it.type_id, it.count)}（格 {it.slot}）…")
-        ok, msg = discard_slot(mover, scanner, it.slot, it.serial)
+        ok, msg = discard_slot(mover, scanner, it.slot, it.type_id)
         if not ok:
             return (dropped > 0), f"丟棄送不出去（{msg}）；已丟 {dropped} 件"
         gone = False

@@ -4,7 +4,8 @@
 
 驗的規格（2026-09-23 使用者定：跟存公會一樣，但是自動丟棄）：
     ① 清單存 config、勾一下就存檔（config.set 要接 save）
-    ② 丟棄封包版面＝代號 0x13、內文 8：u16 格號 + u32 序號（照 game.destroyitemslot 反組譯）
+    ② 丟棄封包版面＝代號 0x13、內文 8：u16 格號 + u32 **種類 ID**（照 game.destroyitemslot 反組譯；
+       ⚠ 物件 +8 是種類不是序號——第一版抄錯，旅行背包被報成丟不掉）
        建/送走 jumpmap.BUILD_FN/SEND_FN（沒定位就拒送）
     ③ run：每件送前重掃背包、送後 poll 序號消失才算；沒消失＝跳過點名；
        背包讀不完整＝提前停手（不當「沒有」）
@@ -122,12 +123,12 @@ ok, msg = discard.discard_slot(MV, SC, 44, 0x11223344)
 check("送得出去", ok, msg)
 check("建包＝(0x13, 8)", CALLS and CALLS[0][0] == jumpmap.BUILD_FN and CALLS[0][1] == (0x13, 8)
       and CALLS[0][2] == 0x10000 + discard.SCRATCH_OFF, str(CALLS[:1]))
-check("內文 +2 u16 格號、+4 u32 序號", MEM.get(DATA_AT + 2) == struct.pack("<HI", 44, 0x11223344),
+check("內文 +2 u16 格號、+4 u32 種類 ID", MEM.get(DATA_AT + 2) == struct.pack("<HI", 44, 0x11223344),
       str(MEM.get(DATA_AT + 2)))
 check("送出＝SEND_FN(連線, 封包)", CALLS[-1][0] == jumpmap.SEND_FN and CALLS[-1][1] == (0x40000, PKT_AT),
       str(CALLS[-1]))
 ok, msg = discard.discard_slot(MV, SC, 44, 0)
-check("序號 0 不送", not ok, msg)
+check("種類 0 不送", not ok, msg)
 saved = jumpmap.BUILD_FN
 jumpmap.BUILD_FN = 0
 ok, msg = discard.discard_slot(MV, SC, 44, 5)
@@ -144,10 +145,12 @@ SENT: list[tuple[int, int]] = []
 REFUSE: set[int] = set()
 
 
-def fake_discard_slot(mover, scanner, slot, serial):
-    SENT.append((slot, serial))
-    if serial not in REFUSE:
-        BAG[:] = [it for it in BAG if it.serial != serial]
+def fake_discard_slot(mover, scanner, slot, type_id):
+    it = next(i for i in BAG if i.slot == slot)
+    check("送的是那格的種類 ID 不是序號", type_id == it.type_id, f"{type_id} vs {it.type_id}")
+    SENT.append((slot, it.serial))
+    if it.serial not in REFUSE:
+        BAG[:] = [i for i in BAG if i.serial != it.serial]
     return True, ""
 
 
