@@ -164,7 +164,7 @@ if os.path.exists(GAME):
         def module_base(self, _name):
             return base
 
-    talkwnd.roulette._module_span = lambda _sc, _b: len(img)
+    talkwnd._module_span = lambda _sc, _b: len(img)
     # ⚠ 前面幾段用的是假 scanner（pid 0、同一個 base）——它們的結果還躺在
     #   `_cache` 裡，不清掉這一段就會拿假位址去對真檔案（會紅得莫名其妙）。
     talkwnd._cache.clear()

@@ -42,7 +42,7 @@ from app.core import window as win                    # noqa: E402
 from app.core.memory import MemoryScanner             # noqa: E402
 from app.game import locate, tablestamp               # noqa: E402
 # ⛔ 排除規則只准有一份：這支跟 coverage_audit 本來各寫各的，2026-08-28 就因此
-#   只有一邊修好（`roulette.FALLBACK_SPAN` 是掃描長度不是位址，這支照樣誤報）。
+#   只有一邊修好（`talkwnd.FALLBACK_SPAN` 是掃描長度不是位址，這支照樣誤報）。
 from tools.coverage_audit import (                    # noqa: E402
     NOT_ADDR, NOT_ADDR_SUFFIX, ADDR_ALLOW)
 

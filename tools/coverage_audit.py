@@ -48,7 +48,7 @@ BASELINE = os.path.join(ROOT, "reports", "callconv_baseline.json")
 
 ADDR_LO, ADDR_HI = 0x400000, 0xA00000
 # ⚠ 這是靠「值落在 0x400000~0xA00000」判斷的，**長度與上限值會誤報**：
-#   `energy.MAX_ENERGY = 0x989680`（一千萬）、`roulette.FALLBACK_SPAN = 0x800000`
+#   `energy.MAX_ENERGY = 0x989680`（一千萬）、`talkwnd.FALLBACK_SPAN = 0x800000`
 #   （問不到 SizeOfImage 時墊底用的掃描長度）都中槍過。這些字尾／字首一律當
 #   數值不當位址 —— 位址不會取名叫 `_SPAN`／`_SIZE`。
 NOT_ADDR = ("MAX_", "MIN_", "LIMIT_", "CAP_", "THRESHOLD_")

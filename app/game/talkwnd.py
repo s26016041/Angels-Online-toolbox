@@ -21,8 +21,8 @@ r"""對話視窗：把「無異議對話」那一頁**按確定過掉**。
 ## 怎麼叫
 
 ⛔ 不自己重建那個封包（要湊兩個執行期物件欄位，改版一動就送垃圾）。
-★ 叫遊戲自己那支：`thiscall(世界物件, 視窗代號)`，跟轉盤 `roulettestart`
-  同一招（見 `roulette.py`）—— 位址從 **UI 指令表用字串當錨**推出來，
+★ 叫遊戲自己那支：`thiscall(世界物件, 視窗代號)`，跟（已刪的）轉盤 `roulettestart`
+  同一招 —— 位址從 **UI 指令表用字串當錨**推出來，
   官方改版位址跟著跑，零寫死。
 
 參數是**視窗代號**：UI 腳本呼叫的是 `messageclose(WND_MESSAGE)`，那個值
@@ -59,9 +59,15 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from app.game import lua, roulette
+from app.game import lua
 
 GAME_MODULE = "angel.dat"
+# ⚠⚠ **「掃多少」不等於「模組多大」**（2026-08-27 轉盤第一版就栽在這裡）：
+#   一開始寫死掃 4MB，又拿 `base + 4MB` 當「這個值在不在模組裡」的上界 ——
+#   結果全域 `0x9BD6AC` 離基底 **5.7MB**、直接被自己的檢查擋掉，五台全部回 None。
+#   而且指令字串在 `0x3E2890`，離 4MB 邊界只剩 120KB，改版稍微長一點就整個掃不到。
+#   → 長度一律問作業系統要（`SizeOfImage`），FALLBACK 只在問不到時墊底。
+FALLBACK_SPAN = 0x800000
 # UI 指令表裡的名字（明文），拿來當錨 —— ⛔ 不寫死函式位址。
 CMD_NAME = b"messageclose\x00"
 # 指令本體很短（實測 41 bytes 到 ret）；多讀一點無妨。
@@ -94,6 +100,44 @@ class Spot:
     close_fn: int        # thiscall(世界物件, 視窗代號) = 送 0x128
 
 
+def _module_span(scanner, base: int) -> int:
+    """`angel.dat` 的 `SizeOfImage`；問不到就用 FALLBACK_SPAN 墊底。"""
+    try:
+        for m in scanner.list_modules():
+            if m.name.lower() == GAME_MODULE and m.base == base and m.size:
+                return int(m.size)
+    except Exception:                                      # noqa: BLE001
+        pass
+    return FALLBACK_SPAN
+
+
+# 分段讀的段大小（1MB）。⚠ 不能整塊讀：映像有讀不到的段，一次讀整個會整批失敗；
+# 也不能砍半重試 —— 砍半會跳過字串（見下面 _read_image 的說明）。
+CHUNK = 0x100000
+
+
+def _read_image(scanner, base: int, span: int) -> bytes | None:
+    """把整個映像讀進來找字串。**分段讀，讀不到的段補零。**
+
+    ⚠⚠ 不可以「一次讀整份、失敗就砍半」：映像裡有沒配置的頁時整份會失敗，
+      而砍半一下就從 6MB 掉到 3MB —— 指令字串在 3.9MB 處，直接被跳過
+      （2026-08-27 寫這支時真的踩到）。分段讀才不會因為尾巴壞掉就丟掉前面，
+      補零也讓**位移保持正確**（位移一歪，抽出來的位址全是垃圾）。
+    ⚠ 範圍檢查仍然用 `span`：讀不到那一段，不代表那個位址不在模組裡。
+    """
+    out = bytearray()
+    got = False
+    for off in range(0, span, CHUNK):
+        n = min(CHUNK, span - off)
+        raw = scanner._read_bytes(base + off, n)
+        if raw and len(raw) == n:
+            out += bytes(raw)
+            got = True
+        else:
+            out += b"\0" * n          # 這一段讀不到 → 補零，後面的位移照樣對
+    return bytes(out) if got else None
+
+
 def locate(scanner) -> Spot | None:
     """推位址；推不出來回 None（＝**大聲停用**，不亂叫別的函式）。"""
     return _locate_cmd(scanner, CMD_NAME, "")
@@ -112,8 +156,8 @@ def _locate_cmd(scanner, cmd_name: bytes, tag: str) -> Spot | None:
     if key in _cache:
         return _cache[key]
     spot = None
-    span = roulette._module_span(scanner, base)
-    buf = roulette._read_image(scanner, base, span)
+    span = _module_span(scanner, base)
+    buf = _read_image(scanner, base, span)
     if buf:
         i = buf.find(cmd_name)
         j = buf.find(struct.pack("<I", base + i)) if i >= 0 else -1
@@ -471,7 +515,7 @@ def _find_lookup_fn(scanner, spot: Spot) -> int | None:
     rel = struct.unpack_from("<i", b, at)[0]
     fn = (spot.close_fn + at + 4 + rel) & 0xFFFFFFFF
     base = scanner.module_base(GAME_MODULE)
-    span = roulette._module_span(scanner, base) if base else 0
+    span = _module_span(scanner, base) if base else 0
     return fn if base and base <= fn < base + span else None
 
 
