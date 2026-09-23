@@ -151,14 +151,13 @@ class EventTab(BaseTab):
         self.ms = QSpinBox()
         self.ms.setRange(MS_MIN, MS_MAX)
         self.ms.setSingleStep(50)
-        self.ms.setSuffix(" ms")
         try:
             self.ms.setValue(int(config.get(CFG_MS, MS_DEFAULT)))
         except Exception:                                # noqa: BLE001
             self.ms.setValue(MS_DEFAULT)
         self.ms.valueChanged.connect(self._on_ms_changed)
         h.addWidget(self.ms)
-        h.addWidget(QLabel("送一包（烤／繼續烤肉輪流）"))
+        h.addWidget(QLabel("ms 送一包（烤／繼續烤肉輪流）"))
         self.bbq_btn = QPushButton("▶ 開始")
         self.bbq_btn.setToolTip("一直送烤肉封包，直到按暫停。")
         self.bbq_btn.clicked.connect(self._start_bbq)
