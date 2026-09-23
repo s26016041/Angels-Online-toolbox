@@ -3,7 +3,7 @@
     py tools\\event_check.py       （全 PASS 印 OK，有 FAIL 結束碼 1）
 
 驗的規格（2026-09-23 使用者定）：
-① 送的是 talkaction **動作碼 2**（擷取 `0x5D952D 參數 (2, …)`）。
+① 送的是 talkaction **0xA、0xB 輪流、從 0xA 開始**（擷取 `0x599074` 那行的參數）。
 ② 間隔照設定（毫秒）送，執行中改間隔立即生效。
 ③ 暫停就停；跳板失效（分身關了）自己停、UI 顯示。
 ④ 送不出去只記失敗次數，不停。
@@ -41,7 +41,7 @@ def main():
     sell.TALK_FN = sell.TALK_FN or 0x5DA91E
     real_talk = sell.talk
 
-    def fake_talk(mv, code=0):
+    def fake_talk(mv, code):
         mv.codes.append(code)
         return mv.ok
     sell.talk = fake_talk
@@ -51,7 +51,7 @@ def main():
         w.start()
         time.sleep(0.52)
         n = w.sent
-        check("① 動作碼 2", mv.codes and set(mv.codes) == {2})
+        check("① 0xA/0xB 輪流", mv.codes[:4] == [0xA, 0xB, 0xA, 0xB])
         check(f"② 50ms 約 10 包（實際 {n}）", 7 <= n <= 13)
         w.interval_ms = 200
         time.sleep(0.05)

@@ -7,16 +7,19 @@
   （`app/game/roulette.py` 一起刪；它借給 talkwnd 的讀映像小工具已搬過去）。
   當時的做法與坑記在 memory `event-roulette-and-coins`。
 
-## 自動烤肉：每 N 毫秒送一包 talkaction(2)
+## 自動烤肉：`0xA`、`0xB` 輪流送 talkaction
 
-2026-09-23 使用者擷取「烤肉」：整段只有**一包**，長度 22（加密後）。呼叫鏈：
+2026-09-23 使用者擷取兩次：呼叫鏈 `0x599074`（Lua `game.talkaction`，C 函式
+0x59904F）→ `0x5D9504`＝`sell.TALK_FN`（代號 0x0B、內文 3）。**參數看 `0x599074`
+那一行**（injector.Packet：那列的參數＝被呼叫那支自己的參數）＝ `0xA`／`0xB`
+＝對話第 1／第 2 項（同 `supply.talk_option`）。⛔ 第一版誤讀成 `0x5D952D` 那行的 2，
+送了伺服器不理。**零新位址**。
 
-    0x599074 → Lua C 函式 0x59904F：arg1 取整數 → thiscall 0x5D9504([0x9F9304], arg)
-    0x5D952D → 0x5D9504：`push 3 / push 0xB / call 建包` → `[pkt+2] = arg` → 送出
-
-也就是**代號 0x0B、內文 3 的 talkaction**，擷取裡的參數是 **2**
-（`0x5D952D 參數 (2, …)`）。這支就是 `sell.TALK_FN`（已登 AOB、`locate.warm()`
-自動跟上改版）—— **零新位址**，所以叫 `sell.talk(mover, 2)`。
+✅ 實機（雪狐，看「生鮮棒棒腿」少 10 才算）：`0xA` 成功；**緊接再送 `0xA` 沒反應**；
+`0xB` 自己不扣、但 `0xB` 後接 `0xA` 每次都扣。＝烤完停在結果頁，`0xB`（繼續烤肉）
+回選單、`0xA` 才烤。所以每拍一包、`0xA`→`0xB` 輪流，從 `0xA` 開始：停在結果頁時
+那包 `0xA` 被忽略、下一包 `0xB` 自己把它帶回來。
+⚠ 未知：選單頁第 2 項是什麼（棒棒腿用完、`0xA` 沒烤成時 `0xB` 會按在選單頁上）。
 
 ★ 送包在背景執行緒：`call_sync` 每包最多卡 `sell.CALL_TIMEOUT`，間隔又能設到
   幾十毫秒，放在 UI 緒會把整個工具拖慢（[[no-crash-no-lag]]）。
@@ -42,10 +45,12 @@ from app.config import config
 from app.core import charname, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import locate, move, sell
+from app.game import bag, locate, move, sell
 from app.tabs.base_tab import GROUP_CHORES, BaseTab
 
-BBQ_CODE = 2                # 烤肉的 talkaction 動作碼（2026-09-23 擷取，見檔頭）
+BBQ_CODES = (0xA, 0xB)      # 烤 → 繼續烤肉（對話第 1／2 項），輪流送；見檔頭
+RAW_NAME = "生鮮棒棒腿"      # 烤一次扣 10 —— 成功與否只認它有沒有少
+COUNT_EVERY = 1.0           # 幾秒盤點一次生鮮棒棒腿（背景緒做，不佔 UI）
 MS_MIN, MS_MAX = 10, 60000  # 間隔可調範圍（毫秒）
 MS_DEFAULT = 500
 CFG_MS = "event.bbq_ms"
@@ -54,10 +59,14 @@ CFG_MS = "event.bbq_ms"
 class BbqWorker:
     """背景送包迴圈。`sent`／`failed` 給 UI 讀（只有這條緒寫）。"""
 
-    def __init__(self, mover, interval_ms: int, send=None) -> None:
+    def __init__(self, mover, interval_ms: int, send=None,
+                 scanner=None) -> None:
         self.mover = mover
+        self.scanner = scanner
         self.interval_ms = max(MS_MIN, int(interval_ms))
-        self._send = send or (lambda mv: sell.talk(mv, BBQ_CODE))
+        self._send = send or (lambda mv, code: sell.talk(mv, code))
+        self.raw: int | None = None  # 生鮮棒棒腿剩幾個（None＝還沒讀到／讀不完整）
+        self._counted = 0.0
         self._stop = threading.Event()
         self.sent = 0
         self.failed = 0
@@ -75,20 +84,36 @@ class BbqWorker:
     def alive(self) -> bool:
         return self._th.is_alive()
 
+    def _count(self) -> None:
+        """⚠ 背包沒讀完整就不更新（讀不到≠沒有，[[bag-false-empty-guards]]）。"""
+        if self.scanner is None:
+            return
+        try:
+            items, complete = bag.scan(self.scanner)
+        except Exception:                                # noqa: BLE001
+            return
+        if complete:
+            self.raw = sum(it.count for it in items if it.name == RAW_NAME)
+
     def _run(self) -> None:
+        n = 0
         while not self._stop.is_set():
+            if time.monotonic() - self._counted >= COUNT_EVERY:
+                self._counted = time.monotonic()
+                self._count()
             t0 = time.monotonic()
             if not (self.mover and self.mover.active) or not sell.TALK_FN:
                 self.dead = True
                 return
             try:
-                ok = self._send(self.mover)
+                ok = self._send(self.mover, BBQ_CODES[n % len(BBQ_CODES)])
             except Exception:                            # noqa: BLE001
                 ok = False
             if ok:
                 self.sent += 1
             else:
                 self.failed += 1
+            n += 1
             left = self.interval_ms / 1000 - (time.monotonic() - t0)
             if left > 0:
                 self._stop.wait(left)
@@ -133,7 +158,7 @@ class EventTab(BaseTab):
             self.ms.setValue(MS_DEFAULT)
         self.ms.valueChanged.connect(self._on_ms_changed)
         h.addWidget(self.ms)
-        h.addWidget(QLabel("送一包"))
+        h.addWidget(QLabel("送一包（烤／繼續烤肉輪流）"))
         self.bbq_btn = QPushButton("▶ 開始")
         self.bbq_btn.setToolTip("一直送烤肉封包，直到按暫停。")
         self.bbq_btn.clicked.connect(self._start_bbq)
@@ -232,7 +257,8 @@ class EventTab(BaseTab):
         if mv is None:
             return
         self._stop_bbq(quiet=True)
-        self._bbq = BbqWorker(mv, self.ms.value())
+        self._bbq = BbqWorker(mv, self.ms.value(),
+                              scanner=self._scanners.get(pid))
         self._bbq.start()
         self.bbq_btn.setEnabled(False)
         self.bbq_stop.setEnabled(True)
@@ -251,7 +277,8 @@ class EventTab(BaseTab):
         w = self._bbq
         if w is None:
             return
-        self.bbq_lbl.setText(f"已送 {w.sent}" +
+        raw = "?" if w.raw is None else w.raw
+        self.bbq_lbl.setText(f"{RAW_NAME} {raw}｜已送 {w.sent}" +
                              (f"／失敗 {w.failed}" if w.failed else ""))
         if w.dead:
             self._stop_bbq("⚠ 分身不見了（跳板失效），自動烤肉已停止")
