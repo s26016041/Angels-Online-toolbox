@@ -12,10 +12,16 @@
     所以別台加的、這台沒有的東西也畫得出來。
   · 搬一下就存檔（config.set 接 save），不用按確定。
   · 列高＝圖示 32 + 上下各 6（使用者：「每個物品上下要距離大點，現在圖片會被擋到」）。
-  · 「🧪 現在就…」＝就地測試，由掛機頁提供 `test_run(say)`；背景執行緒的進度用 QTimer
-    撈回來顯示。
+  · 「🧪 現在就…」＝就地測試（Spec.test_text 非空才放），由掛機頁提供 `test_run(say)`；
+    背景執行緒的進度用 QTimer 撈回來顯示。
+  · **切角色**（使用者 2026-09-23）：頂上「角色」下拉列目前接上的每一台，切換就重讀那台的
+    背包（`clients`＝[(角色名, scanner, test_run)]，掛機頁把全部分身帶進來）。
+  · **三張清單互斥**（使用者 2026-09-23 問「選了左邊就不會再出現了嗎」）：已經在**任一張**
+    清單（存個人倉庫／存公會倉庫／自動丟棄）上的種類，左邊都不再列（`Spec.others` 回另外
+    兩張的種類）—— 同一樣東西不會又存又丟。
 
-各功能只差一個 `Spec`（標題、文案、config 讀寫、候選）；見 guildbank_dialog.py／discard_dialog.py。
+各功能只差一個 `Spec`（標題、文案、config 讀寫、候選）；見 guildbank_dialog.py／
+bank_dialog.py／discard_dialog.py。
 """
 from __future__ import annotations
 
@@ -24,8 +30,8 @@ from typing import Callable
 
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QLabel,
+                               QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout)
 
 from app import theme
 from app.game import itemflags, itemicon, itemname
@@ -51,6 +57,8 @@ class Spec:
     why_not_hint: str = ""           # 不符合那一句的括號說明（空＝不顯示不符合數）
     test_text: str = ""              # 🧪 鈕文字（空＝不放測試鈕）
     test_tip: str = ""
+    # 另外幾張清單上的種類（左邊不列，避免同一樣東西又存又丟）；None＝不互斥
+    others: Callable[[], set[int]] | None = None
 
 
 def aggregate(items):
@@ -71,17 +79,35 @@ def matches(query: str, haystack: str) -> bool:
 
 
 class ItemListDialog(QDialog):
-    def __init__(self, parent, scanner, who: str, spec: Spec, test_run=None) -> None:
+    def __init__(self, parent, scanner, who: str, spec: Spec, test_run=None,
+                 clients=None) -> None:
+        """clients 可選：[(角色名, scanner, test_run)]，有兩台以上就放「角色」下拉；
+        scanner／who／test_run 是一開始選中的那台（不在 clients 裡也照列）。"""
         super().__init__(parent)
         self._sc = scanner
         self._spec = spec
         self._test_run = test_run
         self._progress = ""
         self._agg: dict[int, tuple[int, int]] = {}
+        self._others: set[int] = set()
         self.setWindowTitle(f"{spec.title} — {who}")
         v = QVBoxLayout(self)
 
         top = QHBoxLayout()
+        self.char_combo: QComboBox | None = None
+        self._clients = [(str(n), sc, tr) for n, sc, tr in (clients or [])]
+        if not any(sc is scanner for _n, sc, _t in self._clients):
+            self._clients.insert(0, (str(who), scanner, test_run))
+        if len(self._clients) > 1:
+            top.addWidget(QLabel("角色"))
+            self.char_combo = QComboBox()
+            self.char_combo.setToolTip("看哪一台的背包（清單全部分身共用，切角色只換左邊）")
+            for i, (name, sc, _t) in enumerate(self._clients):
+                self.char_combo.addItem(name)
+                if sc is scanner:
+                    self.char_combo.setCurrentIndex(i)
+            self.char_combo.currentIndexChanged.connect(self._on_char_changed)
+            top.addWidget(self.char_combo)
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜尋：打一個字，有那個字的都會出現（兩邊一起過濾）")
         self.search.setClearButtonEnabled(True)
@@ -149,6 +175,15 @@ class ItemListDialog(QDialog):
         self.resize(860, 600)
         self.reload()
 
+    def _on_char_changed(self, idx: int) -> None:
+        """切角色：換 scanner／測試對象，重讀那台背包。"""
+        if not 0 <= idx < len(self._clients):
+            return
+        name, sc, tr = self._clients[idx]
+        self._sc, self._test_run = sc, tr
+        self.setWindowTitle(f"{self._spec.title} — {name}")
+        self.reload()
+
     @staticmethod
     def _make_list() -> QListWidget:
         lst = QListWidget()
@@ -167,10 +202,14 @@ class ItemListDialog(QDialog):
             except Exception:                                  # noqa: BLE001
                 ok, no, complete = [], [], False
         self._agg = aggregate(ok)
+        self._others = set(self._spec.others()) if self._spec.others else set()
         self._rebuild(self._spec.wanted())
         parts = [f"這台背包可{self._spec.verb} {len(self._agg)} 種"]
         if no and self._spec.why_not_hint:
             parts.append(f"不能{self._spec.verb} {len(no)} 格（{self._spec.why_not_hint}，不列）")
+        taken = [t for t in self._agg if t in self._others]
+        if taken:
+            parts.append(f"已在別張清單 {len(taken)} 種（不列）")
         if not complete:
             parts.append("⚠ 背包沒讀完整（換圖中？）—— 按「重新讀背包」再試")
         self._summary_tail = "　·　".join(parts)
@@ -181,7 +220,7 @@ class ItemListDialog(QDialog):
         self.bag_list.clear()
         self.want_list.clear()
         for tid, (count, icon_id) in self._agg.items():
-            if tid not in wanted:
+            if tid not in wanted and tid not in self._others:
                 self._add_row(self.bag_list, tid, f"{itemname.label(tid)} ×{count}", icon_id)
         # 右邊＝清單本身：名字＋圖示（圖示查表，這台沒有的也畫得出來），照名字排
         for tid in sorted(wanted, key=lambda t: (itemname.label(t), t)):

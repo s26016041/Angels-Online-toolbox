@@ -247,16 +247,9 @@ DEPOSIT_OPCODE = 0x2F
 DEPOSIT_ACTION = 0x11
 # ★ 出處同上反組譯：push 0xB＝內文 11 bytes。
 DEPOSIT_BODY = 11
-# ★ 出處：補給頁「這些物品要怎麼處理」的平行清單（robot var 樹 DATAID，
-#   dump_lua 全域常數對照）：AS_STRLIST_TODISCARD(1516)=物品**名字**、
-#   AS_INTLIST_TODISCARD(1518)=**處理方式**。
-#   方式：0 移除 / 1 存銀行 / 2 賣掉 / 3 丟棄（HANDLETYPE_*，遊戲 Lua 常數）。
-#   我們只認「1=存銀行」的，背包有同名的就存。（不寫死物品，讀使用者設的那張。）
-AS_HANDLE_NAMES = 1516
-# ★ 出處同上：處理方式那張 int 清單（AS_INTLIST_TODISCARD）。
-AS_HANDLE_TYPES = 1518
-# ★ 出處同上：遊戲 Lua 常數 HANDLETYPE_*，1＝存銀行。
-HANDLETYPE_DEPOSIT = 1
+# ⛔ 2026-09-23 起**不再讀**遊戲補給頁的處理清單（robot var AS_STRLIST/INTLIST_TODISCARD
+#   1516/1518、HANDLETYPE 1=存銀行）：要存個人倉庫的東西改由工具箱自己的清單決定
+#   （app/game/bank.py，config `bank.items`，全部分身共用；使用者定）。
 MAX_DEPOSIT = 120          # 一趟最多存幾件（防呆上限；正常一批物品遠少於此）
 DEPOSIT_WAIT = 0.25        # 每存一件後等背包更新（會 poll 到真的少一件）
 # ⚠ 自家的輪詢上限（不是遊戲常數）：存完最多 poll 幾次確認物品離開（×DEPOSIT_WAIT ≈ 1.5s）。
@@ -1288,69 +1281,8 @@ def run_repair(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# 銀行存款：把補給頁「處理列表」標成「儲存」的物品，存進自己的倉庫
+# 銀行存款：把「存個人倉庫」清單（app/game/bank.py，全部分身共用）上的東西存進自己的倉庫
 # ---------------------------------------------------------------------------
-def _read_strlist(scanner, rec: int) -> list[str] | None:
-    """讀一個**字串清單**記錄的全部元素（UTF-8）。型別/筆數/指標對不上回 None。"""
-    head = scanner._read_bytes(rec, robot._L_ELEMS)
-    if not head or head[robot._V_TYPE] != robot.VAR_T_STRLIST:
-        return None
-    n = struct.unpack_from("<i", bytes(head), robot._L_COUNT)[0]
-    if not 0 <= n <= robot._L_CAP:
-        return None
-    if n == 0:
-        return []
-    raw = scanner._read_bytes(rec + robot._L_ELEMS, n * 4)
-    if not raw:
-        return None
-    out: list[str] = []
-    for p in struct.unpack(f"<{n}I", bytes(raw)):
-        if not 0x10000 < p < 0x7FFF0000:
-            return None
-        s = scanner._read_bytes(p, 128)
-        if not s:
-            return None
-        try:
-            out.append(bytes(s).split(b"\x00")[0].decode("utf-8"))
-        except UnicodeDecodeError:
-            return None
-    return out
-
-
-def deposit_targets(scanner) -> set[str] | None:
-    """回「要存銀行」的物品名字集合（處理列表裡方式==1 存銀行的）。
-
-    讀不到回 None（**不要當成沒有**）、清單還沒建或沒有標儲存的回空集合。
-    ★ 直接讀使用者在補給頁設的那張處理列表（名字 1516 ∥ 方式 1518），不寫死。
-    """
-    rec_n = robot._find_var(scanner, AS_HANDLE_NAMES)
-    rec_t = robot._find_var(scanner, AS_HANDLE_TYPES)
-    if rec_n is robot._MISSING or rec_t is robot._MISSING:
-        return set()                       # 清單還沒建 = 沒有要存的
-    if not isinstance(rec_n, int) or not isinstance(rec_t, int):
-        return None                        # 樹讀不到／只缺一張（不同步）
-    names = _read_strlist(scanner, rec_n)
-    types = robot._read_list(scanner, rec_t)
-    if names is None or types is None or len(names) != len(types):
-        return None                        # 兩張表對不上 → 不敢用
-    return {nm for nm, ty in zip(names, types)
-            if ty == HANDLETYPE_DEPOSIT and nm}
-
-
-def pending_deposits(scanner, targets: set[str] | None):
-    """背包裡名字在 targets 的物品清單。背包**沒讀完整袋**回 None、沒有回 []。
-
-    ⚠ 半袋不算數：漏讀的那半袋裡可能正好是要存的東西，「讀了半袋＝沒有」
-      會安靜地跳過存款（bag-false-empty-guards）。
-    """
-    if not targets:
-        return []
-    items, complete = bag.scan(scanner)
-    if not complete:
-        return None                        # 讀不到（別當成「沒有」）
-    return [it for it in items if it.name in targets]
-
-
 def _bank_close(mover, scanner) -> None:
     """關倉庫視窗＋**解鎖移動**。
 
@@ -1415,20 +1347,20 @@ def _item_gone(scanner, serial: int) -> bool:
     return not any(it.serial == serial for it in items)
 
 
-def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
-    """在銀行存款：走到 NPC → 我要用倉庫 → 自己的倉庫 → 把背包裡「標記儲存」的物品都存進去。
+def run_bank(mover, scanner, npc_id: int, fallback,
+             ids: set[int] | None) -> tuple[bool, str]:
+    """在銀行存款：走到 NPC → 我要用倉庫 → 自己的倉庫 → 把背包裡清單上的物品都存進去。
 
+    ids = 「存個人倉庫」清單的種類 ID（bank.wanted()，呼叫端在主執行緒讀 config 帶進來）。
     假設角色**已走到銀行 NPC 附近**。npc_id = 這城銀行的確切編號（NPC_TABLE 給）；
     fallback = .MPC 表座標（重試靠近用）。
     ★ 倉庫**可能滿**：送了存入封包但物品沒離開背包 = 滿了 → 關窗離開（使用者要求）。
     """
+    from app.game import bank                  # 避免模組載入期循環相依
     if not (mover and mover.active):
         return False, "跳板沒裝好"
-    targets = deposit_targets(scanner)
-    if targets is None:
-        return True, "處理清單讀不到，跳過銀行"
-    if not targets:
-        return True, "處理清單沒有標記儲存的物品"
+    if not ids:
+        return True, "存個人倉庫清單是空的"
 
     if not _engage_npc(mover, scanner, npc_id, fallback,
                        [TALK_BANK_USE, TALK_BANK_SELF], BANK_WND):
@@ -1440,7 +1372,7 @@ def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
     capped = False
     bag_lost = False
     for _ in range(MAX_DEPOSIT):
-        pend = pending_deposits(scanner, targets)
+        pend = bank.pending(scanner, ids)      # 每件送前重掃（格號當場重讀，鐵則）
         if pend is None:                       # 背包突然讀不到 → 停手（要說出來，別像做完了）
             bag_lost = True
             break
@@ -1466,50 +1398,13 @@ def run_bank(mover, scanner, npc_id: int, fallback) -> tuple[bool, str]:
         deposited += 1
     else:
         # 迴圈跑滿 MAX_DEPOSIT 還沒 break = 可能還有沒存到（不靜默截斷）
-        capped = bool(pending_deposits(scanner, targets))
+        capped = bool(bank.pending(scanner, ids))
 
     _bank_close(mover, scanner)
     tail = "（達單趟上限，還有沒存完的）" if capped else ""
     if bag_lost:
         tail = "（⚠ 背包讀不到，提前停手，可能還有沒存完的）"
     return True, f"存了 {deposited} 件到倉庫{tail}"
-
-
-def run_bank_here(mover, scanner, say=None) -> tuple[bool, str]:
-    """**就地**測銀行：讀目前地圖的銀行 NPC → 走過去 → 存「標記儲存」的物品。
-
-    不回城、不修不買，單獨驗銀行這段（給測試鈕用）。假設角色**已在有銀行的城裡**。
-    """
-    def note(m):
-        if say:
-            say(m)
-
-    if not (mover and mover.active):
-        return False, "跳板沒裝好"
-    here = scene.current_id(scanner)
-    if here is None:
-        return False, "讀不到目前地圖"
-    entry = NPC_TABLE.get(here)
-    bank_npc = entry.get("bank") if entry else None
-    if not bank_npc:
-        return False, f"{scene.scene_name(here)} 沒有銀行 NPC（不在名單內，或這張圖沒銀行）"
-
-    targets = deposit_targets(scanner)
-    if targets is None:
-        return False, "處理清單讀不到"
-    if not targets:
-        return True, "處理清單沒有標記儲存的物品（在補給頁把某物設成「儲存」再測）"
-    pend = pending_deposits(scanner, targets)
-    if pend is None:                     # ⚠ 讀不到≠沒有（bag-false-empty-guards）
-        return False, "背包讀不到，先不動（避免把「讀不到」當成「沒有」）"
-    if not pend:
-        return True, f"背包沒有要存的東西（要存的：{'、'.join(sorted(targets))}）"
-
-    bkid, bkx, bky = bank_npc
-    note(f"背包有 {len(pend)} 件要存，走去銀行 ({bkx},{bky}) 開倉庫…")
-    # ⚠ 不在這裡先自己走：走去銀行那段由 run_bank 內的 `_engage_npc` 負責
-    #   （官方尋路走過去，最後一段交給 TryAct 自己走完）。
-    return run_bank(mover, scanner, bkid, (bkx, bky))
 
 
 def _wait_still(scanner, timeout: float = 3.0) -> None:
@@ -1997,7 +1892,8 @@ def run_full_supply(mover, scanner, say=None,
                     back_to=None, potions=None,
                     potion_only: bool = False,
                     ledger=None, guild_items=None,
-                    fill_pct=None, should_stop=None) -> tuple[bool, str]:
+                    fill_pct=None, should_stop=None,
+                    bank_items=None) -> tuple[bool, str]:
     """完整補給一趟（外殼：只管**中途叫停**，內容全在 `_full_supply`）。
 
     should_stop() 可選（2026-09-09 使用者要求）：回 True 就**當場中止**這一趟。
@@ -2013,7 +1909,7 @@ def run_full_supply(mover, scanner, say=None,
         ok, msg = _full_supply(mover, scanner, say=say, back_to=back_to,
                                potions=potions, potion_only=potion_only,
                                ledger=ledger, guild_items=guild_items,
-                               fill_pct=fill_pct)
+                               fill_pct=fill_pct, bank_items=bank_items)
         # ★★★ 有 NPC「20 秒都講不到話」→ 把 TALK_FAIL 放進訊息裡，呼叫端據此
         #   **通知＋停機**（使用者 2026-09-20 定）。⚠ 只有整趟失敗才報：
         #   途中某一步講不到話但後面補救成功了，那趟還是成功的，別去吵他。
@@ -2039,8 +1935,11 @@ def _full_supply(mover, scanner, say=None,
                  back_to=None, potions=None,
                  potion_only: bool = False,
                  ledger=None, guild_items=None,
-                 fill_pct=None) -> tuple[bool, str]:
+                 fill_pct=None, bank_items=None) -> tuple[bool, str]:
     """完整補給一趟。say(訊息) 可選，用來即時回報進度。
+
+    bank_items＝「存個人倉庫」清單（bank.wanted()，主執行緒讀 config 帶進來；None／空＝不去
+    個人倉庫）。⛔ 2026-09-23 起不再讀遊戲補給頁的處理清單。
 
     fill_pct 可選：藥水買到負重的百分比整數（掛機頁「掛機設定」，全部分身共用；
     None＝預設 95%）。呼叫端在主執行緒用 farmsettings.fill_pct() 讀了帶進來。
@@ -2216,7 +2115,7 @@ def _full_supply(mover, scanner, say=None,
 
     results = []
 
-    # 4. 先存銀行（★排在修裝前面——使用者要求）：有銀行 + 背包有「處理列表標記儲存」
+    # 4. 先存銀行（★排在修裝前面——使用者要求）：有銀行 + 背包有「存個人倉庫」清單上
     #    的物品 → 走去存。**沒有要存的就不去銀行**（使用者要求）。
     # ⚠ 各步驟**不在這裡先自己走過去**：走近＋點 NPC 全部在 run_bank/run_repair/
     #   run_buy 內的 `_engage_npc`（官方尋路走到他身邊，最後一段交給 TryAct）。
@@ -2224,17 +2123,14 @@ def _full_supply(mover, scanner, say=None,
     if potion_only:
         bank_npc = None          # 自動練技那趟：不去銀行（使用者指定）
     if bank_npc:
-        _bank_targets = deposit_targets(scanner)
-        _bank_pend = (pending_deposits(scanner, _bank_targets)
-                      if _bank_targets else [])
-        if _bank_targets is None:
-            results.append("⚠ 處理清單讀不到，跳過銀行")
-        elif _bank_pend is None:
+        from app.game import bank                # 避免模組載入期循環相依
+        _bank_pend = bank.pending(scanner, bank_items)
+        if _bank_pend is None:
             results.append("⚠ 背包讀不到，跳過銀行")
         elif _bank_pend:
             bkid, bkx, bky = bank_npc
             note(f"背包有 {len(_bank_pend)} 件要存，走去銀行 ({bkx},{bky}) 開倉庫…")
-            _, kmsg = run_bank(mover, scanner, bkid, (bkx, bky))
+            _, kmsg = run_bank(mover, scanner, bkid, (bkx, bky), bank_items)
             note("銀行：" + kmsg)
             results.append("銀行:" + kmsg)
         # ★ 公會（社團）倉庫（2026-09-06 使用者要求）：清單全部分身共用，背包有清單上的

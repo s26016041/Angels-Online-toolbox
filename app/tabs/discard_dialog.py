@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from app.game import discard
+from app.game import bank, discard, guildbank
 from app.tabs.itemlist_dialog import ItemListDialog, Spec
 
 
@@ -23,9 +23,10 @@ def spec() -> Spec:
         test_text="🧪 現在就丟（就地測試）",
         test_tip=("把清單上、這台背包裡有的東西現在就丟掉（不用走去哪裡）。\n"
                   "⚠ 會真的把東西丟掉，丟了拿不回來。"),
+        others=lambda: bank.wanted() | guildbank.wanted(),
     )
 
 
 class DiscardDialog(ItemListDialog):
-    def __init__(self, parent, scanner, who: str, test_run=None) -> None:
-        super().__init__(parent, scanner, who, spec(), test_run=test_run)
+    def __init__(self, parent, scanner, who: str, test_run=None, clients=None) -> None:
+        super().__init__(parent, scanner, who, spec(), test_run=test_run, clients=clients)

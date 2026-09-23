@@ -230,7 +230,7 @@ class FakeSupply:
     #   guild_items／fill_pct 時就這樣紅了兩條沒人發現）。
     def run_full_supply(self, mv, sc, say=None, back_to=None, potions=None,
                         potion_only=False, ledger=None, guild_items=None,
-                        fill_pct=None, should_stop=None):
+                        fill_pct=None, should_stop=None, bank_items=None):
         self.trips.append({"back_to": back_to, "should_stop": should_stop})
         if say:
             say("測試補給中…")

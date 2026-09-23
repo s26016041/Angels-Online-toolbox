@@ -85,6 +85,13 @@ def guild_bankable(type_id: int) -> bool:
     return bits is not None and not (bits & (NO_BANK | NO_TRADE))
 
 
+def storable(type_id: int) -> bool:
+    """**這一類**東西能不能存**個人**倉庫：只看「不可存倉庫」（不可交易／綁定都不擋，
+    自己的倉庫本來就收綁定物）。表沒那筆一律 False（查不到就少做事）。"""
+    bits = flags(type_id)
+    return bits is not None and not (bits & NO_BANK)
+
+
 def why_not(type_id: int) -> str:
     """表說不能放的原因（給清單／提示框看）；表沒擋回空字串。
 

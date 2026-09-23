@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from app.game import guildbank
+from app.game import bank, discard, guildbank
 from app.tabs.itemlist_dialog import ItemListDialog, Spec
 
 
@@ -22,13 +22,11 @@ def spec() -> Spec:
         set_wanted=guildbank.set_wanted,
         candidates=guildbank.candidates,
         why_not_hint="不可交易／不可存倉庫／綁定用完",
-        test_text="🧪 現在就存（就地測試）",
-        test_tip=("走去這座城的銀行 → 開「社團的倉庫」→ 把清單上、這台背包裡有的東西存進去。\n"
-                  "不回城、不修裝、不買東西；人要已經在有銀行的城裡。\n"
-                  "⚠ 會真的把東西存進公會倉庫。"),
+        # ⛔ 「🧪 現在就存」測試鈕 2026-09-23 使用者說不需要（guildbank.run_here 留著給工具用）
+        others=lambda: bank.wanted() | discard.wanted(),
     )
 
 
 class GuildBankDialog(ItemListDialog):
-    def __init__(self, parent, scanner, who: str, test_run=None) -> None:
-        super().__init__(parent, scanner, who, spec(), test_run=test_run)
+    def __init__(self, parent, scanner, who: str, test_run=None, clients=None) -> None:
+        super().__init__(parent, scanner, who, spec(), test_run=None, clients=clients)

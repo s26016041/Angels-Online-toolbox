@@ -76,11 +76,12 @@ from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import skillcd
-from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
+from app.game import (aob, attack, bag, balls, ballswap, bank, buff, castwatch,
                       channel, discard, entity, eventmap, farmsettings, guildbank, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply, terrain)
+from app.tabs.bank_dialog import BankDialog
 from app.tabs.discard_dialog import DiscardDialog
 from app.tabs.farm_settings_dialog import FarmSettingsDialog
 from app.tabs.guildbank_dialog import GuildBankDialog
@@ -2337,7 +2338,7 @@ class CharFarmPage(QWidget):
         self.settings_btn = QPushButton("掛機設定")
         self.settings_btn.setToolTip(
             "掛機設定小視窗：補給時藥水買到負重幾 %（預設 95%）、\n"
-            "存公會倉庫清單、自動丟棄清單。全部分身共用，改一台全部跟著改。")
+            "存個人倉庫／存公會倉庫／自動丟棄三張清單。全部分身共用，改一台全部跟著改。")
         fit_btn(self.settings_btn)
         self.settings_btn.clicked.connect(self._open_settings)
         nbar.addWidget(self.settings_btn)
@@ -3439,6 +3440,7 @@ class CharFarmPage(QWidget):
         # ★ 背景執行緒跑整趟補給。say 回報進度存進 _supply_progress，_supply_tick 顯示＋等完成。
         mv, sc, gen = self._mover, self.sc, self._supply_gen
         gitems = guildbank.wanted()    # 公會倉庫清單（全部分身共用；主執行緒讀 config）
+        bitems = bank.wanted()         # 存個人倉庫清單（同上；2026-09-23 改吃這張）
         fill = farmsettings.fill_pct()  # 藥水買到負重幾 %（掛機設定；主執行緒讀 config）
 
         def _worker():
@@ -3449,6 +3451,7 @@ class CharFarmPage(QWidget):
                     potions=plan,      # 藥水買到負重 N%（生產分頁不帶＝不買）
                     ledger=self._record_purchase,   # 購買紀錄（純資料 append）
                     guild_items=gitems,             # 順手存公會倉庫（2026-09-06）
+                    bank_items=bitems,              # 存個人倉庫（2026-09-23）
                     fill_pct=fill,
                     # ★ 中途叫停：這一趟被作廢（關掉掛機／又開了新一趟）就當場停
                     #   （2026-09-09 使用者要求，見 _start_supply 檔頭）
@@ -3470,6 +3473,11 @@ class CharFarmPage(QWidget):
         「存公會倉庫」「自動丟棄」兩顆鈕也在這裡（2026-09-23 使用者要求從掛機頁搬進來）。
         """
         actions = (
+            ("存個人倉庫",
+             "打開小視窗：列這台背包裡能存倉庫的東西，打字過濾、勾選＝要存的清單。\n"
+             "清單全部分身共用；回程補給到銀行時，每台把清單上、自己背包有的存進自己的倉庫。\n"
+             "（不再讀遊戲補給頁的處理清單，只看這張。）倉庫滿了就關窗離開。",
+             self._open_bank),
             ("存公會倉庫",
              "打開小視窗：列這台背包裡能存公會倉庫的東西，打字過濾、勾選＝要存的清單。\n"
              "清單全部分身共用；回程補給到銀行時，每台把清單上、自己背包有的存進社團倉庫。\n"
@@ -3484,10 +3492,34 @@ class CharFarmPage(QWidget):
         )
         FarmSettingsDialog(self, actions=actions).exec()
 
+    def _who(self) -> str:
+        return str(self.char_name or self.account or self.pid)
+
+    def _clients(self, test_attr: str | None = None) -> list:
+        """給清單小視窗的「角色」下拉：目前接上的每一台 (角色名, scanner, 測試函式)。
+
+        掛機分頁建頁時把自己掛在 `page._tab`（weakref）；拿不到就只有自己這台。
+        """
+        tab = self._tab() if getattr(self, "_tab", None) else None
+        pages = list(tab._pages.values()) if tab is not None else [self]
+        if self not in pages:
+            pages.insert(0, self)
+        out = []
+        for p in pages:
+            if p.sc is None:
+                continue
+            tr = getattr(p, test_attr) if test_attr else None
+            out.append((p._who(), p.sc, tr))
+        return out
+
+    def _open_bank(self) -> None:
+        """「存個人倉庫」小視窗（清單全部分身共用，見 app/tabs/bank_dialog.py）。"""
+        BankDialog(self, self.sc, self._who(), clients=self._clients()).exec()
+
     def _open_discard(self) -> None:
         """「自動丟棄」小視窗（清單全部分身共用，見 app/tabs/discard_dialog.py）。"""
-        who = self.char_name or self.account or self.pid
-        DiscardDialog(self, self.sc, str(who), test_run=self._discard_test).exec()
+        DiscardDialog(self, self.sc, self._who(), test_run=self._discard_test,
+                      clients=self._clients("_discard_test")).exec()
 
     def _discard_test(self, say) -> bool:
         """小視窗的「🧪 現在就丟」：把清單上、這台背包裡有的東西現在就丟掉。
@@ -3545,43 +3577,7 @@ class CharFarmPage(QWidget):
 
     def _open_guildbank(self) -> None:
         """「存公會倉庫」小視窗（清單全部分身共用，見 app/tabs/guildbank_dialog.py）。"""
-        who = self.char_name or self.account or self.pid
-        GuildBankDialog(self, self.sc, str(who), test_run=self._guildbank_test).exec()
-
-    def _guildbank_test(self, say) -> bool:
-        """小視窗的「🧪 現在就存」：就地走去這城的銀行、開社團倉庫、存清單上的東西。
-
-        背景執行緒跑 `guildbank.run_here`；進度／結果用 say(訊息) 回小視窗。
-        接得起來回 True。⚠ 掛機在跑就不准（兩邊會搶走位），上一趟補給沒收工也不准。
-        """
-        if self.run_cb.isChecked():
-            say("先把「開始掛機」關掉再測（避免跟掛機搶走位）")
-            return False
-        t = self._supply_thread
-        if t is not None and t.is_alive():
-            say("上一趟補給的背景執行緒還沒收工，先等它")
-            return False
-        if self.sc is None:
-            say("這台沒連上遊戲")
-            return False
-        if not self._ensure_mover():
-            say("跳板沒裝好（移動功能啟不了）")
-            return False
-        mv, sc = self._mover, self.sc
-
-        def _worker():
-            try:
-                ok, msg = guildbank.run_here(mv, sc, say=say)
-            except Exception as exc:                          # noqa: BLE001
-                ok, msg = False, f"出錯：{exc}"
-            say(("✔ " if ok else "✘ ") + msg)
-
-        # ★ 登記進 _supply_thread：上面那道「上一趟還沒收工」的閘才看得到它 ——
-        #   以前沒登記，連按兩次就兩條走位在同一台互搶（2026-09-22 稽核）。
-        t = threading.Thread(target=_worker, daemon=True)
-        self._supply_thread = t
-        t.start()
-        return True
+        GuildBankDialog(self, self.sc, self._who(), clients=self._clients()).exec()
 
     def _end_supply(self, why: str, stop: bool = False) -> None:
         """補給收工，恢復打怪。stop=True 代表補給失敗，順便停掉掛機並通知。
@@ -7752,6 +7748,7 @@ class FarmTab(ClientWatchMixin, BaseTab):
         page = CharFarmPage(w.pid, w.hwnd, w.title, sc, self._request_scan,
                             tgt, keys, None, acct, nm,
                             self.ATTACK_MODE, self.SETTINGS_PREFIX, gang)
+        page._tab = weakref.ref(self)     # 清單小視窗的「角色」下拉要列全部分身（_clients）
         page._notifier.failed.connect(self.found.setText)
         page.run_cb.clicked.connect(lambda _on, p=page: self._on_run_clicked(p))
         page.train_cb.clicked.connect(
