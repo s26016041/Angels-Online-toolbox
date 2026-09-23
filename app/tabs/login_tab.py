@@ -815,8 +815,18 @@ class LoginTab(BaseTab):
             err = login.sign_in(job["mv"], job["sc"], a["account"],
                                 config.deobfuscate(a["password"]), server_index=idx)
             if err:
+                # ★ 登入函式連去別台（清單選取被遊戲還原，見 login.py 檔頭
+                #   「四、」）：重跑一次就好 —— 登入函式會先關舊連線再連。
+                #   兩次都錯才算失敗，不無限重試。
+                if err.startswith(login.WRONG_SERVER) and job.get("srv_retry", 0) < 2:
+                    job["srv_retry"] = job.get("srv_retry", 0) + 1
+                    self._set_status(f"{a['account']}：{err} 重選伺服器…")
+                    self._goto("signin", STEP_MS)
+                    return
+                job["srv_retry"] = 0
                 self._fail_current(err)
                 return
+            job["srv_retry"] = 0
             self._goto("wait_channel", LOGIN_SETTLE_MS)
             return
 

@@ -116,6 +116,27 @@ strlen → `0x6C1A10`（MD5）→ 抄進 0x890814」，最後才 `call 0x5103E8`
 送出前會確認 `[0x89097C]`（登入連線編號）不是 0；是 0 代表根本還沒連上
 登入伺服器，送了也只是丟進 `0x711130` 的空槽，直接擋下比較好交代。
 
+## 四、選伺服器為什麼會「有時候」選錯（2026-09-23 反組譯 9/22 版）
+
+登入函式（9/22 版 `0x537CDD`）是**按下去那一刻**才掃清單項目的 +6 旗標
+（`0x649E3B`）拿索引 → 取記錄 → `0x538EAC` 把記錄 +0x40 ip／+0x50 port 抄進
+`LOGIN_IP`／`LOGIN_PORT` 兩個全域 → socket 連那兩個。收到登入回應（`0x537505`）
+又掃一次 +6 去建分流清單。
+
+以前 `pick_server()` 只改項目 +6、寫完那一瞬間讀回來就當成功，兩個縫：
+
+  1. 沒走遊戲自己的選取函式（`0x653565`），控制項的「目前索引」(+0x17C) 和
+     遊戲全域「上次選的伺服器」`LAST_SERVER` 都還是舊值。登入畫面每次進場
+     （vtable slot 1 = `0x5364F5`）會**清空重建**清單、再把 `LAST_SERVER` 選回去
+     —— 我們寫完之後畫面一重建（斷線退回登入頁、撿到剛建好／已釋放的舊物件）
+     選取就被還原成上次那台。
+  2. 登入當下與登入後完全沒再對帳 —— 選錯就安靜地登進去。
+
+修法：`pick_server()` 順便把 `LAST_SERVER` 寫成目標索引（遊戲設定載入
+`0x52AD7E` 就是這樣寫的，畫面重建也會選到我們要的）；`sign_in()` 呼叫登入函式
+**之後**讀 `LOGIN_IP`／`LOGIN_PORT` 跟目標記錄比，不一樣就回「連到別台」
+（呼叫端重跑一次 —— 登入函式本來就會先關舊連線）。
+
 相關：[[login-packet-chain]]、[[auto-login-findings]]、[[packet-opcode-table]]、
 [[aob-auto-locate]]（下面每個位址都在 locate.SIGS，改版會自動重新定位）
 """
@@ -154,6 +175,15 @@ PROTECT_LEN = 32
 APP_PTR = 0x0089096C        # 應用程式主物件；伺服器陣列掛在它 +0x500/+0x504
 SERVER_INDEX = 0x00890C88   # 登入時選中的伺服器索引（進陣列用）
 EULA_OK = 0x00890FFC        # 「授權合約已同意」旗標，1 byte
+# ★ 出處：檔頭「四、」—— 登入函式一開始叫 0x538EAC 把選中那筆記錄的 ip/port 抄進
+#   這兩個全域（`strncpy(LOGIN_IP, 記錄+0x40, 0xF)`／`mov [LOGIN_PORT],[記錄+0x50]`），
+#   socket 就連這兩個。登入後讀它們＝遊戲**真的**連去哪台。（9/22 版位址）
+LOGIN_IP = 0x008D2714       # 連線目標 ip 字串，最多 15 字
+LOGIN_PORT = 0x008D2724     # 連線目標 port，u32
+LOGIN_IP_LEN = 0xF          # 0x538EAC 的 strncpy 長度
+# ★ 出處：檔頭「四、」—— 登入畫面進場（0x5364F5）重建清單後選回這個索引；
+#   遊戲設定載入（0x52AD7E）也寫這裡。（9/22 版位址）
+LAST_SERVER = 0x008D24A0    # 上次選的伺服器索引，u32、0 起算
 
 # 登入畫面物件上的欄位
 # ★ 出處：反組譯登入動作問「清單選了哪個」那條鏈 —— 取控制項
@@ -185,6 +215,8 @@ SRV_BEGIN = 0x500
 SRV_END = 0x504
 SRV_STRIDE = 0x178
 SRV_NAME = 0x00
+# ★ 出處：0x538EAC `lea eax,[記錄+0x40]` 抄去 LOGIN_IP（檔頭「四、」）。
+SRV_IP = 0x40
 # ★ 記錄版面出處：檔頭「伺服器清單怎麼讀」——+0x50 port、+0x54/+0x5C 兩格分流數、
 #   +0x58 伺服器編號；五台實測分流數對上（[[channel-switch]]）。讀取端有驗：
 #   port 限 1024~65535、兩格分流數要相等，版面搬家會讀不出而不是讀錯。
@@ -447,6 +479,69 @@ def pick_server(mover, scanner, index: int) -> str:
     got = _selected_index(scanner, items)
     if got != index:
         return f"伺服器沒切過去（想選第 {index + 1} 個，讀回來是 {got}）。"
+    # ★ 順便把遊戲自己的「上次選的伺服器」也寫成目標：登入畫面重建清單時是選
+    #   這個索引回去（檔頭「四、」）。只有這一輪 AOB 真的定位到才寫（寫舊位址
+    #   等於砸不相干的記憶體）；沒定位到就只靠 sign_in() 登入後那道對帳。
+    if locate.located("login", "LAST_SERVER"):
+        mover.write(LAST_SERVER, struct.pack("<I", index))
+    return ""
+
+
+def _server_endpoint(scanner, index: int) -> tuple[str, int] | None:
+    """第 index 筆伺服器記錄的 (ip, port)；讀不到／不像記錄回 None。"""
+    app = _u32(scanner, APP_PTR)
+    beg = _u32(scanner, app + SRV_BEGIN) if app else None
+    end = _u32(scanner, app + SRV_END) if app else None
+    if not beg or not end or end <= beg:
+        return None
+    if not (0 <= index < (end - beg) // SRV_STRIDE):
+        return None
+    rec = beg + index * SRV_STRIDE
+    if _read_server(scanner, rec) is None:
+        return None
+    raw = scanner._read_bytes(rec + SRV_IP, LOGIN_IP_LEN)
+    port = _u32(scanner, rec + SRV_PORT)
+    if not raw or port is None:
+        return None
+    return bytes(raw).split(b"\x00")[0].decode("ascii", "replace"), port
+
+
+def connected_endpoint(scanner) -> tuple[str, int] | None:
+    """登入函式抄進去的連線目標 (ip, port) —— 遊戲**真的**連去哪台。
+
+    ⚠ 只有這一輪 AOB 定位到 LOGIN_IP／LOGIN_PORT 才讀；沒定位到回 None
+      （讀舊位址會拿到垃圾，拿垃圾去比只會把對的登入誤擋）。
+    """
+    if not (locate.located("login", "LOGIN_IP") and
+            locate.located("login", "LOGIN_PORT")):
+        return None
+    raw = scanner._read_bytes(LOGIN_IP, LOGIN_IP_LEN)
+    port = _u32(scanner, LOGIN_PORT)
+    if not raw or port is None:
+        return None
+    ip = bytes(raw).split(b"\x00")[0].decode("ascii", "replace")
+    if not ip or not (1024 <= port <= 65535):
+        return None
+    return ip, port
+
+
+WRONG_SERVER = "連到別台伺服器"
+
+
+def _verify_connected(scanner, index: int) -> str:
+    """登入函式叫完之後：遊戲抄進去的連線目標，是不是我們要的那台？
+
+    ★ 這是「選錯伺服器」唯一可靠的閘（檔頭「四、」）：清單旗標寫完那一瞬間對
+      不代表登入那一刻還對。比不出來（位址沒定位到／記錄讀不到）就放行 ——
+      那等於回到以前沒有這道閘的行為，不會把對的登入誤擋。
+    """
+    want = _server_endpoint(scanner, index)
+    got = connected_endpoint(scanner)
+    if want is None or got is None:
+        return ""
+    if want != got:
+        return (f"{WRONG_SERVER}（要 {want[0]}:{want[1]}，"
+                f"遊戲連的是 {got[0]}:{got[1]}）。")
     return ""
 
 
@@ -610,6 +705,11 @@ def sign_in(mover, scanner, account: str, password: str,
         mover.write(FLAG_BLOB, b"\x00")
     if not ok:
         return "指令槽排不進去或逾時（遊戲主執行緒正忙），等一下再按。"
+    # ★ 登入函式一進去就把選中那筆的 ip/port 抄進全域（call_sync 回來時已經
+    #   寫好），現在讀＝它真的連去哪台。錯了就回報，呼叫端重跑一次 sign_in
+    #   （登入函式本來就會先關舊連線）。
+    if server_index is not None:
+        return _verify_connected(scanner, server_index)
     return ""
 
 
