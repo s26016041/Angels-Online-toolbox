@@ -1,8 +1,9 @@
 """「掛機設定」小視窗（掛機頁右上角那顆鈕開的）。
 
-2026-09-06 使用者要求。目前只有一項：**負重設定**＝補給時藥水買到負重的幾 %
-（原本寫死 95%）。值存 config（`farm.fill_pct`，見 app/game/farmsettings.py），
-**全部分身共用** —— 在哪一台改都一樣。
+2026-09-06 使用者要求。**負重設定**＝補給時藥水買到負重的幾 %（原本寫死 95%）。
+值存 config（`farm.fill_pct`，見 app/game/farmsettings.py），**全部分身共用** —— 在哪一台改都一樣。
+2026-09-23 使用者要求：「存公會倉庫」「自動丟棄」兩顆鈕從掛機頁搬進來（`actions` 帶進來，
+每顆＝(文字, 提示, 按下去要叫的函式)，各自開自己的小視窗）。
 
 規則：
   · 改一下就存檔（config.set 接 save），不用按確定 —— 跟「存公會倉庫」小視窗同一套。
@@ -12,7 +13,7 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
-                               QSpinBox, QVBoxLayout)
+                               QPushButton, QSpinBox, QVBoxLayout)
 
 from app import theme
 from app.game import farmsettings
@@ -20,7 +21,7 @@ from app.tabs.base_tab import fit_spin
 
 
 class FarmSettingsDialog(QDialog):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, actions=()) -> None:
         super().__init__(parent)
         self.setWindowTitle("掛機設定")
         v = QVBoxLayout(self)
@@ -40,6 +41,19 @@ class FarmSettingsDialog(QDialog):
         row.addStretch(1)
         form.addRow("補給時藥水買到負重", row)
         v.addLayout(form)
+
+        # ★ 清單類設定（存公會倉庫／自動丟棄）：一顆鈕開一個小視窗（2026-09-23 從掛機頁搬來）
+        self.action_btns: list[QPushButton] = []
+        if actions:
+            row = QHBoxLayout()
+            for text, tip, fn in actions:
+                btn = QPushButton(text)
+                btn.setToolTip(tip)
+                btn.clicked.connect(fn)
+                row.addWidget(btn)
+                self.action_btns.append(btn)
+            row.addStretch(1)
+            v.addLayout(row)
 
         note = QLabel("這裡的設定全部分身共用；改了立刻存檔，不用按確定。")
         note.setStyleSheet(f"color: {theme.TEXT_MUT};")

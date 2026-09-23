@@ -283,8 +283,10 @@ else:
 
     page = build_page()
     page._spots = [EVENT_SPOT]
-    page._test_supply()
-    check("🧪 測試鈕真的開了一趟補給", len(SUPPLY.trips) == 1,
+    # （🧪 測試鈕 2026-09-23 已刪；這裡直接走它當年走的那條路：重挑記錄點→手動開一趟）
+    page._pick_home()
+    page._start_supply("🧪 測試：假裝裝備壞掉", manual=True)
+    check("手動開一趟補給真的開了", len(SUPPLY.trips) == 1,
           f"實得 {SUPPLY.trips}")
     check("回程目標＝活動地圖那個巡邏點（含分流序號）",
           SUPPLY.trips and SUPPLY.trips[0]["back_to"] == EVENT_SPOT,

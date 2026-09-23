@@ -77,10 +77,11 @@ from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
 from app.game import skillcd
 from app.game import (aob, attack, bag, balls, ballswap, buff, castwatch,
-                      channel, entity, eventmap, farmsettings, guildbank, itemicon, loot,
+                      channel, discard, entity, eventmap, farmsettings, guildbank, itemicon, loot,
                       inventory, itemname, jumpmap, locate, mall, monsters, move,
                       navigate, player, quickbar, recall, revive, robot, scene,
                       skillcost, skills, summon, supply, terrain)
+from app.tabs.discard_dialog import DiscardDialog
 from app.tabs.farm_settings_dialog import FarmSettingsDialog
 from app.tabs.guildbank_dialog import GuildBankDialog
 from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list, fit_spin,
@@ -2145,6 +2146,10 @@ class CharFarmPage(QWidget):
         # 跟擊殺數／購買紀錄同一類；「重新計算」鈕會把它歸零。
         self._loot = loot.Loot()
         self._loot_t = 0.0         # 對帳心跳（LOOT_GAP 一拍）
+        # ★ 自動丟棄（2026-09-23）：掛機中每 discard.GAP 秒讀一次背包，清單上的當場丟。
+        #   背景執行緒跑 discard.run；把手留著，活著就不開第二條。
+        self._discard_t = 0.0
+        self._discard_thread: threading.Thread | None = None
         # ⛔ 舊的 self._dry 通知門閂已刪：買得到的藥水見底**不通知**
         #   （2026-08-19 使用者：會自動補給還通知是吵人），只剩 _dry_stop
         #   那種「店裡沒賣、要停機」才通知，而停機本身就不會重複。
@@ -2331,8 +2336,8 @@ class CharFarmPage(QWidget):
         #   （config farm.fill_pct，見 app/game/farmsettings.py）。
         self.settings_btn = QPushButton("掛機設定")
         self.settings_btn.setToolTip(
-            "掛機設定小視窗：補給時藥水買到負重幾 %（預設 95%）。\n"
-            "全部分身共用，改一台全部跟著改。")
+            "掛機設定小視窗：補給時藥水買到負重幾 %（預設 95%）、\n"
+            "存公會倉庫清單、自動丟棄清單。全部分身共用，改一台全部跟著改。")
         fit_btn(self.settings_btn)
         self.settings_btn.clicked.connect(self._open_settings)
         nbar.addWidget(self.settings_btn)
@@ -2708,30 +2713,8 @@ class CharFarmPage(QWidget):
         #   而且用 _NoteLabel（不列入寬度計算、過長截斷）。
         self.jump_lbl = _NoteLabel()
         sup_v.addLayout(c)
-        # ★ 測試鈕（2026-08-27 使用者要求）：不必等裝備真的壞，直接跑一趟
-        #   **真的**回程補給，用來驗活動地圖（暴走穗海農場）的回程走不走得通。
-        #   ⚠ 走的就是壞裝觸發那條路（_start_supply → supply.run_full_supply），
-        #     不是另做一套 —— 測到的才是真的（memory test-via-button 的教訓）。
-        t = QHBoxLayout()
-        self.test_supply_btn = QPushButton("🧪 測試：假裝裝備壞掉，馬上回去補給")
-        self.test_supply_btn.setToolTip(
-            "馬上跑一趟真的回程補給，用來測活動地圖回得來嗎。\n"
-            "跟裝備真的壞掉走同一條路：天使之翼回城→存倉→修裝→買水→回記錄點"
-            "（活動地圖走活動 NPC 的對話選單回去）。\n"
-            "⚠ 會真的用掉一張天使之翼、真的花錢買東西。")
-        self.test_supply_btn.clicked.connect(self._test_supply)
-        t.addWidget(self.test_supply_btn)
-        # ★ 存公會倉庫（2026-09-06 使用者要求）：小視窗勾清單、全部分身共用；
-        #   回程補給到銀行時順手存（supply.run_full_supply 的 guild_items）。
-        self.guildbank_btn = QPushButton("存公會倉庫")
-        self.guildbank_btn.setToolTip(
-            "打開小視窗：列這台背包裡能存公會倉庫的東西，打字過濾、勾選＝要存的清單。\n"
-            "清單全部分身共用；回程補給到銀行時，每台把清單上、自己背包有的存進社團倉庫。\n"
-            "不可交易／不可存倉庫／綁定次數用完的東西不會列出來；公會倉庫滿了就安靜關窗。")
-        self.guildbank_btn.clicked.connect(self._open_guildbank)
-        t.addWidget(self.guildbank_btn)
-        t.addStretch(1)
-        sup_v.addLayout(t)
+        # ⛔ 「🧪 測試：假裝裝備壞掉」鈕 2026-09-23 使用者要求刪掉；
+        #    「存公會倉庫」「自動丟棄」兩顆鈕搬進「掛機設定」小視窗（_open_settings）。
         sup_v.addWidget(self.jump_lbl)
         grid.addWidget(g_sup, 2, 0, 1, 2)
 
@@ -3482,8 +3465,83 @@ class CharFarmPage(QWidget):
         return True
 
     def _open_settings(self) -> None:
-        """「掛機設定」小視窗（全部分身共用，見 app/tabs/farm_settings_dialog.py）。"""
-        FarmSettingsDialog(self).exec()
+        """「掛機設定」小視窗（全部分身共用，見 app/tabs/farm_settings_dialog.py）。
+
+        「存公會倉庫」「自動丟棄」兩顆鈕也在這裡（2026-09-23 使用者要求從掛機頁搬進來）。
+        """
+        actions = (
+            ("存公會倉庫",
+             "打開小視窗：列這台背包裡能存公會倉庫的東西，打字過濾、勾選＝要存的清單。\n"
+             "清單全部分身共用；回程補給到銀行時，每台把清單上、自己背包有的存進社團倉庫。\n"
+             "不可交易／不可存倉庫／綁定次數用完的東西不會列出來；公會倉庫滿了就安靜關窗。",
+             self._open_guildbank),
+            ("自動丟棄",
+             "打開小視窗：列這台背包裡的東西，打字過濾、勾選＝要丟的清單。\n"
+             f"清單全部分身共用；掛機中每 {discard.GAP:.0f} 秒讀一次背包，清單上的東西當場丟掉"
+             "（不用走去哪裡）。\n"
+             "⚠ 丟了拿不回來。",
+             self._open_discard),
+        )
+        FarmSettingsDialog(self, actions=actions).exec()
+
+    def _open_discard(self) -> None:
+        """「自動丟棄」小視窗（清單全部分身共用，見 app/tabs/discard_dialog.py）。"""
+        who = self.char_name or self.account or self.pid
+        DiscardDialog(self, self.sc, str(who), test_run=self._discard_test).exec()
+
+    def _discard_test(self, say) -> bool:
+        """小視窗的「🧪 現在就丟」：把清單上、這台背包裡有的東西現在就丟掉。
+
+        走的就是掛機中自動丟那條路（`_discard_kick`），不另做一套。接得起來回 True。
+        """
+        if self.sc is None:
+            say("這台沒連上遊戲")
+            return False
+        if not self._ensure_mover():
+            say("跳板沒裝好（移動功能啟不了）")
+            return False
+        if not self._discard_kick(say=say, ids=discard.wanted()):
+            say("上一輪丟棄還沒收工，先等它")
+            return False
+        return True
+
+    def _discard_kick(self, say=None, ids: set[int] | None = None) -> bool:
+        """開一條背景執行緒跑 discard.run；上一條還活著就不開（回 False）。"""
+        t = self._discard_thread
+        if t is not None and t.is_alive():
+            return False
+        mv, sc = self._mover, self.sc
+        if mv is None or sc is None:
+            return False
+
+        def _worker():
+            try:
+                ok, msg = discard.run(mv, sc, ids, say=say)
+            except Exception as exc:                          # noqa: BLE001
+                ok, msg = False, f"出錯：{exc}"
+            if say:
+                say(("✔ " if ok else "✘ ") + msg)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._discard_thread = t
+        t.start()
+        return True
+
+    def _discard_tick(self, dt: float) -> None:
+        """掛機中每 discard.GAP 秒：清單非空、背包有清單上的東西 → 背景丟掉。
+
+        補給／死亡回程中不動（那時我們完全讓開）；清單空就連背包都不讀。
+        """
+        self._discard_t += dt
+        if self._discard_t < discard.GAP:
+            return
+        self._discard_t = 0.0
+        if not self.run_cb.isChecked() or self._supply or self._death:
+            return
+        ids = discard.wanted()          # 主執行緒讀 config（背景執行緒不碰 config）
+        if not ids or self._mover is None or self.sc is None:
+            return
+        self._discard_kick(ids=ids)
 
     def _open_guildbank(self) -> None:
         """「存公會倉庫」小視窗（清單全部分身共用，見 app/tabs/guildbank_dialog.py）。"""
@@ -3524,37 +3582,6 @@ class CharFarmPage(QWidget):
         self._supply_thread = t
         t.start()
         return True
-
-    def _test_supply(self) -> None:
-        """🧪 測試鈕：假裝裝備壞掉，馬上跑一趟**真的**回程補給。
-
-        2026-08-27 使用者要求：活動地圖（暴走穗海農場）的回程要能實機驗，
-        但總不能等裝備真的耐久剩 1。所以這裡直接叫 `_start_supply` ——
-        跟壞裝觸發**完全同一條路**（背景執行緒跑 `supply.run_full_supply`），
-        沒有另做一套測試專用流程（那只會測到替身）。
-
-        ⚠ 不必先勾「開始掛機」：`tick()` 沒勾掛機那條路也會輪詢 `_supply_tick`
-          （見那裡的說明），所以進度、完成、逾時都照樣有人管。
-        """
-        if self._supply:
-            self.status.setText("🧪 已經在跑補給了，等這一趟跑完再測")
-            return
-        if self._death:
-            self.status.setText("🧪 死亡回程進行中，等它結束再測")
-            return
-        if not self._ensure_mover():
-            self.status.setText("🧪 跳板裝不起來，測試補給沒辦法開始")
-            return
-        # 記錄點＝要飛回哪裡。跟按「開始掛機」同一套（巡邏點優先，見 _pick_home）
-        # —— 不重挑的話會沿用上一次掛機留下的舊記錄點，測出來的是別張圖。
-        self._pick_home()
-        home = self._home
-        where = scene.scene_name(home[2]) if home else "出發當下的位置"
-        # ★ manual=True：這顆鈕本來就是「沒在掛機時按一下試跑一趟」，
-        #   不受「回程補給要開始掛機勾著才有效」那道閘限制（2026-09-09）。
-        if not self._start_supply(f"🧪 測試：假裝裝備壞掉（回程目標：{where}）",
-                                  manual=True):
-            return          # 失敗原因 _start_supply 已經寫在狀態列上了
 
     def _end_supply(self, why: str, stop: bool = False) -> None:
         """補給收工，恢復打怪。stop=True 代表補給失敗，順便停掉掛機並通知。
@@ -6323,6 +6350,8 @@ class CharFarmPage(QWidget):
         if self._loot_t >= LOOT_GAP:
             self._loot_t = 0.0
             self._loot.update(self.sc, self.char_name or self.account)
+        # ★ 自動丟棄（2026-09-23）：掛機中清單上的東西每 discard.GAP 秒丟一輪（背景執行緒）。
+        self._discard_tick(dt)
         # ★ 掃描**一直都在跑**，不管有沒有在掛機 ——
         #   這樣「周圍怪物」永遠是即時的，使用者隨時可以把名字加進來，
         #   也不必先按什麼按鈕才能開始（掃描只掃熱區，很便宜）。

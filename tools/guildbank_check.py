@@ -204,14 +204,14 @@ print()
 print("⑤ 小視窗（兩張表）")
 from PySide6.QtCore import QSize                                  # noqa: E402
 from PySide6.QtWidgets import QApplication                        # noqa: E402
-from app.tabs import guildbank_dialog                             # noqa: E402
+from app.tabs import guildbank_dialog, itemlist_dialog            # noqa: E402
 
 app = QApplication.instance() or QApplication([])
 BAG[:] = [FItem(20, 1, 1905, 3, 11), FItem(24, 5, 66, 9, 12), FItem(25, 6, 66, 4, 12),
           FItem(21, 2, 137, 1)]
 CFG.d[guildbank.CFG_KEY] = [66, 4837]         # 4837 清單上但不在這台背包
 guildbank_dialog.guildbank = guildbank
-guildbank_dialog.itemname = types.SimpleNamespace(
+itemlist_dialog.itemname = types.SimpleNamespace(
     label=lambda tid, c=None: {1905: "天使之翼", 66: "低效紅藥水", 4837: "高效藍藥水"}.get(tid, f"種類 {tid}"))
 dlg = guildbank_dialog.GuildBankDialog(None, object(), "測試")
 
