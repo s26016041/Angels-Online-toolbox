@@ -852,18 +852,113 @@ def main() -> int:
     ck("★★★ 退回重來之後又卡 20 秒 → 當成完成一場（沒勾循環就停下）",
        not tab.run_cb.isChecked(), f"i={tab._i}　{tab.status.text()[:60]}")
 
-    # ⛔ 往回沒有點位可退（第 1 步就是對話）→ **什麼都不做**，交給 2 分鐘看門狗
+    # ★★★ 2026-09-23：往回沒有點位可退（前一步就是機關）→ 以前**什麼都不做**、白等 2 分鐘
+    #   看門狗（黑狐第 18 步實錄）。改成使用者的接回規矩：先重做這一步 → 向前 → 向後。
     fake = FakeTalk([])
+    steps6 = [
+        {"do": "bump", "at": [5, 5], "model": 60301},              # 1 動作：往回擋住
+        {"do": "interact", "at": [20, 20], "model": 60307,
+         "menu": [1], "gap": 0.2},                                 # 2 卡在這
+    ]
+    tab = make_tab(steps6, pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    tab._goto(1)
+    tab._clicked = True                        # 已點過、對話一直不開
+    tab._act_t = dt.ACT_STUCK_SECS + 1.0
+    run(tab, 0.1)
+    ck("★★★ 往回是機關沒點位可退、這一步站位走得到 → **重做這一步**（⛔ 不再白等 2 分鐘）",
+       tab.run_cb.isChecked() and tab._i == 1 and (tab._rounds, 1) in tab._rolled
+       and tab._clicked is False and tab._act_t == 0.0,
+       f"i={tab._i} rolled={tab._rolled} clicked={tab._clicked} {tab.status.text()[:60]}")
+    tab._clicked = True
+    tab._act_t = dt.ACT_STUCK_SECS + 1.0
+    run(tab, 0.1)
+    ck("　重做過一次又卡 20 秒 → 當成完成一場（一步一次機會）",
+       not tab.run_cb.isChecked(), f"i={tab._i}　{tab.status.text()[:60]}")
+    # 這一步自己走不到（另一區）→ 向前找第一個走得到的
+    steps7 = steps6 + [{"do": "walk", "to": [40, 40]}, {"do": "walk", "to": [8, 8]}]
+    tab = make_tab(steps7, pos=(8.0, 8.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    tab._grid = FakeGrid({(8, 8), (5, 5)}, others={(20, 20), (40, 40)})
+    tab._reach = {(8, 8), (5, 5)}
+    tab._goto(1)
+    tab._clicked = True
+    tab._act_t = dt.ACT_STUCK_SECS + 1.0
+    run(tab, 0.1)
+    ck("　這一步在另一區、第 3 步也是 → 向前接到第 4 步（第一個走得到的）",
+       tab._i == 3, f"i={tab._i}　{tab.status.text()[:60]}")
+    # 前面全走不到 → 向後（⛔ 不挑步驟類型，機關也可以落腳）
+    tab = make_tab(steps6, pos=(5.0, 5.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    tab._grid = FakeGrid({(5, 5)}, others={(20, 20)})
+    tab._reach = {(5, 5)}
+    tab._goto(1)
+    tab._clicked = True
+    tab._act_t = dt.ACT_STUCK_SECS + 1.0
+    run(tab, 0.1)
+    ck("　向前沒有 → 向後接到第 1 步（機關）", tab._i == 0,
+       f"i={tab._i}　{tab.status.text()[:60]}")
+    # 前後都走不到 → 照舊什麼都不做、交給看門狗，而且只算一次
+    tab = make_tab(steps6, pos=(50.0, 50.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    tab._grid = FakeGrid({(50, 50)}, others={(20, 20), (5, 5)})
+    tab._reach = {(50, 50)}
+    tab._goto(1)
+    tab._clicked = True
+    tab._act_t = dt.ACT_STUCK_SECS + 1.0
+    run(tab, 0.5)
+    ck("　前後都沒有走得到的步驤 → 不退也不收（照舊等 2 分鐘看門狗）",
+       tab.run_cb.isChecked() and tab._i == 1,
+       f"i={tab._i}　{tab.status.text()[:60]}")
+    ck("　而且只算過一次（⛔ 不每拍重新泛洪）", tab._roll_none is True,
+       str(tab._roll_none))
+
+    # ★★★ 2026-09-23 黑狐第 18 步：點了雕像之後**打怪接管**，怪把人拉到 143 格外；
+    #   `_clicked` 還留著 → 回來不走站位、站在原地掃雕像那格（早就串流掉）等到 2 分鐘。
+    #   通則：點過之後只要打過怪，那一發作廢，回到「還沒點」重來（不看距離）。
+    print("\n點完物件被打怪接管 → 那一發作廢、打完重新走去點")
+    fake = FakeTalk([])                       # 點了永遠不開對話
     tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
                      "menu": [1], "gap": 0.2}], pos=(20.0, 20.0),
                    props=[FakeProp(20.1, 20.2, 60307)])
     wire(tab, fake)
-    run(tab, dt.ACT_STUCK_SECS + 6.0)
-    ck("★★ 往回沒有走得到的點位 → 不退也不收（照舊等 2 分鐘看門狗）",
-       tab.run_cb.isChecked() and tab._i == 0,
-       f"i={tab._i}　{tab.status.text()[:60]}")
-    ck("　而且只算過一次（⛔ 不每拍重新泛洪）", tab._roll_none is True,
-       str(tab._roll_none))
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    run(tab, 1.0)
+    ck("　先點了", tab._clicked is True, f"clicked={tab._clicked}")
+    tab._act_t = 7.0
+    mon = FakeMon(x=21.0, y=20.0, eid=5, name="跑來的怪")
+    tab._live_monsters = lambda: [mon]
+    dt.entity.read_pos = lambda _sc, _addr: (21.0, 20.0)
+    logs = []
+    tab._runlog_write = lambda msg, **_k: logs.append(msg)
+    took = tab._fight((20.0, 20.0), TICK)     # 打怪接管（真的 _tick 裡 _fight 回 True 就不跑步驟）
+    ck("★★★ 點過之後 _fight 接管 → 當拍回到「還沒點」、動作計時歸零、不等 2 秒",
+       took and tab._clicked is False and tab._act_t == 0.0 and tab._redo_wait == 0.0
+       and tab._talk_redo_n == 1,
+       f"took={took} clicked={tab._clicked} act_t={tab._act_t} wait={tab._redo_wait} n={tab._talk_redo_n}")
+    ck("　紀錄講得出原因", any("作廢" in m for m in logs), str(logs)[:120])
+    for _ in range(10):
+        tab._fight((20.0, 20.0), TICK)
+    ck("　打怪期間不會重複歸零（只寫一次）", tab._talk_redo_n == 1, str(tab._talk_redo_n))
+    tab._live_monsters = lambda: []           # 怪清完了
+    tab._drop_target()
+    run(tab, 1.0)
+    ck("★★ 打完怪回到對話步驟 → 照原流程**重新點它**", tab._clicked is True
+       and tab.run_cb.isChecked(), f"clicked={tab._clicked} {tab.status.text()[:60]}")
+    # 沒點過就被打怪接管 → 不算、不寫紀錄
+    tab = make_tab([{"do": "interact", "at": [20, 20], "model": 60307,
+                     "menu": [1], "gap": 0.2}], pos=(20.0, 20.0),
+                   props=[FakeProp(20.1, 20.2, 60307)])
+    wire(tab, fake)
+    tab._keys, tab._atk = FakeKeys(), FakeAtk()
+    tab._live_monsters = lambda: [mon]
+    tab._fight((20.0, 20.0), TICK)
+    ck("　還沒點就打怪 → 不算作廢（沒東西可作廢）", tab._talk_redo_n == 0,
+       str(tab._talk_redo_n))
 
     print("\n按完確定視窗暫時不見（不是最後一頁）→ 要等下一頁，不能誤判走完")
     talk_step2 = {"do": "interact", "at": [20, 20], "model": 60307,

@@ -3071,6 +3071,15 @@ class CharDungeonPage(QWidget):
                 self._keys.ent_addr = 0
                 self._last_gave_up = None
                 return False
+        # ★★★ 這一拍起是打怪接管。點過物件之後被接管 → 那一發作廢（2026-09-23 黑狐第 18 步
+        #   實錄）：點選＝叫遊戲自己走過去講話，我們一出手遊戲就改追怪，那一發必死；而且清完
+        #   怪人可能已經在 143 格外。以前 `_clicked` 留著 → 回到對話步驟「點過就不管站位」→
+        #   站在原地每秒掃雕像那格（早就串流掉）等到 2 分鐘看門狗收掉整趟。
+        #   通則：**點過之後只要打過怪，一律回到「還沒點」重來**，不看距離、不管哪個副本；
+        #   打完照原流程走站位→重點，次數不限。順帶：`_clicked` 歸零後 `_stray_dialog` 的
+        #   豁免也解除，打怪途中晚跳出來的框照收（不會掛整場）。
+        if self._clicked:
+            self._click_interrupted()
         m = self._cur
         # ★ 正在打的這隻每拍當場重讀一次：物件還在嗎／動畫狀態／血量。
         alive, st, _lp, hp_ent, flag = entity.read_live_hp(self._sc, m)
@@ -6259,7 +6268,7 @@ class CharDungeonPage(QWidget):
                          f"跟腳本完全對不上（前後都沒有走得到的步驟）")
         return False
 
-    def _talk_redo(self, tag: str, why: str) -> None:
+    def _talk_redo(self, tag: str, why: str, wait: float = TALK_REDO_GAP) -> None:
         """把這一步的對話狀態整組歸零，`TALK_REDO_GAP` 秒後**重新點它講一次**。
 
         為什麼要有它（使用者 2026-09-12）：太早跟機關講話，伺服器只回一頁**沒有
@@ -6279,15 +6288,26 @@ class CharDungeonPage(QWidget):
         self._spam = 0
         self._click_t, self._click_best, self._nudge = 0.0, None, 0
         self._wnd, self._wnd_t = None, 0.0
-        self._menu_t = self._menu_gap = TALK_REDO_GAP
+        self._menu_t = self._menu_gap = wait or MENU_POLL
         # ⚠ _menu_t 只有點完之後才有人扣（見 _do_interact 對話那段），點之前沒人看
         #   → 以前「2 秒後重講」實際是下一拍就點（2026-09-22 稽核）。用獨立欄位擋。
-        self._redo_wait = TALK_REDO_GAP
+        self._redo_wait = wait
         self._talk_redo_n += 1
-        msg = (f"{tag}　{why} → {TALK_REDO_GAP:g} 秒後重新講一次"
+        when = f"{wait:g} 秒後" if wait > 0 else "打完怪"
+        msg = (f"{tag}　{why} → {when}重新走去點、重新講一次"
                f"（第 {self._talk_redo_n} 次）")
         self._say(msg)
         self._runlog_write(msg, force=True)
+
+    def _click_interrupted(self) -> None:
+        """點過物件之後被打怪接管 → 那一發作廢，打完從「還沒點」重來（見 `_tick`）。
+
+        跟 `_talk_redo` 同一組歸零，差別：⛔ 不等 TALK_REDO_GAP（不是伺服器慢，是我們
+        自己打斷的）；`_act_t` 也歸零 —— 打怪是這一步的正事，不算「動作階段卡住」，
+        不然被打斷五次就湊滿 ACT_STUCK_SECS 白白回退。
+        """
+        self._talk_redo(f"第 {self._i + 1} 步", "點完之後打怪接管，那一發作廢", wait=0.0)
+        self._act_t = 0.0
 
     def _rollback_spot(self):
         """回退要落在哪一步（序號）；沒有安全落腳點回 None。
@@ -6335,22 +6355,49 @@ class CharDungeonPage(QWidget):
             self._abort_trip(f"⚠ 第 {self._i + 1} 步 {what} 退回重來之後又卡了"
                              f"{secs}（{self.status.text()[:100]}）")
             return True
-        idx = self._rollback_spot()
+        idx, how = self._rollback_spot(), "退回"
         if idx is None:
-            # ⛔ 沒有安全落腳點就**什麼都不做**：照舊交給「同一段超過 2 分鐘」
-            #   那道看門狗（使用者 2026-09-12 點頭的就是這個版本）。⚠ 算一次就
-            #   記住，`_rollback_spot` 每次都要泛洪（~6ms），不可以每拍重算。
+            # ★★ 往回沒有安全點位（前一步就是機關／傳點）→ 以前**什麼都不做**、交給
+            #   2 分鐘看門狗收掉整趟（2026-09-23 黑狐第 18 步：前一步是撞機關，在 143 格外
+            #   白等 2 分鐘）。改走使用者的接回規矩（同 `_rejoin`，⛔ 不挑步驟類型）：
+            #   **先重做這一步**（站位走得到就整組歸零、重新走去點）→ 再向前找 → 再向後找。
+            idx, how = self._redo_spot()
+        if idx is None:
+            # 前後都沒有走得到的步驟 → 照舊交給看門狗。⚠ 算一次就記住，泛洪 ~6ms 不可每拍重算。
             self._roll_none = True
             return False
         self._rolled.add(key)
         pos = self._step_pos((self._script.steps if self._script else [])[idx])
         where = f"({pos[0]:.0f}, {pos[1]:.0f})" if pos else "原地"
         self._event("warn",
-                    f"第 {self._i + 1} 步 {what} 卡了{secs} → 退回第 {idx + 1} 步 "
+                    f"第 {self._i + 1} 步 {what} 卡了{secs} → {how}第 {idx + 1} 步 "
                     f"{where} 重來（這一步只有一次回退機會）")
         self._drop_target()
         self._goto(idx)
         return True
+
+    def _redo_spot(self):
+        """`_rollback_spot` 找不到時的接回順序：這一步自己 → 向前 → 向後（第一個走得到的）。
+
+        規矩同 `_rejoin`（使用者 2026-09-08：「往前往後都可以不跳過任何步驟」）——不挑
+        步驟類型。回 `(序號, 動詞)`，兩邊都沒有回 `(None, "")`。
+        ⚠ 「重做這一步」只給對話／傳點：那兩種卡住多半是「點過了卻不在那裡」，整組歸零
+          重新走去點才有意義；撞機關本身就是無上限的踩開關輪迴，歸零只會把「踩到第幾個
+          開關」的進度丟掉，等於白等 20 秒 → 跳過，直接向前／向後。
+        ⚠ 跟 `_rejoin` 不同：**沒有位置的步驟（休息／清怪）不算落腳點**。這裡人沒有跑錯
+          地方，只是動作沒成功；機關後面常接一個「清怪」，把它當落腳點＝門沒開就跳過
+          機關往下跑（回歸測試當場抓到）。
+        """
+        steps = self._script.steps if self._script else []
+        cur = steps[self._i].get("do") if self._i < len(steps) else None
+        order = ([(self._i, "重做")] if cur != dungeon.BUMP else [])
+        order += ([(i, "向前接到") for i in range(self._i + 1, len(steps))]
+                  + [(i, "向後接到") for i in range(self._i - 1, -1, -1)])
+        for i, how in order:
+            pos = self._step_pos(steps[i])
+            if pos is not None and self._can_reach(pos):
+                return i, how
+        return None, ""
 
     def _why_unreachable(self, goal) -> str:
         """停下來時**把證據講出來**：那一格到底是牆，還是在別的區。
