@@ -1,32 +1,35 @@
-"""「獲得物品」離線回歸測試 —— app/game/loot.py 的對帳規則＋掛機頁的「紀錄」視窗。
+"""「獲得物品」離線回歸測試 —— app/game/loot.py 的封包入帳規則＋掛機頁的「紀錄」視窗。
 
-驗的規格（2026-08-28 使用者要求）：
-    · 第一拍只建基準，不算收穫
-    · 只認**增加**的量；賣掉／喝掉（負差值）不倒扣
-    · 同一種東西累加成一列，附圖示編號
-    · ⚠⚠ 背包讀不到（`bag.scan` 的第二個回傳值 False）→ 整拍作廢、基準不動，
-      恢復之後**不可以**把整袋算成剛獲得（[[bag-false-empty-guards]] 那個
-      復發七次的坑）
-    · 買來的不算收穫，而且「記帳先／快照先」兩種順序都要對得起來
-    · 換角色（斷線重登洗牌）→ 只重建基準，不把別人整袋算進來
-    · ⛔ **不算金幣**（使用者原話：「錢不算好了」）
-    · 重新計算＝全部歸零並重新起算
+驗的規格（2026-09-24 使用者：「自動戰鬥真的在自動戰鬥的時候才能計算」
+「在自動掛機時才會算要在巡邏點」「都改成吃官方伺服器給的」；memory `loot-into-bag-packet`）：
+    · 只認「殺手＝我／我的召喚物」的 0x0a **緊跟著**的 0x1b 物品同步、總數**變多**
+    · 一隻掉 2 件（連兩包 0x1b）都算；別人殺的、沒擊殺的（買的、別人給的）都不算
+    · 窗口：DROP_WINDOW 包別的封包或下一包 0x0a 就關
+    · 喝水（總數變少）不算，但總數要跟著更新
+    · credit=False（沒勾掛機／不在巡邏圖）照樣更新總數、不入帳
+    · 還沒完整快照 → 舊序號不知道原本幾個 → 不記（少記不猜）；快照後新序號＝新一格
+    · ⚠ 快照不准蓋掉比它新的封包（掉落落在快照與封包處理之間不能漏）
+    · ⚠⚠ 快照讀不到（`bag.scan` 第二值 False）不套（[[bag-false-empty-guards]]）
+    · 換角色 → 序號表丟掉；resync → 等下一次快照
+    · 封包長度 ≠ 92 不認
+    · ⛔ **不算金幣**；重新計算＝累計歸零
+    · 掛機頁 _poll_kills 真的走這條（勾掛機＋在巡邏圖才入帳）
     · 獲得物品／商店紀錄／商城紀錄＝**一顆「紀錄」鈕、視窗裡三個分頁**
-      （表沒有合併：幣別／單位不同，2026-08-21 那條規矩還在）
 
 前半段不碰遊戲也不碰 Qt；後半段用 offscreen Qt 建**真的**掛機分頁與視窗。
 
-用法：py tools\\loot_check.py   （全 PASS 結尾印 OK，有 FAIL 結束碼 1）
+用法：py tools\loot_check.py   （全 PASS 結尾印 OK，有 FAIL 結束碼 1）
 """
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.game import loot                        # noqa: E402
+from app.game import castwatch, loot                 # noqa: E402
 
 FAILS: list[str] = []
 
@@ -37,47 +40,51 @@ def check(name: str, cond: bool, why: str = "") -> None:
         FAILS.append(name)
 
 
-SC = object()          # 假的 scanner：底下的假 bag 根本不看它
+ME, PET, OTHER = 0x6A2F02E8, 0x5000AAAA, 0x11112222
 
 
-class FakeBag:
-    """假背包：`bag` 擺一袋（{種類id: 數量}），`ok=False` 讓它讀不到。
-
-    ⚠ `gold()` 故意留著並且照樣回值 —— 拿來證明**沒有人再去讀它**
-      （2026-08-28 起金幣不算）。
-    """
-
-    def __init__(self) -> None:
-        self.bag: dict[int, int] = {}
-        self.gold_ = 0
-        self.ok = True
-        self.gold_ok = True
-        self.icons: dict[int, int] = {}
-
-    def scan(self, sc, *a, **k):
-        if not self.ok:
-            # ⚠ 讀不到時 bag.scan 回的就是 ([], False) —— 跟「整袋賣光」
-            #   長得一模一樣，這正是這支測試要盯的地方。
-            return [], False
-        items = [types.SimpleNamespace(type_id=t, count=n,
-                                       icon_id=self.icons.get(t, 0))
-                 for t, n in self.bag.items() if n]
-        return items, True
-
-    def gold(self, sc):
-        return self.gold_ if (self.ok and self.gold_ok) else None
+def kill(victim, killer):
+    d = struct.pack("<HIII", 0x0A, victim, killer, 7)
+    return (len(d), d)
 
 
-FB = FakeBag()
-loot.bag = FB          # 整支模組只透過 bag.scan 讀遊戲
+def item(serial, tid, total, slot=24, n=92):
+    """實錄版面（北極狐 2026-09-24）：序號@7 種類@15 格號@44 總數@46，共 92 bytes；
+    環槽只存前 _CAP bytes。"""
+    d = bytearray(92)
+    d[0:7] = bytes((0x1B, 0, 1, 0, 0, 0, 1))
+    struct.pack_into("<I", d, 7, serial)
+    struct.pack_into("<I", d, 11, 0x6AB49442)
+    struct.pack_into("<I", d, 15, tid)
+    d[39:44] = bytes((1, 0x21, 0x71, 0, 0))
+    struct.pack_into("<H", d, 44, slot)
+    struct.pack_into("<H", d, 46, total)
+    return (n, bytes(d[:castwatch._CAP]))
 
 
-def new(bag_now: dict | None = None) -> loot.Loot:
-    """建一個累計器並用現在這袋當基準（＝第一拍）。"""
-    FB.bag = dict(bag_now or {})
-    lt = loot.Loot()
-    lt.update(SC, "甲")
-    return lt
+def other(op=0x13):
+    d = struct.pack("<HI", op, ME) + b"\0" * 6
+    return (len(d), d)
+
+
+def it(serial, tid, count, icon=0):
+    return types.SimpleNamespace(serial=serial, type_id=tid, count=count, icon_id=icon)
+
+
+def mine(k):
+    return k in (ME, PET)
+
+
+class Feeder:
+    """幫一個 Loot 記封包序號（像 CastHook.read_since 那樣連號）。"""
+
+    def __init__(self, lt):
+        self.lt, self.seq = lt, 0
+
+    def __call__(self, *pkts, credit=True):
+        got = self.lt.feed(self.seq, list(pkts), mine, credit)
+        self.seq += len(pkts)
+        return got
 
 
 def qty(lt: loot.Loot, tid: int) -> int:
@@ -87,123 +94,97 @@ def qty(lt: loot.Loot, tid: int) -> int:
     return 0
 
 
-print("① 第一拍只建基準，不算收穫")
-FB.bag, FB.gold_, FB.ok, FB.gold_ok = {1905: 30}, 1000, True, True
-lt = loot.Loot()
-check("回 True（這一拍算數）", lt.update(SC, "甲") is True)
-check("沒有任何收穫", lt.rows() == [], f"實得 {lt.rows()}")
+print("⓪ castwatch.parse_item／環槽放得下")
+check("解得出 (序號, 種類, 格號, 總數)",
+      castwatch.parse_item(item(0x608F619, 1228, 6)[1], 92) == (0x608F619, 1228, 24, 6))
+check("長度不是 92 不認", castwatch.parse_item(item(1, 2, 3)[1], 90) is None)
+check("死亡廣播不是物品包", castwatch.parse_item(kill(1, ME)[1], 14) is None)
+check("環槽＋stub 還塞得進 0x8000 的區塊",
+      64 + castwatch._N * castwatch._SLOT + 0x100 <= 0x8000)
 
-print("② 撿到東西 → 累加（含圖示編號）")
-FB.icons = {1905: 4321}
-lt = new({1905: 30})
-FB.bag = {1905: 33}
-lt.update(SC, "甲")
-FB.bag = {1905: 35, 4836: 2}
-lt.update(SC, "甲")
-check("藥水累計 5", qty(lt, 1905) == 5, f"實得 {qty(lt, 1905)}")
-check("新種類 2 件", qty(lt, 4836) == 2)
-check("兩種", lt.kinds() == 2)
-check("圖示編號有帶出來",
-      [i for t, _n, i, _s in lt.rows() if t == 1905] == [4321])
+print("① 還沒快照：舊序號不知道原本幾個 → 不記")
+lt = loot.Loot(); f = Feeder(lt)
+f(kill(0x100, ME), item(0xA, 2, 8))
+check("沒記", lt.rows() == [], str(lt.rows()))
+check("要求拍快照", lt.need_bag())
 
-print("③ 賣掉／喝掉不倒扣，後來又撿到只算真的增加")
-lt = new({1905: 30})
-FB.bag = {1905: 40}
-lt.update(SC, "甲")              # +10
-FB.bag = {1905: 0}
-lt.update(SC, "甲")              # 全賣掉：不倒扣
-check("賣光之後還是 10", qty(lt, 1905) == 10, f"實得 {qty(lt, 1905)}")
-FB.bag = {1905: 7}
-lt.update(SC, "甲")              # 再撿 7
-check("再撿 7 → 17", qty(lt, 1905) == 17, f"實得 {qty(lt, 1905)}")
+print("② 快照後：我殺的緊接的 0x1b 增加量入帳（圖示從快照學）")
+lt.note_bag([it(0xA, 2, 8, icon=55), it(0xB, 1228, 5)], True, f.seq, "甲")
+got = f(kill(0x101, ME), item(0xA, 2, 9))
+check("+1", qty(lt, 2) == 1 and got == [(2, 1)], str(lt.rows()))
+check("圖示編號帶上", lt.rows()[0][2] == 55, str(lt.rows()))
 
-print("④ ⚠⚠ 背包讀不到 → 整拍作廢，恢復後不可以把整袋當成剛獲得")
-lt = new({1905: 30, 4836: 5})
-FB.ok = False
-check("回 False（這一拍不算數）", lt.update(SC, "甲") is False)
-check("讀不到期間沒有任何收穫", lt.rows() == [])
-FB.ok = True
-FB.bag = {1905: 31, 4836: 5}
-lt.update(SC, "甲")
-check("恢復後只算真的多的 1 件", qty(lt, 1905) == 1 and qty(lt, 4836) == 0,
-      f"實得 {lt.rows()}")
+print("③ 一隻掉兩件（連兩包）都算；新序號＝新一格")
+f(kill(0x102, ME), item(0xB, 1228, 7), item(0xC, 3994, 1))
+check("疊加那件 +2", qty(lt, 1228) == 2, str(lt.rows()))
+check("新格那件 +1", qty(lt, 3994) == 1, str(lt.rows()))
 
-print("⑤ ⛔ 金幣不算（使用者 2026-08-28：「錢不算好了」）")
-check("累計器沒有金幣這個東西", not hasattr(loot.Loot(), "gold"))
-lt = new({1905: 30})
-FB.gold_ = 999999                     # 錢暴增
-FB.bag = {1905: 31}
-lt.update(SC, "甲")
-check("只記東西、不受金幣影響",
-      [(t, n) for t, n, _i, _s in lt.rows()] == [(1905, 1)], f"實得 {lt.rows()}")
+print("④ 別人殺的、沒擊殺的都不算；召喚物殺的算")
+f(kill(0x103, OTHER), item(0xA, 2, 10))
+f(other(), item(0xA, 2, 30))            # 補給買了 20 個（沒擊殺）
+check("別人殺的／買的沒算", qty(lt, 2) == 1, str(lt.rows()))
+f(kill(0x104, PET), item(0xA, 2, 31))
+check("召喚物殺的 +1（從 30 起算，不是從 9）", qty(lt, 2) == 2, str(lt.rows()))
 
-print("⑥ 買來的不算收穫 —— 記帳先、快照後")
-lt = new({1905: 10})
-lt.bought(1905, 50)              # 補給那趟買了 50（ledger 的實測差額）
-FB.bag = {1905: 60}
-lt.update(SC, "甲")
-check("買的 50 全扣掉", qty(lt, 1905) == 0, f"實得 {qty(lt, 1905)}")
-FB.bag = {1905: 63}
-lt.update(SC, "甲")
-check("之後撿到的照算 3", qty(lt, 1905) == 3, f"實得 {qty(lt, 1905)}")
+print("⑤ 窗口內喝水（變少）不算、總數照樣更新")
+lt.note_bag([it(0xD, 8101, 429)] + [it(0xA, 2, 31), it(0xB, 1228, 7), it(0xC, 3994, 1)],
+            True, f.seq, "甲")
+f(kill(0x106, ME), item(0xD, 8101, 428), item(0xA, 2, 32))
+check("紅水沒算", qty(lt, 8101) == 0, str(lt.rows()))
+check("同批的掉落照算", qty(lt, 2) == 3, str(lt.rows()))
 
-print("⑦ 買來的不算收穫 —— 快照先、記帳後（時序相反也要對）")
-lt = new({1905: 10})
-FB.bag = {1905: 60}
-lt.update(SC, "甲")              # 先被算成獲得 50
-check("先算進來 50", qty(lt, 1905) == 50)
-lt.bought(1905, 50)              # 補給的記帳晚一步到
-check("記帳倒扣回 0", qty(lt, 1905) == 0, f"實得 {qty(lt, 1905)}")
-check("那一列整個消失", lt.kinds() == 0)
+print("⑥ 窗口會關：DROP_WINDOW 包別的之後、或下一包 0x0a")
+f(kill(0x107, ME), *[other() for _ in range(loot.DROP_WINDOW)], item(0xA, 2, 40))
+check("隔太多包不算", qty(lt, 2) == 3, str(lt.rows()))
+f(kill(0x108, ME), other(), other(), item(0xA, 2, 41))
+check("隔兩包還在窗口內", qty(lt, 2) == 4, str(lt.rows()))
+f(kill(0x109, ME), kill(0x10A, OTHER), item(0xA, 2, 42))
+check("下一包是別人的擊殺 → 關窗", qty(lt, 2) == 4, str(lt.rows()))
 
-print("⑧ 買的比撿的多 → 扣完為止，不會扣成負的")
-lt = new({1905: 10})
-FB.bag = {1905: 15}
-lt.update(SC, "甲")              # +5
-lt.bought(1905, 50)              # 記帳 50（其中 45 還沒進背包）
-check("倒扣到 0 不會變負", qty(lt, 1905) == 0)
-FB.bag = {1905: 60}
-lt.update(SC, "甲")              # 剩下的 45 進來
-check("剩下的待扣帳也扣掉", qty(lt, 1905) == 0, f"實得 {qty(lt, 1905)}")
-FB.bag = {1905: 62}
-lt.update(SC, "甲")
-check("扣完之後恢復正常記帳", qty(lt, 1905) == 2, f"實得 {qty(lt, 1905)}")
+print("⑦ credit=False（沒勾掛機／不在巡邏圖）不入帳、總數照樣更新")
+f(kill(0x10B, ME), item(0xA, 2, 50), credit=False)
+check("沒入帳", qty(lt, 2) == 4, str(lt.rows()))
+f(kill(0x10C, ME), item(0xA, 2, 51))
+check("回來後從 50 起算 +1", qty(lt, 2) == 5, str(lt.rows()))
 
-print("⑨ 換角色（斷線重登洗牌）→ 只重建基準，不把別人整袋算進來")
-lt = new({1905: 10})
-FB.bag = {1905: 12}
-lt.update(SC, "甲")
-FB.bag = {7777: 300, 1905: 999}
-check("回 True（讀得到）", lt.update(SC, "乙") is True)
-check("別人的東西沒算進來", qty(lt, 7777) == 0 and qty(lt, 1905) == 2,
-      f"實得 {lt.rows()}")
-FB.bag = {7777: 305, 1905: 999}
-lt.update(SC, "乙")
-check("換人之後照樣繼續記", qty(lt, 7777) == 5, f"實得 {qty(lt, 7777)}")
+print("⑧ ⚠ 快照不蓋比它新的封包（掉落落在快照與處理之間）")
+wc0 = f.seq
+snap = [it(0xA, 2, 52), it(0xB, 1228, 7), it(0xC, 3994, 1), it(0xD, 8101, 428)]  # 快照已含掉落
+f(kill(0x10D, ME), item(0xA, 2, 52))     # 封包先吃（呼叫端的順序）
+lt.note_bag(snap, True, wc0, "甲")
+check("那一件 +1 沒漏", qty(lt, 2) == 6, str(lt.rows()))
+f(kill(0x10E, ME), item(0xA, 2, 53))
+check("下一次照樣 +1（快照沒把它蓋錯）", qty(lt, 2) == 7, str(lt.rows()))
 
-print("⑩ 重新計算 → 全部歸零、重新起算")
-lt = new({1905: 10})
-FB.bag = {1905: 20}
-lt.update(SC, "甲")
-old_since = lt.since
+print("⑨ ⚠⚠ 快照讀不到不套")
+lt2 = loot.Loot(); f2 = Feeder(lt2)
+check("回 False", lt2.note_bag([], False, 0, "甲") is False)
+f2(kill(1, ME), item(0xA, 2, 9))
+check("還是不記（沒有基準）", lt2.rows() == [])
+
+print("⑩ 換角色 → 序號表丟掉；resync → 等下一次快照")
+lt.note_bag([it(0xF, 2, 3)], True, f.seq, "乙")
+f(kill(0x10F, ME), item(0xA, 2, 99))
+check("換人後新序號照樣算新一格（別人那袋不算）", qty(lt, 2) == 7 + 99, str(lt.rows()))
+lt.resync()
+f(kill(0x110, ME), item(0xF, 2, 5))
+check("resync 後舊序號不記", qty(lt, 2) == 106, str(lt.rows()))
+
+print("⑪ 重新計算：累計歸零、序號表留著")
+lt.note_bag([it(0xF, 2, 5)], True, f.seq, "乙")
 lt.reset()
-check("物品清空", lt.rows() == [])
-check("起算時間有更新", lt.since >= old_since)
-FB.bag = {1905: 25}
-lt.update(SC, "甲")              # 歸零後的第一拍＝重建基準
-check("歸零後第一拍不算收穫", lt.rows() == [], f"實得 {lt.rows()}")
-FB.bag = {1905: 28}
-lt.update(SC, "甲")
-check("之後照常累加 3", qty(lt, 1905) == 3, f"實得 {qty(lt, 1905)}")
+check("歸零", lt.rows() == [])
+f(kill(0x111, ME), item(0xF, 2, 6))
+check("重置後直接 +1", qty(lt, 2) == 1, str(lt.rows()))
 
-print("⑪ 排序：最後獲得的在最上面")
-lt = new({})
-FB.bag = {111: 1}
-lt.update(SC, "甲")
-FB.bag = {111: 1, 222: 1}
-lt.update(SC, "甲")
-check("新的在第一列", [t for t, *_ in lt.rows()][0] == 222,
-      f"實得 {[t for t, *_ in lt.rows()]}")
+print("⑫ ⛔ 金幣（種類 1）也走 0x1b，一律不算")
+f(kill(0x114, ME), item(0x99, 1, 26611, slot=0))
+check("金幣沒進表", qty(lt, 1) == 0, str(lt.rows()))
+
+print("⑬ 排序：最後獲得的在最上面")
+f(kill(0x112, ME), item(0xE1, 111, 1))
+f(kill(0x113, ME), item(0xE2, 222, 1))
+check("新的在第一列", [t for t, *_ in lt.rows()][0] == 222, str(lt.rows()))
 
 # ---------------------------------------------------------------------------
 # 分頁整合（offscreen Qt ＋ 假遊戲層）：按鈕、心跳節流、視窗、重新計算
@@ -245,29 +226,82 @@ def build_page():
     return page
 
 
-GAP = farm_tab.LOOT_GAP + 0.1
 # 隨便一個圖包裡真的有的圖示編號 —— 驗「圖真的畫得出來」用
 ICON_OK = sorted(itemicon._open()[1])[0] if itemicon.count() else 0
 
-print("⑫ 分頁整合：按鈕在、心跳會對帳、節流有效")
-FB.ok, FB.icons = True, {1905: ICON_OK}
-FB.bag = {1905: 10}
+
+class Ring:
+    """假的 CastHook：pk＝環槽裡的 [(長度, 內容)]，介面跟真的一樣（read_since 回三元組）。"""
+
+    def __init__(self):
+        self.pk: list = []
+        self.active = True
+
+    def installed(self):
+        return True
+
+    def mark_lost(self):
+        self.active = False
+
+    def write_count(self):
+        return len(self.pk)
+
+    def read_since(self, since):
+        return since, len(self.pk), self.pk[since:]
+
+
+BAG = {"items": [], "ok": True}
+SCENE = [122]
+farm_tab.bag.scan = lambda sc, *a, **k: (list(BAG["items"]), BAG["ok"])
+farm_tab.scene.current_id = lambda sc, allow_scan=False: SCENE[0]
+farm_tab.player.pet_eid = lambda sc: 0
+
+
+def poll(page):
+    page._kill_poll_t = -9.0              # 跳過 0.25 秒節流
+    page._poll_kills()
+
+
+print("⑭ 分頁整合：_poll_kills 吃封包入帳；只在巡邏點那張圖算")
 page = build_page()
 check("按鈕文字是「紀錄」", page.log_btn.text() == "紀錄")
 check("三顆舊按鈕已經拿掉",
       not any(hasattr(page, a)
               for a in ("buy_log_btn", "mall_log_btn", "loot_btn")))
-page.tick(GAP)                                   # 第一拍：建基準
-check("第一拍不算收穫", page._loot.rows() == [])
-FB.bag = {1905: 13, 4836: 1}
-page.tick(0.5)                                   # 還沒到 LOOT_GAP
-check("沒到間隔不對帳", page._loot.rows() == [], f"實得 {page._loot.rows()}")
-page.tick(GAP)
-check("到了間隔就對帳", page._loot.kinds() == 2, f"實得 {page._loot.rows()}")
+page._my_id = lambda: ME
+page._home = (10.0, 20.0, 122)
+ring = Ring()
+page._castwatch = ring
+BAG["items"] = [it(0xA, 1905, 10, icon=ICON_OK)]
+poll(page)                                  # 換 hook
+poll(page)                                  # 第一次快照
+ring.pk += [kill(0x201, ME), item(0xA, 1905, 13)]
+poll(page)
+check("我殺的掉落 +3", qty(page._loot, 1905) == 3, str(page._loot.rows()))
+page.tick(0.5)
+check("心跳本身不再對帳背包（背包變多也不算）",
+      qty(page._loot, 1905) == 3, str(page._loot.rows()))
+SCENE[0] = 999
+ring.pk += [kill(0x202, ME), item(0xB, 4836, 1)]
+poll(page)
+check("不在巡邏點那張圖 → 不算", qty(page._loot, 4836) == 0, str(page._loot.rows()))
+SCENE[0] = 122
+ring.pk += [kill(0x203, ME), item(0xC, 4837, 1)]
+poll(page)
+check("回到巡邏圖 → 照算", qty(page._loot, 4837) == 1, str(page._loot.rows()))
+page._home = None
+ring.pk += [kill(0x204, ME), item(0xC, 4837, 2)]
+poll(page)
+check("沒有巡邏點 → 不算", qty(page._loot, 4837) == 1, str(page._loot.rows()))
+page._home = (10.0, 20.0, 122)
+k0 = page._kills
+ring.pk += [kill(0x205, OTHER), item(0xC, 4837, 3)]
+poll(page)
+check("別人殺的 → 不算（擊殺數也不加）",
+      qty(page._loot, 4837) == 1 and page._kills == k0, f"{page._loot.rows()} kills={page._kills}")
 
-print("⑬ 「紀錄」視窗：三個分頁、列數、圖示")
+print("⑮ 「紀錄」視窗：三個分頁、列數、圖示")
 page._record_purchase("聖光城補給商", 7777, 3)   # 商店那頁要有東西可看
-#   ⚠ 故意挑一個**不在背包裡**的種類：記帳會扣掉收穫，拿現有的來記會把上面那一列抵掉
 dlg = page._logs_dialog()
 check("三個分頁", dlg._tabs.count() == 3, f"實得 {dlg._tabs.count()}")
 check("分頁名字對",
@@ -290,36 +324,25 @@ blank = [lt_tbl.item(r, 0).text() for r in range(2)
 check("沒圖的那列留白不頂替別張圖", blank == ["—"] or not blank,
       f"實得 {blank}")
 
-print("⑭ 補給買來的不算收穫（走真的 _record_purchase）")
-FB.bag = {1905: 13, 4836: 1}
-page2 = build_page()
-page2.tick(GAP)                                  # 基準
-page2._record_purchase("聖光城補給商", 1905, 40)  # 補給那趟買 40
-FB.bag = {1905: 53, 4836: 1}
-page2.tick(GAP)
-check("買的沒被算成收穫", page2._loot.rows() == [], f"實得 {page2._loot.rows()}")
-check("商店紀錄照樣記了一筆", len(page2._purchases) == 1)
-
-print("⑮ 重新計算：歸零＋當場重建基準＋表就地重畫")
-FB.bag = {1905: 13, 4836: 1}          # ⚠ 上一段動過這袋，先擺回這台的現況
+print("⑯ 重新計算：歸零＋表就地重畫")
 dlg._loot._reset_btn.click()
 check("表清空", dlg._loot._tbl.rowCount() == 0)
-check("標題改成「還沒對到」", "還沒對到" in dlg._loot._head.text(),
+check("標題改成「還沒有掉落」", "還沒有掉落" in dlg._loot._head.text(),
       f"實得 {dlg._loot._head.text()}")
-FB.bag = {1905: 14, 4836: 1}                     # 重置後又撿到 1 個
-page.tick(GAP)
+ring.pk += [kill(0x206, ME), item(0xA, 1905, 14)]
+poll(page)
 check("重置後只算新的 1 件",
       [(t, n) for t, n, _i, _s in page._loot.rows()] == [(1905, 1)],
       f"實得 {page._loot.rows()}")
 dlg.deleteLater()
 
-print("⑯ 單開一張「獲得物品」（_wrap_panel 那條路）的空表")
+print("⑰ 單開一張「獲得物品」（_wrap_panel 那條路）的空表")
 empty = build_page()._loot_dialog()
-check("說「還沒對到新東西」", "還沒對到" in empty._head.text())
+check("說「還沒有掉落」", "還沒有掉落" in empty._head.text())
 check("零列", empty._tbl.rowCount() == 0)
 empty.deleteLater()
 
-print("⑰ 版面（2026-08-28 使用者調的）")
+print("⑱ 版面（2026-08-28 使用者調的）")
 
 
 def _row_of(page, w) -> int:

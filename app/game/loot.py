@@ -1,57 +1,57 @@
-"""掛機收穫：這段期間背包多了什麼東西。
+"""獲得物品：**伺服器說是我殺的怪掉的**東西（自動掛機／自動刷副本共用）。
 
     lt = loot.Loot()
-    lt.update(scanner, who="小天使")     # 每隔幾秒叫一次（掛機頁的心跳）
-    lt.rows()                            # [(種類id, 累計數量, 圖示編號, 最後時間)]
-    lt.reset()                           # 「重新計算」
+    start, wc, slots = hook.read_since(wc)            # castwatch 環槽（呼叫端自己輪詢）
+    lt.feed(start, slots, is_mine, credit=True)       # 掉落只在 credit 期間入帳
+    lt.note_bag(scanner, wc_before_scan, who)         # 每隔幾秒校一次「每件現在幾個」
+    lt.rows()                                         # [(種類id, 累計數量, 圖示編號, 最後時間)]
+    lt.reset()                                        # 「重新計算」
 
-⛔ **金幣不算**（使用者 2026-08-28 決定：「錢不算好了」）—— 這裡只數東西。
+⛔ **金幣不算**（使用者 2026-08-28：「錢不算好了」）—— 只數東西。
 
-怎麼算出來的
-------------
-遊戲沒有「我剛剛撿到什麼」這種可以直接讀的東西（掉落走的是伺服器封包，
-入向包只解得開施放廣播那一種，見 memory 的 inbound-packet-cast-broadcast），
-所以走**背包快照對帳**：每隔幾秒把整袋按種類數一遍，跟上一拍比，
-**只認增加的部分**，減少的一律不看。
+怎麼認「這是打怪掉的」（2026-09-24 使用者：「都改成吃官方伺服器給的」）
+--------------------------------------------------------------------
+舊版是背包快照對帳（多出來的都算），刷副本、飛去別張圖、買的、別人給的全混進來。
+現在只認伺服器封包（memory `loot-into-bag-packet`、`kill-credit-packet`）：
 
-只認正差值有兩個好處：
-  · 賣掉／存倉／喝掉 → 負差值不計，累計不會倒扣，也不會把「後來又撿到」
-    算成第二次（累計 = 這段期間淨增加的總和，跟收益監控算經驗／金幣時薪
-    同一套算法，見 profit_tab 檔頭）。
-  · 換地圖／重連那種「值瞬間跳掉」的情況方向都是往下（讀不到＝空），
-    先被下面那道閘擋掉，擋不掉的也只會少算，不會多算。
+  · 掉落**不用撿、直接進背包**；那一刻伺服器送物品整筆同步 `0x1b`
+    （序號／種類／格號／目前總數，`castwatch.parse_item`）。
+  · `0x1b` 本身**沒有來源欄位**（喝水、買東西也是這包）→ 靠**順序**：緊跟在
+    「殺手＝我（或我的召喚物）」的死亡廣播 `0x0a` 後面的那幾包 `0x1b`，而且總數
+    **變多**，才算掉落。一隻可能掉 2 件 → 連續幾包都收；窗口在下一包 `0x0a`
+    或 DROP_WINDOW 包別的封包後關上（實錄 6/6 次都是緊接著，一包都沒隔）。
+  · 增加量＝這包的總數 − 這一件（序號）先前的總數。先前的總數兩個來源：
+    每一包 `0x1b`（不論來源都更新）＋定期的背包快照 `note_bag`。
+    ⚠ 快照不准蓋掉比它新的封包：快照前先記 write_count，快照讀完**先把封包吃完**
+      再套快照，而且只套「快照開始後沒收過封包」的那幾件 —— 不然掉落剛好落在
+      快照與封包處理之間，那一件的舊總數已經含掉落，增加量變 0＝漏記。
+  · 還沒有完整快照前看到的**舊序號**不知道原本幾個 → 不記（少記，不猜）。
+    快照後才出現的新序號＝新的一格，增加量＝總數。
 
-⚠⚠ 讀不到一定要整拍作廢（[[bag-false-empty-guards]]，那個坑已經復發七次）
-  —— 背包讀不到時 `bag.items()` 回的是空清單，跟「東西全被賣光」長得一模一樣。
-  拿它當基準的話，下一拍整袋東西會被算成「剛剛獲得」，數字會離譜地灌水。
-  所以這裡只吃 `bag.scan()` 的第二個回傳值（整段真的都讀到了、而且伺服器
-  真的把內容推過來了）；它不成立就**基準不動、什麼都不算**。
+⚠⚠ 快照讀不到就整次不套（[[bag-false-empty-guards]]）：只吃 `bag.scan()` 第二個
+  回傳值成立的那次。
+⚠ 換角色（斷線重登洗牌）→ 序號表整個丟掉重建，累計保留。
 
-⚠ 買來的東西不算收穫（`bought()`）：回程補給買的兩百瓶藥水本來就會讓背包
-  變多，記進「掛機獲得」只會讓人以為打怪掉了兩百瓶。補給那條路本來就在
-  對帳（`supply.run_buy` 的 ledger），把同一筆數量報過來扣掉即可。
-  ★ 記帳跟快照誰先誰後都要對：`bought()` **先從已經累計的數量倒扣**，
-    扣不完的才掛在待扣帳上等下一拍（快照先發生／記帳先發生兩種順序都成立）。
-
-⚠ 這裡**不必**另外問一次 `bag.gold()`：「東西真的推過來了嗎」那道同步判定
-  已經在 `bag.scan()` 的第二個回傳值裡（它自己會查第 0 格的金幣物件，
-  見 `bag._gold_slot_ok`）—— 再讀一次金幣只是同一道閘問第二遍。
-
-全程只讀記憶體，不寫入、不注入。
+全程只讀（封包是 castwatch 攔讀的環槽），不寫入、不注入。
 """
 from __future__ import annotations
 
 import threading
 import time
 
-from app.game import bag
+from app.game import bag, castwatch
+
+
+# 殺手＝我那包之後，最多再看幾包「不是物品同步」的封包就關窗口（實錄 0 包）。
+#   同一批跟著來的有 0x13／0x0d(系統訊息)／0x0b 這些，給幾包餘裕；窗口內總數
+#   **變少**的（喝水）本來就不算，買東西不會剛好落在擊殺那一批裡。
+DROP_WINDOW = 6
 
 
 class Loot:
-    """一台分身的收穫累計器。
+    """一台分身（一個角色）的掉落累計器。
 
-    ⚠ `bought()` 是**背景執行緒**（補給那條）呼叫的，`update()` / `rows()`
-      在 UI 執行緒 —— 所有共用資料都在同一把鎖底下改。
+    ⚠ `rows()` / `kinds()` 可能在別的執行緒被叫（畫表）—— 共用資料都在鎖底下改。
     """
 
     def __init__(self) -> None:
@@ -60,42 +60,41 @@ class Loot:
 
     # -- 對外狀態 -------------------------------------------------------
     def reset(self) -> None:
-        """歸零（「重新計算」鈕）。基準也一起丟掉 —— 下一拍重建。
-
-        ⚠ 基準設 None 而不是留著：留著的話，歸零到下一拍之間背包的變動會被
-          算進新的一輪，看起來就像「才剛按重置就有東西」。
-        """
+        """歸零（「重新計算」鈕）。序號表留著 —— 那是「每件現在幾個」，跟累計無關。"""
         with self._lock:
             self.since = time.time()
             # 種類id →[累計數量, 圖示編號, 最後一次增加的時間, 第幾次增加]
-            # ⚠ 排序要用最後那個流水號當第二鍵：同一拍進來的好幾種東西時間戳
-            #   會一模一樣（`time.time()` 的解析度不夠），只看時間的話順序
-            #   等於「誰先被 dict 走到」，看起來就像沒照新舊排。
+            # ⚠ 排序要用流水號當第二鍵：同一拍進來的幾種東西時間戳一樣。
             self._items: dict[int, list] = {}
             self._seq = 0
-            self._prev: dict[int, int] | None = None   # 上一拍的整袋數量
-            self._pending: dict[int, int] = {}         # 買來的待扣帳
-            self._who: str | None = None               # 上一拍是哪隻角色
+            if not hasattr(self, "_known"):
+                self._forget()
 
-    def rebase(self) -> None:
-        """丟掉基準、**累計保留** —— 下一拍只重建基準、不算收穫。
+    def _forget(self) -> None:
+        self._known: dict[int, int] = {}     # 序號 → 目前總數
+        self._touched: dict[int, int] = {}   # 序號 → 最後一包 0x1b 的封包序號
+        self._icons: dict[int, int] = {}     # 種類 → 圖示編號（快照學來的）
+        self._ready = False                  # 有過一次完整快照了嗎
+        self._armed = 0                      # 擊殺窗口還剩幾包
+        self._who: str | None = None
 
-        ★ 給「只在某段期間記帳」的用法（自動刷副本的「副本收益」：只算人在副本裡
-          跑腳本那段，補給／趕路期間不對帳）。暫停期間背包一定變了（補給買了兩百瓶
-          藥水），恢復對帳時拿暫停前的舊基準去比，整袋買來的東西會被算成「剛獲得」——
-          所以恢復前先把基準丟掉，第一拍只建基準。⚠ 不是 reset()：累計要留著。
-        """
+    def resync(self) -> None:
+        """「每件現在幾個」不可信了（封包漏看：監聽重裝／環槽被蓋過／有一段沒在輪詢）
+        → 丟掉序號表，等下一次完整快照重建；累計保留。重建前舊序號的增加量不記（少記）。"""
         with self._lock:
-            self._prev = None
+            self._known.clear()
+            self._touched.clear()
+            self._ready = False
+            self._armed = 0
+
+    def need_bag(self) -> bool:
+        """還沒有完整快照（剛開／剛 resync）→ 呼叫端這一拍就該拍一次。"""
+        return not self._ready
 
     def rows(self) -> list[tuple[int, int, int, float]]:
-        """[(種類id, 累計數量, 圖示編號, 最後獲得時間)]，**新的在上面**。
-
-        跟商店／商城兩張紀錄表同一個順序（使用者習慣新的在最上面）；
-        同一種東西只有一列，數量累加。
-        """
+        """[(種類id, 累計數量, 圖示編號, 最後獲得時間)]，**新的在上面**。"""
         with self._lock:
-            rows = [(tid, v[0], v[1], v[2], v[3])
+            rows = [(tid, v[0], v[1] or self._icons.get(tid, 0), v[2], v[3])
                     for tid, v in self._items.items()]
         rows.sort(key=lambda r: (r[3], r[4]), reverse=True)
         return [r[:4] for r in rows]
@@ -105,75 +104,77 @@ class Loot:
         with self._lock:
             return len(self._items)
 
-    # -- 記帳 -----------------------------------------------------------
-    def bought(self, type_id: int, qty: int) -> None:
-        """買到的不算收穫。**背景執行緒呼叫**：只碰純資料，不碰 Qt。
+    # -- 封包 -----------------------------------------------------------
+    def feed(self, start: int, slots, is_mine, credit: bool) -> list[tuple[int, int]]:
+        """吃一批入向封包（`CastHook.read_since` 的 start 與 [(長度, 內容)]）。
 
-        數量是補給那趟的背包實測差額（`supply.run_buy` 的 ledger 給什麼就是
-        什麼，不猜）。先從已經累計的倒扣，扣不完的掛帳等下一拍的正差值扣。
+        is_mine(殺手ID) → 這隻算不算我殺的；credit＝現在算不算數（掛機在巡邏圖／
+        副本裡跑腳本）。credit=False 照樣吃 0x1b 更新總數，只是不入帳。
+        回這批入帳的 [(種類id, 數量)]（給呼叫端寫 debug）。
         """
-        type_id, qty = int(type_id), int(qty)
-        if qty <= 0:
-            return
-        with self._lock:
-            cur = self._items.get(type_id)
-            if cur is not None:
-                take = min(qty, cur[0])
-                cur[0] -= take
-                qty -= take
-                if cur[0] <= 0:
-                    del self._items[type_id]
-            if qty > 0:
-                self._pending[type_id] = self._pending.get(type_id, 0) + qty
-
-    # -- 主要心跳 -------------------------------------------------------
-    def update(self, scanner, who: str | None = None) -> bool:
-        """對帳一拍。回傳「這一拍算不算數」（False ＝ 讀不到，基準沒動）。
-
-        `who` 是角色識別（角色名／帳號都行）。⚠ 換人了就只重建基準不累加 ——
-        斷線重登會換到別隻角色（memory 的 auto-login-memory-driven：空視窗
-        會洗牌），不擋的話**別人整袋的東西**會被算成這一趟的收穫。
-        """
-        items, complete = bag.scan(scanner)
-        if not complete:
-            return False                     # ⚠⚠ 讀不到 ≠ 沒有，整拍作廢
-        cur: dict[int, int] = {}
-        icons: dict[int, int] = {}
-        for it in items:
-            cur[it.type_id] = cur.get(it.type_id, 0) + it.count
-            if it.icon_id:
-                icons[it.type_id] = it.icon_id
+        got: list[tuple[int, int]] = []
         now = time.time()
         with self._lock:
-            same_who = who is None or self._who is None or who == self._who
-            self._who = who if who is not None else self._who
-            if self._prev is None or not same_who:
-                # 第一拍（或剛歸零／剛換人）：只建基準，不算收穫。
-                self._prev = cur
-                return True
-            for tid, n in cur.items():
-                gain = n - self._prev.get(tid, 0)
-                if gain <= 0:
+            for i, pkt in enumerate(slots):
+                n, data = pkt
+                k = castwatch.parse_kill(data)
+                if k is not None:
+                    self._armed = DROP_WINDOW if (credit and is_mine(k[1])) else 0
                     continue
-                # 買來的先扣（`bought()` 掛的待扣帳）
-                owed = self._pending.get(tid, 0)
-                if owed:
-                    take = min(owed, gain)
-                    gain -= take
-                    if owed - take:
-                        self._pending[tid] = owed - take
+                it = castwatch.parse_item(data, n)
+                if it is None:
+                    if self._armed:
+                        self._armed -= 1
+                    continue
+                serial, tid, _slot, total = it
+                if tid == bag.GOLD_TYPE:
+                    # ⛔ 金幣不算（2026-08-28）。⚠ 金幣也走這包（北極狐實機：擊殺那批
+                    #   一起送），而且第 0 格不在 bag.scan 的清單裡 → 不擋會被當成
+                    #   「新的一格、增加量＝總額」整筆灌進來（2026-09-24 驗到過）。
+                    continue
+                prev = self._known.get(serial)
+                if prev is None and self._ready:
+                    prev = 0                  # 快照後才出現的序號＝新的一格
+                if self._armed and prev is not None and total > prev:
+                    gain = total - prev
+                    self._seq += 1
+                    row = self._items.get(tid)
+                    if row is None:
+                        self._items[tid] = [gain, self._icons.get(tid, 0), now, self._seq]
                     else:
-                        del self._pending[tid]
-                if gain <= 0:
+                        row[0] += gain
+                        row[2], row[3] = now, self._seq
+                    got.append((tid, gain))
+                self._known[serial] = total
+                self._touched[serial] = start + i
+        return got
+
+    # -- 快照 -----------------------------------------------------------
+    def note_bag(self, items, complete: bool, wc_before: int,
+                 who: str | None = None) -> bool:
+        """套一次背包快照（`bag.scan` 的兩個回傳值）。回「有沒有套上」。
+
+        wc_before＝**快照前**讀的 write_count；⚠ 呼叫端要先把封包吃到快照之後
+        （feed）再叫這支 —— 快照開始後收過封包的那幾件以封包為準、不蓋。
+        """
+        if not complete:
+            return False                     # ⚠⚠ 讀不到 ≠ 沒有，整次不套
+        with self._lock:
+            if who is not None and self._who is not None and who != self._who:
+                self._forget()               # 換角色：序號全換了
+            if who is not None:
+                self._who = who
+            seen = set()
+            for it in items:
+                seen.add(it.serial)
+                if it.icon_id:
+                    self._icons[it.type_id] = it.icon_id
+                if self._touched.get(it.serial, -1) >= wc_before:
                     continue
-                self._seq += 1
-                slot = self._items.get(tid)
-                if slot is None:
-                    self._items[tid] = [gain, icons.get(tid, 0), now, self._seq]
-                else:
-                    slot[0] += gain
-                    slot[2], slot[3] = now, self._seq
-                    if not slot[1] and icons.get(tid):
-                        slot[1] = icons[tid]
-            self._prev = cur
+                self._known[it.serial] = it.count
+            for serial in [s for s in self._known if s not in seen]:
+                if self._touched.get(serial, -1) < wc_before:
+                    del self._known[serial]  # 賣掉／用完／存倉
+                    self._touched.pop(serial, None)
+            self._ready = True
         return True

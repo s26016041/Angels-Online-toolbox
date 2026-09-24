@@ -88,6 +88,9 @@ class Ring:
     def kills_since(self, since):
         return FakeHook(self.pk).kills_since(since)
 
+    def read_since(self, since):
+        return since, len(self.pk), [(len(d), d) for d in self.pk[since:]]
+
 
 class Lbl:
     def __init__(self):
@@ -105,12 +108,18 @@ class Page:
     _bump_kills = farm_tab.CharFarmPage._bump_kills
     _show_kills = farm_tab.CharFarmPage._show_kills
     _note_boss_kill = farm_tab.CharFarmPage._note_boss_kill
+    _feed_loot = farm_tab.CharFarmPage._feed_loot
 
     def __init__(self):
         self._castwatch = None
         self._kill_cw = None
         self._kill_wc = 0
         self._kill_poll_t = -9.0
+        self._loot = farm_tab.loot.Loot()
+        self._loot_t = 0.0
+        self._loot_poll_t = 0.0
+        self._home = None
+        self.char_name = self.account = "t"
         self._recent_tid = {}
         self._pet_eids = {}
         self._kills = 0
@@ -135,6 +144,7 @@ class Page:
 
 
 pet_now = [0]
+farm_tab.bag.scan = lambda sc, *a, **k: ([], False)
 farm_tab.player.pet_eid = lambda sc: pet_now[0]
 boss_ids = {777}
 farm_tab.monsters.is_boss = lambda sc, tid: (True if tid in boss_ids else False)

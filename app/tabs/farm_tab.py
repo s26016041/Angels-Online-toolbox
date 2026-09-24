@@ -194,11 +194,9 @@ BALL_RETRY_GAP = 10.0
 # 「購買紀錄」在記憶體裡最多留幾筆（跟自動回連的事件歷史同一套：session 狀態，
 # 工具箱重開清空）。一趟補給通常 2~5 筆，500 筆夠看好幾天。
 PURCHASE_CAP = 500
-# ★ 「獲得物品」（2026-08-28 使用者要求）多久對帳一次背包。整袋掃一遍實測
-#   幾毫秒（`bag.scan` 一次批量讀指標＋每件一次讀取，範本有快取），放在 UI
-#   心跳上很便宜；間隔太長的話「撿到又賣掉」會整批漏掉，3 秒是折衷。
-#   ⚠ 這是**對帳**的頻率，不是視窗刷新的頻率 —— 視窗是一次性快照
-#     （使用者指定「不用刷頻」，高頻改表也是 qt-ui-pitfalls 的坑）。
+# ★ 「獲得物品」多久拍一次背包快照（校正「每件現在幾個」，見 loot.py 檔頭）。
+#   2026-09-24 起掉落只認伺服器封包，快照只是基準：整袋掃一遍實測幾毫秒，
+#   3 秒一次很便宜。⚠ 不是視窗刷新頻率 —— 視窗是一次性快照（使用者指定「不用刷頻」）。
 LOOT_GAP = 3.0
 # 「獲得物品」表裡圖示格的邊長（px）。遊戲的道具圖示實測多半是 36x36
 #   （assets/item_icons.zip，見 tools/build_item_icons.py），照原尺寸擺最清楚。
@@ -266,7 +264,7 @@ def loot_panel(parent, lt, on_reset, note: str = "") -> QWidget:
                 f"起算 {time.strftime('%m/%d %H:%M', time.localtime(lt.since))}"
                 f"（{since}）")
         if not rows:
-            head += f"　—— 還沒對到新東西（每 {LOOT_GAP:.0f} 秒對帳一次背包）"
+            head += "　—— 還沒有掉落（只算伺服器確認是我殺的怪掉進背包的）"
         if note:
             head += f"　{note}"
         lab.setText(head)
@@ -2143,10 +2141,11 @@ class CharFarmPage(QWidget):
         # session 狀態不進 config（跟擊殺數、事件歷史同一類）。
         self._purchases: list[tuple[float, str, int, int, int | None]] = []
         # ── 獲得物品（2026-08-28 使用者要求）──
-        # 背包快照對帳的累計器（見 app/game/loot.py）。session 狀態不進 config，
+        # 伺服器確認的掉落累計器（見 app/game/loot.py）。session 狀態不進 config，
         # 跟擊殺數／購買紀錄同一類；「重新計算」鈕會把它歸零。
         self._loot = loot.Loot()
-        self._loot_t = 0.0         # 對帳心跳（LOOT_GAP 一拍）
+        self._loot_t = 0.0         # 背包快照心跳（LOOT_GAP 一拍）
+        self._loot_poll_t = 0.0    # 上次輪詢封包的時間（隔太久＝漏看 → resync）
         # ★ 自動丟棄（2026-09-23）：掛機中每 discard.GAP 秒讀一次背包，清單上的當場丟。
         #   背景執行緒跑 discard.run；把手留著，活著就不開第二條。
         self._discard_t = 0.0
@@ -3984,10 +3983,6 @@ class CharFarmPage(QWidget):
             (time.time(), merchant, int(tid), int(qty), cost))
         if len(self._purchases) > PURCHASE_CAP:
             del self._purchases[:-PURCHASE_CAP]
-        # ★ 買來的不算「獲得物品」（2026-08-28）：補給買的兩百瓶藥水本來就會
-        #   讓背包變多，記進收穫只會讓人以為打怪掉了兩百瓶。
-        #   `bought()` 兩種時序都對得起來（見 loot.py），這裡不必管誰先誰後。
-        self._loot.bought(tid, qty)
 
     def _purchases_panel(self) -> QWidget:
         """把購買紀錄畫成一張表（新的在上面），總額掛在表的上方。
@@ -4043,18 +4038,11 @@ class CharFarmPage(QWidget):
 
     # -- 獲得物品（2026-08-28 使用者要求）--------------------------------
     #
-    # 對帳在 `tick()` 裡（LOOT_GAP 一拍），算法與各種誤報的防線見
-    # `app/game/loot.py` 檔頭。這裡只負責畫。
+    # 入帳在 `_poll_kills()` 裡（跟擊殺數同一批封包），算法見 `app/game/loot.py`
+    # 檔頭。這裡只負責畫。
     def _reset_loot(self) -> None:
-        """「重新計算」：歸零並**當場重建基準**。
-
-        ⚠ 不當場重建的話，歸零到下一拍（最多 LOOT_GAP 秒）之間背包的變動
-          會算進新的一輪 —— 看起來就像「才剛按重置就跳出東西」。
-          讀不到（還沒進場／換地圖中）就讓它留空，下一拍自然會建。
-        """
+        """「重新計算」：累計歸零（序號表留著，那是「每件現在幾個」，跟累計無關）。"""
         self._loot.reset()
-        self._loot_t = 0.0
-        self._loot.update(self.sc, self.char_name or self.account)
 
     def _loot_panel(self) -> QWidget:
         """把累計的收穫畫成一張表（新的在上面），摘要掛在表的上方。
@@ -4225,9 +4213,6 @@ class CharFarmPage(QWidget):
     def _record_mall_buy(self, g) -> None:
         """商城買到一筆 → 記帳（**背景執行緒**呼叫，只碰純資料）。"""
         record_mall_buy(self._mall_buys, g)
-        # 商城買的備球最後會領進背包（balls.restock），跟商店買的一樣
-        # 不算「獲得物品」—— 那是花點數換來的，不是打怪掉的。
-        self._loot.bought(g.type_id, g.count)
 
     def _mall_buys_dialog(self) -> QDialog:
         return mall_buys_dialog(
@@ -5987,11 +5972,29 @@ class CharFarmPage(QWidget):
         if cw is not self._kill_cw:
             self._kill_cw = cw
             self._kill_wc = cw.write_count()
+            self._loot.resync()             # 換了一份 hook：中間的物品包沒看到
             self._show_kills()
             return
-        wc = cw.write_count()
-        hits = cw.kills_since(self._kill_wc)
+        # ★ 獲得物品（2026-09-24）：快照先拍（記下拍之前的 write_count），封包吃完再套
+        #   —— 順序見 loot.Loot.note_bag。隔太久沒輪詢（沒勾掛機那段）→ 序號表作廢。
+        gap = now - self._loot_poll_t
+        if gap > 2.0:
+            self._loot.resync()
+        self._loot_poll_t = now
+        self._loot_t += min(gap, LOOT_GAP)
+        snap = None
+        if self._loot_t >= LOOT_GAP or self._loot.need_bag():
+            self._loot_t = 0.0
+            wc0 = cw.write_count()
+            try:
+                snap = (bag.scan(self.sc), wc0)
+            except Exception:                  # noqa: BLE001
+                snap = None
+        start, wc, pkts = cw.read_since(self._kill_wc)
+        if start != self._kill_wc:
+            self._loot.resync()             # 環槽被蓋過：有包沒看到
         self._kill_wc = wc
+        hits = [k for k in (castwatch.parse_kill(d) for _n, d in pkts) if k]
         # 召喚物 eid：每次都重讀（會重建），留 15 秒
         pet = player.pet_eid(self.sc)
         if pet:
@@ -6002,9 +6005,13 @@ class CharFarmPage(QWidget):
         for eid, t in list(self._recent_tid.items()):
             if now - t[1] > 30.0:
                 del self._recent_tid[eid]
+        me = self._my_id()
+        try:
+            self._feed_loot(start, pkts, snap, me)
+        except Exception as exc:               # noqa: BLE001 — 記帳出錯不能拖垮擊殺數
+            self._dbg(f"掉落記帳出錯：{exc}")
         if not hits:
             return
-        me = self._my_id()
         for victim, killer in hits:
             mine = bool(me) and (killer == me or killer in self._pet_eids)
             tid = next((m.type_id for m in self.mons if m.eid == victim), None)
@@ -6018,6 +6025,20 @@ class CharFarmPage(QWidget):
             self._dbg(f"伺服器確認：怪 {victim & 0xFFFF:#x} 是"
                       + ("我的召喚物" if killer != me else "我")
                       + f"殺的（累計 {self._kills} 隻）")
+
+    def _feed_loot(self, start: int, pkts, snap, me: int) -> None:
+        """掉落入帳：只在「開始掛機」勾著、人在巡邏點那張圖時算（2026-09-24 使用者：
+        「在自動掛機時才會算要在巡邏點」）。其他時候照樣吃 0x1b 更新總數、不入帳。"""
+        home = self._home
+        sid = scene.current_id(self.sc, allow_scan=False)
+        credit = bool(me) and home is not None and sid is not None and sid == home[2]
+        got = self._loot.feed(
+            start, pkts, lambda k: k == me or k in self._pet_eids, credit)
+        for tid, n in got:
+            self._dbg(f"伺服器確認掉落：{itemname.label(tid)} ×{n}")
+        if snap is not None:
+            (items, ok), wc0 = snap
+            self._loot.note_bag(items, ok, wc0, self.char_name or self.account)
 
     def _note_rollback(self, me, here) -> bool:
         """位置被伺服器拉回了嗎？是的話順手做善後，回 True。
@@ -6336,17 +6357,8 @@ class CharFarmPage(QWidget):
         #   一定要放在最前面：底下每一段都在讀寫一個已經不存在的行程。
         if self._check_game_gone(dt):
             return
-        # ★ 獲得物品的對帳（2026-08-28 使用者要求）：整袋快照比對，只認增加的
-        #   （怎麼算、為什麼讀不到要整拍作廢，見 app/game/loot.py 檔頭）。
-        # ⚠ 一定要放在所有提早 return **之前**：補給／死亡回程／活動地圖那幾段
-        #   都會直接 return，放後面的話正好在「回城賣東西」那段停止記帳
-        #   （跟趴趴GO 倒數、換球標籤踩過的是同一個坑）。
-        # ★ 不看「開始掛機」有沒有勾：手動打王、練技一樣會撿到東西，
-        #   而按鈕隨時都在，勾選才記帳會讓它看起來壞掉。
-        self._loot_t += dt
-        if self._loot_t >= LOOT_GAP:
-            self._loot_t = 0.0
-            self._loot.update(self.sc, self.char_name or self.account)
+        # ⛔ 獲得物品不再在這裡對帳背包（2026-09-24 使用者：「自動戰鬥真的在自動戰鬥
+        #   的時候才能計算」「都改成吃官方伺服器給的」）→ 改在 _poll_kills 吃封包。
         # ★ 自動丟棄（2026-09-23）：掛機中清單上的東西每 discard.GAP 秒丟一輪（背景執行緒）。
         self._discard_tick(dt)
         # ★ 掃描**一直都在跑**，不管有沒有在掛機 ——

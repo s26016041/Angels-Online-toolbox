@@ -215,7 +215,7 @@ def main() -> int:
     own = None
     if ring_info:
         wcnt_addr, ring = ring_info
-        N, SLOT, CAP, DOFF = castwatch._N, castwatch._SLOT, castwatch._CAP, 4
+        N, SLOT, CAP, DOFF = castwatch._N, castwatch._SLOT, castwatch._CAP, 8
     elif why.startswith("沒 hook"):
         own = install_own(pid)
         _pm, wcnt_addr, ring, _orig = own

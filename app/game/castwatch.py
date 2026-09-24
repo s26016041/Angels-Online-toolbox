@@ -28,7 +28,7 @@ opcode。施放廣播的版面（實測 944/945/946/947，跨兩台不同施法�
   前 7 bytes 遮成 ??（hook 裝著也定位得到），與 farm_tab 關閉/收分身時
   無條件 release（_teardown/_client_gone）。
 - 位址 `INBOUND_FN` 登記進 `locate.SIGS`，改版自動跟上；定位失敗 fn=0 → 拒裝。
-- 純攔讀：stub 只把每包前 16 bytes 抄進自己的環狀緩衝，不改遊戲任何狀態、
+- 純攔讀：stub 只把每包長度＋前 _CAP bytes 抄進自己的環狀緩衝，不改遊戲任何狀態、
   執行完偷來的 7 bytes 再跳回原函式，對遊戲完全透明。
 """
 from __future__ import annotations
@@ -68,14 +68,31 @@ KILL_OFF_KILLER = 6
 KILL_OFF_TAG = 10
 KILL_TAG = 7
 
+# ★ 物品整筆同步＝「背包裡這一件現在長這樣」（2026-09-24 北極狐打史萊姆實錄，
+#   memory `loot-into-bag-packet`）。掉落**不用撿、直接進背包**，那一刻伺服器送：
+#   `1b 00 | 01 00 @2 | … | 序號 u32@7 | 取得時間 u32@11 | 種類ID u32@15 | … | 格號 u16@44 | 總數 u16@46`
+#   ⚠ 這包**沒有來源欄位**：喝水、買東西送的是同一種包（喝水實錄前 7 bytes 完全
+#   一樣，只是總數變少）。「是打怪掉的」只能靠**順序**認 —— 6/6 次掉落都緊跟在
+#   「殺手＝我」的 0x0a 後面（見 loot.Loot.feed）。
+#   版面變了 → parse_item 認不出＝少記（看得到），不會多記。
+ITEM_OP = 0x1B
+ITEM_SUB = 0x0001        # offset 2，u16
+ITEM_OFF_SERIAL = 7
+ITEM_OFF_TYPE = 15
+ITEM_OFF_SLOT = 44
+ITEM_OFF_COUNT = 46
+ITEM_LEN = 92            # 實錄每包都是 92 bytes；長度對不上就不認
+
 # 玩家實體 + 這個 ＝ 我的施法者伺服器ID（拿來認「這一包是不是我放的」）。
 # ⚠ 結構偏移，改版可能搬家；搬家的症狀是**永遠認不出自己的廣播**＝等不到確認，
 #   同樣退回安全路而不是亂送。實測五台的值都對得上自己的施放廣播。
 SRV_ID_OFF = 0x1D0
 
 _N = 512                 # ⚠ 環槽數（2 的次方）——我們自己的緩衝，跟遊戲無關
-_CAP = 16                # 每包記前幾 bytes（夠讀 op/caster/sub/skill 四欄）；⚠ 我們自己的緩衝，跟遊戲無關
-_SLOT = 4 + _CAP         # seq(4) + data
+# 每包記前幾 bytes ＋ 真實長度（施放 16、死亡 14 bytes；物品同步的總數在 @46，
+#   所以 2026-09-24 從 16 放大到 48）；⚠ 我們自己的緩衝，跟遊戲無關
+_CAP = 48
+_SLOT = 8 + _CAP         # seq(4) + 長度(4) + data
 _k32 = ctypes.windll.kernel32
 
 
@@ -94,7 +111,7 @@ def own_server_id(scanner, player_entity: int) -> int | None:
 
 
 def _stub_asm(wcnt: int, ring: int, cont: int) -> str:
-    """inline hook stub（32 位元）：把每包 seq＋前 16 bytes 記進環狀緩衝，
+    """inline hook stub（32 位元）：把每包 seq＋長度＋前 _CAP bytes 記進環狀緩衝，
     再執行偷來的 7 bytes prologue、跳回原函式 +7。
 
     入口：__thiscall ecx=this、[esp+4]=訊息緩衝、[esp+8]=長度。
@@ -111,13 +128,14 @@ def _stub_asm(wcnt: int, ring: int, cont: int) -> str:
     mov dword ptr [ebx], edi
     mov edx, dword ptr [esp+0x24]
     mov ecx, dword ptr [esp+0x28]
+    mov dword ptr [ebx+4], ecx
     cmp ecx, {_CAP:#x}
     jbe cok
     mov ecx, {_CAP:#x}
     cok:
     test edx, edx
     jz done
-    lea edi, [ebx+0x4]
+    lea edi, [ebx+0x8]
     mov esi, edx
     cld
     rep movsb
@@ -233,23 +251,35 @@ class CastHook:
         except Exception:                      # noqa: BLE001
             return 0
 
-    def _slots_since(self, since: int) -> list[bytes]:
-        """自 `since`（write_count 的值）以來每一包的前 16 bytes。讀壞就當沒有。
+    def read_since(self, since: int) -> tuple[int, int, list[tuple[int, bytes]]]:
+        """自 `since`（write_count 的值）以來每一包 → (第一包的序號, 讀到的 write_count,
+        [(真實長度, 內容)])。
+
+        內容＝前 min(長度, _CAP) bytes。呼叫端下次拿回傳的 write_count 當 since
+        （⚠ 別另外先讀 write_count 再叫這支：中間進來的包會被讀兩次）。
+        環槽被蓋過（落後超過 _N 包）就從還在的那一包起算。讀壞的槽回空 bytes
+        （長度 0，佔位，序號才對得上）。
         ⚠ 先讀 wcnt 再讀槽：stub 是「寫完槽才 inc wcnt」，所以 < wc 的槽都是完整的。"""
         if not self._active:
-            return []
+            return since, since, []
         try:
             wc = self._pm.read_uint(self._wcnt)
         except Exception:                      # noqa: BLE001
-            return []
-        out: list[bytes] = []
-        for i in range(max(since, wc - _N), wc):
+            return since, since, []
+        start = max(since, wc - _N)
+        out: list[tuple[int, bytes]] = []
+        for i in range(start, wc):
             s = self._ring + (i % _N) * _SLOT
             try:
-                out.append(bytes(self._pm.read_bytes(s + 4, _CAP)))
+                raw = bytes(self._pm.read_bytes(s + 4, 4 + _CAP))
+                n = struct.unpack_from("<I", raw, 0)[0]
+                out.append((n, raw[4:4 + min(n, _CAP)]))
             except Exception:                  # noqa: BLE001
-                continue
-        return out
+                out.append((0, b""))
+        return start, wc, out
+
+    def _slots_since(self, since: int) -> list[bytes]:
+        return [d for _n, d in self.read_since(since)[2]]
 
     def casts_since(self, since: int) -> list[tuple[int, int]]:
         """自 `since`（write_count 的值）以來的**施放廣播** [(施法者ID, 技能ID)]。
@@ -275,19 +305,7 @@ class CastHook:
         殺手 == own_server_id() 就是伺服器明講「我殺的」；呼叫端自己比對
         （也可以把自己的召喚物 eid 算進來）。
         """
-        out: list[tuple[int, int]] = []
-        for data in self._slots_since(since):
-            if len(data) < KILL_OFF_TAG + 4:
-                continue
-            if struct.unpack_from("<H", data, 0)[0] != KILL_OP:
-                continue
-            if struct.unpack_from("<I", data, KILL_OFF_TAG)[0] != KILL_TAG:
-                continue
-            victim = struct.unpack_from("<I", data, KILL_OFF_VICTIM)[0]
-            killer = struct.unpack_from("<I", data, KILL_OFF_KILLER)[0]
-            if victim and killer:
-                out.append((victim, killer))
-        return out
+        return [k for k in map(parse_kill, self._slots_since(since)) if k]
 
     def fired(self, since: int, server_id: int, skill_id: int) -> bool:
         """自 `since` 以來，**我**（server_id）有沒有放出 `skill_id`？
@@ -338,6 +356,36 @@ class CastHook:
         except Exception:                      # noqa: BLE001
             pass
         self._active = False
+
+
+def parse_kill(data: bytes) -> tuple[int, int] | None:
+    """死亡廣播 → (怪 eid, 殺手伺服器ID)；不是就 None（版面見 KILL_*）。"""
+    if len(data) < KILL_OFF_TAG + 4:
+        return None
+    if struct.unpack_from("<H", data, 0)[0] != KILL_OP:
+        return None
+    if struct.unpack_from("<I", data, KILL_OFF_TAG)[0] != KILL_TAG:
+        return None
+    victim = struct.unpack_from("<I", data, KILL_OFF_VICTIM)[0]
+    killer = struct.unpack_from("<I", data, KILL_OFF_KILLER)[0]
+    return (victim, killer) if victim and killer else None
+
+
+def parse_item(data: bytes, length: int | None = None
+               ) -> tuple[int, int, int, int] | None:
+    """物品整筆同步 → (序號, 種類ID, 格號, 目前總數)；不是就 None（版面見 ITEM_*）。
+    `length`＝封包真實長度（環槽只存前 _CAP bytes，長度另外記）；None＝不驗長度。"""
+    if len(data) < ITEM_OFF_COUNT + 2:
+        return None
+    if length is not None and length != ITEM_LEN:
+        return None
+    if struct.unpack_from("<HH", data, 0) != (ITEM_OP, ITEM_SUB):
+        return None
+    serial = struct.unpack_from("<I", data, ITEM_OFF_SERIAL)[0]
+    tid = struct.unpack_from("<I", data, ITEM_OFF_TYPE)[0]
+    slot = struct.unpack_from("<H", data, ITEM_OFF_SLOT)[0]
+    count = struct.unpack_from("<H", data, ITEM_OFF_COUNT)[0]
+    return (serial, tid, slot, count) if serial and tid else None
 
 
 # ── 一個行程一份，比照 move.acquire ────────────────────────────────

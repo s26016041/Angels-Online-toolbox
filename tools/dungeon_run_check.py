@@ -3795,46 +3795,88 @@ def main() -> int:
     # =====================================================================
     # ★★ 副本收益：只在人在副本裡跑腳本時對帳（補給買的不混進來）
     # =====================================================================
-    print("\n副本收益：只在副本裡對帳")
+    print()
+    print("副本收益：只在副本裡、伺服器確認我殺的掉落才記")
+    import struct as _st
+    ME_SRV = 0x6A2F02E8
 
-    class FakeBag:
+    def _kill(victim, killer):
+        d = _st.pack("<HIII", 0x0A, victim, killer, 7)
+        return (len(d), d)
+
+    def _item(serial, tid, total):
+        d = bytearray(92)
+        d[0:7] = bytes((0x1B, 0, 1, 0, 0, 0, 1))
+        _st.pack_into("<I", d, 7, serial)
+        _st.pack_into("<I", d, 15, tid)
+        _st.pack_into("<H", d, 46, total)
+        return (92, bytes(d[:dt.castwatch._CAP]))
+
+    class FakeRing:
         def __init__(self):
-            self.bag = {}
+            self.pk, self.active = [], True
 
-        def scan(self, _sc, *a, **k):
-            return ([types.SimpleNamespace(type_id=t, count=n, icon_id=0)
-                     for t, n in self.bag.items() if n], True)
+        def installed(self):
+            return True
 
-    FB = FakeBag()
-    dt.loot.bag = FB
-    tab = off_tab()
-    FB.bag = {100: 5}
-    run(tab, 0.5, watch=True)
-    lt = tab._loot_for()
-    ck("進副本第一拍只建基準（整袋不算獲得）", lt.rows() == [], str(lt.rows()))
-    FB.bag = {100: 8}
-    run(tab, dt.LOOT_GAP + 0.3, watch=True)
-    ck("★ 副本裡多了 3 個 → 記 3", [r[:2] for r in lt.rows()] == [(100, 3)], str(lt.rows()))
-    tab._cycle = "supply"                   # 出去補給（買了兩百瓶）
-    FB.bag = {100: 208, 200: 50}
-    run(tab, dt.LOOT_GAP * 2, watch=True)
-    ck("★★ 不在副本裡不對帳（補給買的沒被記）", [r[:2] for r in lt.rows()] == [(100, 3)],
-       str(lt.rows()))
-    tab._cycle, tab._phase = "go", "run"    # 回到副本
-    run(tab, 0.5, watch=True)
-    FB.bag = {100: 210, 200: 50}
-    run(tab, dt.LOOT_GAP + 0.3, watch=True)
-    ck("★★ 回副本後只算新增的 2（舊基準丟掉，兩百瓶沒混進來）",
-       sorted(r[:2] for r in lt.rows()) == [(100, 5)], str(lt.rows()))
-    tab._show_loot()
-    ck("「副本收益」視窗：表跟掛機頁同一支、1 列", tab._loot_dlg._panel._tbl.rowCount() == 1
-       and "只算人在副本裡" in tab._loot_dlg._panel._head.text(), tab._loot_dlg._panel._head.text())
-    tab._loot_dlg._panel._reset_btn.click()
-    ck("　重新計算 → 歸零、當場重建基準", lt.rows() == [] and tab._loot_dlg._panel._tbl.rowCount() == 0)
-    FB.bag = {100: 211, 200: 50}
-    run(tab, dt.LOOT_GAP + 0.3, watch=True)
-    ck("　歸零後只算之後多的 1", [r[:2] for r in lt.rows()] == [(100, 1)], str(lt.rows()))
-    tab._loot_dlg.close()
+        def mark_lost(self):
+            self.active = False
+
+        def write_count(self):
+            return len(self.pk)
+
+        def read_since(self, since):
+            return since, len(self.pk), self.pk[since:]
+
+    BAGNOW = {"items": []}
+    RING = FakeRing()
+    acq = []
+    rel = []
+    _orig = (dt.bag.scan, dt.castwatch.acquire, dt.castwatch.release,
+             dt.castwatch.own_server_id, dt.bag.player_entity, dt.player.pet_eid)
+    dt.bag.scan = lambda _sc, *a, **k: (list(BAGNOW["items"]), True)
+    dt.castwatch.acquire = lambda pid, owner: (acq.append(pid), RING)[1]
+    dt.castwatch.release = lambda pid, owner: rel.append(pid)
+    dt.castwatch.own_server_id = lambda sc, pe: ME_SRV
+    dt.bag.player_entity = lambda sc: 0x1000
+    dt.player.pet_eid = lambda sc: 0
+    _it = lambda serial, tid, n: types.SimpleNamespace(serial=serial, type_id=tid, count=n, icon_id=0)
+    try:
+        tab = off_tab()
+        BAGNOW["items"] = [_it(0xA, 100, 5)]
+        run(tab, 1.0, watch=True)
+        lt = tab._loot_for()
+        ck("進副本就借監聽", acq != [], str(acq))
+        ck("整袋不算獲得", lt.rows() == [], str(lt.rows()))
+        RING.pk += [_kill(1, ME_SRV), _item(0xA, 100, 8)]
+        run(tab, 0.5, watch=True)
+        ck("★ 我殺的掉 3 個 → 記 3", [r[:2] for r in lt.rows()] == [(100, 3)], str(lt.rows()))
+        RING.pk += [_kill(2, 0x1234), _item(0xA, 100, 9)]
+        run(tab, 0.5, watch=True)
+        ck("★ 別人殺的不算", [r[:2] for r in lt.rows()] == [(100, 3)], str(lt.rows()))
+        tab._cycle = "supply"                   # 出去補給
+        run(tab, 0.5, watch=True)
+        ck("★★ 離開副本就還監聽", rel != [], str(rel))
+        RING.pk += [_kill(3, ME_SRV), _item(0xA, 100, 208)]
+        tab._cycle, tab._phase = "go", "run"    # 回到副本（這段期間的包沒看到）
+        BAGNOW["items"] = [_it(0xA, 100, 208)]
+        run(tab, 1.0, watch=True)
+        ck("★★ 不在副本裡的不記", [r[:2] for r in lt.rows()] == [(100, 3)], str(lt.rows()))
+        RING.pk += [_kill(4, ME_SRV), _item(0xA, 100, 210)]
+        run(tab, 0.5, watch=True)
+        ck("★★ 回副本後只算新增的 2", [r[:2] for r in lt.rows()] == [(100, 5)], str(lt.rows()))
+        tab._show_loot()
+        ck("「副本收益」視窗：表跟掛機頁同一支、1 列", tab._loot_dlg._panel._tbl.rowCount() == 1
+           and "只算人在副本裡" in tab._loot_dlg._panel._head.text(), tab._loot_dlg._panel._head.text())
+        tab._loot_dlg._panel._reset_btn.click()
+        ck("　重新計算 → 歸零", lt.rows() == [] and tab._loot_dlg._panel._tbl.rowCount() == 0)
+        RING.pk += [_kill(5, ME_SRV), _item(0xA, 100, 211)]
+        run(tab, 0.5, watch=True)
+        ck("　歸零後只算之後多的 1", [r[:2] for r in lt.rows()] == [(100, 1)], str(lt.rows()))
+        tab._loot_dlg.close()
+    finally:
+        (dt.bag.scan, dt.castwatch.acquire, dt.castwatch.release,
+         dt.castwatch.own_server_id, dt.bag.player_entity, dt.player.pet_eid) = _orig
 
     # =====================================================================
     # ★★ 重要事件：統計＋視窗插列＋卡住偵測（純紀錄）

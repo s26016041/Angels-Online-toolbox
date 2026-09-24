@@ -126,7 +126,7 @@ from app.core import charname, injector, netstat, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
 from app.core.notifier import Notifier
-from app.game import (bank, dungeon, entity, farmsettings, guildbank, itemname, jumpmap, locate,
+from app.game import (bag, bank, castwatch, dungeon, entity, farmsettings, guildbank, itemname, jumpmap, locate,
                       loot, mapobj,
                       move, navigate, player, portal, produce, quickbar, revive,
                       robot, scene, scenery, sell, skills, supply, talkwnd,
@@ -1155,8 +1155,8 @@ class CharDungeonPage(QWidget):
         #   斷線／進不去當完成、停機原因、卡住。兩個視窗都是非強制回應（開著照跑）。
         self.loot_btn = QPushButton("副本收益")
         self.loot_btn.setToolTip(
-            "只算**人在副本裡跑腳本**那段期間背包多出來的東西（同一物品累加）；\n"
-            "趕路、補給、休息期間不記帳，所以補給買的藥水不會混進來。\n"
+            "只算**人在副本裡跑腳本**那段期間、伺服器確認是我（或我的召喚物）殺的怪掉進背包的東西；\n"
+            "同一物品累加；買的、別人給的、趕路補給休息期間拿到的都不算。\n"
             "跟自動掛機的「獲得物品」同一張表；不算金幣；關程式清空。")
         self.loot_btn.clicked.connect(self._show_loot)
         pbar.addWidget(self.loot_btn)
@@ -1797,8 +1797,13 @@ class CharDungeonPage(QWidget):
         self._off_map = None         # 回線後看到的地圖（連續沒變才動）
         self._off_map_t = 0.0
         # ---- 副本收益／卡住偵測（純紀錄）----
-        self._loot_live = False      # 上一拍有沒有在對帳（False→True 要先 rebase）
-        self._loot_t = 0.0
+        self._loot_live = False      # 上一拍有沒有在記帳（False→True 要先 resync）
+        self._loot_t = 0.0           # 背包快照心跳（LOOT_GAP 一拍）
+        self._loot_poll = 0.0        # 封包輪詢節流（0.25 秒）
+        self._loot_cw = None         # 掉落用的入向封包監聽（castwatch，跟掛機頁共用一份）
+        self._loot_wc = 0
+        self._loot_cw_retry = 0.0    # 裝不起來 → 隔一段再試，不每拍狂裝
+        self._loot_pets: dict[int, float] = {}   # 召喚物 eid → 最後看到的時間
         self._stuck_key = None       # 現在在哪一段 (cycle, phase, 第幾步)
         self._stuck_t = 0.0          # 這一段停了多久
         self._stuck_noted = False    # 這一段記過「卡住」了
@@ -2143,6 +2148,8 @@ class CharDungeonPage(QWidget):
             except Exception:                            # noqa: BLE001
                 pass
         self._mover = None
+        self._loot_release()             # 掉落監聽也還掉（castwatch 最後一個人還完才卸）
+        self._loot_live = False
         self._nav.reset()
 
     def _stop(self, why: str = "", quiet: bool = False) -> None:
@@ -6007,36 +6014,86 @@ class CharDungeonPage(QWidget):
         return lt
 
     def _loot_tick(self, dt: float) -> None:
-        """每 LOOT_GAP 秒對帳一次背包 —— **只在 cycle=go、phase=run**（人在副本裡跑腳本）。
-        離開那段（補給／趕路／復活）不對帳；回來時先 `rebase()` 丟掉舊基準，補給買的
-        東西才不會被算成「剛獲得」。讀不到整拍作廢（loot.py 自己擋）；對帳出錯不影響流程。"""
+        """副本收益＝**伺服器確認是我（或我的召喚物）殺的怪掉進背包的**東西（2026-09-24
+        使用者：「打副本的在打副本時才會算」「都改成吃官方伺服器給的」，算法見 loot.py）。
+        只在 cycle=go、phase=run（人在副本裡跑腳本）時記；離開那段就把監聽還掉，
+        回來時序號表作廢重建。出錯不影響流程。"""
         live = self._cycle == "go" and self._phase == "run" and self._sc is not None
         if not live:
             self._loot_live = False
+            self._loot_release()
             return
         lt = self._loot_for()
         if not self._loot_live:
             self._loot_live = True
-            lt.rebase()
-            self._loot_t = LOOT_GAP              # 進來第一拍就建基準
-        self._loot_t += dt
-        if self._loot_t < LOOT_GAP:
+            lt.resync()
+        self._loot_poll += dt
+        if self._loot_poll < 0.25:
             return
-        self._loot_t = 0.0
+        step, self._loot_poll = self._loot_poll, 0.0
         try:
-            lt.update(self._sc, self._acct or None)
+            self._loot_poll_once(lt, step)
         except Exception:                                # noqa: BLE001
             pass
 
-    def _reset_loot(self, lt: loot.Loot) -> None:
-        """「重新計算」：歸零；正在副本裡就當場重建基準（掛機頁同一個理由）。"""
-        lt.reset()
-        if self._loot_live and self._sc is not None:
+    def _loot_poll_once(self, lt: loot.Loot, step: float) -> None:
+        cw = self._loot_cw
+        if cw is not None and cw.active and not cw.installed():
+            cw.mark_lost()                   # 被拆了：旗標放下，下面重裝
+        if cw is None or not cw.active:
+            self._loot_release()
+            now = time.monotonic()
+            if now < self._loot_cw_retry or self._pid is None:
+                return
+            cw = castwatch.acquire(self._pid, self)
+            if cw is None:
+                self._loot_cw_retry = now + 10.0
+                self._runlog_write("副本收益：入向封包監聽裝不起來 → 這段不記掉落")
+                return
+            self._loot_cw = cw
+            self._loot_wc = cw.write_count()
+            lt.resync()
+            return
+        sc = self._sc
+        now = time.monotonic()
+        pet = player.pet_eid(sc)
+        if pet:
+            self._loot_pets[pet] = now
+        for eid, t in list(self._loot_pets.items()):
+            if now - t > 15.0:
+                del self._loot_pets[eid]
+        # 快照先拍（記下拍之前的 write_count），封包吃完再套 —— 順序見 loot.Loot.note_bag
+        self._loot_t += step
+        snap = None
+        if self._loot_t >= LOOT_GAP or lt.need_bag():
+            self._loot_t = 0.0
+            wc0 = cw.write_count()
+            snap = (bag.scan(sc), wc0)
+        start, wc, pkts = cw.read_since(self._loot_wc)
+        if start != self._loot_wc:
+            lt.resync()                      # 環槽被蓋過：有包沒看到
+        self._loot_wc = wc
+        pe = bag.player_entity(sc)
+        me = (castwatch.own_server_id(sc, pe) or 0) if pe else 0
+        got = lt.feed(start, pkts,
+                      lambda k: k == me or k in self._loot_pets, credit=bool(me))
+        for tid, n in got:
+            self._runlog_write(f"副本收益：伺服器確認掉落 {itemname.label(tid)} ×{n}")
+        if snap is not None:
+            (items, ok), wc0 = snap
+            lt.note_bag(items, ok, wc0, self._acct or None)
+
+    def _loot_release(self) -> None:
+        if self._loot_cw is not None and self._pid is not None:
             try:
-                lt.update(self._sc, self._acct or None)
+                castwatch.release(self._pid, self)
             except Exception:                            # noqa: BLE001
                 pass
-            self._loot_t = 0.0
+        self._loot_cw = None
+
+    def _reset_loot(self, lt: loot.Loot) -> None:
+        """「重新計算」：累計歸零（序號表留著，那是「每件現在幾個」，跟累計無關）。"""
+        lt.reset()
 
     def _show_loot(self) -> None:
         """「副本收益」鈕：非強制回應的視窗（開著照跑），開的當下畫一次。"""
