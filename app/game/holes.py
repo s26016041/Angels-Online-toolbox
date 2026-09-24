@@ -457,7 +457,10 @@ class Run:
                     evs.append(Event(DONE,
                                      f"{self.name} 已達目標 {g.holes} 孔，"
                                      f"最後一孔留空給你自己鑲", g.holes))
-                return evs
+                    return evs
+                # ★ 結果驗完當場送下一發（2026-09-25 使用者：跟強化一樣快）。
+                #   _send() 照樣重讀裝備、認 serial、重挑錘子／寶石 —— 驗證一步都沒少。
+                return evs + self._send()
             if g.holes < self.before_holes:
                 return self._stop(UNKNOWN,
                                   f"{self.name} 孔數反而變少（{self.before_holes}"
@@ -468,7 +471,7 @@ class Run:
                 self.resend = 0
                 return [Event(SUCCESS,
                               f"{self.name} 第 {self.hole_idx + 1} 孔鑲上 "
-                              f"{self.used_name}", g.holes)]
+                              f"{self.used_name}", g.holes)] + self._send()
 
         if (time.monotonic() - self.sent_at) * 1000 < WAIT_MS:
             return []
