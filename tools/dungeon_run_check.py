@@ -1411,6 +1411,20 @@ def main() -> int:
        tab._i == 0 and tab._cycle == "go" and tab._rollbacks == 0
        and "不是傳點搬的" in tab.status.text(),
        f"i={tab._i} cycle={tab._cycle} rb={tab._rollbacks} {tab.status.text()}")
+    # ★★ 2026-09-24：上一隻剛死（沒有鎖定目標）但這一區還有怪 → 一樣算打怪中
+    tab = make_tab(LAND41, pos=(37.5, 95.5))
+    tab._loop = True
+    tab._grid = FakeGrid(_room41)
+    tab._reach = set(_room41)
+    tab._jumped = (44.5, 85.5)
+    tab._cur = None
+    tab._targets = lambda: [FakeMon(x=43.0, y=89.0, eid=93, name="還沒清的怪")]
+    tab._fight = lambda _me, _dt: False
+    run(tab, 0.1)
+    ck("★★ 目標剛死、還有怪沒清 → 不算傳送、不收這一趟",
+       tab._i == 0 and tab._cycle == "go" and tab._rollbacks == 0
+       and "不是傳點搬的" in tab.status.text(),
+       f"i={tab._i} cycle={tab._cycle} rb={tab._rollbacks} {tab.status.text()}")
     tab = make_tab(LAND41, pos=(37.5, 95.5))
     tab._loop = True
     tab._grid = FakeGrid(_room41)

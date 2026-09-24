@@ -3578,7 +3578,11 @@ class CharDungeonPage(QWidget):
         #     ⚠ 讀不到地形圖 → 不放寬，照舊判。
         #   ⛔ 不拿「對話傳送還沒點物件（`_clicked`）」當依據：對話走完人沒被搬走會整段重來
         #     （`_clicked` 歸零），伺服器晚一拍才搬人的話那時 `_clicked` 正好是 False。
-        if not near_land and self._cur is not None:
+        # ★★ 2026-09-24 黑狐實錄（同一步第 2 趟又被收掉）：上一隻剛死、還沒換下一隻（`_cur`
+        #   是 None）那一拍，先前放的順移才生效，把人推出傳點 6 格外 → 放行條件不成立。
+        #   → 「正在打怪」改成「有鎖定目標，**或這一區還有打得到的怪**」（還有怪要清＝還在
+        #     打怪，不另訂秒數）。當時旁邊還有 13 隻。
+        if not near_land and (self._cur is not None or self._fight_left()):
             jump = _d(frm, me)
             if (jump <= MAX_PATH
                     and self._path_cost(self._grid, frm, me,
@@ -3636,6 +3640,13 @@ class CharDungeonPage(QWidget):
         self._say(f"第 {self._i + 1} 步　傳點過了，落在 ({me[0]:.0f}, {me[1]:.0f}){off}")
         self._next()
         return True
+
+    def _fight_left(self) -> bool:
+        """這一區還有打得到的怪嗎（`_targets()`；問不出來當沒有＝照舊判）。"""
+        try:
+            return bool(self._targets())
+        except Exception:                                # noqa: BLE001
+            return False
 
     def _jump_note(self, msg: str) -> None:
         """「這次跳位不算傳送」的說明：同一趟同一步只**通知**一次，其餘只寫執行紀錄
