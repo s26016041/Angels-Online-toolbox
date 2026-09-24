@@ -88,13 +88,22 @@ _NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
                (1, 1, 1), (1, -1, 1), (-1, 1, 1), (-1, -1, 1))
 
 
+# ★ 傳點周圍（soft 格）每一步的代價倍數（使用者 2026-09-24：「別靠近傳點半徑 5 格」，
+#   選了「很貴但不切斷」）：有別條路就繞，只有窄路非走不可才經過。
+SOFT_COST = 10.0
+
+
 class Grid:
     """一張地圖的可走格。`rows[y]` 是一列的 bytes，用 bit 判斷。"""
 
-    __slots__ = ("w", "h", "obj", "open")
+    __slots__ = ("w", "h", "obj", "open", "soft")
 
     def __init__(self, w: int, h: int, obj: int, open_rows: list[bytearray]):
         self.w, self.h, self.obj, self.open = w, h, obj, open_rows
+        # ★ 「走得過去但盡量別走」的格（傳點周圍，見 Cache(avoid_portals) 與 SOFT_COST）：
+        #   route() 每踩一步算 SOFT_COST 倍、clear_line() 當牆（拉直線不准切過去）；
+        #   reachable()／walkable() **不看**它 —— 只是貴，不會把區域切斷。
+        self.soft: frozenset = frozenset()
 
     def walkable(self, x: int, y: int) -> bool:
         return (0 <= x < self.w and 0 <= y < self.h
@@ -110,8 +119,14 @@ class Grid:
         return lambda x, y: base(x, y) and (x, y) not in avoid
 
     def clear_line(self, a, b, avoid=None) -> bool:
-        """兩格之間直線是不是全程可走（含不許鑽對角縫）。"""
+        """兩格之間直線是不是全程可走（含不許鑽對角縫）。
+
+        ★ `soft` 格在這裡當牆（起點那格除外：人站在裡面時不能因此每條線都斷）——
+          直線抄近路切過傳點旁邊，正是「十字路口中間有傳點一直被傳走」的來源。"""
         walk = self._walk_fn(avoid)
+        if self.soft:
+            soft, base, a0 = self.soft, walk, (int(a[0]), int(a[1]))
+            walk = lambda x, y: base(x, y) and ((x, y) == a0 or (x, y) not in soft)  # noqa: E731
         x0, y0 = a
         x1, y1 = b
         dx, dy = abs(x1 - x0), abs(y1 - y0)
@@ -247,6 +262,7 @@ class Grid:
         came: dict = {}
         best = {(sx, sy): 0.0}
         walk = self._walk_fn(avoid)
+        soft = self.soft
         push, pop = heapq.heappush, heapq.heappop
         while openq:
             _f, g0, x, y = pop(openq)
@@ -270,7 +286,7 @@ class Grid:
                 # 不許從兩面牆的對角縫鑽過去（遊戲也不讓）
                 if dx and dy and not (walk(nx, y) and walk(x, ny)):
                     continue
-                ng = g0 + c
+                ng = g0 + (c * SOFT_COST if soft and (nx, ny) in soft else c)
                 if ng < best.get((nx, ny), 1e18):
                     best[(nx, ny)] = ng
                     came[(nx, ny)] = (x, y)
@@ -450,7 +466,7 @@ class Cache:
     """
 
     __slots__ = ("_grid", "_key", "why", "_fails", "_cool", "_portals", "portal_cells",
-                 "portal_set")
+                 "portal_set", "portal_zone")
 
     def __init__(self, avoid_portals: bool = False) -> None:
         # ★ avoid_portals：讀到圖就把**傳點範圍**（`mapportal.cells`）當牆蓋上去，
@@ -462,6 +478,8 @@ class Cache:
         # 蓋上去的那些格（含 margin）—— 掛機頁問「這隻怪離傳點近不近」用（見 farm_tab
         #   PORTAL_HANDOFF_KEEP）。跟著 _stamp_portals 換圖重算。
         self.portal_set: frozenset = frozenset()
+        # 傳點 PORTAL_AVOID 格內（含 portal_set）—— 掛機不挑站在這裡的怪。
+        self.portal_zone: frozenset = frozenset()
         self._grid: Grid | None = None
         self._key = None
         # 剛失敗過就先冷卻一下再重試（見 get()）
@@ -537,10 +555,17 @@ class Cache:
             blk = mapportal.cells(sid, grid.w, grid.h)
         except Exception:                        # noqa: BLE001 表壞了 → 不繞（安全退化）
             blk = frozenset()
+        try:
+            zone = mapportal.cells(sid, grid.w, grid.h, mapportal.AVOID)
+        except Exception:                        # noqa: BLE001
+            zone = frozenset()
         for x, y in blk:
             grid.open[y][x] = 0
+        # ★ 傳點 MARGIN～AVOID 格＝很貴、拉直線不准切過（見 Grid.soft／SOFT_COST）
+        grid.soft = frozenset(zone - blk)
         self.portal_cells = len(blk)
         self.portal_set = frozenset(blk)
+        self.portal_zone = frozenset(zone | blk)
 
     @property
     def fails(self) -> int:

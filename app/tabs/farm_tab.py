@@ -5511,6 +5511,7 @@ class CharFarmPage(QWidget):
         hit_eids: set[int] = set()
         # ★★★ 走不走得到，**挑之前**就要問（見 _reach_set）。
         grid, reach = self._reach_set(me)
+        zone = getattr(self._maps, "portal_zone", None) if grid is not None else None
         for m in self.mons:
             # ★ eid=0 的實體絕不能挑（唯讀實測：場上真的會出現，多半是屍體
             #   但也拍到過活狀態 —— 剛生成還沒填 ID／回收中被清掉 ID）。
@@ -5622,6 +5623,13 @@ class CharFarmPage(QWidget):
                         if skipped is not None and me:
                             skipped.append((d, m.name, "走不到（不同連通區）"))
                         continue
+            # ★ 傳點 5 格內的怪不挑（使用者 2026-09-24：十字路口中間有傳點，為了打牠
+            #   走進中間就被傳走）。正在打我的照打（同上面那條規矩）。
+            if (p is not None and not hits_me and zone
+                    and (int(p[0]), int(p[1])) in zone):
+                if skipped is not None and me:
+                    skipped.append((d, m.name, "在傳點旁（5 格內）"))
+                continue
             pool.append((d, m, p))
             if hits_me:
                 hit_eids.add(m.eid)

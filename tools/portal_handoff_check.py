@@ -57,6 +57,43 @@ print("③ terrain.Cache 留下傳點格")
 c = terrain.Cache(avoid_portals=True)
 check("預設空集合", c.portal_set == frozenset())
 
+print("④ 傳點半徑 5 格：很貴、拉直線不准切過、不切斷區域（集會所十字路口，離線 .mpc）")
+from app.game import mapfile, mapportal               # noqa: E402
+g = mapfile.grid_of(147)
+if g is None:
+    check("集會所地圖讀得到", False, "mapfile 沒有 147")
+else:
+    hard = mapportal.cells(147, g.w, g.h)
+    zone = mapportal.cells(147, g.w, g.h, mapportal.AVOID)
+    before = len(g.reachable(125, 85) or ())
+    for x, y in hard:
+        g.open[y][x] = 0
+    g.soft = frozenset(zone - hard)
+    pts = [q["pts"] for q in mapportal.entry(147)["portals"] if q["to"] == 148][0]
+    hull = mapportal._hull([tuple(q) for q in pts])
+
+    def dmin(path):
+        return min(mapportal._dist((x + 0.5, y + 0.5), hull) for x, y in path)
+
+    for a, b in (((125, 85), (150, 77)), ((128, 81), (146, 81)), ((120, 90), (145, 72))):
+        r = g.route(a, b)
+        check(f"{a}→{b} 穿路口：路線離傳點 ≥ 4.5 格", r is not None and dmin(r) >= 4.5,
+              str(r and round(dmin(r), 1)))
+        wp = g.waypoints(a, b)
+        seg_min = min(
+            mapportal._dist((p0[0] + 0.5 + (p1[0] - p0[0]) * k / 20,
+                             p0[1] + 0.5 + (p1[1] - p0[1]) * k / 20), hull)
+            for p0, p1 in zip(wp, wp[1:]) for k in range(21))
+        check("　轉折點之間的直線也離傳點 ≥ 4 格（沒抄近路切過中間）", seg_min >= 4.0,
+              str(round(seg_min, 1)))
+    check("直線切過路口中間 → clear_line 說不通", not g.clear_line((128, 81), (146, 81)))
+    after = len(g.reachable(125, 85) or ())
+    check("區域沒被切斷（只少了傳點那幾格）", before - after <= len(hard), f"{before}→{after}")
+
+print("⑤ 掛機不挑傳點 5 格內的怪（_candidates 有這道）")
+src5 = inspect.getsource(farm_tab.CharFarmPage._candidates)
+check("有 portal_zone 過濾、正在打我的照打", "portal_zone" in src5 and "not hits_me and zone" in src5)
+
 print()
 if FAILS:
     print(f"FAIL：{len(FAILS)} 項沒過 —— " + "、".join(FAILS))
