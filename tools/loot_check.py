@@ -112,7 +112,9 @@ print("② 快照後：我殺的緊接的 0x1b 增加量入帳（圖示從快照
 lt.note_bag([it(0xA, 2, 8, icon=55), it(0xB, 1228, 5)], True, f.seq, "甲")
 got = f(kill(0x101, ME), item(0xA, 2, 9))
 check("+1", qty(lt, 2) == 1 and got == [(2, 1)], str(lt.rows()))
-check("圖示編號帶上", lt.rows()[0][2] == 55, str(lt.rows()))
+from app.game import itemflags as _if                # noqa: E402
+check("圖示編號帶上（表優先、表沒有才用快照的）",
+      lt.rows()[0][2] == (_if.icon_of(2) or 55), str(lt.rows()))
 
 print("③ 一隻掉兩件（連兩包）都算；新序號＝新一格")
 f(kill(0x102, ME), item(0xB, 1228, 7), item(0xC, 3994, 1))
@@ -180,6 +182,12 @@ check("重置後直接 +1", qty(lt, 2) == 1, str(lt.rows()))
 print("⑫ ⛔ 金幣（種類 1）也走 0x1b，一律不算")
 f(kill(0x114, ME), item(0x99, 1, 26611, slot=0))
 check("金幣沒進表", qty(lt, 1) == 0, str(lt.rows()))
+
+print("⑬ 圖示先查物品表：沒進過快照（掉了馬上用掉）也有圖")
+lt3 = loot.Loot(); f3 = Feeder(lt3)
+lt3.note_bag([], True, 0, "甲")
+f3(kill(0x300, ME), item(0x77, 17189, 1))            # 神效大力士果實
+check("用表裡的圖示編號", lt3.rows()[0][2] == _if.icon_of(17189) != 0, str(lt3.rows()))
 
 print("⑬ 排序：最後獲得的在最上面")
 f(kill(0x112, ME), item(0xE1, 111, 1))

@@ -39,7 +39,7 @@ from __future__ import annotations
 import threading
 import time
 
-from app.game import bag, castwatch
+from app.game import bag, castwatch, itemflags
 
 
 # 殺手＝我那包之後，最多再看幾包「不是物品同步」的封包就關窗口（實錄 0 包）。
@@ -94,7 +94,11 @@ class Loot:
     def rows(self) -> list[tuple[int, int, int, float]]:
         """[(種類id, 累計數量, 圖示編號, 最後獲得時間)]，**新的在上面**。"""
         with self._lock:
-            rows = [(tid, v[0], v[1] or self._icons.get(tid, 0), v[2], v[3])
+            # 圖示：先查 GAMEDATA 抽的物品表（CLAUDE.md 第 0 條：有表對表）；表沒這筆
+            #   （改版新道具還沒重跑 build）才用背包快照學到的。⚠ 只靠快照的話，掉進來
+            #   沒幾秒就被用掉的東西（神效大力士果實，2026-09-24 回報）永遠沒圖。
+            rows = [(tid, v[0], itemflags.icon_of(tid) or v[1] or self._icons.get(tid, 0),
+                     v[2], v[3])
                     for tid, v in self._items.items()]
         rows.sort(key=lambda r: (r[3], r[4]), reverse=True)
         return [r[:4] for r in rows]
