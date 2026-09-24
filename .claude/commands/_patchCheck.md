@@ -352,6 +352,7 @@ py tools\recheck_tables.py        # 要進遊戲，最後會直接給結論
 | `py tools\build_supply_merchants.py` | `assets/supply_merchants.json` | 補給城的買／修／銀行 NPC；⛔ 過期＝補給找不到人 |
 | `py tools\build_supply_shop.py` | `assets/supply_shop.json` | 補給店販售表（藥水編號／單價）；⛔ 過期＝買錯或購買紀錄沒單價 |
 | `py tools\build_map_grids.py` | `assets/map_grids.bin.gz` | **離線地形圖**（136 張地圖的可走格，`app/game/mapfile.py` 用）→ 趴趴GO 挑「走過去最短」的傳送點；過期＝新地圖挑不到最短落點（會退回舊的直線最近，不會壞事）；驗證 `py tools\mapgrid_check.py --live`（離線表 vs 記憶體逐格比對，要 0 不同） |
+| `py tools\build_map_portals.py` | `assets/map_portals.json` | **傳點範圍**（`.mpc` 事件「踩上去→傳送」＋範圍點，`app/game/mapportal.py` 用）→ 自動戰鬥算路把傳點當牆繞開；過期＝新地圖／搬過的傳點不繞（會走進去被傳走，但不會送錯東西）；改版後重跑再 `py tools\portal_check.py`（離線 OK；站傳點旁加 `--live` 核對位置） |
 
 跑完 → `py tools
 echeck_tables.py` 全對 → `py tools\stamp_tables.py` 蓋章。

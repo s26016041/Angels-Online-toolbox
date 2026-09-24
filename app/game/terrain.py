@@ -449,9 +449,15 @@ class Cache:
       成本是幾次小讀取（列陣列 h*4 ≈ 720 bytes），而且只在要規劃路線時問。
     """
 
-    __slots__ = ("_grid", "_key", "why", "_fails", "_cool")
+    __slots__ = ("_grid", "_key", "why", "_fails", "_cool", "_portals", "portal_cells")
 
-    def __init__(self) -> None:
+    def __init__(self, avoid_portals: bool = False) -> None:
+        # ★ avoid_portals：讀到圖就把**傳點範圍**（`mapportal.cells`）當牆蓋上去，
+        #   這份快取算出來的路（route／waypoints／reachable／clear_line）全部繞開傳點。
+        #   只給自動戰鬥用（2026-09-24：追怪擦過傳點被傳去別張圖發呆）；
+        #   副本／補給本來就要走傳點，那邊的快取不開。
+        self._portals = avoid_portals
+        self.portal_cells = 0                    # 這張圖蓋了幾格傳點（診斷用）
         self._grid: Grid | None = None
         self._key = None
         # 剛失敗過就先冷卻一下再重試（見 get()）
@@ -509,6 +515,8 @@ class Cache:
         for _ in range(LOAD_TRIES):
             grid, why = load(scanner)
             if grid is not None:
+                if self._portals:
+                    self._stamp_portals(grid, key[3])
                 self._grid, self._key, self.why, self._fails = grid, key, "", 0
                 self._cool = 0.0
                 return grid
@@ -517,6 +525,17 @@ class Cache:
         self._fails += 1
         self._cool = now + RETRY_GAP
         return None
+
+    def _stamp_portals(self, grid: "Grid", sid) -> None:
+        """把這張圖的傳點範圍當牆（表查不到／寬高對不上＝不蓋，跟以前一樣）。"""
+        from app.game import mapportal           # 這裡才 import：避免循環相依
+        try:
+            blk = mapportal.cells(sid, grid.w, grid.h)
+        except Exception:                        # noqa: BLE001 表壞了 → 不繞（安全退化）
+            blk = frozenset()
+        for x, y in blk:
+            grid.open[y][x] = 0
+        self.portal_cells = len(blk)
 
     @property
     def fails(self) -> int:

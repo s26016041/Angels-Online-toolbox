@@ -2219,7 +2219,8 @@ class CharFarmPage(QWidget):
         #     · 而且**不必搶指令槽** —— 尋路要跟攻擊搶那個唯一的槽，
         #       搶不到時回 -1，我們就只能沿用上一次的舊答案（怪早就走掉了）。
         #   一份快取給導航與打怪共用。
-        self._maps = terrain.Cache()
+        # ★ avoid_portals：算路把傳點範圍當牆（追怪／巡邏擦過傳點會被傳走，見 mapportal.py）
+        self._maps = terrain.Cache(avoid_portals=True)
         # ★ 走去巡邏點的導航器（會繞路、會判斷到不了），見 navigate.py
         self._nav = navigate.Navigator(self._maps)
         # ⛔ 「走通過的巡邏路線」記憶（_routes）2026-08-10 刪除：它是探索式
