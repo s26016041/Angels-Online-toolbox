@@ -889,6 +889,38 @@ SIGS: tuple[Sig, ...] = (
         "?? ?? ?? ?? ?? ?? ?? 56 57 8B 7D 0C 8B F1 6A 0C E8 ?? ?? ?? ??"
         " 8B D0 83 C4 04 85 D2 75 07",
         0x007122B0),
+    # ── 小屋（2026-09-25，app/game/house.py）────────────────────────────
+    # 進入房子(選定id, 密碼)。錨在函式開頭整段：`sub esp,0x6C / GS cookie /
+    # mov edi,[ebp+0xC] / lea ecx,[ebp-0x6C] / push 0x27 / push 0x13A / call 建包 /
+    # mov ecx,[ebp-0x68] / mov ebx,空字串 / mov eax,[ebp+8] / push ebx / push edi /
+    # mov [ecx+2],eax / lea esi,[ecx+6] / call strcmp`。封包代號 0x13A 與長度 0x27 是協定，留著當錨。
+    Sig("house", "ENTER_FN", "fn", None,
+        "55 8B EC 83 EC 6C A1 ?? ?? ?? ?? 33 C5 89 45 FC 53 56 57 8B 7D 0C"
+        " 8D 4D 94 6A 27 68 3A 01 00 00 E8 ?? ?? ?? ?? 8B 4D 98 BB ?? ?? ?? ??"
+        " 8B 45 08 53 57 89 41 02 8D 71 06 E8",
+        0x005E49BD),
+    # 房子物件的 vtable。錨在建構子 0x546A62：`call 基底 / push 0x21 / lea eax,[esi+屋主] /
+    # mov [esi],VT / push 0 / push eax / mov [esi+8],VT2 / call memset / add esp,0xC /
+    # mov byte [esi+密碼旗標],0 / mov eax,esi / ret 4`。內嵌 vtable 與結構偏移自己寫 ??。
+    Sig("house", "VT_HOUSE", "data", 28,
+        "55 8B EC 51 56 FF 75 08 8B F1 89 75 FC E8 ?? ?? ?? ?? 6A 21 8D 86 ?? ?? ?? ??"
+        " C7 06 ?? ?? ?? ?? 6A 00 50 C7 46 08 ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 C4 0C"
+        " C6 86 ?? ?? ?? ?? 00 8B C6 5E C9 C2 04 00",
+        0x008078E0),
+    # 自己房子「地圖名／座標」在狀態物件裡的偏移。錨在收回房子的封包處理 0x5C2C3E 整支：
+    # `cmp byte [eax+2],1 / jne / mov byte [esi+旗標],1 / jmp / push 0x20 / lea eax,[esi+地圖名] /
+    # mov word [esi+..],0 / push 空字串 / push eax / call 抄字串 / add esp,0xC / xor eax,eax /
+    # mov ecx,esi / mov [esi+座標],eax / call 刷新房屋資訊`。
+    Sig("house", "MAP_OFF", "off", 28,
+        "55 8B EC 8B 45 08 56 8B F1 80 78 02 01 75 09 C6 86 ?? ?? ?? ?? 01 EB ??"
+        " 6A 20 8D 86 ?? ?? ?? ?? 66 C7 86 ?? ?? ?? ?? 00 00 68 ?? ?? ?? ?? 50"
+        " E8 ?? ?? ?? ?? 83 C4 0C 33 C0 8B CE 89 86 ?? ?? ?? ?? E8",
+        0x000057F6),
+    Sig("house", "XY_OFF", "off", 61,
+        "55 8B EC 8B 45 08 56 8B F1 80 78 02 01 75 09 C6 86 ?? ?? ?? ?? 01 EB ??"
+        " 6A 20 8D 86 ?? ?? ?? ?? 66 C7 86 ?? ?? ?? ?? 00 00 68 ?? ?? ?? ?? 50"
+        " E8 ?? ?? ?? ?? 83 C4 0C 33 C0 8B CE 89 86 ?? ?? ?? ?? E8",
+        0x00005818),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。

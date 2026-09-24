@@ -86,8 +86,8 @@ from app import theme
 from app.config import config
 from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
-from app.game import (channel, entity, jumpmap, locate, login, move, navigate,
-                      robot, scene, team, terrain)
+from app.game import (channel, entity, house, jumpmap, locate, login, move,
+                      navigate, robot, scene, team, terrain)
 from app.tabs.base_tab import GROUP_LAUNCH, BaseTab, fit_spin
 
 COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "隊伍", "狀態")
@@ -135,6 +135,15 @@ WALK_SETTLE = 3.0
 # 「因為 xxx 所以不動」這種訊息在狀態列上撐多久（每一拍都會重寫狀態列，
 # 不撐著的話跳窗一關就被蓋掉了）。
 STICKY_SECS = 20.0
+# --- 去分身的小屋 -------------------------------------------------------------
+HOUSE_CHANNEL = 1           # 使用者指定：一律先換到 1 頻
+# 離房子多近就送「進入」。⚠ 伺服器的距離限制不知道（沒實測），先照官方
+#   「點房子會自己走過去」的習慣站到旁邊；太遠被拒就會在逾時後重送。
+HOUSE_ENTER_RANGE = 5.0
+HOUSE_GOAL_RELAX = 8        # 房子本體擋住的格子，往外找最近可走格的半徑
+HOUSE_ENTER_WAIT = 8.0      # 送出進入到場景變成「房屋」的等待上限
+HOUSE_ENTER_TRIES = 3       # 伺服器一直不讓進（有密碼／距離）就停，不無限重送
+HOUSE_STEP_TRIES = 3        # 換頻／傳送逾時重送幾次就放棄（屋主展示中換不了頻）
 
 def _acct(title: str) -> str:
     """視窗標題裡的帳號；**還沒登入的視窗回空字串**。
@@ -290,6 +299,25 @@ class MultiTab(BaseTab):
         bar4.addWidget(self.walk_btn)
         bar4.addStretch(1)
         root.addLayout(bar4)
+
+        # --- 去分身的小屋 -------------------------------------------------
+        bar5 = QHBoxLayout()
+        bar5.addWidget(QLabel("去小屋"))
+        self.hown = QComboBox()
+        self.hown.setToolTip("誰的小屋（開著的分身讀得到的房子）。")
+        self.hown.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.hown.setMinimumContentsLength(22)
+        bar5.addWidget(self.hown, 1)
+        self.house_btn = QPushButton("前往")
+        self.house_btn.setToolTip(
+            "勾選的分身：換到 1 頻 → 趴趴GO 到那張圖 → 走到房子 → 進去。\n"
+            "⚠ 趴趴GO 每次吃一個翔宇聖翼；本來就在那張圖的不傳送。")
+        self.house_btn.clicked.connect(self._do_house)
+        bar5.addWidget(self.house_btn)
+        root.addLayout(bar5)
+        self._houses: dict[str, tuple[str, int, int, bool]] = {}
+        self._load_houses()
 
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
@@ -447,6 +475,7 @@ class MultiTab(BaseTab):
                 QTimer.singleShot(0, lambda p=pid, a=acc: self._resolve_name(p, a))
         # ⚠ 一定要在上面那圈之後 —— 它才剛把 `_scenes` 更新成這一拍的值。
         self._apply_walk_btn()
+        self._refresh_houses(wins)
         if self._job is not None:
             return                              # 狀態列由 _job_tick 負責
         if not wins:
@@ -788,6 +817,9 @@ class MultiTab(BaseTab):
         self.wx.setEnabled(not busy)
         self.wy.setEnabled(not busy)
         self.here_btn.setEnabled(not busy)
+        self.hown.setEnabled(not busy)
+        self.house_btn.setEnabled(not busy and self.hown.count() > 0
+                                  and self.hown.currentData() is not None)
         self.stop_btn.setEnabled(busy)
 
     def _prep_tick(self) -> None:
@@ -820,6 +852,8 @@ class MultiTab(BaseTab):
             self._jump_tick(job, wins)
         elif job["kind"] == "walk":
             self._walk_tick(job, wins)
+        elif job["kind"] == "house":
+            self._house_tick(job, wins)
         else:
             self._chan_tick(job, wins)
 
@@ -1316,6 +1350,290 @@ class MultiTab(BaseTab):
         self._busy_ui(False)
 
     # ------------------------------------------------------------------
+    # 去分身的小屋
+    # ------------------------------------------------------------------
+    def _load_houses(self) -> None:
+        """上次看到的各角色小屋（config `multi.houses`）。
+
+        ⚠ 遊戲只在屋主**看到自己房子**時才把地圖／座標寫進記憶體（見
+          house.py 檔頭），重登後可能是空的 —— 所以記一份「上次看到」。
+          到了現場一律再用房子物件的屋主名核對，對不上就停，不會送錯。
+        """
+        raw = config.get("multi.houses", {}) or {}
+        for name, v in raw.items():
+            try:
+                m, x, y = str(v[0]), int(v[1]), int(v[2])
+            except Exception:                               # noqa: BLE001
+                continue
+            self._houses[str(name)] = (m, x, y, False)
+        self._fill_houses()
+
+    def _refresh_houses(self, wins) -> None:
+        """每一拍讀各分身自己的小屋（兩次讀取），有變才重填下拉。"""
+        changed = False
+        live: set[str] = set()
+        for w in wins:
+            sc = self._scanners.get(w.pid)
+            acc = _acct(w.title)
+            name = preload.name_of(w.pid, account=acc)
+            # ⚠ 角色名還沒解析出來時 name_of 回的是帳號 —— 不能拿帳號當屋主名記下來
+            #   （到了現場是拿它比房子物件上的屋主名）。
+            if sc is None or not name or name == acc:
+                continue
+            try:
+                got = house.own(sc)
+            except Exception:                               # noqa: BLE001
+                got = None
+            if got is None:
+                continue
+            live.add(name)
+            new = (got.map_name, got.x, got.y, True)
+            if self._houses.get(name) != new:
+                self._houses[name] = new
+                changed = True
+                config.set("multi.houses", {
+                    n: [v[0], v[1], v[2]] for n, v in self._houses.items()})
+                config.save()
+        for name, v in list(self._houses.items()):
+            if v[3] and name not in live:
+                self._houses[name] = (v[0], v[1], v[2], False)
+                changed = True
+        if changed:
+            self._fill_houses()
+
+    def _fill_houses(self) -> None:
+        keep = self.hown.currentData()
+        self.hown.blockSignals(True)
+        self.hown.clear()
+        for name in sorted(self._houses):
+            m, x, y, on = self._houses[name]
+            tail = "" if on else "（上次看到）"
+            self.hown.addItem(f"{name}－{m}({x},{y}){tail}", name)
+        if not self._houses:
+            self.hown.addItem("（沒有分身讀得到小屋）", None)
+        i = self.hown.findData(keep)
+        if i >= 0:
+            self.hown.setCurrentIndex(i)
+        self.hown.blockSignals(False)
+        self.house_btn.setEnabled(self._job is None
+                                  and self.hown.currentData() is not None)
+
+    def _do_house(self) -> None:
+        if self._job is not None:
+            return
+        owner = self.hown.currentData()
+        info = self._houses.get(owner) if owner else None
+        if info is None:
+            self.status.setText("⚠ 沒有選到小屋。")
+            return
+        m, hx, hy, _ = info
+        sid = house.scene_of(m)
+        if sid is None:
+            self._warn("認不得那張地圖",
+                       f"地圖表裡找不到「{m}」（或同名的不只一張），"
+                       "不知道要傳送去哪，所以不動。")
+            return
+        picked = self._checked_pids()
+        if not picked:
+            self.status.setText("還沒勾任何分身。")
+            return
+        wins = sorted(preload.windows(), key=lambda w: w.pid)
+        self._sticky = ""
+        self._state_txt.clear()
+        todo: list[int] = []
+        for pid in picked:
+            w = self._win_of(pid, wins)
+            if w is None or channel.current(w.hwnd) is None \
+                    or pid not in self._scanners:
+                self._state_txt[pid] = "未進遊戲，跳過"
+                continue
+            if house.inside(self._scenes.get(pid)):
+                self._state_txt[pid] = "⚠ 人在房子裡，請先出來，跳過"
+                continue
+            todo.append(pid)
+            self._state_txt[pid] = "準備中…"
+        self._update_rows(wins)
+        if not todo:
+            self.status.setText("沒有可以出發的分身。")
+            return
+        self._job = {"kind": "house", "owner": owner, "map": m, "x": hx,
+                     "y": hy, "sid": sid, "prep": list(todo), "pend": [],
+                     "run": {}, "done": 0}
+        self._busy_ui(True)
+        self._timer.setInterval(WALK_MS)
+        self.status.setText(f"準備中 0/{len(todo)}（正在裝跳板）…")
+        QTimer.singleShot(0, self._prep_tick)
+
+    def _house_tick(self, job, wins) -> None:
+        """一台一台各自跑：換 1 頻 → 趴趴GO → 走到房子 → 進門。"""
+        now = time.monotonic()
+        alive = {w.pid for w in wins}
+        owner, sid = job["owner"], job["sid"]
+        where = f"{owner}的小屋"
+        for pid in job["pend"]:
+            job["run"][pid] = {"ph": "chan", "t": 0.0, "tries": 0,
+                               "goal": None, "nav": None, "best": None,
+                               "since": now, "mv_try": 0.0}
+        job["pend"] = []
+
+        def fail(pid: int, why: str) -> None:
+            self._state_txt[pid] = why
+            job["run"].pop(pid, None)
+
+        for pid in list(job["run"]):
+            st = job["run"][pid]
+            w = self._win_of(pid, wins)
+            sc = self._scanners.get(pid)
+            if pid not in alive or w is None or sc is None:
+                fail(pid, "⚠ 分身已關閉")
+                continue
+            mv = self._movers.get(pid)
+            if mv is None or not mv.active:
+                if now < st["mv_try"]:
+                    continue
+                st["mv_try"] = now + RETRY_GAP
+                mv = self._mover(pid)
+                if mv is None:
+                    self._state_txt[pid] = "⚠ 裝不上跳板，重試中…"
+                    continue
+            cur = self._scenes.get(pid)
+
+            # ① 換到 1 頻（視窗標題變了才算）
+            if st["ph"] == "chan":
+                if channel.current(w.hwnd) == HOUSE_CHANNEL:
+                    st.update(ph="jump", t=0.0, tries=0)
+                elif now >= st["t"]:
+                    if st["tries"] >= HOUSE_STEP_TRIES:
+                        fail(pid, f"⚠ 換 {HOUSE_CHANNEL} 頻送了 {HOUSE_STEP_TRIES} 次"
+                                  "都沒換成（屋主展示中不能換頻）")
+                        continue
+                    subs = self._subsets_of(w)
+                    if not subs:
+                        fail(pid, "⚠ 讀不到分流數，不換頻")
+                        continue
+                    if channel.switch(mv, HOUSE_CHANNEL, subs):
+                        preload.forget_state(pid)
+                        st["tries"] += 1
+                        st["t"] = now + SWITCH_TIMEOUT
+                        self._state_txt[pid] = f"換頻中… → {HOUSE_CHANNEL} 頻"
+                    else:
+                        st["t"] = now + RETRY_GAP
+                        self._state_txt[pid] = "指令槽忙，重試中…"
+                continue
+
+            # ② 趴趴GO 到那張圖（本來就在就不傳）
+            if st["ph"] == "jump":
+                if scene.same_map(cur, sid):
+                    st.update(ph="walk", t=0.0, tries=0)
+                elif now >= st["t"]:
+                    if st["tries"] >= HOUSE_STEP_TRIES:
+                        fail(pid, f"⚠ 傳送 {HOUSE_STEP_TRIES} 次都沒到 {job['map']}"
+                                  "（沒有翔宇聖翼？）")
+                        continue
+                    e = jumpmap.nearest(sid, job["x"], job["y"], sc)
+                    if e is None:
+                        fail(pid, f"⛔ {job['map']} 沒有趴趴GO 傳送點")
+                        continue
+                    ok, why = jumpmap.teleport(mv, sc, e.jump_id)
+                    if ok:
+                        preload.forget_state(pid)
+                        st["tries"] += 1
+                        st["t"] = now + SWITCH_TIMEOUT
+                        self._state_txt[pid] = f"傳送中… → {e.name}"
+                    else:
+                        st["t"] = now + RETRY_GAP
+                        self._state_txt[pid] = f"⚠ {why}，重試中…"
+                continue
+
+            # ③ 走到房子旁邊
+            if st["ph"] == "walk":
+                if not scene.same_map(cur, sid):
+                    fail(pid, "⚠ 換了地圖 → 停止")
+                    continue
+                obj = self._player_of(pid)
+                pos = entity.player_pos(sc, obj) if obj else None
+                if pos is None:
+                    self._state_txt[pid] = "讀不到座標，重試中…"
+                    continue
+                lodge = house.find(sc, owner)
+                if lodge is not None and math.hypot(
+                        pos[0] - lodge.x, pos[1] - lodge.y) <= HOUSE_ENTER_RANGE:
+                    st.update(ph="enter", t=0.0, tries=0)
+                    continue
+                if st["goal"] is None:
+                    grid = self._grid_of(pid).get(sc)
+                    if grid is None:
+                        self._state_txt[pid] = "讀不到地形圖，重試中…"
+                        continue
+                    cx, cy = ((int(lodge.x), int(lodge.y)) if lodge
+                              else (job["x"], job["y"]))
+                    spot = grid.nearest_open(cx, cy, HOUSE_GOAL_RELAX)
+                    if spot is None:
+                        fail(pid, f"⛔ {job['map']}({cx},{cy}) 附近沒有站得住的格子")
+                        continue
+                    st["goal"] = (spot[0] + 0.5, spot[1] + 0.5)
+                    st["nav"] = navigate.Navigator(self._grid_of(pid))
+                    st["best"], st["since"] = None, now
+                gx, gy = st["goal"]
+                d = math.hypot(pos[0] - gx, pos[1] - gy)
+                if d <= WALK_ARRIVE and not entity.is_walking(sc, obj):
+                    if lodge is None:
+                        fail(pid, f"⛔ 走到了但沒看到{where}（收回了？換地方了？）")
+                    else:
+                        st.update(ph="enter", t=0.0, tries=0)
+                    continue
+                note = st["nav"].step(sc, mv, obj, gx, gy)
+                if st["nav"].stuck:
+                    fail(pid, f"⛔ 走不到（{st['nav'].note}）")
+                    continue
+                if st["best"] is None or d < st["best"] - 0.5:
+                    st["best"], st["since"] = d, now
+                elif now - st["since"] > WALK_NO_PROGRESS:
+                    fail(pid, f"⛔ {int(WALK_NO_PROGRESS)} 秒沒有更靠近，放棄")
+                    continue
+                self._state_txt[pid] = f"走向{where}　還有 {d:.0f} 格　{note}"
+                continue
+
+            # ④ 進門（場景變成「房屋」才算）
+            if house.inside(cur):
+                preload.forget_state(pid)
+                job["done"] += 1
+                fail(pid, f"✅ 已進入{where}")
+                continue
+            if now < st["t"]:
+                continue
+            if st["tries"] >= HOUSE_ENTER_TRIES:
+                fail(pid, f"⚠ 送了 {HOUSE_ENTER_TRIES} 次都沒進去（太遠？被拒？）")
+                continue
+            lodge = house.find(sc, owner)
+            if lodge is None:
+                fail(pid, f"⛔ 旁邊看不到{where}了")
+                continue
+            if lodge.locked:
+                fail(pid, f"⛔ {where}設了密碼，不進去")
+                continue
+            ok, why = house.enter(mv, sc, lodge)
+            if ok:
+                st["tries"] += 1
+                st["t"] = now + HOUSE_ENTER_WAIT
+                self._state_txt[pid] = "進門中…"
+            else:
+                st["t"] = now + RETRY_GAP
+                self._state_txt[pid] = f"⚠ {why}，重試中…"
+
+        left = len(job["run"]) + len(job["pend"])
+        if left:
+            self.status.setText(
+                f"去{where}：完成 {job['done']}、還有 {left} 台"
+                "　—— 要停請按「停止」")
+        else:
+            done = job["done"]
+            self._end_walk()
+            self.status.setText(
+                f"完成：{done} 台進了{where}。" if done
+                else f"沒有分身進到{where} —— 原因看每一列的狀態。")
+
+    # ------------------------------------------------------------------
     # 自動組隊
     # ------------------------------------------------------------------
     def _do_team(self) -> None:
@@ -1516,14 +1834,14 @@ class MultiTab(BaseTab):
             for pid in job.get("all", []):
                 self._robot(pid, True)
             why = (why + "，天使守護精靈已重新打開") if why else why
-        walking = job["kind"] == "walk"
+        walking = job["kind"] in ("walk", "house")
         for pid in (list(job["prep"]) + list(job.get("pend", []))
                     + list(job.get("wait", {})) + list(job.get("all", []))
                     + list(job.get("run", {}))):
             if not self._state_txt.get(pid, "").startswith("✅"):
                 self._state_txt[pid] = "已停止"
         self._job = None
-        # 走路任務把心跳調快過（見 WALK_MS），一定要調回來。
+        # 走路／去小屋任務把心跳調快過（見 WALK_MS），一定要調回來。
         self._timer.setInterval(REFRESH_MS)
         self._busy_ui(False)
         if why:
