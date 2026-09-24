@@ -197,11 +197,14 @@ def enter(mover, sc, lodge: Lodge) -> tuple[bool, str]:
 def scene_of(map_name: str) -> int | None:
     """地圖名 → 場景編號（查 scene.SCENE_NAMES，那是 GAMEDATA 抽的表）。
 
-    ⚠ 同名的地圖不只一張（天使學園之類）或表裡沒有 → None，不猜。
+    ★ 同名但其實是同一張圖的不同分流（天使學園＝41/141/241，map_key 一樣）→ 取最小那個。
+    ⚠ 同名而且真的是不同張圖，或表裡沒有 → None，不猜。
     """
     from app.game import scene                       # 避免模組載入期循環相依
-    ids = [k for k, v in scene.SCENE_NAMES.items() if v == map_name]
-    return ids[0] if len(ids) == 1 else None
+    ids = sorted(k for k, v in scene.SCENE_NAMES.items() if v == map_name)
+    if not ids or len({scene.map_key(k) for k in ids}) != 1:
+        return None
+    return ids[0]
 
 
 def inside(scene_id: int | None) -> bool:

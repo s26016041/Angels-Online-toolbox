@@ -74,12 +74,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from app import theme
@@ -87,7 +89,7 @@ from app.config import config
 from app.core import charname, injector, preload
 from app.core.memory import MemoryScanner
 from app.game import (channel, entity, house, jumpmap, locate, login, move,
-                      navigate, robot, scene, team, terrain)
+                      navigate, robot, scene, supply, team, terrain)
 from app.tabs.base_tab import GROUP_LAUNCH, BaseTab, fit_spin
 
 COLS = ("全選", "角色名", "帳號", "伺服器", "頻道", "目前地圖", "隊伍", "狀態")
@@ -143,6 +145,7 @@ HOUSE_ENTER_RANGE = 5.0
 HOUSE_GOAL_RELAX = 8        # 房子本體擋住的格子，往外找最近可走格的半徑
 HOUSE_ENTER_WAIT = 8.0      # 送出進入到場景變成「房屋」的等待上限
 HOUSE_ENTER_TRIES = 3       # 伺服器一直不讓進（有密碼／距離）就停，不無限重送
+MANUAL = "__manual__"       # 「去小屋」下拉的「手動輸入…」那一項
 HOUSE_STEP_TRIES = 3        # 換頻／傳送逾時重送幾次就放棄（屋主展示中換不了頻）
 
 def _acct(title: str) -> str:
@@ -316,8 +319,45 @@ class MultiTab(BaseTab):
         self.house_btn.clicked.connect(self._do_house)
         bar5.addWidget(self.house_btn)
         root.addLayout(bar5)
+
+        # 手動輸入：地圖＋座標＋屋主角色名（下拉選「手動輸入…」才出現）
+        self.hman = QWidget()
+        bar6 = QHBoxLayout(self.hman)
+        bar6.setContentsMargins(0, 0, 0, 0)
+        bar6.addWidget(QLabel("地圖"))
+        self.hmap = QComboBox()
+        self.hmap.setToolTip("房子在哪張圖（只列有補給商的城＋天使學園）。")
+        self._fill_house_maps()
+        bar6.addWidget(self.hmap)
+        bar6.addWidget(QLabel("X"))
+        self.hx = QSpinBox()
+        self.hx.setRange(0, terrain.MAX_DIM - 1)
+        fit_spin(self.hx)
+        bar6.addWidget(self.hx)
+        bar6.addWidget(QLabel("Y"))
+        self.hy = QSpinBox()
+        self.hy.setRange(0, terrain.MAX_DIM - 1)
+        fit_spin(self.hy)
+        bar6.addWidget(self.hy)
+        bar6.addWidget(QLabel("角色名"))
+        self.hname = QLineEdit()
+        self.hname.setToolTip("屋主的角色名（到了用它認房子，對不上就不進）。")
+        self.hname.setMaximumWidth(
+            self.hname.fontMetrics().horizontalAdvance("十二個字的角色名字") + 16)
+        bar6.addWidget(self.hname)
+        bar6.addStretch(1)
+        root.addWidget(self.hman)
+        man = config.get("multi.house_manual", {}) or {}
+        i = self.hmap.findData(man.get("sid"))
+        if i >= 0:
+            self.hmap.setCurrentIndex(i)
+        self.hx.setValue(int(man.get("x", 0) or 0))
+        self.hy.setValue(int(man.get("y", 0) or 0))
+        self.hname.setText(str(man.get("name", "") or ""))
         self._houses: dict[str, tuple[str, int, int, bool]] = {}
         self._load_houses()
+        self.hown.currentIndexChanged.connect(self._on_house_pick)
+        self._on_house_pick()
 
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
@@ -818,6 +858,7 @@ class MultiTab(BaseTab):
         self.wy.setEnabled(not busy)
         self.here_btn.setEnabled(not busy)
         self.hown.setEnabled(not busy)
+        self.hman.setEnabled(not busy)
         self.house_btn.setEnabled(not busy and self.hown.count() > 0
                                   and self.hown.currentData() is not None)
         self.stop_btn.setEnabled(busy)
@@ -1409,8 +1450,7 @@ class MultiTab(BaseTab):
             m, x, y, on = self._houses[name]
             tail = "" if on else "（上次看到）"
             self.hown.addItem(f"{name}－{m}({x},{y}){tail}", name)
-        if not self._houses:
-            self.hown.addItem("（沒有分身讀得到小屋）", None)
+        self.hown.addItem("手動輸入…", MANUAL)
         i = self.hown.findData(keep)
         if i >= 0:
             self.hown.setCurrentIndex(i)
@@ -1418,16 +1458,48 @@ class MultiTab(BaseTab):
         self.house_btn.setEnabled(self._job is None
                                   and self.hown.currentData() is not None)
 
+    def _fill_house_maps(self) -> None:
+        """手動輸入的地圖清單＝有補給商（supply_merchants 表有 buy）的城＋天使學園。
+
+        ★ 都從表來（supply.NPC_TABLE ← GAMEDATA/map 自動抽、scene.SCENE_NAMES），
+          不手打場景編號；同一張圖的分流只列一次。
+        """
+        seen: set = set()
+        sids = sorted(k for k, v in supply.NPC_TABLE.items() if "buy" in v)
+        academy = house.scene_of("天使學園")
+        if academy is not None:
+            sids.append(academy)
+        for sid in sids:
+            key = scene.map_key(sid)
+            if key in seen or not jumpmap.by_scene(sid):
+                continue
+            seen.add(key)
+            self.hmap.addItem(scene.scene_name(sid), sid)
+
+    def _on_house_pick(self) -> None:
+        self.hman.setVisible(self.hown.currentData() == MANUAL)
+
     def _do_house(self) -> None:
         if self._job is not None:
             return
         owner = self.hown.currentData()
-        info = self._houses.get(owner) if owner else None
-        if info is None:
-            self.status.setText("⚠ 沒有選到小屋。")
-            return
-        m, hx, hy, _ = info
-        sid = house.scene_of(m)
+        if owner == MANUAL:
+            owner = self.hname.text().strip()
+            sid = self.hmap.currentData()
+            if not owner or sid is None:
+                self._warn("手動輸入不完整", "地圖和角色名都要填。")
+                return
+            m, hx, hy = self.hmap.currentText(), self.hx.value(), self.hy.value()
+            config.set("multi.house_manual",
+                       {"sid": sid, "x": hx, "y": hy, "name": owner})
+            config.save()
+        else:
+            info = self._houses.get(owner) if owner else None
+            if info is None:
+                self.status.setText("⚠ 沒有選到小屋。")
+                return
+            m, hx, hy, _ = info
+            sid = house.scene_of(m)
         if sid is None:
             self._warn("認不得那張地圖",
                        f"地圖表裡找不到「{m}」（或同名的不只一張），"
