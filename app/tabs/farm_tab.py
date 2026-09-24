@@ -562,6 +562,10 @@ QUICKKEY_RANGE = 8
 #   取 12 = 我們的「打得到」判定門檻，配上 margin 2 格 → 實際停在 10 格
 #  （2026-08-07 試過 9，同晚使用者又改回 10）。
 HANDOFF_RANGE = 12.0
+# ★ 怪在傳點旁（牠 HANDOFF_RANGE 格內有傳點格）→ 我們自己沿著繞開傳點的路走到離怪
+#   這麼近才交棒（使用者 2026-09-24 定「走到怪物 3 格才交給官方」）：遊戲自己走的那段
+#   不知道要避開傳點，交棒越早、擦過傳點被傳走的機會越大。
+PORTAL_HANDOFF_KEEP = 3.0
 # 交棒之後這麼久還沒真的接戰（還在技能射程外、也沒掉過血）就收回來自己走。
 HANDOFF_WAIT = 3.0
 # 原地等首發冷卻最多等這麼久（見 KeyWorker.opener_hold）。冷卻＝技能後置時間，實測 1~6 秒；
@@ -4907,6 +4911,23 @@ class CharFarmPage(QWidget):
             return
         self._release_castwatch()
 
+    def _portal_near(self, mp) -> bool:
+        """這隻怪 HANDOFF_RANGE 格內有沒有傳點格（地形快取蓋上去的那批，見
+        terrain.Cache.portal_set）。沒圖／沒傳點＝False（照舊 10 格交棒）。
+        同一格同一份傳點表只算一次。"""
+        cells = getattr(self._maps, "portal_set", None)
+        if not cells or mp is None:
+            return False
+        key = (int(mp[0]), int(mp[1]), id(cells))
+        memo = getattr(self, "_portal_near_memo", None)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        r2 = HANDOFF_RANGE * HANDOFF_RANGE
+        mx, my = mp[0], mp[1]
+        hit = any((x + 0.5 - mx) ** 2 + (y + 0.5 - my) ** 2 <= r2 for x, y in cells)
+        self._portal_near_memo = (key, hit)
+        return hit
+
     def _release_castwatch(self) -> None:
         """卸施放廣播監聽（最後一個使用者還完才真的卸 hook）。"""
         if self._castwatch is not None:
@@ -6873,6 +6894,12 @@ class CharFarmPage(QWidget):
         #   封包**不會**讓客戶端走過去（那是快捷鍵函式自己做的事）。
         handoff = bool(self._keys.handoff and not blocked
                        and not self._handoff_fail)
+        # ★ 交棒距離：平常 HANDOFF_RANGE（停 10 格）；怪在傳點旁 → 縮成停 3 格
+        #   （PORTAL_HANDOFF_KEEP）。「開始按快捷鍵」的距離要一起縮，不然 12 格就按、
+        #   遊戲提早自己走，又跟我們搶走位。
+        hand_rng = HANDOFF_RANGE
+        if handoff and self._portal_near(mp):
+            hand_rng = PORTAL_HANDOFF_KEEP + 0.6      # margin 0.6（<6 格那一檔）→ 停 3.0
         # ★★★ 攻擊距離**永遠照技能射程** ——「隔著地形」只決定走多近（keep），
         #   **不再**把射程壓成近戰 2 格。
         #   ⚠⚠ 舊寫法 `MELEE_RANGE if blocked` 是遠程「盯怪幾秒不出手」的
@@ -6886,7 +6913,7 @@ class CharFarmPage(QWidget):
         # 「打得到嗎」＝**有沒有任何一招打得到**（每一招各自比自己的射程）。
         # ⚠ 交棒那一輪例外：那時候本來就是「站得遠、叫快捷鍵讓遊戲自己走過去」，
         #   用射程去擋會把交棒整個廢掉（見 KeyWorker.client_walk）。
-        in_range = (dist is not None and dist <= HANDOFF_RANGE if handoff
+        in_range = (dist is not None and dist <= hand_rng if handoff
                     else self._keys.in_range_of_any(dist))
         # ⚠ 交棒的保險：交出去之後如果一直沒真的接戰（>3 秒還在技能射程外、
         #   而且沒掉過血），就收回來自己走 —— 免得客戶端因為地形之類走不到，
@@ -6911,7 +6938,7 @@ class CharFarmPage(QWidget):
         #   再多留就進不了近戰射程了）。下限 MIN_GAP：更近會卡進怪的身體。
         # ⚠⚠ 這是**走位**用的距離（走到那裡每一招都用得到），跟「打不打得到」
         #   完全分開 —— 後者是每一招各自判斷的，這裡不代表任何一招的射程。
-        reach_keep = HANDOFF_RANGE if handoff else reach_walk
+        reach_keep = hand_rng if handoff else reach_walk
         margin = 2.0 if reach_keep >= 6.0 else 0.6
         # ⚠ `self._push_in` ＝ 站定打了 PUSH_IN_SECS 秒零傷害（技能被地形
         #   擋線的實錘症狀）→ 跟「隔著地形」同款處置：貼身走過去打。
@@ -7006,7 +7033,7 @@ class CharFarmPage(QWidget):
         # ⚠ `reach` 只在交棒那一輪有值：交棒時出手不看單招射程，只看這個
         #   總距離。平常是 0 ＝ **沒有單一攻擊距離**，每一招在 step() 裡
         #   各自比自己的射程（使用者指定）。
-        self._keys.reach = HANDOFF_RANGE if handoff else 0.0
+        self._keys.reach = hand_rng if handoff else 0.0
         self._keys.client_walk = handoff
         self._keys.set_on(in_range)
 

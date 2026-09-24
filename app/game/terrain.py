@@ -449,7 +449,8 @@ class Cache:
       成本是幾次小讀取（列陣列 h*4 ≈ 720 bytes），而且只在要規劃路線時問。
     """
 
-    __slots__ = ("_grid", "_key", "why", "_fails", "_cool", "_portals", "portal_cells")
+    __slots__ = ("_grid", "_key", "why", "_fails", "_cool", "_portals", "portal_cells",
+                 "portal_set")
 
     def __init__(self, avoid_portals: bool = False) -> None:
         # ★ avoid_portals：讀到圖就把**傳點範圍**（`mapportal.cells`）當牆蓋上去，
@@ -458,6 +459,9 @@ class Cache:
         #   副本／補給本來就要走傳點，那邊的快取不開。
         self._portals = avoid_portals
         self.portal_cells = 0                    # 這張圖蓋了幾格傳點（診斷用）
+        # 蓋上去的那些格（含 margin）—— 掛機頁問「這隻怪離傳點近不近」用（見 farm_tab
+        #   PORTAL_HANDOFF_KEEP）。跟著 _stamp_portals 換圖重算。
+        self.portal_set: frozenset = frozenset()
         self._grid: Grid | None = None
         self._key = None
         # 剛失敗過就先冷卻一下再重試（見 get()）
@@ -536,6 +540,7 @@ class Cache:
         for x, y in blk:
             grid.open[y][x] = 0
         self.portal_cells = len(blk)
+        self.portal_set = frozenset(blk)
 
     @property
     def fails(self) -> int:
