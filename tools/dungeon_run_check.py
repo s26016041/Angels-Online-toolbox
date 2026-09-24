@@ -176,6 +176,9 @@ class FakeKeys:
 class FakeMover:
     """假跳板：只記「叫我走去哪、留幾格、給了哪些點」。"""
 
+    installed = True            # IAT 還指著我（真的 Mover.installed）
+    gone = False
+
     def __init__(self):
         self.active = True
         self.near = []          # walk_near 的 (x, y, keep)
@@ -2919,6 +2922,34 @@ def main() -> int:
         tab._targets = lambda: []
         tab._drop_target = lambda: None
         return tab
+
+    # ★ 2026-09-24：分身跳板失效 → 自動重裝（以前只喊失效到 2 分鐘停機）
+    tab = loop_tab()
+    dead = FakeMover()
+    dead.active = False
+    dead.gone = True
+    tab._pmover = dead
+    got = []
+    _acq = dt.move.acquire
+    _pp = dt.injector.process_path
+    try:
+        dt.injector.process_path = lambda pid: "x.exe"
+        dt.move.acquire = lambda pid, exe, owner: (got.append(pid), FakeMover())[1]
+        ck("★ 分身跳板失效 → 重裝成功、接著用", tab._pmover_ok() and got == [2]
+           and tab._pmover is not dead, str(got))
+        tab._pmover = dead
+        tab._pmover_retry = 0.0
+
+        def boom(pid, exe, owner):
+            got.append(pid)
+            raise RuntimeError("裝不上")
+        dt.move.acquire = boom
+        ck("　重裝失敗 → 回 False、不當機", tab._pmover_ok() is False)
+        ck("　隔 MOVER_RETRY 秒才再試（不每拍狂裝）",
+           tab._pmover_ok() is False and got.count(2) == 2, str(got))
+        ck("　失效原因講得出來", "讀不到" in dt._mover_dead_why(dead))
+    finally:
+        dt.move.acquire, dt.injector.process_path = _acq, _pp
 
     world = {"here": 98, "mine": [], "his": [], "left": [], "invited": [],
              "joined": 0, "flown": [], "denied": []}

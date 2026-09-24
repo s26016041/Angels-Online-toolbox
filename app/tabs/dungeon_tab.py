@@ -138,6 +138,17 @@ from app.tabs.farm_tab import (_NOTIFY_PAGES, DEFAULT_KEY, GangWorker, LOOT_GAP,
                                SKILL_KEYS, TargetWorker, loot_panel)
 
 TICK_MS = 100
+
+
+def _mover_dead_why(mv) -> str:
+    """跳板為什麼不能用（給執行紀錄；分不出來的也講清楚是哪個旗標）。"""
+    if getattr(mv, "gone", False):
+        return "讀不到分身遊戲的記憶體（跳板被作廢）"
+    if not getattr(mv, "active", False):
+        return "跳板被停用（有人 stop／release）"
+    if not getattr(mv, "installed", False):
+        return "遊戲的 PeekMessageA 入口被換掉（IAT 不指著我們）"
+    return "原因不明"
 # ★ 執行紀錄（2026-09-05 使用者回報「exe 跑一跑會卡住、py 跑就正常」）：exe 沒有主控台、
 #   狀態列一閃就過，出事時完全沒有證據可以比對。開跑就寫 %APPDATA%\AngelsOnlineToolbox\
 #   dungeon_run.log：狀態列（每秒最多一行）、提示、鎖定了哪隻怪（含候選排名：直線距離／
@@ -2105,6 +2116,36 @@ class CharDungeonPage(QWidget):
         self._gang.mover = self._mover
         self._gang.start()
         return True
+
+    def _pmover_ok(self) -> bool:
+        """分身跳板還活著就回 True；死了（分身遊戲還在）就重裝，裝回來也回 True。
+
+        ★ 2026-09-24 黑狐實錄：第 1 趟補給完回入口組隊，白狐的跳板已經失效 → 同意一包都送
+          不出去，只會一直喊「失效」到 2 分鐘停機。自己的跳板早有 `_ensure_mover` 自動重裝，
+          分身這份以前只在開跑時裝一次。→ 比照它：隔 MOVER_RETRY 秒重裝一次，失效原因寫進
+          執行紀錄（下次才知道是哪一種）。"""
+        pm = self._pmover
+        if pm is not None and pm.active and pm.installed:
+            return True
+        if self._ppid is None:
+            return False
+        now = time.monotonic()
+        if now < getattr(self, "_pmover_retry", 0.0):
+            return False
+        self._pmover_retry = now + MOVER_RETRY
+        why = "還沒裝" if pm is None else _mover_dead_why(pm)
+        try:
+            self._pmover = move.acquire(self._ppid, injector.process_path(self._ppid), self)
+        except Exception as exc:                         # noqa: BLE001
+            self._runlog_write(f"⚠ 分身「{self._partner_name}」跳板失效（{why}），重裝失敗：{exc}"
+                               f"（{MOVER_RETRY:.0f} 秒後再試）")
+            return False
+        ok = bool(self._pmover and self._pmover.active and self._pmover.installed)
+        msg = (f"⚠ 分身「{self._partner_name}」跳板失效（{why}）→ "
+               + ("已重裝，接著組隊" if ok else "重裝了但還是不能用"))
+        self._event("warn", msg)
+        self._runlog_write(msg)
+        return ok
 
     def _teardown(self) -> None:
         """把執行緒與跳板都還掉 —— 這一頁不再指揮角色。⚠ 不動勾選框、不關紀錄檔：
@@ -5117,7 +5158,9 @@ class CharDungeonPage(QWidget):
                f"同意送 {self._team_joins} 次（{self._team_join_why or '沒送'}）"]
         try:
             pm = self._pmover
-            out.append("分身跳板=" + ("沒有" if pm is None else "有效" if pm.active else "失效"))
+            out.append("分身跳板=" + ("沒有" if pm is None else
+                                      "有效" if (pm.active and pm.installed)
+                                      else f"失效（{_mover_dead_why(pm)}）"))
             out.append("我的跳板=" + ("有效" if (self._mover and self._mover.active) else "失效"))
             est = set(netstat.established_pids())
             hw = {w.pid: w.hwnd for w in preload.windows()}
@@ -5235,7 +5278,7 @@ class CharDungeonPage(QWidget):
                     self._say(f"組隊：邀請送不出去（{why}），重試中…")
                     return
                 self._team_invited = True                # 一輪只邀一次
-            if self._pmover is None or not self._pmover.active:
+            if not self._pmover_ok():
                 # ⛔ 以前這裡安靜跳過：分身跳板沒了＝同意一包都送不出去，卻照樣一輪輪重邀。
                 self._team_join_why = "分身跳板沒裝上／失效"
                 self._say(f"⚠ 組隊：分身「{self._partner_name}」的跳板失效，同意送不出去"
