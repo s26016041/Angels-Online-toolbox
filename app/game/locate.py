@@ -921,6 +921,35 @@ SIGS: tuple[Sig, ...] = (
         " 6A 20 8D 86 ?? ?? ?? ?? 66 C7 86 ?? ?? ?? ?? 00 00 68 ?? ?? ?? ?? 50"
         " E8 ?? ?? ?? ?? 83 C4 0C 33 C0 8B CE 89 86 ?? ?? ?? ?? E8",
         0x00005818),
+    # 展示房子(密碼)。錨在函式開頭：`sub esp,0x6C / GS cookie / push ebx / mov ebx,[ebp+8] /
+    # push edi / mov edi,ecx / mov ecx,[edi+8] / push [ecx+..] / call 取物件 / test / jz /
+    # push esi / push 0x1C3（房屋裝備欄）/ mov ecx,eax / call`。0x1C3 是欄位編號（協定），留著當錨。
+    Sig("house", "REGISTRY_FN", "fn", None,
+        "55 8B EC 83 EC 6C A1 ?? ?? ?? ?? 33 C5 89 45 FC 53 8B 5D 08 57 8B F9 8B 4F 08"
+        " FF B1 ?? ?? ?? ?? E8 ?? ?? ?? ?? 85 C0 0F 84 ?? ?? ?? ?? 56 68 C3 01 00 00 8B C8 E8",
+        0x005D662F),
+    # 收回房子（closehouse 0x58FEBD 擋完「展示中且 +0x5838==0」後叫它；ecx=[MGR]）：
+    # `mov ecx,[ecx+8] / sub esp,0x10 / push [ecx+..] / call 取物件 / test / je /
+    # push 2 / push 0x139（收回房子封包）/ lea ecx,[ebp-0x10] / call 建包`。
+    Sig("house", "CLOSE_FN", "fn", None,
+        "55 8B EC 8B 49 08 83 EC 10 FF B1 ?? ?? ?? ?? E8 ?? ?? ?? ?? 85 C0 74 ??"
+        " 6A 02 68 39 01 00 00 8D 4D F0 E8",
+        0x005D2D8C),
+    # 「展示中」旗標。錨在 registryhouse 處理 0x58FE2C 開頭：取參數 → 查物件 →
+    # `mov eax,[MGR] / cmp byte [eax+?],0 / jne / cmp byte [eax+展示中],0 / jne`。
+    # 第一個 cmp 是 +0x5838（意義未明），第二個才是我們要的。結構偏移自己寫 ??。
+    Sig("house", "SHOWN_OFF", "off", 64,
+        "55 8B EC 51 51 8B 45 08 8D 4D F8 53 33 DB 89 45 FC 6A 01 88 5D F8 E8 ?? ?? ?? ??"
+        " 85 C0 74 11 8B 0D ?? ?? ?? ?? 50 8B 49 0C E8 ?? ?? ?? ?? 8B D8 A1 ?? ?? ?? ??"
+        " 80 B8 ?? ?? ?? ?? 00 75 ?? 80 B8 ?? ?? ?? ?? 00 75",
+        0x00005839),
+    # 清潔指數。錨在房屋資訊更新 0x601120：填 27009（魔力值，0x6981）之後
+    # `movzx eax,word [edi+清潔] / push eax / push 0x6982（清潔指數那格 27010）`。
+    # 視窗編號來自 wnd03.xml（GAMEDATA），當錨。
+    Sig("house", "CLEAN_OFF", "off", 24,
+        "56 FF B7 ?? ?? ?? ?? 68 81 69 00 00 53 FF 77 0C E8 ?? ?? ?? ??"
+        " 0F B7 87 ?? ?? ?? ?? 50 68 82 69 00 00 53 FF 77 0C E8",
+        0x000057C4),
 )
 
 # 掃過就不再掃：同一份 angel.dat，五台分身結果一樣。

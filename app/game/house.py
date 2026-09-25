@@ -38,13 +38,22 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from app.game import entity, move, quickbar
+from app.game import entity, gather, move, quickbar
 
-# ★ 下面四個由 locate.warm() 用 AOB 寫回（見 locate.SIGS 的 house 段）。
+# ★ 下面這些由 locate.warm() 用 AOB 寫回（見 locate.SIGS 的 house 段）。
 ENTER_FN = 0x005E49BD     # 進入房子(選定id, 密碼字串指標)
 VT_HOUSE = 0x008078E0     # 房子物件的 vtable
 MAP_OFF = 0x57F6          # [MGR]+這裡：自己房子所在地圖名（UTF-8）
 XY_OFF = 0x5818           # [MGR]+這裡：u16 x, u16 y
+# 展示房子(密碼字串指標)，ecx=[MGR]。UI 指令 registryhouse（0x58FE2C）擋完「已經展示」後叫它：
+# 取房屋裝備欄 0x1C3 的物品（沒有→訊息 2360「你沒有裝備房屋」）、範本 +0x18 要 0x39，
+# 建包 0x137 長 0x27（物品 id＋密碼）。★ 封包**沒有座標** → 伺服器用角色當下的位置。
+REGISTRY_FN = 0x005D662F
+# 收回房子（無參數，ecx=[MGR]）→ 封包 0x139。UI 指令 closehouse（0x58FEBD）在
+# 「展示中 且 [MGR]+0x5838==0」時才叫它 —— 我們照同一個條件擋。
+CLOSE_FN = 0x005D2D8C
+SHOWN_OFF = 0x5839        # [MGR]+這裡：byte，房子展示中（registryhouse/closehouse 都看它）
+CLEAN_OFF = 0x57C4        # [MGR]+這裡：u16 清潔指數（updatehouseinfo 0x601120 填進「清潔指數」那格）
 
 MAP_LEN = 0x20            # 0x5C2BD8 push 0x20（抄地圖名的上限）
 OFF_SELECT_ID = 0x1D0
@@ -212,3 +221,163 @@ def inside(scene_id: int | None) -> bool:
     from app.game import scene
     base = scene.base_id(scene_id)
     return base is not None and scene.SCENE_NAMES.get(base) == "房屋"
+
+
+# ===========================================================================
+# 展示（放）房子、清潔指數 —— 2026-09-25 反組譯＋雪狐實機（memory house-location）
+# ===========================================================================
+CLEAN_MAX = 10000         # 合理性上限（強效魔法靈補到 2500；讀到更大的就是垃圾）
+
+
+def _mgr(sc) -> int | None:
+    m = _u32(sc, quickbar.MGR_PTR)
+    return m if _ok(m) else None
+
+
+def shown(sc) -> bool | None:
+    """自己的房子**現在展示中**嗎；讀不到 → None（⚠ None ≠ 沒展示）。
+
+    ★ 五台實測：有擺房子的兩台 1、其他 0；收回後變 0。跟遊戲自己的
+      registryhouse／closehouse 看的是同一格。
+    """
+    m = _mgr(sc)
+    if m is None or not SHOWN_OFF:
+        return None
+    raw = sc._read_bytes(m + SHOWN_OFF, 1)
+    if not raw:
+        return None
+    v = bytes(raw)[0]
+    return None if v > 1 else bool(v)
+
+
+def cleanliness(sc) -> int | None:
+    """房屋清潔指數（Alt+H「清潔指數」那格）；讀不到或不合理 → None。
+
+    ✅ 使用者 2026-09-25 對畫面確認雪狐 2490 相符。收起來的房子也讀得到。
+    """
+    m = _mgr(sc)
+    if m is None or not CLEAN_OFF:
+        return None
+    raw = sc._read_bytes(m + CLEAN_OFF, 2)
+    if not raw or len(raw) < 2:
+        return None
+    v = struct.unpack("<H", bytes(raw))[0]
+    return v if v <= CLEAN_MAX else None
+
+
+def register(mover, sc) -> tuple[bool, str]:
+    """在**角色現在站的位置**展示房子（＝房屋視窗按「展示」）。只保證送出；
+    成不成看 `shown()` 有沒有變 True（太近別人房子是伺服器擋的，訊息 2457）。"""
+    if not (mover and mover.active):
+        return False, "跳板沒裝好"
+    if not REGISTRY_FN:
+        return False, "展示房子的函式定位失敗（改版？）"
+    if shown(sc) is not False:
+        return False, "房子已經在展示中（或讀不到展示狀態）→ 不送"
+    m = _mgr(sc)
+    if m is None:
+        return False, "讀不到狀態物件"
+    with mover.lock:
+        pw = mover.scratch() + SCRATCH_OFF
+        if not mover.write(pw, b"\0" * 4):
+            return False, "寫不進暫存區"
+        if mover.call_sync(REGISTRY_FN, pw, ecx=m, timeout=CALL_TIMEOUT) is None:
+            return False, "指令槽忙"
+    return True, "已送出展示房子"
+
+
+def close(mover, sc) -> tuple[bool, str]:
+    """收回自己的房子（＝房屋視窗按「收回」）。只保證送出；成不成看 `shown()` 變 False。
+
+    ⚠ 照遊戲 closehouse 的條件：展示中 而且 [MGR]+0x5838 == 0 才送（0x5838 意義未明，
+      遊戲自己就這樣擋，我們不猜、照抄）。
+    """
+    if not (mover and mover.active):
+        return False, "跳板沒裝好"
+    if not CLOSE_FN or not SHOWN_OFF:
+        return False, "收回房子的函式定位失敗（改版？）"
+    if shown(sc) is not True:
+        return False, "房子沒在展示（或讀不到）→ 不送"
+    m = _mgr(sc)
+    if m is None:
+        return False, "讀不到狀態物件"
+    b = sc._read_bytes(m + SHOWN_OFF - 1, 1)
+    if not b or bytes(b)[0] != 0:
+        return False, "遊戲現在不給收回（[MGR]+0x5838 非 0）"
+    with mover.lock:
+        if mover.call_sync(CLOSE_FN, ecx=m, timeout=CALL_TIMEOUT) is None:
+            return False, "指令槽忙"
+    return True, "已送出收回房子"
+
+
+# ===========================================================================
+# 屋內：傳送點（踩上去跳選單）、保險箱
+# ===========================================================================
+OFF_TRIGGER = 0x1FE       # word：伺服器發的物件旗標（portal_probe 檔頭：遊戲 0x546A13 每拍看它）
+TRIGGER_MASK = 0x185      # 0x546A3B test eax,0x185 —— 非 0 才是「踩上去會送 0x0D」的物件
+TSPAN = OFF_TRIGGER + 2
+
+
+@dataclass(frozen=True)
+class Thing:
+    addr: int
+    oid: int        # +0x1D0 選定 id
+    model: int      # +0xB4 外觀
+    x: float
+    y: float
+    trigger: bool   # 踩上去會觸發
+
+    def dist(self, pos) -> float:
+        return ((self.x - pos[0]) ** 2 + (self.y - pos[1]) ** 2) ** 0.5
+
+
+def things(sc) -> list[Thing] | None:
+    """場上所有「互動靜態物件」（屋內傳送點／保險箱／製作台／信箱…）；讀不到表回 None。
+
+    ★ 它們跟製作台、採集品同一族：vtable ＝ `gather.VT_RESOURCE`（2026-09-25 實測同值，
+      ⛔ 別再另外登記一份 —— 同一個位址寫兩處，改版只會跟上一處）。
+    """
+    if not gather.VT_RESOURCE:
+        return None
+    mgr = _u32(sc, move.MGR_PTR)
+    if not _ok(mgr):
+        return None
+    tbl = _u32(sc, mgr + move.MGR.TBL)
+    mx = _u32(sc, mgr + move.MGR.MAX)
+    if not _ok(tbl) or mx is None or not 0 < mx <= 0x10000:
+        return None
+    raw = sc._read_bytes(tbl, (mx + 1) * 4)
+    if not raw or len(raw) < (mx + 1) * 4:
+        return None
+    out = []
+    for i, obj in enumerate(struct.unpack_from(f"<{mx + 1}I", bytes(raw))):
+        if not _ok(obj):
+            continue
+        b = sc._read_bytes(obj, TSPAN)
+        if not b or len(b) < TSPAN:
+            continue
+        b = bytes(b)
+        if struct.unpack_from("<I", b, 0)[0] != gather.VT_RESOURCE:
+            continue
+        if (struct.unpack_from("<I", b, move.MGR.OBJ_ID)[0] & 0xFFFF) != i:
+            continue                       # 殘留
+        vx, vy = struct.unpack_from("<II", b, E + entity.OFF_POS_X)
+        x, y = (vx >> 16) / entity.TILE_UNITS, (vy >> 16) / entity.TILE_UNITS
+        if x == 0 and y == 0:
+            continue
+        flags = struct.unpack_from("<H", b, OFF_TRIGGER)[0]
+        out.append(Thing(obj, struct.unpack_from("<I", b, OFF_SELECT_ID)[0],
+                         struct.unpack_from("<I", b, 0xB4)[0], x, y,
+                         bool(flags & TRIGGER_MASK)))
+    return out
+
+
+def thing_still_there(sc, t: Thing) -> bool:
+    """送出前重驗：同一個位址還是同一個東西（vtable、選定 id、外觀都對得上）。"""
+    b = sc._read_bytes(t.addr, TSPAN)
+    if not b or len(b) < TSPAN:
+        return False
+    b = bytes(b)
+    return (struct.unpack_from("<I", b, 0)[0] == gather.VT_RESOURCE
+            and struct.unpack_from("<I", b, OFF_SELECT_ID)[0] == t.oid
+            and struct.unpack_from("<I", b, 0xB4)[0] == t.model)

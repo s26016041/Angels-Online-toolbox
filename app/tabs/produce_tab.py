@@ -129,6 +129,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import threading
 import time
 from collections import Counter
@@ -153,10 +154,11 @@ from app.config import config
 from app.core import charname, crashlog, injector, preload
 from app.core import window as win
 from app.core.memory import MemoryScanner
-from app.game import (bag, balls, ballswap, bank, entity, gather, itemname, mall,
-                      jumpmap, locate, lua, move,
+from app.core.notifier import Notifier
+from app.game import (bag, balls, ballswap, bank, entity, gather, house, housetrip,
+                      itemname, mall, jumpmap, locate, lua, mapobj, move,
                       navigate, produce, recall, recipes, robot, scene, scenery,
-                      supply)
+                      supply, talkwnd)
 from app.tabs.base_tab import (GROUP_AUTO, BaseTab, ClientWatchMixin, fit_list,
                                no_elide, mall_buys_dialog,
                                record_mall_buy)
@@ -196,7 +198,12 @@ SUPPLY_MAX_SECS = 900.0      # 整趟的兜底：超過就放棄，回到採集�
 # 捐獻歷史紀錄最多留幾筆（每台分身各一份，存在設定檔）。
 DONATE_LOG_MAX = 500
 DISPOSE_GUILD, DISPOSE_NONE = "guild", "none"
+# ★ 屋內保險箱（2026-09-25 使用者要的「房屋製作」B 案）：做完的半成品存進自己小屋
+#   生產寵物房的保險箱。只有勾「房屋製作」才有保險箱可用（沒勾就東西留背包、照常回去採）。
+DISPOSE_HBANK, DISPOSE_HGUILD = "hbank", "hguild"
 DISPOSE_LABELS = ((DISPOSE_GUILD, "全部捐公會"),
+                  (DISPOSE_HBANK, "存個人倉庫（屋內保險箱）"),
+                  (DISPOSE_HGUILD, "存社團倉庫（屋內保險箱）"),
                   (DISPOSE_NONE, "做完就停著（不處理）"))
 # ⚠ 舊設定若存的是已刪掉的「存進倉庫」，一律退成「不處理」——
 #   **不准自動改成捐公會**：捐出去收不回來，那是使用者的東西。
@@ -266,6 +273,22 @@ BENCH_SCAN_R = 8.0
 BENCH_REACH = 2.5
 # 記住的檯子長什麼樣（外觀編號）要在多近的範圍內才算「就是上次那個」。
 BENCH_SAME = 2.0
+
+# ── 房屋製作／自動吃清潔指數（2026-09-25 使用者要的，流程見 app/game/housetrip.py）──
+# 生產寵物房的製作台散在 ~20 格內（實測 5 張台 (12~20, 16~30)，進來落在 (36.5,28.5)），
+# 找檯子的範圍要放大到整間。
+HOUSE_BENCH_R = 40.0
+# 去生產寵物房連續失敗幾次就停（使用者：同一步連續失敗 3 次就停下來並通知）。
+HOUSE_FAIL_MAX = 3
+# 瞬移判定：點了東西之後位置一次跳這麼多格＝被傳走了（那個不是檯子）。
+HOUSE_WARP_JUMP = 8.0
+# ★ 使用者定：清潔指數低於 502 就吃一個強效魔法靈（說明：直接提升至 2500）。
+CLEAN_MIN = 502
+CLEAN_ITEM = "強效魔法靈"        # 物品名（查 GAMEDATA 名稱表拿 ID，不寫死編號）
+CLEAN_CHECK_SECS = 30.0         # 多久讀一次清潔指數（純讀）
+CLEAN_RETRY_SECS = 600.0        # 沒吃成／背包沒有 → 這麼久之後再試（通知只發一次）
+# 清潔度實測會慢慢掉（2500→2499 約 5 秒）；吃完 3 秒內應該回到 2500 附近。
+CLEAN_VERIFY_MS = 3000
 
 
 class CharProducePage(QWidget):
@@ -339,6 +362,17 @@ class CharProducePage(QWidget):
         #   沒有它的話，第一個候選剛好是門的時候會變成「點→被傳走→回來→
         #   再點同一個」的無限迴圈。
         self._bad_props: set[tuple[int | None, int]] = set()
+        # ── 房屋製作（見 app/game/housetrip.py）──
+        # 背景工作：{"kind": "go"/"deposit", "ctx": housetrip.Ctx, "thread", "result", "t0"}。
+        # ⚠ 一次只准一條（兩條會同時搶走位）；取消勾選／關分頁設 ctx.cancel。
+        self._hjob: dict | None = None
+        self._hbench = 0             # 生產寵物房裡學到的製作台外觀（0＝還沒學）
+        self._hlog: housetrip.RunLog | None = None
+        # 生產寵物房裡沒有採集品（房屋等級不夠）→ 這次開著期間採集改回原本的定位點。
+        self._house_no_gather = False
+        # ── 自動吃清潔指數 ──
+        self._clean_next = 0.0       # 下一次讀清潔指數的時間
+        self._clean_told = ""        # 已經通知過的問題（同一件事只通知一次）
         self._watch_reset()
         self._build()
         self._load_settings()
@@ -480,6 +514,11 @@ class CharProducePage(QWidget):
         # ★ 只有那一趟進行中才會轉，平常是停的（不佔資源）。
         self._trip_timer = QTimer(self)
         self._trip_timer.timeout.connect(self._trip_tick)
+        # 通知：跟自動掛機／刷副本同一份共用設定（掛機頁最上面那一列）。
+        self._notifier = Notifier(
+            self, "⚠ 自動生產警報",
+            lambda: (str(config.get("farm.notify", "sound") or "sound"),
+                     str(config.get("farm.tg_id", "") or "")))
 
     # ------------------------------------------------------------------
     def _build_make(self) -> QGroupBox:
@@ -535,6 +574,28 @@ class CharProducePage(QWidget):
         row.addWidget(self.bench_lbl)
         row.addStretch(1)
         v.addLayout(row)
+
+        # ── 房屋製作／自動吃清潔指數（2026-09-25 使用者要的）──────────────
+        hrow = QHBoxLayout()
+        self.house_cb = QCheckBox("房屋製作")
+        self.house_cb.setToolTip(
+            "採集和做半成品都在自己小屋的「生產寵物房」。\n"
+            "房子沒擺出來會自己去棕櫚基地擺（試 2 分鐘）；擺不了就取消這格、\n"
+            "通知你，改回原本的定位點和製作檯。全程不換頻道。")
+        self.house_cb.toggled.connect(self._on_house_toggle)
+        hrow.addWidget(self.house_cb)
+        hrow.addSpacing(16)
+        self.clean_cb = QCheckBox("自動吃清潔指數")
+        self.clean_cb.setToolTip(
+            f"房屋清潔指數低於 {CLEAN_MIN} 就吃一個「{CLEAN_ITEM}」（補到 2500）。\n"
+            "不用勾「開始自動生產」也會做。背包沒有會通知一次。")
+        self.clean_cb.toggled.connect(lambda _on: self._on_clean_toggle())
+        hrow.addWidget(self.clean_cb)
+        self.clean_lbl = QLabel("清潔指數：—")
+        self.clean_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
+        hrow.addWidget(self.clean_lbl)
+        hrow.addStretch(1)
+        v.addLayout(hrow)
 
         return box
 
@@ -639,6 +700,7 @@ class CharProducePage(QWidget):
             # ★ 取消勾選也是「負重那一趟」的出口（重試不設上限，靠這個停）。
             self._trip = None
             self._trip_timer.stop()
+            self._house_cancel("停止自動生產")
             # ⚠ 停生產時若回程補給的背景執行緒還在跑：作廢它的結果（_sup=None）。
             #   ⚠⚠ 那一趟**沒法中途硬殺**（run_full_supply 各段有逾時，會自己跑完）——
             #   跟掛機同一個取捨。
@@ -787,6 +849,11 @@ class CharProducePage(QWidget):
         #   定的，這裡補齊；規則本體兩邊共用 `app/game/balls.py`）。
         # ⚠ 動作照舊讓路：`_ball_hold()` 有字就只更新數字、不動手。
         self._ball_tick(self._ball_hold())
+        # ★ 自動吃清潔指數也獨立於「開始自動生產」（使用者：分開勾）。
+        try:
+            self._clean_tick()
+        except Exception as exc:                   # noqa: BLE001
+            self._hlog_w(f"清潔指數檢查出錯：{exc}")
         if not self.run_cb.isChecked():
             return
         try:
@@ -1197,6 +1264,115 @@ class CharProducePage(QWidget):
         dlg.accept()
         self._note("已清空捐獻紀錄")
 
+    def _house_go_step(self, s: dict) -> None:
+        """house_go：背景跑 housetrip.go_workshop，這裡輪詢。
+
+        結果：ok → 往下（做半成品／開採集）；nohouse → 取消房屋製作、通知、走原本的路；
+        fail → 重試，連續 HOUSE_FAIL_MAX 次就大聲停。
+        """
+        nxt = s.get("house_next", "resume")
+        if self._hjob is None:
+            # ★ 先停精靈（不然它會把人拉去採集）＋按 ESC 退出採集狀態（採集中用不了
+            #   趴趴GO 的道具），隔一拍才出發。
+            if not s.get("house_prep"):
+                try:
+                    robot.end_gather(self._mover, self.sc)
+                    robot.set_run(self._mover, self.sc, False)
+                    win.send_key(self.hwnd, self.VK_ESCAPE)
+                except Exception:                  # noqa: BLE001
+                    pass
+                s["house_prep"] = time.monotonic()
+                self._note("房屋製作：先停精靈、按 ESC…")
+                return
+            if time.monotonic() - s["house_prep"] < 1.2:
+                return
+            self._hlog_w(f"出發去生產寵物房（接著要：{'做半成品' if nxt == 'craft' else '採集'}）")
+            self._house_start("go")
+            self._note("房屋製作：出發去生產寵物房…")
+            return
+        res = self._house_poll()
+        if res is None:
+            j = self._hjob
+            self._note(f"房屋製作：{j['progress'] if j else ''}")
+            return
+        kind, msg = res
+        s.pop("house_prep", None)
+        self._hlog_w(f"去生產寵物房結果：{kind}　{msg}")
+        if kind == "ok":
+            s["house_fail"] = 0
+            s["in_house"] = True
+            self._nav.reset()
+            if nxt == "craft":
+                s["step"] = "craft"
+                s["craft"] = self.new_craft_state()
+                s["craft"]["house"] = True
+                self._note("到生產寵物房了，開始做半成品")
+            else:
+                s["step"] = "resume"
+                self._note("到生產寵物房了，開始採集")
+            return
+        if kind == "nohouse":
+            self._house_off(msg)
+            # 改走原本的路：要做半成品 → 天使之翼回程找製作檯；要採集 → 回定位點
+            s["step"] = "recall" if nxt == "craft" else "back"
+            s["esc"] = False
+            return
+        n = s.get("house_fail", 0) + 1
+        s["house_fail"] = n
+        if n >= HOUSE_FAIL_MAX:
+            text = f"去生產寵物房連續 {n} 次失敗（{msg}）—— 已停止自動生產"
+            self._hlog_w("⛔ " + text)
+            self.notify(text)
+            self._trip_end("⚠ " + text, bad=True)
+            self._halt(self.run_cb, self.status.text())
+            return
+        self._note(f"⚠ 去生產寵物房失敗（{msg}）→ 第 {n + 1} 次重試", warn=True)
+
+    def _house_deposit_step(self, s: dict) -> None:
+        """dispose（屋內保險箱）：把做好的半成品存進個人／社團倉庫，然後回去採集。
+
+        ⚠ 沒勾房屋製作（擺不了房子被取消）＝沒有保險箱 → 東西留背包、照常回去採。
+        ⚠ 存不進去不停機：連續 HOUSE_FAIL_MAX 次就通知、東西留背包、回去採。
+        """
+        disp = self.dispose.currentData()
+        where = "社團倉庫" if disp == DISPOSE_HGUILD else "個人倉庫"
+        if not self._house_on() or not s.get("in_house"):
+            self._note(f"⚠ 處理方式是存{where}（屋內保險箱），但現在不在生產寵物房"
+                       " —— 東西留在背包，回去採集", warn=True)
+            s["step"] = "back"
+            return
+        if self._hjob is None:
+            semi = recipes.semi_finished(self.sc)
+            if semi is None:
+                self._note("讀不到配方表 —— 等一下再存")
+                return
+            ids = {r.product for r in semi}
+            self._hlog_w(f"存{where}：半成品 {len(ids)} 種")
+            self._house_start("deposit", guild=(disp == DISPOSE_HGUILD), ids=ids)
+            self._note(f"存{where}（屋內保險箱）…")
+            return
+        res = self._house_poll()
+        if res is None:
+            j = self._hjob
+            self._note(f"存{where}：{j['progress'] if j else ''}")
+            return
+        kind, msg = res
+        if kind == "ok":
+            s["dep_fail"] = 0
+            s["step"] = "back"
+            self._note(msg + "　→ 回去採集")
+            return
+        n = s.get("dep_fail", 0) + 1
+        s["dep_fail"] = n
+        if n >= HOUSE_FAIL_MAX:
+            text = f"存{where}連續 {n} 次失敗（{msg}）—— 東西留在背包，先回去採集"
+            self._hlog_w("⛔ " + text)
+            self.notify(text)
+            self._note("⚠ " + text, warn=True)
+            s["step"] = "back"
+            return
+        self._note(f"⚠ 存{where}失敗（{msg}）→ 重試", warn=True)
+
     def _trip_tick(self) -> None:
         """負重那一趟的狀態機。CRAFT_TICK_MS 一拍。"""
         if self._trip is None or self._loading:
@@ -1263,8 +1439,18 @@ class CharProducePage(QWidget):
             if not ok:
                 self._note(f"關主精靈重試中…（{why}）")
                 return
+            if self._house_on():
+                # ★ 房屋製作：製作台在自己小屋的生產寵物房，不用天使之翼回城。
+                s["step"], s["house_next"] = "house_go", "craft"
+                self._note("已關掉天使守護精靈主開關，去生產寵物房做半成品")
+                return
             s["step"] = "recall"
             self._note("已關掉天使守護精靈主開關，準備回程")
+            return
+
+        # ── 房屋製作：去自己小屋的生產寵物房（背景執行緒跑 housetrip.go_workshop）──
+        if step == "house_go":
+            self._house_go_step(s)
             return
 
         if step == "recall":
@@ -1393,6 +1579,9 @@ class CharProducePage(QWidget):
 
         # ── 做完了 → 捐 or 停 ───────────────────────────────
         if step == "dispose":
+            if self.dispose.currentData() in (DISPOSE_HBANK, DISPOSE_HGUILD):
+                self._house_deposit_step(s)
+                return
             if self.dispose.currentData() != DISPOSE_GUILD:
                 self._trip_end("半成品做完了。處理方式是「做完就停著」—— "
                                "東西留在背包，循環到此結束", warn=True)
@@ -1417,6 +1606,10 @@ class CharProducePage(QWidget):
 
         # ── 回標記點 → 重新設定 → 開採集 → 開主精靈 ──────────
         if step == "back":
+            if self._house_on() and not self._house_no_gather:
+                s["step"], s["house_next"] = "house_go", "resume"
+                return
+            s["in_house"] = False          # 採集走原本的定位點（做半成品那段設的旗子要放下）
             here = scene.current_id(self.sc)
             if here is None:
                 self._note("讀不到目前地圖（載入中？）")
@@ -1478,6 +1671,19 @@ class CharProducePage(QWidget):
             return
 
         if step == "resume":
+            if s.get("in_house") and self._house_on() and not self._house_no_gather:
+                want = set(self.wanted())
+                res = [r for r in gather.nearby(self.sc) if not want or r.name in want]
+                if not res:
+                    self._house_no_gather = True
+                    s["in_house"] = False
+                    msg = ("生產寵物房裡沒有可採的資源（房屋等級不夠？）—— "
+                           "採集改回原本的定位點，做半成品照樣回房子")
+                    self._hlog_w(msg)
+                    self._note("⚠ " + msg, warn=True)
+                    self.notify(msg)
+                    s["step"] = "back"
+                    return
             # ★ 順序照使用者說的：**設定 → 開自動採集 → 最後才開主精靈**。
             # ⚠ 2026-08-14 拿掉 apply_prefs(supply=True)：回程補給改成我們自己的
             #   run_full_supply，不再推精靈的補給頁設定。採集本身仍靠精靈（begin_gather）。
@@ -1566,8 +1772,29 @@ class CharProducePage(QWidget):
         me = self._my_pos()
         if me is None:
             return "讀不到角色位置"
+        in_house = bool(c.get("house"))
+        here0 = scene.current_id(self.sc)
+        if in_house and c.get("poked") is not None and talkwnd.window_visible(self.sc):
+            # 點了跳出對話＝不是製作台（保險箱／信箱／寄養台）→ 關掉、記住不再點。
+            # ⚠ 對話開著角色被伺服器鎖住不能走，一定要先關。
+            self._bad_props.add((here0, c["poked"].model))
+            self._hlog_w(f"點了 {mapobj.name_of(c['poked'].model)} 跳出對話 → 不是製作台")
+            try:
+                talkwnd.close_window(self._mover, self.sc)
+                supply.leave_npc(self._mover, self.sc)
+            except Exception:                      # noqa: BLE001
+                pass
+            c["poked"] = None
+            return "那個不是製作台（跳出對話），關掉換下一個"
         if c["props"] is None or advance:
-            props = scenery.nearby(self.sc, me, BENCH_SCAN_R)
+            props = scenery.nearby(self.sc, me,
+                                   HOUSE_BENCH_R if in_house else BENCH_SCAN_R)
+            if props is not None and in_house:
+                # 傳送點（踩上去會觸發）、看不見的標記點、學過的保險箱都不是製作台
+                trig = {t.oid for t in (house.things(self.sc) or []) if t.trigger}
+                chest = config.get(housetrip.CFG_CHEST, None)
+                props = [p for p in props if p.oid not in trig
+                         and not mapobj.hidden(p.model) and p.model != chest]
             if props is None:
                 return "⚠ 讀不到附近的物件（載入中？）—— 等一下再找製作檯"
             if c["props"] is None:
@@ -1585,8 +1812,15 @@ class CharProducePage(QWidget):
         if not props:
             return (f"⛔ {BENCH_SCAN_R:.0f} 格內沒有可點的製作站台 —— "
                     "這裡沒有檯子（角色停在這，不會亂走）")
+        # ★ 房屋模式：學過的製作台外觀先點；沒學過就先試城裡那張的外觀（同款檯子）
+        if not advance and in_house:
+            want = self._hbench or (self._bench[3] if self._bench else 0)
+            for k, p in enumerate(props):
+                if want and p.model == want:
+                    c["pi"] = k
+                    break
         # ★ 記住的檯子長什麼樣就先點它（位置對得上＋外觀編號一樣）
-        if not advance and self._bench and self._bench[3]:
+        elif not advance and self._bench and self._bench[3]:
             bx, by, _sid, model = self._bench
             for k, p in enumerate(props):
                 if p.model == model and p.dist((bx, by)) <= BENCH_SAME:
@@ -1607,6 +1841,10 @@ class CharProducePage(QWidget):
                         f"　{note}")
         ok, msg = produce.click_bench(self._mover, self.sc, p)
         c["poked"] = p if ok else None
+        c["poke_pos"] = self._my_pos()
+        if in_house:
+            self._hlog_w(f"點 {mapobj.name_of(p.model) or p.model}（{p.x:.1f},{p.y:.1f}，"
+                         f"{d:.1f} 格）：{msg}")
         if not ok:
             return f"⚠ 點製作檯沒送出（{msg}）"
         return (f"點了第 {c['pi'] + 1}/{len(props)} 個候選"
@@ -1647,6 +1885,15 @@ class CharProducePage(QWidget):
                 self._note(f"⚠ 點了東西之後人被帶到{scene.scene_name(here)}"
                            " —— 那個不是製作檯，已記住不再點它，這趟先回去採集",
                            warn=True)
+                return
+        # ★ 房屋模式：製作間跟客廳同一個場景編號，被傳走看不出換圖 → 改看位置跳了沒。
+        if c.get("house") and c.get("poke_pos") and c.get("poked") is not None:
+            me = self._my_pos()
+            if me is not None and math.hypot(me[0] - c["poke_pos"][0],
+                                             me[1] - c["poke_pos"][1]) > HOUSE_WARP_JUMP:
+                self._bad_props.add((here, c["poked"].model))
+                self._hlog_w(f"點了外觀 {c['poked'].model} 被傳走 → 記住不再點，回生產寵物房")
+                s["step"], s["house_next"] = "house_go", "craft"
                 return
         # ⚠ c["t0"] 也是「上一次有進展」的時間（有做出東西就重設）——
         #   這是「卡死一小時」的兜底，不是總時長上限。
@@ -1737,7 +1984,13 @@ class CharProducePage(QWidget):
             c["wnd"] = g.get("WND_MAKE")
             if c.get("poked") is not None:
                 me = self._my_pos()
-                if me is not None:
+                if c.get("house"):
+                    if self._hbench != c["poked"].model:
+                        self._hbench = c["poked"].model
+                        self._save_settings()
+                        self._hlog_w(f"學到生產寵物房的製作台：{mapobj.name_of(self._hbench)}"
+                                     f"（外觀 {self._hbench}）")
+                elif me is not None:
                     self._learn_bench(me, c["poked"].model)
             if not c["wnd"]:
                 return                             # 讀不到 WND_MAKE，等下一拍
@@ -2164,6 +2417,176 @@ class CharProducePage(QWidget):
         color = theme.BAD if bad else (theme.WARN if warn else theme.TEXT_MUT)
         self.status.setStyleSheet(f"color: {color};")
 
+    def notify(self, msg: str) -> None:
+        """送警報通知（跟自動掛機共用設定；掛機頁「啟用通知」關掉就不送）。"""
+        if not config.get("farm.notify_on", True):
+            return
+        try:
+            who = f"{self.account}（{self.char_name}）"
+            note = self._notifier.fire(who, "自動生產：" + msg)
+            self.status.setText(self.status.text() + f"　[{note}]")
+        except Exception:                          # noqa: BLE001
+            pass                                   # 通知送不出去不能拖垮流程
+
+    # ------------------------------------------------------------------
+    # -- 房屋製作（流程本體在 app/game/housetrip.py，這裡只管啟動／輪詢）------
+    def _house_on(self) -> bool:
+        return self.house_cb.isChecked()
+
+    def _hlog_w(self, text: str) -> None:
+        """寫一行 house_run.log（分頁這邊的決定：退回原本方式、通知、清潔指數…）。"""
+        if self._hlog is None:
+            self._hlog = housetrip.RunLog(self.char_name or self.account)
+        self._hlog.w(self.sc, "[分頁] " + text)
+
+    def _on_house_toggle(self, on: bool) -> None:
+        self._save_settings()
+        if self._loading:
+            return
+        if not on:
+            self._house_cancel("取消勾選房屋製作")
+        self._house_no_gather = False
+        self._hlog_w(f"房屋製作 {'勾選' if on else '取消'}")
+
+    def _house_off(self, why: str) -> None:
+        """大聲關掉房屋製作（擺不了房子）：取消勾選＋通知＋之後走原本的方式。"""
+        self.house_cb.blockSignals(True)
+        self.house_cb.setChecked(False)
+        self.house_cb.blockSignals(False)
+        self._save_settings()
+        msg = f"房屋製作已取消：{why} —— 改用原本的定位點和製作檯"
+        self._hlog_w("⛔ " + msg)
+        self._note("⚠ " + msg, warn=True)
+        self.notify(msg)
+
+    def _house_cancel(self, why: str) -> None:
+        j = self._hjob
+        if j is not None:
+            j["ctx"].cancel = True
+            self._hlog_w(f"作廢背景工作（{j['kind']}）：{why}")
+        self._hjob = None
+
+    def _house_start(self, kind: str, **kw) -> None:
+        """開一條房屋背景工作。kind：go（去生產寵物房）／deposit（存保險箱）。"""
+        if self._hjob is not None and self._hjob["thread"].is_alive():
+            return
+        if self._hlog is None:
+            self._hlog = housetrip.RunLog(self.char_name or self.account)
+        job = {"kind": kind, "result": None, "t0": time.monotonic(), "progress": ""}
+        ctx = housetrip.Ctx(self._mover, self.sc, self.char_name, self._hlog,
+                            say=lambda m: job.__setitem__("progress", m))
+        job["ctx"] = ctx
+
+        def _worker():
+            try:
+                if kind == "go":
+                    res = housetrip.go_workshop(ctx)
+                else:
+                    ok, msg = housetrip.deposit(ctx, kw["guild"], kw["ids"])
+                    res = ("ok" if ok else "fail", msg)
+            except Exception as exc:               # noqa: BLE001
+                path = crashlog.record(f"房屋製作 {kind}（PID {self.pid}）", exc)
+                ctx.note(f"⚠ 出錯：{exc}" + (f"（{path}）" if path else ""))
+                res = ("fail", f"出錯：{exc}")
+            job["result"] = res
+
+        t = threading.Thread(target=_worker, daemon=True)
+        job["thread"] = t
+        self._hjob = job
+        t.start()
+
+    def _house_poll(self) -> tuple[str, str] | None:
+        """背景工作跑完了嗎：回 (結果, 說明)；還在跑回 None。"""
+        j = self._hjob
+        if j is None:
+            return ("fail", "背景工作不見了")
+        if j["result"] is None:
+            if not j["thread"].is_alive():
+                self._hjob = None
+                return ("fail", "背景工作意外結束")
+            return None
+        self._hjob = None
+        return j["result"]
+
+    # ------------------------------------------------------------------
+    # -- 自動吃清潔指數 ----------------------------------------------------
+    def _on_clean_toggle(self) -> None:
+        self._save_settings()
+        self._clean_next = 0.0
+        self._clean_told = ""
+
+    def _clean_ids(self) -> set[int]:
+        """「強效魔法靈」的物品 ID（查 GAMEDATA 名稱表；不寫死編號）。"""
+        try:
+            return {k for k, v in itemname._load().items() if v == CLEAN_ITEM}
+        except Exception:                          # noqa: BLE001
+            return set()
+
+    def _clean_tell(self, key: str, msg: str) -> None:
+        """同一件事只通知一次（狀態列照寫）。"""
+        self._hlog_w("清潔指數：" + msg)
+        self._note("⚠ " + msg, warn=True)
+        if self._clean_told != key:
+            self._clean_told = key
+            self.notify(msg)
+
+    def _clean_tick(self) -> None:
+        """每 CLEAN_CHECK_SECS 讀一次清潔指數；低於 CLEAN_MIN 就吃一個強效魔法靈。
+
+        ⚠ 製作中／存倉庫中／換球中不動手（用道具可能打斷），等下一輪。
+        ★ 用之前先按 ESC（採集狀態中有些道具用不了，同天使之翼）；1.2 秒後才用，
+          3 秒後驗清潔指數有沒有真的變高 —— 送出去≠吃到。
+        """
+        now = time.monotonic()
+        if now < self._clean_next:
+            return
+        self._clean_next = now + CLEAN_CHECK_SECS
+        v = house.cleanliness(self.sc)
+        self.clean_lbl.setText(f"清潔指數：{v if v is not None else '讀不到'}")
+        if not self.clean_cb.isChecked() or v is None or v >= CLEAN_MIN:
+            return
+        if self._ball_busy or self._hjob is not None or (
+                self._trip is not None and self._trip.get("step") == "craft"):
+            self._clean_next = now + 5.0
+            return
+        if not self._ensure_mover():
+            return
+        ids = self._clean_ids()
+        its = [i for i in (bag.items(self.sc) or []) if i.type_id in ids]
+        if not its:
+            self._clean_next = now + CLEAN_RETRY_SECS
+            self._clean_tell("none", f"清潔指數 {v} 低於 {CLEAN_MIN}，但背包沒有「{CLEAN_ITEM}」")
+            return
+        try:
+            win.send_key(self.hwnd, self.VK_ESCAPE)
+        except Exception:                          # noqa: BLE001
+            pass
+        QTimer.singleShot(1200, lambda: self._clean_use(v))
+
+    def _clean_use(self, before: int) -> None:
+        ids = self._clean_ids()
+        # ★ 格號送出前當場重讀（背包會在中間變動，CLAUDE.md 鐵則）
+        its = [i for i in (bag.items(self.sc) or []) if i.type_id in ids]
+        if not its or not (self._mover and self._mover.active):
+            return
+        it = its[0]
+        ok = recall.use_item(self._mover, it.slot)
+        self._hlog_w(f"清潔指數 {before} < {CLEAN_MIN} → 用第 {it.slot} 格 {it.name}"
+                     f"（剩 {it.count}）：{'已送出' if ok else '送不出去'}")
+        QTimer.singleShot(CLEAN_VERIFY_MS, lambda: self._clean_verify(before))
+
+    def _clean_verify(self, before: int) -> None:
+        v = house.cleanliness(self.sc)
+        self.clean_lbl.setText(f"清潔指數：{v if v is not None else '讀不到'}")
+        if v is not None and v > before:
+            self._hlog_w(f"清潔指數 {before} → {v} ✅")
+            self._clean_told = ""
+            self._note(f"已吃{CLEAN_ITEM}：清潔指數 {before} → {v}")
+            return
+        self._clean_next = time.monotonic() + CLEAN_RETRY_SECS
+        self._clean_tell("fail", f"吃了「{CLEAN_ITEM}」清潔指數沒變（{before} → {v}），"
+                                 f"{CLEAN_RETRY_SECS / 60:.0f} 分鐘後再試")
+
     # ------------------------------------------------------------------
     # -- 定位點 ----------------------------------------------------------
     def _exact_stalled(self, s: dict, key: str, me, d: float) -> str | None:
@@ -2299,6 +2722,12 @@ class CharProducePage(QWidget):
                            int(b[3]) if len(b) > 3 and b[3] is not None else 0)
         self._refresh_bench()
         self.ball_cb.setChecked(bool(config.get(self._key("auto_ball"), False)))
+        self.house_cb.setChecked(bool(config.get(self._key("house"), False)))
+        self.clean_cb.setChecked(bool(config.get(self._key("clean"), False)))
+        try:
+            self._hbench = int(config.get(self._key("house_bench"), 0) or 0)
+        except (TypeError, ValueError):
+            self._hbench = 0
 
     def _save_settings(self) -> None:
         if self._loading:
@@ -2310,6 +2739,9 @@ class CharProducePage(QWidget):
         config.set(self._key("bench"),
                    list(self._bench) if self._bench else None)
         config.set(self._key("auto_ball"), self.ball_cb.isChecked())
+        config.set(self._key("house"), self.house_cb.isChecked())
+        config.set(self._key("clean"), self.clean_cb.isChecked())
+        config.set(self._key("house_bench"), self._hbench or 0)
         config.save()
 
     # ------------------------------------------------------------------
@@ -2318,6 +2750,10 @@ class CharProducePage(QWidget):
         self._timer.stop()
         self._trip_timer.stop()
         self._trip = None
+        self._house_cancel("關分頁")
+        if self._hlog is not None:
+            self._hlog.close()
+            self._hlog = None
         if self._mover is not None:
             try:
                 move.release(self.pid, self)
