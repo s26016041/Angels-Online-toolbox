@@ -107,14 +107,22 @@ class Cell:
 
 
 class IconGrid(QWidget):
-    """模擬背包：一格一個東西，滑過看說明、點一下選起來。有幾個就畫幾格。"""
+    """模擬背包：一格一個東西，滑過看說明、點一下選起來。有幾個就畫幾格。
 
-    picked = Signal(int)                    # 送出被選中的 key（0 ＝ 沒選）
+    `multi=True`（使用者 2026-09-26 要的多選）：點一下＝加入／取消，選的順序就是
+    處理順序，格子左上角標 1、2、3…。`selected()`／`selected_cell()` 回**最後點的**
+    那一件（單選時的用法照舊能用）；整批用 `selected_cells()`。
+    """
 
-    def __init__(self, empty_text: str, parent: QWidget | None = None) -> None:
+    picked = Signal(int)                    # 送出被點的 key（0 ＝ 沒選）
+
+    def __init__(self, empty_text: str, parent: QWidget | None = None,
+                 multi: bool = False) -> None:
         super().__init__(parent)
         self._cells: list[Cell] = []
-        self._key = 0
+        self._key = 0                       # 單選：選的那格；多選：最後點的那格
+        self._keys: list[int] = []          # 多選：依點選順序
+        self._multi = multi
         self._hover = 0
         self._empty = empty_text
         self.setMouseTracking(True)
@@ -123,7 +131,15 @@ class IconGrid(QWidget):
     # ------------------------------------------------------------------
     def set_cells(self, cells: list[Cell]) -> None:
         self._cells = cells
-        if self._key and all(c.key != self._key for c in cells):
+        have = {c.key for c in cells}
+        if self._multi:
+            keep = [k for k in self._keys if k in have]
+            if keep != self._keys:          # 選的有些不見了（打掉了／用完了）
+                self._keys = keep
+                if self._key not in have:
+                    self._key = keep[-1] if keep else 0
+                self.picked.emit(self._key)
+        elif self._key and self._key not in have:
             self._key = 0                   # 選的那個不見了（打掉了／用完了）
             self.picked.emit(0)
         rows = max(1, (len(cells) + COLS - 1) // COLS)
@@ -135,19 +151,49 @@ class IconGrid(QWidget):
         if not any(c.key == key for c in self._cells):
             return False
         self._key = key
+        if self._multi and key not in self._keys:
+            self._keys.append(key)
         self.picked.emit(key)
         self.update()
         return True
 
+    def select_keys(self, keys) -> None:
+        """多選：整批換成這些（照給的順序）；清單裡沒有的略過。"""
+        have = {c.key for c in self._cells}
+        self._keys = [k for k in keys if k in have]
+        self._key = self._keys[-1] if self._keys else 0
+        self.picked.emit(self._key)
+        self.update()
+
+    def clear_selection(self) -> None:
+        self._keys = []
+        self._key = 0
+        self.picked.emit(0)
+        self.update()
+
+    def cells(self) -> list[Cell]:
+        return list(self._cells)
+
     def selected_cell(self) -> Cell | None:
+        key = self._key
+        if self._multi and key not in self._keys:
+            key = self._keys[-1] if self._keys else 0
         for c in self._cells:
-            if c.key == self._key:
+            if c.key == key:
                 return c
         return None
 
     def selected(self):
         c = self.selected_cell()
         return c.payload if c is not None else None
+
+    def selected_cells(self) -> list[Cell]:
+        """多選：依點選順序的格子；單選：有選就一格。"""
+        by = {c.key: c for c in self._cells}
+        if not self._multi:
+            c = by.get(self._key)
+            return [c] if c is not None else []
+        return [by[k] for k in self._keys if k in by]
 
     def _at(self, pos) -> Cell | None:
         col = (pos.x() - PAD) // CELL
@@ -199,13 +245,38 @@ class IconGrid(QWidget):
                                Qt.AlignRight | Qt.AlignBottom, c.badge)
                 p.setPen(QColor(c.badge_colour))
                 p.drawText(box, Qt.AlignRight | Qt.AlignBottom, c.badge)
-            if c.key == self._key:
+            if self._multi:
+                if c.key in self._keys:
+                    p.setPen(QPen(QColor(PICK_EDGE), PICK_WIDTH))
+                    p.drawRect(cell.adjusted(1, 1, -1, -1))
+                    # 左上角順序號碼（黑底描邊，同右下角數字）
+                    num = str(self._keys.index(c.key) + 1)
+                    box = cell.adjusted(4, 2, 0, 0)
+                    p.setPen(QColor(0, 0, 0, 220))
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        p.drawText(box.translated(dx, dy),
+                                   Qt.AlignLeft | Qt.AlignTop, num)
+                    p.setPen(QColor(PICK_EDGE))
+                    p.drawText(box, Qt.AlignLeft | Qt.AlignTop, num)
+            elif c.key == self._key:
                 p.setPen(QPen(QColor(PICK_EDGE), PICK_WIDTH))
                 p.drawRect(cell.adjusted(1, 1, -1, -1))
         p.end()
 
     def mousePressEvent(self, ev) -> None:               # noqa: N802
         c = self._at(ev.position().toPoint())
+        if self._multi:
+            if c is None:
+                return                      # 點空白不動選取（多選不小心清掉很痛）
+            if c.key in self._keys:
+                self._keys.remove(c.key)
+                self._key = self._keys[-1] if self._keys else 0
+            else:
+                self._keys.append(c.key)
+                self._key = c.key
+            self.picked.emit(c.key)
+            self.update()
+            return
         self._key = c.key if c else 0
         self.picked.emit(self._key)
         self.update()
@@ -343,6 +414,10 @@ class EnhanceTab(BaseTab):
         self._movers: dict[int, move.Mover] = {}
         self._sig: tuple | None = None
         self._run: enhance.Run | holes.Run | None = None
+        # ★ 多選整批（使用者 2026-09-26）：照點選順序一件一件做。
+        #   {"kind": "enhance"/"holes", "queue": [serial...], "target", "tally": {…},
+        #    "cur": 目前這件名字, "last": 目前這件最後一個事件種類}
+        self._batch: dict | None = None
 
         root = QVBoxLayout(self)
         # ⛔ 最上面那段使用說明使用者 2026-09-06 說不要（「那堆說明文字不要寫」）；
@@ -371,13 +446,26 @@ class EnhanceTab(BaseTab):
 
         box = QGroupBox("模擬背包（可強化的裝備）")
         box_lay = QVBoxLayout(box)
-        self.grid = IconGrid("背包裡沒有可強化的裝備")
+        self.grid = IconGrid("背包裡沒有可強化的裝備", multi=True)
         self.grid.picked.connect(self._on_picked)
         area = QScrollArea()
         area.setWidget(self.grid)
         area.setWidgetResizable(True)
         area.setMinimumHeight(CELL * 3 + 12)
         box_lay.addWidget(area)
+        sel_row = QHBoxLayout()
+        self.all_btn = QPushButton("全選")
+        self.all_btn.setToolTip("選起所有還沒到「強化到 +N」或「打孔到 N 孔」的裝備。")
+        self.all_btn.clicked.connect(self._on_select_all)
+        sel_row.addWidget(self.all_btn)
+        self.none_btn = QPushButton("清除")
+        self.none_btn.clicked.connect(self.grid.clear_selection)
+        sel_row.addWidget(self.none_btn)
+        self.sel_lbl = QLabel("點一下選、再點取消；可以選好幾件，照數字順序做")
+        self.sel_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
+        sel_row.addWidget(self.sel_lbl)
+        sel_row.addStretch(1)
+        box_lay.addLayout(sel_row)
         root.addWidget(box)
 
         gem_box = QGroupBox("寶石背包（點一顆 ＝ 打孔時只鑲這一種）")
@@ -598,18 +686,34 @@ class EnhanceTab(BaseTab):
         self._update_buttons()
 
     def _update_buttons(self) -> None:
-        running = self._run is not None and not self._run.done
-        g = self.grid.selected()
-        ok = (g is not None and not running
-              and g.enhance < enhance.MAX_LEVEL)
+        running = self._batch is not None or (
+            self._run is not None and not self._run.done)
+        gs = [c.payload for c in self.grid.selected_cells()]
+        ok = (bool(gs) and not running
+              and any(g.enhance < enhance.MAX_LEVEL for g in gs))
         self.go_btn.setEnabled(bool(ok))
         gem_ok = (self.gem_cap_rb.isChecked()
                   or self.gem_grid.selected() is not None)
-        self.hole_btn.setEnabled(bool(g is not None and not running and gem_ok
-                                      and g.holes < holes.MAX_HOLES))
+        self.hole_btn.setEnabled(bool(gs and not running and gem_ok
+                                      and any(g.holes < holes.MAX_HOLES for g in gs)))
         self.gem_cap.setEnabled(self.gem_cap_rb.isChecked())
         self.stop_btn.setEnabled(running)
         self.who.setEnabled(not running)
+        self.all_btn.setEnabled(not running)
+        self.none_btn.setEnabled(not running)
+        if gs:
+            self.sel_lbl.setText(f"已選 {len(gs)} 件（照格子上的數字順序做）")
+        else:
+            self.sel_lbl.setText("點一下選、再點取消；可以選好幾件，照數字順序做")
+
+    def _on_select_all(self) -> None:
+        """全選：還沒到強化目標、或還沒到打孔目標的裝備（背包順序）。"""
+        et, ht = self.target.value(), self.hole_target.value()
+        keys = [c.key for c in self.grid.cells()
+                if (c.payload.enhance < min(et, enhance.MAX_LEVEL)
+                    or c.payload.holes < min(ht, holes.MAX_HOLES))]
+        self.grid.select_keys(keys)
+        self._update_buttons()
 
     def _on_gem_picked(self, key: int) -> None:
         c = self.gem_grid.selected_cell()
@@ -646,62 +750,124 @@ class EnhanceTab(BaseTab):
             self.hist.takeItem(self.hist.count() - 1)
 
     def _on_go(self) -> None:
-        pid, sc = self._cur()
-        g = self.grid.selected()
-        if sc is None or g is None:
-            return
-        mv = self._mover(pid)
-        if mv is None:
-            return
-        target = self.target.value()
-        if target <= g.enhance:
-            msg = f"選擇強化等級過低（{g.name} 目前 +{g.enhance}，選的是 +{target}）"
-            self._log(msg, theme.WARN)
-            self.status.setText(msg)
-            return
-        self._run = enhance.Run(sc, mv, g.slot, g.serial, target, g.name)
-        self._log(f"開始：{g.name} +{g.enhance} → +{target}", "#7CD8FF")
-        self.status.setText(f"強化中… {g.name} → +{target}")
-        self._run_timer.start(STRIKE_MS)
-        self._update_buttons()
+        self._begin_batch("enhance")
 
     def _on_go_holes(self) -> None:
+        self._begin_batch("holes")
+
+    def _begin_batch(self, kind: str) -> None:
+        """照點選順序整批做。⚠ 只記 serial —— 輪到那件時才重讀它在哪一格、現況多少
+        （背包會在中間變動，CLAUDE.md 鐵則：交給遊戲的格號送出前當場重讀）。"""
         pid, sc = self._cur()
-        g = self.grid.selected()
-        if sc is None or g is None:
+        cells = self.grid.selected_cells()
+        if sc is None or not cells:
             return
-        mv = self._mover(pid)
-        if mv is None:
+        if self._mover(pid) is None:
             return
-        target = self.hole_target.value()
-        cap = self.gem_cap.value()
-        # 目標孔數在點方塊的當下就存了（`_on_hole_target`）
-        # 寶石等限不存：每次選裝備都會自動填「裝備等級 − GEM_CAP_BELOW」
-        if target <= g.holes:
-            msg = f"選擇孔數過低（{g.name} 目前 {g.holes} 孔，選的是 {target} 孔）"
-            self._log(msg, theme.WARN)
-            self.status.setText(msg)
+        gem_type, how = None, ""
+        if kind == "holes":
+            if self.gem_pick_rb.isChecked():
+                c = self.gem_grid.selected_cell()
+                if c is None:
+                    self.status.setText("選了「用選的寶石」但還沒點寶石")
+                    return
+                gem_type = int(c.key)
+                how = f"只鑲 {c.name}"
+            else:
+                how = f"寶石等限 ≤ {self.gem_cap.value()} 級"
+        target = (self.target.value() if kind == "enhance"
+                  else self.hole_target.value())
+        self._batch = {"kind": kind, "queue": [c.key for c in cells],
+                       "target": target, "gem_type": gem_type,
+                       "cap": self.gem_cap.value(), "total": len(cells),
+                       "tally": {"ok": 0, "gone": 0, "down": 0, "skip": 0},
+                       "cur": "", "last": None}
+        what = f"強化到 +{target}" if kind == "enhance" else f"打孔到 {target} 孔（{how}）"
+        self._log(f"整批開始：{len(cells)} 件，{what}", "#7CD8FF")
+        self._next_in_batch()
+        self._update_buttons()
+
+    def _next_in_batch(self) -> None:
+        """輪到下一件：重讀它的現況 → 已達標／不見了就跳過 → 開一個 Run。"""
+        b = self._batch
+        pid, sc = self._cur()
+        mv = self._movers.get(pid)
+        while b is not None and b["queue"]:
+            serial = b["queue"].pop(0)
+            n = b["total"] - len(b["queue"])
+            gears, complete = gear.in_bag(sc) if sc is not None else ([], False)
+            g = next((x for x in gears if x.serial == serial), None)
+            if g is None:
+                if not complete:
+                    b["queue"].insert(0, serial)      # 這一拍背包讀不完整 → 等下一拍
+                    QTimer.singleShot(300, self._next_in_batch)
+                    return
+                b["tally"]["skip"] += 1
+                self._log(f"[{n}/{b['total']}] 那件不在背包了，跳過", theme.WARN)
+                continue
+            t = b["target"]
+            if b["kind"] == "enhance":
+                if g.enhance >= min(t, enhance.MAX_LEVEL):
+                    b["tally"]["skip"] += 1
+                    self._log(f"[{n}/{b['total']}] {g.name} 已經 +{g.enhance}，跳過")
+                    continue
+                self._run = enhance.Run(sc, mv, g.slot, g.serial, t, g.name)
+                self._log(f"[{n}/{b['total']}] 開始：{g.name} +{g.enhance} → +{t}", "#7CD8FF")
+                self.status.setText(f"強化中… [{n}/{b['total']}] {g.name} → +{t}")
+                self._run_timer.start(STRIKE_MS)
+            else:
+                if g.holes >= min(t, holes.MAX_HOLES):
+                    b["tally"]["skip"] += 1
+                    self._log(f"[{n}/{b['total']}] {g.name} 已經 {g.holes} 孔，跳過")
+                    continue
+                cap = b["cap"]
+                lvl = g.base.get("level")
+                if b["total"] > 1 and lvl is not None:
+                    # ★ 整批時等限取「你填的」跟「這件等級 − GEM_CAP_BELOW」較低的那個：
+                    #   只會更保守（拿更差的寶石墊），不會動到好寶石。
+                    cap = min(cap, max(0, int(lvl) - GEM_CAP_BELOW))
+                self._run = holes.Run(sc, mv, g.slot, g.serial, t, cap, g.name,
+                                      gem_type=b["gem_type"])
+                gem = "指定寶石" if b["gem_type"] else f"寶石等限 ≤ {cap}"
+                self._log(f"[{n}/{b['total']}] 開始打孔：{g.name} {g.holes} 孔 → {t} 孔（{gem}）",
+                          "#7CD8FF")
+                self.status.setText(f"打孔中… [{n}/{b['total']}] {g.name} → {t} 孔")
+                self._run_timer.start(RUN_MS)
+            b["cur"], b["last"] = g.name, None
             return
-        gem_type = None
-        how = f"寶石等限 ≤ {cap} 級"
-        if self.gem_pick_rb.isChecked():
-            c = self.gem_grid.selected_cell()
-            if c is None:
-                self.status.setText("選了「用選的寶石」但還沒點寶石")
-                return
-            gem_type = int(c.key)
-            how = f"只鑲 {c.name}"
-        self._run = holes.Run(sc, mv, g.slot, g.serial, target, cap, g.name,
-                              gem_type=gem_type)
-        self._log(f"開始打孔：{g.name} {g.holes} 孔 → {target} 孔（{how}）",
-                  "#7CD8FF")
-        self.status.setText(f"打孔中… {g.name} → {target} 孔")
-        self._run_timer.start(RUN_MS)
+        self._end_batch("")
+
+    def _end_batch(self, why: str) -> None:
+        b = self._batch
+        self._batch = None
+        self._run = None
+        self._run_timer.stop()
+        self.status.setText("　")
+        self._sig = None                      # 逼下一拍重畫（東西可能不見了）
+        if b is not None:
+            t = b["tally"]
+            left = len(b["queue"])
+            parts = [f"成功 {t['ok']}"]
+            if t["gone"]:
+                parts.append(f"毀損 {t['gone']}")
+            if t["down"]:
+                parts.append(f"退等 {t['down']}")
+            if t["skip"]:
+                parts.append(f"跳過 {t['skip']}")
+            if left:
+                parts.append(f"沒做 {left}")
+            bad = bool(why) or t["gone"] or t["down"]
+            self._log(f"整批結束：共 {b['total']} 件，" + "、".join(parts)
+                      + (f"（{why}）" if why else ""),
+                      "#FFC864" if bad else "#7CFC7C")
         self._update_buttons()
 
     def _on_stop(self) -> None:
-        if self._run is not None and not self._run.done:
+        if self._batch is not None or (self._run is not None and not self._run.done):
             self._log("手動停止", "#FFC864")
+        if self._batch is not None:
+            self._end_batch("手動停止")
+            return
         self._run = None
         self._run_timer.stop()
         self.status.setText("　")
@@ -712,14 +878,33 @@ class EnhanceTab(BaseTab):
         if run is None:
             self._run_timer.stop()
             return
+        b = self._batch
         for ev in run.tick():
             self._log(ev.text, COLOUR_OF.get(ev.kind, "#DDDDDD"))
-        if run.done:
-            self._run_timer.stop()
-            self._run = None
+            if b is not None:
+                b["last"] = ev.kind
+        if not run.done:
+            return
+        self._run_timer.stop()
+        self._run = None
+        self._sig = None
+        if b is None:
             self.status.setText("　")
-            self._sig = None                 # 逼下一拍重畫（東西可能不見了）
             self._update_buttons()
+            return
+        # ★ 使用者 2026-09-26 定：失敗毀損／退等 → 繼續下一件；
+        #   錘子／寶石用完、驗不出結果、格子換人 → 整批停。
+        last = b["last"]
+        if last == enhance.DONE:
+            b["tally"]["ok"] += 1
+        elif last == enhance.GONE:
+            b["tally"]["gone"] += 1
+        elif last == enhance.DOWNGRADE:
+            b["tally"]["down"] += 1
+        else:
+            self._end_batch(f"{b['cur']} 停在「{last}」，整批停下")
+            return
+        self._next_in_batch()
 
     # ------------------------------------------------------------------
     def on_close(self) -> None:

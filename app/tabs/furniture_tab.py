@@ -91,6 +91,7 @@ class FurnitureTab(BaseTab):
         self._sig: tuple | None = None
         self._hsig: tuple | None = None
         self._run: furniture.Run | None = None
+        self._batch: dict | None = None   # 多選整批（見 _on_go）
         self._want_hammer = int(config.get("furniture.hammer", 0) or 0)
 
         root = QVBoxLayout(self)
@@ -110,13 +111,26 @@ class FurnitureTab(BaseTab):
 
         box = QGroupBox("傢俱（右下角＝目前魔力值）")
         box_lay = QVBoxLayout(box)
-        self.grid = IconGrid("背包裡沒有傢俱")
+        self.grid = IconGrid("背包裡沒有傢俱", multi=True)
         self.grid.picked.connect(lambda _k: self._update_buttons())
         area = QScrollArea()
         area.setWidget(self.grid)
         area.setWidgetResizable(True)
         area.setMinimumHeight(CELL * 3 + 12)
         box_lay.addWidget(area)
+        sel_row = QHBoxLayout()
+        self.all_btn = QPushButton("全選")
+        self.all_btn.setToolTip("選起所有魔力值還沒到目標、而且用選的錘子敲得到目標的傢俱。")
+        self.all_btn.clicked.connect(self._on_select_all)
+        sel_row.addWidget(self.all_btn)
+        self.none_btn = QPushButton("清除")
+        self.none_btn.clicked.connect(self.grid.clear_selection)
+        sel_row.addWidget(self.none_btn)
+        self.sel_lbl = QLabel("點一下選、再點取消；可以選好幾件，照數字順序做")
+        self.sel_lbl.setStyleSheet(f"color: {theme.TEXT_MUT};")
+        sel_row.addWidget(self.sel_lbl)
+        sel_row.addStretch(1)
+        box_lay.addLayout(sel_row)
         root.addWidget(box)
 
         hbox = QGroupBox("傢俱魔力錘（點一種）")
@@ -266,12 +280,27 @@ class FurnitureTab(BaseTab):
         config.save()                      # ★ set() 不寫檔，要接 save()
 
     def _update_buttons(self) -> None:
-        running = self._run is not None and not self._run.done
-        ok = (self.grid.selected() is not None and self.hgrid.selected() is not None
-              and not running)
+        running = self._batch is not None or (
+            self._run is not None and not self._run.done)
+        n = len(self.grid.selected_cells())
+        ok = n > 0 and self.hgrid.selected() is not None and not running
         self.go_btn.setEnabled(bool(ok))
         self.stop_btn.setEnabled(running)
         self.who.setEnabled(not running)
+        self.all_btn.setEnabled(not running)
+        self.none_btn.setEnabled(not running)
+        self.sel_lbl.setText(f"已選 {n} 件（照格子上的數字順序做）" if n
+                             else "點一下選、再點取消；可以選好幾件，照數字順序做")
+
+    def _on_select_all(self) -> None:
+        """全選：魔力值還沒到目標、而且（有選錘子的話）這種錘子敲得到目標的傢俱。"""
+        target = self.target.value()
+        h = self.hgrid.selected()
+        keys = [c.key for c in self.grid.cells()
+                if c.payload.total < target
+                and (h is None or c.payload.base + h.hi >= target)]
+        self.grid.select_keys(keys)
+        self._update_buttons()
 
     # ------------------------------------------------------------------
     def _log(self, text: str, colour: str = "#DDDDDD") -> None:
@@ -286,32 +315,87 @@ class FurnitureTab(BaseTab):
         self.status.setText(msg)
 
     def _on_go(self) -> None:
+        """照點選順序整批敲。⚠ 只記 serial —— 輪到那件才重讀它在哪一格、魔力值多少。"""
         pid, sc = self._cur()
-        f = self.grid.selected()
+        cells = self.grid.selected_cells()
         h = self.hgrid.selected()
-        if sc is None or f is None or h is None:
+        if sc is None or not cells or h is None:
+            return
+        if self._mover(pid) is None:
             return
         target = self.target.value()
-        if f.total >= target:
-            self._warn(f"{f.name} 魔力值已經 {f.total}（≥ {target}），不用敲")
+        self._batch = {"queue": [c.key for c in cells], "target": target,
+                       "hammer": h.type_id, "hname": h.name, "hi": h.hi,
+                       "total": len(cells), "tally": {"ok": 0, "skip": 0},
+                       "cur": "", "last": None}
+        self._log(f"整批開始：{len(cells)} 件，魔力值 ≥ {target}，用 {h.name}"
+                  f"（{h.lo}～{h.hi}，剩 {h.count}）", "#7CD8FF")
+        self._next_in_batch()
+        self._update_buttons()
+
+    def _next_in_batch(self) -> None:
+        b = self._batch
+        pid, sc = self._cur()
+        mv = self._movers.get(pid)
+        while b is not None and b["queue"]:
+            serial = b["queue"].pop(0)
+            n = b["total"] - len(b["queue"])
+            items, scanned = bag.scan(sc) if sc is not None else ([], False)
+            fs, _ = furniture.in_bag(sc, items, scanned) if sc is not None else ([], False)
+            f = next((x for x in fs if x.serial == serial), None)
+            if f is None:
+                if not scanned:
+                    b["queue"].insert(0, serial)      # 這一拍背包讀不完整 → 等一下
+                    QTimer.singleShot(300, self._next_in_batch)
+                    return
+                b["tally"]["skip"] += 1
+                self._log(f"[{n}/{b['total']}] 那件不在背包了，跳過", theme.WARN)
+                continue
+            t = b["target"]
+            if f.total >= t:
+                b["tally"]["skip"] += 1
+                self._log(f"[{n}/{b['total']}] {f.name} 魔力值已經 {f.total}，跳過")
+                continue
+            if f.base + b["hi"] < t:
+                b["tally"]["skip"] += 1
+                self._log(f"[{n}/{b['total']}] {f.name} 用 {b['hname']} 最多 "
+                          f"{f.base + b['hi']}，到不了 {t}，跳過", theme.WARN)
+                continue
+            self._run = furniture.Run(sc, mv, f.slot, f.serial, b["hammer"], t, f.name)
+            self._log(f"[{n}/{b['total']}] 開始：{f.name} 魔力值 {f.total}"
+                      f"（{f.base}+{f.bonus}）→ ≥ {t}", "#7CD8FF")
+            self.status.setText(f"敲錘中… [{n}/{b['total']}] {f.name} → 魔力值 ≥ {t}")
+            b["cur"], b["last"] = f.name, None
+            self._run_timer.start(RUN_MS)
             return
-        if f.base + h.hi < target:
-            self._warn(f"{h.name} 最高只到 +{h.hi}，{f.name} 最多 {f.base + h.hi}，"
-                       f"到不了 {target}")
-            return
-        mv = self._mover(pid)
-        if mv is None:
-            return
-        self._run = furniture.Run(sc, mv, f.slot, f.serial, h.type_id, target, f.name)
-        self._log(f"開始：{f.name} 魔力值 {f.total}（{f.base}+{f.bonus}）→ ≥ {target}，"
-                  f"用 {h.name}（{h.lo}～{h.hi}，剩 {h.count}）", "#7CD8FF")
-        self.status.setText(f"敲錘中… {f.name} → 魔力值 ≥ {target}")
-        self._run_timer.start(RUN_MS)
+        self._end_batch("")
+
+    def _end_batch(self, why: str) -> None:
+        b = self._batch
+        self._batch = None
+        self._run = None
+        self._run_timer.stop()
+        self.status.setText("　")
+        self._sig = self._hsig = None
+        if b is not None:
+            t = b["tally"]
+            left = len(b["queue"])
+            parts = [f"到目標 {t['ok']}"]
+            if t["skip"]:
+                parts.append(f"跳過 {t['skip']}")
+            if left:
+                parts.append(f"沒做 {left}")
+            self._log(f"整批結束：共 {b['total']} 件，" + "、".join(parts)
+                      + (f"（{why}）" if why else ""),
+                      "#FFC864" if why else "#7CFC7C")
         self._update_buttons()
 
     def _on_stop(self) -> None:
-        if self._run is not None and not self._run.done:
+        if self._batch is not None or (self._run is not None and not self._run.done):
             self._log("手動停止", "#FFC864")
+        if self._batch is not None:
+            self._end_batch("手動停止")
+            return
         self._run = None
         self._run_timer.stop()
         self.status.setText("　")
@@ -322,14 +406,26 @@ class FurnitureTab(BaseTab):
         if run is None:
             self._run_timer.stop()
             return
+        b = self._batch
         for ev in run.tick():
             self._log(ev.text, COLOUR_OF.get(ev.kind, "#DDDDDD"))
-        if run.done:
-            self._run_timer.stop()
-            self._run = None
+            if b is not None:
+                b["last"] = ev.kind
+        if not run.done:
+            return
+        self._run_timer.stop()
+        self._run = None
+        self._sig = self._hsig = None
+        if b is None:
             self.status.setText("　")
-            self._sig = self._hsig = None
             self._update_buttons()
+            return
+        # ★ 到目標 → 下一件；錘子用完／驗不出結果／格子換人 → 整批停（使用者 2026-09-26）
+        if b["last"] == furniture.DONE:
+            b["tally"]["ok"] += 1
+            self._next_in_batch()
+            return
+        self._end_batch(f"{b['cur']} 停在「{b['last']}」，整批停下")
 
     # ------------------------------------------------------------------
     def on_close(self) -> None:
